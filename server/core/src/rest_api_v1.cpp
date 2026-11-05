@@ -10492,6 +10492,12 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            if (title.find('\0') != std::string::npos) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, kCampaignTitleNulMessage),
+                                "application/json");
+                return;
+            }
 
             auto rows_res = build_access_review(auth_db, rbac_store, eps, token_store, directory_sync);
             if (!rows_res) {

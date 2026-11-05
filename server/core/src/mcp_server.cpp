@@ -29322,6 +29322,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (title.find('\0') != std::string::npos) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleNulMessage),
+                                    "application/json");
+                    return;
+                }
                 auto rows_res = build_access_review(auth_db, rbac_store, engine_principal_store_,
                                                     engine_credential_store_, directory_sync);
                 if (!rows_res) {

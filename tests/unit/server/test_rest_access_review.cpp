@@ -2366,7 +2366,13 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
     h.audit_log.clear();
     const std::string msg{yuzu::server::kJustificationTypeMessage};
 
-    const std::vector<nlohmann::json> wrong_types = {123, true, nlohmann::json::array({1}),
+    const std::vector<nlohmann::json> wrong_types = {123,
+                                                     0,
+                                                     true,
+                                                     false,
+                                                     nlohmann::json::array(),
+                                                     nlohmann::json::array({1}),
+                                                     nlohmann::json::object(),
                                                      nlohmann::json{{"a", 1}}};
 
     SECTION("REST") {
@@ -2385,6 +2391,7 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
         CHECK(row.decision_seq == 0);
         CHECK(row.history.empty());
         CHECK(audit_rows(h, "access_review.attested").empty());
+        CHECK(h.audit_log.empty()); // no row of any verb for a refused request
 
         // null is the same as absent: the decision is recorded, as the first one.
         auto with_null = nlohmann::json::parse(sod_body("user", "bob", "Operator"));
@@ -2392,8 +2399,18 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
         auto ok = h.sink.Post(attest_url(cid), with_null.dump());
         REQUIRE(ok);
         CHECK(ok->status == 200);
-        const auto recorded = nlohmann::json::parse(ok->body)["data"];
-        CHECK(recorded["decision_seq"] == 1);
+        auto recorded = nlohmann::json::parse(ok->body)["data"];
+        CHECK(recorded.value("decision_seq", 0) == 1);
+
+        // A string that looks like a number is a string: accepted, and kept as the note.
+        auto numeric = nlohmann::json::parse(sod_body("user", "bob", "Operator"));
+        numeric["justification"] = "123";
+        auto second = h.sink.Post(attest_url(cid), numeric.dump());
+        REQUIRE(second);
+        CHECK(second->status == 200);
+        const auto row2 = grant_row(h, cid, "user", "bob", "Operator");
+        REQUIRE(row2.history.size() == 2);
+        CHECK(row2.history.back().justification == "123");
     }
 
     SECTION("MCP") {
@@ -2431,12 +2448,37 @@ TEST_CASE("open campaign: a title over 256 bytes is refused with 400 / invalid p
     const std::string over = at_cap + "a";
     const std::string msg{yuzu::server::kCampaignTitleTooLongMessage};
 
+    // The cap counts bytes: 128 two-byte characters are exactly 256 bytes and fit, 129 do not.
+    std::string two_byte_fit;
+    for (int i = 0; i < 128; ++i)
+        two_byte_fit += "\xC3\xA9";
+    const std::string two_byte_over = two_byte_fit + "\xC3\xA9";
+    const std::string with_nul = std::string("a\0b", 3);
+    const std::string nul_msg{yuzu::server::kCampaignTitleNulMessage};
+
     SECTION("REST") {
         auto bad = h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", over}}.dump());
         REQUIRE(bad);
         CHECK(bad->status == 400);
         CHECK(bad->body.find(msg) != std::string::npos);
         CHECK(audit_rows(h, "access_review.campaign_opened").empty());
+        CHECK(h.audit_log.empty());
+
+        auto nul =
+            h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", with_nul}}.dump());
+        REQUIRE(nul);
+        CHECK(nul->status == 400);
+        CHECK(nul->body.find(nul_msg) != std::string::npos);
+        CHECK(h.audit_log.empty()); // refused in the handler: no population read, no failure row
+
+        auto wide_over =
+            h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", two_byte_over}}.dump());
+        REQUIRE(wide_over);
+        CHECK(wide_over->status == 400);
+        auto wide_fit =
+            h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", two_byte_fit}}.dump());
+        REQUIRE(wide_fit);
+        CHECK(wide_fit->status == 201);
 
         auto ok = h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", at_cap}}.dump());
         REQUIRE(ok);
@@ -2449,6 +2491,18 @@ TEST_CASE("open campaign: a title over 256 bytes is refused with 400 / invalid p
         CHECK(err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
         CHECK(err.value("message", std::string{}) == msg);
         CHECK(audit_rows(h, "access_review.campaign_opened").empty());
+
+        auto nul = h.mcp_call_tool("open_access_review", {{"title", with_nul}});
+        const auto nul_err = mcp_error_of(nul);
+        CHECK(nul_err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
+        CHECK(nul_err.value("message", std::string{}) == nul_msg);
+        CHECK(audit_rows(h, "access_review.campaign_opened").empty());
+
+        auto wide_over = h.mcp_call_tool("open_access_review", {{"title", two_byte_over}});
+        CHECK(mcp_error_of(wide_over).value("code", 0) == yuzu::server::mcp::kInvalidParams);
+        auto wide_fit = h.mcp_call_tool("open_access_review", {{"title", two_byte_fit}});
+        REQUIRE(wide_fit);
+        CHECK_FALSE(nlohmann::json::parse(wide_fit->body, nullptr, false).contains("error"));
 
         auto ok = h.mcp_call_tool("open_access_review", {{"title", at_cap}});
         REQUIRE(ok);
@@ -3205,6 +3259,14 @@ TEST_CASE("access review store errors: every string the store returns maps to on
     CHECK_FALSE(yuzu::server::decision_cap_wire_message(cap_err + " "));
     CHECK_FALSE(yuzu::server::decision_cap_wire_message("bad_request: reviewer cannot be empty"));
     CHECK_FALSE(yuzu::server::decision_cap_wire_message(""));
+
+    // The title refusals the store returns as a backstop are the caller's: 400 / invalid params.
+    for (const auto* msg :
+         {&yuzu::server::kCampaignTitleTooLongMessage, &yuzu::server::kCampaignTitleNulMessage}) {
+        const auto cls = sod::classify_store_error("bad_request: " + std::string(*msg));
+        CHECK(sod::store_error_http_status(cls) == 400);
+        CHECK(sod::store_error_jsonrpc_code(cls) == kInvalidParams);
+    }
 }
 
 // ── Decision history on the read surfaces (#4752) ───────────────────────────
@@ -3743,7 +3805,26 @@ TEST_CASE("attestation limits: the MCP input schema and description and the Open
     }
     CHECK(found);
 
+    // The campaign title cap is spelled in the open tool's schema and the open route's OpenAPI.
+    const std::string title_max = std::to_string(yuzu::server::kCampaignTitleMaxLen);
+    bool found_open = false;
+    for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
+        if (t["name"] != "open_access_review")
+            continue;
+        found_open = true;
+        CHECK(t["inputSchema"]["properties"]["title"]["maxLength"] ==
+              yuzu::server::kCampaignTitleMaxLen);
+    }
+    CHECK(found_open);
+    CHECK(std::string(yuzu::server::kCampaignTitleTooLongMessage).find(title_max) !=
+          std::string::npos);
+
     const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& open_post = spec["paths"]["/access-reviews"]["post"];
+    CHECK(open_post["requestBody"]["content"]["application/json"]["schema"]["properties"]["title"]
+                   ["maxLength"] == yuzu::server::kCampaignTitleMaxLen);
+    CHECK(open_post["responses"]["400"]["description"].get<std::string>().find(title_max) !=
+          std::string::npos);
     const auto& post = spec["paths"]["/access-reviews/{id}/attestations"]["post"];
     const auto& body = post["requestBody"]["content"]["application/json"]["schema"]["properties"];
     CHECK(body["principal_id"]["maxLength"] == yuzu::server::kPrincipalIdMaxLen);

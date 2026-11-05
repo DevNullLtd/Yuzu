@@ -308,6 +308,12 @@ inline constexpr std::string_view kCampaignTitleTooLongMessage = "title must be 
 static_assert(kCampaignTitleMaxLen == 256,
               "kCampaignTitleTooLongMessage spells out 256: update the text with the constant");
 
+/// The refusal text REST (400) and MCP (invalid-params) return for a title holding a NUL byte, so
+/// the handlers refuse it before the grant population is read and the store's backstop (the same
+/// text with `bad_request: ` in front) cannot drift from them. `pg/pg_exec.hpp` binds `c_str()`,
+/// so a NUL would truncate the stored title.
+inline constexpr std::string_view kCampaignTitleNulMessage = "title contains a NUL byte";
+
 /// The refusal text REST (400) and MCP (invalid-params) return for a PRESENT `justification` that
 /// is not a JSON string. Absent and JSON null both mean "no justification"; any other type used to
 /// be read as the empty string, so the decision was recorded without the note the reviewer sent

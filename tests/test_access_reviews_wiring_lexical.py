@@ -252,6 +252,10 @@ def settings_error_problems(src):
     body = t[at:t.find("function arLoadCampaign(", at)]
     if "e.message" not in body or "data.error ||" in body:
         return ["settings_routes.cpp: arPost does not read error.message (a refusal would show [object Object])"]
+    at = t.find("function arOpenCampaign(")
+    open_body = t[at:t.find("function arAttest(", at)] if at >= 0 else ""
+    if "data.data" not in open_body:
+        return ["settings_routes.cpp: arOpenCampaign does not read the campaign id from the A4 envelope (data.data.campaign_id)"]
     return []
 
 
@@ -265,6 +269,13 @@ class SettingsErrorMessage(unittest.TestCase):
     def test_pattern_is_live(self):
         text = SETTINGS_CPP.read_text(encoding="utf-8")
         self.assertTrue(settings_error_problems(text.replace("e.message", "e.msg")))
+        # Restoring `data.error ||` while keeping e.message is caught on its own.
+        self.assertTrue(settings_error_problems(
+            text.replace("var e = data && data.error;", "var e = data && data.error; var m = data.error || 1;")))
+        # Reading the campaign id from the unwrapped body is caught.
+        self.assertTrue(settings_error_problems(text.replace("data && data.data", "data")
+                                                .replace("var d = data;", "var d = data;")
+                                                .replace("data.data", "data.x")))
         self.assertTrue(settings_error_problems(text.replace("var e = data && data.error;",
                                                              "var e = data.error || data.message;")
                                                 .replace("e.message", "x")))

@@ -265,6 +265,11 @@ TEST_CASE("open_campaign bounds the title: the cap is accepted, one byte over is
     CHECK(over.error() ==
           "bad_request: " + std::string(yuzu::server::kCampaignTitleTooLongMessage));
 
+    // The NUL refusal the handlers now make first is the same text as the store's backstop.
+    auto nul = store.open_campaign(std::string("a\0b", 3), "admin", {}, "enabled");
+    REQUIRE_FALSE(nul.has_value());
+    CHECK(nul.error() == "bad_request: " + std::string(yuzu::server::kCampaignTitleNulMessage));
+
     // Only the campaign at the cap exists.
     auto list = store.list_campaigns();
     REQUIRE(list.has_value());

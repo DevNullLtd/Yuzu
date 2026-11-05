@@ -335,7 +335,8 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
     // the campaign recorded would not carry the title or creator named. Refuse before the pool is
     // touched.
     if (title.find('\0') != std::string::npos)
-        return std::unexpected("bad_request: title contains a NUL byte");
+        return std::unexpected(
+            "bad_request: title contains a NUL byte"); // kCampaignTitleNulMessage
     // The handlers refuse an over-long title first; this is the backstop for a caller that skips
     // them. The same text, so the transports and the store cannot drift.
     if (title.size() > kCampaignTitleMaxLen)
