@@ -5104,6 +5104,12 @@ struct LiveRun {
                 std::fputs(std::format("[#7135] {}\n", detail).c_str(), stderr);
                 FAIL(detail);
             }
+        } else if (await_event) {
+            // The ETW attribution wait is skipped when the session is not running (a host that
+            // cannot start one, or one that died since start). Say so in the job-log tail, or a
+            // later assertion fails with no state text (#7135).
+            std::fputs("[#7135] ETW session not running at write time; ETW attribution wait skipped\n",
+                       stderr);
         }
         tick(t.db, *src);
         g_clock_offset = kEtwSettle100ns + SEC;

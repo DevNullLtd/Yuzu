@@ -1482,14 +1482,18 @@ waits is 95 minutes plus that step's own run time, still under that job's
 480 s (was 240 s; shards A and B keep 240 s) and a hung echo entry up to 180 s (was
 90 s). Where `flake-retry.py` can start its enumeration re-run of the failed suite,
 an entry that hangs again on the re-run costs its limit twice before the job fails
-(nothing is masked): about 24 minutes for shard C on macOS, where the first run
-uses `--timeout-multiplier 2` (960 s) and the re-run does not. On Windows the
-re-run did not run in the one TIMEOUT log read for this (run 41919798385 attempt 4,
-shard C and echo): the verdict `not a classifiable Catch2 run` arrived 0.4 s after
-the TIMEOUT line, which fits the open #6316 (flake-retry spawns the DLL-linked test
-binary without meson's `extra_paths`), so a hung entry there costs its limit once:
-about 8 minutes for shard C, 3 for echo. That is one observation, not a guarantee;
-fixing #6316 would make it twice (16 minutes). The sanitizer and coverage legs call
+(nothing is masked): about 16 minutes for shard C on Linux (480 s twice), and about
+24 on macOS, where the first run uses `--timeout-multiplier 2` (960 s) and the re-run
+does not. On Windows the re-run has not produced a classification in any of the four
+logs read for this: in the one TIMEOUT log (run 41919798385 attempt 4) shard C's
+verdict `not a classifiable Catch2 run` arrived 0.4 s after its TIMEOUT line (echo's
+TIMEOUT line was two minutes earlier, and both verdicts print at the end of the
+run), and three runs with a plain echo exit-42 failure (42040619981, 42049202343,
+42056811785) gave the same verdict. That fits the open #6316 (flake-retry spawns the
+DLL-linked test binary without meson's `extra_paths`), so a hung entry on Windows
+costs its limit once: about 8 minutes for shard C, 3 for echo. It is an inference
+from those logs, not a guarantee; fixing #6316 would make it twice (16 minutes for
+shard C). The sanitizer and coverage legs call
 `meson test --timeout-multiplier 2` directly, with no re-run, so a hung shard C
 there costs 16 minutes. The 95 minutes above leaves 25 minutes inside
 `timeout-minutes: 120` for checkout, build and that step's own run time, so several
@@ -1959,12 +1963,14 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
   that matter: agent shard C 480 s (shards A and B 240 s), `blocked log sink
   SIGTERM harness` 300 s, echo 180 s, `gateway eunit` and `gateway ct` 600 s. (Shard
-  C and echo were 240 s and 90 s until #7135, a deliberate, temporary raise: see the
-  sizing comments in `tests/meson.build`, and #7177 for the split that brings C back
-  down. Every "of 240 s" sample below and the 192 s and 72 s 80% thresholds in the
-  decision rule are against those old values; the current 80% marks are 384 s for
-  shard C and 144 s for echo, so while the raise stands neither warns as early as it
-  did.)
+  C was 240 s until #7135, a deliberate, temporary raise: see the sizing comment in
+  `tests/meson.build`, and #7177 for the split that brings C back down. Echo was 90 s
+  and is now 180 s, which keeps its measured passing runs under 50% of the limit.
+  Every "of 240 s" sample below for shard C, every "of 90 s" sample for echo, and the
+  192 s and 72 s 80% thresholds for them in the decision rule are against those old
+  values; the current marks are 384 s for shard C and 144 s for echo, so while the
+  raise stands neither warns as early as it did. Shards A and B are unchanged at
+  240 s and a 192 s mark.)
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
   carry these entries (the junit import runs once at job end and reads the last
@@ -1981,8 +1987,8 @@ applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
-240 s for the harness, 192 s for an agent shard, 72 s for echo, the last two at
-the pre-#7135 timeouts and, for shard C and echo, 384 s and 144 s now); and the entry
+240 s for the harness, 192 s for agent shards A and B, 192 s for shard C before #7135
+and 384 s now, 72 s for echo before #7135 and 144 s now); and the entry
 count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
 guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green

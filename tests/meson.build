@@ -1432,15 +1432,16 @@ echo_test_exe = executable(
 )
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
-# 180s (#7135; was 90s), the same DELIBERATE, TEMPORARY exception shape as the agent shards above
-# (docs/testing/unit-test-conventions.md; docs/ci-architecture.md): the suite is not being split,
-# so this one is justified by the budget rule instead. It took 51.04s on a Windows CI runner when
+# 180s (#7135; was 90s). Unlike agent shard C above this is not an exception to the budget rule in
+# docs/testing/unit-test-conventions.md: no split is planned, and at 180s the measured passing runs
+# sit under the rule's 50% line. It took 51.04s on a Windows CI runner when
 # it passed (run 41919798385 attempt 5, 28% of 180s) and 82s on a standalone Windows host (#7135
 # comment, 46%), and it timed out at 90.09s on a loaded runner (attempt 4, job 126911227871) in
 # the same job where agent shard C also timed out; both passed on the rerun, so that was load,
 # not a hang. A timeout is a floor, not a measurement: the limit is 2x that floor, and the
 # deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
-# live-registry case adds its own 15s waits on top. Revisit once #7173/#7135 settle.
+# live-registry case adds its own 15s waits on top. Revisit the value once #7173/#7135 settle; there
+# is no commitment to lower it, because the 50% rule is met at 180s.
 test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
