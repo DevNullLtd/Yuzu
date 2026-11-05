@@ -163,7 +163,13 @@ a distro Python that is externally managed, and a bare `pipx install gcovr==X` w
 unpinned.) It passes when the `gcovr` your `PATH` resolves to (the lookup `coverage-gate.sh` itself does)
 reports the version `requirements-ci.in` pins and can produce the reports the gate asks for: a gcovr you
 already have at that version is used as it is (its integrity is then yours, not verified here), and only a
-missing, different or non-working one is replaced. It needs python3 3.10+ with `ensurepip` to install, and
+missing, different or non-working one is replaced. A `~/.local/bin/gcovr` that is a regular file, or a link
+that does not point into this virtualenv, is never overwritten: the script refuses and prints the `rm`
+command to run yourself. It moves or deletes a directory (the virtualenv, a moved-aside copy of it) only when
+it can show the directory is its own: a marker with the script's token and a virtualenv layout, never a file
+name alone; `YUZU_GCOVR_VENV` must be an absolute path with no `.` or `..` segment. If a rebuild fails
+(pip, a timeout, Ctrl-C) the previous virtualenv is put back, and the last line of the log is the cause. It
+needs python3 3.10+ with `ensurepip` to install, and
 `~/.local/bin` on `PATH` (`export PATH="$HOME/.local/bin:$PATH"`): on a fresh account the directory may not
 exist at login, so the first run can install the tool and still report it is not on `PATH` until you
 re-login or add it. It does nothing off Linux, where the coverage gate does not measure.
