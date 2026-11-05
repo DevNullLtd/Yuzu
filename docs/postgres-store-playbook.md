@@ -553,6 +553,23 @@ rolls back and the server refuses to start; retry when writers are quiescent, or
 hand with `CREATE INDEX CONCURRENTLY` (`IF NOT EXISTS` makes the re-boot safe). It ends with the
 contract. ADR-0039's "Update (2026-11-02) — migration v4" section records the index.
 
+A sixth entry: `SoftwareInventoryStore` v10 (`installed_software_instance_idx`, a partial
+unique index on `(agent_id, instance_key) WHERE instance_key <> ''`, and
+`installed_software_purl_idx`, a partial btree on `(purl) WHERE purl <> ''`) builds two plain
+transactional indexes, each holding `ACCESS EXCLUSIVE` on `installed_software` (the table already
+holds rows on a carried-forward database) for the whole migration transaction. Its basis is the
+2026-10-24 fresh-database hard-cutover ruling recorded in `docs/user-manual/upgrading.md`
+"Deployment contract (hard cutover)": the table is empty when v10 runs, so the build returns at
+once. It is not the v7 entry's basis (v7 rests on the no-rolling-upgrade decision, and its own
+text says a later build on a large table must be online). What the entry records is that the
+contract is procedural (the executable does not verify it): on a populated table the two builds
+would hold the lock through two heap scans (measured in the ladder row, about 0.15 s with no keys
+set and up to about 3.5 s with every row keyed, at 1.8M rows), the migration's
+`SET LOCAL statement_timeout = 0` keeps the pool's statement timeout from rolling it back, and the
+pool's 10 s `lock_timeout` bounds only the wait for the lock, so a migration queued behind a long
+reader rolls back and the server refuses to start. It ends with the contract. It does not change
+the rule for new work.
+
 ## Substrate quick facts (pool / runner / helpers)
 
 Design facts every store author inherits (previously recorded only in CLAUDE.md and the
