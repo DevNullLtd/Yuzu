@@ -30,6 +30,7 @@
 #include "leader_elector.hpp"
 #include "leader_metrics.hpp"
 #include "pg/secret_codec.hpp"
+#include "ca_store.hpp"
 #include "pg_reachability_probe.hpp"
 #include "plugin_config_store.hpp"
 #include "principal_class.hpp"
@@ -108,6 +109,7 @@ struct Harness {
     const std::atomic<std::uint64_t>* leader_loop_errors{nullptr}; // HA WS-11
     NvdDatabase* nvd_db{nullptr}; // null unless a case wires one
     EnablementStore* enablement_store{nullptr}; // null unless a case wires one
+    CaStore* ca_store{nullptr}; // #6527: null unless a case wires one
 
     bool session_present{true};
     std::string session_username{"alice"};
@@ -209,6 +211,7 @@ struct Harness {
         deps.server_start_time = std::chrono::steady_clock::now();
         deps.nvd_db = nvd_db;
         deps.enablement_store = enablement_store;
+        deps.ca_store = ca_store;
         deps.plaintext_probe_sink =
             plain_override ? plain_override : (plain_wired ? &plain_sink : nullptr);
         deps.main_listener_serving_fn = [this] { return main_serving.load(); };
@@ -335,6 +338,188 @@ TEST_CASE("health_routes: GET /metrics with a null mgmt_group_store/nvd_db "
     auto r = h.sink.Get("/metrics");
     REQUIRE(r);
     CHECK(r->status == 200);
+}
+
+// ── /metrics — CRL freshness gauges (#6527) ─────────────────────────────────
+
+namespace {
+PgReachabilityProbe::PingFn fixed_ping(PgReachabilityProbe::PingResult::Kind k);
+yuzu::test::PgTestTemplate health_ca_tpl{"health_ca_store", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    CaStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("health ca template: ca_store did not migrate");
+}};
+
+// The value of one unlabelled series in a Prometheus text body, or nullopt when absent.
+std::optional<double> series_value(const std::string& body, const std::string& name) {
+    const std::string needle = "\n" + name + " ";
+    const auto at = ("\n" + body).find(needle);
+    if (at == std::string::npos)
+        return std::nullopt;
+    return std::stod(("\n" + body).substr(at + needle.size()));
+}
+} // namespace
+
+TEST_CASE("health_routes: /metrics publishes the latest CRL's nextUpdate and publish time "
+          "(#6527) and is absent until one exists",
+          "[server][pg][routes][health_routes][crl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    Harness h;
+    h.ca_store = &store;
+    h.wire();
+    const std::string next = "yuzu_server_ca_crl_next_update_timestamp_seconds";
+    const std::string pub = "yuzu_server_ca_crl_published_timestamp_seconds";
+
+    // No CRL yet: neither series exists (a 0 would read as a CRL that expired in 1970).
+    auto none = h.sink.Get("/metrics");
+    REQUIRE(none);
+    CHECK_FALSE(series_value(none->body, next));
+    CHECK_FALSE(series_value(none->body, pub));
+
+    CrlVersionRecord v1;
+    v1.version = 1;
+    v1.der = {0x30, 0x00};
+    v1.this_update = 1'800'000'000;
+    v1.next_update = 1'800'172'800;
+    v1.published_at = 1'800'000'100;
+    REQUIRE(store.record_crl_for_test(v1));
+    CrlVersionRecord v2 = v1;
+    v2.version = 2;
+    v2.next_update = 1'800'259'200;
+    v2.published_at = 1'800'086'500;
+    REQUIRE(store.record_crl_for_test(v2));
+
+    // The highest version wins, and the exact epoch seconds are exported.
+    auto got = h.sink.Get("/metrics");
+    REQUIRE(got);
+    REQUIRE(series_value(got->body, next));
+    CHECK(*series_value(got->body, next) == 1'800'259'200.0);
+    REQUIRE(series_value(got->body, pub));
+    CHECK(*series_value(got->body, pub) == 1'800'086'500.0);
+}
+
+TEST_CASE("health_routes: /metrics keeps the last CRL value when the freshness read fails on a "
+          "lease timeout or a query error (#6527)",
+          "[server][pg][routes][health_routes][crl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    CrlVersionRecord v;
+    v.version = 1;
+    v.der = {0x30, 0x00};
+    v.this_update = 1'800'000'000;
+    v.next_update = 1'800'172'800;
+    v.published_at = 1'800'000'100;
+    REQUIRE(store.record_crl_for_test(v));
+
+    Harness h;
+    h.ca_store = &store;
+    h.wire();
+    const std::string next = "yuzu_server_ca_crl_next_update_timestamp_seconds";
+    const std::string pub = "yuzu_server_ca_crl_published_timestamp_seconds";
+    const auto expect_kept = [&](const char* what) {
+        auto r = h.sink.Get("/metrics");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        INFO(what);
+        REQUIRE(series_value(r->body, next));
+        CHECK(*series_value(r->body, next) == 1'800'172'800.0);
+        REQUIRE(series_value(r->body, pub));
+        CHECK(*series_value(r->body, pub) == 1'800'000'100.0);
+    };
+    expect_kept("first scrape sets the series");
+
+    // A newer CRL row now exists, so a read that SUCCEEDED during the failing legs below would
+    // visibly change the series; the checks therefore prove the read failed AND the value stayed.
+    CrlVersionRecord newer = v;
+    newer.version = 2;
+    newer.next_update = 1'800'345'600;
+    newer.published_at = 1'800'172'900;
+    REQUIRE(store.record_crl_for_test(newer));
+
+    {
+        auto held = pool.acquire(); // the only connection: the next read times out on the lease
+        REQUIRE(held);
+        expect_kept("lease timeout leaves the last value, never 0");
+    }
+
+    yuzu::server::pg::PgConn admin{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::PgResult{
+                PQexec(admin.get(), "ALTER TABLE ca_store.ca_crl_versions RENAME COLUMN "
+                                    "next_update TO next_update_x")}
+                .ok());
+    expect_kept("query error leaves the last value, never 0");
+    REQUIRE(yuzu::server::pg::PgResult{
+                PQexec(admin.get(), "ALTER TABLE ca_store.ca_crl_versions RENAME COLUMN "
+                                    "next_update_x TO next_update")}
+                .ok());
+    // Reads work again, so the series catches up to the newer row on the next scrape.
+    auto caught_up = h.sink.Get("/metrics");
+    REQUIRE(caught_up);
+    REQUIRE(series_value(caught_up->body, next));
+    CHECK(*series_value(caught_up->body, next) == 1'800'345'600.0);
+    REQUIRE(series_value(caught_up->body, pub));
+    CHECK(*series_value(caught_up->body, pub) == 1'800'172'900.0);
+}
+
+TEST_CASE("health_routes: /metrics skips the CRL freshness read while the Postgres probe says "
+          "down and reads once it is Ready (#6527)",
+          "[server][pg][routes][health_routes][crl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    CrlVersionRecord v;
+    v.version = 1;
+    v.der = {0x30, 0x00};
+    v.this_update = 1'800'000'000;
+    v.next_update = 1'800'172'800;
+    v.published_at = 1'800'000'100;
+    REQUIRE(store.record_crl_for_test(v));
+    const std::string next = "yuzu_server_ca_crl_next_update_timestamp_seconds";
+
+    // A probe that has never been Ready: the read is skipped, so the series stays absent even
+    // though a CRL row exists. The skip is the only thing that can make that so.
+    PgReachabilityProbe down(fixed_ping(PgReachabilityProbe::PingResult::Kind::Failed));
+    down.probe_once();
+    Harness gated;
+    gated.ca_store = &store;
+    gated.pg_probe = &down;
+    gated.wire();
+    auto skipped = gated.sink.Get("/metrics");
+    REQUIRE(skipped);
+    CHECK_FALSE(series_value(skipped->body, next));
+
+    PgReachabilityProbe up(fixed_ping(PgReachabilityProbe::PingResult::Kind::Ok));
+    up.probe_once();
+    Harness ready;
+    ready.ca_store = &store;
+    ready.pg_probe = &up;
+    ready.wire();
+    auto read = ready.sink.Get("/metrics");
+    REQUIRE(read);
+    REQUIRE(series_value(read->body, next));
+    CHECK(*series_value(read->body, next) == 1'800'172'800.0);
+}
+
+TEST_CASE("health_routes: /metrics without a ca_store wired emits no CRL freshness series",
+          "[server][routes][health_routes][crl]") {
+    Harness h;
+    h.wire();
+    auto r = h.sink.Get("/metrics");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("yuzu_server_ca_crl_next_update_timestamp_seconds") == std::string::npos);
 }
 
 // ── /livez — trivial, no gate, no deps ──────────────────────────────────────
@@ -1172,8 +1357,9 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "the general limiter site uses the shared 429 writer");
     // The sink the probes register on must exist before register_health_routes is handed it:
     // deleting the construction leaves a null sink, which silently registers nothing.
-    expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_)", 1,
-           "the redirect listener's route sink is built");
+    expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_, "
+           "StageRequirement::ExemptNoStage)", 1,
+           "the redirect listener's route sink is built, and opts out of the post-read stage");
     {
         const auto built =
             flat.find(squeeze("redirect_sink_ = std::make_unique<HttplibRouteSink>("));
@@ -2200,7 +2386,7 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
             std::lock_guard<std::mutex> lk(seen_mu);
             seen.emplace_back(req.method, res.status);
         });
-    HttplibRouteSink plain{srv};
+    HttplibRouteSink plain{srv, StageRequirement::ExemptNoStage};
 
     Harness h;
     h.plain_override = &plain;

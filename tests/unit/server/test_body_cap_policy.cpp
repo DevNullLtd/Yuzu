@@ -19,6 +19,7 @@
  */
 
 #include "body_cap_policy.hpp"
+#include "post_read_stage_test_support.hpp"
 #include "test_loopback_http.hpp"
 #include "web_utils.hpp"
 
@@ -32,10 +33,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #if defined(__has_feature)
 #  if __has_feature(thread_sanitizer)
@@ -517,6 +520,8 @@ constexpr std::uint64_t kUnifiedTestCap = 4u * 1024 * 1024; // matches the real 
 
 struct UnifiedBodyCapTestServer {
     httplib::Server svr;
+    // Declared right after `svr` so it is destroyed first; see post_read_stage_test_support.hpp.
+    std::optional<yuzu::test::PostReadStageScope> stage_scope;
     std::thread server_thread;
     int port{0};
     std::atomic<int> handler_calls{0};
@@ -528,7 +533,7 @@ struct UnifiedBodyCapTestServer {
     // (later) stage.
     std::atomic<int> pre_routing_rejections{0};
     // body-cap-post-read-stage (#2898-aware): counts every invocation of the
-    // fixture's `set_pre_request_handler` below, admitted or refused. Used
+    // fixture's post-read stage below, admitted or refused. Used
     // to prove ORDERING against the pre-routing stage — a request the
     // pre-routing handler already refused never reaches `dispatch_request`
     // at all (httplib's routing() returns as soon as pre-routing answers
@@ -548,17 +553,43 @@ struct UnifiedBodyCapTestServer {
             handler_calls.fetch_add(1);
             res.set_content(R"({"ok":true})", "application/json");
         };
-        svr.Get("/api/v1/devices", ok_handler);
-        svr.Post("/api/v1/devices", ok_handler);
-        svr.Get("/health", ok_handler);
-        svr.Post("/health", ok_handler);
-        svr.Post("/mcp/v1/", ok_handler);
+        // body-cap-post-read-stage — GENUINELY WIRED into this fixture the
+        // same way server.cpp wires it (issue #2898: earlier versions of
+        // this fixture only reproduced the pre-routing decision with pure
+        // functions, which meant a test against the fixture could never
+        // observe a defect in server.cpp's real stage wiring): installed in
+        // `PostReadStageRegistry` BEFORE any route, with the routes below
+        // registered through an `HttplibRouteSink` that wraps each handler.
+        // Real httplib::Server here means `req.body` is genuinely populated
+        // by httplib's own `read_content` before this fires — including for
+        // a real chunked-Transfer-Encoding request the pre-routing handler
+        // admitted unmeasured, which is the whole point of this
+        // stage.
+        stage_scope.emplace(
+            svr, [this](const httplib::Request& req,
+                        httplib::Response& res) -> httplib::Server::HandlerResponse {
+                post_read_calls.fetch_add(1);
+                const auto cap_match = resolve_body_cap(req.method, req.path);
+                if (req.body.size() <= cap_match.max_body_bytes) {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+                post_read_rejections.fetch_add(1);
+                res.status = 413;
+                return httplib::Server::HandlerResponse::Handled;
+            });
+        yuzu::server::HttplibRouteSink sink{svr};
+
+        sink.Get("/api/v1/devices", ok_handler);
+        sink.Post("/api/v1/devices", ok_handler);
+        sink.Get("/health", ok_handler);
+        sink.Post("/health", ok_handler);
+        sink.Post("/mcp/v1/", ok_handler);
         // A small-cap (256 KiB), requires_measurable=false class — used by
         // the post-read-stage tests below so a genuine chunked over-cap body
         // stays cheap to send in a test.
-        svr.Post("/api/v1/ca/import-chain", ok_handler);
-        svr.Post("/api/v1/inventory/software/normalization/aliases", ok_handler);
-        svr.Post("/api/v1/inventory/software/normalization/pack", ok_handler);
+        sink.Post("/api/v1/ca/import-chain", ok_handler);
+        sink.Post("/api/v1/inventory/software/normalization/aliases", ok_handler);
+        sink.Post("/api/v1/inventory/software/normalization/pack", ok_handler);
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
@@ -603,28 +634,6 @@ struct UnifiedBodyCapTestServer {
             // other admitted path. What matters is that it only gets here
             // AFTER the cap check above ran unconditionally (D3).
             return httplib::Server::HandlerResponse::Unhandled;
-        });
-
-        // body-cap-post-read-stage — GENUINELY WIRED into this fixture the
-        // same way server.cpp wires it (issue #2898: earlier versions of
-        // this fixture only reproduced the pre-routing decision with pure
-        // functions, which meant a test against the fixture could never
-        // observe a defect in server.cpp's real `set_pre_request_handler`).
-        // Real httplib::Server here means `req.body` is genuinely populated
-        // by httplib's own `read_content` before this fires — including for
-        // a real chunked-Transfer-Encoding request the pre-routing handler
-        // above admitted unmeasured, which is the whole point of this
-        // stage.
-        svr.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res)
-                                        -> httplib::Server::HandlerResponse {
-            post_read_calls.fetch_add(1);
-            const auto cap_match = resolve_body_cap(req.method, req.path);
-            if (req.body.size() <= cap_match.max_body_bytes) {
-                return httplib::Server::HandlerResponse::Unhandled;
-            }
-            post_read_rejections.fetch_add(1);
-            res.status = 413;
-            return httplib::Server::HandlerResponse::Handled;
         });
 
         port = svr.bind_to_any_port("127.0.0.1");
@@ -1110,13 +1119,13 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
 // ── 9. Post-read body cap, second stage (body-cap-post-read-stage) ────────
 //
 // GENUINELY WIRED into `UnifiedBodyCapTestServer` (see that fixture's
-// `set_pre_request_handler` above) — issue #2898 is the reason this needed
+// post-read stage above) — issue #2898 is the reason this needed
 // calling out explicitly: earlier body-cap fixtures in this file only
 // reproduced production's DECISION with the same pure functions
 // (`resolve_body_cap` etc.), never httplib's actual middleware wiring for
 // this stage, so a test written only against a fixture like that could not
 // have told a real server.cpp defect from a fixture defect. These cases
-// exercise the real httplib `pre_request_handler_` call site end-to-end —
+// exercise the real stage wiring (registry plus route-sink wrapper) end-to-end —
 // same reasoning as section 8 above for the pre-routing stage.
 #ifndef _WIN32
 TEST_CASE("Post-read body cap: a genuine chunked body over a class's cap is rejected "

@@ -661,6 +661,101 @@ TEST_CASE("CaStore: issuer_fingerprint provenance round-trips (issued + CRL)",
     CHECK(latest->issuer_fingerprint == "AA:BB:CC:DD");
 }
 
+TEST_CASE("CaStore: latest_crl_freshness tells none-published from a read failure and reads the "
+          "highest version without its DER (#6527)",
+          "[ca_store][pg][crl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+
+    auto none = store.latest_crl_freshness();
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->has_value());
+
+    CrlVersionRecord a;
+    a.version = 1;
+    a.der = {0x30, 0x00};
+    a.this_update = 1000;
+    a.next_update = 2000;
+    a.published_at = 1100;
+    REQUIRE(store.record_crl_for_test(a));
+    CrlVersionRecord b = a;
+    b.version = 2;
+    b.next_update = 3000;
+    b.published_at = 2100;
+    REQUIRE(store.record_crl_for_test(b));
+
+    auto got = store.latest_crl_freshness();
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((*got)->version == 2);
+    CHECK((*got)->next_update == 3000);
+    CHECK((*got)->published_at == 2100);
+}
+
+TEST_CASE("CaStore: latest_crl_freshness reports a lease timeout and a query error as errors "
+          "and the pool stays usable (#6527)",
+          "[ca_store][pg][crl][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    CrlVersionRecord a;
+    a.version = 1;
+    a.der = {0x30, 0x00};
+    a.this_update = 1000;
+    a.next_update = 2000;
+    a.published_at = 1100;
+    REQUIRE(store.record_crl_for_test(a));
+    {
+        auto held = pool.acquire(); // the only connection
+        REQUIRE(held);
+        auto r = store.latest_crl_freshness();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().rfind(kCaDbErrorPrefix, 0) == 0);
+        CHECK(r.error().find("unavailable") != std::string::npos);
+    }
+    PgConn admin{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(admin.get(), "ALTER TABLE ca_store.ca_crl_versions RENAME COLUMN "
+                                         "published_at TO published_at_x")}
+                .ok());
+    auto bad = store.latest_crl_freshness();
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().find("latest_crl_freshness failed") != std::string::npos);
+    REQUIRE(PgResult{PQexec(admin.get(), "ALTER TABLE ca_store.ca_crl_versions RENAME COLUMN "
+                                         "published_at_x TO published_at")}
+                .ok());
+    auto ok = store.latest_crl_freshness();
+    REQUIRE(ok.has_value());
+    REQUIRE(ok->has_value());
+    CHECK((*ok)->next_update == 2000);
+
+    // A NULL in either column (constraint dropped, bad restore) is an error, never a 0.
+    REQUIRE(PgResult{PQexec(admin.get(), "ALTER TABLE ca_store.ca_crl_versions ALTER COLUMN "
+                                         "next_update DROP NOT NULL")}
+                .ok());
+    REQUIRE(PgResult{PQexec(admin.get(), "INSERT INTO ca_store.ca_crl_versions "
+                                         "(version, der, this_update, next_update, published_at) "
+                                         "VALUES (2, '\\x3000', 1500, NULL, 1600)")}
+                .ok());
+    auto nulled = store.latest_crl_freshness();
+    REQUIRE_FALSE(nulled.has_value());
+    CHECK(nulled.error().find("NULL") != std::string::npos);
+}
+
+TEST_CASE("CaStore: latest_crl_freshness on a store that never opened is an error, not "
+          "'nothing published' (#6527)",
+          "[ca_store][crl][negative]") {
+    // An unreachable pool never migrates, so open_ stays false. Needs no Postgres.
+    PgPool closed_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+    CaStore closed{closed_pool};
+    REQUIRE_FALSE(closed.is_open());
+    auto failed = closed.latest_crl_freshness();
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(failed.error().find("not open") != std::string::npos);
+}
+
 TEST_CASE("CaStore: issuer_key_id round-trips and list_issued_by_key_id filters (#1296)",
           "[ca_store][pg][provenance][pki]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);

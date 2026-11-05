@@ -13,11 +13,19 @@
   `attempted` and then a `failure` row. Every console send that reaches no agent now writes a
   `command.dispatch` `failure` row (`reason=no_agents_reached`), where before only an
   expression-targeted send did, and a group whose creation fails writes `failure`
-  (`create_failed`). Every other audit row these four routes write (refusals, scope narrowing,
-  outcomes) and the Echo SQL and status-scan sends keep the request's own answer but now mark the
-  response `Sec-Audit-Failed: true` when the row does not persist, instead of answering exactly as
-  if it had been recorded. Expect one extra audit row per console send, group creation, Echo
-  re-enable and Echo purge. Not covered, among others: `POST /api/command`, MCP
+  (`create_failed`). Each of the four decides its own permission again after its `attempted` row
+  and acts on nothing, writing `failure` (`permission_revoked`), when the grant was withdrawn
+  meanwhile; Create Group also re-checks the session and visibility (`session_revoked`,
+  `scope_revoked`). Every other audit row these four routes write themselves (refusals, scope
+  narrowing, outcomes) and the Echo SQL and status-scan sends keep the request's own answer but
+  now mark the response `Sec-Audit-Failed: true` when the row does not persist, instead of
+  answering exactly as if it had been recorded. The permission-denial row
+  (`auth.permission_required`) is written by the shared permission gate, not these routes, and a
+  lost one still answers a plain `403`
+  (tracked in #7096). Expect an `attempted` row ahead of the outcome row of every console send
+  that was not expression-targeted (those already wrote one), every group creation, and every Echo
+  re-enable and purge. Not covered, among others: `POST /api/command`, MCP
   `execute_instruction`, the legacy command forwarder, management-group creation through REST, MCP
   and Settings, and the Echo **Capture sources** push still audit after acting (tracked in #7073,
-  #7074 and #7075). See [Upgrading](docs/user-manual/upgrading.md).
+  #7074 and #7075), and the REST twins that audit first do not yet re-check the permission after
+  their audit row (#7110). See [Upgrading](docs/user-manual/upgrading.md).

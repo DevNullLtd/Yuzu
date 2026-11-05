@@ -980,6 +980,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                    "ManagementGroup", "", "session_revoked");
                      return;
                  }
+                 // The flat ManagementGroup:Write admission above ran before the wait too, so it
+                 // is decided again for the re-authenticated session: a grant revoked during the
+                 // wait creates nothing (#3619 review). The gate writes its own 403.
+                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "permission_revoked name=" + group_name);
+                     return;
+                 }
                  agent_scope = resolve_visible_scope(*fresh_session);
                  if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
                      audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
@@ -1005,7 +1013,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  mg.description = "Created from filtered results (command " +
                                   command_id + ")";
                  mg.membership_type = "static";
-                 mg.created_by = session->username;
+                 mg.created_by = fresh_session->username;
                  auto group_result = mgmt_group_store_->create_group(mg);
                  if (!group_result) {
                      // The attempted row above is stored, so it gets an outcome (#3619). It
@@ -1590,6 +1598,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              "be stored, so nothing was sent. Retry once the audit store "
                              "recovers.</span>"))
                          return;
+                 }
+                 // The Execution:Execute admission above ran before the wait too. With RBAC off
+                 // the dispatch seam admits every human principal, so a JIT elevation that
+                 // lapsed during the wait is caught only here (#3619 review). The gate writes
+                 // its own refusal.
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     audit_or_flag(req, res, "command.dispatch", "failure", "command", "",
+                                   "reason=permission_revoked " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
+                     return;
                  }
                  // UP-5 (#3619): the attempted row can wait on the audit pool, so the caller's
                  // authority is resolved again here and the dispatch confines to what the
@@ -2388,6 +2407,19 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                      return;
                  }
+                 // Execution:Execute was admitted before the wait; decide it again so a grant
+                 // withdrawn during the wait dispatches nothing (#3619 review). The gate writes
+                 // its own refusal; counted as the RBAC refusal it is.
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
+                                   std::format("permission_revoked device={} source={}", device_id,
+                                               source));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_reenable_total",
+                                           {{"result", "denied"}}).increment();
+                     }
+                     return;
+                 }
 
                  std::unordered_map<std::string, std::string> params;
                  params[std::format("{}_enabled", source)] = "true";
@@ -2574,6 +2606,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total",
                                            {{"result", "audit_unavailable"}}).increment();
+                     }
+                     return;
+                 }
+                 // Infrastructure:Delete was admitted before the wait. With RBAC off the
+                 // dispatch seam admits every human principal and echo.purge_source carries no
+                 // ExecuteGate, so a JIT elevation that lapsed during the wait is caught only
+                 // here (#3619 review). The gate writes its own refusal.
+                 if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("permission_revoked device={} source={}", device_id,
+                                               source));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
+                             .increment();
                      }
                      return;
                  }

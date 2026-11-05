@@ -2214,7 +2214,7 @@ before acting on any "open" / "in progress" claim:
    WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd replica or any WS-9 failover
    scenario**, is distinct from WS-8-readyz's per-tier health contract already listed above, and has
    shipped (leader/epoch metrics and the `yuzu-ha-leader` alerts; the CRL-freshness gauge it once
-   also listed is split out as #6527 and the remediation-claim counters as #6526, neither shipped);
+   also listed is split out as #6527 (shipped) and the remediation-claim counters as #6526 (not shipped));
    the durable cluster-capability admission gate that would replace the procedural mixed-version
    hold is #6528, not built; and #4098 (verify webhook/offload emit sites are per-replica-origin
    before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s `StoreWorkerPool::workers_`
