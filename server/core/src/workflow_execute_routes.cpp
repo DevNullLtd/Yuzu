@@ -25,6 +25,10 @@ struct HttpShape {
         return {202, false};
     case S::kRunIncomplete: // sent something, did not fully succeed: typed status, never a retry hint
         return {202, false};
+    case S::kIdempotentReplay: // a repeat of a key: the thin body of the run it is bound to
+        return {202, false};
+    case S::kIdempotencyConflict: // the key is bound to a different request: terminal
+        return {422, false};
     case S::kUnavailable:
         return {503, false}; // a missing dependency is not a transient fault
     case S::kNoPrincipal:
@@ -104,6 +108,27 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             const std::string cid = detail::ensure_correlation_id(res);
             const std::string workflow_id = req.matches[1].str();
 
+            // The optional client idempotency key, bound-checked before anything is read or
+            // leased. Exactly one header: two values are ambiguous, and which one a proxy kept
+            // is not something to guess at when the answer decides whether steps are re-sent.
+            std::string idempotency_key;
+            if (req.has_header("Idempotency-Key")) {
+                const auto bad =
+                    req.get_header_value_count("Idempotency-Key") != 1
+                        ? std::optional<WorkflowExecuteBodyError>{WorkflowExecuteBodyError{
+                              "idempotency_key_invalid", "send the Idempotency-Key header once"}}
+                        : check_workflow_idempotency_key(req.get_header_value("Idempotency-Key"));
+                if (bad) {
+                    res.status = 400;
+                    nlohmann::json j = nlohmann::json::parse(
+                        detail::error_json_a4(400, bad->message, cid, detail::A4ErrorOpts{}));
+                    j["error"]["reason"] = bad->reason;
+                    res.set_content(j.dump(), "application/json");
+                    return;
+                }
+                idempotency_key = req.get_header_value("Idempotency-Key");
+            }
+
             // #2437-class guard: raw-text depth check BEFORE the parse.
             if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
                 res.status = 400;
@@ -144,24 +169,6 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
 
             // The run's clock starts here, so everything below counts against the budget.
             const auto deadline = std::chrono::steady_clock::now() + kWorkflowSyncBudget;
-
-            // ADMISSION, before any read of the workflow and before the `requested` row: a
-            // synchronous run holds this worker for up to the budget, so it leases from the one
-            // shared held-open budget, and a draining server starts no new run. The lease is a
-            // plain local: the response is synchronous, so a return or a throw releases it.
-            auto admission = admit_workflow_run(d.stream_budget, d.draining, caller.principal,
-                                                d.metrics);
-            if (admission.refusal) {
-                const auto& refused = *admission.refusal;
-                const auto shape = http_shape(refused);
-                res.status = shape.code;
-                res.set_header("Retry-After",
-                               std::to_string((kWorkflowRunCapRetryAfterMs + 999) / 1000));
-                res.set_content(
-                    error_body(res, refused, shape.code, shape.retryable_hint, refused.remediation),
-                    "application/json");
-                return;
-            }
 
             WorkflowExecutePorts ports;
             ports.api = d.workflow_api.get();
@@ -228,12 +235,24 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                 }
             };
 
+            ports.count_idempotent = [&](std::string_view outcome) {
+                if (!d.metrics)
+                    return;
+                try {
+                    d.metrics
+                        ->counter(kWorkflowRunIdempotentMetric, {{"outcome", std::string(outcome)}})
+                        .increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
+                }
+            };
+
             WorkflowExecuteRequest wreq;
             wreq.workflow_id = workflow_id;
             wreq.agent_ids = std::move(*agent_ids);
             wreq.caller = caller;
             wreq.audit_context = "surface=rest";
             wreq.deadline = deadline;
+            wreq.idempotency_key = idempotency_key;
             // The run is synchronous on this handler thread, so `req` outlives every use of the
             // closure and no copy of it is kept. The principal is the one `caller_fn` resolved
             // (the session's username), the value `revalidate_stream` compares the credential to.
@@ -244,16 +263,77 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                 };
 
             WorkflowExecuteOutcome out;
-            try {
-                out = apply_workflow_execute(ports, wreq);
-            } catch (const std::exception& e) {
-                // Reached only for a throw BEFORE the `requested` row (the prepare half): nothing
-                // was sent, so retrying is safe. A throw after that row comes back as kRunFailed.
-                spdlog::error("workflow execute (REST v1) threw: {}", e.what());
-                out.status = WorkflowExecuteStatus::kStoreFailed;
-                out.message = "workflow execution failed";
-                out.reason = "internal_error";
-                out.retryable = true;
+            // The idempotency pre-check, BEFORE admission: a repeat of a key is a short read, so it
+            // is answered while the server drains and when the run cap is full, and a replay never
+            // holds a lease. A throw here is as retryable as one in prepare: nothing was sent.
+            bool answered = false;
+            if (!idempotency_key.empty()) {
+                try {
+                    if (auto early = check_workflow_idempotency(ports, wreq)) {
+                        out = std::move(*early);
+                        answered = true;
+                    } else {
+                        wreq.idempotency_prechecked = true;
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::error("workflow execute (REST v1) idempotency check threw: {}",
+                                  e.what());
+                    out.status = WorkflowExecuteStatus::kStoreFailed;
+                    out.message = "workflow execution failed";
+                    out.reason = "internal_error";
+                    out.retryable = true;
+                    answered = true;
+                }
+            }
+
+            if (!answered) {
+                // ADMISSION, before any read of the workflow and before the `requested` row: a
+                // synchronous run holds this worker for up to the budget, so it leases from the
+                // one shared held-open budget, and a draining server starts no new run. The lease
+                // is a plain local: the response is synchronous, so a return or a throw releases
+                // it.
+                auto admission = admit_workflow_run(d.stream_budget, d.draining, caller.principal,
+                                                    d.metrics);
+                if (admission.refusal) {
+                    const auto& refused = *admission.refusal;
+                    const auto shape = http_shape(refused);
+                    res.status = shape.code;
+                    res.set_header("Retry-After",
+                                   std::to_string((kWorkflowRunCapRetryAfterMs + 999) / 1000));
+                    res.set_content(error_body(res, refused, shape.code, shape.retryable_hint,
+                                               refused.remediation),
+                                    "application/json");
+                    return;
+                }
+                try {
+                    out = apply_workflow_execute(ports, wreq);
+                } catch (const std::exception& e) {
+                    // Reached only for a throw BEFORE the `requested` row (the prepare half):
+                    // nothing was sent, so retrying is safe. A throw after that row comes back as
+                    // kRunFailed.
+                    spdlog::error("workflow execute (REST v1) threw: {}", e.what());
+                    out.status = WorkflowExecuteStatus::kStoreFailed;
+                    out.message = "workflow execution failed";
+                    out.reason = "internal_error";
+                    out.retryable = true;
+                }
+            }
+
+            // A repeat of a key: the thin body of the run it is bound to, never a new run. 202 like
+            // the original; a run still in progress adds Retry-After (poll it, do not re-send).
+            if (out.status == WorkflowExecuteStatus::kIdempotentReplay) {
+                if (!out.audit_persisted)
+                    res.set_header("Sec-Audit-Failed", "true");
+                if (out.replay_status == kReplayRunning)
+                    res.set_header("Retry-After",
+                                   std::to_string((kIdempotentRunningRetryAfterMs + 999) / 1000));
+                res.status = 202;
+                res.set_content(
+                    nlohmann::json({{"data", workflow_idempotent_replay_json(out, workflow_id)},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
             }
 
             // A run that sent something is a 202 whose `status` says how it ended: `completed`

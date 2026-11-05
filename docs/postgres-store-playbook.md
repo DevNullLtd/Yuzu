@@ -553,6 +553,8 @@ rolls back and the server refuses to start; retry when writers are quiescent, or
 hand with `CREATE INDEX CONCURRENTLY` (`IF NOT EXISTS` makes the re-boot safe). It ends with the
 contract. ADR-0039's "Update (2026-11-02) — migration v4" section records the index.
 
+A sixth plain build, `WorkflowEngine` `workflow_executions` v3 (#2146, `idx_wf_exec_idem`, a partial UNIQUE index on `(principal, idempotency_key) WHERE idempotency_key IS NOT NULL`, with three nullable columns and a CHECK added in the same migration), rests on the same basis as the fourth and fifth: the deployment contract is a fresh database only (`docs/user-manual/upgrading.md` "Deployment contract"), so `workflow_executions` is empty when v3 runs and the empty-table rule above already applies; the entry records that the contract is procedural. On a carried-forward table the build would hold a `SHARE` lock (writes blocked, reads allowed) for its duration, and the pool's 10 s `lock_timeout` could roll the migration back so the server refuses to start; `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` by hand is the remedy (the index would have to be built before the migration, and `ADD COLUMN` takes only a brief lock). The index is partial, so a keyless run never touches it. It ends with the contract.
+
 ## Substrate quick facts (pool / runner / helpers)
 
 Design facts every store author inherits (previously recorded only in CLAUDE.md and the

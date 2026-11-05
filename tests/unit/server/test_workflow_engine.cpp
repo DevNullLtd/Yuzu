@@ -25,6 +25,8 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
+#include "workflow_api_local.hpp"
+#include "workflow_execute.hpp" // the idempotency pre-check over the real engine
 #include "workflow_model.hpp" // workflow_execution_visible: the differential oracle for the list predicate
 
 #include "../test_helpers.hpp"
@@ -34,7 +36,10 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdlib>
+#include <functional>
 #include <chrono>
 #include <map>
 #include <set>
@@ -2360,4 +2365,384 @@ TEST_CASE("WorkflowEngine::query_executions_page: latest-per-workflow flags the 
     REQUIRE(exact.has_value());
     CHECK(exact->rows.size() == 3);
     CHECK_FALSE(exact->truncated_by_cap);
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// Idempotent execute (#2146): the key claimed on the run row, atomically with admission.
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct ClaimResult {
+    std::expected<std::string, std::string> result{std::string{}};
+    std::optional<WorkflowRunReplay> replay;
+    int admitted_calls{0};
+    int dispatches{0};
+};
+
+WorkflowIdempotencyClaim claim_of(const std::string& principal, const std::string& key,
+                                  const std::string& fingerprint = "fp-1") {
+    return WorkflowIdempotencyClaim{principal, key, fingerprint};
+}
+
+ClaimResult execute_keyed(WorkflowEngine& engine, const std::string& wf_id,
+                          const WorkflowIdempotencyClaim& claim,
+                          const std::vector<std::string>& agents = {"agent-1"}) {
+    ClaimResult out;
+    WorkflowRunControl control;
+    control.idempotency = claim;
+    control.on_replay = [&out](const WorkflowRunReplay& r) { out.replay = r; };
+    control.on_admitted = [&out](const std::string&) { ++out.admitted_calls; };
+    StepDispatchFn fn = [&out](const std::string&, const std::string&, const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        ++out.dispatches;
+        return std::string(R"({"status":"ok"})");
+    };
+    out.result = engine.execute(wf_id, agents, fn, nullptr, control.on_admitted, control);
+    return out;
+}
+
+std::int64_t count_rows(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
+} // namespace
+
+TEST_CASE("WorkflowEngine idempotency: the first keyed call is admitted and bound; a repeat is a "
+          "replay that writes and dispatches nothing",
+          "[workflow_engine][pg][execute][idempotency]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kTwoStepYaml);
+
+    CHECK_FALSE(engine.find_execution_by_key("alice", "key-0123456789")->has_value());
+
+    const auto first = execute_keyed(engine, wf_id, claim_of("alice", "key-0123456789", "fp-A"));
+    REQUIRE(first.result.has_value());
+    CHECK(first.admitted_calls == 1);
+    CHECK(first.dispatches == 2);
+    CHECK_FALSE(first.replay);
+
+    const auto bound = engine.find_execution_by_key("alice", "key-0123456789");
+    REQUIRE(bound.has_value());
+    REQUIRE(bound->has_value());
+    CHECK((*bound)->execution_id == *first.result);
+    CHECK((*bound)->workflow_id == wf_id);
+    CHECK((*bound)->request_fingerprint == "fp-A");
+    CHECK((*bound)->status == "completed");
+    CHECK((*bound)->started_at > 0);
+
+    const auto second = execute_keyed(engine, wf_id, claim_of("alice", "key-0123456789", "fp-A"));
+    REQUIRE_FALSE(second.result.has_value());
+    CHECK(second.result.error() == kWorkflowIdempotentReplayError);
+    REQUIRE(second.replay);
+    CHECK(second.replay->execution_id == *first.result);
+    CHECK(second.replay->fingerprint == "fp-A");
+    CHECK(second.replay->status == "completed");
+    CHECK(second.replay->workflow_id == wf_id);
+    CHECK(second.admitted_calls == 0);
+    CHECK(second.dispatches == 0);
+    CHECK(engine.list_executions(wf_id)->size() == 1); // no second row, and no orphan step results
+    CHECK(count_rows(wf_db_fx_.dsn(), "SELECT count(*) FROM workflow_engine.workflow_step_results") == 2);
+
+    // A keyless run on the same workflow is untouched by any of this.
+    REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
+    CHECK(engine.list_executions(wf_id)->size() == 2);
+}
+
+TEST_CASE("WorkflowEngine idempotency: TWO concurrent calls with one key admit EXACTLY ONE run; the "
+          "other is a replay of it",
+          "[workflow_engine][pg][execute][idempotency][race]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kOneStepYaml);
+
+    for (int round = 0; round < 12; ++round) {
+        const std::string key = "race-key-" + std::to_string(1000 + round);
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        ClaimResult a, b;
+        const auto worker = [&](ClaimResult& out) {
+            ++ready;
+            while (!go.load())
+                std::this_thread::yield();
+            out = execute_keyed(engine, wf_id, claim_of("alice", key, "fp-race"));
+        };
+        std::thread ta(worker, std::ref(a));
+        std::thread tb(worker, std::ref(b));
+        while (ready.load() < 2)
+            std::this_thread::yield();
+        go = true;
+        ta.join();
+        tb.join();
+
+        INFO("round " << round);
+        const int admitted = static_cast<int>(a.result.has_value()) + static_cast<int>(b.result.has_value());
+        CHECK(admitted == 1);
+        CHECK(a.admitted_calls + b.admitted_calls == 1);
+        CHECK(a.dispatches + b.dispatches == 1); // the step was sent ONCE
+        const auto& loser = a.result.has_value() ? b : a;
+        const auto& winner = a.result.has_value() ? a : b;
+        REQUIRE_FALSE(loser.result.has_value());
+        CHECK(loser.result.error() == kWorkflowIdempotentReplayError);
+        REQUIRE(loser.replay);
+        CHECK(loser.replay->execution_id == *winner.result);
+        CHECK(count_rows(wf_db_fx_.dsn(),
+                         "SELECT count(*) FROM workflow_engine.workflow_executions WHERE "
+                         "idempotency_key = '" + key + "'") == 1);
+    }
+}
+
+TEST_CASE("WorkflowEngine idempotency: the same key under two PRINCIPALS is two keys; both admit",
+          "[workflow_engine][pg][execute][idempotency]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kOneStepYaml);
+    const auto a = execute_keyed(engine, wf_id, claim_of("alice", "shared-key-0001"));
+    const auto b = execute_keyed(engine, wf_id, claim_of("bob", "shared-key-0001"));
+    REQUIRE(a.result.has_value());
+    REQUIRE(b.result.has_value());
+    CHECK(*a.result != *b.result);
+    CHECK(engine.find_execution_by_key("alice", "shared-key-0001")->value().execution_id == *a.result);
+    CHECK(engine.find_execution_by_key("bob", "shared-key-0001")->value().execution_id == *b.result);
+    CHECK_FALSE(engine.find_execution_by_key("carol", "shared-key-0001")->has_value());
+    // And each is a replay for its own principal only.
+    CHECK_FALSE(execute_keyed(engine, wf_id, claim_of("alice", "shared-key-0001")).result.has_value());
+}
+
+TEST_CASE("WorkflowEngine idempotency: a soft-deleted workflow with a key is NOT FOUND, never a replay "
+          "and never a row",
+          "[workflow_engine][pg][execute][idempotency][delete]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kOneStepYaml);
+    REQUIRE(engine.delete_workflow(wf_id).has_value());
+    const auto r = execute_keyed(engine, wf_id, claim_of("alice", "key-deleted-001"));
+    REQUIRE_FALSE(r.result.has_value());
+    CHECK(r.result.error().find("workflow not found") != std::string::npos);
+    CHECK_FALSE(r.replay);
+    CHECK(r.dispatches == 0);
+    CHECK(count_rows(wf_db_fx_.dsn(), "SELECT count(*) FROM workflow_engine.workflow_executions") == 0);
+}
+
+TEST_CASE("WorkflowEngine idempotency: when the admission INSERT returns ZERO rows, a read in the same "
+          "transaction tells 'workflow gone' (not found) from 'key taken' (replay)",
+          "[workflow_engine][pg][execute][idempotency][delete][race]") {
+    // The only way past execute()'s own get_workflow() read into the INSERT's zero-row branch is a
+    // delete that lands between them. A second connection holds an ACCESS EXCLUSIVE lock on the
+    // executions table so the INSERT is parked there; the workflow is soft-deleted while it waits.
+    for (const bool key_taken : {false, true}) {
+        INFO("key_taken=" << key_taken);
+        WORKFLOW_ENGINE(engine);
+        const auto wf_id = *engine.create_workflow(kOneStepYaml);
+        const std::string key = "key-zero-rows-1";
+
+        PgConn locker{PQconnectdb(wf_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+        REQUIRE(PgResult{PQexec(locker.get(), "BEGIN")}.ok());
+        REQUIRE(PgResult{PQexec(locker.get(),
+                                "LOCK TABLE workflow_engine.workflow_executions IN ACCESS EXCLUSIVE MODE")}
+                    .ok());
+
+        ClaimResult out;
+        std::thread t([&] { out = execute_keyed(engine, wf_id, claim_of("alice", key, "fp-z")); });
+
+        // Wait (bounded) until the INSERT is parked on the lock.
+        bool parked = false;
+        for (int i = 0; i < 500 && !parked; ++i) {
+            parked = count_rows(wf_db_fx_.dsn(),
+                                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                                "AND query LIKE 'INSERT INTO workflow_engine.workflow_executions%'") > 0;
+            if (!parked)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        REQUIRE(parked);
+        REQUIRE(engine.delete_workflow(wf_id).has_value());
+        if (key_taken) // the key was bound by another call that won, while this one waited
+            REQUIRE(PgResult{PQexec(locker.get(),
+                                    ("INSERT INTO workflow_engine.workflow_executions (id, workflow_id, "
+                                     "status, agent_ids_json, started_at, principal, idempotency_key, "
+                                     "request_fingerprint) VALUES ('exec-winner', '" +
+                                     wf_id + "', 'running', '[]', 1, 'alice', '" + key + "', 'fp-z')")
+                                        .c_str())}
+                         .ok());
+        REQUIRE(PgResult{PQexec(locker.get(), "COMMIT")}.ok());
+        t.join();
+
+        REQUIRE_FALSE(out.result.has_value());
+        CHECK(out.dispatches == 0);
+        CHECK(out.admitted_calls == 0);
+        if (key_taken) {
+            CHECK(out.result.error() == kWorkflowIdempotentReplayError);
+            REQUIRE(out.replay);
+            CHECK(out.replay->execution_id == "exec-winner");
+        } else {
+            CHECK(out.result.error().find("workflow not found") != std::string::npos);
+            CHECK_FALSE(out.replay);
+            CHECK(count_rows(wf_db_fx_.dsn(),
+                             "SELECT count(*) FROM workflow_engine.workflow_executions") == 0);
+        }
+    }
+}
+
+TEST_CASE("WorkflowEngine idempotency: a key with no principal or no fingerprint is unstorable (CHECK), "
+          "and the unique index covers keyed rows only",
+          "[workflow_engine][pg][execute][idempotency][schema]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kOneStepYaml);
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const auto insert = [&](const char* id, const char* principal, const char* key, const char* fp) {
+        return yuzu::server::pg::exec_params(
+            conn.get(),
+            "INSERT INTO workflow_engine.workflow_executions (id, workflow_id, status, "
+            "agent_ids_json, started_at, principal, idempotency_key, request_fingerprint) "
+            "VALUES ($1, $2, 'running', '[]', 1, $3, $4, $5)",
+            std::vector<std::optional<std::string>>{
+                std::string(id), wf_id,
+                principal ? std::optional<std::string>(principal) : std::nullopt,
+                key ? std::optional<std::string>(key) : std::nullopt,
+                fp ? std::optional<std::string>(fp) : std::nullopt});
+    };
+    CHECK(insert("e1", nullptr, "key-no-principal", "fp").status() == PGRES_FATAL_ERROR);
+    CHECK(insert("e2", "alice", "key-no-fingerprint", nullptr).status() == PGRES_FATAL_ERROR);
+    CHECK(insert("e3", nullptr, nullptr, nullptr).status() == PGRES_COMMAND_OK); // keyless: no claim
+    CHECK(insert("e4", nullptr, nullptr, nullptr).status() == PGRES_COMMAND_OK); // many keyless rows
+    CHECK(insert("e5", "alice", "key-complete-01", "fp").status() == PGRES_COMMAND_OK);
+    CHECK(insert("e6", "alice", "key-complete-01", "fp").status() == PGRES_FATAL_ERROR); // unique
+    CHECK(insert("e7", "bob", "key-complete-01", "fp").status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK and the partial unique "
+          "index to a v2 store, and a fresh store gets the same",
+          "[workflow_engine][pg][schema][idempotency][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        WorkflowEngine fresh{pool};
+        REQUIRE(fresh.is_open());
+    }
+    const auto query_count = [&](const std::string& sql) { return count_rows(db.dsn(), sql); };
+    const auto v3_artifacts = [&] {
+        return std::array<std::int64_t, 4>{
+            query_count("SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                        "'workflow_engine' AND table_name = 'workflow_executions' AND column_name IN "
+                        "('principal', 'idempotency_key', 'request_fingerprint')"),
+            query_count("SELECT count(*) FROM pg_constraint WHERE conname = 'wf_exec_idem_complete'"),
+            // a UNIQUE index with a predicate (partial) on (principal, idempotency_key)
+            query_count("SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                        "WHERE c.relname = 'idx_wf_exec_idem' AND i.indisunique AND i.indpred IS NOT NULL"),
+            query_count("SELECT version FROM public.schema_meta WHERE store = 'workflow_engine'")};
+    };
+    CHECK(v3_artifacts() == std::array<std::int64_t, 4>{3, 1, 1, 3});
+
+    // Put the store back at v2 exactly as an earlier build left it, then open it again.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        for (const char* ddl :
+             {"DROP INDEX workflow_engine.idx_wf_exec_idem",
+              "ALTER TABLE workflow_engine.workflow_executions DROP CONSTRAINT wf_exec_idem_complete",
+              "ALTER TABLE workflow_engine.workflow_executions DROP COLUMN principal, "
+              "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint",
+              "UPDATE public.schema_meta SET version = 2 WHERE store = 'workflow_engine'"}) {
+            PgResult r{PQexec(conn.get(), ddl)};
+            REQUIRE(r.ok());
+        }
+    }
+    CHECK(v3_artifacts() == std::array<std::int64_t, 4>{0, 0, 0, 2});
+    WorkflowEngine upgraded{pool};
+    REQUIRE(upgraded.is_open());
+    CHECK(v3_artifacts() == std::array<std::int64_t, 4>{3, 1, 1, 3});
+    // And the upgraded store claims keys.
+    const auto wf_id = *upgraded.create_workflow(kOneStepYaml);
+    CHECK(execute_keyed(upgraded, wf_id, claim_of("alice", "key-after-upgrade")).result.has_value());
+}
+
+TEST_CASE("WorkflowEngine idempotency: a run killed after the claim leaves a `running` row that the "
+          "pre-check replays as running, then as indeterminate past 180 s",
+          "[workflow_engine][pg][execute][idempotency][crash]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kOneStepYaml);
+    const std::string key = "key-killed-0001";
+    const std::vector<std::string> agents{"agent-1"};
+
+    // What a process death after the claim leaves: the keyed row, `running`, never finalized.
+    const std::int64_t started = 5'000'000;
+    {
+        PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto fp_ports = WorkflowExecutePorts{};
+        const auto fp = *workflow_request_fingerprint(fp_ports, wf_id, agents);
+        PgResult r = yuzu::server::pg::exec_params(
+            conn.get(),
+            "INSERT INTO workflow_engine.workflow_executions (id, workflow_id, status, "
+            "agent_ids_json, started_at, principal, idempotency_key, request_fingerprint) "
+            "VALUES ('exec-killed', $1, 'running', '[\"agent-1\"]', $2::bigint, 'alice', $3, $4)",
+            std::vector<std::string>{wf_id, std::to_string(started), key, fp});
+        REQUIRE(r.ok());
+    }
+
+    const auto api = make_local_workflow_api(engine);
+    std::int64_t now = started + 10;
+    WorkflowExecutePorts ports;
+    ports.api = api.get();
+    ports.run = [](const std::string&, const std::vector<std::string>&, StepDispatchFn, ConditionEvalFn,
+                   const WorkflowRunControl&) -> std::expected<std::string, std::string> {
+        return std::unexpected(std::string{"must not run"});
+    };
+    ports.instruction_store_open = true;
+    ports.approval_gate_available = true;
+    ports.lookup = [](const std::string&)
+        -> std::expected<std::optional<WorkflowStepInstruction>, std::string> {
+        return std::optional<WorkflowStepInstruction>{};
+    };
+    ports.classify = [](std::string_view, std::string_view)
+        -> std::expected<CommandCapability, ClassificationError> {
+        return std::unexpected(ClassificationError{});
+    };
+    ports.authorize = [](const DispatchCaller&, std::string_view, std::string_view)
+        -> std::expected<CommandCapability, detail::DispatchDenial> {
+        return std::unexpected(detail::DispatchDenial{});
+    };
+    ports.dispatch = [](const WorkflowStepInstruction&, const std::vector<std::string>&,
+                        const std::unordered_map<std::string, std::string>&, const DispatchCaller&) {
+        return ConfinedDispatchOutcome{};
+    };
+    std::vector<std::string> audits;
+    ports.audit = [&](const std::string&, const std::string& result, const std::string&,
+                      const std::string&) {
+        audits.push_back(result);
+        return true;
+    };
+    ports.now_epoch = [&] { return now; };
+
+    WorkflowExecuteRequest req;
+    req.workflow_id = wf_id;
+    req.agent_ids = agents;
+    req.caller = DispatchCaller{.principal = "alice"};
+    req.audit_context = "surface=test";
+    req.idempotency_key = key;
+
+    auto early = check_workflow_idempotency(ports, req);
+    REQUIRE(early);
+    CHECK(early->status == WorkflowExecuteStatus::kIdempotentReplay);
+    CHECK(early->replay_status == "running");
+    CHECK(early->execution_id == "exec-killed");
+    CHECK(audits.empty());
+
+    now = started + 179;
+    CHECK(check_workflow_idempotency(ports, req)->replay_status == "running");
+    now = started + 181;
+    const auto late = check_workflow_idempotency(ports, req);
+    REQUIRE(late);
+    CHECK(late->replay_status == "indeterminate");
+    CHECK_FALSE(late->retryable);
+    CHECK(audits == std::vector<std::string>{"success"});
+
+    // A different request under the same key is a conflict, whatever the run's age.
+    req.agent_ids = {"agent-1", "agent-2"};
+    CHECK(check_workflow_idempotency(ports, req)->status == WorkflowExecuteStatus::kIdempotencyConflict);
 }

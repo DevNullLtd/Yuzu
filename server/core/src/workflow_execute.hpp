@@ -120,6 +120,45 @@
 /// reported in `steps` with its reason, and an earlier step has already been sent. The preflight
 /// does NOT promise that every step will reach a device, only that the caller is allowed to ask.
 ///
+/// IDEMPOTENCY (#2146, ADR-1005 A4). A caller whose response is lost cannot tell "never started"
+/// from "started", and a blind re-send dispatches every step twice. So the call carries a client
+/// KEY (REST `Idempotency-Key` header, optional; MCP `idempotency_key`, REQUIRED) and a repeat of
+/// it is answered with the run the key is bound to, sending nothing:
+///   * the key is `[A-Za-z0-9._:-]`, 8 to 128 bytes, bound-checked by the transport BEFORE any
+///     ticket, lease or read (`check_workflow_idempotency_key`); it is scoped to the PRINCIPAL
+///     (never global) and bound for the life of the run's row. An empty principal never holds a key.
+///   * the REQUEST FINGERPRINT is sha256 over `wf-exec-v1\n`, the workflow id and the agent ids
+///     SORTED and DEDUPED, joined by `\n`. It deliberately EXCLUDES the step digest: a later edit to
+///     an instruction must not turn a retry into a 422 that pushes the client to a new key, which
+///     is a second dispatch. The same key with a different fingerprint is `kIdempotencyConflict`
+///     (REST 422, MCP -32602, reason `idempotency_key_conflict`), terminal.
+///   * THE PRE-CHECK (`check_workflow_idempotency`) runs after the wiring check and BEFORE the
+///     workflow is read or any step is judged (a since-deleted workflow or a raised approval mode
+///     must not hide the replay), and the transports run it BEFORE admission, the lease and the
+///     approval ticket: a replay is a short read, not a held-open worker, so it is answered while
+///     the server drains and when the run cap is full, and a retry with a spent or no ticket gets
+///     it without a new approval. A lookup fault is `kStoreFailed` (retryable), nothing written:
+///     it must never read as "no run bound".
+///   * THE CLAIM is the engine's, atomic with the run's admission (`WorkflowRunControl::
+///     idempotency`). A call that passed the pre-check and lost the race has already written its
+///     `requested` row; it closes it `denied reason=idempotent_duplicate` (or
+///     `idempotency_key_conflict` when the winner's fingerprint differs) and answers as a replay.
+///   * THE REPLAY BODY is deliberately THIN (`workflow_idempotent_replay_json`): the run's id,
+///     workflow, status, `idempotent_replay:true` and `started_at`. The engine persists no
+///     per-step outcome beyond each dispatch's return, so the original response cannot be rebuilt,
+///     and a stored copy would be a second source of truth: the caller reads the run with
+///     `get_workflow_execution`. `completed`/`failed` are final; `running` carries `retry_after_ms`
+///     2000 and means POLL, never re-send; a `running` row older than `kIdempotentRunStaleAfter`
+///     is `indeterminate` (a crash or a dropped finalize leaves it `running` forever), not
+///     retryable, no retry hint. A deliberate re-run needs a NEW key.
+///   * AUDIT: a terminal replay (completed, failed, indeterminate) writes one `workflow.execute`
+///     `success` row `idempotent_replay=true run_status=<token>`; a `running` replay writes NONE
+///     (a client polling every 2 s would write 30 rows a minute; the counter is its record). The
+///     key is neutralised (`clip_token`) in every detail. `yuzu_server_workflow_run_idempotent_total
+///     {outcome=replayed|in_progress|conflict}` counts them.
+///   * RETENTION: none. The key lives with its run row and nothing deletes that row; any future
+///     prune of the run table owns the clock-guarded-retention obligation.
+///
 /// The `DispatchCaller` is the CALLER's, derived once by the transport (`caller_fn`), with
 /// `approval_provenance` left as the transport set it: both REST and MCP leave it `None`, and MCP
 /// does so even after the C8 gate consumed a ticket (`execute_workflow` is not a stamping site,
@@ -187,6 +226,33 @@ inline constexpr std::chrono::seconds kWorkflowSyncBudget{60};
 /// (`kIndeterminate`): one retry, never more, and never past the run's deadline. A request may
 /// carry a shorter value (`WorkflowExecuteRequest::reauthorize_retry_delay`, for tests).
 inline constexpr std::chrono::milliseconds kReauthorizeRetryDelay{1000};
+
+/// The bounds of a client idempotency key (REST `Idempotency-Key`, MCP `idempotency_key`).
+inline constexpr std::size_t kIdempotencyKeyMinLen = 8;
+inline constexpr std::size_t kIdempotencyKeyMaxLen = 128;
+
+/// A run that is still `running` this long after it started is answered as `indeterminate`, not
+/// `running`: the budget is 60 s, and a row left running past it (the process died after the
+/// claim, or the final status write was dropped) would otherwise be polled forever. 180 s is the
+/// 60 s run budget plus slack for the longest finalize retry and clock disagreement between replicas.
+inline constexpr std::chrono::seconds kIdempotentRunStaleAfter{180};
+
+/// `retry_after_ms` / `Retry-After` of a replay whose run is still in progress: poll the run.
+inline constexpr std::int64_t kIdempotentRunningRetryAfterMs = 2000;
+
+/// `yuzu_server_workflow_run_idempotent_total{outcome}`: a repeat of an idempotency key that was
+/// answered without sending anything. `replayed` (a terminal run: completed, failed or
+/// indeterminate), `in_progress` (the run is still running) and `conflict` (the same key with a
+/// different request). A closed set, every member pre-seeded to 0 at boot.
+inline constexpr char kWorkflowRunIdempotentMetric[] = "yuzu_server_workflow_run_idempotent_total";
+inline constexpr std::array<std::string_view, 3> kWorkflowRunIdempotentOutcomes{
+    "replayed", "in_progress", "conflict"};
+
+/// The `status` of a replay body (`workflow_idempotent_replay_json`). A closed set.
+inline constexpr std::string_view kReplayRunning = "running";
+inline constexpr std::string_view kReplayCompleted = "completed";
+inline constexpr std::string_view kReplayFailed = "failed";
+inline constexpr std::string_view kReplayIndeterminate = "indeterminate";
 
 /// The closing reasons of a run the credential check stopped (`WorkflowExecuteOutcome::reason`,
 /// the closing audit row's `reason=` and the 2xx body's `reason`). A closed pair.
@@ -275,6 +341,11 @@ struct WorkflowExecutePorts {
     WorkflowAuditFn audit;
     /// Optional: the digest used by `workflow_effect_binding` (default: `sha256_hex`).
     WorkflowDigestFn digest;
+    /// Optional: the digest behind the idempotency request fingerprint (default: `sha256_hex`).
+    /// Its own seam, not `digest`, so the effect-binding refusal and the fingerprint refusal can
+    /// each be driven alone: an MCP call always carries a key, so with one shared seam the
+    /// fingerprint would fail first and the effect-binding failure could never be reached.
+    WorkflowDigestFn fingerprint_digest;
     /// Optional: bumps `yuzu_server_dispatch_target_rejected_total{route="workflow",reason}`.
     std::function<void(std::string_view reason)> count_target_rejected;
     /// Optional: bumps `yuzu_server_dispatch_denied_total{reason}` with the chokepoint's own
@@ -283,6 +354,11 @@ struct WorkflowExecutePorts {
     /// Optional: bumps `yuzu_server_dispatch_fanout_throw_total{route="workflow",phase="dispatch"}`
     /// when a run throws after its `requested` row.
     std::function<void()> count_run_threw;
+    /// Optional: bumps `yuzu_server_workflow_run_idempotent_total{outcome}`.
+    std::function<void(std::string_view outcome)> count_idempotent;
+    /// Optional: epoch seconds now, to age a `running` replay against `started_at` (default: the
+    /// system clock, the clock the engine stamped `started_at` with). A seam for the stale test.
+    std::function<std::int64_t()> now_epoch;
 };
 
 /// instruction id -> `workflow_step_effect` text: what one step's instruction resolved to when the
@@ -314,6 +390,14 @@ struct WorkflowExecuteRequest {
     std::function<auth::CredentialCheck()> reauthorize;
     /// The wait before the single retry of an indeterminate `reauthorize` answer.
     std::chrono::milliseconds reauthorize_retry_delay{kReauthorizeRetryDelay};
+    /// The client's idempotency key, already bound-checked by the transport
+    /// (`check_workflow_idempotency_key`). Empty == a keyless call, whose behaviour is unchanged.
+    /// Non-empty requires a non-empty `caller.principal`, whatever `caller.system` says.
+    std::string idempotency_key;
+    /// The transport ran `check_workflow_idempotency` itself (it must, before admission) and
+    /// found no run bound, so `apply_workflow_execute` need not read it a second time. A run that
+    /// raced past the pre-check is still caught by the engine's atomic claim.
+    bool idempotency_prechecked{false};
 };
 
 /// A parse refusal for the request body. `reason` is a closed token (the
@@ -356,6 +440,8 @@ enum class WorkflowExecuteStatus {
     kExceedsSyncBudget,          ///< the workflow's worst-case retry sleep exceeds `kWorkflowSyncBudget` (400, nothing done, no ticket)
     kRunCapReached,              ///< admission: this principal or the server holds as many runs/streams as it may (429, retryable, nothing done)
     kDraining,                   ///< admission: the server is shutting down and starts no new run (503, retryable, nothing done)
+    kIdempotentReplay,           ///< the idempotency key is bound to a run: answered with the thin replay body, nothing sent (202)
+    kIdempotencyConflict,        ///< the key is bound to a DIFFERENT request (422, terminal, nothing sent)
 };
 
 /// How a run that reached the engine ended, judged from what the engine recorded and what the
@@ -455,6 +541,12 @@ struct WorkflowExecuteOutcome {
     std::string credential_stop;
     /// False only when the closing outcome row failed to persist after the run had started.
     bool audit_persisted{true};
+    /// kIdempotentReplay only: the run the key is bound to answered instead of a new one.
+    /// `replay_status` is one of kReplayRunning/Completed/Failed/Indeterminate, `run_status` the
+    /// engine's own, `started_at` the run's start (epoch seconds).
+    bool idempotent_replay{false};
+    std::string replay_status;
+    std::int64_t started_at{0};
 };
 
 /// The ONE judgement of how a finished run ended. `run_status` is the engine's recorded status
@@ -525,12 +617,35 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
                                                           const WorkflowExecuteRequest& req,
                                                           const WorkflowExecutePlan& plan);
 
-/// Run the sequence in the header banner: prepare, then run. Never throws for an expected
+/// Run the sequence in the header banner: the idempotency pre-check (unless the transport ran
+/// it), prepare, then run. Never throws for an expected
 /// refusal. A port that throws BEFORE the `requested` row is the caller's to catch (the transports
 /// wrap it, and answer retryable: nothing was sent); one that throws after it is answered as
 /// `kRunFailed` (see the banner).
 [[nodiscard]] WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
                                                             const WorkflowExecuteRequest& req);
+
+/// Bound-checks a client idempotency key: 8 to 128 bytes of `[A-Za-z0-9._:-]`. `nullopt` == fine.
+/// The transport calls it before any ticket, lease or read, so a bad key spends nothing. The
+/// message names the rule and never echoes the key.
+[[nodiscard]] std::optional<WorkflowExecuteBodyError>
+check_workflow_idempotency_key(std::string_view key);
+
+/// The request fingerprint stored with a claim and compared on a repeat: sha256 over
+/// `wf-exec-v1\n` + workflow id + `\n` + the agent ids sorted and deduped, joined by `\n`.
+/// `nullopt` on a digest failure (never a digest of zeros): the caller refuses the call.
+[[nodiscard]] std::optional<std::string>
+workflow_request_fingerprint(const WorkflowExecutePorts& ports, const std::string& workflow_id,
+                             const std::vector<std::string>& agent_ids);
+
+/// The idempotency pre-check (see the banner). `nullopt` == proceed: the call is keyless, or no run
+/// is bound to its key. Otherwise the outcome to render: `kIdempotentReplay`,
+/// `kIdempotencyConflict`, `kStoreFailed` (the lookup failed: retryable, nothing written),
+/// `kUnavailable`/`kNoPrincipal` (wiring or an empty principal) or `kEffectDigestFailed` (the
+/// fingerprint could not be computed: audited, no ticket). Writes at most one audit row (a terminal
+/// replay, a conflict or a digest failure) and bumps the idempotent counter; never dispatches.
+[[nodiscard]] std::optional<WorkflowExecuteOutcome>
+check_workflow_idempotency(const WorkflowExecutePorts& ports, const WorkflowExecuteRequest& req);
 
 /// The pure per-step admission verdict, exposed so the preflight, the dispatch-time re-check and
 /// the tests share one function.
@@ -568,6 +683,14 @@ struct StepAdmissionDecision {
 /// incomplete run for a completed one. One builder so REST and MCP cannot drift on field set.
 [[nodiscard]] nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,
                                                           const std::string& workflow_id);
+
+/// The THIN body of a `kIdempotentReplay` outcome, for both transports: `execution_id`,
+/// `workflow_id`, `status` (running | completed | failed | indeterminate), `idempotent_replay:true`
+/// and `started_at`, plus a `message`; `retry_after_ms` 2000 while running; `retryable:false` and
+/// (for indeterminate) a `remediation` otherwise. NO `steps` and no `late_denied`: the engine does
+/// not persist them, so read the run with `get_workflow_execution`.
+[[nodiscard]] nlohmann::json workflow_idempotent_replay_json(const WorkflowExecuteOutcome& o,
+                                                             const std::string& workflow_id);
 
 /// Adapter from the real store; the returned function holds `store` by pointer, which must
 /// outlive it (the server owns the store for the process lifetime). A null `store` yields an

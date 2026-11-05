@@ -120,6 +120,23 @@ const std::vector<pg::PgMigration>& migrations() {
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE instruction_id LIKE 'crossplatform.tar.%';"
          "UPDATE workflows SET yaml_source = replace(yaml_source, "
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE yaml_source LIKE '%crossplatform.tar.%';"},
+        // v3 (#2146, idempotent execute): a client key claimed on the run's own row. NULL on every
+        // keyless run (the legacy route and any call that sent no key), so the partial UNIQUE index
+        // holds only keyed rows and a keyless INSERT never touches it. The CHECK makes a key
+        // without its principal or fingerprint unstorable: a NULL principal never conflicts under
+        // a unique index, so such a row would silently stop being idempotent. Plain (transactional)
+        // index build on a table the fresh-database hard cutover guarantees is empty
+        // (docs/postgres-store-playbook.md "Recorded exception"). No backfill: an existing run
+        // has no key.
+        {3,
+         "ALTER TABLE workflow_executions "
+         "  ADD COLUMN principal           TEXT,"
+         "  ADD COLUMN idempotency_key     TEXT,"
+         "  ADD COLUMN request_fingerprint TEXT;"
+         "ALTER TABLE workflow_executions ADD CONSTRAINT wf_exec_idem_complete CHECK ("
+         "  idempotency_key IS NULL OR (principal IS NOT NULL AND request_fingerprint IS NOT NULL));"
+         "CREATE UNIQUE INDEX idx_wf_exec_idem ON workflow_executions(principal, idempotency_key) "
+         "  WHERE idempotency_key IS NOT NULL;"},
     };
     return kMigrations;
 }
@@ -730,27 +747,72 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // between the get_workflow() read above and this statement (a concurrent delete_workflow()
     // in between now fails admission here instead of silently orphaning a new execution against
     // a since-deleted workflow).
-    bool admitted = false;
+    //
+    // IDEMPOTENCY (#2146). A keyed call adds `ON CONFLICT (principal, idempotency_key) WHERE
+    // idempotency_key IS NOT NULL DO NOTHING` (the inference clause must name the partial index's
+    // predicate, or Postgres finds no arbiter), so the claim and the admission are ONE statement:
+    // exactly one of two concurrent calls with the same key inserts. ZERO rows is then ambiguous
+    // (the workflow was soft-deleted/removed, or the key is taken), and only a read in this same
+    // transaction can tell which: a row bound to (principal, key) is a REPLAY, none is the
+    // ordinary "workflow not found". READ COMMITTED: a loser that waited on the winner's
+    // uncommitted insert sees the winner's row once it commits.
+    enum class Admission { kAdmitted, kReplay, kNotFound };
+    Admission admission = Admission::kNotFound;
+    WorkflowRunReplay replay;
+    const auto& claim = control.idempotency;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        pg::PgResult ires = pg::exec_params(
-            conn,
-            "INSERT INTO workflow_engine.workflow_executions "
-            "(id, workflow_id, status, agent_ids_json, started_at, current_step) "
-            "SELECT $1, w.id, 'running', $3, $4::bigint, 0 "
-            "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
-            "RETURNING id",
-            std::vector<std::string>{exec_id, workflow_id, agent_str, now});
+        pg::PgResult ires = claim
+            ? pg::exec_params(
+                  conn,
+                  "INSERT INTO workflow_engine.workflow_executions "
+                  "(id, workflow_id, status, agent_ids_json, started_at, current_step, "
+                  " principal, idempotency_key, request_fingerprint) "
+                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0, $5, $6, $7 "
+                  "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
+                  "ON CONFLICT (principal, idempotency_key) WHERE idempotency_key IS NOT NULL "
+                  "DO NOTHING RETURNING id",
+                  std::vector<std::string>{exec_id, workflow_id, agent_str, now, claim->principal,
+                                           claim->key, claim->fingerprint})
+            : pg::exec_params(
+                  conn,
+                  "INSERT INTO workflow_engine.workflow_executions "
+                  "(id, workflow_id, status, agent_ids_json, started_at, current_step) "
+                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0 "
+                  "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
+                  "RETURNING id",
+                  std::vector<std::string>{exec_id, workflow_id, agent_str, now});
         if (ires.status() != PGRES_TUPLES_OK) {
             spdlog::error("WorkflowEngine::execute: execution insert failed: {}",
                           PQresultErrorMessage(ires.get()));
             return false;
         }
         if (PQntuples(ires.get()) == 0) {
-            // Workflow vanished/soft-deleted since get_workflow() above — commit the (no-op)
-            // txn; `admitted` stays false and the caller gets the ordinary not-found error.
+            if (claim) {
+                pg::PgResult bound = pg::exec_params(
+                    conn,
+                    "SELECT id, workflow_id, request_fingerprint, status, started_at "
+                    "FROM workflow_engine.workflow_executions "
+                    "WHERE principal = $1 AND idempotency_key = $2",
+                    std::vector<std::string>{claim->principal, claim->key});
+                if (bound.status() != PGRES_TUPLES_OK) {
+                    spdlog::error("WorkflowEngine::execute: idempotency read failed: {}",
+                                  PQresultErrorMessage(bound.get()));
+                    return false;
+                }
+                if (PQntuples(bound.get()) > 0) {
+                    admission = Admission::kReplay;
+                    replay.execution_id = col_str(bound.get(), 0, 0);
+                    replay.workflow_id = col_str(bound.get(), 0, 1);
+                    replay.fingerprint = col_str(bound.get(), 0, 2);
+                    replay.status = col_str(bound.get(), 0, 3);
+                    replay.started_at = to_i64(col(bound.get(), 0, 4));
+                }
+            }
+            // Replay, or the workflow vanished/soft-deleted since get_workflow() above: commit
+            // the (no-op) txn; the caller gets the replay or the ordinary not-found error.
             return true;
         }
-        admitted = true;
+        admission = Admission::kAdmitted;
 
         for (const auto& step : workflow.steps) {
             pg::PgResult sres = pg::exec_params(
@@ -771,7 +833,12 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
 
     if (!ok)
         return std::unexpected(std::string(kDbErrorPrefix) + "failed to admit execution");
-    if (!admitted)
+    if (admission == Admission::kReplay) {
+        if (control.on_replay)
+            control.on_replay(replay);
+        return std::unexpected(std::string(kWorkflowIdempotentReplayError));
+    }
+    if (admission != Admission::kAdmitted)
         return std::unexpected("workflow not found: " + workflow_id);
 
     // Every write from here on is standalone/best-effort (ADR-0064 "Mid-execution write
@@ -1295,6 +1362,32 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
 }
 
 // ── Execution queries ───────────────────────────────────────────────────────
+
+std::expected<std::optional<WorkflowIdempotentRun>, std::string> WorkflowEngine::find_execution_by_key(
+    const std::string& principal, const std::string& idempotency_key) const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kDbErrorPrefix) + "pool exhausted");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id, workflow_id, request_fingerprint, status, started_at "
+        "FROM workflow_engine.workflow_executions WHERE principal = $1 AND idempotency_key = $2",
+        std::vector<std::string>{principal, idempotency_key});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::nullopt;
+    WorkflowIdempotentRun run;
+    run.execution_id = col_str(res.get(), 0, 0);
+    run.workflow_id = col_str(res.get(), 0, 1);
+    run.request_fingerprint = col_str(res.get(), 0, 2);
+    run.status = col_str(res.get(), 0, 3);
+    run.started_at = to_i64(col(res.get(), 0, 4));
+    return run;
+}
 
 std::expected<std::optional<WorkflowExecution>, std::string> WorkflowEngine::get_execution(
     const std::string& id) const {

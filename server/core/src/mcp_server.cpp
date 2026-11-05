@@ -1338,12 +1338,26 @@ static const ToolDef kTools[] = {
     // POST /api/v1/workflows/{id}/execute.
     {"execute_workflow",
      "Run a multi-step workflow (see list_workflows / get_workflow) against the named devices. "
+     "SEND AN idempotency_key (REQUIRED): a fresh unique string per intended run, 8 to 128 "
+     "characters from A-Z a-z 0-9 . _ : -, scoped to you. A repeat of the SAME key and the same "
+     "request is SAFE: it sends nothing and answers with the run the key is bound to (status "
+     "completed, failed, running or indeterminate, idempotent_replay true), needs no new approval "
+     "and no approval_id, and is answered even while the server is shutting down or at the run "
+     "cap. NEVER re-send this call without the key you first used. A deliberate second run needs "
+     "a NEW key; the key stays bound to its run for the life of the run record. The same key with "
+     "a different workflow_id or agent_ids is refused -32602 reason idempotency_key_conflict "
+     "(terminal). A replay's status running (retry_after_ms 2000) means POLL get_workflow_execution, "
+     "never re-send; past about 2 minutes treat a run that is still running as indeterminate "
+     "(the server answers indeterminate, retryable false, once it has run for 180 seconds): "
+     "read get_workflow_execution, where a step with no command_id was never sent, and inspect "
+     "the step results before deciding on a new key. "
      "SYNCHRONOUS DISPATCH, ASYNC DEVICE WORK: the call returns once every step's command has "
      "been SENT (it can take as long as the workflow's step retries and delays, but never longer "
      "than a 60 second run budget), not when devices "
      "finish; read the outcome with get_workflow_execution on the returned execution_id, and the "
-     "devices' own results with query_responses by each step's command_id. NEVER re-send this "
-     "call to 'retry': a second call sends every step to the devices a second time. "
+     "devices' own results with query_responses by each step's command_id. A call without a "
+     "key must never be re-sent to 'retry' (it is refused here): a second run sends every step "
+     "to the devices a second time. "
      "agent_ids is REQUIRED (1 to 10000 ids): a workflow run names its devices; there is no scope "
      "and no fleet-wide default. Each step is sent only to the agents you can see; ids outside "
      "your visibility are silently dropped, and a step that then reaches nobody is reported in "
@@ -1428,19 +1442,23 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("workflow_id":{"type":"string","minLength":1,"maxLength":128,"description":"Workflow id from list_workflows"},)j"
      R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128},"description":"Agent ids to run the workflow against. Required: there is no scope and no fleet-wide default"},)j"
+     R"j("idempotency_key":{"type":"string","minLength":8,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$","description":"REQUIRED. A unique string per intended run, scoped to you and bound to the run for the life of its record; repeat the same key (with the same workflow_id and agent_ids) to learn what happened to a call whose answer was lost, never to run again"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"})j"
-     R"j(},"required":["workflow_id","agent_ids"],"additionalProperties":false})j",
+     R"j(},"required":["workflow_id","agent_ids","idempotency_key"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{)j"
      R"j("execution_id":{"type":"string","description":"Read the run with get_workflow_execution"},)j"
+     R"j("idempotent_replay":{"type":"boolean","description":"Present (true) only when the idempotency_key was already bound to a run and this call sent nothing: the other fields then describe that run, thinly (status, started_at, message), and steps and late_denied are absent"},)j"
+     R"j("started_at":{"type":"integer","description":"Present only on an idempotent replay: when the run started, epoch seconds"},)j"
      R"j("workflow_id":{"type":"string"},)j"
-     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), or the zero-reach cause token when no step reached any agent"},)j"
+     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), or the zero-reach cause token when no step reached any agent. On an idempotent replay: completed, failed (retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started; retryable false)"},)j"
      R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
      R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
-     R"j("message":{"type":"string","description":"Present only when no step reached any agent"},)j"
+     R"j("remediation":{"type":"string","description":"Present only on an indeterminate idempotent replay"},)j"
+     R"j("message":{"type":"string","description":"Present when no step reached any agent, and on an idempotent replay"},)j"
      R"j("reason":{"type":"string","enum":["deadline_exceeded","server_shutdown","credential_revoked","credential_indeterminate"],"description":"Present only when the run was stopped: the 60 second run budget (deadline_exceeded), the server stopping (server_shutdown, status interrupted), or the caller's credential check before a step (credential_revoked, or credential_indeterminate when it could not be confirmed after one retry; status aborted)"},)j"
      R"j("retry_after_ms":{"type":["integer","null"],"description":"Present only when no step reached any agent: 5000 for a retryable cause, null for a permanent one"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row failed to persist after the run had started"})j"
-     R"j(},"required":["execution_id","workflow_id","status","steps"]})j"},
+     R"j(},"required":["execution_id","workflow_id","status"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
@@ -8456,12 +8474,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Strict arguments: the C8 schema check only runs for approval-gated callers.
                 for (auto it = args.begin(); it != args.end(); ++it) {
                     if (it.key() != "workflow_id" && it.key() != "agent_ids" &&
-                        it.key() != "approval_id") {
+                        it.key() != "idempotency_key" && it.key() != "approval_id") {
                         res.set_content(
                             error_response(id, kInvalidParams,
                                            "unknown argument '" + it.key().substr(0, 64) +
-                                               "'; execute_workflow takes workflow_id, agent_ids "
-                                               "and approval_id"),
+                                               "'; execute_workflow takes workflow_id, agent_ids, "
+                                               "idempotency_key and approval_id"),
                             "application/json");
                         return std::nullopt;
                     }
@@ -8491,8 +8509,27 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return std::nullopt;
                 }
+                // The idempotency key is REQUIRED here (the blind-retry surface: every MCP caller
+                // is supervised, so a keyless retry is a fresh mint plus a second human approval
+                // plus a full re-send). Bound-checked before anything is minted, leased or read.
+                const auto key = param_string_strict(args, "idempotency_key");
+                const auto key_error =
+                    !key ? std::optional<WorkflowExecuteBodyError>{WorkflowExecuteBodyError{
+                               "idempotency_key_required",
+                               "idempotency_key is required: send a unique string of 8 to 128 "
+                               "characters from A-Z a-z 0-9 . _ : - and repeat the SAME key to "
+                               "learn the outcome of a call whose answer was lost, never to run "
+                               "again"}}
+                         : check_workflow_idempotency_key(*key);
+                if (key_error) {
+                    mcp_audit("denied", "reason=" + key_error->reason);
+                    res.set_content(error_response(id, kInvalidParams, key_error->message), // retry-hint-exempt: input-parse failure, not a store fault
+                                    "application/json");
+                    return std::nullopt;
+                }
                 WorkflowMcpCall call;
                 call.workflow_id = *wf_id;
+                call.wreq.idempotency_key = *key;
                 call.wreq.workflow_id = *wf_id;
                 call.wreq.agent_ids = std::move(*agent_ids);
                 // The caller's REAL DispatchCaller; an unwired derivation fails CLOSED on
@@ -8565,6 +8602,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                       {{"route", "workflow"}, {"phase", "dispatch"}})
                             .increment();
                     } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the answer
+                    }
+                };
+                ports.count_idempotent = [&](std::string_view outcome) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter(kWorkflowRunIdempotentMetric,
+                                      {{"outcome", std::string(outcome)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
                     }
                 };
                 return ports;
@@ -8684,6 +8732,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                              true, out.reason),
                                     "application/json");
                     return;
+                case WES::kIdempotencyConflict: {
+                    // The key is bound to a DIFFERENT request: terminal, no retry hint. The run it
+                    // is bound to is the caller's own, so its id is handed back.
+                    nlohmann::json data{{"correlation_id", yuzu::server::detail::make_correlation_id()},
+                                        {"retry_after_ms", nullptr},
+                                        {"remediation", out.remediation},
+                                        {"reason", out.reason},
+                                        {"execution_id", out.execution_id}};
+                    res.set_content(error_response(id, kInvalidParams, out.message, data.dump()),
+                                    "application/json");
+                    return;
+                }
+                case WES::kIdempotentReplay: // answered by respond_workflow_idempotency, never here
                 case WES::kOk:
                 case WES::kRunIncomplete:
                 case WES::kNoAgentsReached:
@@ -8698,6 +8759,27 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 res.set_content(error_response(id, kInvalidParams, out.message),
                                 "application/json");
+            };
+
+            // The answer to the idempotency pre-check (`check_workflow_idempotency`): a replay is a
+            // SUCCESS envelope carrying the thin body (nothing was sent), anything else is the
+            // refusal the shared sequence rendered. A terminal replay is audited here as well as by
+            // the sequence (workflow.execute); a running replay writes no row (polling must not).
+            const auto respond_workflow_idempotency = [&](const WorkflowExecuteOutcome& out,
+                                                          const std::string& workflow_id) {
+                if (out.status != WorkflowExecuteStatus::kIdempotentReplay) {
+                    render_workflow_refusal(out);
+                    return;
+                }
+                if (out.replay_status != kReplayRunning)
+                    mcp_audit("success", "execution_id=" + audit_caller_id(out.execution_id) +
+                                             " idempotent_replay=true run_status=" +
+                                             out.replay_status);
+                res.set_content(
+                    success_response(id, tool_result(workflow_idempotent_replay_json(out, workflow_id)
+                                                         .dump(),
+                                                     kObjectOutputSchema)),
+                    "application/json");
             };
 
             // ── C8: Generic tier + approval checks via catalogue().security ──
@@ -9094,6 +9176,16 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         try {
                             const auto ports = make_workflow_ports();
+                            // A repeat of the idempotency key is answered HERE, after the tier and
+                            // Workflow:Execute gates above and before the probe, the ticket mint
+                            // and the lease: a retry whose ticket is spent, or that carries none,
+                            // gets the run the key is bound to with no -32006 and no new approval
+                            // (it sends nothing and discloses only the caller's own row). Allowed
+                            // while draining and at the run cap: it is a short read.
+                            if (auto early = check_workflow_idempotency(ports, call->wreq)) {
+                                respond_workflow_idempotency(*early, call->workflow_id);
+                                return;
+                            }
                             const auto plan = prepare_workflow_execute(ports, call->wreq);
                             if (!plan) {
                                 render_workflow_refusal(plan.error());
@@ -22400,13 +22492,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto call = parse_workflow_call();
                 if (!call)
                     return;
-                // Admission: the recall arm normally holds the lease already (it took it before
-                // the ticket was spent); a caller that did not go through it takes it here, before
-                // any read of the workflow.
-                if (!workflow_run_lease && !admit_workflow_run_mcp())
-                    return;
                 const auto ports = make_workflow_ports();
                 WorkflowExecuteRequest wreq = call->wreq;
+                // Admission: the recall arm normally holds the lease already (it took it before
+                // the ticket was spent, and ran the idempotency pre-check before that); a caller
+                // that did not go through it checks the key, then takes the lease here, before any
+                // read of the workflow. A repeat of the key precedes the lease: it is a short read.
+                if (!workflow_run_lease) {
+                    try {
+                        if (auto early = check_workflow_idempotency(ports, wreq)) {
+                            respond_workflow_idempotency(*early, call->workflow_id);
+                            return;
+                        }
+                    } catch (const std::exception& e) {
+                        respond_workflow_threw(e.what());
+                        return;
+                    }
+                    if (!admit_workflow_run_mcp())
+                        return;
+                }
+                wreq.idempotency_prechecked = true;
                 // The effects the consumed ticket was bound to: the run holds every fresh read to
                 // them, and sends nothing for a step that moved (definition_changed).
                 wreq.expected_step_effects = workflow_bound_effects;
@@ -22430,6 +22535,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 using WES = WorkflowExecuteStatus;
+                if (out.status == WES::kIdempotentReplay) {
+                    // The race: this call lost the engine's atomic claim to one with the same key.
+                    respond_workflow_idempotency(out, call->workflow_id);
+                    return;
+                }
                 if (out.status == WES::kOk || out.status == WES::kRunIncomplete ||
                     out.status == WES::kNoAgentsReached) {
                     auto payload = workflow_execute_result_json(out, call->workflow_id);

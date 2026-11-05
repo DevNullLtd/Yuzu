@@ -21,6 +21,7 @@
 #include "workflow_types.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -43,12 +44,40 @@ enum class WorkflowStopLevel {
     kStop,
 };
 
+/// A client's idempotency claim on a run: the key is bound to `principal` for the life of the
+/// run's row, and `fingerprint` is what the claim stores so a repeat of the key can be told from a
+/// DIFFERENT request under the same key. All three are required together (the store's CHECK
+/// refuses a key without the other two). Built by `workflow_execute.cpp`; the engine only stores
+/// and compares them.
+struct WorkflowIdempotencyClaim {
+    std::string principal;
+    std::string key;
+    std::string fingerprint;
+};
+
+/// The run an idempotency claim lost to: reported through `WorkflowRunControl::on_replay` when the
+/// engine finds the key already bound, in the same transaction as the lost claim. Nothing was
+/// written and nothing will be dispatched; the run port then returns `std::unexpected` whose text
+/// starts with `kWorkflowIdempotentReplayError`.
+struct WorkflowRunReplay {
+    std::string execution_id;
+    std::string workflow_id;
+    std::string fingerprint;
+    std::string status;
+    std::int64_t started_at{0};
+};
+
+/// The error text a run port returns when `on_replay` was called. A caller that set `on_replay`
+/// reads the replay from there and must not parse this text.
+inline constexpr char kWorkflowIdempotentReplayError[] = "idempotent replay";
+
 /// Per-run controls. Every member is optional and an unset member is no hook, so a caller that
 /// sets none gets the engine's plain behaviour. The engine consumes the members it supports; a
 /// member it does not yet consume is ignored. Members are added here as the engine gains the
 /// matching hook, so the port signature never changes.
 ///
-/// Consumed today: `on_admitted`, `before_attempt`, `deadline`, `should_stop` and `on_interrupted`.
+/// Consumed today: `on_admitted`, `before_attempt`, `deadline`, `should_stop`, `on_interrupted`,
+/// `idempotency` and `on_replay`.
 struct WorkflowRunControl {
     /// Called once with the new run's execution id after the engine has admitted the run and
     /// before the first step is dispatched.
@@ -70,6 +99,18 @@ struct WorkflowRunControl {
     /// caller learns the run was interrupted at the moment the engine acted, never inferred
     /// afterwards. Not called for `kDraining` (the run goes on) or for a deadline.
     std::function<void()> on_interrupted;
+    /// Unset == a keyless run (the legacy route, and any caller that sent no key): admission is
+    /// exactly what it was. Set: the engine claims `(principal, key)` ATOMICALLY with the run's
+    /// admission, in the one transaction that creates the execution row. There are three
+    /// outcomes, and none is a retry: ADMITTED (the run goes on, the row carries the claim);
+    /// REPLAY (the key is already bound to a run: `on_replay` is called with that run and the
+    /// port returns `std::unexpected` starting with `kWorkflowIdempotentReplayError`; nothing was
+    /// written); NOT FOUND (no run is bound to the key and the workflow is gone or
+    /// soft-deleted: the ordinary "workflow not found" error, never mistaken for a replay).
+    std::optional<WorkflowIdempotencyClaim> idempotency;
+    /// Called once with the run the key is bound to, when the claim found one. Required to be set
+    /// with `idempotency` (the caller has no other way to tell a replay from an error).
+    std::function<void(const WorkflowRunReplay&)> on_replay;
 };
 
 using WorkflowRunFn = std::function<std::expected<std::string, std::string>(

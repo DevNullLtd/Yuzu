@@ -32734,7 +32734,8 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // #2146 batch B: Workflow:Execute is supervised-tier gated (requires_approval(), owner
         // ruling 2026-10-30); the operator tier is denied outright by tier_allows().
         {"execute_workflow",
-         nlohmann::json::parse(R"({"workflow_id":"wf-1","agent_ids":["agent-1"]})")},
+         nlohmann::json::parse(
+             R"({"workflow_id":"wf-1","agent_ids":["agent-1"],"idempotency_key":"key-0123456789"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
@@ -47984,9 +47985,21 @@ struct WfExecDispatchProbe {
     }
 };
 
-std::string wf_exec_call(const std::string& arguments, int id = 1) {
+// The idempotency key is REQUIRED on execute_workflow (#2146). Every case that is not ABOUT the
+// key gets this one injected, so its arguments (and the ticket subject they bind) stay stable
+// across a mint and its recall. `wf_exec_call_raw` sends the arguments exactly as written.
+constexpr const char* kWfDefaultKey = "wf-test-key-0001";
+
+std::string wf_exec_call_raw(const std::string& arguments, int id = 1) {
     return R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(id) +
            R"(,"params":{"name":"execute_workflow","arguments":)" + arguments + "}}";
+}
+
+std::string wf_exec_call(const std::string& arguments, int id = 1) {
+    auto j = nlohmann::json::parse(arguments, nullptr, false);
+    if (j.is_object() && !j.contains("idempotency_key"))
+        j["idempotency_key"] = kWfDefaultKey;
+    return wf_exec_call_raw(j.is_discarded() ? arguments : j.dump(), id);
 }
 
 } // namespace
@@ -48090,7 +48103,9 @@ TEST_CASE("MCP execute_workflow: the served tool declares approval_id, is destru
             continue;
         found = true;
         CHECK(tool["inputSchema"]["properties"].contains("approval_id"));
-        CHECK(tool["inputSchema"]["required"] == nlohmann::json::array({"workflow_id", "agent_ids"}));
+        CHECK(tool["inputSchema"]["required"] ==
+              nlohmann::json::array({"workflow_id", "agent_ids", "idempotency_key"}));
+        CHECK(tool["inputSchema"]["properties"].contains("idempotency_key"));
         CHECK(tool["inputSchema"]["properties"]["agent_ids"]["maxItems"] == 10000);
         CHECK(tool["annotations"]["readOnlyHint"] == false);
         CHECK(tool["annotations"]["destructiveHint"] == true);
@@ -48103,6 +48118,12 @@ TEST_CASE("MCP execute_workflow: the served tool declares approval_id, is destru
 }
 
 namespace {
+
+std::int64_t wf_epoch_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 // What the PG-backed execute_workflow cases share: a real InstructionStore holding the two step
 // instructions, a workflow double serving them as wf-1, a run port that drives the step callback
@@ -48185,13 +48206,34 @@ struct WfMcpFx {
                 e.workflow_id = "wf-1";
                 e.status = "completed";
                 return std::optional<yuzu::server::WorkflowExecution>{e};
-            });
+            },
+            yuzu::server::test::FnWorkflowApi::ListExecutionsFn{}, find_fn());
     }
+
+    // The idempotency lookup over `bound`. Installed by wire() on whichever double the case
+    // ended up with, so a case that swaps in its own FnWorkflowApi still has it.
+    yuzu::server::test::FnWorkflowApi::FindByKeyFn find_fn() {
+        return [this](const std::string& principal, const std::string& key)
+                   -> std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string> {
+            ++find_calls;
+            if (find_fault)
+                return std::unexpected(std::string{"db: boom"});
+            if (auto it = bound.find({principal, key}); it != bound.end())
+                return std::optional<yuzu::server::WorkflowIdempotentRun>{it->second};
+            return std::optional<yuzu::server::WorkflowIdempotentRun>{};
+        };
+    }
+
+    // The runs an idempotency key is bound to, by (principal, key): what the read seam answers.
+    std::map<std::pair<std::string, std::string>, yuzu::server::WorkflowIdempotentRun> bound;
+    int find_calls{0};
+    bool find_fault{false};
 
     void wire(McpTestServer& ts, yuzu::server::InstructionStore& store,
               yuzu::server::ApprovalManager& appr) {
         ts.instruction_store_for_test = &store;
         ts.approval_manager_for_test = &appr;
+        api->set_find_by_key(find_fn());
         ts.workflow_api_for_test = api;
         ts.caller_fn_for_test = [](const auth::Session&) {
             return yuzu::server::DispatchCaller{.principal = "alice",
@@ -48206,6 +48248,21 @@ struct WfMcpFx {
             -> std::expected<std::string, std::string> {
             ++run_calls;
             seen_deadline = control.deadline;
+            // The engine's atomic claim: a key already bound is a replay, nothing admitted;
+            // otherwise it is bound to the run being admitted.
+            if (control.idempotency) {
+                const auto& c = *control.idempotency;
+                if (auto it = bound.find({c.principal, c.key}); it != bound.end()) {
+                    if (control.on_replay)
+                        control.on_replay(yuzu::server::WorkflowRunReplay{
+                            it->second.execution_id, it->second.workflow_id,
+                            it->second.request_fingerprint, it->second.status,
+                            it->second.started_at});
+                    return std::unexpected(std::string(yuzu::server::kWorkflowIdempotentReplayError));
+                }
+                bound[{c.principal, c.key}] = yuzu::server::WorkflowIdempotentRun{
+                    "exec-1", "wf-1", c.fingerprint, "running", wf_epoch_now()};
+            }
             if (control.on_admitted) // as the real engine: once admitted, before step 1
                 control.on_admitted("exec-1");
             if (on_run)
@@ -48215,6 +48272,9 @@ struct WfMcpFx {
                 if (!r)
                     step_errors.push_back(r.error());
             }
+            if (control.idempotency)
+                bound[{control.idempotency->principal, control.idempotency->key}].status =
+                    "completed";
             return std::string{"exec-1"};
         };
         ts.authorize_dispatch_fn_for_test =
@@ -48681,6 +48741,7 @@ TEST_CASE("MCP execute_workflow: a run the engine stopped for a server stop is `
             e.status = "failed";
             return std::optional<yuzu::server::WorkflowExecution>{e};
         });
+    fx.api->set_find_by_key(fx.find_fn());
     ts.workflow_api_for_test = fx.api;
     ts.workflow_run_for_test = [&](const std::string&, const std::vector<std::string>&,
                                    yuzu::server::StepDispatchFn fn, yuzu::server::ConditionEvalFn,
@@ -48741,6 +48802,7 @@ TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; 
                 e.status = "failed";
                 return std::optional<yuzu::server::WorkflowExecution>{e};
             });
+        fx.api->set_find_by_key(fx.find_fn());
         ts.workflow_api_for_test = fx.api;
         // The engine stand-in asks the hook before every step and stops when it says no, as the
         // real engine does before every dispatch attempt.
@@ -48843,6 +48905,7 @@ TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; 
                 e.status = "completed";
                 return std::optional<yuzu::server::WorkflowExecution>{e};
             });
+        fx.api->set_find_by_key(fx.find_fn());
         ts.workflow_api_for_test = fx.api;
         ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
         const std::string approval_id = wf_mint_and_approve(ts, appr);
@@ -49006,6 +49069,11 @@ TEST_CASE("MCP execute_workflow: a workflow whose retry sleeps exceed the 60 s b
         [](const std::string&)
             -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
             return std::optional<yuzu::server::WorkflowExecution>{};
+        },
+        yuzu::server::test::FnWorkflowApi::ListExecutionsFn{},
+        [](const std::string&, const std::string&)
+            -> std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string> {
+            return std::optional<yuzu::server::WorkflowIdempotentRun>{};
         });
     McpTestServer ts;
     fx.wire(ts, store, appr);
@@ -49114,4 +49182,372 @@ TEST_CASE("MCP execute_workflow: an untiered session is refused by the handler's
     REQUIRE(ok);
     CHECK(nlohmann::json::parse(ok->body).contains("result"));
     CHECK(fx.dispatches == 2);
+}
+
+
+// ── idempotent execute (#2146) ────────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr const char* kWfKey = "wf-test-key-0001"; // == kWfDefaultKey, the helper's injected key
+
+yuzu::server::WorkflowIdempotentRun wf_bound_run(const char* status, std::int64_t age_s = 5,
+                                                 std::vector<std::string> ids = {"a1"}) {
+    yuzu::server::WorkflowExecutePorts none; // default digest: sha256_hex
+    return yuzu::server::WorkflowIdempotentRun{
+        "exec-bound", "wf-1", *yuzu::server::workflow_request_fingerprint(none, "wf-1", ids), status,
+        wf_epoch_now() - age_s};
+}
+
+nlohmann::json wf_payload(const httplib::Response& r) {
+    const auto j = nlohmann::json::parse(r.body);
+    REQUIRE(j.contains("result"));
+    return nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+}
+
+} // namespace
+
+TEST_CASE("MCP execute_workflow: idempotency_key is REQUIRED and bound-checked; a call without a good "
+          "one is -32602 BEFORE any ticket is minted",
+          "[mcp][pg][workflow][twin][idempotency][tier][approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    const std::string long_key(129, 'k');
+    const std::vector<std::string> bad_args = {
+        R"({"workflow_id":"wf-1","agent_ids":["a1"]})",
+        R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":""})",
+        R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":"short"})",
+        R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":"has space in it"})",
+        R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":7})",
+        R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":")" + long_key + R"("})",
+    };
+    int id = 1;
+    for (const auto& args : bad_args) {
+        INFO(args);
+        auto res = ts.call(wf_exec_call_raw(args, id++));
+        REQUIRE(res);
+        const auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == -32602);
+        CHECK(j["error"]["message"].get<std::string>().find("idempotency_key") != std::string::npos);
+        CHECK_FALSE((j["error"].contains("data") && j["error"]["data"].contains("approval_id")));
+    }
+    CHECK(appr.pending_count() == 0); // nothing minted, nothing burned
+    CHECK(fx.run_calls == 0);
+    CHECK(fx.dispatches == 0);
+    CHECK(fx.find_calls == 0); // not even a lookup: the key was refused before any read
+}
+
+TEST_CASE("MCP execute_workflow: the key rides in the ticket's bound arguments, so a different key is a "
+          "different ticket and the same key dedupes",
+          "[mcp][pg][workflow][twin][idempotency][tier][approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    const auto mint = [&](const char* key, int id) {
+        auto r = ts.call(wf_exec_call(std::string(R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":")") + key + R"("})", id));
+        REQUIRE(r);
+        return nlohmann::json::parse(r->body)["error"]["data"]["approval_id"].get<std::string>();
+    };
+    const auto a = mint("key-first-0001", 1);
+    const auto a_again = mint("key-first-0001", 2);
+    const auto b = mint("key-second-001", 3);
+    CHECK(a == a_again);
+    CHECK(a != b);
+    CHECK(appr.pending_count() == 2);
+    // A ticket minted for one key does not redeem for another.
+    REQUIRE(appr.approve(a, "reviewer-bob", ""));
+    auto wrong = ts.call(wf_exec_call(std::string(R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":"key-second-001","approval_id":")") + a + R"("})", 4));
+    REQUIRE(wrong);
+    CHECK(nlohmann::json::parse(wrong->body).contains("error"));
+    CHECK(fx.run_calls == 0);
+    CHECK(appr.get(a)->consumed_at == 0);
+}
+
+TEST_CASE("MCP execute_workflow: a retry after the ticket was SPENT, or with no ticket at all, gets the "
+          "run the key is bound to: no -32006, no new approval, nothing re-sent",
+          "[mcp][pg][workflow][twin][idempotency][tier][approval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+
+    const std::string approval_id = wf_mint_and_approve(ts, appr);
+    auto first = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+    REQUIRE(first);
+    const auto fj = wf_payload(*first);
+    CHECK(fj["status"] == "completed");
+    CHECK_FALSE(fj.contains("idempotent_replay"));
+    REQUIRE(fx.run_calls == 1);
+    REQUIRE(fx.dispatches == 2);
+    REQUIRE(appr.get(approval_id)->consumed_at != 0); // SPENT
+    const auto pending_after = appr.pending_count();
+    const auto authorize_before = fx.authorize_calls;
+
+    // (1) The lost-response retry with the SPENT approval_id.
+    auto spent = ts.call(wf_exec_call(wf_recall_args(approval_id), 3));
+    REQUIRE(spent);
+    INFO(spent->body);
+    const auto sj = wf_payload(*spent);
+    CHECK(sj["idempotent_replay"] == true);
+    CHECK(sj["status"] == "completed");
+    CHECK(sj["execution_id"] == "exec-1");
+    CHECK(sj["workflow_id"] == "wf-1");
+    CHECK(sj.contains("started_at"));
+    CHECK_FALSE(sj.contains("steps"));
+
+    // (2) The retry with NO approval_id at all: not -32006, and no new ticket.
+    auto bare = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 4));
+    REQUIRE(bare);
+    const auto bj = wf_payload(*bare);
+    CHECK(bj["idempotent_replay"] == true);
+    CHECK(bj["execution_id"] == "exec-1");
+
+    CHECK(appr.pending_count() == pending_after);
+    CHECK(fx.run_calls == 1);       // the run port was not reached again
+    CHECK(fx.dispatches == 2);      // nothing was re-sent
+    CHECK(fx.authorize_calls == authorize_before); // not even a probe
+    // A terminal replay is audited once each time; the original run's rows are untouched.
+    CHECK(wf_audit_has(ts, "success", "idempotent_replay=true run_status=completed"));
+}
+
+TEST_CASE("MCP execute_workflow: a replay is answered while the server DRAINS and at the run cap; a new "
+          "key is refused at the same moment",
+          "[mcp][pg][workflow][twin][idempotency][drain][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    fx.bound[{"alice", kWfKey}] = wf_bound_run("completed");
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
+    bool draining = true;
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.stream_budget_for_test = &budget;
+    ts.draining_for_test = [&draining] { return draining; };
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    namespace sb = yuzu::server::detail;
+    std::vector<sb::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < sb::kPerPrincipalWorkflowRun; ++i) {
+        auto r = budget.try_acquire(sb::SseSurface::kWorkflowRun, ts.mock_username,
+                                    sb::kPerPrincipalWorkflowRun);
+        REQUIRE(r.lease);
+        held.push_back(std::move(r.lease));
+    }
+    auto replay = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+    REQUIRE(replay);
+    INFO(replay->body);
+    CHECK(replay->status == 200);
+    CHECK(wf_payload(*replay)["idempotent_replay"] == true);
+    CHECK(budget.active() == held.size());
+    CHECK(appr.pending_count() == 0);
+    // A different key at the same moment is a normal admission refusal.
+    auto fresh = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":"other-key-0002"})", 2));
+    REQUIRE(fresh);
+    // (Admission is checked where the ticket is redeemed, so a fresh key still mints one.)
+    CHECK(nlohmann::json::parse(fresh->body)["error"]["code"] == -32006);
+    CHECK(appr.pending_count() == 1);
+    CHECK(fx.run_calls == 0);
+}
+
+TEST_CASE("MCP execute_workflow: replay answers for a running run (retry_after_ms 2000, NO audit row), "
+          "a failed run and an indeterminate one",
+          "[mcp][pg][workflow][twin][idempotency]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    const auto call = [&](const char* key, int id) {
+        auto r = ts.call(wf_exec_call(std::string(R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":")") + key + R"("})", id));
+        REQUIRE(r);
+        return wf_payload(*r);
+    };
+    fx.bound[{"alice", "key-running-001"}] = wf_bound_run("running", 4);
+    fx.bound[{"alice", "key-failed-0001"}] = wf_bound_run("failed", 40);
+    fx.bound[{"alice", "key-stale-00001"}] = wf_bound_run("running", 900);
+
+    const auto audit_rows = ts.audit_log.size();
+    const auto running = call("key-running-001", 1);
+    CHECK(running["status"] == "running");
+    CHECK(running["retry_after_ms"] == 2000);
+    CHECK(running["idempotent_replay"] == true);
+    CHECK(ts.audit_log.size() == audit_rows); // polling writes no row of any kind (workflow.execute or mcp)
+
+    const auto failed = call("key-failed-0001", 2);
+    CHECK(failed["status"] == "failed");
+    CHECK(failed["retryable"] == false);
+    CHECK_FALSE(failed.contains("retry_after_ms"));
+
+    const auto stale = call("key-stale-00001", 3);
+    CHECK(stale["status"] == "indeterminate");
+    CHECK(stale["retryable"] == false);
+    CHECK_FALSE(stale.contains("retry_after_ms"));
+    CHECK(stale["remediation"].get<std::string>().find("get_workflow_execution") != std::string::npos);
+
+    CHECK(fx.run_calls == 0);
+    CHECK(fx.dispatches == 0);
+    CHECK(appr.pending_count() == 0);
+}
+
+TEST_CASE("MCP execute_workflow: the same key with a different request is -32602 "
+          "idempotency_key_conflict, terminal, and mints nothing",
+          "[mcp][pg][workflow][twin][idempotency][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    fx.bound[{"alice", kWfKey}] = wf_bound_run("completed", 5, {"a1"});
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    auto res = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1","a2"]})", 1));
+    REQUIRE(res);
+    INFO(res->body);
+    const auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == -32602);
+    CHECK(j["error"]["data"]["reason"] == "idempotency_key_conflict");
+    CHECK(j["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["data"]["execution_id"] == "exec-bound");
+    CHECK(appr.pending_count() == 0);
+    CHECK(fx.run_calls == 0);
+    CHECK(wf_audit_has(ts, "denied", "reason=idempotency_key_conflict"));
+}
+
+TEST_CASE("MCP execute_workflow: a lookup that fails is a retryable -32603 with no ticket, nothing "
+          "sent and nothing written",
+          "[mcp][pg][workflow][twin][idempotency][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    fx.find_fault = true;
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    auto res = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+    REQUIRE(res);
+    const auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == -32603);
+    CHECK(j["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(appr.pending_count() == 0);
+    CHECK(fx.run_calls == 0);
+    CHECK(fx.dispatches == 0);
+    CHECK(fx.authorize_calls == 0);
+}
+
+TEST_CASE("MCP execute_workflow: a caller with no tier (the handler path) claims the key on the first "
+          "call and gets the replay on the second, with one send",
+          "[mcp][pg][workflow][twin][idempotency]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn());
+    auto first = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+    REQUIRE(first);
+    CHECK(wf_payload(*first)["status"] == "completed");
+    CHECK(fx.find_calls == 1); // one pre-check read for the first call
+    auto second = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 2));
+    REQUIRE(second);
+    const auto sj = wf_payload(*second);
+    CHECK(sj["idempotent_replay"] == true);
+    CHECK(sj["execution_id"] == "exec-1");
+    CHECK(fx.run_calls == 1);
+    CHECK(fx.dispatches == 2);
+}
+
+TEST_CASE("MCP execute_workflow: the served tool leads with the key, requires it, bounds it, keeps "
+          "idempotentHint false and declares the thin replay in its output schema",
+          "[mcp][workflow][twin][idempotency][schema]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    bool found = false;
+    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"]) {
+        if (tool["name"] != "execute_workflow")
+            continue;
+        found = true;
+        const auto desc = tool["description"].get<std::string>();
+        // The guidance leads: it is in the first 300 bytes, before the dispatch explanation.
+        CHECK(desc.substr(0, 300).find("idempotency_key") != std::string::npos);
+        CHECK(desc.substr(0, 400).find("REQUIRED") != std::string::npos);
+        CHECK(desc.find("A repeat of the SAME key and the same request is SAFE") != std::string::npos);
+        CHECK(desc.find("NEVER re-send this call without the key you first used") != std::string::npos);
+        CHECK(desc.find("A deliberate second run needs a NEW key") != std::string::npos);
+        CHECK(desc.find("idempotency_key_conflict") != std::string::npos);
+        CHECK(desc.find("indeterminate") != std::string::npos);
+        const auto& key = tool["inputSchema"]["properties"]["idempotency_key"];
+        CHECK(key["type"] == "string");
+        CHECK(key["minLength"] == 8);
+        CHECK(key["maxLength"] == 128);
+        CHECK(key["pattern"] == "^[A-Za-z0-9._:-]+$");
+        CHECK(tool["inputSchema"]["additionalProperties"] == false);
+        CHECK(tool["annotations"]["idempotentHint"] == false); // a keyed repeat is safe in prose only
+        const auto& out = tool["outputSchema"];
+        CHECK(out["required"] == nlohmann::json::array({"execution_id", "workflow_id", "status"}));
+        CHECK(out["properties"].contains("idempotent_replay"));
+        CHECK(out["properties"].contains("started_at"));
+        CHECK(out["properties"].contains("steps")); // still declared, no longer required
+    }
+    CHECK(found);
+
+    // The strict-argument allowlist names the key.
+    McpTestServer strict;
+    strict.start();
+    auto bogus = strict.call(wf_exec_call_raw(R"({"workflow_id":"wf-1","agent_ids":["a1"],"bogus":1})", 2));
+    REQUIRE(bogus);
+    const auto bj = nlohmann::json::parse(bogus->body);
+    CHECK(bj["error"]["message"].get<std::string>().find("idempotency_key") != std::string::npos);
 }

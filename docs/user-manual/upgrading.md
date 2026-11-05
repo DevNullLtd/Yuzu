@@ -359,6 +359,21 @@ The ticket for `execute_instruction_definition`, `create_result_set_from_instruc
 
 **Rollback.** Rolling back restores the old behaviour: a `supervised` token again runs a workflow without a ticket. No data changes in either direction.
 
+## ⚠️ Breaking: workflow execution is capped per principal and idempotent on a client key (#2146)
+
+**What changed.** Four things, all on workflow execution.
+
+1. **A run holds a slot.** A workflow run is synchronous and holds an HTTP worker for up to 60 seconds, so `POST /api/v1/workflows/{id}/execute`, MCP `execute_workflow` and the LEGACY `POST /api/workflows/{id}/execute` now share one admission step: at most 2 concurrent runs per principal, drawn from the same held-open budget as the streaming endpoints (`--max-sse-streams`), and no new run while the server drains. **A legacy caller that ran more than 2 workflow executes at once per principal was unbounded before and now gets `429` (`Retry-After: 5`); it gets `503` while the server shuts down.** Nothing was read, sent or audited on a refusal, so retrying is safe. See `yuzu_server_workflow_run_refused_total{reason}` and `yuzu_server_workflow_runs_in_flight`.
+2. **Idempotency key.** MCP `execute_workflow` REQUIRES an `idempotency_key` argument (8 to 128 characters from `A-Z a-z 0-9 . _ : -`); a call without a valid one is `-32602`. The REST v1 route accepts an optional `Idempotency-Key` header (also added to the CORS allowed headers). A repeat of a key with the same request sends nothing and answers with the run the key is bound to; the same key with a different request is `422` / `-32602` `idempotency_key_conflict`. The legacy route takes no key and is unchanged. A client that wraps `execute_workflow` must now generate a unique key per intended run and reuse it only to retry a lost answer.
+3. **Schema.** The `workflow_engine` schema moves to v3: `workflow_executions` gains `principal`, `idempotency_key` and `request_fingerprint` (all NULL on a keyless run), a CHECK that a key always has its principal and fingerprint, and a partial UNIQUE index `idx_wf_exec_idem` on `(principal, idempotency_key)`. The index is a plain (transactional) build, accepted because the 0.15.0 deployment contract is a fresh database where the table is empty (docs/postgres-store-playbook.md "Recorded exception"). No existing run is given a key.
+4. **Retention.** A key stays bound to its run for as long as the run's row exists; nothing prunes that table today.
+
+**Who is affected.** Automation that calls the legacy execute route with more than 2 concurrent runs per principal; every MCP client that calls `execute_workflow`.
+
+**What to do.** Cap concurrent workflow runs per principal at 2 or honour `Retry-After`. Generate a fresh key per intended run and send the SAME key when retrying a call whose answer you did not receive; poll `get_workflow_execution` for a `running` answer, and treat a run that has been `running` for about 2 minutes as indeterminate (the server says so from 180 seconds).
+
+**Rollback.** Rolling back to a build without these changes is outside the 0.15.0 deployment contract (see "Deployment contract (hard cutover)"). The new columns are nullable and the old build ignores them, but the old build would not honour a key.
+
 ## ⚠️ Breaking: /mcp/v1/ refuses callers whose credential carries no MCP tier (#4309)
 
 **What changed.** `GET`, `POST` and `DELETE` on `/mcp/v1/` now refuse every authenticated credential whose MCP tier is empty, for every principal, with HTTP `403` and JSON-RPC `-32003`. The message is `/mcp/v1/ requires an MCP-tier bearer token`; the body has a `null` id, a `correlation_id`, `retry_after_ms: null` and a `remediation`, and no `permission` field. Two credential kinds carry no tier: a browser session cookie (local, OIDC or SAML sign-in) and an API token minted without `mcp_tier` (this includes a service-scoped token, one minted with `scope_service`, that has no tier). There is no engine special case: an engine token is always minted with tier `readonly`, so it is admitted, and a tierless engine row would be refused. There is no flag and no kill switch for this check, by design: a default-open flag would keep the gap open, and the remedy is one REST call.

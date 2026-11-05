@@ -45,6 +45,12 @@ public:
         return engine_.query_executions_page(q, visible);
     }
 
+    [[nodiscard]] std::expected<std::optional<WorkflowIdempotentRun>, std::string>
+    find_execution_by_key(const std::string& principal,
+                          const std::string& idempotency_key) const override {
+        return engine_.find_execution_by_key(principal, idempotency_key);
+    }
+
 private:
     WorkflowEngine& engine_;
 };

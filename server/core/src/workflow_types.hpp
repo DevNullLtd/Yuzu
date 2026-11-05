@@ -120,6 +120,17 @@ struct WorkflowExecution {
     std::vector<WorkflowStepResult> step_results;
 };
 
+/// The run a client's idempotency key is bound to (`WorkflowApi::find_execution_by_key`): just
+/// enough to answer a repeat of the call without reading the run's steps. `request_fingerprint`
+/// is the opaque value the claim stored (workflow_execute.hpp computes it).
+struct WorkflowIdempotentRun {
+    std::string execution_id;
+    std::string workflow_id;
+    std::string request_fingerprint;
+    std::string status; // the engine's recorded status: "running", "completed", "failed", ...
+    int64_t started_at{0}; // epoch seconds, as WorkflowExecution::started_at
+};
+
 struct WorkflowQuery {
     std::string name_filter;
     int limit{100};

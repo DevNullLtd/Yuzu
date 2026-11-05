@@ -170,6 +170,11 @@ public:
     /// lease; if that also fails the row stays `running`, the error is logged and
     /// `yuzu_server_workflow_finalize_failed_total` counts it.
     ///
+    /// IDEMPOTENCY. `control.idempotency` claims `(principal, key)` in the same transaction that
+    /// admits the run, so two concurrent calls with one key start exactly one run. The loser gets
+    /// `control.on_replay` and a `kWorkflowIdempotentReplayError` result, writes nothing and
+    /// dispatches nothing. See `WorkflowRunControl::idempotency`.
+    ///
     /// `control` carries the run's bounds (`workflow_run_port.hpp`): before every dispatch attempt
     /// the engine asks `control.before_attempt` and compares `control.deadline` with the steady
     /// clock; either refusing STOPS the run (the attempt is not made, the step is recorded failed,
@@ -183,6 +188,15 @@ public:
         ConditionEvalFn condition_fn = nullptr,
         std::function<void(const std::string& execution_id)> on_admitted = nullptr,
         const WorkflowRunControl& control = {});
+
+    /// The run a client's idempotency key is bound to, or `nullopt` when none is. Bound to
+    /// `principal`, never global: the same key under two principals is two keys. `unexpected(msg)`
+    /// (prefixed `kDbErrorPrefix`) is a genuine read failure and is NEVER "no run bound", because
+    /// the caller then dispatches (workflow_execute.hpp fails the call closed instead). The key is
+    /// bound for the life of the run's row; nothing deletes a workflow execution today, and a
+    /// future prune of this table owns the retention obligation (docs/clock-guarded-retention.md).
+    std::expected<std::optional<WorkflowIdempotentRun>, std::string> find_execution_by_key(
+        const std::string& principal, const std::string& idempotency_key) const;
 
     /// Get execution status with step results.
     std::expected<std::optional<WorkflowExecution>, std::string> get_execution(

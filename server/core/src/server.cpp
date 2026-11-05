@@ -1629,6 +1629,25 @@ public:
         for (const auto reason : yuzu::server::kWorkflowRunRefusedReasons)
             metrics_.counter(yuzu::server::kWorkflowRunRefusedMetric,
                              {{"reason", std::string(reason)}});
+        // Repeats of a workflow-run idempotency key answered WITHOUT sending anything, by
+        // outcome: replayed (the run it is bound to is terminal), in_progress (that run is still
+        // running: the caller is told to poll), conflict (the same key with a different request,
+        // HTTP 422 / MCP -32602). Closed set, every member pre-seeded. A running replay writes no
+        // audit row, so this counter is its only record.
+        metrics_.describe(yuzu::server::kWorkflowRunIdempotentMetric,
+                          "Repeats of a workflow-run idempotency key (POST /api/v1/workflows/{id}/"
+                          "execute Idempotency-Key header, MCP execute_workflow idempotency_key) "
+                          "answered without sending anything, by outcome: replayed (the run the "
+                          "key is bound to is completed, failed or indeterminate), in_progress "
+                          "(that run is still running; the caller polls get_workflow_execution), "
+                          "conflict (the key is bound to a different request; HTTP 422, MCP "
+                          "-32602, terminal). A sustained in_progress rate means clients poll by "
+                          "repeating the call, which is correct; a rising conflict rate means "
+                          "clients reuse keys across different requests",
+                          "counter");
+        for (const auto outcome : yuzu::server::kWorkflowRunIdempotentOutcomes)
+            metrics_.counter(yuzu::server::kWorkflowRunIdempotentMetric,
+                             {{"outcome", std::string(outcome)}});
         // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
         // `event_type` set, pre-seeded. Only the v1 / MCP twins count here (event_emit_hook.hpp);
         // the legacy routes' own emit calls do not touch this counter.
@@ -16466,7 +16485,7 @@ private:
                 }
                 res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
                 res.set_header("Access-Control-Allow-Headers",
-                               "Content-Type, Authorization, X-Yuzu-Token");
+                               "Content-Type, Authorization, X-Yuzu-Token, Idempotency-Key");
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 

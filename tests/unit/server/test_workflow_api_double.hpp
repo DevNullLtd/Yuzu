@@ -35,13 +35,19 @@ public:
     using ListExecutionsFn = std::function<std::expected<yuzu::server::WorkflowExecutionPage, std::string>(
         const yuzu::server::WorkflowExecutionListQuery&, const yuzu::server::authz::VisibleSet&)>;
 
-    // The fourth function defaults to unwired so the existing three-argument construction sites
-    // (which never list) stay unchanged.
+    /// (principal, idempotency_key) -> the run the key is bound to, or a store failure.
+    using FindByKeyFn = std::function<
+        std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string>(
+            const std::string&, const std::string&)>;
+
+    // The fourth and fifth functions default to unwired so the existing three-argument
+    // construction sites (which never list and never send a key) stay unchanged.
     FnWorkflowApi(ListFn list_fn, GetFn get_fn, GetExecutionFn get_execution_fn,
-                  ListExecutionsFn list_executions_fn = {})
+                  ListExecutionsFn list_executions_fn = {}, FindByKeyFn find_by_key_fn = {})
         : list_fn_(std::move(list_fn)), get_fn_(std::move(get_fn)),
           get_execution_fn_(std::move(get_execution_fn)),
-          list_executions_fn_(std::move(list_executions_fn)) {}
+          list_executions_fn_(std::move(list_executions_fn)),
+          find_by_key_fn_(std::move(find_by_key_fn)) {}
 
     [[nodiscard]] std::expected<std::vector<yuzu::server::Workflow>, std::string>
     list_workflows(const yuzu::server::WorkflowQuery& q) const override {
@@ -72,11 +78,24 @@ public:
         return list_executions_fn_(q, scope);
     }
 
+    /// Installs (or replaces) the idempotency lookup after construction, for a fixture that builds
+    /// the double through a constructor call it does not own. Set-before-traffic.
+    void set_find_by_key(FindByKeyFn fn) { find_by_key_fn_ = std::move(fn); }
+
+    [[nodiscard]] std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string>
+    find_execution_by_key(const std::string& principal,
+                          const std::string& idempotency_key) const override {
+        if (!find_by_key_fn_)
+            return std::unexpected(std::string{"FnWorkflowApi: find_execution_by_key unwired"});
+        return find_by_key_fn_(principal, idempotency_key);
+    }
+
 private:
     ListFn list_fn_;
     GetFn get_fn_;
     GetExecutionFn get_execution_fn_;
     ListExecutionsFn list_executions_fn_;
+    FindByKeyFn find_by_key_fn_;
 };
 
 } // namespace yuzu::server::test

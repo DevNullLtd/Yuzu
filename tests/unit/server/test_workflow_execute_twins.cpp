@@ -28,6 +28,7 @@
 #include "dispatch_target_shape.hpp"
 #include "dispatch_zero_reach.hpp"
 #include "mcp_policy.hpp"
+#include "sha256_hex.hpp"
 #include "stream_budget.hpp"
 #include "test_route_sink.hpp"
 #include "test_workflow_api_double.hpp"
@@ -42,6 +43,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -166,6 +168,35 @@ struct Fx {
         return reauth_after;
     }
 
+    // ── idempotency (#2146) ──
+    // The runs the stand-in engine has bound a key to, by (principal, key). The pre-check reads
+    // it through find_execution_by_key; the stand-in engine's atomic claim reads and writes it.
+    std::map<std::pair<std::string, std::string>, WorkflowIdempotentRun> bound;
+    int find_calls{0};
+    bool find_fault{false};
+    std::int64_t fixed_now{1'000'000};
+    std::optional<WorkflowIdempotencyClaim> seen_claim;
+    std::map<std::string, int> idem_counts;
+    /// Called by the stand-in engine right before it claims: lets a test bind a competing run
+    /// AFTER the pre-check said "none" (the lost race).
+    std::function<void(const WorkflowIdempotencyClaim&)> before_claim;
+
+    /// The fingerprint the sequence computes for (workflow_id, ids), as the spec writes it.
+    static std::string fingerprint_of(const std::string& wf, std::vector<std::string> ids) {
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        std::string material = "wf-exec-v1\n" + wf;
+        for (const auto& id : ids)
+            material += "\n" + id;
+        return *sha256_hex(material);
+    }
+    void bind(const std::string& principal, const std::string& key, const std::string& status,
+              std::int64_t started_ago_s = 1, const std::string& wf = "wf-1",
+              std::vector<std::string> ids = {"a1"}, const std::string& exec = "exec-bound") {
+        bound[{principal, key}] = WorkflowIdempotentRun{exec, wf, fingerprint_of(wf, std::move(ids)),
+                                                        status, fixed_now - started_ago_s};
+    }
+
     WorkflowExecuteRequest request(std::vector<std::string> ids = {"a1"}) {
         WorkflowExecuteRequest r;
         r.workflow_id = "wf-1";
@@ -213,7 +244,17 @@ struct Fx {
             e.status = engine_status;
             return std::optional<WorkflowExecution>{e};
         };
-        return std::make_shared<test::FnWorkflowApi>(test::FnWorkflowApi::ListFn{}, get, get_exec);
+        auto find = [this](const std::string& principal, const std::string& key)
+            -> std::expected<std::optional<WorkflowIdempotentRun>, std::string> {
+            ++find_calls;
+            if (find_fault)
+                return std::unexpected(std::string{"db: boom"});
+            if (auto it = bound.find({principal, key}); it != bound.end())
+                return std::optional<WorkflowIdempotentRun>{it->second};
+            return std::optional<WorkflowIdempotentRun>{};
+        };
+        return std::make_shared<test::FnWorkflowApi>(test::FnWorkflowApi::ListFn{}, get, get_exec,
+                                                      test::FnWorkflowApi::ListExecutionsFn{}, find);
     }
 
     /// The stand-in for the engine behind the run port: it drives the steps in order,
@@ -230,6 +271,25 @@ struct Fx {
                 return engine_error;
             if (engine_throws_before_admit)
                 throw std::runtime_error("engine exploded before admission");
+            // The engine's atomic claim: a key already bound is a replay (nothing admitted);
+            // otherwise the claim binds it to the run being admitted.
+            seen_claim = control.idempotency;
+            if (control.idempotency) {
+                const auto& c = *control.idempotency;
+                if (before_claim)
+                    before_claim(c);
+                if (auto it = bound.find({c.principal, c.key}); it != bound.end()) {
+                    if (control.on_replay)
+                        control.on_replay(WorkflowRunReplay{it->second.execution_id,
+                                                            it->second.workflow_id,
+                                                            it->second.request_fingerprint,
+                                                            it->second.status,
+                                                            it->second.started_at});
+                    return std::unexpected(std::string(kWorkflowIdempotentReplayError));
+                }
+                bound[{c.principal, c.key}] = WorkflowIdempotentRun{
+                    *engine_error, "wf-1", c.fingerprint, "running", fixed_now};
+            }
             if (control.on_admitted) // as the real engine, once admitted and before step 1
                 control.on_admitted(*engine_error);
             if (during_run)
@@ -262,6 +322,9 @@ struct Fx {
                 }
             }
             events.push_back("engine_returned");
+            if (control.idempotency)
+                bound[{control.idempotency->principal, control.idempotency->key}].status =
+                    engine_status;
             return engine_error;
         };
     }
@@ -337,6 +400,8 @@ struct Fx {
         };
         p.count_dispatch_denied = [this](std::string_view r) { counted_denials.emplace_back(r); };
         p.count_run_threw = [this] { ++run_threw_count; };
+        p.count_idempotent = [this](std::string_view o) { ++idem_counts[std::string(o)]; };
+        p.now_epoch = [this] { return fixed_now; };
         return p;
     }
 
@@ -2745,4 +2810,578 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: an indeterminate credential chec
         CHECK(body_of(*res)["data"]["status"] == "completed");
         CHECK(r.fx.reauth_calls == 2);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Idempotent execute (#2146): a client key claimed on the run row, a repeat answered with the run
+// it is bound to and nothing sent. The sequence is tested here against a stand-in engine that
+// models the engine's atomic claim; the claim itself (ON CONFLICT, the same-transaction
+// disambiguation, the CHECK, the migration) is tested against Postgres in test_workflow_engine.cpp.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr const char* kKey = "key-0123456789";
+
+WorkflowExecuteRequest keyed(Fx& fx, std::vector<std::string> ids = {"a1"},
+                             const char* key = kKey) {
+    auto r = fx.request(std::move(ids));
+    r.idempotency_key = key;
+    return r;
+}
+
+std::int64_t real_epoch_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+std::unique_ptr<httplib::Response> post_with_key(Rest& r, const std::string& key,
+                                                 const std::string& body = R"({"agent_ids":["a1"]})") {
+    return r.sink.dispatch("POST", "/api/v1/workflows/wf-1/execute", body, "application/json",
+                           {{"Idempotency-Key", key}});
+}
+
+bool audit_mentions(const Fx& fx, std::string_view needle) {
+    return std::any_of(fx.audit_details.begin(), fx.audit_details.end(),
+                       [&](const std::string& d) { return d.find(needle) != std::string::npos; });
+}
+
+} // namespace
+
+TEST_CASE("idempotency key: 8 to 128 bytes of [A-Za-z0-9._:-], nothing else",
+          "[workflow][twin][idempotency]") {
+    CHECK_FALSE(check_workflow_idempotency_key("12345678"));
+    CHECK_FALSE(check_workflow_idempotency_key(std::string(128, 'k')));
+    CHECK_FALSE(check_workflow_idempotency_key("a.b_c:d-E9ZZ"));
+    const std::string too_long(129, 'k');
+    for (const std::string bad :
+         {std::string{}, std::string("1234567"), too_long, std::string("key with space"),
+          std::string("key/slash/123"), std::string("key@host123"), std::string("key\nline123"),
+          std::string("caf\xc3\xa9-key-123"), std::string("key\"quote123"), std::string("key;semi123")}) {
+        INFO(bad);
+        const auto e = check_workflow_idempotency_key(bad);
+        REQUIRE(e);
+        CHECK(e->reason == "idempotency_key_invalid");
+        // The message names the rule and never echoes the key.
+        CHECK(e->message.find("key with") == std::string::npos);
+    }
+}
+
+TEST_CASE("idempotency: the fingerprint is sha256 over the domain, the workflow and the SORTED, "
+          "DEDUPED agent ids; it excludes everything else",
+          "[workflow][twin][idempotency]") {
+    Fx fx;
+    auto a = fx.api();
+    const auto p = fx.ports(a);
+    const auto fp = workflow_request_fingerprint(p, "wf-1", {"a2", "a1", "a1"});
+    REQUIRE(fp);
+    CHECK(*fp == *sha256_hex(std::string("wf-exec-v1\nwf-1\na1\na2")));
+    CHECK(*fp == Fx::fingerprint_of("wf-1", {"a1", "a2"}));
+    CHECK(fp == workflow_request_fingerprint(p, "wf-1", {"a1", "a2"}));
+    CHECK(fp != workflow_request_fingerprint(p, "wf-1", {"a1"}));
+    CHECK(fp != workflow_request_fingerprint(p, "wf-2", {"a1", "a2"}));
+    // A digest that cannot be computed is no fingerprint, never a digest of zeros.
+    auto broken = p;
+    broken.fingerprint_digest = [](std::string_view) { return std::optional<std::string>{}; };
+    CHECK_FALSE(workflow_request_fingerprint(broken, "wf-1", {"a1"}));
+}
+
+TEST_CASE("idempotency: a keyless call is unchanged: no lookup, no claim, the run goes ahead",
+          "[workflow][twin][idempotency]") {
+    Fx fx;
+    const auto out = fx.run();
+    CHECK(out.status == WorkflowExecuteStatus::kOk);
+    CHECK(fx.find_calls == 0);
+    CHECK_FALSE(fx.seen_claim);
+    CHECK(fx.bound.empty());
+    CHECK_FALSE(audit_mentions(fx, "idempotency_key"));
+    CHECK(fx.idem_counts.empty());
+}
+
+TEST_CASE("idempotency: a first keyed call looks the key up ONCE, hands the engine the claim, and "
+          "records the key in its audit rows",
+          "[workflow][twin][idempotency]") {
+    Fx fx;
+    const auto out = fx.run(keyed(fx, {"a2", "a1"}));
+    REQUIRE(out.status == WorkflowExecuteStatus::kOk);
+    CHECK(fx.find_calls == 1);
+    REQUIRE(fx.seen_claim);
+    CHECK(fx.seen_claim->principal == "alice");
+    CHECK(fx.seen_claim->key == kKey);
+    CHECK(fx.seen_claim->fingerprint == Fx::fingerprint_of("wf-1", {"a1", "a2"}));
+    CHECK(fx.bound.size() == 1);
+    CHECK(audit_mentions(fx, std::string("idempotency_key=") + kKey));
+    CHECK(fx.idem_counts.empty());
+
+    // A transport that already ran the pre-check does not make the lookup twice.
+    Fx again;
+    auto req = keyed(again);
+    req.idempotency_prechecked = true;
+    CHECK(again.run(req).status == WorkflowExecuteStatus::kOk);
+    CHECK(again.find_calls == 0);
+}
+
+TEST_CASE("idempotency: a repeat of a COMPLETED run answers with the run and sends NOTHING",
+          "[workflow][twin][idempotency][security]") {
+    Fx fx;
+    fx.bind("alice", kKey, "completed");
+    const auto out = fx.run(keyed(fx));
+    REQUIRE(out.status == WorkflowExecuteStatus::kIdempotentReplay);
+    CHECK(out.execution_id == "exec-bound");
+    CHECK(out.replay_status == "completed");
+    CHECK(out.idempotent_replay);
+    CHECK(out.started_at == fx.fixed_now - 1);
+    // Nothing happened but the one terminal-replay audit row: not the engine, not the authorizer,
+    // not an instruction read, not a dispatch, not a `requested` row.
+    CHECK_FALSE(fx.engine_called);
+    CHECK_FALSE(fx.dispatched_anything());
+    CHECK(fx.authorize_calls.empty());
+    CHECK(fx.lookup_count.empty());
+    CHECK(fx.events == std::vector<std::string>{"audit:success"});
+    REQUIRE(fx.audit_details.size() == 1);
+    CHECK(fx.audit_details[0].find("idempotent_replay=true run_status=completed") !=
+          std::string::npos);
+    CHECK(fx.audit_details[0].find("execution_id=exec-bound") != std::string::npos);
+    CHECK(fx.idem_counts == std::map<std::string, int>{{"replayed", 1}});
+
+    const auto j = workflow_idempotent_replay_json(out, "wf-1");
+    CHECK(j["execution_id"] == "exec-bound");
+    CHECK(j["workflow_id"] == "wf-1");
+    CHECK(j["status"] == "completed");
+    CHECK(j["idempotent_replay"] == true);
+    CHECK(j["started_at"] == fx.fixed_now - 1);
+    CHECK_FALSE(j.contains("steps"));
+    CHECK_FALSE(j.contains("late_denied"));
+    CHECK_FALSE(j.contains("retry_after_ms"));
+    CHECK_FALSE(j.contains("retryable"));
+}
+
+TEST_CASE("idempotency: the replay is decided BEFORE the workflow is read, so a since-deleted workflow "
+          "or a raised approval mode still gets the replay",
+          "[workflow][twin][idempotency]") {
+    Fx fx;
+    fx.bind("alice", kKey, "completed");
+    fx.defs["i-ro"] = def("i-ro", "os_info", "os_version", "always"); // would be a 403 now
+    CHECK(fx.run(keyed(fx)).status == WorkflowExecuteStatus::kIdempotentReplay);
+    Fx gone;
+    gone.bind("alice", kKey, "completed");
+    auto req = keyed(gone);
+    req.workflow_id = "wf-deleted";
+    gone.bound[{"alice", kKey}].workflow_id = "wf-deleted";
+    gone.bound[{"alice", kKey}].request_fingerprint =
+        Fx::fingerprint_of("wf-deleted", {"a1"});
+    CHECK(gone.run(req).status == WorkflowExecuteStatus::kIdempotentReplay);
+}
+
+TEST_CASE("idempotency: a FAILED, cancelled, RUNNING, stale-running or unknown-status run each answer "
+          "with their own thin status and the right retry fields",
+          "[workflow][twin][idempotency]") {
+    struct Row {
+        const char* engine_status;
+        std::int64_t ago_s;
+        const char* expect;
+        bool audited;
+    };
+    const Row rows[] = {
+        {"failed", 5, "failed", true},
+        {"cancelled", 5, "failed", true},
+        {"running", 5, "running", false},
+        {"pending", 5, "running", false},
+        {"running", 179, "running", false},
+        {"running", 181, "indeterminate", true}, // past the 180 s bound
+        {"running", -500, "indeterminate", true}, // dated far in the future: not believable
+        {"weird", 5, "indeterminate", true},
+        {"", 5, "indeterminate", true},
+    };
+    for (const auto& row : rows) {
+        INFO(row.engine_status << " ago=" << row.ago_s);
+        Fx fx;
+        fx.bind("alice", kKey, row.engine_status, row.ago_s);
+        const auto out = fx.run(keyed(fx));
+        REQUIRE(out.status == WorkflowExecuteStatus::kIdempotentReplay);
+        CHECK(out.replay_status == row.expect);
+        CHECK_FALSE(fx.engine_called);
+        CHECK_FALSE(fx.dispatched_anything());
+        // A terminal replay writes ONE row; a running one NONE (a poller would write one per poll).
+        CHECK(fx.audit_details.size() == (row.audited ? 1u : 0u));
+        const auto j = workflow_idempotent_replay_json(out, "wf-1");
+        CHECK(j["status"] == row.expect);
+        CHECK(j["idempotent_replay"] == true);
+        if (std::string_view(row.expect) == "running") {
+            CHECK(j["retry_after_ms"] == 2000);
+            CHECK_FALSE(j.contains("retryable"));
+            CHECK(fx.idem_counts == std::map<std::string, int>{{"in_progress", 1}});
+        } else {
+            CHECK_FALSE(j.contains("retry_after_ms"));
+            CHECK(j["retryable"] == false);
+            CHECK(fx.idem_counts == std::map<std::string, int>{{"replayed", 1}});
+        }
+        if (std::string_view(row.expect) == "indeterminate") {
+            CHECK(j["remediation"].get<std::string>().find("get_workflow_execution") !=
+                  std::string::npos);
+            CHECK(j["remediation"].get<std::string>().find("new key") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("idempotency: the same key with a DIFFERENT request is a terminal conflict that names the "
+          "bound run and sends nothing; another order of the same agents is the same request",
+          "[workflow][twin][idempotency][security]") {
+    SECTION("different agents") {
+        Fx fx;
+        fx.bind("alice", kKey, "completed", 1, "wf-1", {"a1"});
+        const auto out = fx.run(keyed(fx, {"a1", "a2"}));
+        REQUIRE(out.status == WorkflowExecuteStatus::kIdempotencyConflict);
+        CHECK(out.reason == "idempotency_key_conflict");
+        CHECK(out.execution_id == "exec-bound");
+        CHECK_FALSE(out.retryable);
+        CHECK_FALSE(fx.engine_called);
+        CHECK_FALSE(fx.dispatched_anything());
+        CHECK(fx.events == std::vector<std::string>{"audit:denied"});
+        CHECK(fx.audit_details[0].find("reason=idempotency_key_conflict") != std::string::npos);
+        CHECK(fx.idem_counts == std::map<std::string, int>{{"conflict", 1}});
+    }
+    SECTION("different workflow") {
+        Fx fx;
+        fx.bind("alice", kKey, "completed", 1, "wf-other", {"a1"});
+        CHECK(fx.run(keyed(fx)).status == WorkflowExecuteStatus::kIdempotencyConflict);
+    }
+    SECTION("the same agents in another order, with a repeat, are the same request") {
+        Fx fx;
+        fx.bind("alice", kKey, "completed", 1, "wf-1", {"a1", "a2"});
+        CHECK(fx.run(keyed(fx, {"a2", "a1", "a2"})).status ==
+              WorkflowExecuteStatus::kIdempotentReplay);
+    }
+}
+
+TEST_CASE("idempotency: a key is the PRINCIPAL's own: another principal's run under the same key is not "
+          "this caller's, and the call runs",
+          "[workflow][twin][idempotency][security]") {
+    Fx fx;
+    fx.bind("bob", kKey, "completed");
+    const auto out = fx.run(keyed(fx)); // alice
+    CHECK(out.status == WorkflowExecuteStatus::kOk);
+    CHECK(fx.engine_called);
+    CHECK(fx.bound.contains({"alice", kKey}));
+    CHECK(fx.bound.contains({"bob", kKey}));
+    CHECK(fx.bound[{"bob", kKey}].execution_id == "exec-bound"); // untouched
+}
+
+TEST_CASE("idempotency: a key with no principal is refused whoever the caller is, system included",
+          "[workflow][twin][idempotency][security]") {
+    for (const bool system : {false, true}) {
+        INFO("system=" << system);
+        Fx fx;
+        auto req = keyed(fx);
+        req.caller.principal.clear();
+        req.caller.system = system;
+        const auto out = fx.run(req);
+        CHECK(out.status == WorkflowExecuteStatus::kNoPrincipal);
+        // A non-system caller without a principal is refused by the ordinary wiring check; a
+        // SYSTEM caller passes that one (it may run unkeyed) and is refused for the key alone.
+        CHECK(out.reason == (system ? "idempotency_requires_principal" : "no_principal"));
+        CHECK_FALSE(fx.engine_called);
+        CHECK(fx.find_calls == 0);
+        CHECK(fx.events.empty());
+    }
+}
+
+TEST_CASE("idempotency: a lookup that FAILS refuses the call, retryable, with nothing written or sent "
+          "(it never reads as 'no run bound')",
+          "[workflow][twin][idempotency][failclosed]") {
+    Fx fx;
+    fx.find_fault = true;
+    const auto out = fx.run(keyed(fx));
+    CHECK(out.status == WorkflowExecuteStatus::kStoreFailed);
+    CHECK(out.retryable);
+    CHECK(out.message.find("db:") == std::string::npos); // no raw store text
+    CHECK_FALSE(fx.engine_called);
+    CHECK_FALSE(fx.dispatched_anything());
+    CHECK(fx.events.empty()); // not even a denial row
+    CHECK(fx.lookup_count.empty());
+}
+
+TEST_CASE("idempotency: an unwired port refuses a keyed call exactly as an unkeyed one (fail closed)",
+          "[workflow][twin][idempotency][failclosed]") {
+    Fx fx;
+    fx.bind("alice", kKey, "completed");
+    fx.store_open = false;
+    const auto out = fx.run(keyed(fx));
+    CHECK(out.status == WorkflowExecuteStatus::kUnavailable);
+    CHECK(fx.find_calls == 0);
+    CHECK(fx.events.empty());
+}
+
+TEST_CASE("idempotency: a fingerprint that cannot be computed refuses the keyed call, audited, with "
+          "nothing sent",
+          "[workflow][twin][idempotency][failclosed]") {
+    Fx fx;
+    auto a = fx.api();
+    auto ports = fx.ports(a);
+    ports.fingerprint_digest = [](std::string_view) { return std::optional<std::string>{}; };
+    const auto out = apply_workflow_execute(ports, keyed(fx));
+    CHECK(out.status == WorkflowExecuteStatus::kEffectDigestFailed);
+    CHECK(out.reason == "request_fingerprint_unavailable");
+    CHECK(fx.events == std::vector<std::string>{"audit:failure"});
+    CHECK_FALSE(fx.engine_called);
+    CHECK(fx.find_calls == 0);
+    // Keyless calls do not need the digest.
+    Fx k;
+    auto ka = k.api();
+    auto kports = k.ports(ka);
+    kports.fingerprint_digest = [](std::string_view) { return std::optional<std::string>{}; };
+    CHECK(apply_workflow_execute(kports, k.request()).status == WorkflowExecuteStatus::kOk);
+}
+
+TEST_CASE("idempotency: a call that passed the pre-check and LOST the engine's claim closes its "
+          "requested row denied/idempotent_duplicate and answers as a replay, sending nothing",
+          "[workflow][twin][idempotency][race][security]") {
+    SECTION("the winner has the same request, and is still running") {
+        Fx fx;
+        fx.before_claim = [&](const WorkflowIdempotencyClaim& c) {
+            fx.bound[{c.principal, c.key}] = WorkflowIdempotentRun{
+                "exec-winner", "wf-1", c.fingerprint, "running", fx.fixed_now};
+        };
+        const auto out = fx.run(keyed(fx));
+        REQUIRE(out.status == WorkflowExecuteStatus::kIdempotentReplay);
+        CHECK(out.execution_id == "exec-winner");
+        CHECK(out.replay_status == "running");
+        CHECK_FALSE(fx.dispatched_anything());
+        CHECK(fx.events == std::vector<std::string>{"audit:requested", "audit:denied"});
+        CHECK(fx.audit_details[1].find("reason=idempotent_duplicate") != std::string::npos);
+        CHECK(fx.audit_details[1].find("execution_id=exec-winner") != std::string::npos);
+        CHECK(fx.idem_counts == std::map<std::string, int>{{"in_progress", 1}});
+    }
+    SECTION("the winner has the same request and has already completed") {
+        Fx fx;
+        fx.before_claim = [&](const WorkflowIdempotencyClaim& c) {
+            fx.bound[{c.principal, c.key}] = WorkflowIdempotentRun{
+                "exec-winner", "wf-1", c.fingerprint, "completed", fx.fixed_now - 3};
+        };
+        const auto out = fx.run(keyed(fx));
+        REQUIRE(out.status == WorkflowExecuteStatus::kIdempotentReplay);
+        CHECK(out.replay_status == "completed");
+        CHECK(fx.idem_counts == std::map<std::string, int>{{"replayed", 1}});
+    }
+    SECTION("the winner's request differs: a 422-class conflict, requested row closed denied") {
+        Fx fx;
+        fx.before_claim = [&](const WorkflowIdempotencyClaim& c) {
+            fx.bound[{c.principal, c.key}] = WorkflowIdempotentRun{
+                "exec-winner", "wf-1", Fx::fingerprint_of("wf-1", {"zzz"}), "running", fx.fixed_now};
+        };
+        const auto out = fx.run(keyed(fx));
+        REQUIRE(out.status == WorkflowExecuteStatus::kIdempotencyConflict);
+        CHECK(out.execution_id == "exec-winner");
+        CHECK(fx.events == std::vector<std::string>{"audit:requested", "audit:denied"});
+        CHECK(fx.audit_details[1].find("reason=idempotency_key_conflict") != std::string::npos);
+        CHECK_FALSE(fx.dispatched_anything());
+        CHECK(fx.idem_counts == std::map<std::string, int>{{"conflict", 1}});
+    }
+}
+
+TEST_CASE("idempotency: the idempotent counter's outcome set is closed", "[workflow][twin][idempotency]") {
+    REQUIRE(kWorkflowRunIdempotentOutcomes.size() == 3);
+    CHECK(kWorkflowRunIdempotentOutcomes[0] == "replayed");
+    CHECK(kWorkflowRunIdempotentOutcomes[1] == "in_progress");
+    CHECK(kWorkflowRunIdempotentOutcomes[2] == "conflict");
+    CHECK(std::string(kWorkflowRunIdempotentMetric) == "yuzu_server_workflow_run_idempotent_total");
+}
+
+// ── the REST route ───────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a repeat of a completed run is a "
+          "202 with the thin body, sends nothing, and holds no lease",
+          "[workflow][twin][rest][idempotency]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    r.fx.bind("alice", kKey, "completed", 7);
+    const auto res = post_with_key(r, kKey);
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(res->get_header_value("Retry-After").empty());
+    const auto j = body_of(*res);
+    CHECK(j["meta"]["api_version"] == "v1");
+    CHECK(j["data"]["execution_id"] == "exec-bound");
+    CHECK(j["data"]["status"] == "completed");
+    CHECK(j["data"]["idempotent_replay"] == true);
+    CHECK(j["data"]["started_at"] == r.fx.fixed_now - 7);
+    CHECK_FALSE(j["data"].contains("steps"));
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK_FALSE(r.fx.dispatched_anything());
+    CHECK(r.fx.authorize_calls.empty());
+    CHECK(r.budget.active() == 0);
+    CHECK(r.metrics.counter(kWorkflowRunIdempotentMetric, {{"outcome", "replayed"}}).value() == 1);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a repeat is answered while the "
+          "server DRAINS and when the run cap is FULL, with the refusal counters unmoved",
+          "[workflow][twin][rest][idempotency][drain][cap]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    r.fx.bind("alice", kKey, "completed");
+    r.draining = true;
+    std::vector<detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < detail::kPerPrincipalWorkflowRun; ++i) {
+        auto a = r.budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                      detail::kPerPrincipalWorkflowRun);
+        REQUIRE(a.lease);
+        held.push_back(std::move(a.lease));
+    }
+    const auto res = post_with_key(r, kKey);
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(body_of(*res)["data"]["idempotent_replay"] == true);
+    CHECK(r.refused("draining") == 0);
+    CHECK(r.refused("per_principal_stream_cap") == 0);
+    CHECK(r.refused("global_stream_cap") == 0);
+    CHECK(r.budget.active() == held.size()); // the replay took no lease of its own
+    // A NEW key is still refused at the same moment: only a replay bypasses admission.
+    const auto fresh = post_with_key(r, "another-key-0001");
+    REQUIRE(fresh);
+    CHECK(fresh->status == 503);
+    CHECK(r.refused("draining") == 1);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a run still running is a 202 with "
+          "retry_after_ms 2000 and Retry-After 2, and writes NO audit row",
+          "[workflow][twin][rest][idempotency]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    r.fx.bind("alice", kKey, "running", 4);
+    const auto res = post_with_key(r, kKey);
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    const auto j = body_of(*res);
+    CHECK(j["data"]["status"] == "running");
+    CHECK(j["data"]["retry_after_ms"] == 2000);
+    CHECK(j["data"]["idempotent_replay"] == true);
+    CHECK(r.persist_calls == 0);
+    CHECK(r.metrics.counter(kWorkflowRunIdempotentMetric, {{"outcome", "in_progress"}}).value() == 1);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: failed and indeterminate replays "
+          "are 202s that say retryable false and give no retry hint",
+          "[workflow][twin][rest][idempotency]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    r.fx.bind("alice", "key-failed-0001", "failed", 30);
+    r.fx.bind("alice", "key-stale-00001", "running", 900);
+    const auto failed = post_with_key(r, "key-failed-0001");
+    REQUIRE(failed);
+    CHECK(failed->status == 202);
+    CHECK(body_of(*failed)["data"]["status"] == "failed");
+    CHECK(body_of(*failed)["data"]["retryable"] == false);
+    CHECK(failed->get_header_value("Retry-After").empty());
+    const auto stale = post_with_key(r, "key-stale-00001");
+    REQUIRE(stale);
+    CHECK(stale->status == 202);
+    const auto j = body_of(*stale);
+    CHECK(j["data"]["status"] == "indeterminate");
+    CHECK(j["data"]["retryable"] == false);
+    CHECK_FALSE(j["data"].contains("retry_after_ms"));
+    CHECK(stale->get_header_value("Retry-After").empty());
+    CHECK(j["data"]["remediation"].get<std::string>().find("new key") != std::string::npos);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: the same key with a different "
+          "request is a terminal 422 idempotency_key_conflict naming the bound run",
+          "[workflow][twin][rest][idempotency][security]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    r.fx.bind("alice", kKey, "completed", 1, "wf-1", {"a1"});
+    const auto res = post_with_key(r, kKey, R"({"agent_ids":["a1","a2"]})");
+    REQUIRE(res);
+    CHECK(res->status == 422);
+    const auto j = body_of(*res);
+    CHECK(j["error"]["reason"] == "idempotency_key_conflict");
+    CHECK(j["error"]["execution_id"] == "exec-bound");
+    CHECK((!j["error"].contains("retry_after_ms") || j["error"]["retry_after_ms"].is_null()));
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK(r.metrics.counter(kWorkflowRunIdempotentMetric, {{"outcome", "conflict"}}).value() == 1);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a first call runs, then the "
+          "identical call replays it",
+          "[workflow][twin][rest][idempotency]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    const auto first = post_with_key(r, kKey);
+    REQUIRE(first);
+    CHECK(first->status == 202);
+    CHECK(body_of(*first)["data"]["status"] == "completed");
+    CHECK(body_of(*first)["data"]["steps"].size() == 1);
+    CHECK_FALSE(body_of(*first)["data"].contains("idempotent_replay"));
+    const auto sent = std::count_if(r.fx.events.begin(), r.fx.events.end(),
+                                    [](const std::string& e) { return e.starts_with("dispatch:"); });
+    const auto second = post_with_key(r, kKey);
+    REQUIRE(second);
+    CHECK(second->status == 202);
+    CHECK(body_of(*second)["data"]["idempotent_replay"] == true);
+    CHECK(body_of(*second)["data"]["execution_id"] == body_of(*first)["data"]["execution_id"]);
+    CHECK(std::count_if(r.fx.events.begin(), r.fx.events.end(),
+                        [](const std::string& e) { return e.starts_with("dispatch:"); }) == sent);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a malformed or doubled key is a "
+          "400 idempotency_key_invalid before anything is read or leased; no key is unchanged",
+          "[workflow][twin][rest][idempotency]") {
+    Rest r;
+    for (const std::string bad : {std::string("short"), std::string(129, 'k'), std::string("bad key 12345"),
+                                  std::string("key/with/slash"), std::string()}) {
+        INFO(bad);
+        const auto res = post_with_key(r, bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(body_of(*res)["error"]["reason"] == "idempotency_key_invalid");
+    }
+    r.sink.repeated_headers = {{"Idempotency-Key", "key-aaaaaaaaaa"}, {"Idempotency-Key", "key-bbbbbbbbbb"}};
+    const auto dup = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(dup);
+    CHECK(dup->status == 400);
+    CHECK(body_of(*dup)["error"]["reason"] == "idempotency_key_invalid");
+    r.sink.repeated_headers.clear();
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK(r.fx.find_calls == 0);
+    CHECK(r.budget.active() == 0);
+    CHECK(r.fx.events.empty());
+    const auto keyless = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(keyless);
+    CHECK(keyless->status == 202);
+    CHECK(r.fx.find_calls == 0);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a failed lookup is a retryable 503 "
+          "with nothing written, sent or leased",
+          "[workflow][twin][rest][idempotency][failclosed]") {
+    Rest r;
+    r.fx.find_fault = true;
+    const auto res = post_with_key(r, kKey);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK(r.fx.events.empty());
+    CHECK(r.persist_calls == 0);
+    CHECK(r.budget.active() == 0);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a lost claim race is a 202 replay "
+          "or a 422, never a second send",
+          "[workflow][twin][rest][idempotency][race]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    r.fx.before_claim = [&](const WorkflowIdempotencyClaim& c) {
+        r.fx.bound[{c.principal, c.key}] = WorkflowIdempotentRun{
+            "exec-winner", "wf-1", c.fingerprint, "running", r.fx.fixed_now};
+    };
+    const auto res = post_with_key(r, kKey);
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(body_of(*res)["data"]["execution_id"] == "exec-winner");
+    CHECK(body_of(*res)["data"]["status"] == "running");
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK_FALSE(r.fx.dispatched_anything());
+    CHECK(r.budget.active() == 0);
 }

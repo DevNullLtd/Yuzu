@@ -22,6 +22,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <chrono>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -53,6 +54,9 @@ WorkflowExecuteOutcome refuse(WorkflowExecuteStatus status, std::string message,
 constexpr std::size_t kEffectSummarySteps = 3;
 constexpr std::size_t kEffectLabelMax = 64;
 constexpr std::string_view kEffectDigestDomain = "yuzu-workflow-step-effects-v1\n";
+
+std::optional<WorkflowExecuteOutcome> workflow_wiring_refusal(const WorkflowExecutePorts& ports,
+                                                              const WorkflowExecuteRequest& req);
 
 std::string dump_replacing(const nlohmann::json& j) {
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -204,6 +208,213 @@ WorkflowInstructionLookupFn make_instruction_lookup(InstructionStore* store) {
             return std::optional<WorkflowStepInstruction>{};
         return std::optional<WorkflowStepInstruction>{to_step_instruction(**r)};
     };
+}
+
+// ── idempotency ───────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr std::string_view kFingerprintDomain = "wf-exec-v1\n";
+
+bool idempotency_key_char_ok(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '.' || c == '_' || c == ':' || c == '-';
+}
+
+void count_idempotent(const WorkflowExecutePorts& ports, std::string_view outcome) {
+    if (!ports.count_idempotent)
+        return;
+    try {
+        ports.count_idempotent(outcome);
+    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
+    }
+}
+
+std::int64_t epoch_now(const WorkflowExecutePorts& ports) {
+    if (ports.now_epoch)
+        return ports.now_epoch();
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+/// What a replay of the engine's recorded `status` says. A `running`/`pending` row is `running`
+/// only while its age is believable: past the stale bound, or dated further in the future than
+/// that (a replica clock far ahead would otherwise leave it `running` for as long as the skew),
+/// it is `indeterminate`. An unknown status is `indeterminate` too, never `completed`.
+std::string_view replay_status_for(std::string_view engine_status, std::int64_t started_at,
+                                   std::int64_t now) {
+    if (engine_status == "completed")
+        return kReplayCompleted;
+    if (engine_status == "failed" || engine_status == "cancelled")
+        return kReplayFailed;
+    if (engine_status == "running" || engine_status == "pending") {
+        const std::int64_t age = now - started_at;
+        const std::int64_t bound = kIdempotentRunStaleAfter.count();
+        return (age > bound || -age > bound) ? kReplayIndeterminate : kReplayRunning;
+    }
+    return kReplayIndeterminate;
+}
+
+WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
+                                      const WorkflowIdempotentRun& run) {
+    WorkflowExecuteOutcome o;
+    o.status = WorkflowExecuteStatus::kIdempotentReplay;
+    o.idempotent_replay = true;
+    o.execution_id = run.execution_id;
+    o.run_status = run.status;
+    o.started_at = run.started_at;
+    o.replay_status = std::string(replay_status_for(run.status, run.started_at, epoch_now(ports)));
+    o.reason = "idempotent_replay";
+    o.retryable = o.replay_status == kReplayRunning;
+    if (o.replay_status == kReplayRunning) {
+        o.message = "this idempotency key is bound to a run that is still in progress; nothing was "
+                    "sent for this call";
+        o.remediation = "poll get_workflow_execution on the execution_id; do not send this call "
+                        "again";
+    } else if (o.replay_status == kReplayCompleted) {
+        o.message = "this idempotency key is bound to a run that already completed; nothing was "
+                    "sent for this call";
+    } else if (o.replay_status == kReplayFailed) {
+        o.message = "this idempotency key is bound to a run that failed or was stopped; nothing "
+                    "was sent for this call";
+        o.remediation = "read get_workflow_execution for what ran; a deliberate re-run needs a new "
+                        "idempotency key";
+    } else {
+        o.message = "this idempotency key is bound to a run whose outcome could not be confirmed; "
+                    "nothing was sent for this call";
+        o.remediation = "read get_workflow_execution; a step with no command_id was never sent; a "
+                        "deliberate re-run needs a new key";
+    }
+    return o;
+}
+
+WorkflowExecuteOutcome conflict_outcome(const std::string& bound_execution_id) {
+    WorkflowExecuteOutcome o = refuse(
+        WorkflowExecuteStatus::kIdempotencyConflict,
+        "this idempotency key is already bound to a different request; nothing was sent",
+        "idempotency_key_conflict");
+    o.execution_id = bound_execution_id;
+    o.remediation = "use a new idempotency key for a different request; this key stays bound to "
+                    "the run it started, readable with get_workflow_execution";
+    return o;
+}
+
+} // namespace
+
+std::optional<WorkflowExecuteBodyError> check_workflow_idempotency_key(std::string_view key) {
+    if (key.size() < kIdempotencyKeyMinLen || key.size() > kIdempotencyKeyMaxLen ||
+        !std::all_of(key.begin(), key.end(), idempotency_key_char_ok))
+        return WorkflowExecuteBodyError{
+            "idempotency_key_invalid",
+            "the idempotency key must be " + std::to_string(kIdempotencyKeyMinLen) + " to " +
+                std::to_string(kIdempotencyKeyMaxLen) +
+                " characters from A-Z a-z 0-9 . _ : -"};
+    return std::nullopt;
+}
+
+std::optional<std::string> workflow_request_fingerprint(const WorkflowExecutePorts& ports,
+                                                        const std::string& workflow_id,
+                                                        const std::vector<std::string>& agent_ids) {
+    // Sorted and deduped INSIDE the fingerprint only: the same set of devices in another order
+    // is the same request, and the ticket's canonical arguments are untouched.
+    std::set<std::string_view> ids;
+    for (const auto& id : agent_ids)
+        ids.insert(id);
+    std::string material(kFingerprintDomain);
+    material += workflow_id;
+    for (const auto id : ids) {
+        material += '\n';
+        material += id;
+    }
+    const auto digest = ports.fingerprint_digest ? ports.fingerprint_digest(material)
+                                                 : sha256_hex(material);
+    if (!digest || digest->size() != 64)
+        return std::nullopt;
+    return digest;
+}
+
+std::optional<WorkflowExecuteOutcome> check_workflow_idempotency(const WorkflowExecutePorts& ports,
+                                                                 const WorkflowExecuteRequest& req) {
+    if (req.idempotency_key.empty())
+        return std::nullopt;
+    // The wiring check, the same one prepare runs: a deployment that could not run the workflow
+    // does not answer from a key either.
+    if (auto refusal = workflow_wiring_refusal(ports, req))
+        return refusal;
+    // A key belongs to a principal. An empty one is refused whoever the caller is, `system`
+    // included: under the store's unique index a NULL principal never conflicts, so the key
+    // would silently stop being idempotent.
+    if (req.caller.principal.empty())
+        return refuse(WorkflowExecuteStatus::kNoPrincipal,
+                      "an idempotency key needs an authenticated principal",
+                      "idempotency_requires_principal");
+
+    const std::string target_id = clip_token(req.workflow_id);
+    const std::string key_detail = " idempotency_key=" + clip_token(req.idempotency_key);
+    const auto fingerprint = workflow_request_fingerprint(ports, req.workflow_id, req.agent_ids);
+    if (!fingerprint) {
+        (void)ports.audit(std::string(kActionExecute), "failure", target_id,
+                          req.audit_context + " reason=request_fingerprint_unavailable" +
+                              key_detail);
+        return refuse(WorkflowExecuteStatus::kEffectDigestFailed,
+                      "the request could not be fingerprinted for its idempotency key",
+                      "request_fingerprint_unavailable");
+    }
+
+    const auto bound = ports.api->find_execution_by_key(req.caller.principal, req.idempotency_key);
+    if (!bound) {
+        // A fault is NOT "no run bound": proceeding would dispatch, and the whole point of the
+        // key is that a call whose first answer was lost cannot be sent twice. Nothing is written.
+        spdlog::warn("workflow execute: idempotency lookup failed: {}",
+                     genericize_db_error("workflow idempotency lookup", bound.error()));
+        return refuse(WorkflowExecuteStatus::kStoreFailed, "workflow store unavailable",
+                      "store_unavailable", /*retryable=*/true);
+    }
+    if (!*bound)
+        return std::nullopt;
+    const WorkflowIdempotentRun& run = **bound;
+
+    if (run.request_fingerprint != *fingerprint) {
+        (void)ports.audit(std::string(kActionExecute), "denied", target_id,
+                          req.audit_context + " reason=idempotency_key_conflict execution_id=" +
+                              clip_token(run.execution_id) + key_detail);
+        count_idempotent(ports, "conflict");
+        return conflict_outcome(run.execution_id);
+    }
+
+    WorkflowExecuteOutcome o = replay_outcome(ports, run);
+    if (o.replay_status == kReplayRunning) {
+        // No audit row: a client polling a running run would write one per poll.
+        count_idempotent(ports, "in_progress");
+        return o;
+    }
+    o.audit_persisted = ports.audit(
+        std::string(kActionExecute), "success", target_id,
+        req.audit_context + " execution_id=" + clip_token(run.execution_id) +
+            " idempotent_replay=true run_status=" + o.replay_status + key_detail);
+    count_idempotent(ports, "replayed");
+    return o;
+}
+
+nlohmann::json workflow_idempotent_replay_json(const WorkflowExecuteOutcome& o,
+                                               const std::string& workflow_id) {
+    nlohmann::json j = {{"execution_id", o.execution_id},
+                        {"workflow_id", workflow_id},
+                        {"status", o.replay_status},
+                        {"idempotent_replay", true},
+                        {"started_at", o.started_at},
+                        {"message", o.message}};
+    if (o.replay_status == kReplayRunning) {
+        j["retry_after_ms"] = kIdempotentRunningRetryAfterMs;
+    } else if (o.replay_status != kReplayCompleted) {
+        j["retryable"] = false;
+        if (o.replay_status == kReplayIndeterminate)
+            j["remediation"] = o.remediation;
+    }
+    if (!o.audit_persisted)
+        j["audit_persisted"] = false;
+    return j;
 }
 
 // ── how a run ended ───────────────────────────────────────────────────────
@@ -381,28 +592,40 @@ WorkflowExecuteStatus status_for(StepAdmission v) {
 
 } // namespace
 
+namespace {
+
+/// Step 1 of the banner, one copy for `prepare_workflow_execute` and the idempotency pre-check:
+/// every port the sequence needs is wired, and the caller has a principal. A replay is refused
+/// when the deployment could not run the workflow either (fail closed), so an unwired build
+/// never answers from a key.
+std::optional<WorkflowExecuteOutcome> workflow_wiring_refusal(const WorkflowExecutePorts& ports,
+                                                              const WorkflowExecuteRequest& req) {
+    if (!ports.api || !ports.run)
+        return refuse(WorkflowExecuteStatus::kUnavailable, "workflow engine not available",
+                      "workflow_engine_unavailable");
+    if (!ports.instruction_store_open || !ports.lookup)
+        return refuse(WorkflowExecuteStatus::kUnavailable, "instruction store not available",
+                      "instruction_store_unavailable");
+    if (!ports.approval_gate_available)
+        return refuse(WorkflowExecuteStatus::kUnavailable,
+                      "approval gate not available; a workflow is not run without it",
+                      "approval_gate_unavailable");
+    if (!ports.classify || !ports.authorize || !ports.dispatch || !ports.audit)
+        return refuse(WorkflowExecuteStatus::kUnavailable, "workflow dispatch not available",
+                      "dispatch_unavailable");
+    if (req.caller.principal.empty() && !req.caller.system)
+        return refuse(WorkflowExecuteStatus::kNoPrincipal, "authenticated session has no principal",
+                      "no_principal");
+    return std::nullopt;
+}
+
+} // namespace
+
 std::expected<WorkflowExecutePlan, WorkflowExecuteOutcome>
 prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecuteRequest& req) {
     // ── 1. wiring: fail CLOSED, before any read or effect ────────────────
-    if (!ports.api || !ports.run)
-        return std::unexpected(refuse(WorkflowExecuteStatus::kUnavailable,
-                                      "workflow engine not available",
-                                      "workflow_engine_unavailable"));
-    if (!ports.instruction_store_open || !ports.lookup)
-        return std::unexpected(refuse(WorkflowExecuteStatus::kUnavailable,
-                                      "instruction store not available",
-                                      "instruction_store_unavailable"));
-    if (!ports.approval_gate_available)
-        return std::unexpected(
-            refuse(WorkflowExecuteStatus::kUnavailable,
-                   "approval gate not available; a workflow is not run without it",
-                   "approval_gate_unavailable"));
-    if (!ports.classify || !ports.authorize || !ports.dispatch || !ports.audit)
-        return std::unexpected(refuse(WorkflowExecuteStatus::kUnavailable,
-                                      "workflow dispatch not available", "dispatch_unavailable"));
-    if (req.caller.principal.empty() && !req.caller.system)
-        return std::unexpected(refuse(WorkflowExecuteStatus::kNoPrincipal,
-                                      "authenticated session has no principal", "no_principal"));
+    if (auto refusal = workflow_wiring_refusal(ports, req))
+        return std::unexpected(std::move(*refusal));
 
     const std::string target_id = clip_token(req.workflow_id);
     auto deny_audit = [&](std::string_view reason, const std::string& extra) {
@@ -585,6 +808,9 @@ struct RunProgress {
     /// The credential check refused an attempt: `kReasonCredentialRevoked` or
     /// `kReasonCredentialIndeterminate`. Set at the moment the hook says no.
     std::string credential_stop;
+    /// The engine's atomic claim found the key already bound to a run (`on_replay`): this call
+    /// lost the race and starts nothing.
+    std::optional<WorkflowRunReplay> replay;
 };
 
 /// The credential half of the `before_attempt` hook: true == the attempt may be made. See the
@@ -636,6 +862,7 @@ bool credential_admits_attempt(const WorkflowExecuteRequest& req,
 
 /// Step 6 and the closing row. Anything it throws is answered by the caller as `kRunFailed`.
 WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const WorkflowExecuteRequest& req,
+                                 const std::optional<WorkflowIdempotencyClaim>& claim,
                                  RunProgress& progress) {
     const std::string target_id = clip_token(req.workflow_id);
     auto deny_audit = [&](std::string_view reason, const std::string& extra) {
@@ -760,6 +987,10 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                                                 kWorkflowSyncBudget);
     control.deadline = deadline;
     control.on_interrupted = [&progress] { progress.interrupted = true; };
+    if (claim) {
+        control.idempotency = claim;
+        control.on_replay = [&progress](const WorkflowRunReplay& r) { progress.replay = r; };
+    }
     // The deadline first (no I/O), then the caller's credential: one hook, so the engine needs no
     // field of its own. The engine asks it before every dispatch attempt, which is before each
     // step's first attempt and after each retry sleep.
@@ -773,6 +1004,27 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         return credential_admits_attempt(req, deadline, progress);
     };
     const auto run = ports.run(req.workflow_id, req.agent_ids, dispatch_fn, condition_fn, control);
+    if (!run && progress.replay) {
+        // The race: this call passed the pre-check, wrote its `requested` row, and lost the
+        // engine's atomic claim to a call with the same key. Nothing was dispatched. Close the
+        // row it opened and answer as the pre-check would have.
+        const WorkflowRunReplay& won = *progress.replay;
+        const bool differs = !claim || won.fingerprint != claim->fingerprint;
+        (void)ports.audit(std::string(kActionExecute), "denied", target_id,
+                          req.audit_context + " reason=" +
+                              (differs ? "idempotency_key_conflict" : "idempotent_duplicate") +
+                              " execution_id=" + clip_token(won.execution_id) +
+                              " idempotency_key=" + clip_token(req.idempotency_key));
+        if (differs) {
+            count_idempotent(ports, "conflict");
+            return conflict_outcome(won.execution_id);
+        }
+        WorkflowExecuteOutcome o = replay_outcome(
+            ports, WorkflowIdempotentRun{won.execution_id, won.workflow_id, won.fingerprint,
+                                         won.status, won.started_at});
+        count_idempotent(ports, o.replay_status == kReplayRunning ? "in_progress" : "replayed");
+        return o;
+    }
     if (!run) {
         const bool db = is_generic_db_error(run.error());
         const bool gone = run.error().starts_with("workflow not found");
@@ -895,6 +1147,9 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             " dispatches=" + std::to_string(o.steps.size()) +
             " agents_reached=" + std::to_string(reached_total) +
             (late_denied ? " late_denied=true" : "") +
+            (req.idempotency_key.empty()
+                 ? ""
+                 : " idempotency_key=" + clip_token(req.idempotency_key)) +
             (succeeded ? ""
                        : " run_outcome=" + std::string(workflow_run_outcome_token(o.run_outcome))) +
             (o.status == WorkflowExecuteStatus::kNoAgentsReached || o.deadline_exceeded ||
@@ -911,10 +1166,36 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
                                             const WorkflowExecutePlan& plan) {
     const std::string target_id = clip_token(req.workflow_id);
 
+    // ── 4b. the idempotency claim, built BEFORE the requested row ─────────
+    // A key without a principal, or a request that cannot be fingerprinted, refuses here with no
+    // row of the run's own: the engine's CHECK would refuse the insert anyway, but a refusal
+    // after the `requested` row would read as a started run.
+    std::optional<WorkflowIdempotencyClaim> claim;
+    if (!req.idempotency_key.empty()) {
+        if (req.caller.principal.empty())
+            return refuse(WorkflowExecuteStatus::kNoPrincipal,
+                          "an idempotency key needs an authenticated principal",
+                          "idempotency_requires_principal");
+        auto fingerprint = workflow_request_fingerprint(ports, req.workflow_id, req.agent_ids);
+        if (!fingerprint) {
+            (void)ports.audit(std::string(kActionExecute), "failure", target_id,
+                              req.audit_context + " reason=request_fingerprint_unavailable" +
+                                  " idempotency_key=" + clip_token(req.idempotency_key));
+            return refuse(WorkflowExecuteStatus::kEffectDigestFailed,
+                          "the request could not be fingerprinted for its idempotency key",
+                          "request_fingerprint_unavailable");
+        }
+        claim = WorkflowIdempotencyClaim{req.caller.principal, req.idempotency_key,
+                                         std::move(*fingerprint)};
+    }
+
     // ── 5. the requested row, BEFORE anything is dispatched ──────────────
     if (!ports.audit(std::string(kActionExecute), "requested", target_id,
                      req.audit_context + " agents=" + std::to_string(req.agent_ids.size()) +
-                         " steps=" + std::to_string(plan.step_count)))
+                         " steps=" + std::to_string(plan.step_count) +
+                         (req.idempotency_key.empty()
+                              ? ""
+                              : " idempotency_key=" + clip_token(req.idempotency_key))))
         return refuse(WorkflowExecuteStatus::kAuditFailed,
                       "audit subsystem unavailable; refusing to dispatch without durable evidence",
                       "audit_unavailable", /*retryable=*/true);
@@ -934,7 +1215,7 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
         "sent, before starting another";
     RunProgress progress;
     try {
-        return drive_run(ports, req, progress);
+        return drive_run(ports, req, claim, progress);
     } catch (const std::exception& e) {
         spdlog::error("workflow execute: run threw: {}", e.what());
     } catch (...) {
@@ -969,6 +1250,10 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
 
 WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
                                               const WorkflowExecuteRequest& req) {
+    if (!req.idempotency_prechecked) {
+        if (auto early = check_workflow_idempotency(ports, req))
+            return std::move(*early);
+    }
     auto plan = prepare_workflow_execute(ports, req);
     if (!plan)
         return std::move(plan.error());
