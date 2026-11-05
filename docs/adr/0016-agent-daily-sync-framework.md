@@ -412,12 +412,13 @@ needs full EVR (`epoch:version-release`) + `arch` + the host's distro release fo
 Lane-1 OVAL matching, and an honest `kind=app` discriminator for the Lane-3
 OS-native tail. The population contract is **honest-empty**: a field the
 ecosystem does not store is `''`, never synthesised, except `publisher`, which carries a
-vendor or a `via:` label (see the 2026-11-04 section) (rpm = full NEVRA + VENDOR, else
+vendor or a `via:` label (the section "2026-11-04 — `installed_software`: a publisher on every
+row, and the `via:` origin label" below states the rule). Per source: rpm = full NEVRA + VENDOR, else
 PACKAGER, + stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
 held; apk = name/version/pkgrel; pacman = name/EVR; Windows/macOS = `kind=app`
 with name/version/publisher only; `distro_id`/`distro_version` from
 `/etc/os-release` stamped on every Linux row; `homebrew` is a reserved
-ecosystem value, not collected). `version` is the upstream version with the
+ecosystem value, not collected. `version` is the upstream version with the
 release/revision split into its own field, and rpm `publisher` is the `VENDOR` tag,
 else the `PACKAGER` tag.
 
