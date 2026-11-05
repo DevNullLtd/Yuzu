@@ -5275,10 +5275,11 @@ groups:
             the per-call record cap, repeated a component kind and path (two components of
             one kind with an empty path among them), or left the facet with a section hash
             other than the agent's own post-apply hash, so the server rolled that section
-            back and asked for a full one. The full resend repairs a delta that went out of
-            step, so nothing is lost; a repeated component kind and path fails on every
-            resend and does not repair itself, and a persistent share means the agent and
-            server disagree about the row set: grep the warn-level "did not verify" server line
+            back and asked for a full one. The full section the agent sends in answer repairs
+            a delta that went out of step. A repeated component kind and path is the
+            exception: it fails on every cycle and does not repair itself, and the fix is in
+            the agent's component writer. A persistent share means the agent and server
+            disagree about the row set: grep the warn-level "did not verify" server line
             for the agent_id (that line is sampled, about 1 in 100, so the search can
             come back empty even while mismatches are happening) and compare the agent's
             writer against the server's canonical section hash.

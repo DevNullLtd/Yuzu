@@ -45,8 +45,8 @@ which is NOT, is enumerated separately). Passes on their own dedicated component
 threads (cert reloader, catalogue rollup, software-title normalisation, provisional-MFA
 cleanup, OTA watchdog, MCP projector, the two store-worker delivery pools, and — since HA
 WS-8 — the Postgres reachability probe) each get their own entry too — the 2026-09-07 sweep
-(methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
-a prior revision missed eight of these; later additions (50 passes, including the one-shot
+(methodology recorded in the `kBackgroundJobs` header) brought the table to 40 by
+adding eight of these; later additions (50 passes, including the one-shot
 `inventory_store.purge_typed_sources` on `typed_purge_thread_` and the hourly
 `software_normalization_job.run_tick` on `SoftwareNormalizationJob::thread_`) are recorded in
 that header.
