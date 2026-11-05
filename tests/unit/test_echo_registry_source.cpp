@@ -5059,10 +5059,12 @@ struct LiveRun {
                 // say why. The session is system-wide, so name what it did deliver and what it
                 // says it lost: a large events_lost or rt_buffers_lost with events still arriving
                 // is the session overflowing under load (this write's event was dropped); zero
-                // loss and no events at all is a session that is not delivering.
+                // loss and no events at all is a session that is not delivering. If
+                // loss_query_ok is 0 the counters are not evidence.
                 const SessionLoss loss = session_loss();
                 FAIL("no ETW event from this write within 15 s. session delivered "
-                     << src->buffer_for_test().pushed() << " events from all writers ("
+                     << src->buffer_for_test().pushed()
+                     << " events from all writers since it started ("
                      << src->buffer_for_test().size() << " still buffered); events_lost="
                      << loss.events_lost << " rt_buffers_lost=" << loss.rt_buffers_lost
                      << " decode_failed=" << loss.decode_failed

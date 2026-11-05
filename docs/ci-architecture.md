@@ -1944,8 +1944,9 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
   that matter: agent shards 480 s, `blocked log sink SIGTERM harness` 300 s, echo
   180 s, `gateway eunit` and `gateway ct` 600 s. (The agent shards and echo were
-  240 s and 90 s until #7135; the sample figures and the 80% thresholds below are
-  against those.)
+  240 s and 90 s until #7135. Every "of 240 s" sample below and the 192 s and 72 s
+  80% thresholds in the decision rule are against those old values; the current 80%
+  marks are 384 s and 144 s.)
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
   carry these entries (the junit import runs once at job end and reads the last
