@@ -5843,11 +5843,15 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
                                                    {row("A", "1", "", "d2")})
                   .empty());
     }
-    SECTION("two upgrades of one title pair in (epoch, version, release) order, whatever the input order") {
-        // Same stem (name, publisher, arch, location); four distinct instance_keys. The k-th
-        // removed row in tuple order pairs the k-th added row in tuple order.
-        const auto olds = std::vector<SoftwareEntry>{row("A", "1.5", "", "y"), row("A", "1", "", "x")};
-        const auto news = std::vector<SoftwareEntry>{row("A", "3", "", "x"), row("A", "2", "", "y")};
+    SECTION("two upgrades of one title pair in (epoch, version, release) order, "
+            "whatever the input order") {
+        // Same stem (name, publisher, arch, location), equal install_date, four distinct
+        // instance_keys. The k-th removed row in tuple order pairs the k-th added row in tuple
+        // order. The labels are chosen so the added rows' instance_key order is the reverse of
+        // their tuple order: pairing by instance_key would give 1 -> 4 and 1.5 -> 3.
+        const auto olds = std::vector<SoftwareEntry>{row("A", "1.5"), row("A", "1")};
+        const auto news = std::vector<SoftwareEntry>{row("A", "4"), row("A", "3")};
+        REQUIRE(row("A", "4").instance_key < row("A", "3").instance_key);
         for (const auto& [o, n] : {std::pair{olds, news},
                                    std::pair{std::vector<SoftwareEntry>(olds.rbegin(), olds.rend()),
                                              std::vector<SoftwareEntry>(news.rbegin(), news.rend())}}) {
@@ -5855,22 +5859,22 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
             REQUIRE(ch.size() == 2);
             CHECK(ch[0].kind == Kind::kUpgrade);
             CHECK(ch[0].from_version == "1");
-            CHECK(ch[0].to_version == "2");
+            CHECK(ch[0].to_version == "3");
             CHECK(ch[1].kind == Kind::kUpgrade);
             CHECK(ch[1].from_version == "1.5");
-            CHECK(ch[1].to_version == "3");
-            CHECK(ch[1].instance_key == row("A", "3", "", "x").instance_key);
+            CHECK(ch[1].to_version == "4");
+            CHECK(ch[1].instance_key == row("A", "4").instance_key);
         }
     }
     SECTION("an equal tuple pairs first: churn beside an upgrade is one upgrade, never two") {
-        // Removed {1 (churned date), 1.5}; added {1 (new date), 2}: 1 <-> 1 is churn, 1.5 -> 2.
+        // Removed {1, 2 (date d1)}; added {2 (date d2), 3}: 2 <-> 2 is churn, 1 -> 3 the one
+        // upgrade. Pairing the k-th rows without the equal-tuple walk gives 1 -> 2 and 2 -> 3.
         const auto ch = SoftwareInventoryStore::diff_changes(
-            {row("A", "1", "", "d1"), row("A", "1.5", "", "d1")},
-            {row("A", "1", "", "d2"), row("A", "2", "", "d1")});
+            {row("A", "1"), row("A", "2", "", "d1")}, {row("A", "2", "", "d2"), row("A", "3")});
         REQUIRE(ch.size() == 1);
         CHECK(ch[0].kind == Kind::kUpgrade);
-        CHECK(ch[0].from_version == "1.5");
-        CHECK(ch[0].to_version == "2");
+        CHECK(ch[0].from_version == "1");
+        CHECK(ch[0].to_version == "3");
     }
     SECTION("release and epoch are part of the compared tuple and of the recorded text") {
         const auto rel = [&](const std::string& v, const std::string& r, const std::string& ep) {
