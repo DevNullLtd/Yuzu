@@ -1,4 +1,4 @@
-# first-registration lines of the 8 stale-cohort agents, from the full container logs of both replicas (replica 1 = server, replica 2 = server-2), captured before the rig was removed
+# [gateway] lines (auto-enrolled, Issued per-agent client cert, re-registering, ProxyRegister succeeded, stream CONNECTED) for the 8 stale_other agents, selected by agent id from the full container logs of both replicas (server = replica 1, server-2 = replica 2) while the rig was up. Verbatim, nothing redacted (id=b2da75e1 is the 8-hex display prefix of the enrollment token). A subset: 'Agent registered', 'Enrollment token consumed', 'Agent removed', DISCONNECTED lines and registrations after an unrecorded cut-off are not included.
 ## run-F3-2r-162443 agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e
 server: [2026-11-05 16:24:19.157] [info] [6898] [gateway] Agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e re-registering (already enrolled)
 server: [2026-11-05 16:24:19.158] [info] [6898] [gateway] ProxyRegister succeeded: agent=14e0c219-5eb4-4e27-9dcb-c83941099e3e, session=gw-session-068261c0677757c74a4be2de56295f96
