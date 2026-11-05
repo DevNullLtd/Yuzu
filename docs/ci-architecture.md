@@ -1111,6 +1111,28 @@ progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then cal
 with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
 both follow a registry link and can delete its target.
 
+**Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
+`YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A
+real-time session outlives its process until something stops it, so a test process that is killed (a meson timeout),
+crashes or is cancelled leaves its session running, and the four runner agents share one OS identity, so the leak is
+shared state. On 2026-11-05 `logman query -ets` on Wee Tam showed one such session for a dead pid while `echo unit
+tests` failed on every Windows run waiting for its own registry event (#7173, #7135); the leg passed after the session
+was stopped by hand. Whether the leak is the cause is not established (the session limit was not reached, and no
+mechanism by which a dead session starves a new one is known), so the guard is preventive and the root-cause question
+stays on #7135.
+The Windows job runs `scripts/ci/stop-dead-etw-sessions.ps1` three times: `Self-test the ETW leaked-session cleanup`
+before the suite (canned `logman` output with injected liveness and stop functions: it starts and stops no session and
+only writes plain `selftest note:` lines, never an annotation), `Stop ETW sessions leaked by dead Yuzu test processes
+(pre-test)` before `Test (non-pg suites)`, and a `(post-test)` run under `always()` after the registry leftover
+assertion, so a session leaked by this job's own killed or cancelled test process is stopped and logged against this job
+rather than the next one. Each real run logs the total session count (limit 64, `::warning` from 48) and the Yuzu count.
+It stops a session by exact name only when the name matches `^Yuzu\w*Etw-\d+$` and its pid is not a running process,
+re-checked immediately before `logman stop`, so a live job on another runner slot keeps its session and no system or
+Defender session is ever matched. It never fails the job: a listing or stop error is a `::warning` and the script
+exits 0. Residuals: a pid reused by an unrelated live process keeps its session until that process exits; output the
+parser does not understand (a non-English Windows) stops nothing and warns; `nightly.yml`'s `windows-asan` job runs
+only the `agent` suite and does not run this step.
+
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
 ungated, with no multiplier, on the shared 4-runner Wee Tam box. It shares

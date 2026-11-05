@@ -4198,6 +4198,14 @@ test('sso-only runtime wiring lexical gate',
   suite: 'docs',
   timeout: 60,
 )
+# #7175: pins the Windows job's wiring of scripts/ci/stop-dead-etw-sessions.ps1 (step order, the post-test
+# step's always(), pwsh, and that the script can never fail the job); source-text only, so Python.
+test('windows etw cleanup wiring lexical gate',
+  _python3_test,
+  args: [files('test_etw_cleanup_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('same-site gate production wiring lexical selftest',
   _python3_test,
   args: [files('test_same_site_wiring_lexical_selftest.py')],
