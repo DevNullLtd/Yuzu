@@ -7,6 +7,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
+#include "workflow_wait.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -33,6 +34,27 @@ constexpr const char* kStoreName = "workflow_engine";
 // "Lease discipline").
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
+// The ONE retry of a run's final status write, when the first attempt could not get a lease: a
+// row left `running` is an orphan nothing sweeps, so the retry is allowed to wait out a busy pool.
+constexpr std::chrono::milliseconds kFinalizeRetryTimeout{10000};
+
+/// Counts one run in `WorkflowEngine::in_flight_` for exactly the scope it is alive in, so no
+/// path out of `execute()` (a return, a rethrow) can leak the count and hold a shutdown drain.
+class InFlightRun {
+public:
+    explicit InFlightRun(std::atomic<int>& n) noexcept : n_(n) {
+        n_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~InFlightRun() { n_.fetch_sub(1, std::memory_order_acq_rel); }
+    InFlightRun(const InFlightRun&) = delete;
+    InFlightRun& operator=(const InFlightRun&) = delete;
+
+private:
+    std::atomic<int>& n_;
+};
+
+/// Why a run was stopped (`kNone`: it was not). Selects the reason on the steps it skips.
+enum class StopCause { kNone, kBound, kShutdown };
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for the migration txn.
@@ -373,7 +395,8 @@ void wf_update_attempt(PGconn* conn, const std::string& execution_id, int step_i
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-WorkflowEngine::WorkflowEngine(pg::PgPool& pool) : pool_(pool) {
+WorkflowEngine::WorkflowEngine(pg::PgPool& pool)
+    : pool_(pool), write_timeout_(kWriteTimeout), finalize_retry_timeout_(kFinalizeRetryTimeout) {
     // Construction-only unbounded acquire (ADR-0012 §2) — every runtime acquire elsewhere in
     // this file is bounded.
     auto lease = pool_.acquire();
@@ -682,6 +705,10 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     if (!open_)
         return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
 
+    // From here to the end of the final status write (a throw included) this run holds the
+    // shutdown drain: counted in-process, never from the table.
+    const InFlightRun in_flight(in_flight_);
+
     // Load workflow
     auto workflow_result = get_workflow(workflow_id);
     if (!workflow_result)
@@ -751,7 +778,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // degradation") — a lease timeout mid-execute degrades to unrecorded history for that one
     // write rather than aborting an in-flight, possibly already-dispatched fleet operation.
     auto with_write_lease = [&](auto&& fn) {
-        auto lease = pool_.try_acquire_for(kWriteTimeout);
+        auto lease = pool_.try_acquire_for(write_timeout_);
         if (!lease) {
             spdlog::warn("WorkflowEngine::execute: lease unavailable mid-execution — a write "
                         "for execution {} was dropped (best-effort history, ADR-0064)",
@@ -766,10 +793,43 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // a clock read here that disagreed with its own by a microsecond would stop a run the caller
     // never recorded as stopped); `deadline` then only bounds the retry delay. With no hook, a
     // passed deadline stops the run.
-    const auto stop_before_attempt = [&control]() {
-        if (control.before_attempt)
-            return !control.before_attempt();
-        return control.deadline && std::chrono::steady_clock::now() >= *control.deadline;
+    //
+    // SHUTDOWN is asked first and is the engine's own: the higher of the run's `should_stop` and
+    // the engine-level default (`set_should_stop`). `kStop` ends the run exactly as a passed
+    // bound does, but with its own cause, so the skipped steps carry `server_shutdown` and the
+    // caller hears `on_interrupted` at the moment the engine acts.
+    const auto stop_level = [&]() {
+        auto level = WorkflowStopLevel::kNone;
+        if (control.should_stop)
+            level = control.should_stop();
+        if (should_stop_)
+            level = std::max(level, should_stop_());
+        return level;
+    };
+    StopCause stop_cause = StopCause::kNone;
+    const auto note_stop = [&](StopCause cause) {
+        if (stop_cause != StopCause::kNone)
+            return;
+        stop_cause = cause;
+        if (cause == StopCause::kShutdown && control.on_interrupted)
+            control.on_interrupted();
+    };
+    const auto stop_before_attempt = [&]() {
+        if (stop_level() == WorkflowStopLevel::kStop) {
+            note_stop(StopCause::kShutdown);
+            return true;
+        }
+        const bool bound = control.before_attempt
+                               ? !control.before_attempt()
+                               : (control.deadline &&
+                                  std::chrono::steady_clock::now() >= *control.deadline);
+        if (bound)
+            note_stop(StopCause::kBound);
+        return bound;
+    };
+    const auto skip_reason_json = [&stop_cause]() {
+        return stop_cause == StopCause::kShutdown ? std::string(R"({"reason":"server_shutdown"})")
+                                                  : std::string(R"({"reason":"run stopped"})");
     };
     bool run_stopped = false;
 
@@ -787,6 +847,24 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             on_admitted(exec_id);
 
         for (const auto& step : workflow.steps) {
+            // A stop that arrived between steps ends the run before this step begins: this step
+            // and every later one is skipped, nothing is dispatched.
+            if (stop_level() == WorkflowStopLevel::kStop) {
+                note_stop(StopCause::kShutdown);
+                run_stopped = true;
+                spdlog::warn("WorkflowEngine: execution {} stopped before step {} (server "
+                             "shutdown); skipping the remaining steps",
+                             exec_id, step.index);
+                with_write_lease([&](PGconn* c) {
+                    for (const auto& remaining : workflow.steps) {
+                        if (remaining.index >= step.index)
+                            wf_update_step_result(c, exec_id, remaining.index, "skipped",
+                                                  skip_reason_json());
+                    }
+                });
+                execution_failed = true;
+                break;
+            }
             current_step_index = step.index;
             current_step_open = true;
             // Check if execution was cancelled
@@ -894,8 +972,10 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                         run_stopped = true;
                         foreach_failed = true;
                         permanent_failure = true;
-                        foreach_results.push_back(
-                            nlohmann::json({{"error", "run stopped before this attempt"}}));
+                        foreach_results.push_back(nlohmann::json(
+                            {{"error", stop_cause == StopCause::kShutdown
+                                           ? "run stopped before this attempt (server shutdown)"
+                                           : "run stopped before this attempt"}}));
                         break;
                     }
                     auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
@@ -967,18 +1047,50 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
 
                 // Retry if attempts remain (never after a permanent failure)
                 if (!permanent_failure && attempt <= step.retry_count) {
-                    spdlog::warn("WorkflowEngine: step {} attempt {}/{} failed, retrying in {}s",
-                                 step.index, attempt, step.retry_count + 1, step.retry_delay_seconds);
-                    // The delay never runs past the deadline: the next attempt then finds the run
-                    // out of time and stops it, instead of the run sleeping on after the bound.
-                    auto delay = std::chrono::steady_clock::duration(
-                        std::chrono::seconds(step.retry_delay_seconds));
-                    if (control.deadline) {
-                        const auto left = *control.deadline - std::chrono::steady_clock::now();
-                        delay = std::clamp(left, std::chrono::steady_clock::duration::zero(), delay);
+                    // The pending retry ends here, un-made, when the server is stopping (the whole
+                    // run stops) or draining (this step fails under its own on_failure policy and
+                    // the run goes on). Either way no delay is slept for it.
+                    const auto end_retry = [&](WorkflowStopLevel level) {
+                        permanent_failure = true;
+                        if (level == WorkflowStopLevel::kStop) {
+                            note_stop(StopCause::kShutdown);
+                            run_stopped = true;
+                            foreach_results.push_back(nlohmann::json(
+                                {{"error", "run stopped before the retry (server shutdown)"}}));
+                        } else {
+                            spdlog::warn("WorkflowEngine: step {} (execution {}) retry abandoned: "
+                                         "the server is draining",
+                                         step.index, exec_id);
+                            foreach_results.push_back(nlohmann::json(
+                                {{"error", "retry abandoned: the server is draining"}}));
+                        }
+                        step_result = foreach_results.dump();
+                    };
+                    if (const auto level = stop_level(); level != WorkflowStopLevel::kNone) {
+                        end_retry(level);
+                    } else {
+                        spdlog::warn("WorkflowEngine: step {} attempt {}/{} failed, retrying in {}s",
+                                     step.index, attempt, step.retry_count + 1,
+                                     step.retry_delay_seconds);
+                        // The delay never runs past the deadline: the next attempt then finds the
+                        // run out of time and stops it, instead of the run sleeping on after the
+                        // bound.
+                        auto delay = std::chrono::steady_clock::duration(
+                            std::chrono::seconds(step.retry_delay_seconds));
+                        if (control.deadline) {
+                            const auto left = *control.deadline - std::chrono::steady_clock::now();
+                            delay = std::clamp(left, std::chrono::steady_clock::duration::zero(),
+                                               delay);
+                        }
+                        if (delay > std::chrono::steady_clock::duration::zero() &&
+                            interruptible_wait(delay, [&] {
+                                return stop_level() != WorkflowStopLevel::kNone;
+                            }) == WaitResult::kWoken) {
+                            if (const auto woke_level = stop_level();
+                                woke_level != WorkflowStopLevel::kNone)
+                                end_retry(woke_level);
+                        }
                     }
-                    if (delay > std::chrono::steady_clock::duration::zero())
-                        std::this_thread::sleep_for(delay);
                 } else {
                     step_result = foreach_results.dump();
                 }
@@ -998,14 +1110,16 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             current_step_open = false;
 
             if (run_stopped) {
-                spdlog::warn("WorkflowEngine: execution {} stopped before step {}'s attempt (run "
-                             "bound reached); skipping the remaining steps",
-                             exec_id, step.index);
+                spdlog::warn("WorkflowEngine: execution {} stopped at step {} ({}); skipping the "
+                             "remaining steps",
+                             exec_id, step.index,
+                             stop_cause == StopCause::kShutdown ? "server shutdown"
+                                                                : "run bound reached");
                 with_write_lease([&](PGconn* c) {
                     for (const auto& remaining : workflow.steps) {
                         if (remaining.index > step.index) {
                             wf_update_step_result(c, exec_id, remaining.index, "skipped",
-                                                  R"({"reason":"run stopped"})");
+                                                  skip_reason_json());
                         }
                     }
                 });
@@ -1096,21 +1210,64 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // either case — as an unconditional metric/log keyed only on `execution_failed` would —
     // would claim a write that didn't happen, or misreport a cancellation as a step failure.
     std::optional<std::string> finalize_status;
-    with_write_lease([&](PGconn* c) {
+    // Landed: our write matched the running row. NoMatch: it executed and matched nothing (a
+    // cancel already moved the row). Dropped: no lease, or the statement failed, so nothing was
+    // written; only that is worth a second try.
+    enum class FinalizeTry { kLanded, kNoMatch, kDropped };
+    // `persist` keeps asking for a lease until `lease_timeout` is spent: one `try_acquire_for`
+    // on a saturated pool gives up after the pool's own fast-fail (500 ms) whatever timeout it
+    // was given, which would make the retry no longer than the first try.
+    const auto try_finalize = [&](std::chrono::milliseconds lease_timeout,
+                                  bool persist) -> FinalizeTry {
+        const auto give_up = std::chrono::steady_clock::now() + lease_timeout;
+        auto lease = pool_.try_acquire_for(lease_timeout);
+        while (!lease && persist && std::chrono::steady_clock::now() < give_up)
+            lease = pool_.try_acquire_for(std::max(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    give_up - std::chrono::steady_clock::now()),
+                std::chrono::milliseconds(1)));
+        if (!lease) {
+            spdlog::warn("WorkflowEngine::execute: lease unavailable for the final status write "
+                         "of execution {}",
+                         exec_id);
+            return FinalizeTry::kDropped;
+        }
         pg::PgResult res = pg::exec_params(
-            c,
+            lease.get(),
             "UPDATE workflow_engine.workflow_executions SET status = $1, completed_at = $2::bigint "
             "WHERE id = $3 AND status = 'running' RETURNING status",
             std::vector<std::string>{execution_failed ? "failed" : "completed",
                                      std::to_string(now_epoch()), exec_id});
         if (res.status() != PGRES_TUPLES_OK) {
             spdlog::warn("WorkflowEngine: finalize status update failed for {}: {}", exec_id,
-                        PQresultErrorMessage(res.get()));
-            return;
+                         PQresultErrorMessage(res.get()));
+            return FinalizeTry::kDropped;
         }
-        if (PQntuples(res.get()) > 0)
-            finalize_status = col_str(res.get(), 0, 0); // "failed" or "completed" — confirmed written
-    });
+        if (PQntuples(res.get()) == 0)
+            return FinalizeTry::kNoMatch;
+        finalize_status = col_str(res.get(), 0, 0); // "failed" or "completed": confirmed written
+        return FinalizeTry::kLanded;
+    };
+    auto finalize_try = try_finalize(write_timeout_, /*persist=*/false);
+    if (finalize_try == FinalizeTry::kDropped) {
+        // The row would otherwise stay `running` with nothing to close it: one more try, with a
+        // longer lease, before giving up on it.
+        spdlog::warn("WorkflowEngine: final status write for execution {} dropped; retrying once "
+                     "with a longer lease",
+                     exec_id);
+        finalize_try = try_finalize(finalize_retry_timeout_, /*persist=*/true);
+    }
+    if (finalize_try == FinalizeTry::kDropped) {
+        spdlog::error("WorkflowEngine: execution {} was NOT finalized: the final status write "
+                      "failed twice, so the row stays 'running' until something closes it",
+                      exec_id);
+        if (metrics_) {
+            try {
+                metrics_->counter("yuzu_server_workflow_finalize_failed_total", {}).increment();
+            } catch (...) { // NOLINT(bugprone-empty-catch): observability must not fail the run
+            }
+        }
+    }
 
     // Determine the real outcome for the log line (and, via the completed/not-completed split
     // below, the metric). If our own write landed, trust it. If not (lease timeout, or the guard

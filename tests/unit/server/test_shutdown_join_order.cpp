@@ -70,6 +70,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "shutdown_drain_rules.hpp"
+
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -181,6 +184,57 @@ TEST_CASE("server.cpp: web_thread_.join() runs before schedule_engine_.reset() "
     INFO("web_thread_.join() at server.cpp:" << web_join_line);
     INFO("schedule_engine_.reset() at server.cpp:" << schedule_engine_reset_line);
     CHECK(web_join_line < schedule_engine_reset_line);
+}
+
+/**
+ * #2146: the shutdown drain waits for workflow runs in flight. The pure rule is in
+ * shutdown_drain_rules.hpp; the loop that feeds it lives in ServerImpl::stop(), which is not
+ * unit-constructible, so the wiring is pinned by scan: the engine's in-process counter is read
+ * INSIDE the drain loop (after draining_ is set, before stop_requested_ is), and what it reads
+ * feeds keep_draining_for_work. Reading a table count instead, or computing the wait without it,
+ * fails here.
+ */
+TEST_CASE("server.cpp: the drain loop waits on the workflow engine's in-process run count, between "
+          "draining_ and stop_requested_ (#2146)",
+          "[shutdown_order][shutdown_drain]") {
+    const std::string& text = stripped_source("server.cpp");
+    const int draining_line =
+        require_one_line(text, "draining_.store(true, std::memory_order_release)",
+                         "draining_.store(true)");
+    const int count_line = require_one_line(text, "workflow_engine_->in_flight_runs()",
+                                            "workflow_engine_->in_flight_runs()");
+    const int rule_line = require_one_line(text, "shutdown_drain::keep_draining_for_work(",
+                                           "shutdown_drain::keep_draining_for_work(");
+    const int stop_line = require_one_line(text, "stop_requested_.store(true, std::memory_order_release)",
+                                           "stop_requested_.store(true)");
+    INFO("draining_ " << draining_line << " count " << count_line << " rule " << rule_line
+                      << " stop_requested_ " << stop_line);
+    CHECK(draining_line < count_line);
+    CHECK(count_line < rule_line);
+    CHECK(rule_line < stop_line);
+    // The engine learns of the shutdown through ONE wiring, from the same two flags.
+    const int should_stop_line = require_one_line(text, "workflow_engine_->set_should_stop(",
+                                                  "workflow_engine_->set_should_stop(");
+    CHECK(should_stop_line > 0);
+}
+
+TEST_CASE("shutdown_drain: a workflow run in flight extends the wait, and the SAME cap releases it",
+          "[shutdown_drain]") {
+    using namespace std::chrono_literals;
+    using yuzu::server::shutdown_drain::keep_draining_for_work;
+    using yuzu::server::shutdown_drain::kExecutionDrainCap;
+    // Nothing in the tracker, no grace: only the engine's own run count holds the drain.
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, 1));
+    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, 3));
+    // The cap bounds it exactly as it bounds a tracked execution: a run still going at the cap is
+    // stopped by stop_requested_, not waited for.
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, 1));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap + 5s, 0s, 4, 4));
+    // A tracked execution alone, and the minimum grace, behave as before.
+    CHECK(keep_draining_for_work(1s, 0s, 2, 0));
+    CHECK(keep_draining_for_work(5s, 10s, 0, 0));
+    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0));
 }
 
 // require_one_line fails loudly on zero or on more than one occurrence (uniqueness kept

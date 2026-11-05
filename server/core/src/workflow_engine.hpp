@@ -24,6 +24,7 @@
 #include "workflow_run_port.hpp" // WorkflowRunControl (the per-run hooks execute() consumes)
 #include "workflow_types.hpp" // ADR-0031 WS-A4 (eighth family): relocated pure POD types
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -99,6 +100,31 @@ public:
     /// contract, same as every other metrics-emitting store on this ladder.
     void set_metrics(yuzu::MetricsRegistry* metrics) noexcept { metrics_ = metrics; }
 
+    /// The engine-level shutdown state every run consults (`WorkflowStopLevel`), legacy route
+    /// included: the server wires it to `draining_` / `stop_requested_`. A run acts on the higher
+    /// of this and its own `WorkflowRunControl::should_stop`. Unset == `kNone`. Set-before-traffic
+    /// contract (like `set_metrics`): the function is read without a lock while runs are in
+    /// flight, and it must be cheap and must not throw.
+    void set_should_stop(std::function<WorkflowStopLevel()> fn) { should_stop_ = std::move(fn); }
+
+    /// Lease timeouts for the writes of a run already in flight (step results, the finalize).
+    /// `write` bounds each of them (default 2 s); `finalize_retry` bounds the ONE retry the final
+    /// status write gets when the first attempt could not get a lease (default 10 s). A seam so a
+    /// test can starve the pool in milliseconds; production never calls it. Set-before-traffic.
+    void set_run_lease_timeouts(std::chrono::milliseconds write,
+                                std::chrono::milliseconds finalize_retry) noexcept {
+        write_timeout_ = write;
+        finalize_retry_timeout_ = finalize_retry;
+    }
+
+    /// Runs inside `execute()` right now, counted in-process from the top of `execute()` to after
+    /// its final status write (a throw included). The shutdown drain waits on this. It is
+    /// deliberately NOT a count of `running` rows: an orphan left by a crash, or a run owned by
+    /// another replica, must never hold this process's shutdown.
+    [[nodiscard]] int in_flight_runs() const noexcept {
+        return in_flight_.load(std::memory_order_acquire);
+    }
+
     // ── Workflow CRUD ────────────────────────────────────────────────────
     std::expected<std::string, std::string> create_workflow(const std::string& yaml_source);
 
@@ -132,6 +158,17 @@ public:
     /// exception is rethrown to the caller, so a run is never left `running` behind a throw.
     /// `on_admitted` is called once with the new execution id after admission and before the first
     /// step.
+    ///
+    /// SHUTDOWN. The engine asks the higher of `control.should_stop` and the engine-level
+    /// `set_should_stop` at the top of every step, before every attempt and while a retry delay is
+    /// waited out (an interruptible wait, `workflow_wait.hpp`, so a change is seen within one
+    /// slice). `kDraining` abandons the retry a step had not yet made (the step then fails under
+    /// its own `on_failure` policy) and the run goes on dispatching its remaining steps. `kStop`
+    /// ends the run: the unstarted steps are marked skipped with reason `server_shutdown`, the
+    /// execution is finalized `failed` through the same guarded UPDATE, `control.on_interrupted`
+    /// is called, and `cancel_execution` is NOT used. The final write gets one retry with a longer
+    /// lease; if that also fails the row stays `running`, the error is logged and
+    /// `yuzu_server_workflow_finalize_failed_total` counts it.
     ///
     /// `control` carries the run's bounds (`workflow_run_port.hpp`): before every dispatch attempt
     /// the engine asks `control.before_attempt` and compares `control.deadline` with the steady
@@ -194,6 +231,10 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    std::function<WorkflowStopLevel()> should_stop_;
+    std::chrono::milliseconds write_timeout_;
+    std::chrono::milliseconds finalize_retry_timeout_;
+    std::atomic<int> in_flight_{0};
 
     std::string generate_id() const;
 

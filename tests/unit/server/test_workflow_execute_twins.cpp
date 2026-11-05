@@ -133,6 +133,9 @@ struct Fx {
     // The stand-in engine asks `before_attempt` ahead of every step, as the real engine does ahead
     // of every attempt, and stops the run (skipping the rest) when it says no.
     bool engine_stopped{false};
+    /// >= 0: before dispatching the step at this 0-based position the stand-in engine behaves as
+    /// the real one does on a server stop: it calls `on_interrupted` once and sends nothing more.
+    int interrupt_before_step{-1};
 
     WorkflowExecuteRequest request(std::vector<std::string> ids = {"a1"}) {
         WorkflowExecuteRequest r;
@@ -198,7 +201,15 @@ struct Fx {
                 control.on_admitted(*engine_error);
             if (during_run)
                 during_run();
+            int position = -1;
             for (const auto& sid : step_ids) {
+                ++position;
+                if (position == interrupt_before_step) {
+                    if (control.on_interrupted)
+                        control.on_interrupted();
+                    engine_stopped = true;
+                    break;
+                }
                 if (control.before_attempt && !control.before_attempt()) {
                     engine_stopped = true;
                     break;
@@ -913,8 +924,13 @@ TEST_CASE("workflow execute: the run outcome is judged by ONE function and its t
     CHECK(workflow_run_outcome_token(O::kFailed) == "failed");
     CHECK(workflow_run_outcome_token(O::kPartial) == "partial");
     CHECK(workflow_run_outcome_token(O::kAborted) == "aborted");
-    // Reserved for the shutdown path: no run produces it yet, but the vocabulary is pinned.
     CHECK(workflow_run_outcome_token(O::kInterrupted) == "interrupted");
+    // A server stop is its own outcome, whatever was sent, ...
+    CHECK(classify_workflow_run("failed", false, {reached(1)}, false, true) == O::kInterrupted);
+    CHECK(classify_workflow_run("failed", false, {}, false, true) == O::kInterrupted);
+    // ... except that a step refused at send time or a passed deadline is judged first.
+    CHECK(classify_workflow_run("failed", true, {reached(1)}, false, true) == O::kAborted);
+    CHECK(classify_workflow_run("failed", false, {reached(1)}, true, true) == O::kAborted);
 }
 
 TEST_CASE("workflow execute: a protective action never reports the three gate-withhold causes",
@@ -2287,6 +2303,91 @@ TEST_CASE("workflow run budget: a run stopped at its deadline skips the rest, re
         CHECK(*f.seen_deadline > std::chrono::steady_clock::now());
         CHECK(*f.seen_deadline <= std::chrono::steady_clock::now() + kWorkflowSyncBudget);
     }
+}
+
+TEST_CASE("workflow run shutdown: a run the engine stopped for a server stop is INTERRUPTED, a typed "
+          "non-success with reason server_shutdown, even when nothing had been sent",
+          "[workflow][twin][shutdown][outcome]") {
+    SECTION("stopped after step 1 was sent") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed"; // what the engine records for a stopped run
+        f.interrupt_before_step = 1;
+        const auto o = f.run();
+        CHECK(f.engine_stopped);
+        CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kInterrupted);
+        CHECK(o.interrupted);
+        CHECK_FALSE(o.deadline_exceeded);
+        CHECK(o.reason == "server_shutdown");
+        CHECK_FALSE(o.retryable);
+        CHECK(o.steps.size() == 1); // step 2 was never sent
+        CHECK(f.events.back() == "audit:failure");
+        CHECK(f.audit_details.back().find("run_outcome=interrupted") != std::string::npos);
+        CHECK(f.audit_details.back().find("reason=server_shutdown") != std::string::npos);
+        const auto j = workflow_execute_result_json(o, "wf-1");
+        CHECK(j["status"] == "interrupted");
+        CHECK(j["reason"] == "server_shutdown");
+        CHECK(j["retryable"] == false);
+        CHECK(j["run_status"] == "failed");
+        CHECK(j["message"].get<std::string>().find("shutting down") != std::string::npos);
+    }
+    SECTION("stopped before any step was sent: still a typed interrupted run, not a zero-reach error") {
+        Fx f;
+        f.engine_status = "failed";
+        f.interrupt_before_step = 0;
+        const auto o = f.run();
+        CHECK_FALSE(f.dispatched_anything());
+        CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kInterrupted);
+        CHECK(o.reason == "server_shutdown");
+        CHECK_FALSE(o.retryable);
+        CHECK(o.execution_id == "exec-1");
+        CHECK(f.audit_details.back().find("run_outcome=interrupted") != std::string::npos);
+    }
+    SECTION("a draining server alone interrupts nothing: the engine never calls on_interrupted") {
+        Fx f;
+        const auto o = f.run();
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        CHECK_FALSE(o.interrupted);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kSucceeded);
+    }
+    SECTION("the sequence hands the engine an on_interrupted hook") {
+        Fx f;
+        f.engine_status = "failed";
+        auto a = f.api();
+        auto p = f.ports(a);
+        bool had_hook = false;
+        p.run = [&](const std::string&, const std::vector<std::string>&, StepDispatchFn,
+                    ConditionEvalFn, const WorkflowRunControl& control)
+            -> std::expected<std::string, std::string> {
+            had_hook = static_cast<bool>(control.on_interrupted);
+            return std::string{"exec-1"};
+        };
+        (void)apply_workflow_execute(p, f.request());
+        CHECK(had_hook);
+    }
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a run interrupted by a server stop is a 202 with "
+          "status interrupted, reason server_shutdown and no retry hint",
+          "[workflow][twin][rest][shutdown][outcome]") {
+    Rest r;
+    r.fx.engine_status = "failed";
+    r.fx.step_ids = {"i-ro", "i-ro2"};
+    r.fx.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    r.fx.interrupt_before_step = 1;
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto j = body_of(*res);
+    CHECK(j["data"]["status"] == "interrupted");
+    CHECK(j["data"]["reason"] == "server_shutdown");
+    CHECK(j["data"]["retryable"] == false);
+    CHECK(j["data"]["run_status"] == "failed");
+    REQUIRE(j["data"]["steps"].size() == 1);
+    CHECK(r.fx.audit_details.back().find("run_outcome=interrupted") != std::string::npos);
 }
 
 TEST_CASE("workflow run budget: prepare refuses a workflow whose worst-case retry sleep exceeds 60 s; "

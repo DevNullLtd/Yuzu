@@ -7713,6 +7713,24 @@ public:
                 startup_failed_ = true;
             } else {
                 workflow_engine_->set_metrics(&metrics_);
+                // Every run, the legacy route's included, learns of a shutdown here:
+                // `draining_` makes a run give up retries it has not made, `stop_requested_`
+                // ends it (steps skipped `server_shutdown`). The closure outlives no run: the
+                // web server is joined before the engine is destroyed.
+                workflow_engine_->set_should_stop([this] {
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        return yuzu::server::WorkflowStopLevel::kStop;
+                    if (draining_.load(std::memory_order_acquire))
+                        return yuzu::server::WorkflowStopLevel::kDraining;
+                    return yuzu::server::WorkflowStopLevel::kNone;
+                });
+                metrics_.describe("yuzu_server_workflow_finalize_failed_total",
+                                  "Workflow runs whose final status write failed twice (a lease "
+                                  "timeout or a failed statement, then one retry with a longer "
+                                  "lease), leaving the execution row 'running'. Any increase is "
+                                  "an orphan nothing closes. #2146.",
+                                  "counter");
+                metrics_.counter("yuzu_server_workflow_finalize_failed_total", {});
                 metrics_.describe("yuzu_server_workflow_engine_writes_total",
                                   "WorkflowEngine create_workflow/delete_workflow/execute/"
                                   "cancel_execution outcomes, by op and result. ADR-0064.",
@@ -10712,10 +10730,18 @@ public:
                 // has no client-side deadline and can overrun the cap.
                 if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
                     running = execution_tracker_->query_executions({.status = "running"}).size();
-                if (!shutdown_drain::keep_draining(elapsed, min_grace, running > 0))
+                // Workflow runs the engine holds in-process (a synchronous run pins an HTTP
+                // worker): an atomic read, so it is taken every tick whatever the tracker
+                // says, and never a table count (orphans and other replicas must not hold
+                // this replica's shutdown). The same cap bounds it.
+                const int workflow_runs = workflow_engine_ ? workflow_engine_->in_flight_runs() : 0;
+                if (!shutdown_drain::keep_draining_for_work(elapsed, min_grace, running,
+                                                            workflow_runs))
                     break;
-                if (running > 0) {
-                    spdlog::info("Draining: {} executions in flight, waiting...", running);
+                if (running > 0 || workflow_runs > 0) {
+                    spdlog::info("Draining: {} executions and {} workflow runs in flight, "
+                                 "waiting...",
+                                 running, workflow_runs);
                 } else if (steady_clock::now() - last_log >= seconds(10)) {
                     // A countdown, so a long grace does not read as a hang and invite
                     // the second signal that hard-exits (UP-11).
@@ -19531,8 +19557,8 @@ private:
         // The run port behind POST /api/v1/workflows/{id}/execute and MCP execute_workflow
         // (workflow_run_port.hpp): ONE closure over the engine, shared by both, kept out of the
         // read seam above. Null when the engine was never opened, like `workflow_api`. The engine
-        // consumes `on_admitted`, `before_attempt` and `deadline` of the WorkflowRunControl so
-        // far; `should_stop` is not yet consumed.
+        // consumes the whole WorkflowRunControl; shutdown reaches it through the
+        // engine-level `set_should_stop` wired at the engine's construction.
         yuzu::server::WorkflowRunFn workflow_run_fn;
         if (workflow_engine_)
             workflow_run_fn = [engine = workflow_engine_.get()](

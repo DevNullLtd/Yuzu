@@ -6711,9 +6711,9 @@ nothing is sent.
 it cannot be saved the answer is `503` with `Sec-Audit-Failed: true` and nothing was sent. A step
 refused at send time because its definition changed after the preflight is audited as `denied` at
 that moment (detail ends `(late)`). A closing row records the outcome: `success` ONLY for a run
-whose `data.status` is `completed`, otherwise `failure` with `run_outcome=failed|partial|aborted`
-in the detail (the same tokens as the `partial`/`aborted` status, and `failed` for the `503` where
-nothing reached; `interrupted` is reserved for a server shutdown and is not produced yet); if that one is lost the `202` carries `data.audit_persisted: false` and
+whose `data.status` is `completed`, otherwise `failure` with `run_outcome=failed|partial|aborted|interrupted`
+in the detail (the same tokens as the `partial`/`aborted`/`interrupted` status, and `failed` for the `503` where
+nothing reached; `interrupted` is a run stopped by a server shutdown, with `reason=server_shutdown`); if that one is lost the `202` carries `data.audit_persisted: false` and
 `Sec-Audit-Failed: true`. A refusal by the per-step checks (`approval_required`, `dispatch_denied`,
 `step_unclassified`, the targeting refusals) is audited as `denied` with the `reason`, and writes no
 `requested` row. A wiring failure, an unknown or empty workflow, an unknown instruction and a store
@@ -6740,6 +6740,21 @@ false` (or, if no step reached any agent, the `503` `deadline_exceeded`, also no
 already in flight is not interrupted. The closing audit row is `failure` with
 `run_outcome=aborted reason=deadline_exceeded`.
 
+**Shutdown.** A server that is *draining* (it has been told to stop and is holding its listener open
+for in-flight work) lets a run in flight finish its dispatching: a retry the run had not yet made is
+abandoned at once (the pending retry counts as exhausted and no delay is slept; the wait is checked
+every 250 ms, so a run asleep in a retry delay wakes within a quarter of a second), the step then
+fails under its own `on_failure` policy, and the run goes on with its remaining steps. The shutdown
+waits for these runs, counted inside the server process (never from the table, so a run left
+`running` by a crash or owned by another replica does not hold it), up to the same 30 second cap it
+applies to tracked executions. A server that is *stopping* ends the run: nothing more is sent, the
+steps not yet started are `skipped` with reason `server_shutdown`, the execution is closed `failed`
+(it is not marked `cancelled`), and the answer is the typed `202` below with `data.status:
+"interrupted"`, `data.reason: "server_shutdown"` and `retryable: false`, even when nothing had been
+sent. Steps already sent are not recalled. The closing audit row is `failure` with
+`run_outcome=interrupted reason=server_shutdown`. Read the run with `GET
+/api/v1/workflow-executions/{id}`: a step with no `command_id` was never sent.
+
 **Dispatch is synchronous, device work is not.** The call returns after every step's command has
 been sent, including step retries and delays (within the run budget above), so it can be slow. Each step is sent only to the
 agents the caller can see (the same confinement as every other dispatch); a named agent outside the
@@ -6760,9 +6775,10 @@ withheld counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_swit
 at send time and every send attempt reached at least one agent (commands were sent; devices have not
 necessarily finished). A run that sent something and did not meet all three is still a `202` (a
 `5xx` would invite a blind re-send of steps already sent) but is NOT a success: `data.status` is
-`partial` (some attempt reached nobody, or the engine did not complete after a send) or `aborted` (a
+`partial` (some attempt reached nobody, or the engine did not complete after a send), `aborted` (a
 step was refused at send time because its definition changed, or the run reached its 60 second
-deadline, and the rest did not run), with
+deadline, and the rest did not run) or `interrupted` (the server began stopping: `data.reason`
+`server_shutdown`), with
 `data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
 with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step retried
 to success still counts its earlier zero-reach attempt, so the run reads `partial`: the label errs

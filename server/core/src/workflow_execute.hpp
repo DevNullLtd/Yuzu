@@ -68,7 +68,7 @@
 /// after the run: the run is synchronous and the engine finalizes its row before `run` returns, so
 /// the read cannot see an earlier state, and an unreadable row ("unknown") is never success. The
 /// transports map the outcome identically: kOk -> 202 `status:"completed"`; a run that sent
-/// something but did not succeed (kRunIncomplete) -> 202 with `status:"partial"|"aborted"` and
+/// something but did not succeed (kRunIncomplete) -> 202 with `status:"partial"|"aborted"|"interrupted"` and
 /// `retryable:false`; a run that reached nobody (kNoAgentsReached) -> the zero-reach error.
 ///
 /// ADMISSION AND THE BUDGET. A run is SYNCHRONOUS: the transport's worker thread is held for the
@@ -84,6 +84,14 @@
 /// deadline is the real bound.
 /// A run stopped at its deadline skips its remaining steps, closes `failed`, and ends
 /// `WorkflowRunOutcome::kAborted` with `deadline_exceeded` and reason `deadline_exceeded`.
+///
+/// SHUTDOWN. A server that is DRAINING lets a run in flight finish its dispatching: the engine
+/// abandons any retry the run had not yet made and goes on with the remaining steps, and the
+/// shutdown waits for the run (the engine's in-flight count is part of the drain wait, capped).
+/// A server that is STOPPING ends the run: the engine tells the sequence (`on_interrupted`), the
+/// run answers `WorkflowRunOutcome::kInterrupted` as a typed 2xx `status:"interrupted"` with
+/// reason `server_shutdown` and `retryable:false`, and its closing audit row is `failure` with
+/// `run_outcome=interrupted reason=server_shutdown`.
 ///
 /// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
 /// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches
@@ -296,7 +304,7 @@ enum class WorkflowExecuteStatus {
     kDefinitionChanged,          ///< a step's instruction moved from the ticket-bound effect (400, nothing sent for it)
     kEffectDigestFailed,         ///< the step-effect digest could not be computed (500, no ticket minted)
     kRunFailed,                  ///< the run THREW after the `requested` row: steps may have been sent (500, NOT retryable)
-    kRunIncomplete,              ///< the run ran and sent something but did not fully succeed: `partial` or `aborted` (2xx, typed status, NOT retryable)
+    kRunIncomplete,              ///< the run ran and sent something but did not fully succeed: `partial`, `aborted` or `interrupted` (2xx, typed status, NOT retryable)
     kExceedsSyncBudget,          ///< the workflow's worst-case retry sleep exceeds `kWorkflowSyncBudget` (400, nothing done, no ticket)
     kRunCapReached,              ///< admission: this principal or the server holds as many runs/streams as it may (429, retryable, nothing done)
     kDraining,                   ///< admission: the server is shutting down and starts no new run (503, retryable, nothing done)
@@ -314,8 +322,12 @@ enum class WorkflowExecuteStatus {
 ///                    OR the run reached its deadline (`kWorkflowSyncBudget`) and the engine
 ///                    stopped it (`deadline_exceeded`). Takes precedence: the run was cut short,
 ///                    whatever else it did.
-///   * `kInterrupted` RESERVED for the shutdown path (commit 7): the run was stopped by the server
-///                    draining before it finished. Produced by nothing yet.
+///   * `kInterrupted` the engine ended the run because the server is stopping (the engine told the
+///                    sequence through `WorkflowRunControl::on_interrupted`, at the moment it
+///                    acted): the unstarted steps are skipped `server_shutdown` and the execution
+///                    is closed `failed`. Typed 2xx `status:"interrupted"`, reason
+///                    `server_shutdown`, `retryable:false`, whether or not anything was sent.
+///                    A server that is merely DRAINING does not interrupt a run.
 ///   * `kFailed`      no dispatch attempt reached any agent: the engine ended `failed` (or in any
 ///                    status other than `completed`, or unreadable) with nothing sent, or every
 ///                    attempt reached nobody and the failed step's policy (abort, skip_remaining)
@@ -385,6 +397,8 @@ struct WorkflowExecuteOutcome {
     /// The run reached its deadline and the engine stopped it: the remaining steps were skipped
     /// and the execution closed `failed`. Always paired with `run_outcome == kAborted`.
     bool deadline_exceeded{false};
+    /// The server stopped and the engine ended the run (`kInterrupted`), reason `server_shutdown`.
+    bool interrupted{false};
     /// False only when the closing outcome row failed to persist after the run had started.
     bool audit_persisted{true};
 };
@@ -394,7 +408,7 @@ struct WorkflowExecuteOutcome {
 [[nodiscard]] WorkflowRunOutcome
 classify_workflow_run(std::string_view run_status, bool late_denied,
                       const std::vector<WorkflowStepDispatchNote>& steps,
-                      bool deadline_exceeded = false);
+                      bool deadline_exceeded = false, bool interrupted = false);
 
 /// What `admit_workflow_run` decided. `lease` is engaged iff the run is admitted and must be held
 /// for the WHOLE run (a stack object in the transport, so a return or a throw releases it);
@@ -494,7 +508,7 @@ struct StepAdmissionDecision {
 /// withheld counts when nothing was reached), `late_denied`, and `audit_persisted:false` only when
 /// the closing audit row failed. `status` is the engine's recorded dispatch-level status
 /// (`completed` for a full success). For kRunIncomplete it is the run's outcome token instead
-/// (`partial` or `aborted`), the engine's own status moves to `run_status`, and `message` and
+/// (`partial`, `aborted` or `interrupted`), the engine's own status moves to `run_status`, and `message` and
 /// `retryable:false` are added: a client that reads only `status` can never mistake an
 /// incomplete run for a completed one. One builder so REST and MCP cannot drift on field set.
 [[nodiscard]] nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,

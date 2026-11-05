@@ -16,7 +16,13 @@
 ///      listener immediately and the LB learned about it from refused
 ///      connections. Default 0 (single-node shutdown unchanged).
 ///   2. In-flight executions — the pre-existing wait, capped at
-///      `kExecutionDrainCap` from drain start.
+///      `kExecutionDrainCap` from drain start. Two things count: the tracker's `running`
+///      executions and the workflow runs the workflow engine holds IN-PROCESS
+///      (`WorkflowEngine::in_flight_runs()`, a counter of runs inside `execute()`, never a count
+///      of `running` rows in Postgres: an orphan left by a crash, or a run owned by another
+///      replica, must not hold this replica's shutdown). `keep_draining_for_work` is the one
+///      decision over both, and the same cap bounds it: a workflow run still going at the cap is
+///      stopped (`WorkflowStopLevel::kStop`) when `stop_requested_` is set, not waited for.
 ///
 /// Total wait is therefore max(N, time for executions to finish), normally at
 /// most max(N, kExecutionDrainCap). Residual: the executions query runs on a
@@ -40,6 +46,7 @@
 /// setting; it is not derived from the 210s budget.
 
 #include <chrono>
+#include <cstddef>
 
 namespace yuzu::server::shutdown_drain {
 
@@ -52,6 +59,15 @@ constexpr bool keep_draining(std::chrono::steady_clock::duration elapsed,
     if (elapsed < min_grace)
         return true;
     return executions_running && elapsed < kExecutionDrainCap;
+}
+
+/// `keep_draining` over BOTH kinds of in-flight work: `tracker_running` executions the tracker
+/// reports as running, and `workflow_runs` runs the workflow engine holds in-process. Either
+/// being non-zero extends the wait, up to the same `kExecutionDrainCap`.
+constexpr bool keep_draining_for_work(std::chrono::steady_clock::duration elapsed,
+                                      std::chrono::seconds min_grace, std::size_t tracker_running,
+                                      int workflow_runs) noexcept {
+    return keep_draining(elapsed, min_grace, tracker_running > 0 || workflow_runs > 0);
 }
 
 } // namespace yuzu::server::shutdown_drain

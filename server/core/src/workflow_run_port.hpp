@@ -29,12 +29,26 @@
 
 namespace yuzu::server {
 
+/// What the server's shutdown asks of a run in flight. Ordered: a higher level includes the lower.
+///   * `kNone`      nothing: the run is untouched.
+///   * `kDraining`  the server is draining (its listener is held open for in-flight work): a run
+///                  abandons any retry it has not yet made (the pending retry is treated as
+///                  exhausted and no delay is slept) but KEEPS dispatching its remaining steps.
+///   * `kStop`      the server is stopping: nothing more is dispatched. The run is finalized
+///                  `failed`, its unstarted steps are marked skipped with reason
+///                  `server_shutdown`, and the caller is told through `on_interrupted`.
+enum class WorkflowStopLevel {
+    kNone,
+    kDraining,
+    kStop,
+};
+
 /// Per-run controls. Every member is optional and an unset member is no hook, so a caller that
 /// sets none gets the engine's plain behaviour. The engine consumes the members it supports; a
 /// member it does not yet consume is ignored. Members are added here as the engine gains the
 /// matching hook, so the port signature never changes.
 ///
-/// Consumed today: `on_admitted`, `before_attempt` and `deadline`.
+/// Consumed today: `on_admitted`, `before_attempt`, `deadline`, `should_stop` and `on_interrupted`.
 struct WorkflowRunControl {
     /// Called once with the new run's execution id after the engine has admitted the run and
     /// before the first step is dispatched.
@@ -47,8 +61,15 @@ struct WorkflowRunControl {
     /// engine refuses to start an attempt at or after it, with the same stop as `before_attempt`,
     /// and never sleeps a retry delay past it. A dispatch already in flight is not interrupted.
     std::optional<std::chrono::steady_clock::time_point> deadline;
-    /// Polled between attempts and during retry sleeps; `true` stops the run.
-    std::function<bool()> should_stop;
+    /// Polled at the top of every step and every attempt and during retry sleeps (at most one
+    /// sliced wait, `kInterruptibleWaitSlice`, behind a change). The engine also holds an
+    /// engine-level default (`WorkflowEngine::set_should_stop`, the server's shutdown state) and
+    /// acts on the HIGHER of the two answers. See `WorkflowStopLevel`.
+    std::function<WorkflowStopLevel()> should_stop;
+    /// Called once, from the engine, when it ENDS the run because the level read `kStop`: the
+    /// caller learns the run was interrupted at the moment the engine acted, never inferred
+    /// afterwards. Not called for `kDraining` (the run goes on) or for a deadline.
+    std::function<void()> on_interrupted;
 };
 
 using WorkflowRunFn = std::function<std::expected<std::string, std::string>(

@@ -48649,6 +48649,66 @@ TEST_CASE("MCP execute_workflow: a run where step 1 reached an agent and step 2 
     CHECK_FALSE(wf_audit_has(ts, "success", "execution_id=exec-1"));
 }
 
+TEST_CASE("MCP execute_workflow: a run the engine stopped for a server stop is `interrupted` with "
+          "reason server_shutdown, a typed non-success that must not be re-sent",
+          "[mcp][pg][workflow][twin][security][tier][approval][outcome][shutdown]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    // The engine stand-in sends step 1, then behaves as the real engine on a server stop: it
+    // tells the sequence it interrupted the run and sends nothing more. The engine records
+    // `failed` for an interrupted run.
+    fx.api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        [inner = fx.api](const std::string& id) { return inner->get_workflow(id); },
+        [](const std::string& id)
+            -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
+            yuzu::server::WorkflowExecution e;
+            e.id = id;
+            e.workflow_id = "wf-1";
+            e.status = "failed";
+            return std::optional<yuzu::server::WorkflowExecution>{e};
+        });
+    ts.workflow_api_for_test = fx.api;
+    ts.workflow_run_for_test = [&](const std::string&, const std::vector<std::string>&,
+                                   yuzu::server::StepDispatchFn fn, yuzu::server::ConditionEvalFn,
+                                   const yuzu::server::WorkflowRunControl& control)
+        -> std::expected<std::string, std::string> {
+        ++fx.run_calls;
+        if (control.on_admitted)
+            control.on_admitted("exec-1");
+        (void)fn(fx.step_ids[0], "[]", "{}");
+        if (control.on_interrupted)
+            control.on_interrupted();
+        return std::string{"exec-1"};
+    };
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    const std::string approval_id = wf_mint_and_approve(ts, appr);
+    auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+    REQUIRE(recall);
+    INFO(recall->body);
+    const auto j = nlohmann::json::parse(recall->body);
+    REQUIRE(j.contains("result"));
+    const auto payload = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fx.dispatches == 1); // step 2 was never sent
+    CHECK(payload["status"] == "interrupted");
+    CHECK(payload["reason"] == "server_shutdown");
+    CHECK(payload["run_status"] == "failed");
+    CHECK(payload["retryable"] == false);
+    CHECK(payload["retry_after_ms"].is_null());
+    CHECK(payload["execution_id"] == "exec-1");
+    CHECK(wf_audit_has(ts, "failure", "run_outcome=interrupted"));
+    CHECK(wf_audit_has(ts, "failure", "reason=server_shutdown"));
+    CHECK_FALSE(wf_audit_has(ts, "success", "execution_id=exec-1"));
+}
+
 TEST_CASE("MCP execute_workflow: a run that throws after the requested row is -32603 dispatch_exception "
           "naming the execution and the sends, with NO retry hint",
           "[mcp][pg][workflow][twin][security][tier][approval][throw]") {

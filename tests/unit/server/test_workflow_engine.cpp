@@ -31,6 +31,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -784,6 +785,312 @@ TEST_CASE("WorkflowEngine: before_attempt alone decides when installed; false st
     CHECK(exec.step_results[0].status == "success");
     CHECK(exec.step_results[1].status == "failed"); // stopped before its attempt
     // Step 2 was the one stopped; nothing after it exists to skip.
+}
+
+// ── Shutdown: wake-on-stop, drain, in-flight count, finalize retry (#2146) ───────────────────
+
+namespace {
+
+/// Step 1 retries twice with a 30 s delay and carries on after a failure; step 2 is plain.
+const std::string kSlowRetryYaml = "kind: Workflow\nmetadata:\n  name: slow-retry-wf\nspec:\n  steps:\n"
+                                   "    - instruction: inst-1\n"
+                                   "      retryCount: 2\n"
+                                   "      retryDelay: 30\n"
+                                   "      onFailure: continue\n"
+                                   "    - instruction: inst-2\n";
+
+/// Flips a stop level from another thread after `after`, then joins in the destructor.
+struct LevelFlipper {
+    std::atomic<int> level{0}; // WorkflowStopLevel as int
+    std::thread t;
+    LevelFlipper(std::chrono::milliseconds after, WorkflowStopLevel to) {
+        t = std::thread([this, after, to] {
+            std::this_thread::sleep_for(after);
+            level.store(static_cast<int>(to), std::memory_order_release);
+        });
+    }
+    ~LevelFlipper() {
+        if (t.joinable())
+            t.join();
+    }
+    [[nodiscard]] WorkflowStopLevel get() const {
+        return static_cast<WorkflowStopLevel>(level.load(std::memory_order_acquire));
+    }
+};
+
+} // namespace
+
+TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one slice, skips the rest "
+          "`server_shutdown`, finalizes failed and tells the caller (#2146)",
+          "[workflow_engine][pg][execute][shutdown]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kSlowRetryYaml);
+    std::vector<std::string> dispatched;
+    StepDispatchFn always_fail = [&dispatched](const std::string& id, const std::string&,
+                                               const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        dispatched.push_back(id);
+        return std::unexpected(StepDispatchError{"agent unreachable", false});
+    };
+    int interrupted_calls = 0;
+
+    const auto check_stopped = [&](std::chrono::steady_clock::duration elapsed) {
+        // The 30 s delay was cut short: the wait is sliced at 250 ms.
+        CHECK(elapsed < std::chrono::seconds(3));
+        CHECK(dispatched == std::vector<std::string>{"inst-1"}); // no retry, no step 2
+        CHECK(interrupted_calls == 1);
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "failed");
+        CHECK(exec.step_results[1].status == "skipped");
+        CHECK(exec.step_results[1].result_json.find("server_shutdown") != std::string::npos);
+        CHECK(exec.completed_at > 0); // finalized, not left running
+    };
+
+    SECTION("the run's own should_stop") {
+        LevelFlipper flip(std::chrono::milliseconds(300), WorkflowStopLevel::kStop);
+        WorkflowRunControl control;
+        control.should_stop = [&flip] { return flip.get(); };
+        control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        REQUIRE(r.has_value());
+        check_stopped(elapsed);
+    }
+    SECTION("the engine-level default reaches a run that passed no control (the legacy route)") {
+        LevelFlipper flip(std::chrono::milliseconds(300), WorkflowStopLevel::kStop);
+        engine.set_should_stop([&flip] { return flip.get(); });
+        WorkflowRunControl control; // as the legacy route: none
+        control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        REQUIRE(r.has_value());
+        check_stopped(elapsed);
+    }
+    SECTION("a stop that is already set dispatches nothing and skips every step") {
+        engine.set_should_stop([] { return WorkflowStopLevel::kStop; });
+        WorkflowRunControl control;
+        control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(dispatched.empty());
+        CHECK(interrupted_calls == 1);
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 2);
+        for (const auto& sr : exec.step_results) {
+            CHECK(sr.status == "skipped");
+            CHECK(sr.result_json.find("server_shutdown") != std::string::npos);
+        }
+    }
+    SECTION("a stop that arrives while a step is in flight ends the run before the next step") {
+        std::atomic<int> level{0};
+        std::vector<std::string> seen;
+        StepDispatchFn ok_then_stop = [&](const std::string& id, const std::string&,
+                                          const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            seen.push_back(id);
+            level.store(static_cast<int>(WorkflowStopLevel::kStop));
+            return std::string(R"({"status":"ok"})");
+        };
+        WorkflowRunControl control;
+        control.should_stop = [&level] { return static_cast<WorkflowStopLevel>(level.load()); };
+        control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
+        auto r = engine.execute(wf_id, {"agent-1"}, ok_then_stop, nullptr, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(seen == std::vector<std::string>{"inst-1"});
+        CHECK(interrupted_calls == 1);
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "success");
+        CHECK(exec.step_results[1].status == "skipped");
+        CHECK(exec.step_results[1].result_json.find("server_shutdown") != std::string::npos);
+    }
+    SECTION("a stop is never a cancel: the row is failed, not cancelled") {
+        engine.set_should_stop([] { return WorkflowStopLevel::kStop; });
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail);
+        REQUIRE(r.has_value());
+        CHECK(only_execution(engine, wf_id).status == "failed");
+    }
+}
+
+TEST_CASE("WorkflowEngine: a DRAINING server abandons a retry sleep but keeps dispatching the remaining "
+          "steps, and does not interrupt the run (#2146)",
+          "[workflow_engine][pg][execute][shutdown][drain]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kSlowRetryYaml);
+    std::vector<std::string> dispatched;
+    StepDispatchFn fail_first = [&dispatched](const std::string& id, const std::string&,
+                                              const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        dispatched.push_back(id);
+        if (id == "inst-1")
+            return std::unexpected(StepDispatchError{"agent unreachable", false});
+        return std::string(R"({"status":"ok"})");
+    };
+    int interrupted_calls = 0;
+    WorkflowRunControl control;
+    control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
+
+    const auto check_continued = [&](std::chrono::steady_clock::duration elapsed) {
+        CHECK(elapsed < std::chrono::seconds(3)); // the 30 s delays were not slept
+        // Step 1 once (its two retries were abandoned), then step 2 ran.
+        CHECK(dispatched == std::vector<std::string>{"inst-1", "inst-2"});
+        CHECK(interrupted_calls == 0);
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "completed"); // on_failure=continue carried the run on
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "failed");
+        CHECK(exec.step_results[0].result_json.find("draining") != std::string::npos);
+        CHECK(exec.step_results[1].status == "success");
+    };
+
+    SECTION("draining flips while the run sleeps") {
+        LevelFlipper flip(std::chrono::milliseconds(300), WorkflowStopLevel::kDraining);
+        engine.set_should_stop([&flip] { return flip.get(); });
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = engine.execute(wf_id, {"agent-1"}, fail_first, nullptr, nullptr, control);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        REQUIRE(r.has_value());
+        check_continued(elapsed);
+    }
+    SECTION("draining already set: the failed attempt is not retried and no delay is slept") {
+        engine.set_should_stop([] { return WorkflowStopLevel::kDraining; });
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = engine.execute(wf_id, {"agent-1"}, fail_first, nullptr, nullptr, control);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        REQUIRE(r.has_value());
+        check_continued(elapsed);
+    }
+    SECTION("draining does not touch a run that never needs a retry") {
+        engine.set_should_stop([] { return WorkflowStopLevel::kDraining; });
+        auto r = engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), nullptr, nullptr, control);
+        REQUIRE(r.has_value());
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "completed");
+        CHECK(exec.step_results[0].status == "success");
+        CHECK(exec.step_results[1].status == "success");
+    }
+}
+
+TEST_CASE("WorkflowEngine: in_flight_runs counts a run from the top of execute() to after its final "
+          "write, a throw included, and never counts rows (#2146)",
+          "[workflow_engine][pg][execute][shutdown][inflight]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kOneStepYaml);
+    CHECK(engine.in_flight_runs() == 0);
+
+    SECTION("one while a step is dispatching, none afterwards") {
+        int during = -1;
+        StepDispatchFn fn = [&](const std::string&, const std::string&, const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            during = engine.in_flight_runs();
+            return std::string(R"({"status":"ok"})");
+        };
+        REQUIRE(engine.execute(wf_id, {"agent-1"}, fn).has_value());
+        CHECK(during == 1);
+        CHECK(engine.in_flight_runs() == 0);
+    }
+    SECTION("a throwing step does not leak the count") {
+        StepDispatchFn fn = [](const std::string&, const std::string&,
+                               const std::string&) -> std::expected<std::string, StepDispatchError> {
+            throw std::runtime_error("boom");
+        };
+        CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, fn), std::runtime_error);
+        CHECK(engine.in_flight_runs() == 0);
+    }
+    SECTION("a refused run (unknown workflow, no dispatch fn) does not leak the count") {
+        CHECK_FALSE(engine.execute("no-such-workflow", {"agent-1"}, ok_dispatch_fn()).has_value());
+        CHECK(engine.in_flight_runs() == 0);
+    }
+    SECTION("two runs on two threads are both counted, and an orphan `running` row is not") {
+        // An orphan: a run row left `running` (a crash, another replica) must not count.
+        {
+            auto lease = wf_pool_fx_.try_acquire_for(std::chrono::seconds(2));
+            REQUIRE(lease);
+            PgResult ins = pg::exec_params(
+                lease.get(),
+                "INSERT INTO workflow_engine.workflow_executions "
+                "(id, workflow_id, status, agent_ids_json, started_at, current_step) "
+                "VALUES ('orphan-1', $1, 'running', '[]', 1, 0)",
+                std::vector<std::string>{wf_id});
+            REQUIRE(ins.status() == PGRES_COMMAND_OK);
+        }
+        CHECK(engine.in_flight_runs() == 0);
+        std::atomic<int> inside{0};
+        std::atomic<bool> release{false};
+        StepDispatchFn hold = [&](const std::string&, const std::string&, const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            ++inside;
+            while (!release.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            return std::string(R"({"status":"ok"})");
+        };
+        std::thread a([&] { (void)engine.execute(wf_id, {"agent-1"}, hold); });
+        std::thread b([&] { (void)engine.execute(wf_id, {"agent-2"}, hold); });
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (inside.load() < 2 && std::chrono::steady_clock::now() < give_up)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(engine.in_flight_runs() == 2);
+        release.store(true);
+        a.join();
+        b.join();
+        CHECK(engine.in_flight_runs() == 0);
+    }
+}
+
+TEST_CASE("WorkflowEngine: a final status write that cannot get a lease is retried once with a longer "
+          "lease; if that fails too the row stays running, loudly and counted (#2146 op-8)",
+          "[workflow_engine][pg][execute][finalize]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db_fx_, workflow_engine_tpl);
+    PgPool pool{{.conninfo = wf_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    WorkflowEngine engine{pool};
+    REQUIRE(engine.is_open());
+    yuzu::MetricsRegistry metrics;
+    engine.set_metrics(&metrics);
+    auto wf_id = *engine.create_workflow(kOneStepYaml);
+
+    // The step callback takes the pool's only connection and hands it back from another thread
+    // after `hold`, so every write that follows the step meets a saturated pool.
+    std::thread releaser;
+    const auto run_with_pool_held = [&](std::chrono::milliseconds hold) {
+        auto held = std::make_shared<PgPool::Lease>();
+        StepDispatchFn fn = [&](const std::string&, const std::string&, const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            *held = pool.try_acquire_for(std::chrono::seconds(2));
+            releaser = std::thread([held, hold] {
+                std::this_thread::sleep_for(hold);
+                held->reset();
+            });
+            return std::string(R"({"status":"ok"})");
+        };
+        auto r = engine.execute(wf_id, {"agent-1"}, fn);
+        REQUIRE(r.has_value());
+        releaser.join();
+    };
+    const auto finalize_failed = [&] {
+        return metrics.counter("yuzu_server_workflow_finalize_failed_total", {}).value();
+    };
+
+    SECTION("the longer retry gets the lease once the pool frees: the row is finalized") {
+        engine.set_run_lease_timeouts(std::chrono::milliseconds(50), std::chrono::seconds(10));
+        run_with_pool_held(std::chrono::milliseconds(600));
+        CHECK(only_execution(engine, wf_id).status == "completed");
+        CHECK(finalize_failed() == 0);
+        CHECK(engine.in_flight_runs() == 0);
+    }
+    SECTION("both attempts fail: the row stays running and the failure is counted") {
+        engine.set_run_lease_timeouts(std::chrono::milliseconds(50), std::chrono::milliseconds(200));
+        run_with_pool_held(std::chrono::milliseconds(1500));
+        CHECK(only_execution(engine, wf_id).status == "running");
+        CHECK(finalize_failed() == 1);
+        CHECK(engine.in_flight_runs() == 0); // the count is the run's, not the row's
+    }
 }
 
 TEST_CASE("WorkflowEngine: execute skips a step whose condition evaluates false",

@@ -181,8 +181,8 @@ nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,
         j["run_status"] = o.run_status;
         j["retryable"] = false;
         j["message"] = o.message;
-        if (o.deadline_exceeded)
-            j["reason"] = o.reason; // "deadline_exceeded"
+        if (o.deadline_exceeded || o.interrupted)
+            j["reason"] = o.reason; // "deadline_exceeded" | "server_shutdown"
     }
     if (!o.audit_persisted)
         j["audit_persisted"] = false;
@@ -223,9 +223,11 @@ std::string_view workflow_run_outcome_token(WorkflowRunOutcome outcome) {
 
 WorkflowRunOutcome classify_workflow_run(std::string_view run_status, bool late_denied,
                                          const std::vector<WorkflowStepDispatchNote>& steps,
-                                         bool deadline_exceeded) {
+                                         bool deadline_exceeded, bool interrupted) {
     if (late_denied || deadline_exceeded)
         return WorkflowRunOutcome::kAborted;
+    if (interrupted)
+        return WorkflowRunOutcome::kInterrupted;
     const bool any_reached = std::any_of(steps.begin(), steps.end(),
                                          [](const auto& n) { return n.agents_reached > 0; });
     const bool all_reached = std::all_of(steps.begin(), steps.end(),
@@ -574,6 +576,8 @@ struct RunProgress {
     bool late_denied{false};
     /// The engine asked `before_attempt` after the deadline and was told to stop.
     bool deadline_hit{false};
+    /// The engine ended the run because the server is stopping (`on_interrupted`).
+    bool interrupted{false};
 };
 
 /// Step 6 and the closing row. Anything it throws is answered by the caller as `kRunFailed`.
@@ -701,6 +705,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     const auto deadline = req.deadline.value_or(std::chrono::steady_clock::now() +
                                                 kWorkflowSyncBudget);
     control.deadline = deadline;
+    control.on_interrupted = [&progress] { progress.interrupted = true; };
     control.before_attempt = [&progress, deadline] {
         if (std::chrono::steady_clock::now() < deadline)
             return true;
@@ -736,14 +741,17 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         o.run_status = (*ex)->status;
 
     o.deadline_exceeded = progress.deadline_hit;
-    o.run_outcome = classify_workflow_run(o.run_status, late_denied, o.steps, o.deadline_exceeded);
+    o.interrupted = progress.interrupted;
+    o.run_outcome = classify_workflow_run(o.run_status, late_denied, o.steps, o.deadline_exceeded,
+                                          o.interrupted);
     const bool any_reached = std::any_of(o.steps.begin(), o.steps.end(),
                                          [](const auto& n) { return n.agents_reached > 0; });
     if (o.run_outcome == WorkflowRunOutcome::kSucceeded) {
         o.status = WorkflowExecuteStatus::kOk;
-    } else if (any_reached) {
-        // Something was sent, so the run is readable and its steps matter: a typed 2xx, never a
-        // blind-retry invitation.
+    } else if (any_reached || o.run_outcome == WorkflowRunOutcome::kInterrupted) {
+        // Something was sent (or the server's own shutdown ended the run, whatever it had sent),
+        // so the run is readable and its steps matter: a typed 2xx, never a blind-retry
+        // invitation.
         o.status = WorkflowExecuteStatus::kRunIncomplete;
         o.reason = std::string(workflow_run_outcome_token(o.run_outcome));
         o.retryable = false;
@@ -752,6 +760,10 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                 ? "the workflow started and some steps were sent, but the run reached its " +
                       std::to_string(kWorkflowSyncBudget.count()) +
                       " second time budget and was stopped; the remaining steps did not run"
+            : o.interrupted
+                ? "the workflow started but the server began shutting down and the run was "
+                  "stopped; the remaining steps did not run and steps already sent are not "
+                  "recalled; read the run with get_workflow_execution before starting another"
             : o.run_outcome == WorkflowRunOutcome::kAborted
                 ? "the workflow started and some steps were sent, but a step was refused at "
                   "dispatch because its definition changed; the rest did not run"
@@ -759,6 +771,8 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                   "every step; read the run with get_workflow_execution before starting another";
         if (o.deadline_exceeded)
             o.reason = "deadline_exceeded";
+        else if (o.interrupted)
+            o.reason = "server_shutdown";
     } else {
         o.status = WorkflowExecuteStatus::kNoAgentsReached;
         const WorkflowStepDispatchNote* first_zero = nullptr;
@@ -809,7 +823,8 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             (late_denied ? " late_denied=true" : "") +
             (succeeded ? ""
                        : " run_outcome=" + std::string(workflow_run_outcome_token(o.run_outcome))) +
-            (o.status == WorkflowExecuteStatus::kNoAgentsReached || o.deadline_exceeded
+            (o.status == WorkflowExecuteStatus::kNoAgentsReached || o.deadline_exceeded ||
+                     o.interrupted
                  ? " reason=" + o.reason
                  : ""));
     return o;

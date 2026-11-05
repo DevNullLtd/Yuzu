@@ -249,7 +249,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             }
 
             // A run that sent something is a 202 whose `status` says how it ended: `completed`
-            // for a full success, `partial` or `aborted` (retryable:false) otherwise (D7: a 5xx
+            // for a full success, `partial`, `aborted` or `interrupted` (retryable:false) otherwise (D7: a 5xx
             // would invite a blind re-send of steps that were already sent).
             if (out.status == WorkflowExecuteStatus::kOk ||
                 out.status == WorkflowExecuteStatus::kRunIncomplete) {
