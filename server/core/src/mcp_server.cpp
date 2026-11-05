@@ -3683,18 +3683,25 @@ static const ToolDef kTools[] = {
      "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
      "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
      "engine-principal-revoke call an operator makes after reading this evidence. This is "
-     "an UPSERT: calling it again for the same (campaign_id, principal_type, principal_id, "
-     "role_name) OVERWRITES the prior reviewer's decision, reviewer, and justification — "
-     "the earlier evidence is not retained, so destructiveHint:true. Mirrors "
-     "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
-     "or access_review.flagged (by decision). Requires AccessReview:Attest.",
+     "FINAL and irreversible, so destructiveHint:true: the first decision on a "
+     "(campaign_id, principal_type, principal_id, role_name) grant sticks and cannot be "
+     "changed while the campaign is open (a second call is refused as already_decided; open "
+     "a new campaign to re-review). Separation of duties: the reviewer may NOT decide their "
+     "own grant (principal_type 'user' whose principal_id is the caller) nor an engine "
+     "principal they own — refused as self_attestation, and another reviewer must decide it. "
+     "Group grants are not covered by the owner check. Both refusals are audited with "
+     "result=denied. An identifier with a NUL byte or over 512 bytes, or a justification with "
+     "a NUL byte or over 8192 bytes, is refused as invalid-params (nothing is truncated). "
+     "Mirrors POST /api/v1/access-reviews/{id}/attestations. Self-audited as "
+     "access_review.attested or access_review.flagged (by decision). Requires "
+     "AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1},)j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":512},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1},)j"
-     R"j("role_name":{"type":"string","minLength":1},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":512},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":512},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
-     R"j("justification":{"type":"string"})j"
+     R"j("justification":{"type":"string","maxLength":8192})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
      R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
 
@@ -5769,7 +5776,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"raise_guardian_policy_generation",
      {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
-    // record_attestation: UPSERT that overwrites a prior reviewer decision → Destructive.
+    // record_attestation: writes a FINAL, irreversible reviewer decision (#4752 — once-only,
+    // no overwrite) → stays Destructive. Do NOT lower it: that would loosen tier gating, a
+    // security decision rather than a side effect of making the write once-only.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
@@ -6344,18 +6353,33 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // fault, so it maps to kInvalidParams like the REST twin's 404. Any other
 // message is a genuine read/write failure → kInternalError (retryable).
 //
-// Contract pin: same binary posture as rest_api_v1.cpp's
-// access_review_error_status — every tool handler above pre-validates its
-// own required fields (title/decision/campaign_id/principal_type/
-// principal_id/role_name) BEFORE calling into AccessReviewStore, so the
-// store's own input-validation error strings never actually reach this
-// function today; they would otherwise land in the `else -> kInternalError`
-// arm, which is wrong (client error, not retryable). Callers MUST keep
-// pre-validating. If a future path reaches the store unvalidated, add a
-// `bad_request:` prefix to that store error and a kInvalidParams arm here
-// (and the matching 400 arm in rest_api_v1.cpp's access_review_error_status)
-// rather than letting it fall through to kInternalError.
+// Contract pin: same classes as rest_api_v1.cpp's access_review_error_status —
+// self_attestation: -> kPermissionDenied, already_decided: and bad_request: ->
+// kInvalidParams (#4752), not_found: -> kInvalidParams, else kInternalError.
+// Every tool handler above also pre-validates its own required fields
+// (title/decision/campaign_id/principal_type/principal_id/role_name) BEFORE
+// calling into AccessReviewStore, so the store's remaining bare validation
+// strings never actually reach this function today; they would otherwise land
+// in the `else -> kInternalError` arm, which is wrong (client error, not
+// retryable). Callers MUST keep pre-validating; a store error a handler cannot
+// pre-validate gets a `bad_request:` prefix (see
+// AccessReviewStore::record_attestation) and is mapped here and in the matching
+// 400 arm in rest_api_v1.cpp rather than falling through to kInternalError.
 int mcp_error_for_access_review_msg(const std::string& msg) {
+    // #4752: a deliberate refusal of an attestation. self_attestation is a
+    // permission problem (the reviewer may not decide their own grant);
+    // already_decided is bad input against the row's current state. Neither is
+    // retryable, so neither may fall into kInternalError.
+    switch (classify_attestation_refusal(msg)) {
+    case AttestationRefusal::SelfAttestation:
+        return kPermissionDenied;
+    case AttestationRefusal::AlreadyDecided:
+        return kInvalidParams;
+    case AttestationRefusal::None:
+        break;
+    }
+    if (is_bad_request_error(msg))
+        return kInvalidParams;
     return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
 }
 
@@ -29413,10 +29437,26 @@ McpServer::HandlerFn McpServer::build_handler(
                                                      ? "access_review.flagged"
                                                      : "access_review.attested";
                 if (!rec_res) {
+                    // #4752: a deliberate refusal is audited `denied` with a
+                    // stable token (matches the REST twin); other errors keep
+                    // `failure`.
+                    const auto refusal = classify_attestation_refusal(rec_res.error());
+                    const bool refused = refusal != AttestationRefusal::None;
                     const bool denied_audit_ok =
-                        audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
-                                rec_res.error());
-                    mcp_audit("failure", rec_res.error());
+                        refused ? audit_fn(req, audit_action, "denied", "AccessReview",
+                                           campaign_id + ":" + principal_type + ":" +
+                                               principal_id + ":" + role_name,
+                                           attestation_refusal_token(refusal))
+                                : audit_fn(req, audit_action, "failure", "AccessReview",
+                                           // bad_request: an identifier (possibly this very
+                                           // campaign_id) was NUL-bearing or over-long, so the
+                                           // row carries a fixed empty target, not the bytes.
+                                           is_bad_request_error(rec_res.error()) ? std::string{}
+                                                                                 : campaign_id,
+                                           rec_res.error());
+                    mcp_audit(refused ? "denied" : "failure",
+                              refused ? std::string(attestation_refusal_token(refusal))
+                                      : rec_res.error());
                     res.set_content(
                         error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
                                        rec_res.error(),

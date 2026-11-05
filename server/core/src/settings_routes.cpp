@@ -1287,7 +1287,7 @@ function arFeedback(msg, isError) {
   fb.textContent = msg;
   fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
-function arPost(url, body, onSuccess) {
+function arPost(url, body, onSuccess, onRefused) {
   fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -1298,8 +1298,12 @@ function arPost(url, body, onSuccess) {
       var data = {};
       try { data = JSON.parse(t); } catch (e) {}
       if (!r.ok) {
-        var msg = (data && (data.error || data.message)) || ('Action failed (' + r.status + ')');
+        // The A4 error body is {error:{code,message,...}}: read the message, never print the object.
+        var e = data && data.error;
+        var msg = (e && typeof e === 'object' ? e.message : e) || (data && data.message) ||
+                  ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
+        if (onRefused) onRefused(r.status);
         return;
       }
       arFeedback('Done.', false);
@@ -1336,7 +1340,9 @@ function arAttest(btn) {
     role_name: d.roleName,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
-  }, function () { arLoadCampaign(d.campaignId); });
+  }, function () { arLoadCampaign(d.campaignId); },
+  // 409: another reviewer decided this grant first (decisions are final) - show the row as decided.
+  function (status) { if (status === 409) arLoadCampaign(d.campaignId); });
 }
 function arCloseCampaign(btn) {
   var id = btn.dataset.campaignId;
