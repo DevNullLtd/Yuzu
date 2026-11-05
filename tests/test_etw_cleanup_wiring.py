@@ -56,14 +56,14 @@ def main():
             body = steps[name]
             if "shell: pwsh" not in body:
                 errors.append(f"{name!r} must be `shell: pwsh`")
-            if not re.search(r"^        timeout-minutes: \d+\s*$", body, re.M):
-                errors.append(f"{name!r} must carry a `timeout-minutes` cap (a wedged logman must not hold the runner)")
+            if not re.search(r"^        timeout-minutes: (?:[1-9]|1[0-5])\s*$", body, re.M):
+                errors.append(f"{name!r} must carry a `timeout-minutes` cap of 1 to 15 (a wedged logman must not hold the runner)")
             if "./scripts/ci/stop-dead-etw-sessions.ps1" not in body:
                 errors.append(f"{name!r} must run ./scripts/ci/stop-dead-etw-sessions.ps1")
         if "-SelfTest" not in steps[SELFTEST]:
             errors.append("the self-test step must pass -SelfTest")
         for name in (SELFTEST, PRE):
-            if re.search(r"^        (if|continue-on-error):", steps[name], re.M):
+            if re.search(r"^        ['\"]?(if|continue-on-error)['\"]?\s*:", steps[name], re.M):
                 errors.append(f"{name!r} must not carry `if:` or `continue-on-error` (the guard would be silently off)")
         for name in (PRE, POST):
             if "-SelfTest" in steps[name]:

@@ -19,8 +19,13 @@
        the session by EXACT name with `logman stop <name> -ets`. A session whose pid is alive is never touched, so a job
        running on one of the other runner slots keeps its session. A pid that was reused by an unrelated live process
        leaves its session in place (the safe direction; it is stopped once that process exits).
-    3. Never fails the job: a listing or stop error is a ::warning and the script exits 0. It cannot make the test
-       phase red; only -SelfTest can exit non-zero.
+    3. Never fails the job: a listing or stop error is a ::warning and the script exits 0. Every `logman` call runs
+       in a child process with a 45 s timeout (killed on expiry) inside a 180 s budget for the whole run, so a wedged
+       ETW service costs the step at most about 3 minutes and then warns; the workflow's 5-minute step cap is only a
+       backstop. A listing with fewer than 3 session rows (a healthy box always has the kernel loggers) is treated as
+       not understood and stops nothing. A stop that fails is re-checked against a fresh listing: a session that has
+       gone (a concurrent job stopped it first) is logged as gone, not as a failure. The totals are also appended to
+       $GITHUB_STEP_SUMMARY when it is set. Only -SelfTest can exit non-zero.
 
   Only names matching ^Yuzu[A-Za-z]*Etw-[0-9]+$ (case-sensitive, ASCII) are candidates. System, Defender and every
   other session are never matched.
@@ -45,6 +50,7 @@ param(
     [switch]$SelfTest,
     [ValidateRange(1, 64)]
     [int]$WarnAt = 48,
+    [ValidateSet('run', 'pre-test', 'post-test')]
     [string]$Phase = 'run'
 )
 
@@ -79,11 +85,55 @@ function Read-EtwSessionList {
     [pscustomobject]@{ Total = $total; Yuzu = $yuzu }
 }
 
+# Total wall-clock budget for every logman call of one run, and the cap on a single call. A call that outlives its
+# slice is killed; the caller treats that as a failure and warns.
+$script:Clock = [System.Diagnostics.Stopwatch]::StartNew()
+$script:BudgetSec = 180
+$script:CallSec = 45
+
+# Run an executable with a timeout, no shell: returns @{ TimedOut; Code; Lines }. `Arguments` is one string; the only
+# values ever placed in it are the fixed words `query`/`stop`/`-ets` and a session name that already passed the
+# anchored ASCII grammar, so there is nothing to quote.
+function Invoke-NativeBounded {
+    param([string]$FilePath, [string]$Arguments, [int]$TimeoutSec)
+    $remaining = $script:BudgetSec - [int]$script:Clock.Elapsed.TotalSeconds
+    if ($remaining -le 0) { return [pscustomobject]@{ TimedOut = $true; Code = -1; Lines = @() } }
+    $limit = [Math]::Min($TimeoutSec, $remaining)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $out = $p.StandardOutput.ReadToEndAsync()
+        $err = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($limit * 1000)) {
+            try { $p.Kill() } catch { }
+            return [pscustomobject]@{ TimedOut = $true; Code = -1; Lines = @() }
+        }
+        $p.WaitForExit()   # flush the async readers
+        $text = $out.Result
+        $null = $err.Result
+        [pscustomobject]@{ TimedOut = $false; Code = $p.ExitCode; Lines = @($text -split "\r?\n") }
+    } finally { $p.Dispose() }
+}
+
+function Get-LogmanPath {
+    $candidate = Join-Path $env:SystemRoot 'System32\logman.exe'
+    if ($env:SystemRoot -and (Test-Path -LiteralPath $candidate)) { $candidate } else { 'logman.exe' }
+}
+
 # A liveness probe that throws counts as ALIVE: the one wrong answer that can hurt is a false "dead", so every doubt
 # resolves to leaving the session alone.
 function Test-AliveSafe {
     param([scriptblock]$Probe, [int]$ProcessId)
-    try { [bool](& $Probe $ProcessId) } catch { $true }
+    try {
+        $r = @(& $Probe $ProcessId)
+        if ($r.Count -ne 1) { $true } else { [bool]$r[0] }   # a probe that answers nothing, or twice, is not an answer
+    } catch { $true }
 }
 
 # The whole flow with its three outside-world functions injected, so -SelfTest drives it without touching the box.
@@ -96,9 +146,10 @@ function Invoke-EtwSessionCleanup {
         [scriptblock]$IsAlive,
         [scriptblock]$Stop,
         [int]$WarnAt,
-        [string]$Phase
+        [string]$Phase,
+        [int]$MinRows = 3
     )
-    $result = [pscustomobject]@{ Listed = $false; Total = 0; YuzuCount = 0; Warned = $false; Stopped = @(); Skipped = @(); Failed = @() }
+    $result = [pscustomobject]@{ Listed = $false; Total = 0; YuzuCount = 0; Warned = $false; Stopped = @(); Skipped = @(); Failed = @(); Gone = @() }
     try {
         $lines = @(& $Query)
     } catch {
@@ -110,9 +161,9 @@ function Invoke-EtwSessionCleanup {
     $result.Total = $list.Total
     $result.YuzuCount = @($list.Yuzu).Count
     Write-Host "ETW sessions ($Phase): $($list.Total) total (system limit $SessionLimit), $(@($list.Yuzu).Count) Yuzu"
-    if ($list.Total -eq 0) {
-        # a successful `logman` listing always has at least the kernel loggers; zero means the output was not understood
-        Write-Host "${script:WarnPrefix}ETW session cleanup ($Phase): no session rows parsed from the logman output, nothing stopped"
+    if ($list.Total -lt $MinRows) {
+        # a healthy box always lists its kernel loggers; fewer rows than that means the output was not understood
+        Write-Host "${script:WarnPrefix}ETW session cleanup ($Phase): only $($list.Total) session row(s) parsed from the logman output (expected at least $MinRows), listing not understood, nothing stopped"
         return $result
     }
     if ($list.Total -ge $WarnAt) {
@@ -133,8 +184,19 @@ function Invoke-EtwSessionCleanup {
             $result.Stopped += $s.Name
             Write-Host "${script:WarnPrefix}stopped leaked ETW session $($s.Name): pid $($s.ProcessId) is not running ($Phase)"
         } else {
-            $result.Failed += $s.Name
-            Write-Host "${script:WarnPrefix}could not stop leaked ETW session $($s.Name) (pid $($s.ProcessId) is not running); leaving it ($Phase)"
+            # a concurrent job may have stopped it first: look again before calling it a failure
+            $gone = $false
+            try {
+                $again = Read-EtwSessionList -Lines @(& $Query)
+                $gone = ($again.Total -ge $MinRows) -and (@($again.Yuzu | Where-Object { $_.Name -eq $s.Name }).Count -eq 0)
+            } catch { $gone = $false }
+            if ($gone) {
+                $result.Gone += $s.Name
+                Write-Host "  $($s.Name) is already gone (stopped by a concurrent job)"
+            } else {
+                $result.Failed += $s.Name
+                Write-Host "${script:WarnPrefix}could not stop leaked ETW session $($s.Name) (pid $($s.ProcessId) is not running); leaving it ($Phase)"
+            }
         }
     }
     $result
@@ -153,7 +215,7 @@ if ($SelfTest) {
         'Circular Kernel Context Logger          Trace                         Running',
         'YuzuEchoRegistryEtw-111                 Trace                         Running',
         'YuzuEchoRegistryEtw-222                 Trace                         Running',
-        'YuzuTarFileEtw-333                      Trace                         Running',
+        'YuzuEchoProcEtw-333                      Trace                         Running',
         'NotYuzuEchoRegistryEtw-444              Trace                         Running',
         'yuzuEchoRegistryEtw-555                 Trace                         Running',
         'YuzuEchoRegistryEtw-abc                 Trace                         Running',
@@ -172,8 +234,8 @@ if ($SelfTest) {
     Test-Expect ($r.Listed) 'arm 1 did not list'
     Test-Expect ($r.Total -eq 9) "arm 1 total sessions: expected 9, got $($r.Total)"
     Test-Expect ($r.YuzuCount -eq 4) "arm 1 Yuzu sessions: expected 4, got $($r.YuzuCount)"
-    Test-Expect (($r.Stopped -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuTarFileEtw-333') "arm 1 stopped: $($r.Stopped -join ',')"
-    Test-Expect (($script:stopCalls -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuTarFileEtw-333') "arm 1 stop calls: $($script:stopCalls -join ',')"
+    Test-Expect (($r.Stopped -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuEchoProcEtw-333') "arm 1 stopped: $($r.Stopped -join ',')"
+    Test-Expect (($script:stopCalls -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuEchoProcEtw-333') "arm 1 stop calls: $($script:stopCalls -join ',')"
     Test-Expect ($r.Skipped -contains 'YuzuEchoRegistryEtw-222') 'arm 1 stopped a session whose pid is alive'
     Test-Expect ($r.Skipped -contains 'YuzuEchoRegistryEtw-99999999999999') 'arm 1 stopped a session whose pid is not parseable'
     Test-Expect ($script:stopCalls -notcontains 'NotYuzuEchoRegistryEtw-444') 'arm 1 matched a look-alike name'
@@ -184,7 +246,7 @@ if ($SelfTest) {
     $stopFirstFails = { param([string]$Name) $script:stopCalls += $Name; $Name -ne 'YuzuEchoRegistryEtw-111' }
     $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopFirstFails -WarnAt 48 -Phase 'selftest'
     Test-Expect (($r.Failed -join ',') -eq 'YuzuEchoRegistryEtw-111') "arm 2 failed: $($r.Failed -join ',')"
-    Test-Expect (($r.Stopped -join ',') -eq 'YuzuTarFileEtw-333') "arm 2 stopped: $($r.Stopped -join ',')"
+    Test-Expect (($r.Stopped -join ',') -eq 'YuzuEchoProcEtw-333') "arm 2 stopped: $($r.Stopped -join ',')"
 
     # arm 3: a pid that comes alive between the first check and the stop is left alone
     $script:stopCalls = @()
@@ -207,7 +269,7 @@ if ($SelfTest) {
     $script:stopCalls = @()
     $stopThrowsFirst = { param([string]$Name) $script:stopCalls += $Name; if ($Name -eq 'YuzuEchoRegistryEtw-111') { throw 'access denied' }; $true }
     $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopThrowsFirst -WarnAt 48 -Phase 'selftest'
-    Test-Expect (($r.Failed -join ',') -eq 'YuzuEchoRegistryEtw-111' -and ($r.Stopped -join ',') -eq 'YuzuTarFileEtw-333') "arm 6 throwing stop: failed=$($r.Failed -join ',') stopped=$($r.Stopped -join ',')"
+    Test-Expect (($r.Failed -join ',') -eq 'YuzuEchoRegistryEtw-111' -and ($r.Stopped -join ',') -eq 'YuzuEchoProcEtw-333') "arm 6 throwing stop: failed=$($r.Failed -join ',') stopped=$($r.Stopped -join ',')"
 
     # arm 7: a liveness probe that throws counts as alive, so nothing is stopped
     $script:stopCalls = @()
@@ -220,16 +282,46 @@ if ($SelfTest) {
     $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopOk -WarnAt 10 -Phase 'selftest'
     Test-Expect (-not $r.Warned) 'arm 8 warned below -WarnAt'
 
+    # arm 9: a stop that fails because a concurrent job already stopped the session is "gone", not a failure
+    $script:stopCalls = @()
+    $script:qcalls = 0
+    $queryGoneAfterFirst = { $script:qcalls++; if ($script:qcalls -eq 1) { $header } else { @($header | Where-Object { $_ -notlike 'YuzuEchoRegistryEtw-111 *' }) } }
+    $stopAlwaysFails = { param([string]$Name) $script:stopCalls += $Name; $false }
+    $r = Invoke-EtwSessionCleanup -Query $queryGoneAfterFirst -IsAlive $isAlive -Stop $stopAlwaysFails -WarnAt 48 -Phase 'selftest'
+    Test-Expect (($r.Gone -join ',') -eq 'YuzuEchoRegistryEtw-111') "arm 9 gone: $($r.Gone -join ',')"
+    Test-Expect (($r.Failed -join ',') -eq 'YuzuEchoProcEtw-333') "arm 9 failed: $($r.Failed -join ',')"
+
+    # arm 10: a listing with fewer rows than a healthy box has is not understood: nothing is stopped
+    $script:stopCalls = @()
+    $r = Invoke-EtwSessionCleanup -Query { @('YuzuEchoRegistryEtw-111                 Trace                         Running', 'Circular Kernel Context Logger          Trace                         Running') } -IsAlive $isAlive -Stop $stopOk -WarnAt 48 -Phase 'selftest'
+    Test-Expect ($r.Total -eq 2 -and $script:stopCalls.Count -eq 0) 'arm 10 acted on a listing with too few rows'
+
+    # arm 11: a probe that answers nothing is not an answer: alive
+    $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive { param([int]$ProcessId) } -Stop $stopOk -WarnAt 48 -Phase 'selftest'
+    Test-Expect ($r.Stopped.Count -eq 0) 'arm 11 stopped a session on an empty liveness answer'
+
+    # arm 12: the bounded native runner kills a call that outlives its slice and reports an exit code and output
+    # otherwise (this host process itself is the child; no session is touched)
+    $hostExe = (Get-Process -Id $PID).Path
+    $t0 = [int]$script:Clock.Elapsed.TotalSeconds
+    $slow = Invoke-NativeBounded -FilePath $hostExe -Arguments '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60' -TimeoutSec 3
+    Test-Expect ($slow.TimedOut) 'arm 12 did not time out a sleeping child'
+    Test-Expect (([int]$script:Clock.Elapsed.TotalSeconds - $t0) -lt 30) 'arm 12 waited for the sleeping child'
+    $fast = Invoke-NativeBounded -FilePath $hostExe -Arguments '-NoProfile -NonInteractive -Command "Write-Output hello; exit 3"' -TimeoutSec 30
+    Test-Expect ((-not $fast.TimedOut) -and $fast.Code -eq 3 -and ($fast.Lines -contains 'hello')) "arm 12 fast child: timedout=$($fast.TimedOut) code=$($fast.Code) lines=$($fast.Lines -join '|')"
+
     Write-Host 'ETW session cleanup self-test: all arms hold'
     exit 0
 }
 
 # Real mode: never throw out of here. The test phase must not be made red by housekeeping.
 try {
+    $logman = Get-LogmanPath
     $query = {
-        $out = & logman query -ets 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "logman query -ets exited $LASTEXITCODE" }
-        $out | ForEach-Object { "$_" }
+        $r = Invoke-NativeBounded -FilePath $logman -Arguments 'query -ets' -TimeoutSec $script:CallSec
+        if ($r.TimedOut) { throw 'logman query -ets timed out or the run budget was exhausted' }
+        if ($r.Code -ne 0) { throw "logman query -ets exited $($r.Code)" }
+        $r.Lines
     }
     # Only Get-Process's own "no process with this id" error means dead; any other failure means alive (leave it).
     $isAliveReal = {
@@ -240,10 +332,18 @@ try {
     }
     $stopReal = {
         param([string]$Name)
-        & logman stop $Name -ets *> $null
-        $LASTEXITCODE -eq 0
+        # the name is spliced into a command line: refuse anything outside the grammar, whatever the caller did
+        if ($Name -cnotmatch '^Yuzu[A-Za-z]*Etw-[0-9]+$') { return $false }
+        $r = Invoke-NativeBounded -FilePath $logman -Arguments "stop $Name -ets" -TimeoutSec $script:CallSec
+        (-not $r.TimedOut) -and $r.Code -eq 0
     }
-    $null = Invoke-EtwSessionCleanup -Query $query -IsAlive $isAliveReal -Stop $stopReal -WarnAt $WarnAt -Phase $Phase
+    $r = Invoke-EtwSessionCleanup -Query $query -IsAlive $isAliveReal -Stop $stopReal -WarnAt $WarnAt -Phase $Phase
+    if ($env:GITHUB_STEP_SUMMARY) {
+        try {
+            $line = if ($r.Listed) { "- ETW sessions ($Phase): $($r.Total) total, $($r.YuzuCount) Yuzu, stopped $($r.Stopped.Count), kept $($r.Skipped.Count), gone $($r.Gone.Count), failed $($r.Failed.Count)" } else { "- ETW sessions ($Phase): listing failed, nothing stopped" }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $line
+        } catch { }
+    }
 } catch {
     Write-Host "${script:WarnPrefix}ETW session cleanup ($Phase) failed unexpectedly, test phase continues: $($_.Exception.Message)"
 }

@@ -2159,11 +2159,12 @@ jobs:
       # process that is killed (a meson timeout), crashes or is cancelled leaves one behind. The four runner agents on
       # this box share one OS identity, so a leaked session is shared state nothing else cleans up. On 2026-11-05 one
       # for a dead pid was on this box while `echo unit tests` failed on every run (#7173, #7135). This step logs the
-      # session count (the system limit is 64) and stops sessions named Yuzu*Etw-<pid> whose pid is NOT running, by
-      # exact name, so a live job on another runner slot keeps its session. It never fails the job (a listing or stop
-      # error is a ::warning; a successful stop is annotated too, on purpose, so a leak shows on the job); each step is
-      # capped at 5 minutes so a wedged logman cannot hold the runner; the self-test before them proves the decisions
-      # without touching a real session. See
+      # session count (the system limit is 64) and stops sessions named Yuzu<letters>Etw-<digits> whose pid is NOT
+      # running, by exact name, so a live job on another runner slot keeps its session. The script never fails the job
+      # (a listing or stop error is a ::warning; a successful stop is annotated too, on purpose, so a leak shows on the
+      # job). Every logman call inside it is killed after 45 s within a 180 s budget, and each step is capped at 5
+      # minutes as a backstop, so a wedged logman cannot hold the runner. The self-test step, by contrast, is allowed to
+      # fail the job: a broken guard should be loud. It proves the decisions without touching a real session. See
       # scripts/ci/stop-dead-etw-sessions.ps1 and "Leaked ETW sessions" in docs/ci-architecture.md.
       - name: Self-test the ETW leaked-session cleanup
         timeout-minutes: 5
