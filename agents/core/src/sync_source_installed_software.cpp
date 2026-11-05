@@ -4,6 +4,7 @@
 #include "sync_canonical.hpp" // sanitize_utf8_strict / clamp_field / sha256_hex
 
 #include <inventory_status_row.hpp> // the status-row grammar shared with the producing plugins
+#include <middleware_products.hpp>  // the middleware product table (title/vendor/ecosystem/kind)
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -318,6 +319,14 @@ const InventoryAction kInventoryActions[] = {
      .action = "python",
      .adapt = parse_runtimes_python_output,
      .constrained = ConstrainedPolicy::drop_source},
+    // Metadata-only source whose steady-state constraint is a permission fact: a constrained
+    // answer drops just that source (rows withheld) instead of failing the whole cycle.
+    {.plugin = "middleware",
+     .action = "ibm_mq",
+     .adapt = [](const std::string& o, ConstrainedPolicy pol) {
+         return parse_middleware_output(o, "ibm_mq", pol);
+     },
+     .constrained = ConstrainedPolicy::drop_source},
 };
 
 } // namespace
@@ -510,6 +519,38 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     }, policy, /*escaped=*/true);
 }
 
+AdaptedRows parse_middleware_output(const std::string& out, std::string_view action,
+                                    ConstrainedPolicy policy) {
+    // <id>|<title>|<name>|<version or ->|<install_path>|<edition or ->  (install_path and
+    // edition are not carried). Free-text fields arrive escape-aware (a path may hold `\|`), so
+    // the split is too. Name, publisher, kind and ecosystem come from the plugin's own product
+    // table, never from the row.
+    const yuzu::middleware::Product* p = yuzu::middleware::find_product(action);
+    if (p == nullptr)
+        return failed("unknown middleware product");
+    return adapt_pkg_inventory(out, action,
+                               [p, action](const std::vector<std::string_view>& tok,
+                                           std::vector<SwEntry>& entries) {
+        if (tok[0] != action || tok.size() != 6)
+            return false;
+        // The title column is fixed vocabulary from the table: with no per-product title span a
+        // row can only carry p->title, anything else is seen but not mapped (siblings kept). The
+        // token keeps its wire escapes, so this raw compare is only exact because
+        // products_well_formed() accepts only a title the wire form leaves unchanged: printable ASCII
+        // without `|` or `\` (middleware_products.hpp).
+        if (tok[1] == p->title) {
+            SwEntry e;
+            e.name = p->title;
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+            e.publisher = p->vendor;
+            e.kind = p->kind;
+            e.ecosystem = p->ecosystem;
+            entries.push_back(std::move(e));
+        }
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {
     // windows_optional_features_parsers.hpp: `feature|<name>|<state>|<0/1>` per
     // feature (no status row in this grammar); sentinels are 3-token
@@ -605,6 +646,9 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
+    // Nightly maintenance window, 01:00-05:00 machine-local time (a compile-time default:
+    // no settings channel exists yet). Each agent keeps a stable moment inside it.
+    src.window = SyncWindow{60, 300};
     // A retry re-runs at most one call per table action in-process (no fan-out); the backoff
     // caps that at four extra runs per outage.
     src.skip_backoff = true;

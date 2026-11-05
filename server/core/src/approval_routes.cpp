@@ -134,7 +134,7 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     // admit ONLY cookie sessions, which is exactly the ambient-credential class
     // `browser_write_is_cross_site` exists for -- every sibling cookie-write route
     // family carries it. The central pre-routing gate answers a cookie-session write
-    // first, then the central step-up check runs in the pre-request stage; this copy is
+    // first, then the central step-up check runs in the post-read stage; this copy is
     // defence in depth and runs after both and after the permission gate (an
     // unauthorised caller keeps its 403), BEFORE the class check, this handler's
     // step-up call and the `attempted` row, so a cross-site request mutates nothing

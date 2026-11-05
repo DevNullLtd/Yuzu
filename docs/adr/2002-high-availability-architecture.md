@@ -30,9 +30,13 @@ be scoped to any single customer, and we must **not assume the customer runs HA 
 Three groundwork facts make this tractable rather than a rewrite:
 
 1. **The Erlang gateway already clusters** (OTP `pg` process groups, ETS registry) and already
-   tolerates *server* failover — on upstream reconnect it re-proxies a `ProxyRegister` for every
-   held agent because the new server "may be a fresh instance with an empty registry"
-   (`yuzu_gw_upstream.erl`). **But** per-agent *targeted* routing is today a **node-local ETS lookup**
+   tolerates *server* failover — it re-proxies a `ProxyRegister` for the agents a restarted or
+   replaced server no longer knows, because the new server may be a fresh instance with an empty registry.
+   Since #5695 that replay is evidence-driven (a targeted replay of the ids a heartbeat verdict lists as
+   unknown; a full replay on enough unknown ids or a truncated verdict (both limited by a cooldown), or
+   on a lost CONNECTED notice; the exact triggers are in the header block of `yuzu_gw_upstream.erl`), not an unconditional
+   replay of every held agent on reconnect.
+   **But** per-agent *targeted* routing is today a **node-local ETS lookup**
    (`yuzu_gw_registry:lookup`, `yuzu_gw_registry.erl:90`) — `pg` is used only for broadcast groups —
    so distributed intra-cluster agent→node routing is **net-new work**, not a free property (see §7).
 2. **ADR-0031 (presentation/core/engine decomposition)** already commits the direction: sessions and
@@ -445,6 +449,60 @@ cluster unit; intra-zone scale is more nodes.
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
 
+**Update (2026-11-02, WS-13 / #291 — decided after a Fable plan review).**
+- **First design: a VIP or a multi-address DNS name, with no agent code.** The agent takes one
+  `--server` address and builds one channel (`agents/core/src/agent.cpp`, the single `CreateCustomChannel`
+  call), which keeps one gateway node per session. At the gRPC layer (1.76 per the author, a one-off
+  check with no retained record, the agent's channel settings, two test servers behind one multi-address name) the default `pick_first` policy moved to the surviving
+  address within about a second of the connected one dying. This is **not yet measured** with a real agent,
+  real TLS or a silent partition (keepalive 60 s + 20 s), so it supports "support both" in design but is
+  not evidence for the gate. An agent-side endpoint list (a gRPC target built from `--server a:p,b:p` plus a
+  fixed TLS target name) is built only if a static node list without DNS becomes a required topology; a
+  server-advertised endpoint list is WS-15 scope.
+- **Requirements this puts on the topology.** Every node's certificate must carry the name or address the
+  agent dials (the agent has no target-name override). Gateway-fronted quarantine needs addresses that do
+  not change: the quarantine allow-list is resolved **once at startup, deliberately** (#3429), so after the
+  addresses behind the name change a quarantined agent can reach no node and cannot be released remotely.
+  The resolver does not parse a list or a scheme, so any list syntax must carry a test that the
+  allow-list is not empty.
+- **Reconnect timing (13.1, done; implements #5990).** After a lost stream each retry waits a random whole number of
+  seconds in [1, 3 x the previous delay], at most 300 s (decorrelated jitter, owner decision 2026-10-17), and the previous
+  delay returns to 1 s after a successful Register. The first retry is 1 to 3 s, so the agents of a failed node return
+  in three one-second buckets at first, not without bursts, and spread wider with each retry (a 10,000-agent
+  simulation in `tests/unit/test_reconnect_backoff.cpp` bounds the share in any one second per round). **Cost, simulated
+  and pinned by a test (attempt counts and the settled mean delay):** in a sustained outage an agent retries about twice as often as the old fixed ladder did (about
+  28 attempts in 30 minutes against 13; a steady-state mean delay of about 135 s against 256 s), because a typical
+  agent's delay grows far more slowly than the mean does. The enrolled-but-no-certificate retry restarts from the base at
+  its first retry, then keeps growing its delay across its Register calls, with each of its waits at least 8 s so that
+  the four waits outlast the server's 30 s one-certificate-per-agent window (the old fixed 2+4+8+16 s ladder summed
+  to exactly 30 s). The average return after an outage is usually sooner, but the slowest 1% of agents can wait
+  longer than under the old ladder (simulated for outages of 30 to 600 s: p99 about 285 s against 250 s). A restarted agent has no wait, and the heartbeat-driven re-registration cooldown (#1894) is
+  unchanged.
+- **Known gap (precondition confirmed on one rig, consequence unmeasured).** A gateway node that is up but has lost its server still acknowledges proxied
+  heartbeats from node-local state (`yuzu_gw_agent_service:heartbeat/2`; an unknown session gets `NOT_FOUND`),
+  and the agent re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees success, gets no
+  trigger, its keepalives stay healthy, and the route lease (90 s) expires. The 13.0 spike confirmed the precondition on its rig (finding 4) and did not measure the consequence on two
+  replicas; if it proves harmful, a WS-13 slice (the gateway ends agent streams after an outage longer than the lease) closes it.
+- **Rollout.** Moving a direct-connect fleet behind a gateway silently stops its agents updating
+  themselves while #5619 is open (the gateway implements neither `CheckForUpdate` nor `DownloadUpdate`),
+  so the 13.4 rollout runbook must refuse unless the operator declares out-of-band package management
+  (no rollout tool exists yet). It also needs
+  agents of 0.15.0 or later (older agents wedge in their reconnect path, #2182), no quarantined devices,
+  and a statement of what changes (client-address attribution, mTLS at the edge).
+- **Gate wording.** The clause "for gateway-fronted fleets, WS-13 is done" became: WS-13's failover items for
+  a deployment with more than one gateway node, and its rollout item for any fleet that still connects
+  directly. Losing a server replica does not move agents (the gateway re-registers the agents a restarted or
+  replaced server no longer knows, on evidence since #5695: see Context and §7g); agent failover answers
+  losing a gateway node. By deployment shape: a fleet that still connects directly is newly gated (the rollout
+  item); a deployment with several gateway nodes keeps the failover items.
+- **Decided 2026-11-04 (#6920, the project lead).** The 13.0 spike record (`docs/ha-spikes/ws13-0-gateway-failover.md`) was input. Its figures are single-host and caveated; the follow-up measurements are tracked in #7051.
+  (1) **Slice 13.6** (a gateway node that is up but has lost its server) stays OUTSIDE the gate, because its harm is untested. In the six spike runs that cut a node off from the server while leaving its agents connected (faults F3 and F3x), `/readyz` never changed and the agents stayed on the node (every route went non-routable after about 60 to 90 s); in the five with a gateway log the breaker never opened in 400 s, on a quiet single-host fleet; and dispatch kept working on the single-replica server. What happens on two replicas, where the route directory is used, is not measured: by code reading, agents may be undispatchable there, protective actions included (whether a quarantine issued in that state reaches the endpoint is unmeasured). Spike finding 10 (a command accepted and then lost after a fault on the agent port only) is unexplained and is not reproduced by the 13.6 probe; its repeat is in #7051. Slice 13.6 moves INTO the gate if the two-replica probe owned by #7082 finds an agent still attached to such a node undispatchable, or if the one-replica loaded-fleet run in #7051 finds one (that run cannot show a lease-driven failure, because one replica does not consult the route directory, so such a finding is recorded as a separate defect and the project lead decides whether 13.6 moves in). The #7082 probe is a read-only dispatch sent through any replica, including one that does not hold the agent's session, at +120 s, +300 s and +420 s after the fault, in a two-replica WS-9 or lab run (never in production enablement); "delivered" means a terminal response produced by the agent (a result or an agent-reported failure) within a deadline the harness states, and a failure synthesised by the server (for example `gateway_unavailable`) is not delivered; the same probe is run before the fault as a control, and a failed control makes the run inconclusive, not a pass; results are recorded per replica; and a pass is evidence for that rig only and does not remove the known gap. #7082 records the outcome either way. Moving 13.6 in edits every hand-stated copy of the gate together: the matrix gate sentence, decision note, WS-13 row, gate column, Phase B and stamp; the ADR decision and gate-wording bullets; the `/ha` skill section 1b, both "Remaining gate items" lines, the WS-13 row and Phase B; and roadmap 14.2.
+  (2) **#5649 and #5648 are INSIDE the gate**, whatever the gateway count. ADR-2002 section 7c's convergence claim holds for one replica only until #5649 is decided and run on two replicas (section 7g), and by code reading a hung or failing server out of two can feed the gateway's only circuit breaker (on a channel with two endpoints a cleanly dead one drops out of the channel's pick, though its lost connection may still count as a failure). Done means: for #5649, the decision (sticky to one upstream endpoint, or safe on any replica) is recorded in this ADR, a WS-9 two-replica scenario (not yet written) is run repeatedly, with the number of runs recorded, and converges, with `increase(yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}[10m]) == 0` on every replica from a settle time after both are up, in consecutive runs (the count and the settle time are set when the scenario is written), and the one-connection guidance in `docs/user-manual/gateway.md` and the boot warning are rewritten to match the decision; for #5648, the breaker is per upstream endpoint with failover and `/readyz` stays ready while one endpoint is usable, and a rig run with one hung (not killed) server out of two, while the fleet registers and syncs so that `yuzu_gw_upstream_rpc_errors_total` rises for an `rpc_name` other than `batch_heartbeat` with a transport, timeout or server-fault code (not an encode error, a stream-limit refusal or a request-fault status), leaves the other endpoint's breaker closed (read from its `yuzu_gw_upstream_circuit_transitions_total` and `/readyz`; a heartbeat-only run proves nothing, because heartbeat flushes do not feed the breaker). #5648 is not built and #5649 is undecided, so this moves the gate further from lifted, not nearer.
+  (3) A **one-gateway** deployment is deliberately not gated on WS-13's failover items: there is no second node to fail over to. The gateway is then a single point of failure for its fleet. This gate applies only when enabling a second server replica and does not address that, and this is not a statement that one gateway is acceptable for HA. Only (2) gates it, plus the rollout item while it still has direct-connect agents. The gate is checked per deployment: a fleet with no gateway first needs the rollout item and then the row for the shape it becomes; one gateway needs #5648 and #5649; several gateways need #5648, #5649, the failover items and slice 13.7; and a second server replica stays unsupported until the row for its shape holds and every other gate clause is closed. This keeps the 2026-11-02 relaxation of the original "for gateway-fronted fleets" clause.
+  (4) **Slice 13.7 (#7062)**, for a deployment with more than one gateway node, is INSIDE the gate: the server's `--gateway-command-addr` names one node, and killing it left the fleet undispatchable although every agent had re-attached. It is inside by this decision, not on measured evidence: four spike runs (H7) used the single-node address, two of them kill runs with valid probes, and none of the six probes in those two was delivered (spike finding 5: four refused as gateway-unavailable, two accepted with no result); there is no control run (#7051). By code reading, a protective command (quarantine included) sent in that state is queued as sent and then, about six seconds later, recorded as `gateway_unavailable` on its execution row only; it is not delivered, and a missed scheduled occurrence is not retried. A release sent in that state is equally undelivered. On the device page only "Confirmed on device at the last status read" is evidence that a quarantine applied. The signal is `yuzu_server_gateway_forward_total{status="unavailable"}` rising; no shipped alert covers it. The effect on the endpoint is unmeasured.
+  Risk acceptance (the project lead, 2026-11-04; recorded on #6920, https://github.com/DevNullLtd/Yuzu/issues/6920#issuecomment-6636272238). Accepted for now: (a) slice 13.6 stays outside the gate while its harm is unmeasured, including whether a quarantine reaches an agent in that state; (b) a one-gateway deployment is a single point of failure for its fleet, which this gate does not address. Not decided: spike finding 10 (its repeat in #7051 is its review trigger). Known open defect on the supported shape, not accepted and not mitigated: behind a dead `--gateway-command-addr` node a quarantine is not delivered (slice 13.7, #7062). Not accepted: lifting the gate. One server replica is the only supported shape (`docs/user-manual/server-admin.md`, "Leader election: metrics and alerts"), and nothing in the product prevents a second replica until the cluster-capability admission gate (#6528) is built. On that supported shape with several gateways, a dead `--gateway-command-addr` node left the fleet undispatchable in the two spike kill runs (control owed, #7051; fix tracked in #7062). Owner: the project lead. Review at the first recorded outcome of #7082 or of the #7051 dispatch probe, or when every other gate clause is closed, whichever is first.
+  The gate is **not lifted**.
+
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
 `#4324` per-home stream-generation fence done; 4.3a (intra-cluster routing) done; `#4555` (gateway
@@ -606,7 +664,7 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   `ProxyInventory` / `NotifyStreamStatus` session resolution is now directory-authoritative — see §7f
   (merged as PR #5694, 2026-10-12); the `ProxyRegister` known-session
   check itself is unchanged.* Under active-active a replay routed to a non-owning replica still takes
-  the fresh branch until the safe-to-scale gate work lands.
+  the fresh branch; closing that is the #5649 decision (§7g item 3), a gate clause since 2026-11-04 (#6920).
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
   re-read on the replay branch, and a fresh re-register COALESCE-preserves the OLD cluster/node until a
   CONNECTED `announce_connected` lands; a 4.2 reader must not trust placement from a replay/fail-open
@@ -1275,8 +1333,8 @@ correct action in both cases is today's behaviour (no replay).
   `register_agent` and wipes its placement until its own reannounce lands on it. A per-session replay
   guard planned for the gateway-side change bounds the replay RATE, not the NUMBER of rounds. Expected
   signature: `renew_leases`/`unknown_session` desync not decaying on some replica after both sides are
-  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix;
-  until it lands the safe-to-scale gate still forbids a second replica.
+  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix (it landed as §7f and is not sufficient on its own: see §7g item 3 and #5649);
+  the safe-to-scale gate still forbids a second replica.
 - **Lease window (observed on one local development rig with one agent, dev `3c8ac2c0c`; not
   reproducible from the repo; tracker #1197).** After a server-only restart a single-target command to
   an agent the new server does not know was still delivered while the lease and presence rows written
@@ -1502,8 +1560,8 @@ one core replica a server-only restart now recovers through the replay described
   some replica after both sides are upgraded, with
   `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}` rising (it counts verdicts that queued
   at least one agent, so at most once per flush; INFERRED). The
-  durable cross-replica session lookup (WS-5, `#4246` #3) is the fix; until it lands the safe-to-scale
-  gate forbids a second replica.
+  durable cross-replica session lookup (WS-5, `#4246` #3) was the intended fix (it landed as §7f and is not sufficient on its own: see §7g item 3 and #5649); the safe-to-scale
+  gate still forbids a second replica.
 - **Observed on a local rig, not reproducible from the repository (one real agent, one core replica,
   debug builds).** After a server-only restart the replay came on the first agent heartbeat after the
   server was healthy again (17.5 s in the 10 s outage runs, with the same session id and no agent
@@ -1604,10 +1662,10 @@ one core replica a server-only restart now recovers through the replay described
   not observed to repair the row of the entry above, and that row is not caused by this change. The limit
   stands: the row waits for the agent's own reconnect. Tracked as a follow-up (no issue yet), together with
   the entry above.
-- **Planned follow-ups (tracked as follow-ups, no issue numbers yet), in this order.** (i) A bounded pending
+- **Planned follow-ups (tracked as follow-ups, in this order; (ii) is now #5380).** (i) A bounded pending
   queue for dropped notifications, a gateway-only change. (ii) A server-side re-arm of a tombstoned route
   row when a lease renewal comes up short, with a new advisory list that the gateway answers by
-  re-announcing; this needs a protocol change and is planned to land before the safe-to-scale gate.
+  re-announcing; this needs a protocol change and is planned to land before the safe-to-scale gate (tracked as #5380).
   (iii) A session-match guard and a refusal counter for the `accepted=false` disconnect.
 - **Upgrade day.** The server is upgraded first, so the server restart that ships this fix meets the old
   gateway and agents behind it can read offline (observed on one rig after a SIGKILL restart; a graceful
@@ -1975,6 +2033,23 @@ when the applied frame's `status()` is not `RUNNING` (`is_terminal_command_statu
 `gateway_mgmt_stub_pool.hpp`, unit-tested against the full status enum). The `not_connected`-repair site is
 unconditionally terminal by its classifier's own contract and needs no such check.
 
+**Third correction (2026-11-01, #2146 batch B Gate 8):** the four per-attempt synthesizing sites above sit INSIDE the
+per-command forward thread, so a command whose thread could never be started was outside every one of them. The
+other two (`unknown_cluster` and the null-pool branch) resolve in the dispatching thread, before that command's own forward thread exists
+(`server.cpp`'s `forward_gateway_pending`, ahead of the spawn).
+`forward_gateway_pending` drains the queue and spawns one detached `std::thread` per command, and `send_to` had
+already counted each queued command as sent (it returns true at the queue push), so a throwing spawn
+(`std::system_error` or `bad_alloc`) unwound the loop, destroyed every not-yet-spawned drained command with no
+terminal response, and left its execution row `running` with a targeted count it could never complete (the
+stuck-execution sweep skips a row whose targeted count is above 0). The whole per-command body, from the first
+allocating statement through the spawn, now runs as the `forward_one` lambda under `guarded_forward` (`server/core/src/gateway_forward_guard.hpp`, which also holds the reason constant and the stored detail text), so one try statement covers it: a failure resolves THAT command through
+`apply_gateway_forward_terminal_failure` with the reason code `gateway_forward_spawn_failed` and the loop continues.
+That resolution is best effort: the resolver allocates too, so under the same resource pressure it can fail as well;
+that is logged at error level (an operator `cancel_execution` is then the only way to close the row), and an
+unknown-cluster resolution that already ran is never repeated, so each later drained command gets its own spawn attempt and,
+failing that, its own terminal failure. The non-throwing path is unchanged, and no `yuzu_server_gateway_forward_total`
+status was added for it. The reason code is listed in `docs/user-manual/server-admin.md` beside the others.
+
 **Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
 re-drive), for two independent, load-bearing reasons — not silently, this time:**
 
@@ -2016,7 +2091,7 @@ every branch this PR's own scope covers, not that one.
 
 **Status: merged as PR #5694 (`eabc2b639`, 2026-10-12). THE SAFE-TO-SCALE GATE IS NOT
 LIFTED** — this closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13
-for gateway-fronted fleets, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
+failover and rollout items, #5648 and #5649 per the gate as decided 2026-11-04 (#6920), WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
 `docs/ha-delivery-matrix.md`). Run exactly ONE server replica (§7c).
 
 **Problem.** `GatewayUpstreamServiceImpl` resolved a gateway `session_id` to an `agent_id` only through

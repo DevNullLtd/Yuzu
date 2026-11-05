@@ -471,7 +471,7 @@ over a limit makes execute answer `500`):
 
 `enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
 poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
-that route does not read `enabled`.
+that route does not read `enabled`, and neither do its v1 and MCP twins.
 
 ### Replacing a stored parameter schema
 
@@ -596,7 +596,7 @@ spec:
 
 When a user (or MCP tool) executes an instruction that requires approval:
 
-1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). An MCP client is different: it re-calls the same tool with the `approval_id` once the ticket is approved, and that call runs it.
+1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). This is true on every surface, MCP included: a `pending_approval` answer from `execute_instruction_definition` carries the same kind of instruction-origin ticket, and no surface can redeem it, so re-calling the tool with that `approval_id` does not run the instruction. Only an MCP tier ticket is redeemable: when the supervised tier itself holds a call for approval (an `execute_instruction` or similar call answered with `approval_required` (-32006)), the client re-calls the same tool with that `approval_id` once a person has approved it, and that call runs. A definition whose `approval_mode` is not `auto` therefore cannot be run through the execute routes or tools until #6064 lands (this limit predates the v1 and MCP twins).
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
 3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab (a rejected request is never run; an approved instruction-origin ticket is recorded but not dispatched, as in step 1). On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
@@ -1003,6 +1003,8 @@ curl -s -b cookies.txt \
 
 The `scope` field controls which agents are included. Set `"scope": "failed_only"` to target only agents that reported failure; any other value (or omitting the field) reruns all agents.
 
+**What a rerun does.** It creates a new `pending` execution record linked to the original; it does not send anything to any device. The REST v1 route `POST /api/v1/executions/{id}/rerun` and the MCP tool `record_execution_rerun` do the same, take a boolean `failed_only` instead of the `scope` string, and answer `dispatched_to_devices: false`. Likewise `POST /api/v1/executions/{id}/cancel` and `cancel_execution` only mark the execution cancelled; they do not stop a command a device already received. See `docs/user-manual/rest-api.md`.
+
 ### Cancel
 
 Cancellation records the requesting user for audit:
@@ -1322,6 +1324,8 @@ curl -s -b cookies.txt \
 ```
 
 > **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.
+
+**Versioned and MCP twins (#2146).** `POST /api/v1/instructions/{id}/execute` and the MCP tool `execute_instruction_definition` run the same pipeline with the same `agent_ids` / `scope` / `params` and the same `approval_mode` rules, with these differences from the route above: the v1 response is wrapped as `{"data": {...}, "meta": {"api_version": "v1"}}` and every error carries an A4 envelope with a machine-readable `reason`; a call is audited `requested` BEFORE it dispatches and refused with `503` if that row cannot be stored (the legacy route audits after the send); the `202` body adds `approval_mode`; zero agents reached is an error with a `reason` (`400` for `invalid_scope`, `503` otherwise) rather than the legacy untyped `503`; the check order puts the dispatch authorization (`403`/`400` with a `reason`) and the destructive-targeting rules (`400` `destructive_untargeted` / `forensic_untargeted`, `404` `destructive_no_visible_target`) before the definition's approval, so a call that is refused for those reasons never queues an approval. A definition id holding a control character (a byte below `0x20` or equal to `0x7F`, NUL included) or not valid UTF-8 (reachable on REST, where the HTTP layer percent-decodes the path to raw bytes) is refused before the definition is looked up (`400` / `-32602`, `reason` `invalid_definition_id`, a `denied` audit row, nothing queued or dispatched); the legacy route does not apply that check. A dispatch that throws part-way answers `500` / `-32603` `dispatch_exception` with no retry hint, and names the execution row it left running as the typed field `error.execution_id` (`error.data.execution_id` on MCP) plus, when known, the lower-bound count of agents already sent the command as `error.agents_sent` (`error.data.agents_sent`; a gateway-routed agent counts once its command is queued for forwarding, which can still fail): check that execution's results or close it with `cancel_execution` before running the definition again. Like the legacy route, neither twin reads the definition's `enabled` flag. The MCP twin does not stream progress, and a definition whose `approval_mode` is not `auto` answers `pending_approval` for an operator-tier or a supervised-tier token alike: a tier's auto-approval or consumed ticket never stands in for the definition's own approval, and a supervised token's ticket never lifts the admin-or-approval requirement of the definition's `plugin.action` either: a non-administrator is refused with `approval_required` (permanent, no ticket minted). See the [REST API reference](rest-api.md) and the [MCP guide](mcp.md).
 
 #### List definitions (v1 endpoint)
 
@@ -1719,6 +1723,7 @@ Reads are gated on `InstructionDefinition:Read`, mutations on `InstructionDefini
 **Limitations operators should expect:**
 
 - **Equals-op only in dashboard auto-apply.** The dashboard's filter map is exact-match; `contains`/`starts_with`/`ends_with` filters in a template are stored and returned by REST but the dashboard only auto-applies the `equals` clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded.
+- **The View's equals filters are defaults, not locks.** Tick **View without saved filters** (shown next to the View dropdown when a template carries an `equals` filter) to show the results without them. While the box is ticked, the table and its sort, page and Search requests skip the View's filters; untick it to bring them back. It never drops a filter you set yourself, and a new command starts with it unticked.
 - **Detail drawer ignores the column subset.** The expandable per-row detail drawer always shows every parsed field — hiding values there would defeat its "expand for full record" purpose.
 - **Dashboard YAML editor strips `spec.responseTemplates`.** Same caveat as `spec.visualization`. Author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints.
 

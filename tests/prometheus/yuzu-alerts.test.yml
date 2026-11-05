@@ -1617,6 +1617,29 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
             value: 1
+      # Negative control for the per_agent_cap companion (#561): a store-health reason
+      # must not fire it.
+      - expr: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE 24b -- an agent hitting the per-command row cap (#561) must not page
+  # YuzuResponseIngestDrops (store health), but must page the informational
+  # companion.
+  - interval: 1m
+    name: response ingest drops - per_agent_cap alone does not page store health
+    input_series:
+      - series: 'yuzu_server_response_ingest_dropped_total{job="yuzu",instance="s1",reason="per_agent_cap"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing", instance="s1", job="yuzu", reason="per_agent_cap", severity="info"}'
+            value: 1
 
   # ── YuzuRbacReadDegraded ────────────────────────────────────────────────
   #
@@ -2274,6 +2297,35 @@ tests:
         values: "0x60"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuScimProvenanceDenied"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuScimGuardStoreUnavailable (#6836) ────────────────────────────────
+
+  # CASE 54a -- a SCIM guard could not read the auth store (retryable 503); the
+  # bounded `guard` label survives onto the alert.
+  - interval: 1m
+    name: scim guard store unavailable - a guard read fault fires and keeps its guard label
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing", guard="role", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 54b -- a flat (pre-seeded) counter stays quiet.
+  - interval: 1m
+    name: scim guard store unavailable - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="provenance"}'
+        values: "0x60"
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable"}'
         eval_time: 45m
         exp_samples: []
 
@@ -3140,6 +3192,148 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing", severity="warning"}'
             value: 1
+
+  # ── YuzuInventoryIngestSlow - blob v3 (phase="v3") ───────────────────────
+  #
+  # A blob-v3 call applies up to 32 sections in one transaction on one connection (the heaviest
+  # hold), so the rule must match phase="v3" as well as phase="full". RED against the former
+  # phase="full" selector: the v3 series is invisible to it.
+  # CASE - a v3 series with 12 ingests/min all above 10s (the +Inf bucket climbs, le="10" stays
+  # flat) fires once the 10m hold clears.
+  - interval: 1m
+    name: inventory ingest slow - phase v3 over 10s fires
+    input_series:
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="v3",le="+Inf"}'
+        values: "0+12x40"
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="v3",le="10"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE - the same shape on phase="full" still fires: widening the selector to include v3 must
+  # not drop the original phase.
+  - interval: 1m
+    name: inventory ingest slow - phase full over 10s still fires
+    input_series:
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="full",le="+Inf"}'
+        values: "0+12x40"
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="full",le="10"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE - the same slow shape on a phase the rule does not cover (hash_only, a compare with no
+  # write) does not fire: the selector widened to the two full-apply phases, not to every phase.
+  - interval: 1m
+    name: inventory ingest slow - phase hash_only over 10s does not fire
+    input_series:
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="hash_only",le="+Inf"}'
+        values: "0+12x40"
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="hash_only",le="10"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryIngestSlow"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # ── YuzuInventorySectionIngestRefused ────────────────────────────────────
+  #
+  # A refused (grammar) section is counted per facet; the rule is an increase over a day with no
+  # hold and carries the facet label (sum by (facet)). delta_unsupported has its own info rule
+  # further down.
+  # CASE - a facet whose sections keep being refused fires, naming the facet.
+  - interval: 1m
+    name: inventory section ingest refused - a rejected facet fires with its facet label
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="installed_apps.list_inventory",outcome="rejected"}'
+        values: "0+1x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing", facet="installed_apps.list_inventory", severity="warning"}'
+            value: 1
+
+  # CASE - ONE refused section fires (a pre-seeded 0, then a single increment). RED against the
+  # former `rate(...[15m]) > 0` with `for: 15m`: one increment keeps the rate non-zero for under
+  # 15m, so the hold was never met and a low-cadence refusal never alerted.
+  - interval: 1m
+    name: inventory section ingest refused - a single refusal fires
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="rejected"}'
+        values: "0x10 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing", facet="pkg_inventory.packages", severity="warning"}'
+            value: 1
+
+  # CASE - delta_unsupported (a delta whose base matched, the server has no delta apply yet) does NOT
+  # fire the warning: it is the expected placeholder and has its own info rule below.
+  - interval: 1m
+    name: inventory section ingest refused - delta_unsupported does not fire the warning
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="delta_unsupported"}'
+        values: "0+1x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuInventorySectionDeltaUnsupported ─────────────────────────────────
+  # CASE - a facet answered need_full for deltas fires as INFO after a 1h hold, naming the facet.
+  - interval: 1m
+    name: inventory section delta unsupported - fires as info with its facet label after 1h
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="delta_unsupported"}'
+        values: "0+1x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionDeltaUnsupported", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventorySectionDeltaUnsupported", alertstate="firing"}'
+        eval_time: 80m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventorySectionDeltaUnsupported", alertstate="firing", facet="pkg_inventory.packages", severity="info"}'
+            value: 1
+
+  # CASE - a rejected section never fires the info rule (it has the warning above).
+  - interval: 1m
+    name: inventory section delta unsupported - rejected does not fire it
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="installed_apps.list_inventory",outcome="rejected"}'
+        values: "0+1x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionDeltaUnsupported"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE - healthy outcomes (stored, status_only, need_full, error) climbing never fire this rule:
+  # need_full has YuzuInventoryHighNeedFullRatio and error has YuzuInventorySustainedIngestErrors.
+  - interval: 1m
+    name: inventory section ingest refused - stored, status_only, need_full and error do not fire
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="installed_apps.list_inventory",outcome="stored"}'
+        values: "0+5x50"
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="installed_apps.list_inventory",outcome="status_only"}'
+        values: "0+1x50"
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="installed_apps.list_inventory",outcome="need_full"}'
+        values: "0+1x50"
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="installed_apps.list_inventory",outcome="error"}'
+        values: "0+1x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused"}'
+        eval_time: 30m
+        exp_samples: []
 
   # ── YuzuCertInventoryReportsRejected ─────────────────────────────────────
   # CASE - ONE device refused ONCE fires (increase over a day, no hold), carrying its reason.
@@ -6748,6 +6942,163 @@ tests:
       - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
         eval_time: 8m
         exp_samples: []
+
+  # ── YuzuSoftwareNormalizationStale / YuzuSoftwareNormalizationFailing (SAM.4) ──
+  #
+  # The job ticks HOURLY and adds one outcome counter increment per tick. The Failing
+  # rule is increase(...[3h]) >= 2 with `for: 10m`, sized to that cadence (a 15m window
+  # cannot observe an hourly increment, and in a sustained outage the period is a little
+  # OVER an hour because the wait starts when a tick ends). 1m samples; the counter steps
+  # at the hour.
+
+  # Healthy: the stamp tracks wall-clock (promtool's time() is the sample time, so a
+  # value of 60*minute IS "now"), and no tick has failed. Both rules stay quiet.
+  - interval: 1m
+    name: software normalization - a healthy hourly job is quiet
+    input_series:
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0+60x240"
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareNormalization.*", alertstate="firing"}'
+        eval_time: 3h50m
+        exp_samples: []
+
+  # Stale: s2's stamp tracks wall-clock for 60m and then freezes at 3600. It is quiet
+  # while the age is under two cadences (7200 s), pending once the age passes it
+  # (3h00m), and firing after the 10m hold. s1 sits at the seeded 0 forever (building,
+  # or never succeeded): the `> 0` guard keeps the Stale rule quiet (the Failing rule
+  # owns that case). RED against dropping the guard.
+  - interval: 1m
+    name: software normalization - stale fires after two cadences and not while building
+    input_series:
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0x300"
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s2"}'
+        values: "0+60x60 3600x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s1"}'
+        eval_time: 4h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 2h50m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # Failing: two failed hourly ticks inside one 3h window. The error counter steps at
+  # t=60m (1) and t=120m (2). Quiet after the first failure; the second brings
+  # increase([3h]) to 2, and after the 10m hold it fires and is still firing at 2h20m.
+  # The leading zeros model the job's construction-time seed (the server creates the
+  # series at 0 before the first tick), so this series is the state the server produces.
+  - interval: 1m
+    name: software normalization - two failed hourly ticks fire
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x60 2x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing, sustained outage: the period is 61 m (3600 s wait + a one-minute tick), the
+  # real shape of an outage. The counter steps at 61, 122, 183, 244, 305 and 366 m. A 2h
+  # window holds only ONE increment for 2 minutes of every period (181-182, 242-243 and
+  # 303-304 m here), the expression drops below 2 and `for` resets, so [2h] went quiet once
+  # an hour; [3h] always holds two. Evaluated INSIDE each of those would-be gaps and at 5h30
+  # the alert must be continuously firing from its first firing (132 m).
+  - interval: 1m
+    name: software normalization - a sustained outage at a 61 minute period fires continuously
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x60 1x60 2x60 3x60 4x60 5x60 6x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 100m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 140m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 182m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 243m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 304m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 330m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing: ONE isolated failure followed by successes never fires, however long we wait.
+  - interval: 1m
+    name: software normalization - one isolated hourly failure stays quiet
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # Failing, positive baseline: the counter already sits at 1 (an earlier failure that has
+  # aged out of the window) and ONE new failure steps it to 2. The first in-window sample
+  # is then non-zero, so increase() extrapolates the single increment to the window edge
+  # and reads a little above 1 for the whole hour it stays in the window; `> 1` fired on
+  # it. The rule is `>= 2`: only two increments in the window reach 2.
+  - interval: 1m
+    name: software normalization - one failure after an aged-out earlier failure stays quiet
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # Failing, positive baseline: two failures on top of an aged-out earlier one (1 -> 2 -> 3)
+  # still fire after the hold.
+  - interval: 1m
+    name: software normalization - two failures after an aged-out earlier failure fire
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x60 3x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
 
   # ── YuzuDedupStoreDegraded (#3663) ───────────────────────────────────────
   #

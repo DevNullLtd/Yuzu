@@ -498,6 +498,71 @@ TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the
     CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the audit header, the "
+          "unreadable pending count, the misconfigured arm and the dispatch_exception fields",
+          "[openapi][instruction_execute]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/instructions/{id}/execute"));
+    const auto& op = spec["paths"]["/instructions/{id}/execute"]["post"];
+    const auto& rsp = op["responses"];
+    // Sec-Audit-Failed is a typed response header on every status that can carry a lost
+    // best-effort row, not prose alone.
+    for (const char* code : {"200", "202", "400"}) {
+        INFO(code);
+        REQUIRE(rsp.contains(code));
+        REQUIRE(rsp[code].contains("headers"));
+        REQUIRE(rsp[code]["headers"].contains("Sec-Audit-Failed"));
+        CHECK(rsp[code]["headers"]["Sec-Audit-Failed"]["schema"]["enum"] == json::array({"true"}));
+    }
+    REQUIRE(rsp.contains("503"));
+    REQUIRE(rsp.contains("500"));
+    REQUIRE(rsp.contains("429"));
+    const std::string d503 = rsp["503"].value("description", "");
+    CHECK(d503.find("pending-approval count unreadable") != std::string::npos);
+    CHECK(d503.find("retry_after_ms 5000") != std::string::npos);
+    const std::string d500 = rsp["500"].value("description", "");
+    CHECK(d500.find("dispatch_unconfigured") != std::string::npos);
+    CHECK(d500.find("dispatch_exception") != std::string::npos);
+    CHECK(d500.find("error.execution_id") != std::string::npos);
+    CHECK(d500.find("error.agents_sent") != std::string::npos);
+    // The cap is a soft bound everywhere the manual says so.
+    const std::string desc = op.value("description", "");
+    CHECK(desc.find("about 25 pending approvals") != std::string::npos);
+    CHECK(desc.find("soft bound") != std::string::npos);
+    CHECK(rsp["429"].value("description", "").find("about 25 pending approvals") !=
+          std::string::npos);
+    CHECK(rsp["400"].value("description", "").find("invalid_definition_id") != std::string::npos);
+    // The id refusal names invalid UTF-8 beside the control character, in the 400 text and in the
+    // "Order:" prose (both were once control-character-only).
+    CHECK(rsp["400"].value("description", "").find("invalid UTF-8") != std::string::npos);
+    const auto order_at = desc.find("Order: body depth and JSON parse, the definition id");
+    REQUIRE(order_at != std::string::npos);
+    CHECK(desc.find("invalid_definition_id for a control byte (below 0x20 or 0x7F) or invalid UTF-8", order_at) !=
+          std::string::npos);
+    // The gateway caveat on the lower-bound count.
+    CHECK(desc.find("counts once queued for forwarding, which can still fail") != std::string::npos);
+}
+
+// The command twin's 500 carries the same typed fields as the instruction twin's (docs-writer p4-1):
+// the sent count is a lower bound recorded as the targeted count only when the write succeeds.
+TEST_CASE("openapi_spec_json(): POST /commands documents the dispatch_exception fields and the "
+          "lower-bound, write-dependent targeted count",
+          "[openapi][command_v1]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/commands"));
+    const auto& rsp = spec["paths"]["/commands"]["post"]["responses"];
+    REQUIRE(rsp.contains("500"));
+    const std::string d500 = rsp["500"].value("description", "");
+    CHECK(d500.find("dispatch_exception") != std::string::npos);
+    CHECK(d500.find("error.execution_id") != std::string::npos);
+    CHECK(d500.find("error.agents_sent") != std::string::npos);
+    CHECK(d500.find("lower bound") != std::string::npos);
+    CHECK(d500.find("only when the write succeeds") != std::string::npos);
+    CHECK(d500.find("cancel_execution") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
           "[openapi][hardware][sync_fanout]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
@@ -1779,7 +1844,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"22536dd3060e5782\"";
+    static const std::string kOperationIdChecksum = "\"5d12cce46b2c8920\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -1918,6 +1983,31 @@ TEST_CASE("openapi documents: x-yuzu-guide is on every tag in the guides form on
         REQUIRE(tag.contains("x-yuzu-guide"));
         CHECK(tag["x-yuzu-guide"].is_object());
         CHECK_FALSE(tag["x-yuzu-guide"].empty());
+    }
+}
+
+TEST_CASE("openapi documents: every tag an operation uses is declared in the tag list",
+          "[openapi][structure][guides]") {
+    // An undeclared tag renders in a viewer with no description and, in the guides form, no
+    // guide. The Commands tag was used for a release's worth of review before anyone noticed.
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::set<std::string> declared;
+        for (const auto& tag : spec["tags"])
+            declared.insert(tag.at("name").get<std::string>());
+        std::set<std::string> used;
+        for (const auto& o : all_operations(spec)) {
+            for (const auto& t : o.op.value("tags", json::array()))
+                used.insert(t.get<std::string>());
+        }
+        std::set<std::string> undeclared;
+        for (const auto& t : used) {
+            if (!declared.contains(t))
+                undeclared.insert(t);
+        }
+        CHECK(undeclared == std::set<std::string>{});
+        CHECK(declared.size() == 48);
     }
 }
 
@@ -2263,4 +2353,68 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo 
 
     const std::string ok = get_op["responses"]["200"].value("description", "");
     CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
+}
+
+TEST_CASE("openapi documents: the response status set of the ten hand-checked operations matches "
+          "what their handlers return",
+          "[openapi][structure][responses]") {
+    // Pins WHICH statuses the document declares per route, not their wording. Each expected set
+    // below was written from the handler (symbol and file named per row), not from the document.
+    //
+    struct Row {
+        const char* path;
+        const char* method;
+        std::set<std::string> statuses;
+    };
+    const std::vector<Row> rows = {
+        // register_routes(): sink.Post("/api/v1/quarantine"): 201; 400 (body, whitelist, dispatch
+        // check cannot classify); 401 (auth_fn); 403 (scoped gate, dispatch check); 500 (gate or
+        // authorizer not wired); 503 (store not open, store fault, attempt audit unavailable).
+        {"/quarantine", "post", {"201", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete(R"(/api/v1/quarantine/(.+))"): 200; the same refusals.
+        {"/quarantine/{agent_id}", "delete", {"200", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete(R"(/api/v1/engine-principals/([^/]+))"): 200; 401 and
+        // 403 (step-up, perm_fn, engine session); 404 (no such principal); 503 (six causes). It
+        // has no input-validation 400.
+        {"/engine-principals/{id}", "delete", {"200", "401", "403", "404", "503"}},
+        // register_routes(): the .../credentials/rotate handler: 200; 400 (body, overlap_secs,
+        // engine_store_error_status ClientValidation); 401; 403; 409 (conflict class); 503.
+        {"/engine-principals/{id}/credentials/rotate", "post", {"200", "400", "401", "403", "409", "503"}},
+        // register_routes(): the .../credentials/confirm handler: 200; 400 (token_id or secret
+        // missing, validation class); 401; 403 (also a wrong secret); 409; 503.
+        {"/engine-principals/{id}/credentials/confirm", "post", {"200", "400", "401", "403", "409", "503"}},
+        // AuthRoutes elevate handler (auth_routes.cpp, sink.Post("/api/v1/elevate")): 200; 400
+        // (justification, duration); 401 (session, dead window, step-up); 403 (eligibility,
+        // identity source, amr, MFA); 500 (grant audit unrecordable); 503 (auth store).
+        {"/elevate", "post", {"200", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete("/api/v1/sessions"): 200; 400 (username missing or
+        // malformed); 401 (step-up); 403 (perm_fn); 500 (empty session username); 503
+        // (session_revoke_fn not wired).
+        {"/sessions", "delete", {"200", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete("/api/v1/sessions/me"): 200; 403 (MCP-tier or
+        // service-scoped token); 401 (auth_fn, unauthenticated); 500 (empty session username);
+        // 503 (session_revoke_fn not wired).
+        {"/sessions/me", "delete", {"200", "401", "403", "500", "503"}},
+        // file_retrieval_routes.cpp register_mint(): 201; 400 (invalid JSON body, ttl_secs,
+        // expected_sha256, and a MintError that is not kUnavailable); 401 (auth_fn); 403
+        // (require_permission UploadGrant:Write); 503 (store or entropy).
+        {"/upload-grants", "post", {"201", "400", "401", "403", "503"}},
+        // SettingsRoutes sink.Get("/api/v2/agent/plugin-policy") (settings_routes.cpp): 200; 401
+        // and 403 (perm_fn_ PluginSigning:Read); 500 (bundle on disk unreadable); 503 (audit
+        // unavailable, runtime config store unavailable, bundle changed while serving).
+        {"/v2/agent/plugin-policy", "get", {"200", "401", "403", "500", "503"}},
+    };
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& row : rows) {
+            INFO(row.method << " " << row.path);
+            REQUIRE(spec["paths"].contains(row.path));
+            REQUIRE(spec["paths"][row.path].contains(row.method));
+            std::set<std::string> declared;
+            for (const auto& [code, response] : spec["paths"][row.path][row.method]["responses"].items())
+                declared.insert(code);
+            CHECK(declared == row.statuses);
+        }
+    }
 }
