@@ -114,6 +114,13 @@
 /// elevation) and `exec_visible` (group scope) are the snapshot taken when the call was taken,
 /// so an elevation that expires or a group narrowing during the run is bounded only by the
 /// 60 s deadline (D2b, a follow-up). `kValidStale` is accepted for the whole run (at most 60 s).
+/// TOKEN CACHE LAG. For an API-token caller the check is served from the token store's
+/// per-process cache (`ApiTokenStore::kTokenCacheTtl`, 60 s from when the entry was made, not
+/// slid on a hit). A revoke handled by THIS replica erases its entry, so the next check sees
+/// `kRevoked`. A revoke handled by ANOTHER replica reaches this one only when its entry ages
+/// out (nothing signals across replicas), up to 60 s, which is the whole run budget: on a
+/// multi-replica deployment `kRevoked` may stop none of the remaining steps. See the note in
+/// `AuthRoutes::revalidate_stream`; the held-open MCP streams carry the same lag.
 ///
 /// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
 /// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches

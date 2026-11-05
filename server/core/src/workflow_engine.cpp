@@ -1027,17 +1027,17 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 }
             }
 
-            // Update current step — `WHERE status = 'running'` guards this write the same way
+            // Update current step - `WHERE status = 'running'` guards this write the same way
             // finalize's is guarded (governance finding, security-guardian + docs-writer,
             // independently): without it, a concurrent cancel_execution() landing between the
             // cancellation check above and this write could flip status back to 'running', making
             // the loop (and finalize afterwards) forget the cancellation ever happened. `RETURNING id`
             // makes the CAS observable (governance finding, security-guardian): a CONFIRMED zero-row
-            // result means the guard didn't match — status was no longer 'running', i.e. a cancel landed
-            // in the window between the check above and this write — so the loop stops immediately
+            // result means the guard didn't match - status was no longer 'running', i.e. a cancel landed
+            // in the window between the check above and this write - so the loop stops immediately
             // instead of dispatching one more step past the cancel. A lease timeout or query failure is
             // NOT treated as a mismatch (that would break the ADR-0064 degrade-and-continue posture for
-            // an ordinary transient failure) — only a definite, executed CAS that matched zero rows
+            // an ordinary transient failure) - only a definite, executed CAS that matched zero rows
             // stops the loop. Currently unreachable in production (cancel_execution has no caller),
             // closed as the same defense-in-depth as the finalize fix.
             bool cas_ran = false;
@@ -1075,7 +1075,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 } catch (...) {}
 
                 if (!condition_fn(step.condition, fields)) {
-                    // Condition not met — skip step
+                    // Condition not met - skip step
                     with_write_lease([&](PGconn* c) {
                         wf_update_step_result(
                             c, exec_id, step.index, "skipped",
@@ -1106,7 +1106,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 dispatch_params.push_back("{}");
             }
 
-            // Dispatch with retry logic — no lease/conn held across a dispatch_fn call or
+            // Dispatch with retry logic - no lease/conn held across a dispatch_fn call or
             // sleep_for (ADR-0064 "Lease discipline").
             bool step_succeeded = false;
             std::string step_result;
@@ -1304,7 +1304,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                     execution_failed = true;
                     break;
                 } else {
-                    // "abort" — default
+                    // "abort" - default
                     spdlog::error("WorkflowEngine: step {} failed, aborting workflow", step.index);
                     with_write_lease([&](PGconn* c) {
                         for (const auto& remaining : workflow.steps) {

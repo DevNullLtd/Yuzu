@@ -21003,7 +21003,7 @@ private:
         // the classify+authorize half calls classify_and_authorize_dispatch
         // via the SAME has_permission binder (dispatch_has_permission
         // above); the kill-switch half calls the SAME kill_switch_denial
-        // (agent_registry.hpp) finalize_classified_command itself calls —
+        // (agent_registry.hpp) finalize_classified_command itself calls -
         // Gate 6 governance fix: an earlier round of this PR re-expressed
         // that boolean inline instead of sharing code with
         // finalize_classified_command, reintroducing the exact

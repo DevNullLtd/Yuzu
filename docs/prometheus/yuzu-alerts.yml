@@ -3081,7 +3081,7 @@ groups:
             Workflow runs on {{ $labels.instance }} have been refused with reason
             global_stream_cap, a refusal rate above zero over the last 5 minutes, for 10
             minutes running: the shared held-open budget is full, so a caller got a 429
-            (MCP -32012) with Retry-After 5 and nothing was read, sent or audited. A
+            (MCP -32012) with Retry-After 5, no workflow or instruction was read, and nothing was sent or audited. A
             single refusal does not fire it (the 5 minute rate window cannot stay true for
             10 minutes on one event); a sustained one means the saturation
             YuzuHeldOpenUtilisationHigh warns about has arrived. Check

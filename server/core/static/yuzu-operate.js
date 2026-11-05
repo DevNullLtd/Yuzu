@@ -1064,6 +1064,17 @@
       return r.message || fallback;
     }
 
+    // A refused run (429: this account already has runs in progress or the server's held-open
+    // budget is full; 503: the server is shutting down or a store is unavailable). Say when to
+    // retry from the Retry-After header (seconds) so the operator is not left with a bare status.
+    function runRefusalText(status, message, retryAfter) {
+      var secs = parseInt(retryAfter, 10);
+      var wait = secs > 0 && secs <= 3600 ? ' Try again in ' + secs + ' seconds.' : ' Try again shortly.';
+      var why = message || (status === 429 ? 'Too many workflow runs are in progress.'
+                                           : 'The server is not starting new workflow runs.');
+      return why + wait;
+    }
+
     function newWorkflow() {
       if (!window.YuzuDialog) return;
       YuzuDialog.form({
@@ -1352,6 +1363,9 @@
               if (r.status === 401) return 'Your session has expired. Sign in again.';
               var msg = data && data.error && typeof data.error.message === 'string' ? data.error.message : '';
               if (r.status === 403) return msg || 'You do not have permission to run this workflow.';
+              if (r.status === 429 || r.status === 503) {
+                return runRefusalText(r.status, msg, r.headers.get('Retry-After'));
+              }
               return msg || 'Could not start the run (HTTP ' + r.status + ').';
             });
           }, function () {
@@ -1363,7 +1377,7 @@
       }).then(function (v) {
         if (v === null) return;
         if (outcome === 'timeout') {
-          showToast('The run may keep running on the server. Check Recent runs before running it again.', 'warning');
+          showToast('The run may keep running on the server. Check Recent runs before running it again; starting another run may be refused for up to a minute.', 'warning');
           watchRun(id, baseline);
           return;
         }

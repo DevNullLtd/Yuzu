@@ -1264,6 +1264,75 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      shared held-open budget (`StreamBudget`, at most 2 per principal) and has a 60
      second deadline. The 2026-10-30 entry is left as written; this entry supersedes
      its residual sentence only.
+     - **Known residuals of this change (recorded by the change author; ADR-owner
+       acceptance pending).** Each was checked against the code at the commit that
+       wrote this paragraph. Only the token-cache lag in residual 3 has a tracking
+       reference (`AuthRoutes::revalidate_stream` cites #2447); no issue is filed
+       for the rest yet (file each and update its line with the number). The date
+       is the latest the residual is re-read, not a promise it is fixed by then.
+       1. *Write-ahead command id (revisit by 2026-12-15).* A step's command id is
+          stored after the send, by a write that can be dropped, so a step recorded
+          `pending` or `skipped` may still have been sent. The docs tell the reader
+          to check the audit and response stores. Closing it means recording the
+          intended command id before the send.
+       2. *Orphan runs (revisit by 2026-12-15).* Nothing sweeps a run left
+          `running` (a crashed process, a final write that failed twice, an
+          unconfirmed claim COMMIT); its idempotency key stays bound. The runbook is
+          `docs/user-manual/server-admin.md` "A workflow run left `running`". A sweep
+          must close the row and decide the key's fate on purpose.
+       3. *Caller authority is a snapshot (revisit by 2026-12-15).* The run
+          re-checks that the credential is live before each step but does not
+          re-derive the `DispatchCaller` (D2b): an administrator elevation that
+          expires, or a device-group narrowing, during the run is bounded only by the
+          60 s deadline. The liveness check for an API-token caller is answered from
+          a per-process cache of up to 60 s with no cross-replica signal, so a
+          revoke handled by another replica may stop none of the remaining steps.
+       4. *No per-surface ceiling (revisit by 2026-12-15).* The workflow run leases
+          from the one shared budget, 2 per principal, so 64 principals can hold all
+          128 default slots for up to 60 s and every new stream or run is refused
+          meanwhile. The caps and the `yuzu_server_workflow_runs_in_flight` gauge are
+          per server process. ADR-0034 Decision 3 prefers utilisation to per-surface
+          counters; the gauge is a diagnostic share of that utilisation, and
+          `YuzuHeldOpenUtilisationHigh` alerts on the total.
+       5. *Zero-reach is final for the key (revisit by 2027-01-15).* A run that
+          reaches no device (for example every target is quarantined) answers with
+          no retry hint, and with a key the key is bound to that failed run, so
+          running again after the cause clears needs a new key (on MCP, a new
+          approval).
+       6. *`foreach` (revisit by 2027-01-15).* A step expands over the previous
+          step's result, which is the dispatch acknowledgement (command id, agents
+          reached) and not device output, so it sends one item today.
+       7. *Unkeyed calls (revisit by 2027-01-15).* The key is required only on MCP.
+          The REST route takes it as an optional header and the legacy route takes
+          none, so a lost response retried blind sends every step again; the cap and
+          the 60 s bound still apply.
+       8. *The legacy route has fewer controls (revisit by 2027-01-15).* No approval
+          ticket or step-effect binding, no per-step credential re-check, no refusal
+          of a workflow whose retry sleeps exceed 60 s, no `requested` audit row, and
+          a run stopped at the deadline is recorded `result=success` with the stop in
+          the detail only. It answers `202` `status: running` after such a stop.
+       9. *Audit coverage (revisit by 2027-01-15).* A cap or drain refusal writes no
+          audit row (the counter is its record). Each terminal idempotent replay
+          writes one `success` row and replays are not capped, because they take no
+          slot.
+       10. *Stored attempt number (revisit by 2027-01-15).* The engine writes a
+           step's `attempt` after a failed attempt only, so a step retried to
+           success shows its last failed attempt's number.
+       11. *Shutdown (revisit by 2026-12-15).* The drain waits at most 30 s for
+           runs; a run still going then is stopped between attempts and closed
+           `failed` (the caller is told `interrupted`), and a send already in flight
+           is not interrupted. A run whose final write cannot be made before the
+           process exits stays `running` (residual 2).
+       12. *Unconfirmed claim COMMIT (revisit by 2026-12-15).* When a claim COMMIT
+           fails and Postgres cannot say whether it committed, the call fails but a
+           `running` row for a run that was never dispatched may exist, with its key
+           bound (and, on MCP, its ticket spent), until residual 2's runbook or a
+           sweep clears it.
+       13. *Run records are kept without limit (revisit by 2027-01-15).* No prune
+           exists for `workflow_executions` (see `docs/clock-guarded-retention.md`),
+           so the account name, the key and the agent list (about 1.3 MB per run at
+           10,000 agents) stay for the life of the database, and a deleted-and-
+           recreated username inherits the old account's keys.
 
 ## Interim rules (until the named follow-ups ship)
 

@@ -487,6 +487,14 @@ TEST_CASE("operate pages: the Workflows action controller keeps its guards",
     // The copy never claims the run was stopped or that it finished when it may still run.
     CHECK(has(js, "The run may keep running on the server."));
     CHECK_FALSE(has(js, "keeps running on the server"));
+    // A refused run (429 cap, 503 draining or store) says when to retry from Retry-After instead
+    // of a bare status, and a 429/503 is never folded into the generic "Could not start" text.
+    CHECK(has(js, "function runRefusalText(status, message, retryAfter) {"));
+    CHECK(has(js, "if (r.status === 429 || r.status === 503) {"));
+    CHECK(has(js, "return runRefusalText(r.status, msg, r.headers.get('Retry-After'));"));
+    CHECK(has(js, "' Try again in ' + secs + ' seconds.' : ' Try again shortly.'"));
+    CHECK(has(js, "starting another run may be refused for up to a minute."));
+    CHECK(js.find("r.status === 429 || r.status === 503") < js.find("'Could not start the run (HTTP '"));
     // A key on the row's own button is the button's, not a row selection.
     CHECK(has(js, "if (e.target && e.target.tagName === 'BUTTON') return;"));
     // New workflow posts the YAML as JSON; delete is the id-only DELETE; neither is retried.

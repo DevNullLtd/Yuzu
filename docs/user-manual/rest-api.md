@@ -6579,8 +6579,11 @@ unknown-instruction `400` run only when the approval manager and the instruction
 wired and open; if either is not, this legacy route skips them and goes on to dispatch. The v1 twin
 refuses with `503` instead. The route replies `202` after the steps have been dispatched.
 A step refused at send time by the targeting gate is recorded failed at once, with no retry and no
-retry sleep. If a step throws, the engine closes the execution `failed` (never left `running`),
-marks its remaining steps `skipped`, and the request fails with the server's generic `500`.
+retry sleep. If a step throws, the engine closes the execution `failed`, marks its remaining steps
+`skipped`, and the request fails with the server's generic `500` (an empty body). The close is one
+write, tried once more with a longer lease when the first fails; if both fail the row stays
+`running` (counted on `yuzu_server_workflow_finalize_failed_total`; see "A workflow run left
+`running`" in [server-admin.md](server-admin.md#a-workflow-run-left-running)).
 
 **Admission and run bound (#2146).** This route holds one HTTP worker for the whole run, so it
 takes the same held-open slot as [`POST /api/v1/workflows/{id}/execute`](#post-apiv1workflowsidexecute)
@@ -6589,11 +6592,11 @@ slot held by a run on any of the three counts against all of them. It is taken a
 permission check and the body check and before the workflow or any instruction is read. A
 principal that already has 2 runs in progress, or a full server-wide held-open budget, is refused
 `429`, and a draining server `503`, each with `Retry-After: 5`, `retry_after_ms: 5000` in the
-error body and nothing read, sent or audited (the refusal is counted on
+error body, no workflow or instruction read and nothing sent or audited (the refusal is counted on
 `yuzu_server_workflow_run_refused_total{reason}`). The slot is released when the response is
 written, whatever the outcome. The run is bounded to 60 seconds from the moment the request is
 taken: no dispatch attempt starts after that, a retry delay is cut to the time left, the remaining
-steps are skipped and the execution is closed `failed`. The answer is unchanged (`202`, `status: running`) and the `workflow.execute` audit detail gains ` (run stopped: deadline_exceeded)`, so
+steps are skipped and the execution is closed `failed`. The answer is unchanged (`202`, `status: running`), so a stopped run reads as a started one; the `workflow.execute` audit detail gains ` (run stopped: deadline_exceeded)`, so
 read the run with `GET /api/workflow-executions/{id}`. Unlike the v1 twin, this route does not
 refuse up front a workflow whose retry sleeps could exceed 60 seconds, and does not re-check the
 caller's credential between steps.
@@ -6723,15 +6726,15 @@ nothing is sent.
 | `404` | `workflow_not_found` | Unknown or soft-deleted workflow. |
 | `404` | `destructive_no_visible_target` | A Destructive or Forensics step whose named agents are all outside the caller's view. |
 | `422` | `idempotency_key_conflict` | The `Idempotency-Key` is already bound to a DIFFERENT request (another workflow, or another set of agent ids). Terminal: nothing was sent, `error.execution_id` names the run the key is bound to. Use a new key for a different request. |
-| `429` | `per_principal_stream_cap`, `global_stream_cap` | Admission: the caller already has 2 workflow runs in progress, or the server's shared held-open budget (`--max-sse-streams`) is full. `Retry-After: 5` and `retry_after_ms: 5000`. Nothing was read, sent or audited. Retrying is safe. |
-| `500` | `no_principal` | The session has no principal. |
+| `429` | `per_principal_stream_cap`, `global_stream_cap` | Admission: the caller already has 2 workflow runs in progress (counted per principal and per server process), or the server's shared held-open budget (`--max-sse-streams`) is full. `Retry-After: 5` and `retry_after_ms: 5000`. No workflow or instruction was read, nothing was sent or audited; a call that carries an `Idempotency-Key` has had the key looked up first (a read), and a repeat of a key already bound to a run is answered with the replay instead of this refusal. Retrying is safe. |
+| `500` | `no_principal`, `idempotency_requires_principal` | The session has no principal (the second reason: a call that carries a key). Nothing was sent. |
+| `500` | `request_fingerprint_unavailable` | A keyed call whose request fingerprint (a SHA-256) could not be computed. Audited (`failure`); nothing was sent. |
 | `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
-| `503` | `draining` | Admission: the server is shutting down and starts no new run. `Retry-After: 5` and `retry_after_ms: 5000`; nothing was read, sent or audited. Retry against another replica or after the restart. |
+| `503` | `draining` | Admission: the server is shutting down and starts no new run. `Retry-After: 5` and `retry_after_ms: 5000`; no workflow or instruction was read and nothing was sent or audited (a keyed call has had its key looked up). Retry against another replica or after the restart. |
 | `503` | `audit_unavailable` | The server has no audit sink wired (a configuration defect, `retry_after_ms: null`, `Sec-Audit-Failed: true`), or the `requested` row could not be saved. Nothing was read, leased, run or sent. |
 | `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
-| `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). Also the answer to an unexpected fault BEFORE the `requested` row (the preflight half): nothing was sent, so retrying is safe. A failed idempotency lookup is this too: it is never treated as "no run is bound to the key", so nothing is written and nothing is sent. |
-| `500` | `request_fingerprint_unavailable` | A keyed call whose request fingerprint (a SHA-256) could not be computed. Audited (`failure`); nothing was sent. |
-| `503` | `audit_unavailable` | The `requested` row could not be saved (`Sec-Audit-Failed: true`); nothing was sent. |
+| `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). A failed idempotency lookup is this too: it is never treated as "no run is bound to the key", so nothing is written and nothing is sent. |
+| `503` | `internal_error` | The idempotency pre-check or the preflight (before the `requested` row) THREW an exception (`retry_after_ms: 5000`, message `workflow execution failed`; the detail is in the server log). Nothing was sent and no run was started, so retrying is safe, with the same key if one was sent: the key is not bound before the claim. |
 | `503` | a zero-reach cause | The run started and no step reached any agent (below). |
 
 **Events.** As the legacy `POST /api/workflows/{id}/execute` does, a call whose run the engine admitted publishes the platform event `workflow.executed` once, after the closing audit row and whatever the run's outcome (`completed`, `partial`, `aborted`, `interrupted`, or a run that reached no agent), with no attributes or payload (see [analytics-events.md](../analytics-events.md)). A refusal, an idempotent replay (a repeat of a key, or a call that lost the engine's claim), an engine refusal and a run that threw publish nothing, and a failed publish never changes the answer; it is counted on `yuzu_server_event_emit_failed_total{event_type="workflow.executed"}` when the hook itself throws.
@@ -6760,7 +6763,9 @@ tell "never started" from "started", and a blind re-send dispatches every step t
 `Idempotency-Key` header: a fresh unique string per intended run, 8 to 128 characters from
 `A-Z a-z 0-9 . _ : -`, sent exactly once. The key belongs to the calling principal (another principal's
 identical key is a different key) and stays bound to its run for the life of the run record; nothing
-prunes it. A repeat of the SAME key with the SAME request (the workflow id and the SET of agent ids:
+prunes it. The run record also keeps your account name, the call's correlation id and the full agent list, so
+what is stored about whom is listed under "Workflow run records are not pruned" in
+[server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146). A repeat of the SAME key with the SAME request (the workflow id and the SET of agent ids:
 order and repeats do not matter; the stored step definitions are not part of it, so an instruction
 edited since does not turn a retry into a conflict) sends nothing and answers `202` with the thin body
 of the run the key is bound to. The replay says the class the FIRST answer said: it is judged from
@@ -6776,7 +6781,7 @@ two outcomes cannot disagree: the same rule classifies both.
 | `aborted` | A step was refused at send time (its definition changed after approval or the preflight), or the run was stopped by its 60 second deadline or by the credential check. The replay does not say which of the stop causes (`data.reason` is absent). Final. | `retryable: false` |
 | `interrupted` | The stopping server ended the run. Final. | `retryable: false` |
 | `running` | The run is still in progress. **Poll `GET /api/v1/workflow-executions/{id}`; never re-send.** | `retry_after_ms: 2000`, `Retry-After: 2` |
-| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running. Past about 2 minutes, treat a `running` answer the same way. | `retryable: false`, `remediation` |
+| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running. Treat a `running` answer older than 180 seconds the same way. | `retryable: false`, `remediation` |
 
 What the stored rows can and cannot say: a run the engine recorded `failed` or `cancelled` whose rows cannot be read back replays `failed`. A step-result write the engine dropped under a database brownout costs precision (a run may replay `partial` or `failed` where the first answer said `interrupted` or `aborted`), never correctness: the replay is never `completed` for a run it cannot prove succeeded. A `foreach` step is judged by its last attempt (every item of that attempt must have reached an agent); the engine sends one item today.
 
@@ -6790,8 +6795,8 @@ original claimed the key) loses the claim inside the database, closes its own `r
 unchanged, and must never be re-sent to retry.
 
 **Run budget (60 seconds) and admission.** A run is synchronous, so it holds one of the server's
-HTTP worker threads for its whole length. Three things bound that. (1) *Admission:* before anything
-is read or any row is written, the run takes a slot from the same held-open budget the streaming
+HTTP worker threads for its whole length. Three things bound that. (1) *Admission:* before the
+workflow is read or any row is written (a keyed call's key is looked up first), the run takes a slot from the same held-open budget the streaming
 endpoints share (`--max-sse-streams`; `yuzu_http_held_open_responses`), at most 2 per principal. A
 principal at its limit, a full server budget and a draining server are refused up front (`429`
 `per_principal_stream_cap` / `global_stream_cap`, `503` `draining`) with `Retry-After: 5`; the
@@ -6808,6 +6813,13 @@ step in progress is recorded `failed`, the remaining steps are `skipped` (`run s
 false` (or, if no step reached any agent, the `503` `deadline_exceeded`, also not retryable). A send
 already in flight is not interrupted. The closing audit row is `failure` with
 `run_outcome=aborted reason=deadline_exceeded`.
+
+**Limits are per server process.** The 2-runs-per-principal cap, the held-open budget behind it and
+the gauge `yuzu_server_workflow_runs_in_flight` are all counted inside one server process. With N
+replicas a principal can have up to 2N runs in progress, and each replica's `429` says nothing about
+the others; to see the fleet-wide number, sum the gauge across replicas
+(`sum(yuzu_server_workflow_runs_in_flight)`). A repeat of an `Idempotency-Key` is the exception: it
+is looked up in the shared database, so any replica answers it.
 
 **Shutdown.** A server that is *draining* (it has been told to stop and is holding its listener open
 for in-flight work) lets a run in flight finish its dispatching: a retry the run had not yet made is
@@ -6845,6 +6857,17 @@ elevation that expires during the run, and a device-group narrowing, are not re-
 elevation flag and visible device set are those taken when the call was accepted, so they are
 bounded only by the 60 second deadline.
 
+**A revoked API token can outlive a revoke on another replica, for up to 60 seconds.** For a caller
+authenticated with an API token the liveness check is answered from the token store's per-process
+cache, whose entries live 60 seconds from when they were made and are not renewed by a hit. A token
+revoked through the replica that is running the call is dropped from that cache at once, so the next
+check stops the run. A token revoked through a DIFFERENT replica reaches this one only when its cache
+entry ages out, which is up to 60 seconds, the whole run budget: on a deployment with more than one
+server replica the check may stop none of the remaining steps. The 60 second deadline, the live RBAC
+check at each send and the revoke itself still apply. The held-open MCP streams carry the same lag
+(see the MCP manual). Cookie sessions and engine principals are decided differently and are not
+covered by this paragraph.
+
 **Dispatch is synchronous, device work is not.** The call returns after every step's command has
 been sent, including step retries and delays (within the run budget above), so it can be slow. Each step is sent only to the
 agents the caller can see (the same confinement as every other dispatch); a named agent outside the
@@ -6855,7 +6878,9 @@ failed is retried only when its failure is transient (`retry_count` times, with 
 between attempts); a step refused at send time (its definition changed, or it no longer passes the
 caller's approval or targeting checks) is a permanent failure, recorded at once with no retry and no
 sleep, and the step's `on_failure` policy applies. A fault that throws out of the run closes the
-execution `failed` (never left `running`) and answers `500 dispatch_exception` as above.
+execution `failed` and answers `500 dispatch_exception` as above. The close is a single write
+retried once; if both tries fail the row stays `running` (see "A workflow run left `running`" in
+[server-admin.md](server-admin.md#a-workflow-run-left-running)).
 
 **Success `202`** (a repeat of an `Idempotency-Key` answers with the thin body under **Idempotency**
 instead): `data.execution_id`, `data.workflow_id`, `data.status`, `data.late_denied` and
