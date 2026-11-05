@@ -43,9 +43,10 @@ could not.
   after the runs, so the circuit breaker did not open either on this quiet fleet [measured: open and half_open
   read 0 on all three gateways, read live after all runs; the counters die with `down`]. The victim's heartbeat
   lane failed throughout (213-224 `BatchHeartbeat failed ... timeout` lines in its log per fault run, about 0.45
-  per second [measured]) and does not feed the breaker (`yuzu_gw_heartbeat_buffer.erl` [code]). The one shipped
+  per second [measured]) and does not feed the breaker (`yuzu_gw_heartbeat_buffer.erl` [code]). A shipped
   rule that would see it is `YuzuGatewayUpstreamErrors` (`deploy/grafana/yuzu-alerts.yml:87-88`,
-  `rate(yuzu_gw_upstream_rpc_errors_total[5m]) > 0.1` for 5 m) [code, not run against these runs].
+  `rate(yuzu_gw_upstream_rpc_errors_total[5m]) > 0.1` for 5 m), which would fire roughly 425-455 s after the
+  fault [inferred]; neither shipped alert file was loaded by this rig, so nothing fired [code, not run].
 - **Probe.** `os_info.os_name` (read-only) to each sampled agent, through BOTH replicas, on both REST surfaces
   (`POST /api/v1/commands` and the legacy `POST /api/command`), plus one scope-arm probe per replica
   (`hostname == '<name>'`, v1 only). Rounds: a control that immediately precedes the fault (its sends are 0.14-0.19 s
@@ -87,16 +88,23 @@ each run's `probes.jsonl`, so a re-analysis can be checked against them.
 
 **Which code took the data.** The four data runs were taken with the runner as committed at `4bfa0565a`
 (`script_sha` 9b0c86c8099b in each run's `meta.txt`), before any governance fix to the runner or client; their
-`meta.txt` records no client or overlay sha. The runner, client and overlay were then changed in three rounds of
-review fixes. After the last of them one 100 s, 6-agent no-fault smoke run (`run-NOFAULT-211915`) was taken with
-the files exactly as committed (`script_sha` ca221d6e97af, `client_sha` bca5fa548225, `overlay_sha`
-412931b7c0da, equal to the blobs at that commit); it has a `COMPLETE` marker and a 54-line `registrations.txt`
-and is valid by the rule below. **No full fault run was taken on the hardened rig.** The hardening was checked by
-that smoke run, by refusals of bad arguments and of a concurrent command (including one with another state
-directory), by an offline contract test of the client (`tests/test_ha_two_replica_probe_contract.py`: synthetic
-runs with no rows, no control rows, a missing round, all HTTP 500, no window, duplicate rows, a missing capture
-or an outbound packet in a fault window are each not valid), and by an export that refuses to replace the
-committed CSVs when nothing matches.
+`meta.txt` records no client or overlay sha. The runner, client and overlay were then changed in four rounds of
+review fixes. Two earlier 100 s no-fault smoke runs used earlier files and are not evidence for the committed ones
+(`run-NOFAULT-180748` the round-1 files, `run-NOFAULT-211915` the round-3 files). The last one, `run-NOFAULT-220936`
+(100 s, 6 sampled agents, 60-agent fleet), was taken with the files exactly as committed (`script_sha`
+6d70c5847b50, `client_sha` 147d4e83502c, `overlay_sha` 412931b7c0da, each equal to `git hash-object` of the
+committed file); it carries a `COMPLETE` marker that holds the SHA-256 of its `probes.jsonl`
+(`adcfc06d2b17ed57d71b1649e0ef1a0496ffa77c674481e22cd37194f87e20ea`, which matches), a 54-line `registrations.txt`,
+and exports `valid=yes`. Because it was a no-fault run with a 100 s window, the fault-capture check and the
+recovery rounds of the committed code have **not driven a live fault run: no full fault run was taken on the
+hardened rig**. The hardening was checked by that smoke run, by refusals of bad arguments and of a concurrent
+command (including one with another state directory or `TMPDIR`), by an offline contract test of the client
+(`tests/test_ha_two_replica_probe_contract.py`, 22 cases: synthetic runs with no rows, no control rows, a missing
+round, all HTTP 500, no window, duplicate rows, a missing, header-only or outbound-carrying capture, a changed
+`probes.jsonl` after `COMPLETE`, or an attestation for a run that records a client sha are each not valid), and by
+an export that refuses to replace the committed CSVs when nothing is exported. The offline test was written
+against the defects governance found; nine mutants of the client were not killed by an earlier, smaller version
+of it and are not all covered.
 
 **What the committed tables are.** The current client re-derives them from the raw `probes.jsonl`: `export --runs`
 of the four runs with `--legacy-unmarked` reproduces both committed CSVs byte for byte. Against the first CSVs
@@ -107,6 +115,12 @@ runs predate the `COMPLETE` marker; their completeness is attested by the author
 existing and no failure line in the run logs. The first-registration lines behind finding 2 are in
 `docs/ha-spikes/ws13-6/stale-cohort-registrations.txt`, a hand-selected subset of container logs that the rig's
 `down` removes (its header says what is missing).
+
+**Raw-store disclosure.** Reviewers re-ran `analyse` on some run directories in the raw store, which regenerated
+those runs' `probes.csv` and `summary.md` (about 21:28-21:45 UTC on 2026-11-05); `probes.jsonl` was not touched and
+its SHA-256 still equals the value in `run-timeline.csv` for each of the four data runs. The circuit-transition
+counters were read live after the runs by two reviewers (0) and could not be re-read by two others, so they are
+unretained evidence.
 
 ## Predictions, written before any run, against what was measured
 
@@ -225,7 +239,7 @@ The safe-to-scale gate is not lifted and one server replica remains the only sup
 moves 13.6 inside the gate (every hand-stated copy of the gate: the delivery matrix, ADR-2002, the `/ha` skill,
 roadmap 14.2, and the operator manuals that describe this state as unmeasured) is a separate change owned by
 #7082; **until it lands those copies say 13.6 is outside the gate while this record reports the condition for
-moving it inside as met, and #7082 stays open for that edit.** This record is the first recorded outcome of
+moving it inside as met, and #7082 stays open for that edit.** The deferred non-blocking governance findings are in #7198, which has no owner until it is triaged. The one-replica loaded-fleet F3 run, which is also a #6920 trigger for 13.6, is #7051 and has not been done. This record is the first recorded outcome of
 the #7082 probe. The project lead's risk acceptance (`docs/ha-delivery-matrix.md:76`, ADR-2002 line 503) names
 that outcome as its review trigger and is due its review now. Its premise for slice 13.6, 'unmeasured', no
 longer holds on this rig; its quarantine clause is still unmeasured (Limits). The review is not made here.
@@ -240,12 +254,17 @@ from the commit under test with `Dockerfile.server`, `Dockerfile.gateway` and `D
 the `yuzu-postgres:local` image (`Dockerfile.postgres`), Docker Compose new enough for `!override` (the runs used
 5.1.4), `flock`, bash 5, and a host with nothing else on 10.77.12.0/22 (the runner refuses otherwise). The runner
 takes a lock at `/tmp/yuzu-ws13-7082-yuzu-ha-gw-2r.lock` (a fixed path, refused if it is a symlink), so two
-commands cannot run against one rig whatever their `TMPDIR` or state directory. The runs used `up --agents 20` and
+commands on one host cannot run against one rig whatever their `TMPDIR` or state directory. The lock is a file in
+the host's `/tmp`: two commands that see different `/tmp` namespaces (a sandbox, `bwrap --tmpfs /tmp`, a container)
+do not exclude each other. The runs used `up --agents 20` and
 then `scale 60`, `scenario NOFAULT --window 480 --sample 10` and `scenario F3-2r --victim gateway-N --sample 10
 --window 480 --recovery 300`; the `scenario` defaults are `--window 480 --sample 10 --recovery 600`. The
 summaries are produced by `python3 -I scripts/ha/ha-two-replica-probe-client.py export --state
 ~/.local/share/yuzu/ws13-7082/<salt> --out <dir> --runs <run,run> [--legacy-unmarked <run,run>]`, which refuses
-(and replaces nothing) when no run matches. An offline test of the client's rules is
+(and replaces nothing) when no run matches or nothing is exported. The four data runs are `run-F3-2r-162443`
+(victim gateway-1), `run-F3-2r-164225` (gateway-2), `run-F3-2r-170006` (gateway-3) and `run-NOFAULT-160202`; they
+predate the `COMPLETE` marker, so without `--legacy-unmarked <those four>` all four read `valid=no`, and the
+attestation is refused for any run whose `meta.txt` records a client sha. An offline test of the client's rules is
 `python3 -I tests/test_ha_two_replica_probe_contract.py` (not wired into CI).
 
 `probe-summary.csv` has one row per run, round, cohort (`clean`, `stale_other`, or `inconclusive` for an agent
@@ -266,6 +285,7 @@ finding-1 tally; it does not require the recovery rounds. `invalid_reason` says 
 A run killed with SIGKILL leaves its sampler, its fault rule and its capture container `spike-2r-cap-<pid>`
 behind, and the rig lock is held until every foreground child the runner had started exits (a schedule `sleep`, a
 probe, or the `docker wait` on the capture), so `restore`, `down` and `scale` are refused meanwhile. Recover in
-this order: `docker rm -f spike-2r-cap-*` (ends the `docker wait`), kill the sampler (`kill $(cat <run
+this order: `docker ps -aq --filter name=spike-2r-cap- | xargs -r docker rm -f` (ends the `docker wait`; docker does not expand a
+wildcard in `rm`), kill the sampler (`kill $(cat <run
 dir>/sampler.pid)`) and any surviving child, then `restore`. Such a run has no `COMPLETE` marker: do not export
 it. The overlay is a lab measurement rig and not a deployment pattern.
