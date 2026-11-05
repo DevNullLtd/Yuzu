@@ -28,6 +28,7 @@
 #include "dispatch_target_shape.hpp"
 #include "dispatch_zero_reach.hpp"
 #include "mcp_policy.hpp"
+#include "stream_budget.hpp"
 #include "test_route_sink.hpp"
 #include "test_workflow_api_double.hpp"
 #include "workflow_execute.hpp"
@@ -40,6 +41,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -47,6 +49,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -119,6 +122,17 @@ struct Fx {
     // `permanent` to decide whether to retry).
     std::vector<StepDispatchError> step_errors;
     int run_threw_count{0};
+    // (retry_count, retry_delay_seconds) of step i, as the stored workflow carries them; steps
+    // beyond the list keep the model defaults (0 retries).
+    std::vector<std::pair<int, int>> step_retries;
+    // What the run port was handed, and a hook called once the run is admitted (the lease-held
+    // assertions run there).
+    std::optional<std::chrono::steady_clock::time_point> seen_deadline;
+    bool seen_before_attempt{false};
+    std::function<void()> during_run;
+    // The stand-in engine asks `before_attempt` ahead of every step, as the real engine does ahead
+    // of every attempt, and stops the run (skipping the rest) when it says no.
+    bool engine_stopped{false};
 
     WorkflowExecuteRequest request(std::vector<std::string> ids = {"a1"}) {
         WorkflowExecuteRequest r;
@@ -147,6 +161,10 @@ struct Fx {
                 s.index = i++;
                 s.instruction_id = sid;
                 s.label = "step-" + sid;
+                if (static_cast<size_t>(s.index) < step_retries.size()) {
+                    s.retry_count = step_retries[static_cast<size_t>(s.index)].first;
+                    s.retry_delay_seconds = step_retries[static_cast<size_t>(s.index)].second;
+                }
                 w.steps.push_back(s);
             }
             return std::optional<Workflow>{w};
@@ -170,13 +188,21 @@ struct Fx {
                       ConditionEvalFn, const WorkflowRunControl& control)
                    -> std::expected<std::string, std::string> {
             engine_called = true;
+            seen_deadline = control.deadline;
+            seen_before_attempt = static_cast<bool>(control.before_attempt);
             if (!engine_error)
                 return engine_error;
             if (engine_throws_before_admit)
                 throw std::runtime_error("engine exploded before admission");
             if (control.on_admitted) // as the real engine, once admitted and before step 1
                 control.on_admitted(*engine_error);
+            if (during_run)
+                during_run();
             for (const auto& sid : step_ids) {
+                if (control.before_attempt && !control.before_attempt()) {
+                    engine_stopped = true;
+                    break;
+                }
                 const auto r = fn(sid, "[]", "{}");
                 if (!r)
                     step_errors.push_back(r.error());
@@ -1507,6 +1533,9 @@ struct Rest {
     bool saw_caller{false};
     std::shared_ptr<test::FnWorkflowApi> api;
     yuzu::MetricsRegistry metrics;
+    // The one held-open budget the route leases from, and the server's draining flag.
+    detail::StreamBudget budget{{.global_cap = 8}};
+    bool draining{false};
     yuzu::server::test::TestRouteSink sink;
 
     Rest() {
@@ -1559,7 +1588,13 @@ struct Rest {
         };
         d.caller_fn = [this](const httplib::Request&) { return caller; };
         d.metrics = &metrics;
+        d.stream_budget = &budget;
+        d.draining = [this] { return draining; };
         register_workflow_execute_v1_route(sink, std::move(d));
+    }
+
+    std::int64_t refused(const char* reason) {
+        return metrics.counter(kWorkflowRunRefusedMetric, {{"reason", reason}}).value();
     }
 };
 
@@ -1975,4 +2010,337 @@ TEST_CASE("MCP policy: Workflow:Execute is denied at the operator tier and needs
     // The read side is untouched.
     CHECK(tier_allows("readonly", "Workflow", "Read"));
     CHECK_FALSE(requires_approval("supervised", "Workflow", "Read"));
+}
+
+// ───────────── commit 6: admission, the held-open lease and the 60 s run budget (#2146 D1/D3) ─────────
+
+namespace {
+
+std::int64_t refused_count(yuzu::MetricsRegistry& m, const char* reason) {
+    return static_cast<std::int64_t>(
+        m.counter(kWorkflowRunRefusedMetric, {{"reason", reason}}).value());
+}
+
+} // namespace
+
+TEST_CASE("workflow run admission: a run leases kWorkflowRun, two per principal, counted in the one budget; "
+          "a draining server is refused first and takes no lease",
+          "[workflow][twin][cap]") {
+    detail::StreamBudget budget{{.global_cap = 3}};
+    yuzu::MetricsRegistry m;
+    const std::function<bool()> never = [] { return false; };
+
+    // The metric's closed reason set is the budget's own two tokens plus `draining`.
+    REQUIRE(kWorkflowRunRefusedReasons.size() == 3);
+    CHECK(kWorkflowRunRefusedReasons[0] == detail::StreamBudget::kRejectGlobal);
+    CHECK(kWorkflowRunRefusedReasons[1] == detail::StreamBudget::kRejectPerPrincipal);
+    CHECK(kWorkflowRunRefusedReasons[2] == "draining");
+
+    auto a1 = admit_workflow_run(&budget, never, "alice", &m);
+    auto a2 = admit_workflow_run(&budget, never, "alice", &m);
+    REQUIRE(a1.lease);
+    REQUIRE(a2.lease);
+    CHECK_FALSE(a1.refusal);
+    CHECK(budget.active_for_surface(detail::SseSurface::kWorkflowRun) == 2);
+
+    // The third run of the same principal: the per-principal cap, retryable, nothing counted wrongly.
+    auto a3 = admit_workflow_run(&budget, never, "alice", &m);
+    CHECK_FALSE(a3.lease);
+    REQUIRE(a3.refusal);
+    CHECK(a3.refusal->status == WorkflowExecuteStatus::kRunCapReached);
+    CHECK(a3.refusal->reason == "per_principal_stream_cap");
+    CHECK(a3.refusal->retryable);
+    CHECK(refused_count(m, "per_principal_stream_cap") == 1);
+    CHECK(refused_count(m, "global_stream_cap") == 0);
+
+    // Another principal takes the last global slot; the next one anywhere is refused on the GLOBAL cap.
+    auto b1 = admit_workflow_run(&budget, never, "bob", &m);
+    REQUIRE(b1.lease);
+    auto c1 = admit_workflow_run(&budget, never, "carol", &m);
+    REQUIRE(c1.refusal);
+    CHECK(c1.refusal->reason == "global_stream_cap");
+    CHECK(refused_count(m, "global_stream_cap") == 1);
+    // A stream on another surface is refused too: it is ONE budget.
+    CHECK_FALSE(budget.try_acquire(detail::SseSurface::kApiEvents, "dave", 16).lease);
+
+    // Dropping a lease frees its slot for the next run.
+    a1.lease.release();
+    CHECK(admit_workflow_run(&budget, never, "carol", &m).lease);
+
+    // Draining wins over a budget with room, takes no lease and counts `draining`.
+    detail::StreamBudget roomy{{.global_cap = 10}};
+    const std::function<bool()> always = [] { return true; };
+    auto d = admit_workflow_run(&roomy, always, "alice", &m);
+    CHECK_FALSE(d.lease);
+    REQUIRE(d.refusal);
+    CHECK(d.refusal->status == WorkflowExecuteStatus::kDraining);
+    CHECK(d.refusal->reason == "draining");
+    CHECK(d.refusal->retryable);
+    CHECK(roomy.active() == 0);
+    CHECK(refused_count(m, "draining") == 1);
+
+    // A null budget is the unmetered test seam; a null draining port is never draining.
+    auto u = admit_workflow_run(nullptr, {}, "alice", &m);
+    CHECK_FALSE(u.refusal);
+    CHECK_FALSE(u.lease);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: the run holds a kWorkflowRun lease for exactly the run, "
+          "released on success, on a thrown run and on a refusal after admission",
+          "[workflow][twin][rest][cap]") {
+    using detail::SseSurface;
+    SECTION("a successful run") {
+        Rest r;
+        std::size_t during = 99;
+        r.fx.during_run = [&] { during = r.budget.active_for_surface(SseSurface::kWorkflowRun); };
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(during == 1);
+        CHECK(r.budget.active() == 0);
+    }
+    SECTION("a run that throws after the requested row") {
+        Rest r;
+        r.dispatch_throws = true;
+        std::size_t during = 99;
+        r.fx.during_run = [&] { during = r.budget.active_for_surface(SseSurface::kWorkflowRun); };
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(during == 1);
+        CHECK(r.budget.active() == 0);
+    }
+    SECTION("a refusal from the per-step checks") {
+        Rest r;
+        r.fx.defs["i-ro"] = def("i-ro", "os_info", "os_version", "always");
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(r.budget.active() == 0);
+    }
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a principal at its run cap gets 429 + Retry-After and "
+          "NOTHING is read, sent or audited; the same call succeeds once a slot frees",
+          "[workflow][twin][rest][cap][security]") {
+    Rest r;
+    std::vector<detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < detail::kPerPrincipalWorkflowRun; ++i) {
+        auto a = r.budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                      detail::kPerPrincipalWorkflowRun);
+        REQUIRE(a.lease);
+        held.push_back(std::move(a.lease));
+    }
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    const auto j = body_of(*res);
+    CHECK(j["error"]["reason"] == "per_principal_stream_cap");
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(j["error"]["remediation"].get<std::string>().find("nothing was sent") != std::string::npos);
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK_FALSE(r.fx.dispatched_anything());
+    CHECK(r.fx.events.empty()); // no audit row of any kind
+    CHECK(r.fx.lookup_count.empty()); // no instruction was read
+    CHECK(r.persist_calls == 0);
+    CHECK(r.refused("per_principal_stream_cap") == 1);
+    // Another principal is unaffected by alice's cap.
+    r.caller.principal = "bob";
+    CHECK(r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})")->status == 202);
+    r.caller.principal = "alice";
+
+    held.pop_back();
+    const auto ok = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(ok);
+    CHECK(ok->status == 202);
+    CHECK(r.fx.engine_called);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a full server budget is a 429 on the global cap",
+          "[workflow][twin][rest][cap]") {
+    Rest r;
+    std::vector<detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < r.budget.capacity(); ++i) {
+        auto a = r.budget.try_acquire(detail::SseSurface::kApiEvents, "p" + std::to_string(i), 0);
+        REQUIRE(a.lease);
+        held.push_back(std::move(a.lease));
+    }
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    CHECK(body_of(*res)["error"]["reason"] == "global_stream_cap");
+    CHECK(r.refused("global_stream_cap") == 1);
+    CHECK_FALSE(r.fx.engine_called);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a draining server refuses a new run with a retryable 503 "
+          "and takes no lease",
+          "[workflow][twin][rest][cap][drain]") {
+    Rest r;
+    r.draining = true;
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    const auto j = body_of(*res);
+    CHECK(j["error"]["reason"] == "draining");
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(r.budget.active() == 0);
+    CHECK(r.refused("draining") == 1);
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK(r.fx.events.empty());
+    r.draining = false;
+    CHECK(r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})")->status == 202);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a malformed body is a 400 even at the cap, and takes no "
+          "slot",
+          "[workflow][twin][rest][cap]") {
+    Rest r;
+    std::vector<detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < detail::kPerPrincipalWorkflowRun; ++i)
+        held.push_back(std::move(r.budget
+                                     .try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                                  detail::kPerPrincipalWorkflowRun)
+                                     .lease));
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":[]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(r.refused("per_principal_stream_cap") == 0);
+}
+
+TEST_CASE("workflow run budget: the REST route stamps a 60 s deadline when it takes the call, and the "
+          "sequence installs the hook the engine asks before every attempt",
+          "[workflow][twin][rest][deadline]") {
+    Rest r;
+    const auto before = std::chrono::steady_clock::now();
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    REQUIRE(r.fx.seen_deadline.has_value());
+    CHECK(*r.fx.seen_deadline >= before + kWorkflowSyncBudget);
+    CHECK(*r.fx.seen_deadline <= std::chrono::steady_clock::now() + kWorkflowSyncBudget);
+    CHECK(r.fx.seen_before_attempt);
+    CHECK_FALSE(r.fx.engine_stopped);
+}
+
+TEST_CASE("workflow run budget: a run stopped at its deadline skips the rest, reports aborted/"
+          "deadline_exceeded, closes `failure`, and is never `completed`",
+          "[workflow][twin][deadline][outcome]") {
+    SECTION("the deadline passes between step 1 and step 2") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed"; // what the engine records for a stopped run
+        // Step 1 is sent and takes longer than the whole budget.
+        f.dispatch_override = [&](const WorkflowStepInstruction& d, const std::vector<std::string>&,
+                                  const DispatchCaller&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-" + d.id};
+        };
+        auto req = f.request();
+        req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+        const auto o = f.run(req);
+        CHECK(f.engine_stopped);
+        CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+        CHECK(o.deadline_exceeded);
+        CHECK(o.reason == "deadline_exceeded");
+        CHECK_FALSE(o.retryable);
+        CHECK(o.steps.size() == 1); // step 2 was never sent
+        CHECK(f.events.back() == "audit:failure");
+        CHECK(f.audit_details.back().find("run_outcome=aborted") != std::string::npos);
+        CHECK(f.audit_details.back().find("reason=deadline_exceeded") != std::string::npos);
+        const auto j = workflow_execute_result_json(o, "wf-1");
+        CHECK(j["status"] == "aborted");
+        CHECK(j["reason"] == "deadline_exceeded");
+        CHECK(j["retryable"] == false);
+        CHECK(j["message"].get<std::string>().find("60 second") != std::string::npos);
+    }
+    SECTION("the deadline had already passed before the first attempt: nothing reached anyone") {
+        Fx f;
+        f.engine_status = "failed";
+        auto req = f.request();
+        req.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        const auto o = f.run(req);
+        CHECK_FALSE(f.dispatched_anything());
+        CHECK(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+        CHECK(o.deadline_exceeded);
+        CHECK(o.reason == "deadline_exceeded");
+        CHECK_FALSE(o.retryable);
+        CHECK(f.audit_details.back().find("reason=deadline_exceeded") != std::string::npos);
+    }
+    SECTION("a run that finishes inside its budget is untouched") {
+        Fx f;
+        auto req = f.request();
+        req.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        const auto o = f.run(req);
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        CHECK_FALSE(o.deadline_exceeded);
+    }
+    SECTION("a request that carries no deadline is still bounded by the sequence") {
+        Fx f;
+        const auto o = f.run(); // Fx::request() sets none
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        REQUIRE(f.seen_deadline.has_value());
+        CHECK(*f.seen_deadline > std::chrono::steady_clock::now());
+        CHECK(*f.seen_deadline <= std::chrono::steady_clock::now() + kWorkflowSyncBudget);
+    }
+}
+
+TEST_CASE("workflow run budget: prepare refuses a workflow whose worst-case retry sleep exceeds 60 s; "
+          "exactly 60 s is admitted; nothing is audited, sent or run",
+          "[workflow][twin][budget]") {
+    struct Row {
+        const char* what;
+        std::vector<std::pair<int, int>> retries; // (retry_count, retry_delay_seconds) per step
+        bool admitted;
+    };
+    const Row rows[] = {
+        {"6 x 10 s == 60 s", {{6, 10}}, true},
+        {"61 x 1 s == 61 s", {{61, 1}}, false},
+        {"7 x 10 s == 70 s", {{7, 10}}, false},
+        {"two steps 30 s + 30 s == 60 s", {{3, 10}, {3, 10}}, true},
+        {"two steps 30 s + 31 s == 61 s", {{3, 10}, {31, 1}}, false},
+        {"many retries with no delay sleep nothing", {{10, 0}, {10, 0}}, true},
+        {"no retries at all", {{0, 3600}}, true},
+        {"the maximum retries at the maximum delay", {{10, 3600}}, false},
+    };
+    for (const auto& row : rows) {
+        DYNAMIC_SECTION(row.what) {
+            Fx f;
+            f.step_ids = {"i-ro", "i-ro2"};
+            f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+            f.step_retries = row.retries;
+            const auto o = f.run();
+            if (row.admitted) {
+                CHECK(o.status == WorkflowExecuteStatus::kOk);
+                CHECK(f.engine_called);
+            } else {
+                CHECK(o.status == WorkflowExecuteStatus::kExceedsSyncBudget);
+                CHECK(o.reason == "workflow_exceeds_sync_budget");
+                CHECK_FALSE(o.retryable);
+                CHECK(o.remediation.find("retryCount x retryDelay") != std::string::npos);
+                CHECK_FALSE(f.engine_called);
+                CHECK_FALSE(f.dispatched_anything());
+                CHECK(f.events.empty()); // no `requested` row, no denial row
+                CHECK(f.authorize_calls.empty());
+            }
+        }
+    }
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a workflow over the sync budget is a 400 with the reason "
+          "and takes a lease only for the length of the refusal",
+          "[workflow][twin][rest][budget]") {
+    Rest r;
+    r.fx.step_retries = {{7, 10}};
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(body_of(*res)["error"]["reason"] == "workflow_exceeds_sync_budget");
+    CHECK(r.fx.events.empty());
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK(r.budget.active() == 0);
 }

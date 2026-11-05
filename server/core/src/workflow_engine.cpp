@@ -674,7 +674,8 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     const std::vector<std::string>& agent_ids,
     StepDispatchFn dispatch_fn,
     ConditionEvalFn condition_fn,
-    std::function<void(const std::string& execution_id)> on_admitted) {
+    std::function<void(const std::string& execution_id)> on_admitted,
+    const WorkflowRunControl& control) {
 
     if (!dispatch_fn)
         return std::unexpected("dispatch function is required");
@@ -759,6 +760,18 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
         }
         fn(lease.get());
     };
+
+    // The run's bounds (WorkflowRunControl), asked before EVERY dispatch attempt. When the caller
+    // installed `before_attempt`, it alone decides (the caller owns the reason it said no, and
+    // a clock read here that disagreed with its own by a microsecond would stop a run the caller
+    // never recorded as stopped); `deadline` then only bounds the retry delay. With no hook, a
+    // passed deadline stops the run.
+    const auto stop_before_attempt = [&control]() {
+        if (control.before_attempt)
+            return !control.before_attempt();
+        return control.deadline && std::chrono::steady_clock::now() >= *control.deadline;
+    };
+    bool run_stopped = false;
 
     // Execute steps sequentially
     std::string prev_result_json = "{}";
@@ -875,6 +888,16 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 bool permanent_failure = false; // no retry, no retry sleep
 
                 for (const auto& params : dispatch_params) {
+                    if (stop_before_attempt()) {
+                        // Not retried, not slept on, and the step's on_failure policy does not
+                        // apply: the whole run ends after this step is recorded.
+                        run_stopped = true;
+                        foreach_failed = true;
+                        permanent_failure = true;
+                        foreach_results.push_back(
+                            nlohmann::json({{"error", "run stopped before this attempt"}}));
+                        break;
+                    }
                     auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
                     // #2437-class guard: StepDispatchFn's documented contract (workflow_engine.hpp)
                     // is "returns a JSON result string" with no depth bound. Today's one wired
@@ -946,8 +969,16 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 if (!permanent_failure && attempt <= step.retry_count) {
                     spdlog::warn("WorkflowEngine: step {} attempt {}/{} failed, retrying in {}s",
                                  step.index, attempt, step.retry_count + 1, step.retry_delay_seconds);
-                    std::this_thread::sleep_for(
+                    // The delay never runs past the deadline: the next attempt then finds the run
+                    // out of time and stops it, instead of the run sleeping on after the bound.
+                    auto delay = std::chrono::steady_clock::duration(
                         std::chrono::seconds(step.retry_delay_seconds));
+                    if (control.deadline) {
+                        const auto left = *control.deadline - std::chrono::steady_clock::now();
+                        delay = std::clamp(left, std::chrono::steady_clock::duration::zero(), delay);
+                    }
+                    if (delay > std::chrono::steady_clock::duration::zero())
+                        std::this_thread::sleep_for(delay);
                 } else {
                     step_result = foreach_results.dump();
                 }
@@ -965,6 +996,22 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                                       step_succeeded ? "success" : "failed", step_result);
             });
             current_step_open = false;
+
+            if (run_stopped) {
+                spdlog::warn("WorkflowEngine: execution {} stopped before step {}'s attempt (run "
+                             "bound reached); skipping the remaining steps",
+                             exec_id, step.index);
+                with_write_lease([&](PGconn* c) {
+                    for (const auto& remaining : workflow.steps) {
+                        if (remaining.index > step.index) {
+                            wf_update_step_result(c, exec_id, remaining.index, "skipped",
+                                                  R"({"reason":"run stopped"})");
+                        }
+                    }
+                });
+                execution_failed = true;
+                break;
+            }
 
             if (step_succeeded) {
                 prev_result_json = step_result;

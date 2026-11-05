@@ -157,6 +157,9 @@ public:
         /// leases from the same counter as every other streaming surface. nullptr = no
         /// admission control (test harnesses only).
         yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+        /// True while the server is draining; the synchronous workflow-run routes refuse new runs
+        /// then (the budget itself does not consult its closing flag). Unset = never draining.
+        std::function<bool()> draining;
         AuthFn auth_fn;
         PermFn perm_fn;
         /// Side-effect-free permission probe for RENDERING decisions only (never a gate):

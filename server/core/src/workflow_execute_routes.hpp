@@ -43,6 +43,14 @@ struct WorkflowExecuteRouteDeps {
     WorkflowRoutes::ConcurrencyDispatchFn command_dispatch_fn_concurrency;
     WorkflowRoutes::CallerFn caller_fn;
     yuzu::MetricsRegistry* metrics{nullptr};
+    /// THE shared held-open budget (ADR-0034): a synchronous run holds its worker for up to
+    /// `kWorkflowSyncBudget`, so it leases from the same instance as every streaming surface
+    /// (`SseSurface::kWorkflowRun`). nullptr = unmetered (test harnesses only; production always
+    /// wires it).
+    detail::StreamBudget* stream_budget{nullptr};
+    /// True while the server is draining. A run is refused then (`StreamBudget::try_acquire` does
+    /// not consult its own closing flag). Unset = never draining (test harnesses).
+    std::function<bool()> draining;
 };
 
 void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRouteDeps deps);

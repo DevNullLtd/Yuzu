@@ -872,6 +872,11 @@ public:
     /// `execute_workflow` answers "workflow engine not available" and dispatches nothing.
     void set_workflow_run_fn(WorkflowRunFn fn) { workflow_run_fn_ = std::move(fn); }
 
+    /// True while the server is draining. `execute_workflow` refuses a new run then
+    /// (`StreamBudget::try_acquire` does not consult its own closing flag). Unset (the default)
+    /// is never draining: a harness that does not wire it. server.cpp wires `draining_`.
+    void set_draining_fn(std::function<bool()> fn) { draining_fn_ = std::move(fn); }
+
     /// The digest `execute_workflow` binds a ticket's step effects with. Unset (the production
     /// default) is `sha256_hex`; set only by a test that drives the fail-closed refusal.
     void set_workflow_digest_fn(std::function<std::optional<std::string>(std::string_view)> fn) {
@@ -1421,6 +1426,7 @@ private:
     std::shared_ptr<const WorkflowApi> workflow_api_;
     ConcurrencyDispatchFn workflow_concurrency_dispatch_fn_; // see set_workflow_concurrency_dispatch_fn
     WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
+    std::function<bool()> draining_fn_;                      // see set_draining_fn
     std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;

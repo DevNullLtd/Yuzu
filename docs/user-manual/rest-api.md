@@ -6692,13 +6692,16 @@ nothing is sent.
 | `400` | `unknown_instruction` | A step names an instruction that does not exist. |
 | `400` | `step_unclassified` | A step's `plugin.action` is not in the capability catalogue. |
 | `400` | `destructive_untargeted`, `forensic_untargeted` | A Destructive or Forensics step is not explicitly targeted. |
+| `400` | `workflow_exceeds_sync_budget` | The sum over the workflow's steps of `retryCount` x `retryDelay` exceeds the 60 second run budget (see **Run budget** below). Nothing was done and no row is written; the workflow cannot be run until it is replaced by one with fewer retries or shorter delays. |
 | `400` | `rejected` | The engine refused the run after the preflight; `error.message` carries its reason, and a closing `failure` audit row is written. |
 | `403` | `approval_required` | A step's approval mode does not admit the caller. |
 | `403` | `dispatch_denied` | The caller may not dispatch a step's `plugin.action`. Not retryable. |
 | `404` | `workflow_not_found` | Unknown or soft-deleted workflow. |
 | `404` | `destructive_no_visible_target` | A Destructive or Forensics step whose named agents are all outside the caller's view. |
+| `429` | `per_principal_stream_cap`, `global_stream_cap` | Admission: the caller already has 2 workflow runs in progress, or the server's shared held-open budget (`--max-sse-streams`) is full. `Retry-After: 5` and `retry_after_ms: 5000`. Nothing was read, sent or audited. Retrying is safe. |
 | `500` | `no_principal` | The session has no principal. |
 | `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step with no `command_id` was never sent) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
+| `503` | `draining` | Admission: the server is shutting down and starts no new run. `Retry-After: 5` and `retry_after_ms: 5000`; nothing was read, sent or audited. Retry against another replica or after the restart. |
 | `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
 | `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). Also the answer to an unexpected fault BEFORE the `requested` row (the preflight half): nothing was sent, so retrying is safe. |
 | `503` | `audit_unavailable` | The `requested` row could not be saved (`Sec-Audit-Failed: true`); nothing was sent. |
@@ -6717,8 +6720,28 @@ nothing reached; `interrupted` is reserved for a server shutdown and is not prod
 read failure write no `workflow.execute` row at all. Audit details are neutralised (CWE-117); the
 full row list is in [audit-log.md](audit-log.md).
 
+**Run budget (60 seconds) and admission.** A run is synchronous, so it holds one of the server's
+HTTP worker threads for its whole length. Three things bound that. (1) *Admission:* before anything
+is read or any row is written, the run takes a slot from the same held-open budget the streaming
+endpoints share (`--max-sse-streams`; `yuzu_http_held_open_responses`), at most 2 per principal. A
+principal at its limit, a full server budget and a draining server are refused up front (`429`
+`per_principal_stream_cap` / `global_stream_cap`, `503` `draining`) with `Retry-After: 5`; the
+refusal is counted on `yuzu_server_workflow_run_refused_total{reason}` and writes no audit row.
+The slot is held until the response is written, whatever the outcome. (2) *Precheck:* a workflow
+whose worst-case retry sleep, the sum over its steps of `retryCount` x `retryDelay`, exceeds 60
+seconds is refused `400 workflow_exceeds_sync_budget` (exactly 60 is accepted). This models sleeps
+only; dispatch time and `foreach` fan-out are not modelled, so it is a prefilter. (3) *Deadline:*
+the run has 60 seconds from the moment the request is taken. No send attempt starts after the
+deadline, and a retry delay is cut to the time left. At the deadline the engine stops the run: the
+step in progress is recorded `failed`, the remaining steps are `skipped` (`run stopped`, the step's
+`on_failure` policy does not apply), the execution is closed `failed`, and the answer is the typed
+`202` below with `data.status: "aborted"`, `data.reason: "deadline_exceeded"` and `retryable:
+false` (or, if no step reached any agent, the `503` `deadline_exceeded`, also not retryable). A send
+already in flight is not interrupted. The closing audit row is `failure` with
+`run_outcome=aborted reason=deadline_exceeded`.
+
 **Dispatch is synchronous, device work is not.** The call returns after every step's command has
-been sent, including step retries and delays, so it can be slow. Each step is sent only to the
+been sent, including step retries and delays (within the run budget above), so it can be slow. Each step is sent only to the
 agents the caller can see (the same confinement as every other dispatch); a named agent outside the
 caller's view is dropped silently. Read the run with `GET /api/v1/workflow-executions/{execution_id}`
 and each device's output with the step's `command_id`. Do not repeat the call to retry: every step is
@@ -6738,7 +6761,8 @@ at send time and every send attempt reached at least one agent (commands were se
 necessarily finished). A run that sent something and did not meet all three is still a `202` (a
 `5xx` would invite a blind re-send of steps already sent) but is NOT a success: `data.status` is
 `partial` (some attempt reached nobody, or the engine did not complete after a send) or `aborted` (a
-step was refused at send time because its definition changed, and the rest did not run), with
+step was refused at send time because its definition changed, or the run reached its 60 second
+deadline, and the rest did not run), with
 `data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
 with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step retried
 to success still counts its earlier zero-reach attempt, so the run reads `partial`: the label errs
@@ -6747,7 +6771,8 @@ toward failure.
 **Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
 with `error.reason` and `error.execution_id` (the run exists and is readable). `run_failed` (the
 engine ended the run without a single dispatch attempt, or its final state could not be read;
-`retry_after_ms: null`), `quarantined`,
+`retry_after_ms: null`), `deadline_exceeded` (the 60 second run budget ended the run before any
+step reached an agent; `retry_after_ms: null`), `quarantined`,
 `plugin_not_found`, `kill_switched_os` and `late_denied` are permanent (`retry_after_ms: null`);
 `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached` (offline
 devices, or a per-device concurrency claim) are retryable (`retry_after_ms: 5000`).

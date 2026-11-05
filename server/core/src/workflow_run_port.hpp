@@ -30,16 +30,22 @@
 namespace yuzu::server {
 
 /// Per-run controls. Every member is optional and an unset member is no hook, so a caller that
-/// sets none gets the engine's plain behaviour. The engine adapter consumes the members it
-/// supports; a member it does not yet consume is ignored. Members are added here as the engine
-/// gains the matching hook, so the port signature never changes.
+/// sets none gets the engine's plain behaviour. The engine consumes the members it supports; a
+/// member it does not yet consume is ignored. Members are added here as the engine gains the
+/// matching hook, so the port signature never changes.
+///
+/// Consumed today: `on_admitted`, `before_attempt` and `deadline`.
 struct WorkflowRunControl {
     /// Called once with the new run's execution id after the engine has admitted the run and
     /// before the first step is dispatched.
     std::function<void(const std::string& execution_id)> on_admitted;
-    /// Called before every dispatch attempt; `false` stops the run.
+    /// Called before every dispatch attempt (each retry and each foreach item included); `false`
+    /// stops the run: the attempt is not made, the step is recorded failed, the remaining steps
+    /// are skipped and the execution is finalized `failed`. The caller records why it said no.
     std::function<bool()> before_attempt;
-    /// Wall-clock bound for the whole run (steady clock; retry sleeps count against it).
+    /// Wall-clock bound for the whole run (steady clock; retry sleeps count against it). The
+    /// engine refuses to start an attempt at or after it, with the same stop as `before_attempt`,
+    /// and never sleeps a retry delay past it. A dispatch already in flight is not interrupted.
     std::optional<std::chrono::steady_clock::time_point> deadline;
     /// Polled between attempts and during retry sleeps; `true` stops the run.
     std::function<bool()> should_stop;

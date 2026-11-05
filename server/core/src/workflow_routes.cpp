@@ -2885,7 +2885,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             .command_dispatch_fn = cmd_dispatch,
             .command_dispatch_fn_concurrency = cmd_dispatch_concurrency,
             .caller_fn = caller_fn,
-            .metrics = metrics});
+            .metrics = metrics,
+            .stream_budget = deps.stream_budget,
+            .draining = deps.draining});
 
     // GET /api/workflow-executions/:id -- get execution status
     sink.Get(R"(/api/workflow-executions/([^/]+))", [fleet_read_fn,

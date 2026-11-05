@@ -683,6 +683,109 @@ TEST_CASE("WorkflowEngine: on_admitted gets the new execution id before the firs
     }
 }
 
+TEST_CASE("WorkflowEngine: a run past its deadline stops before the next attempt, skips the rest, closes "
+          "failed, ignores on_failure, and never sleeps a retry delay past the deadline (#2146 D1)",
+          "[workflow_engine][pg][execute][deadline]") {
+    WORKFLOW_ENGINE(engine);
+    // Step 1 retries 3 times with a 1 s delay and `continue` on failure; step 2 is plain.
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: deadline-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      retryCount: 3\n"
+                             "      retryDelay: 1\n"
+                             "      onFailure: continue\n"
+                             "    - instruction: inst-2\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    std::vector<std::string> dispatched;
+    StepDispatchFn always_fail = [&dispatched](const std::string& id, const std::string&,
+                                               const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        dispatched.push_back(id);
+        return std::unexpected(StepDispatchError{"agent unreachable", false});
+    };
+
+    SECTION("the retry delay is cut to the time left, then the next attempt is not made") {
+        WorkflowRunControl control;
+        control.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        REQUIRE(r.has_value());
+        // One attempt, then the 1 s delay was cut to the ~300 ms left. Uncapped, the run would
+        // have slept the whole second and then made three more attempts.
+        CHECK(dispatched == std::vector<std::string>{"inst-1"});
+        CHECK(elapsed < std::chrono::milliseconds(900));
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "failed");
+        // on_failure=continue did NOT carry the run on to step 2: it was skipped, not run.
+        CHECK(exec.step_results[1].status == "skipped");
+        CHECK(exec.step_results[1].result_json.find("run stopped") != std::string::npos);
+    }
+    SECTION("a deadline that has already passed dispatches nothing") {
+        WorkflowRunControl control;
+        control.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(dispatched.empty());
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "failed");
+        CHECK(exec.step_results[1].status == "skipped");
+    }
+    SECTION("a deadline in the future changes nothing: the plain retry path runs to completion") {
+        WorkflowRunControl control;
+        control.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        int attempts = 0;
+        StepDispatchFn flaky = [&attempts](const std::string&, const std::string&, const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            if (++attempts < 2)
+                return std::unexpected(StepDispatchError{"transient", false});
+            return std::string(R"({"status":"ok"})");
+        };
+        const std::string quick = "kind: Workflow\nmetadata:\n  name: quick-wf\nspec:\n  steps:\n"
+                                  "    - instruction: inst-1\n"
+                                  "      retryCount: 2\n"
+                                  "      retryDelay: 0\n";
+        auto quick_id = *engine.create_workflow(quick);
+        auto r = engine.execute(quick_id, {"agent-1"}, flaky, nullptr, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(attempts == 2);
+        CHECK(only_execution(engine, quick_id).status == "completed");
+    }
+}
+
+TEST_CASE("WorkflowEngine: before_attempt alone decides when installed; false stops the run like a "
+          "deadline (#2146 D1)",
+          "[workflow_engine][pg][execute][deadline]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kTwoStepYaml);
+    int dispatches = 0;
+    StepDispatchFn ok = [&dispatches](const std::string&, const std::string&, const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        ++dispatches;
+        return std::string(R"({"status":"ok"})");
+    };
+    int asked = 0;
+    WorkflowRunControl control;
+    // The hook says yes once, then no. A deadline that has already passed is ignored for the
+    // stop decision (the hook owns it), so step 1 runs.
+    control.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    control.before_attempt = [&asked] { return ++asked == 1; };
+    auto r = engine.execute(wf_id, {"agent-1"}, ok, nullptr, nullptr, control);
+    REQUIRE(r.has_value());
+    CHECK(dispatches == 1);
+    CHECK(asked == 2);
+    const auto exec = only_execution(engine, wf_id);
+    CHECK(exec.status == "failed");
+    REQUIRE(exec.step_results.size() == 2);
+    CHECK(exec.step_results[0].status == "success");
+    CHECK(exec.step_results[1].status == "failed"); // stopped before its attempt
+    // Step 2 was the one stopped; nothing after it exists to skip.
+}
+
 TEST_CASE("WorkflowEngine: execute skips a step whose condition evaluates false",
           "[workflow_engine][pg][execute]") {
     WORKFLOW_ENGINE(engine);

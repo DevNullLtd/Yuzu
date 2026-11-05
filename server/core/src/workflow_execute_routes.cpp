@@ -36,6 +36,12 @@ struct HttpShape {
     case S::kWorkflowNotFound:
     case S::kDestructiveNoVisibleTarget:
         return {404, false};
+    case S::kRunCapReached: // capacity: nothing was read or sent, so a retry is safe
+        return {429, true};
+    case S::kDraining:
+        return {503, true};
+    case S::kExceedsSyncBudget:
+        return {400, false};
     case S::kInvalidWorkflow:
     case S::kUnknownInstruction:
     case S::kUnclassifiedStep:
@@ -136,6 +142,27 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             const DispatchCaller caller =
                 d.caller_fn ? d.caller_fn(req) : DispatchCaller{.exec_visible = authz::deny_all()};
 
+            // The run's clock starts here, so everything below counts against the budget.
+            const auto deadline = std::chrono::steady_clock::now() + kWorkflowSyncBudget;
+
+            // ADMISSION, before any read of the workflow and before the `requested` row: a
+            // synchronous run holds this worker for up to the budget, so it leases from the one
+            // shared held-open budget, and a draining server starts no new run. The lease is a
+            // plain local: the response is synchronous, so a return or a throw releases it.
+            auto admission = admit_workflow_run(d.stream_budget, d.draining, caller.principal,
+                                                d.metrics);
+            if (admission.refusal) {
+                const auto& refused = *admission.refusal;
+                const auto shape = http_shape(refused);
+                res.status = shape.code;
+                res.set_header("Retry-After",
+                               std::to_string((kWorkflowRunCapRetryAfterMs + 999) / 1000));
+                res.set_content(
+                    error_body(res, refused, shape.code, shape.retryable_hint, refused.remediation),
+                    "application/json");
+                return;
+            }
+
             WorkflowExecutePorts ports;
             ports.api = d.workflow_api.get();
             ports.run = d.workflow_run;
@@ -206,6 +233,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             wreq.agent_ids = std::move(*agent_ids);
             wreq.caller = caller;
             wreq.audit_context = "surface=rest";
+            wreq.deadline = deadline;
 
             WorkflowExecuteOutcome out;
             try {

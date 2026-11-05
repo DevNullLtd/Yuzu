@@ -21,6 +21,7 @@
 /// backfill" line, and the caller (`server.cpp`) runs `legacy_sqlite_probe::warn_if_legacy_rows()`
 /// over the legacy file so a locally-wrong "no production fleet" premise gets a loud signal.
 
+#include "workflow_run_port.hpp" // WorkflowRunControl (the per-run hooks execute() consumes)
 #include "workflow_types.hpp" // ADR-0031 WS-A4 (eighth family): relocated pure POD types
 
 #include <chrono>
@@ -131,12 +132,20 @@ public:
     /// exception is rethrown to the caller, so a run is never left `running` behind a throw.
     /// `on_admitted` is called once with the new execution id after admission and before the first
     /// step.
+    ///
+    /// `control` carries the run's bounds (`workflow_run_port.hpp`): before every dispatch attempt
+    /// the engine asks `control.before_attempt` and compares `control.deadline` with the steady
+    /// clock; either refusing STOPS the run (the attempt is not made, the step is recorded failed,
+    /// the remaining steps are skipped `run stopped`, the execution is finalized `failed` through
+    /// the same guarded UPDATE, and `on_failure` does not apply). A retry delay is cut to the time
+    /// left before the deadline. A default `control` is no bound: the legacy route's behaviour.
     std::expected<std::string, std::string> execute(
         const std::string& workflow_id,
         const std::vector<std::string>& agent_ids,
         StepDispatchFn dispatch_fn,
         ConditionEvalFn condition_fn = nullptr,
-        std::function<void(const std::string& execution_id)> on_admitted = nullptr);
+        std::function<void(const std::string& execution_id)> on_admitted = nullptr,
+        const WorkflowRunControl& control = {});
 
     /// Get execution status with step results.
     std::expected<std::optional<WorkflowExecution>, std::string> get_execution(

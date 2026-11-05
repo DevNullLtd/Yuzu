@@ -71,6 +71,20 @@
 /// something but did not succeed (kRunIncomplete) -> 202 with `status:"partial"|"aborted"` and
 /// `retryable:false`; a run that reached nobody (kNoAgentsReached) -> the zero-reach error.
 ///
+/// ADMISSION AND THE BUDGET. A run is SYNCHRONOUS: the transport's worker thread is held for the
+/// whole run, retry sleeps included, so each transport first calls `admit_workflow_run` (before
+/// any read of the workflow, before the `requested` row, and on MCP before the approval ticket is
+/// consumed): it refuses a draining server (`kDraining`, 503) and leases from the ONE shared
+/// `StreamBudget` on `SseSurface::kWorkflowRun` (`kRunCapReached`, 429; 2 per principal). The
+/// lease lives exactly as long as the transport's call. The run itself is bounded by
+/// `kWorkflowSyncBudget` (60 s): `prepare_workflow_execute` refuses a workflow whose worst-case
+/// retry sleep exceeds it (`kExceedsSyncBudget`, 400, nothing done and so no ticket), and the
+/// engine stops a run at its deadline (below). The precheck models sleeps only: it does not
+/// model dispatch time or `foreach` fan-out (every item is a dispatch inside an attempt), so the
+/// deadline is the real bound.
+/// A run stopped at its deadline skips its remaining steps, closes `failed`, and ends
+/// `WorkflowRunOutcome::kAborted` with `deadline_exceeded` and reason `deadline_exceeded`.
+///
 /// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
 /// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches
 /// is decided later, per step, at the dispatch chokepoint (visibility, containment, plugin
@@ -100,12 +114,16 @@
 #include "dispatch_caller.hpp"
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_zero_reach.hpp"
+#include "stream_budget.hpp" // detail::StreamBudget: a run leases from the ONE held-open budget
 #include "workflow_api.hpp"
 #include "workflow_run_port.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <array>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -114,9 +132,39 @@
 #include <unordered_map>
 #include <vector>
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server {
 
 class InstructionStore;
+
+/// The wall-clock budget of ONE synchronous workflow run, from the moment the transport takes
+/// the call to the moment the engine must have stopped dispatching (owner ruling, 2026-11-04;
+/// Fable op-7: never above 60 s). Three things are held to it: the run's `deadline`
+/// (`WorkflowRunControl`, so no attempt starts after it and no retry delay runs past it),
+/// `prepare_workflow_execute`'s worst-case sleep check (a workflow whose retries could sleep
+/// longer than this is refused up front), and the retry hint of a refused admission. A caller
+/// or an intermediary that gives up before it has no idempotency key, so the budget stays short.
+inline constexpr std::chrono::seconds kWorkflowSyncBudget{60};
+
+/// `Retry-After` / `retry_after_ms` of a run refused for capacity or for a draining server. A run
+/// holds its worker for up to `kWorkflowSyncBudget`, so a slot usually frees well inside a minute;
+/// 5 s is the platform's stream-cap retry floor (`kMcpStreamCapRetryAfterMs`, mcp_stream.hpp).
+inline constexpr std::int64_t kWorkflowRunCapRetryAfterMs = 5000;
+
+/// A run refused at ADMISSION (before any read of the workflow or the `requested` row):
+/// `yuzu_server_workflow_run_refused_total{reason}`. The first two are the shared
+/// `StreamBudget`'s own reject tokens, the third is a server that is draining (the budget's
+/// `try_acquire` does not consult its `closing_` flag, so the adapters refuse on `draining`
+/// explicitly). A closed set; every member is pre-seeded to 0 at boot.
+inline constexpr char kWorkflowRunRefusedMetric[] = "yuzu_server_workflow_run_refused_total";
+inline constexpr char kWorkflowRunsInFlightMetric[] = "yuzu_server_workflow_runs_in_flight";
+inline constexpr char kWorkflowRunRefusedDraining[] = "draining";
+inline constexpr std::array<std::string_view, 3> kWorkflowRunRefusedReasons{
+    detail::StreamBudget::kRejectGlobal, detail::StreamBudget::kRejectPerPrincipal,
+    kWorkflowRunRefusedDraining};
 
 /// The slice of an `InstructionDefinition` the sequence reads. Decoupled from the store type so
 /// the ports (and the tests) never need Postgres.
@@ -206,6 +254,10 @@ struct WorkflowExecuteRequest {
     /// snapshot, whose digest the ticket match proved equal to the approved one). Unset on REST,
     /// which has no ticket, and on any call that carried none: nothing then holds the lookup.
     std::optional<WorkflowStepEffects> expected_step_effects;
+    /// When the run must stop, set by the transport when it takes the call (`now +
+    /// kWorkflowSyncBudget`) so the time prepare spent counts against it. Unset falls back to
+    /// `now + kWorkflowSyncBudget` at the start of the run: a run is never unbounded.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
 /// A parse refusal for the request body. `reason` is a closed token (the
@@ -245,6 +297,9 @@ enum class WorkflowExecuteStatus {
     kEffectDigestFailed,         ///< the step-effect digest could not be computed (500, no ticket minted)
     kRunFailed,                  ///< the run THREW after the `requested` row: steps may have been sent (500, NOT retryable)
     kRunIncomplete,              ///< the run ran and sent something but did not fully succeed: `partial` or `aborted` (2xx, typed status, NOT retryable)
+    kExceedsSyncBudget,          ///< the workflow's worst-case retry sleep exceeds `kWorkflowSyncBudget` (400, nothing done, no ticket)
+    kRunCapReached,              ///< admission: this principal or the server holds as many runs/streams as it may (429, retryable, nothing done)
+    kDraining,                   ///< admission: the server is shutting down and starts no new run (503, retryable, nothing done)
 };
 
 /// How a run that reached the engine ended, judged from what the engine recorded and what the
@@ -255,8 +310,10 @@ enum class WorkflowExecuteStatus {
 /// (`late_denied`), and every dispatch attempt reached at least one agent. The others, tested
 /// in this order:
 ///   * `kAborted`     a step was refused at send time (`late_denied`): its definition moved off the
-///                    preflight or off the ticket-bound effect, or it no longer passed admission.
-///                    Takes precedence: the run was cut short by a refusal, whatever else it did.
+///                    preflight or off the ticket-bound effect, or it no longer passed admission;
+///                    OR the run reached its deadline (`kWorkflowSyncBudget`) and the engine
+///                    stopped it (`deadline_exceeded`). Takes precedence: the run was cut short,
+///                    whatever else it did.
 ///   * `kInterrupted` RESERVED for the shutdown path (commit 7): the run was stopped by the server
 ///                    draining before it finished. Produced by nothing yet.
 ///   * `kFailed`      no dispatch attempt reached any agent: the engine ended `failed` (or in any
@@ -325,6 +382,9 @@ struct WorkflowExecuteOutcome {
     /// Set for every outcome of a run that finished the step loop (kOk, kNoAgentsReached,
     /// kRunIncomplete); `kSucceeded` for anything else.
     WorkflowRunOutcome run_outcome{WorkflowRunOutcome::kSucceeded};
+    /// The run reached its deadline and the engine stopped it: the remaining steps were skipped
+    /// and the execution closed `failed`. Always paired with `run_outcome == kAborted`.
+    bool deadline_exceeded{false};
     /// False only when the closing outcome row failed to persist after the run had started.
     bool audit_persisted{true};
 };
@@ -333,7 +393,28 @@ struct WorkflowExecuteOutcome {
 /// after the step loop ("unknown" when it could not be read back, which is never success).
 [[nodiscard]] WorkflowRunOutcome
 classify_workflow_run(std::string_view run_status, bool late_denied,
-                      const std::vector<WorkflowStepDispatchNote>& steps);
+                      const std::vector<WorkflowStepDispatchNote>& steps,
+                      bool deadline_exceeded = false);
+
+/// What `admit_workflow_run` decided. `lease` is engaged iff the run is admitted and must be held
+/// for the WHOLE run (a stack object in the transport, so a return or a throw releases it);
+/// `refusal` is the outcome to render (`kRunCapReached` or `kDraining`) and is set iff `lease` is
+/// not. A refusal wrote nothing and read nothing: no audit row (the counter is its only record,
+/// like the streamed-POST cap on MCP's own admission), no ticket spent.
+struct WorkflowRunAdmission {
+    detail::StreamBudget::Lease lease;
+    std::optional<WorkflowExecuteOutcome> refusal;
+};
+
+/// THE admission step of a synchronous workflow run, one copy for REST v1 and MCP (and the legacy
+/// route). Refuses first when the server is draining (`draining` set and true), then leases from
+/// `budget` on `SseSurface::kWorkflowRun` keyed by `principal` with the per-principal share
+/// `kPerPrincipalWorkflowRun`. Counts `kWorkflowRunRefusedMetric{reason}` on a refusal. A null
+/// `budget` is an unmetered seam (a test harness; production always wires the one budget), and
+/// then only the draining refusal applies. Never throws for a refusal.
+[[nodiscard]] WorkflowRunAdmission
+admit_workflow_run(detail::StreamBudget* budget, const std::function<bool()>& draining,
+                   const std::string& principal, yuzu::MetricsRegistry* metrics);
 
 /// What `prepare_workflow_execute` hands to `run_workflow_execute`. The run needs only
 /// `step_count`: the workflow and its instructions are re-read by the run itself (per step,

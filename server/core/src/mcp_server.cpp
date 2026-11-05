@@ -1339,7 +1339,8 @@ static const ToolDef kTools[] = {
     {"execute_workflow",
      "Run a multi-step workflow (see list_workflows / get_workflow) against the named devices. "
      "SYNCHRONOUS DISPATCH, ASYNC DEVICE WORK: the call returns once every step's command has "
-     "been SENT (it can take as long as the workflow's step retries and delays), not when devices "
+     "been SENT (it can take as long as the workflow's step retries and delays, but never longer "
+     "than a 60 second run budget), not when devices "
      "finish; read the outcome with get_workflow_execution on the returned execution_id, and the "
      "devices' own results with query_responses by each step's command_id. NEVER re-send this "
      "call to 'retry': a second call sends every step to the devices a second time. "
@@ -1373,6 +1374,16 @@ static const ToolDef kTools[] = {
      "nothing for that step and answers -32602 definition_changed with the ticket SPENT. An "
      "edit to anything else in a definition runs as edited, with every precheck re-run at send "
      "time. "
+     "RUN BUDGET AND ADMISSION: the call holds a server worker for the whole run, so at most 2 "
+     "runs per principal (and a server-wide limit shared with the streams) are admitted; a "
+     "refusal is HTTP 429 / -32012 with error.data.reason per_principal_stream_cap or "
+     "global_stream_cap, or 503 / -32015 reason draining while the server shuts down, with "
+     "retry_after_ms 5000: nothing was read, sent or audited and NO approval ticket was spent, so "
+     "re-call with the same approval_id. A workflow whose worst-case retry sleep (the sum over its "
+     "steps of retryCount x retryDelay) exceeds 60 seconds is refused -32602 reason "
+     "workflow_exceeds_sync_budget before a ticket is minted. The run has 60 seconds from the call: "
+     "no send starts after the deadline, the remaining steps are skipped and the run is closed "
+     "failed (status aborted, reason deadline_exceeded, not retryable). "
      "AUDIT: an 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
      "it cannot be saved the call fails with a retryable error and nothing was sent. A step "
      "refused at send time because its definition changed is audited at that moment and is not "
@@ -1388,7 +1399,8 @@ static const ToolDef kTools[] = {
      "time and every send attempt reached at least one agent (it means sent, not finished). "
      "Otherwise, when something was sent, status is \"partial\" (some attempt reached nobody, or "
      "the engine did not complete after a send) or \"aborted\" (a step was refused at send time "
-     "because its definition changed; the rest did not run), with run_status (the engine's own "
+     "because its definition changed, or the run reached its 60 second deadline, reason "
+     "deadline_exceeded; the rest did not run), with run_status (the engine's own "
      "status), message, retryable false and retry_after_ms null: the run is NOT a success and "
      "must not be re-sent; read get_workflow_execution and each step's reason. The closing "
      "audit row is result failure with run_outcome=failed|partial|aborted. If "
@@ -1412,6 +1424,7 @@ static const ToolDef kTools[] = {
      R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
      R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
      R"j("message":{"type":"string","description":"Present only when no step reached any agent"},)j"
+     R"j("reason":{"type":"string","enum":["deadline_exceeded"],"description":"Present only when the 60 second run budget stopped the run"},)j"
      R"j("retry_after_ms":{"type":["integer","null"],"description":"Present only when no step reached any agent: 5000 for a retryable cause, null for a permanent one"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row failed to persist after the run had started"})j"
      R"j(},"required":["execution_id","workflow_id","status","steps"]})j"},
@@ -7804,6 +7817,12 @@ McpServer::HandlerFn McpServer::build_handler(
             // effect line was computed over, set by the C8 probe on the mint AND the recall and
             // handed to the run as `expected_step_effects`. Unset when no ticket is in play.
             std::optional<WorkflowStepEffects> workflow_bound_effects;
+            // The held-open lease of an execute_workflow run (SseSurface::kWorkflowRun, #2146 D3).
+            // Acquired by the C8 recall arm immediately BEFORE the approval ticket is consumed (so
+            // a refusal spends no ticket) or, for a caller that never reaches that arm, by the
+            // handler; carried to the handler and released with this request, on any return or
+            // throw. Declared here so both sites see the one object.
+            std::optional<yuzu::server::detail::StreamBudget::Lease> workflow_run_lease;
 
             // Audit helper. Returns true when the audit row persisted, false when it was
             // dropped, so SOC 2 read/write surfaces can
@@ -8470,6 +8489,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     caller_fn ? caller_fn(*session)
                               : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
                 call.wreq.audit_context = "surface=mcp";
+                // The run's clock starts when the call is taken, so prepare counts against it.
+                call.wreq.deadline = std::chrono::steady_clock::now() + kWorkflowSyncBudget;
                 return call;
             };
             const auto make_workflow_ports = [&]() {
@@ -8545,6 +8566,35 @@ McpServer::HandlerFn McpServer::build_handler(
                                          /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                 "application/json");
             };
+            // An execute_workflow run refused at ADMISSION (cap or draining): the same HTTP 429 /
+            // 503 + Retry-After and honest retry_after_ms the streamed-POST cap answers, with the
+            // budget's own reason token. Nothing was read, sent or audited (the counter is the
+            // record) and no approval ticket was spent. The code is the existing stream-cap code
+            // (-32012) for a cap and the existing shutdown code (-32015) while draining.
+            const auto respond_workflow_admission_refused = [&](const WorkflowExecuteOutcome& out) {
+                const bool draining = out.status == WorkflowExecuteStatus::kDraining;
+                res.status = draining ? 503 : 429;
+                res.set_header("Retry-After",
+                               std::to_string((kWorkflowRunCapRetryAfterMs + 999) / 1000));
+                res.set_content(a4_error(draining ? kMcpShuttingDown : kMcpStreamCap, out.message,
+                                         out.remediation,
+                                         static_cast<long>(kWorkflowRunCapRetryAfterMs), {}, true,
+                                         out.reason),
+                                "application/json");
+            };
+            // Leases the run's slot from the ONE shared budget, or answers the refusal. True ==
+            // the lease is held in `workflow_run_lease` for the rest of the request.
+            const auto admit_workflow_run_mcp = [&]() -> bool {
+                auto admission = admit_workflow_run(stream_budget, draining_fn_, session->username,
+                                                    metrics);
+                if (admission.refusal) {
+                    respond_workflow_admission_refused(*admission.refusal);
+                    return false;
+                }
+                if (admission.lease)
+                    workflow_run_lease.emplace(std::move(admission.lease));
+                return true;
+            };
             // Renders any status the sequence refuses with (everything but kOk, kRunIncomplete and
             // kNoAgentsReached, which are success envelopes).
             const auto render_workflow_refusal = [&](const WorkflowExecuteOutcome& out) {
@@ -8609,6 +8659,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     // stable token a worker branches on.
                     res.set_content(a4_error(kPermissionDenied, out.message, out.remediation, -1,
                                              {}, true, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kRunCapReached:
+                case WES::kDraining:
+                    respond_workflow_admission_refused(out);
+                    return;
+                case WES::kExceedsSyncBudget:
+                    // A property of the stored workflow, permanent until it is replaced: no hint.
+                    res.set_content(a4_error(kInvalidParams, out.message, out.remediation, -1, {},
+                                             true, out.reason),
                                     "application/json");
                     return;
                 case WES::kOk:
@@ -9864,6 +9924,13 @@ McpServer::HandlerFn McpServer::build_handler(
                             return rotation_precondition(row);
                         return {};
                     };
+                    // #2146 execute_workflow: the run's held-open slot is taken BEFORE the
+                    // one-time ticket is spent, so a cap or draining refusal burns nothing and
+                    // the client re-calls with the same approval_id. Every check that can still
+                    // refuse WITHOUT consuming has run above; the consume is the first thing
+                    // that spends. (The handler acquires for a caller that never gets here.)
+                    if (tool_name == "execute_workflow" && !admit_workflow_run_mcp())
+                        return;
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
                     if (auto consumed = approval_manager->consume_ticket(
@@ -22319,6 +22386,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 const auto call = parse_workflow_call();
                 if (!call)
+                    return;
+                // Admission: the recall arm normally holds the lease already (it took it before
+                // the ticket was spent); a caller that did not go through it takes it here, before
+                // any read of the workflow.
+                if (!workflow_run_lease && !admit_workflow_run_mcp())
                     return;
                 const auto ports = make_workflow_ports();
                 WorkflowExecuteRequest wreq = call->wreq;

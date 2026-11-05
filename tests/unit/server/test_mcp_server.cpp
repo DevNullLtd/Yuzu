@@ -78,6 +78,7 @@
 #include "test_workflow_api_double.hpp" // ADR-0031 WS-A4 (eighth family): FnWorkflowApi, seam-bypass tripwire tests
 #include "store_errors.hpp"               // kDbErrorPrefix (list_workflow_executions degrade test)
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
+#include "workflow_execute.hpp" // #2146: kWorkflowSyncBudget, the run budget the MCP cap case asserts
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
 #include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg - #2146 A2-R1
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
@@ -1081,6 +1082,10 @@ struct McpTestServer {
     /// production). Empty (the default) leaves the tool answering "workflow engine not available".
     yuzu::server::WorkflowRunFn workflow_run_for_test;
 
+    /// #2146 D3: the server's draining flag as the MCP server reads it. Empty (the default) is
+    /// never draining.
+    std::function<bool()> draining_for_test;
+
     /// #2146 sec-1: replaces the SHA-256 the execute_workflow ticket binding uses, to drive the
     /// fail-closed refusal. Empty (the default) is the production digest.
     std::function<std::optional<std::string>(std::string_view)> workflow_digest_for_test;
@@ -1915,6 +1920,8 @@ private:
         // the raw engine (see workflow_api_for_test's own doc comment).
         if (workflow_run_for_test)
             mcp.set_workflow_run_fn(workflow_run_for_test);
+        if (draining_for_test)
+            mcp.set_draining_fn(draining_for_test);
         if (workflow_digest_for_test)
             mcp.set_workflow_digest_fn(workflow_digest_for_test);
         if (workflow_api_for_test) {
@@ -48111,6 +48118,8 @@ struct WfMcpFx {
     std::optional<int> zero_on_dispatch;
     std::vector<yuzu::server::StepDispatchError> step_errors; // failed step callbacks, in order
     std::function<void(int)> on_authorize; // called with the 0-based authorizer call index
+    std::function<void()> on_run;          // called inside the run port once the run is admitted
+    std::optional<std::chrono::steady_clock::time_point> seen_deadline; // the run's control.deadline
     std::shared_ptr<yuzu::server::test::FnWorkflowApi> api;
 
     // An editor repoints a stored step instruction at another (plugin, action).
@@ -48191,8 +48200,11 @@ struct WfMcpFx {
                                           const yuzu::server::WorkflowRunControl& control)
             -> std::expected<std::string, std::string> {
             ++run_calls;
+            seen_deadline = control.deadline;
             if (control.on_admitted) // as the real engine: once admitted, before step 1
                 control.on_admitted("exec-1");
+            if (on_run)
+                on_run();
             for (const auto& sid : step_ids) {
                 const auto r = fn(sid, "[]", "{}");
                 if (!r)
@@ -48672,6 +48684,133 @@ TEST_CASE("MCP execute_workflow: a run that throws after the requested row is -3
     CHECK(wf_audit_has(ts, "failure", "execution_id=exec-1"));
     CHECK(wf_audit_has(ts, "failure", "agents_sent=3"));
     CHECK_FALSE(wf_audit_has(ts, "success", "execution_id"));
+}
+
+TEST_CASE("MCP execute_workflow: a run refused for CAPACITY or DRAINING spends no approval ticket, "
+          "holds a lease for the whole run, and carries a 60 s deadline",
+          "[mcp][pg][workflow][twin][security][tier][approval][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
+    bool draining = false;
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.stream_budget_for_test = &budget;
+    ts.draining_for_test = [&draining] { return draining; };
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    namespace sb = yuzu::server::detail;
+
+    const std::string approval_id = wf_mint_and_approve(ts, appr);
+    REQUIRE(appr.get(approval_id).has_value());
+    CHECK(appr.get(approval_id)->consumed_at == 0);
+    const std::size_t audit_rows_before = ts.audit_log.size();
+
+    // (1) This principal already runs as many workflows as it may.
+    std::vector<sb::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < sb::kPerPrincipalWorkflowRun; ++i) {
+        auto r = budget.try_acquire(sb::SseSurface::kWorkflowRun, ts.mock_username,
+                                    sb::kPerPrincipalWorkflowRun);
+        REQUIRE(r.lease);
+        held.push_back(std::move(r.lease));
+    }
+    auto capped = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+    REQUIRE(capped);
+    INFO(capped->body);
+    CHECK(capped->status == 429);
+    CHECK(capped->get_header_value("Retry-After") == "5");
+    const auto cj = nlohmann::json::parse(capped->body);
+    REQUIRE(cj.contains("error"));
+    CHECK(cj["error"]["code"] == yuzu::server::mcp::kMcpStreamCap);
+    CHECK(cj["error"]["data"]["reason"] == "per_principal_stream_cap");
+    CHECK(cj["error"]["data"]["retry_after_ms"] == 5000);
+    // Nothing was read, sent or audited, and THE TICKET IS STILL UNSPENT.
+    CHECK(fx.run_calls == 0);
+    CHECK(fx.dispatches == 0);
+    CHECK(appr.get(approval_id)->consumed_at == 0);
+    CHECK(ts.audit_log.size() == audit_rows_before); // a capacity refusal writes no audit row
+
+    // (2) The server is draining: 503 / -32015, the ticket is again unspent.
+    held.clear();
+    draining = true;
+    auto drained = ts.call(wf_exec_call(wf_recall_args(approval_id), 3));
+    REQUIRE(drained);
+    CHECK(drained->status == 503);
+    CHECK(drained->get_header_value("Retry-After") == "5");
+    const auto dj = nlohmann::json::parse(drained->body);
+    CHECK(dj["error"]["code"] == yuzu::server::mcp::kMcpShuttingDown);
+    CHECK(dj["error"]["data"]["reason"] == "draining");
+    CHECK(fx.run_calls == 0);
+    CHECK(appr.get(approval_id)->consumed_at == 0);
+    CHECK(ts.audit_log.size() == audit_rows_before);
+    CHECK(budget.active() == 0); // a draining refusal took no lease
+
+    // (3) Once the cap clears the SAME ticket redeems. The run holds ONE lease while it runs,
+    // and its deadline is the 60 s budget, stamped when the call was taken.
+    draining = false;
+    std::size_t leases_during_run = 99;
+    fx.on_run = [&] { leases_during_run = budget.active_for_surface(sb::SseSurface::kWorkflowRun); };
+    const auto before = std::chrono::steady_clock::now();
+    auto ok = ts.call(wf_exec_call(wf_recall_args(approval_id), 4));
+    REQUIRE(ok);
+    INFO(ok->body);
+    REQUIRE(nlohmann::json::parse(ok->body).contains("result"));
+    CHECK(leases_during_run == 1);
+    CHECK(budget.active() == 0); // released with the request
+    CHECK(fx.run_calls == 1);
+    CHECK(appr.get(approval_id)->consumed_at != 0);
+    REQUIRE(fx.seen_deadline.has_value());
+    CHECK(*fx.seen_deadline >= before + yuzu::server::kWorkflowSyncBudget);
+    CHECK(*fx.seen_deadline <= std::chrono::steady_clock::now() + yuzu::server::kWorkflowSyncBudget);
+}
+
+TEST_CASE("MCP execute_workflow: a workflow whose retry sleeps exceed the 60 s budget is refused "
+          "before a ticket is minted",
+          "[mcp][pg][workflow][twin][security][tier][approval][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    // Wrap the seeded workflow: step 1 may sleep 61 s in the worst case.
+    auto inner = fx.api;
+    fx.api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        [inner](const std::string& id)
+            -> std::expected<std::optional<yuzu::server::Workflow>, std::string> {
+            auto w = inner->get_workflow(id);
+            if (w && *w) {
+                (*w)->steps[0].retry_count = 61;
+                (*w)->steps[0].retry_delay_seconds = 1;
+            }
+            return w;
+        },
+        [](const std::string&)
+            -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
+            return std::optional<yuzu::server::WorkflowExecution>{};
+        });
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    auto refused = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+    REQUIRE(refused);
+    INFO(refused->body);
+    const auto j = nlohmann::json::parse(refused->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(j["error"]["data"]["reason"] == "workflow_exceeds_sync_budget");
+    CHECK(j["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK(fx.run_calls == 0);
+    CHECK(fx.dispatches == 0);
 }
 
 TEST_CASE("MCP execute_workflow: a throw BEFORE the requested row keeps the retry hint, because "

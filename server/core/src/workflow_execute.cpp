@@ -12,6 +12,7 @@
 #include "web_utils.hpp" // audit_token (CWE-117)
 
 #include <yuzu/log_token.hpp>
+#include <yuzu/metrics.hpp>
 #include <yuzu/protective_actions.hpp>
 
 #include <nlohmann/json.hpp>
@@ -180,6 +181,8 @@ nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,
         j["run_status"] = o.run_status;
         j["retryable"] = false;
         j["message"] = o.message;
+        if (o.deadline_exceeded)
+            j["reason"] = o.reason; // "deadline_exceeded"
     }
     if (!o.audit_persisted)
         j["audit_persisted"] = false;
@@ -219,8 +222,9 @@ std::string_view workflow_run_outcome_token(WorkflowRunOutcome outcome) {
 }
 
 WorkflowRunOutcome classify_workflow_run(std::string_view run_status, bool late_denied,
-                                         const std::vector<WorkflowStepDispatchNote>& steps) {
-    if (late_denied)
+                                         const std::vector<WorkflowStepDispatchNote>& steps,
+                                         bool deadline_exceeded) {
+    if (late_denied || deadline_exceeded)
         return WorkflowRunOutcome::kAborted;
     const bool any_reached = std::any_of(steps.begin(), steps.end(),
                                          [](const auto& n) { return n.agents_reached > 0; });
@@ -231,6 +235,62 @@ WorkflowRunOutcome classify_workflow_run(std::string_view run_status, bool late_
     if (run_status == "completed" && all_reached)
         return WorkflowRunOutcome::kSucceeded;
     return any_reached ? WorkflowRunOutcome::kPartial : WorkflowRunOutcome::kFailed;
+}
+
+// ── admission ─────────────────────────────────────────────────────────────
+
+WorkflowRunAdmission admit_workflow_run(detail::StreamBudget* budget,
+                                        const std::function<bool()>& draining,
+                                        const std::string& principal,
+                                        yuzu::MetricsRegistry* metrics) {
+    WorkflowRunAdmission out;
+    const auto count = [&](std::string_view reason) {
+        if (!metrics)
+            return;
+        try {
+            metrics->counter(kWorkflowRunRefusedMetric, {{"reason", std::string(reason)}})
+                .increment();
+        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+        }
+    };
+    // Draining first: StreamBudget::try_acquire does not consult its closing flag, and a run
+    // admitted now would hold the drain open for up to the whole run budget.
+    if (draining && draining()) {
+        count(kWorkflowRunRefusedDraining);
+        out.refusal = refuse(WorkflowExecuteStatus::kDraining,
+                             "the server is shutting down and is not starting new workflow runs",
+                             kWorkflowRunRefusedDraining, /*retryable=*/true);
+        out.refusal->remediation =
+            "retry after the server restarts, or against another replica; nothing was sent";
+        return out;
+    }
+    if (!budget)
+        return out; // unmetered seam (test harness)
+    auto acquired = budget->try_acquire(detail::SseSurface::kWorkflowRun, principal,
+                                        detail::kPerPrincipalWorkflowRun);
+    if (acquired.lease) {
+        out.lease = std::move(acquired.lease);
+        return out;
+    }
+    const std::string_view why = acquired.reject_reason != nullptr
+                                     ? std::string_view(acquired.reject_reason)
+                                     : std::string_view(detail::StreamBudget::kRejectGlobal);
+    const bool per_principal = why == detail::StreamBudget::kRejectPerPrincipal;
+    count(per_principal ? detail::StreamBudget::kRejectPerPrincipal
+                        : detail::StreamBudget::kRejectGlobal);
+    out.refusal = refuse(WorkflowExecuteStatus::kRunCapReached,
+                         per_principal ? "this principal already has as many workflow runs in "
+                                         "progress as it may"
+                                       : "the server is running as many held-open requests as it "
+                                         "is sized for",
+                         per_principal ? detail::StreamBudget::kRejectPerPrincipal
+                                       : detail::StreamBudget::kRejectGlobal,
+                         /*retryable=*/true);
+    out.refusal->remediation =
+        per_principal
+            ? "wait for one of your workflow runs to finish, then retry; nothing was sent"
+            : "retry shortly; nothing was sent";
+    return out;
 }
 
 // ── step-effect binding ───────────────────────────────────────────────────
@@ -366,6 +426,31 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
     if (workflow.steps.empty())
         return std::unexpected(refuse(WorkflowExecuteStatus::kInvalidWorkflow,
                                       "workflow has no steps", "workflow_no_steps"));
+    // The synchronous budget: the most a run could SLEEP between retries, summed over the steps
+    // (retry_count x retry_delay_seconds each), must fit inside kWorkflowSyncBudget. This models
+    // sleeps only. It does not model dispatch time or `foreach` fan-out (each item is a dispatch
+    // inside one attempt), so it is a prefilter for a workflow that cannot finish in the budget
+    // even when every dispatch is instant; the run's deadline is the real bound. Like a workflow
+    // with no steps this is a property of the stored workflow: no row is written, nothing is sent.
+    {
+        std::int64_t worst_sleep_s = 0;
+        for (const auto& step : workflow.steps) {
+            worst_sleep_s += static_cast<std::int64_t>(std::max(step.retry_count, 0)) *
+                             std::max(step.retry_delay_seconds, 0);
+            if (worst_sleep_s > kWorkflowSyncBudget.count()) {
+                WorkflowExecuteOutcome o = refuse(
+                    WorkflowExecuteStatus::kExceedsSyncBudget,
+                    "the workflow's retry delays could add up to more than the " +
+                        std::to_string(kWorkflowSyncBudget.count()) +
+                        " second budget of one run",
+                    "workflow_exceeds_sync_budget");
+                o.remediation = "reduce the retry count or retry delay of the workflow's steps "
+                                "(the sum over the steps of retryCount x retryDelay must not "
+                                "exceed the budget) and create a new workflow; nothing was sent";
+                return std::unexpected(std::move(o));
+            }
+        }
+    }
 
     // ── 3 + 4. every step admitted, or the whole run is refused ──────────
     // The chokepoint dry run is asked once per distinct (plugin, action): its answer depends on
@@ -487,6 +572,8 @@ struct RunProgress {
     int agents_sent{0};
     std::vector<WorkflowStepDispatchNote> notes;
     bool late_denied{false};
+    /// The engine asked `before_attempt` after the deadline and was told to stop.
+    bool deadline_hit{false};
 };
 
 /// Step 6 and the closing row. Anything it throws is answered by the caller as `kRunFailed`.
@@ -607,6 +694,19 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     control.on_admitted = [&progress](const std::string& execution_id) {
         progress.execution_id = execution_id;
     };
+    // The run is bounded (kWorkflowSyncBudget). The transport stamps the deadline when it takes
+    // the call; a request without one is still bounded from here. The hook is the authority the
+    // engine consults before every attempt, so "the run was stopped by its deadline" is recorded
+    // here, at the moment of the refusal, and never inferred from a clock afterwards.
+    const auto deadline = req.deadline.value_or(std::chrono::steady_clock::now() +
+                                                kWorkflowSyncBudget);
+    control.deadline = deadline;
+    control.before_attempt = [&progress, deadline] {
+        if (std::chrono::steady_clock::now() < deadline)
+            return true;
+        progress.deadline_hit = true;
+        return false;
+    };
     const auto run = ports.run(req.workflow_id, req.agent_ids, dispatch_fn, condition_fn, control);
     if (!run) {
         const bool db = is_generic_db_error(run.error());
@@ -635,7 +735,8 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     if (const auto ex = ports.api->get_workflow_execution(*run); ex && *ex)
         o.run_status = (*ex)->status;
 
-    o.run_outcome = classify_workflow_run(o.run_status, late_denied, o.steps);
+    o.deadline_exceeded = progress.deadline_hit;
+    o.run_outcome = classify_workflow_run(o.run_status, late_denied, o.steps, o.deadline_exceeded);
     const bool any_reached = std::any_of(o.steps.begin(), o.steps.end(),
                                          [](const auto& n) { return n.agents_reached > 0; });
     if (o.run_outcome == WorkflowRunOutcome::kSucceeded) {
@@ -647,11 +748,17 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         o.reason = std::string(workflow_run_outcome_token(o.run_outcome));
         o.retryable = false;
         o.message =
-            o.run_outcome == WorkflowRunOutcome::kAborted
+            o.deadline_exceeded
+                ? "the workflow started and some steps were sent, but the run reached its " +
+                      std::to_string(kWorkflowSyncBudget.count()) +
+                      " second time budget and was stopped; the remaining steps did not run"
+            : o.run_outcome == WorkflowRunOutcome::kAborted
                 ? "the workflow started and some steps were sent, but a step was refused at "
                   "dispatch because its definition changed; the rest did not run"
                 : "the workflow started and some steps were sent, but it did not complete on "
                   "every step; read the run with get_workflow_execution before starting another";
+        if (o.deadline_exceeded)
+            o.reason = "deadline_exceeded";
     } else {
         o.status = WorkflowExecuteStatus::kNoAgentsReached;
         const WorkflowStepDispatchNote* first_zero = nullptr;
@@ -661,7 +768,15 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                 break;
             }
         }
-        if (first_zero) {
+        if (o.deadline_exceeded) {
+            // The deadline ended the run before any step reached an agent: it is the cause,
+            // whatever an earlier zero-reach step said, and a retry would only race it again.
+            o.reason = "deadline_exceeded";
+            o.retryable = false;
+            o.message = "the workflow started but reached its " +
+                        std::to_string(kWorkflowSyncBudget.count()) +
+                        " second time budget before any step reached an agent, and was stopped";
+        } else if (first_zero) {
             o.reason = first_zero->reason;
             o.retryable = first_zero->retryable;
             o.message = first_zero->reason == "definition_changed"
@@ -694,7 +809,9 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             (late_denied ? " late_denied=true" : "") +
             (succeeded ? ""
                        : " run_outcome=" + std::string(workflow_run_outcome_token(o.run_outcome))) +
-            (o.status == WorkflowExecuteStatus::kNoAgentsReached ? " reason=" + o.reason : ""));
+            (o.status == WorkflowExecuteStatus::kNoAgentsReached || o.deadline_exceeded
+                 ? " reason=" + o.reason
+                 : ""));
     return o;
 }
 
