@@ -1291,7 +1291,8 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // the INSERT's foreign-key check waits, then fails 23503 (Rejected). The UPDATE arm takes no
 // rule-row lock at all. `insert_events` (the batch
 // path, no production caller) takes census rows in batch order across pairs and carries no such
-// guarantee: two concurrent batches can deadlock, which surfaces per statement as Failed.
+// guarantee: two concurrent batches can deadlock, which surfaces per statement as Failed (and
+// then rolls the batch back).
 
 constexpr std::int64_t kReceiptSkewCapNs = 300'000'000'000LL; // receipt + 300 s bounds the key
 
@@ -1351,7 +1352,8 @@ enum class CensusOutcome {
     PendingRetired, // repair only: the event's pending evidence was retired concurrently
     Rejected,       // the rule is gone (the census foreign key, 23503); definitive, not a fault
     Failed,         // any other statement error; savepoint rolled back and released; the event is
-                    // left with pending evidence (a first delivery records it now, a repair has it)
+                    // left with pending evidence (a first delivery records it now, a repair has
+                    // it; a batch aborts and rolls back instead)
     Abandoned,      // a savepoint control or the pending-evidence write failed; abandon the txn
 };
 
@@ -1974,8 +1976,8 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
     for (const auto& row : rows) {
         const OrderingKey ordering = derive_ordering_key(
             row.agent_ns, row.received_ns != 0 ? row.received_ns : wall_clock_ns());
-        // projection_pending is explicitly false: this path does not abort on a failed census
-        // write, so it would otherwise strand evidence nothing repairs (no production caller).
+        // projection_pending is explicitly false: this path records no pending evidence, so a
+        // failed census write aborts the batch (below) instead of stranding the event.
         pg::PgResult ins = pg::exec_params(
             conn,
             "INSERT INTO guaranteed_state_store.guaranteed_state_events "
@@ -2011,7 +2013,7 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
         const std::int64_t ingest_seq = to_i64(PQgetvalue(ins.get(), 0, 0));
         // Census upsert inside the batch transaction, rolled back with the batch on any later
         // failure; a refused or failed census write is isolated by its own savepoint, as in
-        // insert_event_classified.
+        // insert_event_classified (a failed one then aborts the batch, below).
         if (census_bearing(row)) {
             const CensusOutcome projected =
                 project_rule_status(conn, census_proj_failures_, census_lock_barrier_, row,

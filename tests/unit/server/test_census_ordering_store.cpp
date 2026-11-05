@@ -829,6 +829,7 @@ TEST_CASE("census ordering: the batch path orders by key and rolls back on a fai
     // neither event is stored and the census row is unchanged.
     install_census_fail(db.dsn(), "true");
     const auto events_before = store.event_count();
+    REQUIRE(events_before == 2); // a degraded read returns 0; the comparison below must not be vacuous
     const auto m = store.insert_events(
         {ev("b3", "r1", "a", kErrored, kBase + 300), ev("b4", "r1", "a", kDrifted, kBase + 400)});
     REQUIRE_FALSE(m.has_value());

@@ -4182,9 +4182,9 @@ public:
         metrics_.describe(
             "yuzu_server_guardian_census_proj_failures_total",
             "Compliance-census (guardian_agent_rule_status) writes that failed "
-            "for a reason other than the rule not existing. The failure does not "
-            "discard the source event: it stays stored with pending census "
-            "evidence (for source batch the whole batch is rolled back instead), and the pair keeps its previous state "
+            "for a reason other than the rule not existing. The failure of a single "
+            "event does not discard it: it stays stored with pending census "
+            "evidence, and the pair keeps its previous state "
             "until a redelivery of that event repairs it or a later event for the pair arrives. A "
             "repair that fails is counted here again. >0 means the census may be "
             "stale; the server log line 'census upsert failed' names the agent "
@@ -4201,7 +4201,8 @@ public:
                           "marks the pair order_uncertain. pending_retired is a repair that found "
                           "its evidence already retired; rejected is a write refused because the "
                           "rule is gone (not a fault); failed is a fault that leaves pending "
-                          "evidence, except for source batch, whose failure rolls back the whole batch (see "
+                          "evidence, except for source batch, whose failure rolls back the whole batch "
+                          "(this count is not rolled back; see "
                           "..._census_proj_failures_total); abandoned aborted the "
                           "transaction (counted again as an ingest error). Counted when the "
                           "projection returns, before the transaction commits. Resets on server "

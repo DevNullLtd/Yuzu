@@ -2539,8 +2539,7 @@ TEST_CASE("GuaranteedStateStore: insert_events batch projects only observations"
 
 TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the sentinel",
           "[pg][guaranteed_state_store][events][dex][security]") {
-    // Adversarial-review F1: the batch insert_events path (the preferred gRPC
-    // GuaranteedStatePush ingest) must apply the SAME sentinel guard as the
+    // Adversarial-review F1: the batch insert_events path (no production caller today) must apply the SAME sentinel guard as the
     // single-row path — a batch carrying rule_id="__observation__" with a
     // census-mapping event_type (drift.detected) must NOT mint a phantom
     // (agent, __observation__) census row (§24). Enforce server-side, never trust
@@ -3733,7 +3732,7 @@ TEST_CASE("GuaranteedStateStore: a census write for a deleted rule keeps the eve
     }
 }
 
-TEST_CASE("GuaranteedStateStore: a failed census write keeps the event, is counted once, and "
+TEST_CASE("GuaranteedStateStore: a failed census write keeps a single event, is counted once, and "
           "leaves the old census row and the transaction intact",
           "[pg][guaranteed_state_store][events][census]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
@@ -3775,7 +3774,7 @@ TEST_CASE("GuaranteedStateStore: a failed census write keeps the event, is count
         CHECK(store.event_count() == 1);
         CHECK(store.census_proj_failures_total() == 1);
         CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
-        CHECK(census_count(db.dsn()) == "1"); // agent-B and agent-C never reached the census
+        CHECK(census_count(db.dsn()) == "1"); // agent-B's row from b1 was rolled back; agent-C never ran
     }
 }
 
