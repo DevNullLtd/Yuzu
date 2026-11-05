@@ -41,6 +41,17 @@ def windows_job_steps(text):
     return {p.split("\n", 1)[0].strip(): p for p in parts}, [p.split("\n", 1)[0].strip() for p in parts]
 
 
+def code_only(text):
+    """The script with quoted strings and # comments blanked, line by line (a lexical approximation, enough to keep
+    prose and string literals such as the self-test's `-Command "...; exit 3"` from being mistaken for statements)."""
+    out = []
+    for line in text.splitlines():
+        line = re.sub(r"'[^'\n]*'", "''", line)
+        line = re.sub(r'"[^"\n]*"', '""', line)
+        out.append(line.split("#", 1)[0])
+    return "\n".join(out)
+
+
 def main():
     errors = []
     steps, order = windows_job_steps(CI.read_text(encoding="utf-8"))
@@ -72,14 +83,17 @@ def main():
             if "-SelfTest" in steps[name]:
                 errors.append(f"{name!r} must not pass -SelfTest")
             # the script's ValidateSet makes any other value a parameter-binding failure, which is a red step
-            if not re.search(rf"stop-dead-etw-sessions\.ps1 -Phase {phase}\s*$", steps[name], re.M):
+            if not re.search(rf"^\s*run:\s+\./scripts/ci/stop-dead-etw-sessions\.ps1 -Phase {phase}\s*$", steps[name], re.M):
                 errors.append(f"{name!r} must run the script with exactly `-Phase {phase}`")
 
     ps1 = PS1.read_text(encoding="utf-8")
     if any(ord(c) > 127 for c in ps1):
         errors.append("stop-dead-etw-sessions.ps1 must be ASCII only")
-    # no `exit` with a non-zero code anywhere in the file (functions included): only a -SelfTest throw may fail a step
-    if [c for c in re.findall(r"^\s*exit\s+(\S+)", ps1, re.M) if c != "0"]:
+    # no `exit` with a non-zero code anywhere in the file (functions included), at the start of a line or after `;`,
+    # `{` or `(`; only a -SelfTest throw may fail a step
+    code = code_only(ps1)
+    bad_exit = [c.rstrip(";})") for c in re.findall(r"(?:^|[;{(])\s*exit\s+(\S+)", code, re.M)]
+    if any(c != "0" for c in bad_exit) or re.search(r"(?:^|[;{(])\s*exit\s*(?:$|[;})])", code, re.M):
         errors.append("the script must only ever `exit 0` (a failed -SelfTest expectation throws instead)")
     outside = ps1.split("if ($SelfTest) {", 1)
     # the self-test block ends at the first top-level `exit 0` + `}`; everything after it is real mode
@@ -87,8 +101,8 @@ def main():
     if not real_mode:
         errors.append("could not find the end of the -SelfTest block (expected `    exit 0` then `}`)")
     else:
-        if "exit 1" in real_mode or re.search(r"^\s*throw\b", real_mode, re.M):
-            errors.append("real mode must never `exit 1`/`throw` (housekeeping must not fail the job)")
+        if re.search(r"^\s*throw\b", code_only(real_mode), re.M):
+            errors.append("real mode must never start a statement with `throw` (housekeeping must not fail the job)")
         code_lines = [l.strip() for l in real_mode.splitlines() if l.strip() and not l.strip().startswith("#")]
         # the FIRST statement of real mode opens the catch-all, and the last-but-one closes it with a catch
         if not code_lines or code_lines[0] != "try {":

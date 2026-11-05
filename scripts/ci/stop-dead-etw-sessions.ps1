@@ -115,7 +115,7 @@ function Invoke-NativeBounded {
             try { $p.Kill() } catch { }
             return [pscustomobject]@{ TimedOut = $true; Code = -1; Lines = @() }
         }
-        $p.WaitForExit()   # flush the async readers
+        $p.WaitForExit()   # the process is fully reaped; the bounded Wait below is what waits for the readers
         # the child has exited; a reader only stays pending if something else still holds the pipe, so bound the wait
         if (-not ($out.Wait(5000) -and $err.Wait(5000))) {
             return [pscustomobject]@{ TimedOut = $true; Code = -1; Lines = @() }
