@@ -695,6 +695,7 @@ yuzu_server_core_lib = static_library(
     'src/rest_a4_envelope.cpp', # A4 error envelope + correlation id (moved out of rest_api_v1.cpp: lib-split back edge)
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
+    'src/post_read_stage.cpp', # per-server post-read stage (body cap + step-up) the HttplibRouteSink wraps handlers with
     'src/route_inventory.cpp', # process-wide record of HttplibRouteSink registrations (boot-time step-up sweep)
     'src/step_up_gate.cpp', # MFA step-up decide/render split + request chokepoint (policy table: src/step_up_policy.hpp)
     'src/mfa_qr.cpp',
@@ -1018,6 +1019,7 @@ yuzu_server_routes_lib = static_library(
     'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
     'src/device_ui.cpp',
     'src/inventory_routes.cpp',
+    'src/software_curation_routes.cpp',
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',
