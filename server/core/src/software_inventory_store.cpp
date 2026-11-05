@@ -1607,7 +1607,6 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         };
 
         enum class Step { kApplied, kMismatch, kFail };
-        const auto sqlstate_is_unique = [](const std::string& state) { return state == "23505"; };
 
         // An installed_software full or delta section, already inside its savepoint.
         const auto apply_rows = [&](std::size_t i, const Held* prior,
@@ -1645,7 +1644,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 if (!p.rows.empty()) {
                     std::string state;
                     if (!insert_entries(c, agent_id_s, p.rows, &state))
-                        return sqlstate_is_unique(state) ? Step::kMismatch : Step::kFail;
+                        return state == "23505" ? Step::kMismatch : Step::kFail;
                 }
                 // Verify: the facet as the table now holds it must hash to what the agent holds.
                 std::vector<SoftwareEntry> now_rows;
@@ -1727,7 +1726,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
             if (!p.comps.empty()) {
                 std::string state;
                 if (!insert_components(c, agent_id_s, p.comps, ts, &state))
-                    return sqlstate_is_unique(state) ? Step::kMismatch : Step::kFail;
+                    return state == "23505" ? Step::kMismatch : Step::kFail;
             }
             if (sec.status == V3Status::kDelta) {
                 std::vector<V3Component> now_rows;
@@ -1790,15 +1789,15 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 continue;
             }
 
-            const std::string sp = "s" + std::to_string(i);
-            if (!exec_ok(("SAVEPOINT " + sp).c_str()))
+            // One constant name: each savepoint is released before the next section starts.
+            if (!exec_ok("SAVEPOINT sec"))
                 return fail("savepoint");
             std::array<std::int64_t, 3> counts{};
             const Step step = is_component(i) ? apply_components(i) : apply_rows(i, prior, counts);
             if (step == Step::kFail)
                 return fail("section apply");
             if (step == Step::kMismatch) {
-                if (!exec_ok(("ROLLBACK TO SAVEPOINT " + sp).c_str()))
+                if (!exec_ok("ROLLBACK TO SAVEPOINT sec"))
                     return fail("savepoint rollback");
                 done[i] = O::kMismatch;
             } else {
@@ -1807,7 +1806,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 done[i] = O::kStored;
                 wrote = true;
             }
-            if (!exec_ok(("RELEASE SAVEPOINT " + sp).c_str()))
+            if (!exec_ok("RELEASE SAVEPOINT sec"))
                 return fail("savepoint release");
         }
 
