@@ -43,7 +43,11 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_DIR = Path(os.environ.get("YUZU_ENSURE_SCRIPT_DIR", ROOT / "scripts" / "test"))
 FARM_TOOLS = ("bash sh dirname basename sed head grep readlink sha256sum shasum cut cat ls mkdir rm ln mv "
-              "uname touch chmod tr mktemp tail wc od find rmdir sleep").split()
+              "uname touch chmod tr mktemp tail wc od find rmdir sleep stat").split()
+
+# What the script writes, and what a stale stamp looks like (a SHA-256, as the script requires of a stamp).
+TOKEN = "yuzu-gcovr-venv v1\n"
+ZERO_SHA = "0" * 64 + "\n"
 
 # A sequence stub: STUB_<VAR> is a space-separated list of outcomes ("ok"/"fail"), one per call; the
 # last repeats. The call count lives in $STUB_LOG.<name>.
@@ -130,7 +134,7 @@ exit @RC
 # python3 builds a stub venv: bin/{pip,gcovr,python}. pip honours STUB_PIP_RC; the venv's python is
 # the health probe (`import gcovr, jinja2, ...`) and succeeds unless STUB_VENV_HEALTHY=0. Venv creation
 # records, in $STUB_LOG.venv, whether the build marker already existed at that moment and whether a
-# moved-aside copy of the previous venv (marked by a `sentinel` file) is visible, and, in
+# moved-aside copy of the previous venv (marked by a share/sentinel file) is visible, and, in
 # $STUB_LOG.fd9, whether the lock descriptor reached it (as it does for pip, and not for the venv's own
 # gcovr and python, which the script runs as probes).
 PYTHON3 = """#!/bin/sh
@@ -144,7 +148,7 @@ if [ "$1" = -c ]; then
   exit 0
 fi
 if [ "$1" = -m ] && [ "$2" = venv ]; then
-  aside=0; for d in "$3".yuzu-gcovr-old.*; do [ -e "$d/sentinel" ] && aside=1; done
+  aside=0; for d in "$3".yuzu-gcovr-old.*; do [ -e "$d/share/sentinel" ] && aside=1; done
   echo "marker=$([ -e "$3/.yuzu-gcovr-venv" ] && echo 1 || echo 0) aside=$aside" >> "$STUB_LOG.venv"
   echo "venv-create """ + _FD9 + """" >> "$STUB_LOG.fd9"
   mkdir -p "$3/bin"; echo "home = /stub" > "$3/pyvenv.cfg"
@@ -167,6 +171,21 @@ echo "venv-python """ + _FD9 + """" >> "$STUB_LOG.fd9"
 [ "${STUB_VENV_HEALTHY:-1}" = 1 ]
 EOF
   chmod +x "$3/bin/pip" "$3/bin/gcovr" "$3/bin/python"
+  # Awkward states a test can ask the venv step to leave behind (all off by default):
+  [ "${STUB_VENV_FORGE:-0}" = 1 ] && echo "somebody else's file" > "$3/precious.txt"
+  [ "${STUB_VENV_LOCKED:-0}" = 1 ] && { mkdir -p "$3/share/locked"; : > "$3/share/locked/f"; chmod 555 "$3/share/locked"; }
+  [ "${STUB_VENV_STAMP_RO:-0}" = 1 ] && { echo 0000000000000000000000000000000000000000000000000000000000000000 > "$3/.requirements-ci.sha256"; chmod 444 "$3/.requirements-ci.sha256"; }
+  if [ -n "${STUB_SWAP_ASIDE:-}" ]; then
+    for d in "$3".yuzu-gcovr-old.*; do
+      [ -d "$d" ] || continue
+      mv "$d" "$3.aside-moved"
+      case "$STUB_SWAP_ASIDE" in
+        dir) mkdir "$d"; echo foreign > "$d/f";;
+        link) ln -s "$3.aside-moved" "$d";;
+      esac
+    done
+  fi
+  [ "${STUB_VENV_SYMLINK:-0}" = 1 ] && { mv "$3" "$3.real"; ln -s "$3.real" "$3"; }
 fi
 exit 0
 """
@@ -275,21 +294,40 @@ class Sandbox:
             raise AssertionError(f"{script} still running after {timeout}s (blocked?)") from e
 
 
-# What the "real tree and real HOME were not written" guard watches. It must name only what the
-# helpers can write: a whole-checkout `git status` also sees files other suites create next to this one
-# (gateway/**/*.coverdata with pid-dependent names, in a tracked directory so each is listed), which made
-# every test fail in the CI docs suite whether or not a helper wrote anything.
-#   - tests/puppeteer/node_modules (the directory, its top-level entries, npm's own .package-lock.json and
-#     this repo's stamp), tests/puppeteer/package.json and package-lock.json (content);
-#   - every file under scripts/test (content; __pycache__ excluded) and requirements-ci.in / .txt;
-#   - the real HOME's paths the helpers write: the gcovr venv and its lock, the ~/.local/bin/gcovr link,
-#     the puppeteer lock file and browser cache directory.
+# WHAT THE "real tree and real HOME were not written" GUARD WATCHES, exactly. It names only paths the
+# helpers can write, because a whole-checkout `git status` also sees files other suites create next to this
+# one (gateway/**/*.coverdata with pid-dependent names in a tracked directory, build directories,
+# screenshots), which made every case fail in the CI docs suite whether or not a helper wrote anything.
+#
+# Covered, in the checkout:
+#   - tests/puppeteer/node_modules: the directory, its top-level names, npm's own .package-lock.json (stat AND
+#     content hash) and this repo's stamp (stat and content), plus a bounded stat-walk (name, kind, size,
+#     mtime, mode) of everything down to depth 2 (node_modules/<package>/<entry>);
+#   - tests/puppeteer/package.json and package-lock.json (content hash and file mode);
+#   - every file and directory under scripts/test (content hash and mode; __pycache__ excluded by name);
+#   - requirements-ci.in and requirements-ci.txt (content hash and mode).
+# Covered, in the real HOME:
+#   - ~/.local/share/yuzu: the names in it (the venv, its lock, and any <venv>.yuzu-gcovr-old.* sibling),
+#     the venv itself (stat, names, marker and stamp content) and the content hash of its bin/gcovr;
+#   - ~/.local/bin/gcovr, the one link the helper writes there (not the rest of ~/.local/bin: pip --user and
+#     other jobs on a shared account write there);
+#   - ~/.cache/yuzu-ensure-puppeteer.lock and the ~/.cache/puppeteer directory itself (stat).
+# NOT covered: anything below depth 2 of node_modules; anything below the top level of ~/.cache/puppeteer;
+# ~/.npm and ~/.cache/pip; the rest of ~/.local/bin; __pycache__ directories; the mtime of a file that was
+# rewritten with identical content and restored mtime (only content-hashed paths see content); every other
+# path in the checkout (a helper that wrote to, say, docs/ would pass). The sandbox, not this guard, is what
+# keeps the helpers inside their temp HOME and temp repo copy; this is the tripwire for the paths that
+# matter most if that failed.
+# On a developer box the HOME half can also trip on a REAL /test running in another worktree at the same
+# time (it installs into the same paths); that is a race with the box, not a defect of the helper under test.
 GUARD_HOME_PATHS = (".local/share/yuzu/gcovr-venv", ".local/share/yuzu/gcovr-venv.lock", ".local/bin/gcovr",
                     ".cache/yuzu-ensure-puppeteer.lock", ".cache/puppeteer")
+GUARD_WALK_DEPTH = 2
 
 
 def _sig(path):
-    """A content-free signature of one path, never following a link; None when it does not exist."""
+    """A content-free signature of one path (type, size, mtime, mode), never following a link; None when it
+    does not exist."""
     try:
         st = os.lstat(path)
     except OSError:
@@ -297,8 +335,8 @@ def _sig(path):
     if stat.S_ISLNK(st.st_mode):
         return ("link", os.readlink(path))
     if stat.S_ISDIR(st.st_mode):
-        return ("dir", st.st_mtime_ns)
-    return ("file", st.st_size, st.st_mtime_ns)
+        return ("dir", st.st_mtime_ns, st.st_mode & 0o7777)
+    return ("file", st.st_size, st.st_mtime_ns, st.st_mode & 0o7777)
 
 
 def _sha(path):
@@ -306,6 +344,12 @@ def _sha(path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         return None
+
+
+def _content(path):
+    """Content hash plus mode of one file; None when it does not exist."""
+    sig = _sig(path)
+    return None if sig is None else (_sha(path), sig[-1] if sig[0] != "link" else sig)
 
 
 def _names(path):
@@ -316,7 +360,7 @@ def _names(path):
 
 
 def _tree(path):
-    """{relative path: ("file", sha) | ("link", target) | ("dir",)} for everything below `path`
+    """{relative path: ("file", sha, mode) | ("link", target) | ("dir", mode)} for everything below `path`
     (__pycache__ directories excluded: Python writes them on import and they are not the helpers')."""
     out = {}
     for dirpath, dirnames, filenames in os.walk(path):
@@ -327,28 +371,57 @@ def _tree(path):
             if full.is_symlink():
                 out[rel] = ("link", os.readlink(full))
             elif full.is_dir():
-                out[rel] = ("dir",)
+                out[rel] = ("dir", full.stat().st_mode & 0o7777)
             else:
-                out[rel] = ("file", _sha(full))
+                out[rel] = ("file", _sha(full), full.stat().st_mode & 0o7777)
+    return out
+
+
+def _walk(path, depth):
+    """(relative path, kind, size, mtime_ns, mode) for the entries below `path` down to `depth` levels, one
+    stat each, no link followed. Cheap enough for node_modules (about a thousand entries at depth 2)."""
+    base, out = Path(path), []
+
+    def rec(directory, level):
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError:
+            return
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            kind = "link" if stat.S_ISLNK(st.st_mode) else ("dir" if stat.S_ISDIR(st.st_mode) else "file")
+            out.append((str(Path(e.path).relative_to(base)), kind, st.st_size if kind == "file" else 0,
+                        st.st_mtime_ns, st.st_mode & 0o7777))
+            if kind == "dir" and level < depth:
+                rec(e.path, level + 1)
+
+    rec(base, 1)
     return out
 
 
 def guard_snapshot(root, home):
     """What the helpers could have written under `root` (a checkout) and `home` (a HOME), as a dict that
-    compares equal before and after a case that wrote nothing there."""
+    compares equal before and after a case that wrote nothing there. See the comment above for the exact
+    coverage."""
     root, home = Path(root), Path(home)
     pp = root / "tests" / "puppeteer"
     nm = pp / "node_modules"
     snap = {
-        "node_modules": (_sig(nm), _names(nm)),
-        "node_modules/.package-lock.json": _sig(nm / ".package-lock.json"),
+        "node_modules": (_sig(nm), _names(nm), _walk(nm, GUARD_WALK_DEPTH)),
+        "node_modules/.package-lock.json": (_sig(nm / ".package-lock.json"), _sha(nm / ".package-lock.json")),
         "node_modules/stamp": (_sig(nm / ".yuzu-package-lock.sha256"), _sha(nm / ".yuzu-package-lock.sha256")),
-        "tests/puppeteer/package.json": _sha(pp / "package.json"),
-        "tests/puppeteer/package-lock.json": _sha(pp / "package-lock.json"),
+        "tests/puppeteer/package.json": _content(pp / "package.json"),
+        "tests/puppeteer/package-lock.json": _content(pp / "package-lock.json"),
         "scripts/test": _tree(root / "scripts" / "test"),
-        "requirements-ci.in": _sha(root / "requirements-ci.in"),
-        "requirements-ci.txt": _sha(root / "requirements-ci.txt"),
+        "requirements-ci.in": _content(root / "requirements-ci.in"),
+        "requirements-ci.txt": _content(root / "requirements-ci.txt"),
     }
+    share = home / ".local" / "share" / "yuzu"
+    snap["home:.local/share/yuzu"] = _names(share)
+    snap["home:gcovr-venv/bin/gcovr"] = _content(share / "gcovr-venv" / "bin" / "gcovr")
     for rel in GUARD_HOME_PATHS:
         path = home / rel
         snap["home:" + rel] = (_sig(path), _names(path), _sha(path / ".yuzu-gcovr-venv"),
@@ -406,6 +479,7 @@ class SandboxCase(unittest.TestCase):
         self.assertEqual(seen, {**{t: {"open"} for t in install_tags}, **{t: {"closed"} for t in probe_tags}})
 
 
+@unittest.skipIf(sys.platform == "win32", "needs POSIX symlinks and stubs (the whole file skips on Windows)")
 class GuardSnapshotSelfTest(unittest.TestCase):
     """The guard that SandboxCase uses must (a) notice a helper writing where the helpers write, and (b)
     not notice what other suites write next to this one. Both halves are asserted on scratch checkouts
@@ -494,6 +568,105 @@ class GuardSnapshotSelfTest(unittest.TestCase):
         (root / "scripts" / "test" / "__pycache__" / "x.pyc").write_text("x")
         (home / ".cache" / "somebody-else").mkdir()
         self.assertEqual(guard_snapshot(root, home), before)
+
+
+    def test_what_the_wider_coverage_adds_is_noticed(self):
+        """Each case: a state is prepared and snapshotted, then ONE write the stat-only view would miss."""
+        def put(path, text, size_preserving_from=None):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        def rewrite_same_size_and_mtime(path, text):
+            st = os.stat(path)
+            path.write_text(text)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+        cases = {
+            "a script's file mode changed": (
+                lambda r, h: None,
+                lambda r, h: (r / "scripts" / "test" / "ensure-gcovr.sh").chmod(0o700)),
+            "package-lock.json's file mode changed": (
+                lambda r, h: None,
+                lambda r, h: (r / "tests" / "puppeteer" / "package-lock.json").chmod(0o600)),
+            "requirements-ci.txt's file mode changed": (
+                lambda r, h: None,
+                lambda r, h: (r / "requirements-ci.txt").chmod(0o600)),
+            "npm's lock file rewritten with the same size and mtime": (
+                lambda r, h: put(r / "tests" / "puppeteer" / "node_modules" / ".package-lock.json", "aaaa"),
+                lambda r, h: rewrite_same_size_and_mtime(r / "tests" / "puppeteer" / "node_modules" / ".package-lock.json", "bbbb")),
+            "a file added at depth 2 of node_modules": (
+                lambda r, h: (r / "tests" / "puppeteer" / "node_modules" / "puppeteer").mkdir(parents=True),
+                lambda r, h: put(r / "tests" / "puppeteer" / "node_modules" / "puppeteer" / "index.js", "x")),
+            "a file in node_modules changed in size": (
+                lambda r, h: put(r / "tests" / "puppeteer" / "node_modules" / "puppeteer" / "index.js", "x"),
+                lambda r, h: put(r / "tests" / "puppeteer" / "node_modules" / "puppeteer" / "index.js", "xyz")),
+            "the venv's gcovr rewritten with the same size and mtime": (
+                lambda r, h: put(h / ".local" / "share" / "yuzu" / "gcovr-venv" / "bin" / "gcovr", "aaaa"),
+                lambda r, h: rewrite_same_size_and_mtime(h / ".local" / "share" / "yuzu" / "gcovr-venv" / "bin" / "gcovr", "bbbb")),
+            "a moved-aside sibling of the venv appears": (
+                lambda r, h: (h / ".local" / "share" / "yuzu" / "gcovr-venv").mkdir(parents=True),
+                lambda r, h: (h / ".local" / "share" / "yuzu" / "gcovr-venv.yuzu-gcovr-old.AbC123").mkdir()),
+            "the gcovr link is re-pointed": (
+                lambda r, h: (h / ".local" / "bin" / "gcovr").symlink_to("/one"),
+                lambda r, h: ((h / ".local" / "bin" / "gcovr").unlink(), (h / ".local" / "bin" / "gcovr").symlink_to("/two"))),
+        }
+        for name, (prepare, write) in cases.items():
+            with self.subTest(name):
+                root, home = self.scratch()
+                prepare(root, home)
+                before = guard_snapshot(root, home)
+                write(root, home)
+                self.assertNotEqual(guard_snapshot(root, home), before, f"{name}: the guard did not notice")
+
+    def test_the_documented_limits_of_the_guard_are_the_real_ones(self):
+        """The comment above guard_snapshot says what is NOT covered. Pin it, so the comment cannot drift
+        from the code: these writes are deliberately invisible (and a concurrent job makes most of them)."""
+        root, home = self.scratch()
+        nm = root / "tests" / "puppeteer" / "node_modules" / "puppeteer"
+        (nm / "lib" / "deep").mkdir(parents=True)                                       # depth 3 exists already
+        (home / ".cache" / "puppeteer" / "chrome").mkdir(parents=True)
+        (home / ".local" / "bin" / "gcovr").symlink_to("/x")
+        before = guard_snapshot(root, home)
+        (nm / "lib" / "deep" / "file.js").write_text("x")                               # a file at depth 4 of node_modules
+        (home / ".cache" / "puppeteer" / "chrome" / "build").write_text("x")            # below the top level of ~/.cache/puppeteer
+        (home / ".local" / "bin" / "some-pip-tool").write_text("x")                     # the rest of ~/.local/bin
+        (home / ".npm").mkdir()
+        (home / ".cache" / "pip").mkdir()
+        self.assertEqual(guard_snapshot(root, home), before)
+
+    def test_what_a_concurrent_run_of_other_suites_writes_does_not_change_the_snapshot(self):
+        root, home = self.scratch()
+        (root / "tests" / "puppeteer" / "node_modules" / "puppeteer").mkdir(parents=True)
+        before = guard_snapshot(root, home)
+        for i in range(5):
+            (root / "gateway" / f"zz-pid-{i}.coverdata").write_text("x")             # files in a tracked directory
+            (root / "tests" / "puppeteer" / f"shot-{i}.png").write_text("x")          # screenshots next to the tests
+            (root / "scripts" / f"ci-{i}.tmp").write_text("x")                        # scratch files in scripts/ (not scripts/test)
+        (root / "build-linux" / "tests").mkdir(parents=True)
+        (root / "build-linux" / "tests" / "log.txt").write_text("x")
+        (root / "scripts" / "test" / "__pycache__").mkdir()
+        (root / "scripts" / "test" / "__pycache__" / "x.cpython-314.pyc").write_text("x")
+        self.assertEqual(guard_snapshot(root, home), before)
+
+    def test_every_test_class_in_this_file_skips_on_windows(self):
+        """tests/meson.build says the whole file skips on Windows, and `/test` runs the docs suite natively
+        there. A class that calls Path.symlink_to or POSIX stubs without a win32 skip would error on a Windows
+        account without the symlink privilege (WinError 1314)."""
+        import ast
+        tree = ast.parse(Path(__file__).read_text())
+        guarded_bases = {"SandboxCase", "GcovrCase", "EnsurePuppeteer", "EnsureGcovr", "EnsureGcovrNonLinux",
+                         "EnsureGcovrPinMismatch"}   # these inherit SandboxCase's skipIf
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases = {b.id for b in node.bases if isinstance(b, ast.Name)}
+            if not any(b.endswith("TestCase") for b in bases) and not bases & guarded_bases:
+                continue
+            if bases & guarded_bases:
+                continue
+            skips = [ast.unparse(d) for d in node.decorator_list]
+            self.assertTrue(any("skipIf" in d and "win32" in d for d in skips),
+                            f"{node.name} has no @unittest.skipIf(sys.platform == 'win32', ...): {skips}")
 
 
 class EnsurePuppeteer(SandboxCase):
@@ -660,6 +833,27 @@ class EnsurePuppeteer(SandboxCase):
 
     def test_failed_npm_ci(self):
         self.expect(self.run_script(STUB_NPM_RC="1"), 1, "npm ci failed")
+
+    def test_modules_with_a_stamp_but_no_puppeteer_directory_are_reinstalled(self):
+        # the stamp and npm's lock file are there, the package is not: the install is incomplete, not "ready"
+        self.install_modules()
+        shutil.rmtree(self.pp / "node_modules" / "puppeteer")
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.sb.calls(), [self.NPM_CI])
+
+    def test_the_shasum_fallback_is_the_production_hash_on_macos(self):
+        # macOS has no sha256sum; the script then asks `shasum -a 256`. Remove sha256sum from the farm and give
+        # `shasum` a stub that only answers to exactly that invocation, then runs the real hasher.
+        real = shutil.which("sha256sum")
+        (self.sb.farm / "sha256sum").unlink(missing_ok=True)
+        (self.sb.farm / "shasum").unlink(missing_ok=True)
+        self.sb.stub("shasum", f'#!/bin/sh\necho "shasum $*" >> "$STUB_LOG.shasum"\n[ "$1 $2" = "-a 256" ] || exit 2\nshift 2\nexec {real} "$@"\n')
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.stamp_path().read_text(), self.lock_sha() + "\n")
+        self.assertEqual(self.sb.side("shasum"), [f"shasum -a 256 {self.pp}/package-lock.json"])
+        self.sb.reset_logs()
+        self.expect(self.run_script(), 0, "already match")
+        self.assertEqual(self.sb.calls(), [])
 
     # --- timeouts ----------------------------------------------------------------------------
 
@@ -1319,7 +1513,7 @@ class EnsureGcovr(GcovrCase):
 
     def test_stale_requirements_stamp_rebuilds(self):
         self.build()
-        self.stamp.write_text("deadbeef\n")
+        self.stamp.write_text(ZERO_SHA)
         self.expect(self.run_script(), 0, "ready")
         self.assertEqual(len(self.pip_calls()), 1)
         self.assertEqual(self.stamp.read_text().strip(), self.sb.req_sha())
@@ -1342,7 +1536,7 @@ class EnsureGcovr(GcovrCase):
 
     def test_complete_managed_venv_shadowed_on_path_is_not_rebuilt(self):
         self.build()
-        sentinel = self.write(self.sb.venv / "sentinel", "old\n")
+        sentinel = self.write(self.sb.venv / "share" / "sentinel", "old\n")
         self.sb.stub("gcovr", gcovr_stub("8.6"))  # something else ahead of the link on PATH
         r = self.run_script()
         self.expect(r, 1, "which reports '8.6'")
@@ -1354,22 +1548,22 @@ class EnsureGcovr(GcovrCase):
 
     def test_rebuild_moves_the_old_venv_aside_then_removes_it(self):
         self.build()
-        (self.sb.venv / "sentinel").write_text("old\n")
-        self.stamp.write_text("deadbeef\n")
+        self.write(self.sb.venv / "share" / "sentinel", "old\n")
+        self.stamp.write_text(ZERO_SHA)
         self.expect(self.run_script(), 0, "ready")
         self.assertEqual(self.sb.side("venv"), ["marker=1 aside=1"])  # old copy visible while building
         self.assertEqual(self.old_dirs(), [])
-        self.assertFalse((self.sb.venv / "sentinel").exists())
+        self.assertFalse((self.sb.venv / "share" / "sentinel").exists())
 
     def stale_old_venv(self):
         """A first install, then made stale (wrong requirements stamp) with a sentinel only the old tree has."""
         self.build()
-        (self.sb.venv / "sentinel").write_text("old\n")
-        self.stamp.write_text("deadbeef\n")
+        self.write(self.sb.venv / "share" / "sentinel", "old\n")
+        self.stamp.write_text(ZERO_SHA)
 
     def assert_previous_venv_is_back(self):
-        self.assertTrue((self.sb.venv / "sentinel").exists(), "the previous venv was not put back")
-        self.assertEqual(self.stamp.read_text(), "deadbeef\n")
+        self.assertTrue((self.sb.venv / "share" / "sentinel").exists(), "the previous venv was not put back")
+        self.assertEqual(self.stamp.read_text(), ZERO_SHA)
         self.assertEqual(self.old_dirs(), [])
 
     def test_failing_pip_puts_the_previous_venv_back(self):
@@ -1417,8 +1611,9 @@ class EnsureGcovr(GcovrCase):
                     if proc.poll() is None:
                         os.killpg(proc.pid, signal.SIGKILL)
                         proc.communicate()
-                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.returncode, {signal.SIGTERM: 143, signal.SIGINT: 130}[sig])
                 self.assertIn("restored the previous virtualenv", err)
+                self.assertIn(f"interrupted (SIG{sig.name[3:]})", [l for l in err.splitlines() if l.strip()][-1])
                 self.assert_previous_venv_is_back()
 
     def test_a_failure_after_the_new_venv_is_complete_does_not_give_the_old_one_back(self):
@@ -1427,7 +1622,8 @@ class EnsureGcovr(GcovrCase):
         r = self.run_script(local_bin=False)
         self.expect(r, 1, "is not on PATH")
         self.assertNotIn("restored", r.stderr)
-        self.assertFalse((self.sb.venv / "sentinel").exists(), "the old tree must stay replaced")
+        self.assertEqual(r.stderr.count("is not on PATH"), 1, "the cause is printed once when the restore has nothing to say")
+        self.assertFalse((self.sb.venv / "share" / "sentinel").exists(), "the old tree must stay replaced")
         self.assertEqual(self.stamp.read_text().strip(), self.sb.req_sha())
         self.assertEqual(self.old_dirs(), [])
 
@@ -1437,17 +1633,17 @@ class EnsureGcovr(GcovrCase):
         if os.geteuid() == 0:
             self.skipTest("root ignores directory modes")
         self.stale_old_venv()
-        locked = self.sb.venv / "locked"
-        (locked).mkdir()
+        locked = self.sb.venv / "share" / "locked"
+        locked.mkdir(parents=True)
         (locked / "file").write_text("x\n")
         locked.chmod(0o555)
         r = self.run_script(local_bin=False)
         for d in self.sb.venv.parent.glob(self.sb.venv.name + ".yuzu-gcovr-old.*"):
-            (d / "locked").chmod(0o755)          # let the temp dir clean up
+            (d / "share" / "locked").chmod(0o755)          # let the temp dir clean up
         self.expect(r, 1, "is not on PATH")
         self.assertIn("could not remove the leftover", r.stderr)
         self.assertNotIn("restored", r.stderr)
-        self.assertFalse((self.sb.venv / "sentinel").exists(), "the stale tree was put back over the new venv")
+        self.assertFalse((self.sb.venv / "share" / "sentinel").exists(), "the stale tree was put back over the new venv")
         self.assertEqual(self.stamp.read_text().strip(), self.sb.req_sha())
 
     def test_the_previous_venv_is_never_put_back_over_something_that_is_not_the_half_built_one(self):
@@ -1459,7 +1655,7 @@ class EnsureGcovr(GcovrCase):
         self.assertIn("NOT restoring", r.stderr)
         self.assertEqual((self.sb.venv / "precious.txt").read_text(), "somebody else's file\n")
         self.assertEqual(len(self.old_dirs()), 1)
-        self.assertTrue((self.sb.venv.parent / self.old_dirs()[0] / "sentinel").exists())
+        self.assertTrue((self.sb.venv.parent / self.old_dirs()[0] / "share" / "sentinel").exists())
 
     def test_a_failed_first_install_has_nothing_to_restore_and_the_next_run_recovers(self):
         r = self.run_script(STUB_PIP_RC="1")
@@ -1502,39 +1698,48 @@ class EnsureGcovr(GcovrCase):
                 self.assertEqual(self.old_dirs(venv), [])
                 self.assertFalse(self.link.is_symlink())
 
+    REAL_LAYOUT = {".yuzu-gcovr-venv": TOKEN, ".requirements-ci.sha256": ZERO_SHA, "pyvenv.cfg": "home = /usr/bin\n",
+                   "bin/python": "x\n", "lib/python3/site-packages/x.py": "x\n", "include/h.h": "x\n",
+                   "share/man/m.1": "x\n", ".gitignore": "*\n"}
+
     def test_directories_the_guard_accepts_are_replaced(self):
         # (files present in the existing $VENV) -> accepted as ours / empty, so rebuilt in place
         for i, (name, files) in enumerate((
-                ("empty directory", []),
-                ("half-built venv: marker only, no pyvenv.cfg", [".yuzu-gcovr-venv"]),
-                ("finished venv of ours: requirements stamp only", [".requirements-ci.sha256"]))):
+                ("empty directory", {}),
+                ("half-built venv: the marker with its token only", {".yuzu-gcovr-venv": TOKEN}),
+                ("half-built venv of the earlier script: an empty marker only", {".yuzu-gcovr-venv": ""}),
+                ("finished venv of ours: a SHA-256 stamp only", {".requirements-ci.sha256": ZERO_SHA}),
+                ("a venv with the layout python -m venv and pip leave, token and stamp", self.REAL_LAYOUT),
+                ("the earlier script's venv: an empty marker and a venv shape",
+                 {".yuzu-gcovr-venv": "", "pyvenv.cfg": "home = /usr/bin\n", "bin/python": "x\n"}))):
             with self.subTest(name):
                 venv = self.sb.tmp / f"venv_{i}"
                 venv.mkdir()
-                for f in files:
-                    (venv / f).write_text("x\n")
+                for f, content in files.items():
+                    self.write(venv / f, content)
                 self.sb.reset_logs()
                 self.link.unlink(missing_ok=True)  # the previous case's link would read as "a gcovr at the pin"
                 self.expect(self.run_script(YUZU_GCOVR_VENV=str(venv)), 0, "ready")
                 self.assertEqual(len(self.pip_calls()), 1)
                 self.assertEqual(self.sb.side("venv"), ["marker=1 aside=0"])
                 self.assertEqual((venv / ".requirements-ci.sha256").read_text().strip(), self.sb.req_sha())
+                self.assertEqual((venv / ".yuzu-gcovr-venv").read_text(), TOKEN)    # the new marker carries its token
                 # A replaced $VENV is moved aside and removed; nothing (not even an empty husk) may remain.
                 self.assertEqual(self.old_dirs(venv), [])
 
     def test_old_venv_leftovers_are_removed_only_when_they_are_owned_or_empty(self):
         parent, name = self.sb.venv.parent, self.sb.venv.name
         removed, kept = [], []
-        for suffix, files in (("123", []),                                   # empty (a kill mid-delete)
-                              ("99", []),                                    # empty, no markers of any kind
-                              ("456", [".yuzu-gcovr-venv", "bin/x"]),        # half-deleted but still marked
-                              ("457", [".requirements-ci.sha256", "lib/y"]), # finished venv, stamp only
-                              ("789", [".yuzu-gcovr-venv", ".requirements-ci.sha256", "bin/python", "lib/a/b/c.py"]),
-                              ("x12", [".yuzu-gcovr-venv", "notes.txt"])):
+        for suffix, files in (("123", {}),                                                 # empty (a kill mid-delete)
+                              ("99", {}),                                                  # empty, no markers of any kind
+                              ("456", {".yuzu-gcovr-venv": TOKEN, "bin/x": "x\n"}),         # half-deleted but still marked
+                              ("457", {".requirements-ci.sha256": ZERO_SHA, "lib/y": "x\n"}),  # finished venv, stamp only
+                              ("789", {**self.REAL_LAYOUT}),
+                              ("x12", {".yuzu-gcovr-venv": "", "pyvenv.cfg": "home = /x\n", "bin/p": "x\n"})):  # the earlier script's
             d = parent / f"{name}.yuzu-gcovr-old.{suffix}"
             d.mkdir()
-            for f in files:
-                self.write(d / f, "x\n")
+            for f, content in files.items():
+                self.write(d / f, content)
             removed.append(d)
         # The name alone is not ownership: a directory of that name without our marker or stamp could be
         # somebody's own (YUZU_GCOVR_VENV pointing at a path of theirs), and a half-deleted tree by an
@@ -1559,7 +1764,7 @@ class EnsureGcovr(GcovrCase):
             self.assertIn(str(f.parent), r.stderr)
         # the sweep runs before and after the build: the notice is printed once per directory, not twice
         self.assertEqual(r.stderr.count(f"leaving {unowned[0].parent} alone"), 1, r.stderr)
-        self.assertIn("neither this script's marker", r.stderr)
+        self.assertIn("is not known to be ours", r.stderr)
         for f in kept:
             self.assertEqual(f.read_text(), "not ours\n", f.parent.name)
         self.assertEqual(a_file.read_text(), "a file, not a directory\n")
@@ -1582,8 +1787,8 @@ class EnsureGcovr(GcovrCase):
         venv = self.sb.tmp / "my_gcovr"
         mine = self.write(self.sb.tmp / "my_gcovr.old.3" / "notes.txt", "my own directory\n")
         self.build(YUZU_GCOVR_VENV=str(venv))
-        (venv / "sentinel").write_text("old\n")
-        (venv / ".requirements-ci.sha256").write_text("deadbeef\n")  # force a rebuild: old venv moves aside
+        self.write(venv / "share" / "sentinel", "old\n")
+        (venv / ".requirements-ci.sha256").write_text(ZERO_SHA)  # force a rebuild: old venv moves aside
         self.link.unlink()
         self.expect(self.run_script(YUZU_GCOVR_VENV=str(venv)), 0, "ready")
         self.assertEqual(self.sb.side("venv"), ["marker=1 aside=1"])  # the real rebuild happened
@@ -1595,7 +1800,7 @@ class EnsureGcovr(GcovrCase):
         self.build()
         self.link.unlink()
         leftover = self.write(f"{self.sb.venv}.yuzu-gcovr-old.4242/bin/half", "half-deleted\n")
-        self.write(f"{self.sb.venv}.yuzu-gcovr-old.4242/.yuzu-gcovr-venv", "")   # the marker survives a part-way delete
+        self.write(f"{self.sb.venv}.yuzu-gcovr-old.4242/.yuzu-gcovr-venv", TOKEN)   # the marker survives a part-way delete
         self.expect(self.run_script(), 0, "(re)linking")
         self.assertFalse(leftover.parent.parent.exists())
         self.assertTrue((self.sb.venv / ".yuzu-gcovr-venv").exists(), "the venv itself is untouched")
@@ -1604,12 +1809,12 @@ class EnsureGcovr(GcovrCase):
         # A kill part-way through the delete must leave a tree that is still recognisably ours. A `find`
         # stub records which ownership files existed at the moment it was asked to empty each leftover.
         real_find = shutil.which("find")
-        self.sb.stub("find", f'#!/bin/sh\nfor d in "$@"; do case "$d" in *yuzu-gcovr-old*) echo "$d marker=$([ -e "$d/.yuzu-gcovr-venv" ] && echo 1 || echo 0) stamp=$([ -e "$d/.requirements-ci.sha256" ] && echo 1 || echo 0)" >> "$STUB_LOG.find";; esac; done\nexec {real_find} "$@"\n')
+        self.sb.stub("find", f'#!/bin/sh\ncase "$*" in *-exec*) for d in "$@"; do case "$d" in *yuzu-gcovr-old*) echo "$d marker=$([ -e "$d/.yuzu-gcovr-venv" ] && echo 1 || echo 0) stamp=$([ -e "$d/.requirements-ci.sha256" ] && echo 1 || echo 0)" >> "$STUB_LOG.find";; esac; done;; esac\nexec {real_find} "$@"\n')
         self.build()
         self.link.unlink()
         left = f"{self.sb.venv}.yuzu-gcovr-old.4242"
-        self.write(f"{left}/.yuzu-gcovr-venv", "")
-        self.write(f"{left}/.requirements-ci.sha256", "x\n")
+        self.write(f"{left}/.yuzu-gcovr-venv", TOKEN)
+        self.write(f"{left}/.requirements-ci.sha256", ZERO_SHA)
         self.write(f"{left}/bin/python", "x\n")
         self.expect(self.run_script(), 0, "(re)linking")
         self.assertFalse(Path(left).exists())
@@ -1749,10 +1954,441 @@ class EnsureGcovr(GcovrCase):
         (self.sb.venv / "bin" / "gcovr").unlink()                     # a dangling link into OUR venv
         self.link.unlink()
         self.link.symlink_to(self.sb.venv / "bin" / "gcovr")
-        self.stamp.write_text("deadbeef\n")
+        self.stamp.write_text(ZERO_SHA)
         self.sb.reset_logs()
         self.expect(self.run_script(), 0, "ready")
         self.assertEqual(os.readlink(self.link), f"{self.sb.venv}/bin/gcovr")
+
+    # --- batch 2: the aside name, ownership, links, signals, and the order of the last line ---------
+
+    def tree(self, root):
+        """{relative path: content, or '-> target' for a link, or '<dir>'} for everything below `root`."""
+        out = {}
+        for p in sorted(Path(root).rglob("*")):
+            rel = str(p.relative_to(root))
+            if p.is_symlink():
+                out[rel] = "-> " + os.readlink(p)
+            elif p.is_dir():
+                out[rel] = "<dir>"
+            else:
+                out[rel] = p.read_text()
+        return out
+
+    def last_line(self, r):
+        lines = [line for line in r.stderr.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    def assert_cause_last(self, r, fragment):
+        """The last line printed is the cause (the /test gate records the log's last line as its note), even
+        when a restore notice came before it."""
+        last = self.last_line(r)
+        self.assertTrue(last.startswith("ensure-gcovr: NOT READY:"), f"last line is not the cause: {last!r}\n{r.stderr}")
+        self.assertIn(fragment, last)
+
+    def mktemp_stub(self):
+        """Log every mktemp call; for the aside template return STUB_MKTEMP_RESULT, or fail on STUB_MKTEMP_FAIL."""
+        real = shutil.which("mktemp")
+        self.sb.stub("mktemp", f'#!/bin/sh\necho "mktemp $*" >> "$STUB_LOG"\n'
+                               f'case "$*" in *yuzu-gcovr-old*)\n'
+                               f'  [ "$STUB_MKTEMP_FAIL" = 1 ] && exit 1\n'
+                               f'  [ -n "$STUB_MKTEMP_RESULT" ] && {{ echo "$STUB_MKTEMP_RESULT"; exit 0; }};;\nesac\n'
+                               f'exec {real} "$@"\n')
+
+    def stale_old_venv_at(self, venv):
+        env = {"YUZU_GCOVR_VENV": str(venv)}
+        self.expect(self.run_script(**env), 0, "ready")
+        self.sb.reset_logs()
+        self.write(venv / "share" / "sentinel", "old\n")
+        (venv / ".requirements-ci.sha256").write_text(ZERO_SHA)
+        self.link.unlink(missing_ok=True)
+
+    # F1: the aside name
+
+    def test_the_aside_directory_is_made_by_mktemp_beside_the_venv(self):
+        self.stale_old_venv()
+        self.mktemp_stub()
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual([c for c in self.sb.calls() if c.startswith("mktemp ")],
+                         [f"mktemp -d {self.sb.venv}.yuzu-gcovr-old.XXXXXX"])
+
+    def check_aside_refused(self, victim, fragment, **env):
+        self.stale_old_venv()
+        before = self.tree(self.sb.venv)
+        self.mktemp_stub()
+        r = self.run_script(**env)
+        self.expect(r, 1, fragment)
+        self.assertEqual(self.tree(self.sb.venv), before, "the old venv must be left exactly as it was")
+        self.assertEqual(self.venv_creations(), [])
+        self.assertEqual(self.pip_calls(), [])
+        self.assertNotIn("restored", r.stderr)
+        self.assert_cause_last(r, fragment)
+        return r
+
+    def test_a_foreign_directory_at_the_aside_name_is_refused_before_the_old_venv_is_touched(self):
+        foreign = self.write(self.sb.tmp / "foreign_aside" / "precious.txt", "mine\n").parent
+        self.check_aside_refused(foreign, "not a fresh empty directory", STUB_MKTEMP_RESULT=str(foreign))
+        self.assertEqual(self.tree(foreign), {"precious.txt": "mine\n"}, "nothing may be moved into it")
+
+    def test_a_symlink_at_the_aside_name_is_refused_before_the_old_venv_is_touched(self):
+        target = self.write(self.sb.tmp / "link_target" / "precious.txt", "mine\n").parent
+        link = self.sb.tmp / "aside_link"
+        link.symlink_to(target)
+        self.check_aside_refused(link, "not a fresh empty directory", STUB_MKTEMP_RESULT=str(link))
+        self.assertEqual(self.tree(target), {"precious.txt": "mine\n"})
+        self.assertTrue(link.is_symlink())
+
+    def test_a_regular_file_at_the_aside_name_is_refused_before_the_old_venv_is_touched(self):
+        f = self.write(self.sb.tmp / "aside_file", "mine\n")
+        self.check_aside_refused(f, "not a fresh empty directory", STUB_MKTEMP_RESULT=str(f))
+        self.assertEqual(f.read_text(), "mine\n")
+
+    def test_a_failing_mktemp_refuses_before_the_old_venv_is_touched(self):
+        self.check_aside_refused(None, "cannot create a directory beside", STUB_MKTEMP_FAIL="1")
+
+    def test_an_unreadable_inode_refuses_and_removes_the_empty_directory_it_made(self):
+        self.stale_old_venv()
+        before = self.tree(self.sb.venv)
+        real_stat = shutil.which("stat")
+        # `stat` of the venv itself fails; every other call (the restore's own) works
+        self.sb.stub("stat", f'#!/bin/sh\nfor a in "$@"; do last="$a"; done\n[ "$last" = "$YUZU_GCOVR_VENV" ] && exit 1\nexec {real_stat} "$@"\n')
+        r = self.run_script()
+        self.expect(r, 1, "cannot read the inode")
+        self.assertEqual(self.tree(self.sb.venv), before, "the old venv must be left exactly as it was")
+        self.assertEqual(self.old_dirs(), [], "the empty directory mktemp made must not be left behind")
+        self.assertNotIn("restored", r.stderr)
+        self.assert_cause_last(r, "cannot read the inode")
+
+    def test_a_pre_existing_empty_directory_at_the_aside_name_is_never_left_behind_or_nested_into(self):
+        # mktemp's contract: an empty directory it returns is ours. The venv replaces it (mv -T), nothing nests.
+        empty = self.sb.tmp / "reserved_empty"
+        empty.mkdir()
+        self.stale_old_venv()
+        self.mktemp_stub()
+        self.expect(self.run_script(STUB_MKTEMP_RESULT=str(empty), STUB_PIP_RC="1"), 1, "pip could not install")
+        self.assert_previous_venv_is_back()
+        self.assertFalse(empty.exists() and any(empty.iterdir()), "the old venv was moved INTO the directory")
+
+    # F1: the restore needs proof that the aside directory is the one this run moved
+
+    def test_the_previous_venv_is_not_put_back_from_a_directory_that_replaced_the_aside_one(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_SWAP_ASIDE="dir", STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertIn("is not the directory this run moved aside", r.stderr)
+        self.assertNotIn("restored", r.stderr)
+        aside = self.sb.venv.parent / self.old_dirs()[0]
+        self.assertEqual(self.tree(aside), {"f": "foreign\n"}, "the foreign directory is left as found")
+        self.assertTrue((Path(f"{self.sb.venv}.aside-moved") / "share" / "sentinel").exists(), "the real old venv is untouched")
+        self.assert_cause_last(r, "pip could not install")
+
+    def test_the_previous_venv_is_not_put_back_from_a_link_that_replaced_the_aside_one(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_SWAP_ASIDE="link", STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertIn("is not the directory this run moved aside", r.stderr)
+        self.assertNotIn("restored", r.stderr)
+        self.assertTrue(Path(f"{self.sb.venv}.aside-moved").is_dir())
+        self.assert_cause_last(r, "pip could not install")
+
+    def test_the_previous_venv_is_not_put_back_when_the_aside_directory_is_gone(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_SWAP_ASIDE="gone", STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertIn("is not the directory this run moved aside", r.stderr)
+        self.assertNotIn("restored", r.stderr)
+        self.assert_cause_last(r, "pip could not install")
+
+    # F2: ownership is content and layout, not a file name
+
+    def test_a_directory_that_merely_looks_marked_is_never_replaced(self):
+        cases = {
+            "an empty marker file and a subdirectory of the user's": {".yuzu-gcovr-venv": "", "sub/userfile": "mine\n"},
+            "the token marker and a file of the user's": {".yuzu-gcovr-venv": TOKEN, "notes.txt": "mine\n"},
+            "the token marker plus a second line": {".yuzu-gcovr-venv": TOKEN + "more\n", "bin/x": "x\n"},
+            "a marker with some other content": {".yuzu-gcovr-venv": "something else\n", "bin/x": "x\n"},
+            "a stamp that is not a SHA-256": {".requirements-ci.sha256": "deadbeef\n", "bin/x": "x\n"},
+            "a SHA-256 stamp and a file of the user's": {".requirements-ci.sha256": ZERO_SHA, "notes.txt": "mine\n"},
+            "an empty marker, layout directories, no venv shape": {".yuzu-gcovr-venv": "", "share/userdata": "mine\n"},
+            "an empty marker and a pyvenv.cfg without a home line": {".yuzu-gcovr-venv": "", "pyvenv.cfg": "x\n", "bin/x": "x\n"},
+            "the token marker and an entry named like two allowed ones": {".yuzu-gcovr-venv": TOKEN, "bin lib": "mine\n"},
+            "a file named like the marker that is huge": {".yuzu-gcovr-venv": "x" * 5000, "bin/x": "x\n"},
+        }
+        for i, (name, files) in enumerate(cases.items()):
+            with self.subTest(name):
+                venv = self.sb.tmp / f"user_{i}"
+                for f, content in files.items():
+                    self.write(venv / f, content)
+                before = self.tree(venv)
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=str(venv))
+                self.expect(r, 1, "refusing to replace")
+                self.assertEqual(self.tree(venv), before, "the user's directory must be left exactly as it was")
+                self.assertEqual(self.venv_creations(), [])
+                self.assertEqual(self.pip_calls(), [])
+                self.assertEqual(self.old_dirs(venv), [])
+
+    def test_a_symlinked_marker_does_not_make_a_directory_ours(self):
+        venv = self.sb.tmp / "user_link"
+        target = self.write(self.sb.tmp / "token_file", TOKEN)
+        self.write(venv / "bin" / "x", "mine\n")
+        (venv / ".yuzu-gcovr-venv").symlink_to(target)
+        before = self.tree(venv)
+        r = self.run_script(YUZU_GCOVR_VENV=str(venv))
+        self.expect(r, 1, "refusing to replace")
+        self.assertEqual(self.tree(venv), before)
+
+    def test_a_forged_marker_does_not_make_a_leftover_ours(self):
+        parent, name = self.sb.venv.parent, self.sb.venv.name
+        forged = {"700": {".yuzu-gcovr-venv": "", "sub/userfile": "mine\n"},
+                  "701": {".yuzu-gcovr-venv": TOKEN, "notes.txt": "mine\n"},
+                  "702": {".requirements-ci.sha256": "not a sha\n", "bin/x": "mine\n"}}
+        trees = {}
+        for sfx, files in forged.items():
+            d = parent / f"{name}.yuzu-gcovr-old.{sfx}"
+            for f, content in files.items():
+                self.write(d / f, content)
+            trees[d] = self.tree(d)
+        r = self.run_script()
+        self.expect(r, 0, "ready")
+        for d, before in trees.items():
+            self.assertEqual(self.tree(d), before, d.name)
+            self.assertIn(f"leaving {d} alone", r.stderr)
+
+    def test_a_venv_the_python_step_left_looking_like_a_users_is_never_removed_by_the_restore(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_VENV_FORGE="1", STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertIn("NOT restoring", r.stderr)
+        self.assertEqual((self.sb.venv / "precious.txt").read_text(), "somebody else's file\n")
+        self.assertEqual(len(self.old_dirs()), 1)
+        self.assertTrue((self.sb.venv.parent / self.old_dirs()[0] / "share" / "sentinel").exists())
+        self.assert_cause_last(r, "pip could not install")
+
+    # F3: where a link points is judged after resolving it
+
+    def link_to(self, target):
+        self.link.parent.mkdir(parents=True, exist_ok=True)
+        self.link.unlink(missing_ok=True)
+        self.link.symlink_to(target)
+
+    def test_a_link_that_leaves_the_venv_by_dot_segments_is_not_replaced(self):
+        for name, target in (("a dot-dot segment out of the venv", f"{self.sb.venv}/../pipx/bin/gcovr"),
+                             ("a sibling whose name starts with ours", str(self.sb.tmp / "venv2" / "bin" / "gcovr")),
+                             ("a relative link to a sibling venv", "../../../venv2/bin/gcovr"),
+                             ("a relative link out through our venv", "../../../venv/../venv2/bin/gcovr"),
+                             ("the venv directory itself's parent", str(self.sb.tmp / "bin" / "gcovr"))):
+            with self.subTest(name):
+                self.sb.reset_logs()
+                self.link_to(target)
+                r = self.run_script()
+                self.expect(r, 1, "was NOT replaced")
+                self.assertEqual(os.readlink(self.link), target)
+                self.assertEqual(self.sb.calls(), [], "nothing may be installed when the link is refused")
+                self.assertFalse(self.sb.venv.exists())
+
+    def test_a_link_into_the_venv_is_replaced_whatever_form_it_takes(self):
+        for name, target in (("another file inside our venv, no venv present", f"{self.sb.venv}/bin/something-else"),
+                             ("a relative link into our venv", "../../../venv/bin/gcovr"),
+                             ("dot segments that stay inside our venv", f"{self.sb.venv}/bin/../bin/gcovr"),
+                             ("a dangling link into our venv", f"{self.sb.venv}/lib/gone")):
+            with self.subTest(name):
+                shutil.rmtree(self.sb.venv, ignore_errors=True)
+                self.sb.reset_logs()
+                self.link_to(target)
+                self.expect(self.run_script(), 0, "ready")
+                self.assertEqual(os.readlink(self.link), f"{self.sb.venv}/bin/gcovr")
+
+    def test_a_symlinked_parent_of_the_venv_works_and_a_link_through_the_real_path_is_ours(self):
+        real_parent = self.sb.tmp / "real_parent"
+        real_parent.mkdir()
+        via = self.sb.tmp / "via_link"
+        via.symlink_to(real_parent)
+        venv = via / "venv"                      # the venv path goes through a symlinked directory
+        self.link_to(f"{real_parent}/venv/bin/gcovr")   # the existing link names the same place by its real path
+        self.expect(self.run_script(YUZU_GCOVR_VENV=str(venv)), 0, "ready")
+        self.assertEqual(os.readlink(self.link), f"{venv}/bin/gcovr")
+        self.assertTrue((real_parent / "venv" / ".yuzu-gcovr-venv").exists())
+        # a rebuild through the same path puts the old venv back after a failure, too
+        self.write(real_parent / "venv" / "share" / "sentinel", "old\n")
+        (real_parent / "venv" / ".requirements-ci.sha256").write_text(ZERO_SHA)
+        r = self.run_script(YUZU_GCOVR_VENV=str(venv), STUB_PIP_RC="1")
+        self.expect(r, 1, "restored the previous virtualenv")
+        self.assertTrue((real_parent / "venv" / "share" / "sentinel").exists())
+
+    # F4: a second signal must not abort the restore
+
+    def test_a_second_signal_during_the_restore_does_not_abort_it(self):
+        import signal
+        self.stale_old_venv()
+        real_mv = shutil.which("mv")
+        # slow only the rename that PUTS THE VENV BACK (its last argument is the venv path)
+        self.sb.stub("mv", f'#!/bin/sh\nfor a in "$@"; do last="$a"; done\n'
+                           f'if [ "$last" = "$YUZU_GCOVR_VENV" ]; then : > "$STUB_RESTORE_FLAG"; sleep 2; fi\n'
+                           f'exec {real_mv} "$@"\n')
+        flag = self.sb.tmp / "restore_started"
+        env = {"HOME": str(self.sb.home), "PATH": os.pathsep.join(map(str, [self.sb.bin, self.sb.home / ".local" / "bin", self.sb.farm])),
+               "STUB_LOG": str(self.sb.log), "YUZU_GCOVR_VENV": str(self.sb.venv), "TMPDIR": str(self.sb.tmpdir),
+               "LC_ALL": "C", "STUB_RESTORE_FLAG": str(flag), "STUB_PIP_RC": "1"}
+        proc = subprocess.Popen([shutil.which("bash"), str(self.sb.repo / "scripts" / "test" / self.SCRIPT)],
+                                env=env, cwd=self.sb.neutral, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            for _ in range(200):
+                if flag.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(flag.exists(), "the restore never started")
+            os.killpg(proc.pid, signal.SIGTERM)
+            time.sleep(0.1)
+            os.killpg(proc.pid, signal.SIGINT)
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("restored the previous virtualenv", err)
+        self.assert_previous_venv_is_back()
+
+    # F5: the venv path
+
+    def test_a_venv_path_that_is_not_absolute_or_has_dot_segments_is_refused(self):
+        base = str(self.sb.tmp)
+        for name, value in (("a bare relative name", "gcovr-venv"),
+                            ("a dot-relative path", "./gcovr-venv"),
+                            ("a parent-relative path", "../gcovr-venv"),
+                            ("a dot segment in the middle", f"{base}/a/./venv"),
+                            ("a dot-dot segment in the middle", f"{base}/a/../venv"),
+                            ("a trailing dot", f"{base}/venv/."),
+                            ("a trailing dot-dot", f"{base}/venv/.."),
+                            ("a trailing dot after slashes", f"{base}/venv//.")):
+            with self.subTest(name):
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=value)
+                self.expect(r, 1, "YUZU_GCOVR_VENV")
+                self.assertEqual(self.sb.calls(), [])
+                self.assertFalse((self.sb.home / ".local").exists(), "nothing may be created")
+                self.assertEqual(list(self.sb.neutral.iterdir()), [], "nothing may land in the working directory")
+                self.assertFalse(any(self.sb.tmp.glob("*.lock")))
+
+    def test_a_relative_home_is_refused(self):
+        self.expect(self.run_script(HOME="relative/home"), 1, "HOME must be an absolute path")
+        self.assertEqual(self.sb.calls(), [])
+
+    # D1: the cause is the last line
+
+    def test_the_cause_is_the_last_line_after_a_failed_rebuild_that_was_restored(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_PIP_RC="1")
+        self.expect(r, 1, "restored the previous virtualenv")
+        self.assert_cause_last(r, "pip could not install")
+        self.assertLess(r.stderr.index("restored the previous virtualenv"), r.stderr.rindex("pip could not install"))
+
+    def test_the_cause_is_the_last_line_when_the_restore_is_refused(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_VENV_FORGE="1", STUB_PIP_RC="1")
+        self.assertIn("NOT restoring", r.stderr)
+        self.assert_cause_last(r, "pip could not install")
+        self.assertLess(r.stderr.index("NOT restoring"), r.stderr.rindex("pip could not install"))
+
+    def test_the_cause_is_the_last_line_when_the_venv_step_times_out(self):
+        self.stale_old_venv()
+        self.sb.stub("timeout", timeout_stub())
+        r = self.run_script(STUB_TIMEOUT_RC="124", STUB_TIMEOUT_ONLY="venv")
+        self.expect(r, 1, "restored the previous virtualenv")
+        self.assert_cause_last(r, "could not create the virtualenv")
+
+    def test_the_cause_is_the_last_line_when_there_is_nothing_to_restore(self):
+        r = self.run_script(STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertEqual(r.stderr.count("pip could not install"), 1, "printed once when no restore notice intervenes")
+        self.assert_cause_last(r, "pip could not install")
+
+    # Q5 and friends: every branch of the restore says what it did
+
+    def test_a_half_built_venv_that_cannot_be_removed_is_reported_and_the_old_one_is_not_nested(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        self.stale_old_venv()
+        self.addCleanup(lambda: (self.sb.venv / "share" / "locked").exists() and (self.sb.venv / "share" / "locked").chmod(0o755))
+        r = self.run_script(STUB_VENV_LOCKED="1", STUB_PIP_RC="1")
+        self.expect(r, 1, "could not remove the half-built virtualenv")
+        self.assertNotIn("restored", r.stderr)
+        aside = self.sb.venv.parent / self.old_dirs()[0]
+        self.assertTrue((aside / "share" / "sentinel").exists(), "the previous venv is intact beside the venv")
+        self.assertFalse(any(p.name.startswith("venv.yuzu-gcovr-old") for p in self.sb.venv.rglob("*")), "nothing may be nested")
+        self.assert_cause_last(r, "pip could not install")
+
+    def test_a_symlink_at_the_venv_path_stops_the_restore_and_says_so(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_VENV_SYMLINK="1", STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertIn("is a symlink; it is at", r.stderr)
+        self.assertNotIn("restored", r.stderr)
+        self.assertTrue((self.sb.venv.parent / self.old_dirs()[0] / "share" / "sentinel").exists())
+
+    def test_an_empty_venv_that_cannot_be_removed_is_reported_and_the_old_one_is_kept(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        parent = self.sb.tmp / "v"
+        venv = parent / "venv"
+        parent.mkdir()
+        self.stale_old_venv_at(venv)
+        self.addCleanup(lambda: parent.chmod(0o755))
+        real_mkdir = shutil.which("mkdir")
+        # after the script creates the venv directory, make it and its parent read-only: the marker cannot be
+        # written, and the empty directory cannot be removed afterwards
+        self.sb.stub("mkdir", f'#!/bin/sh\n{real_mkdir} "$@" || exit $?\n'
+                              f'for d in "$@"; do [ "$d" = "$YUZU_GCOVR_VENV" ] && {{ chmod 555 "$d"; chmod 555 "$(dirname "$d")"; }}; done\nexit 0\n')
+        r = self.run_script(YUZU_GCOVR_VENV=str(venv))
+        self.expect(r, 1, "cannot write to")
+        self.assertIn("could not remove the empty", r.stderr)
+        self.assertNotIn("restored", r.stderr)
+        parent.chmod(0o755)
+        self.assertTrue(any((d / "share" / "sentinel").exists() for d in parent.glob("venv.yuzu-gcovr-old.*")))
+        self.assert_cause_last(r, "cannot write to")
+
+    def test_a_restore_that_cannot_move_the_old_venv_back_says_so(self):
+        self.stale_old_venv()
+        real_mv = shutil.which("mv")
+        self.sb.stub("mv", f'#!/bin/sh\nfor a in "$@"; do last="$a"; done\n'
+                           f'[ "$last" = "$YUZU_GCOVR_VENV" ] && exit 1\nexec {real_mv} "$@"\n')
+        r = self.run_script(STUB_PIP_RC="1")
+        self.expect(r, 1, "could not be moved back; it is at")
+        self.assertNotIn("restored", r.stderr)
+        self.assertTrue((self.sb.venv.parent / self.old_dirs()[0] / "share" / "sentinel").exists())
+        self.assert_cause_last(r, "pip could not install")
+
+    def test_a_stamp_that_cannot_be_written_still_gives_the_old_venv_back(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file modes")
+        self.stale_old_venv()
+        r = self.run_script(STUB_VENV_STAMP_RO="1")
+        self.expect(r, 1, "cannot write")
+        self.assertIn("restored the previous virtualenv", r.stderr)
+        self.assert_previous_venv_is_back()
+        self.assert_cause_last(r, "cannot write")
+
+    def test_a_deletion_never_removes_an_ownership_file_before_the_contents(self):
+        real_rm = shutil.which("rm")
+        # log any recursive rm that is handed one of the two ownership files as an argument
+        self.sb.stub("rm", f'#!/bin/sh\nrec=0; for a in "$@"; do case "$a" in -*[rR]*) rec=1;; esac; done\n'
+                           f'if [ "$rec" = 1 ]; then for a in "$@"; do case "$a" in */.yuzu-gcovr-venv|*/.requirements-ci.sha256) echo "rm $*" >> "$STUB_LOG.rm";; esac; done; fi\nexec {real_rm} "$@"\n')
+        self.stale_old_venv()
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.sb.side("rm"), [])
+
+    def test_a_symlinked_leftover_whose_target_looks_owned_is_never_followed(self):
+        # a victim that WOULD be owned (token, stamp, a venv layout): only the two link guards stop the sweep
+        victim = self.sb.tmp / "marked_victim"
+        for f, content in {".yuzu-gcovr-venv": TOKEN, ".requirements-ci.sha256": ZERO_SHA, "bin/p": "precious\n"}.items():
+            self.write(victim / f, content)
+        before = self.tree(victim)
+        link = self.sb.venv.parent / f"{self.sb.venv.name}.yuzu-gcovr-old.7"
+        link.symlink_to(victim)
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.tree(victim), before)
+        self.assertTrue(link.is_symlink())
 
     def test_regular_file_at_the_link_is_not_replaced(self):
         self.link.parent.mkdir(parents=True)
