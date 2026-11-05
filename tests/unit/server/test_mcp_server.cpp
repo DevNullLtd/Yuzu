@@ -48146,6 +48146,8 @@ struct WfMcpFx {
     std::function<void(int)> on_authorize; // called with the 0-based authorizer call index
     std::function<void()> on_run;          // called inside the run port once the run is admitted
     std::optional<std::chrono::steady_clock::time_point> seen_deadline; // the run's control.deadline
+    /// When set, the rows a read of a completed run returns (instead of one `success` per step).
+    std::vector<yuzu::server::WorkflowStepResult> stored_rows_override;
     std::shared_ptr<yuzu::server::test::FnWorkflowApi> api;
 
     // An editor repoints a stored step instruction at another (plugin, action).
@@ -48199,12 +48201,26 @@ struct WfMcpFx {
                 }
                 return std::optional<yuzu::server::Workflow>{w};
             },
-            [](const std::string& id)
+            [this](const std::string& id)
                 -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
                 yuzu::server::WorkflowExecution e;
                 e.id = id;
                 e.workflow_id = "wf-1";
                 e.status = "completed";
+                // A completed run holds one settled `success` row per step, as the engine's does;
+                // an idempotent replay judges those rows, and rows that do not add up are never
+                // `completed`.
+                for (std::size_t i = 0; i < step_ids.size(); ++i) {
+                    yuzu::server::WorkflowStepResult r;
+                    r.step_index = static_cast<int>(i);
+                    r.instruction_id = step_ids[i];
+                    r.status = "success";
+                    r.result_json =
+                        R"j({"status":"dispatched","command_id":"c","agents_reached":1})j";
+                    e.step_results.push_back(std::move(r));
+                }
+                if (!stored_rows_override.empty())
+                    e.step_results = stored_rows_override;
                 return std::optional<yuzu::server::WorkflowExecution>{e};
             },
             yuzu::server::test::FnWorkflowApi::ListExecutionsFn{}, find_fn());
@@ -49419,6 +49435,46 @@ TEST_CASE("MCP execute_workflow: replay answers for a running run (retry_after_m
     CHECK_FALSE(stale.contains("retry_after_ms"));
     CHECK(stale["remediation"].get<std::string>().find("get_workflow_execution") != std::string::npos);
 
+    CHECK(fx.run_calls == 0);
+    CHECK(fx.dispatches == 0);
+    CHECK(appr.pending_count() == 0);
+}
+
+TEST_CASE("MCP execute_workflow: a replay of a run the engine called completed but whose stored steps "
+          "show a failure answers `partial`, never `completed` (hp2-1)",
+          "[mcp][pg][workflow][twin][idempotency][outcome]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    // An onFailure: continue step that reached nobody: the engine row is `completed`.
+    yuzu::server::WorkflowStepResult ok;
+    ok.step_index = 0;
+    ok.instruction_id = fx.step_ids[0];
+    ok.status = "success";
+    ok.result_json = R"j({"status":"dispatched","command_id":"c","agents_reached":1})j";
+    yuzu::server::WorkflowStepResult missed;
+    missed.step_index = 1;
+    missed.instruction_id = fx.step_ids[1];
+    missed.status = "failed";
+    missed.result_json = R"j([{"error":"no agents reached for x (quarantined)"}])j";
+    fx.stored_rows_override = {ok, missed};
+    fx.bound[{"alice", kWfKey}] = wf_bound_run("completed", 5, {"a1"});
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    auto res = ts.call(wf_exec_call(std::string(R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":")") + kWfKey + R"("})", 1));
+    REQUIRE(res);
+    const auto payload = wf_payload(*res);
+    CHECK(payload.at("status") == "partial");
+    CHECK(payload.at("idempotent_replay") == true);
+    CHECK(payload.at("retryable") == false);
+    CHECK_FALSE(payload.contains("retry_after_ms"));
+    CHECK(wf_audit_has(ts, "success", "idempotent_replay=true run_status=partial"));
     CHECK(fx.run_calls == 0);
     CHECK(fx.dispatches == 0);
     CHECK(appr.pending_count() == 0);

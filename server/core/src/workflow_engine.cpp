@@ -894,9 +894,15 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             note_stop(StopCause::kBound);
         return bound;
     };
-    const auto skip_reason_json = [&stop_cause]() {
-        return stop_cause == StopCause::kShutdown ? std::string(R"({"reason":"server_shutdown"})")
-                                                  : std::string(R"({"reason":"run stopped"})");
+    // The two stop tokens a step's stored result carries, under `reason`, whether the step was
+    // skipped or was the one in flight (workflow_run_port.hpp: kStepReason*). A reader of the
+    // stored rows (the idempotent replay) tells a shutdown from a run bound from these alone.
+    const auto stop_reason = [&stop_cause]() {
+        return stop_cause == StopCause::kShutdown ? std::string(kStepReasonServerShutdown)
+                                                  : std::string(kStepReasonRunStopped);
+    };
+    const auto skip_reason_json = [&stop_reason]() {
+        return nlohmann::json({{"reason", stop_reason()}}).dump();
     };
     bool run_stopped = false;
 
@@ -993,8 +999,9 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 if (!condition_fn(step.condition, fields)) {
                     // Condition not met — skip step
                     with_write_lease([&](PGconn* c) {
-                        wf_update_step_result(c, exec_id, step.index, "skipped",
-                                              R"({"reason":"condition not met"})");
+                        wf_update_step_result(
+                            c, exec_id, step.index, "skipped",
+                            nlohmann::json({{"reason", kStepReasonConditionNotMet}}).dump());
                     });
                     spdlog::info("WorkflowEngine: step {} skipped (condition: {})", step.index,
                                 step.condition);
@@ -1033,6 +1040,8 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 bool permanent_failure = false; // no retry, no retry sleep
 
                 for (const auto& params : dispatch_params) {
+                    if (control.on_attempt)
+                        control.on_attempt(step.index, attempt);
                     if (stop_before_attempt()) {
                         // Not retried, not slept on, and the step's on_failure policy does not
                         // apply: the whole run ends after this step is recorded.
@@ -1042,7 +1051,8 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                         foreach_results.push_back(nlohmann::json(
                             {{"error", stop_cause == StopCause::kShutdown
                                            ? "run stopped before this attempt (server shutdown)"
-                                           : "run stopped before this attempt"}}));
+                                           : "run stopped before this attempt"},
+                             {"reason", stop_reason()}}));
                         break;
                     }
                     auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
@@ -1123,7 +1133,8 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                             note_stop(StopCause::kShutdown);
                             run_stopped = true;
                             foreach_results.push_back(nlohmann::json(
-                                {{"error", "run stopped before the retry (server shutdown)"}}));
+                                {{"error", "run stopped before the retry (server shutdown)"},
+                                 {"reason", stop_reason()}}));
                         } else {
                             spdlog::warn("WorkflowEngine: step {} (execution {}) retry abandoned: "
                                          "the server is draining",
@@ -1248,7 +1259,9 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             with_write_lease([&](PGconn* c) {
                 if (current_step_open)
                     wf_update_step_result(c, exec_id, current_step_index, "failed",
-                                          R"({"error":"step dispatch threw"})");
+                                          nlohmann::json({{"error", "step dispatch threw"},
+                                                          {"reason", kStepReasonDispatchException}})
+                                              .dump());
                 for (const auto& remaining : workflow.steps) {
                     if (remaining.index > current_step_index) {
                         wf_update_step_result(c, exec_id, remaining.index, "skipped",

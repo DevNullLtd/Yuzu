@@ -20,6 +20,8 @@
 
 #include "workflow_engine.hpp"
 
+#include "capability_fragments.hpp" // the production catalogue the replay-parity runs classify against
+#include "command_capability.hpp"
 #include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -34,6 +36,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
+#include <yuzu/server/auth.hpp>
 
 #include <algorithm>
 #include <array>
@@ -2795,4 +2798,462 @@ TEST_CASE("WorkflowEngine idempotency: a run killed after the claim leaves a `ru
     // A different request under the same key is a conflict, whatever the run's age.
     req.agent_ids = {"agent-1", "agent-2"};
     CHECK(check_workflow_idempotency(ports, req)->status == WorkflowExecuteStatus::kIdempotencyConflict);
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// Replay parity over the REAL engine (#2146 hp2-1, hp2-2): the rows the engine itself persists.
+//
+// `apply_workflow_execute` is driven end to end with the real engine behind the run port and the
+// real read seam, once under a key and once more with the same key. The twin matrix in
+// test_workflow_execute_twins.cpp proves the rule against a stand-in; this one proves the stop
+// tokens, the failure placeholders and the refusal prefixes the engine really writes are the ones
+// the replay reads, so a change to either side that drifts breaks here.
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct ParityStep {
+    const char* instruction;
+    int retries{0};
+    bool keep_going{false}; // onFailure: continue
+};
+
+std::string parity_yaml(const char* name, const std::vector<ParityStep>& steps) {
+    std::string y = std::string("kind: Workflow\nmetadata:\n  name: ") + name +
+                    "\nspec:\n  steps:\n";
+    for (const auto& st : steps) {
+        y += std::string("    - instruction: ") + st.instruction + "\n";
+        y += "      retryCount: " + std::to_string(st.retries) + "\n      retryDelay: 0\n";
+        if (st.keep_going)
+            y += "      onFailure: continue\n";
+    }
+    return y;
+}
+
+ConfinedDispatchOutcome parity_reached() {
+    return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-parity"};
+}
+ConfinedDispatchOutcome parity_missed() {
+    ConfinedDispatchOutcome o;
+    o.denied_quarantined_count = 1;
+    return o;
+}
+
+struct ParityEnv {
+    std::map<std::string, int> reads;                  // instruction id -> lookups so far
+    std::map<std::string, std::string> mode_after_first; // instruction id -> approval mode from the 2nd read
+    std::map<std::string, std::string> action_after_first; // instruction id -> action from the 2nd read
+    std::map<std::string, int> sends;                   // instruction id -> dispatches so far
+    int total_sends{0};
+    /// A send waits until this instant (plus a few ms) before it answers: how the deadline cases
+    /// land the deadline between two steps without racing the callback's length.
+    std::optional<std::chrono::steady_clock::time_point> hold_until;
+    std::function<ConfinedDispatchOutcome(const std::string& id, int nth)> dispatch;
+    std::string key{"key-pg-parity-01"};
+    std::vector<std::pair<std::string, std::string>> audits; // (result, detail)
+};
+
+struct ParityOutcome {
+    WorkflowExecuteOutcome first;
+    WorkflowExecuteOutcome replay;
+    int sends_after_first{0};
+    int sends_after_replay{0};
+};
+
+ParityOutcome parity_run(WorkflowEngine& engine, ParityEnv& env, const std::string& wf_id,
+                         const std::function<void(WorkflowExecuteRequest&)>& tweak = {}) {
+    static const CommandCapabilityRegistry caps{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    const auto api = make_local_workflow_api(engine);
+    WorkflowExecutePorts ports;
+    ports.api = api.get();
+    ports.run = [&engine](const std::string& workflow_id, const std::vector<std::string>& agent_ids,
+                          StepDispatchFn dispatch_fn, ConditionEvalFn condition_fn,
+                          const WorkflowRunControl& control) {
+        return engine.execute(workflow_id, agent_ids, std::move(dispatch_fn),
+                              std::move(condition_fn), control.on_admitted, control);
+    };
+    ports.instruction_store_open = true;
+    ports.approval_gate_available = true;
+    ports.lookup = [&env](const std::string& id)
+        -> std::expected<std::optional<WorkflowStepInstruction>, std::string> {
+        const int n = ++env.reads[id];
+        std::string mode = "auto";
+        std::string action = "os_version";
+        if (n > 1) {
+            if (const auto it = env.mode_after_first.find(id); it != env.mode_after_first.end())
+                mode = it->second;
+            if (const auto it = env.action_after_first.find(id); it != env.action_after_first.end())
+                action = it->second;
+        }
+        return std::optional<WorkflowStepInstruction>{
+            WorkflowStepInstruction{id, "os_info", action, mode, "per-device"}};
+    };
+    ports.classify = [](std::string_view plugin, std::string_view action) {
+        return caps.classify(plugin, action);
+    };
+    ports.authorize = [](const DispatchCaller&, std::string_view plugin, std::string_view action)
+        -> std::expected<CommandCapability, detail::DispatchDenial> {
+        auto c = caps.classify(plugin, action);
+        if (!c)
+            return std::unexpected(detail::DispatchDenial{});
+        return *c;
+    };
+    ports.dispatch = [&env](const WorkflowStepInstruction& d, const std::vector<std::string>&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const DispatchCaller&) {
+        ++env.total_sends;
+        return env.dispatch(d.id, ++env.sends[d.id]);
+    };
+    ports.audit = [&env](const std::string&, const std::string& result, const std::string&,
+                         const std::string& detail) {
+        env.audits.emplace_back(result, detail);
+        return true;
+    };
+
+    WorkflowExecuteRequest req;
+    req.workflow_id = wf_id;
+    req.agent_ids = {"agent-1"};
+    req.caller = DispatchCaller{.principal = "alice", .principal_role = "user"};
+    req.audit_context = "surface=test";
+    req.idempotency_key = env.key;
+    if (tweak)
+        tweak(req);
+
+    ParityOutcome out;
+    out.first = apply_workflow_execute(ports, req);
+    out.sends_after_first = env.total_sends;
+    out.replay = apply_workflow_execute(ports, req);
+    out.sends_after_replay = env.total_sends;
+    return out;
+}
+
+std::string parity_first_class(const WorkflowExecuteOutcome& o) {
+    return std::string(workflow_run_outcome_token(
+        o.status == WorkflowExecuteStatus::kRunFailed ? WorkflowRunOutcome::kFailed : o.run_outcome));
+}
+
+} // namespace
+
+TEST_CASE("WorkflowEngine replay parity: the replay of a run the REAL engine ran says what the first "
+          "answer said, and `completed` only for a success",
+          "[workflow_engine][pg][execute][idempotency][parity]") {
+    WORKFLOW_ENGINE(engine);
+    ParityEnv env;
+    std::atomic<bool> stop{false};
+    engine.set_should_stop([&stop] {
+        return stop.load() ? WorkflowStopLevel::kStop : WorkflowStopLevel::kNone;
+    });
+    int executed = 0;
+    int serial = 0;
+
+    struct Scenario {
+        const char* name;
+        std::vector<ParityStep> steps;
+        const char* expect; // the first answer's class
+        std::function<ConfinedDispatchOutcome(const std::string&, int)> dispatch;
+        std::function<void(ParityEnv&, WorkflowExecuteRequest&)> tweak;
+    };
+    const auto always_reached = [](const std::string&, int) { return parity_reached(); };
+
+    const std::vector<Scenario> scenarios = {
+        {"succeeded", {{"inst-a"}, {"inst-b"}}, "succeeded", always_reached, {}},
+        {"onFailure continue, a later step reached nobody (engine says completed)",
+         {{"inst-a"}, {"inst-b", 0, true}},
+         "partial",
+         [](const std::string& id, int) { return id == "inst-b" ? parity_missed() : parity_reached(); },
+         {}},
+        {"onFailure continue, the first step reached nobody",
+         {{"inst-a", 0, true}, {"inst-b"}},
+         "partial",
+         [](const std::string& id, int) { return id == "inst-a" ? parity_missed() : parity_reached(); },
+         {}},
+        {"onFailure continue, nothing reached anyone",
+         {{"inst-a", 0, true}, {"inst-b", 0, true}},
+         "failed",
+         [](const std::string&, int) { return parity_missed(); },
+         {}},
+        {"retried to success",
+         {{"inst-a", 1}, {"inst-b"}},
+         "succeeded",
+         [](const std::string& id, int nth) {
+             return (id == "inst-a" && nth == 1) ? parity_missed() : parity_reached();
+         },
+         {}},
+        {"retried and still failing",
+         {{"inst-a", 1, true}, {"inst-b"}},
+         "partial",
+         [](const std::string& id, int) { return id == "inst-a" ? parity_missed() : parity_reached(); },
+         {}},
+        {"the same instruction twice: the first failed (continue), the second reached",
+         {{"inst-a", 0, true}, {"inst-a"}},
+         "partial",
+         [](const std::string&, int nth) { return nth == 1 ? parity_missed() : parity_reached(); },
+         {}},
+        {"abort policy: a later step reached nobody and the engine failed the run",
+         {{"inst-a"}, {"inst-b"}},
+         "partial",
+         [](const std::string& id, int) { return id == "inst-b" ? parity_missed() : parity_reached(); },
+         {}},
+        {"late_denied: step 2's approval mode was raised after the preflight",
+         {{"inst-a"}, {"inst-b"}},
+         "aborted",
+         always_reached,
+         [](ParityEnv& e, WorkflowExecuteRequest&) { e.mode_after_first["inst-b"] = "always"; }},
+        {"late_denied on a step the run would have carried on from (continue)",
+         {{"inst-a"}, {"inst-b", 0, true}, {"inst-a"}},
+         "aborted",
+         always_reached,
+         [](ParityEnv& e, WorkflowExecuteRequest&) { e.mode_after_first["inst-b"] = "always"; }},
+        {"definition_changed: step 2 moved off the effect the ticket was bound to",
+         {{"inst-a"}, {"inst-b"}},
+         "aborted",
+         always_reached,
+         [](ParityEnv& e, WorkflowExecuteRequest& r) {
+             WorkflowStepEffects fx;
+             for (const char* id : {"inst-a", "inst-b"})
+                 fx.emplace(id, workflow_step_effect(WorkflowStepInstruction{
+                                    id, "os_info", "os_version", "auto", "per-device"}));
+             r.expected_step_effects = std::move(fx);
+             e.action_after_first["inst-b"] = "os_uptime";
+         }},
+        {"interrupted: the server began stopping after step 1",
+         {{"inst-a"}, {"inst-b"}},
+         "interrupted",
+         [](const std::string&, int) { return parity_reached(); },
+         [](ParityEnv&, WorkflowExecuteRequest&) {}},
+        {"credential revoked before step 2",
+         {{"inst-a"}, {"inst-b"}},
+         "aborted",
+         always_reached,
+         [](ParityEnv&, WorkflowExecuteRequest& r) {
+             auto asked = std::make_shared<int>(0);
+             r.reauthorize = [asked] {
+                 return ++*asked == 1 ? auth::CredentialCheck::kValid
+                                      : auth::CredentialCheck::kRevoked;
+             };
+         }},
+        {"credential could not be confirmed before the first step",
+         {{"inst-a"}, {"inst-b"}},
+         "aborted",
+         always_reached,
+         [](ParityEnv&, WorkflowExecuteRequest& r) {
+             r.reauthorize = [] { return auth::CredentialCheck::kIndeterminate; };
+             r.reauthorize_retry_delay = std::chrono::milliseconds(1);
+         }},
+        {"deadline passed between step 1 and step 2",
+         {{"inst-a"}, {"inst-b"}},
+         "aborted",
+         always_reached,
+         [](ParityEnv& e, WorkflowExecuteRequest& r) {
+             r.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+             e.hold_until = r.deadline;
+         }},
+        {"a dispatch threw after step 1 was sent",
+         {{"inst-a"}, {"inst-b"}},
+         "failed",
+         [](const std::string& id, int) -> ConfinedDispatchOutcome {
+             if (id == "inst-b")
+                 throw std::runtime_error("registry exploded mid fan-out");
+             return parity_reached();
+         },
+         {}},
+    };
+
+    for (const auto& sc : scenarios) {
+        INFO(sc.name);
+        env = ParityEnv{};
+        stop = false;
+        env.dispatch = sc.dispatch;
+        env.key = "key-pg-parity-" + std::to_string(serial + 1);
+        const std::string wf_name = "parity-" + std::to_string(++serial);
+        const auto wf_id = *engine.create_workflow(parity_yaml(wf_name.c_str(), sc.steps));
+        const std::string name = sc.name;
+        if (name.starts_with("interrupted")) {
+            // The stop lands as the first step's send returns, so the engine finds it at the top
+            // of step 2.
+            env.dispatch = [&stop](const std::string&, int) {
+                stop = true;
+                return parity_reached();
+            };
+        }
+        if (name.starts_with("deadline")) {
+            env.dispatch = [&env](const std::string&, int) {
+                if (env.hold_until)
+                    std::this_thread::sleep_until(*env.hold_until + std::chrono::milliseconds(5));
+                return parity_reached();
+            };
+        }
+        const auto outcome = parity_run(engine, env, wf_id, [&](WorkflowExecuteRequest& r) {
+            if (sc.tweak)
+                sc.tweak(env, r);
+        });
+        stop = false;
+        ++executed;
+
+        CHECK(parity_first_class(outcome.first) == sc.expect);
+        REQUIRE(outcome.replay.status == WorkflowExecuteStatus::kIdempotentReplay);
+        const std::string want = std::string(sc.expect) == "succeeded" ? "completed" : sc.expect;
+        CHECK(outcome.replay.replay_status == want);
+        CHECK((outcome.replay.replay_status == "completed") ==
+              (parity_first_class(outcome.first) == "succeeded"));
+        CHECK(outcome.sends_after_replay == outcome.sends_after_first); // a replay sends nothing
+    }
+    // A silent skip is not evidence: the counter proves every scenario ran against the real engine.
+    CHECK(executed == static_cast<int>(scenarios.size()));
+    CHECK(executed == 16);
+}
+
+TEST_CASE("WorkflowEngine replay parity: a step retried to success numbers its attempts and the run is "
+          "succeeded on both answers (hp2-2)",
+          "[workflow_engine][pg][execute][idempotency][parity][attempt]") {
+    WORKFLOW_ENGINE(engine);
+    ParityEnv env;
+    env.dispatch = [](const std::string& id, int nth) {
+        return (id == "inst-a" && nth == 1) ? parity_missed() : parity_reached();
+    };
+    const auto wf_id = *engine.create_workflow(
+        parity_yaml("parity-attempts", {{"inst-a", 2}, {"inst-b"}}));
+    const auto out = parity_run(engine, env, wf_id);
+    CHECK(out.first.status == WorkflowExecuteStatus::kOk);
+    CHECK(out.first.run_outcome == WorkflowRunOutcome::kSucceeded);
+    REQUIRE(out.first.steps.size() == 3);
+    CHECK(out.first.steps[0].attempt == 1);
+    CHECK(out.first.steps[0].step_index == 0);
+    CHECK(out.first.steps[0].agents_reached == 0);
+    CHECK(out.first.steps[1].attempt == 2);
+    CHECK(out.first.steps[1].step_index == 0);
+    CHECK(out.first.steps[2].attempt == 1);
+    CHECK(out.first.steps[2].step_index == 1);
+    // The closing row of the first answer is a success: no run_outcome in it.
+    REQUIRE_FALSE(env.audits.empty());
+    bool saw_success = false;
+    for (const auto& [result, detail] : env.audits) {
+        if (result == "success" && detail.find("idempotent_replay") == std::string::npos) {
+            saw_success = true;
+            CHECK(detail.find("run_outcome") == std::string::npos);
+        }
+        CHECK(result != "failure");
+    }
+    CHECK(saw_success);
+    REQUIRE(out.replay.status == WorkflowExecuteStatus::kIdempotentReplay);
+    CHECK(out.replay.replay_status == "completed");
+    const auto exec = only_execution(engine, wf_id);
+    REQUIRE(exec.step_results.size() == 2);
+    CHECK(exec.step_results[0].status == "success");
+}
+
+TEST_CASE("WorkflowEngine: the engine announces every attempt (step index and attempt number) before "
+          "asking before_attempt, including an attempt it then stops",
+          "[workflow_engine][pg][execute][attempt]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(
+        parity_yaml("attempts-hook", {{"inst-a", 1}, {"inst-b"}}));
+    std::vector<std::string> events;
+    int inst_a_calls = 0;
+    StepDispatchFn dispatch = [&](const std::string& id, const std::string&, const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        events.push_back("dispatch:" + id);
+        if (id == "inst-a" && ++inst_a_calls == 1)
+            return std::unexpected(StepDispatchError{"transient", false});
+        return std::string(R"({"status":"ok"})");
+    };
+    WorkflowRunControl control;
+    control.on_attempt = [&](int step, int attempt) {
+        events.push_back("attempt:" + std::to_string(step) + "/" + std::to_string(attempt));
+    };
+    int asked = 0;
+    control.before_attempt = [&] {
+        events.push_back("ask");
+        return ++asked < 4; // the fourth ask (none: three attempts) never says no
+    };
+    auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, nullptr, control);
+    REQUIRE(r.has_value());
+    CHECK(events == std::vector<std::string>{"attempt:0/1", "ask", "dispatch:inst-a", "attempt:0/2",
+                                             "ask", "dispatch:inst-a", "attempt:1/1", "ask",
+                                             "dispatch:inst-b"});
+
+    // An attempt the run is stopped before is still announced, so the caller knows the step made it.
+    events.clear();
+    asked = 0;
+    inst_a_calls = 0;
+    control.before_attempt = [&] {
+        events.push_back("ask");
+        return ++asked < 2; // yes for attempt 1, no for the retry
+    };
+    auto stopped = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, nullptr, control);
+    REQUIRE(stopped.has_value());
+    CHECK(events == std::vector<std::string>{"attempt:0/1", "ask", "dispatch:inst-a", "attempt:0/2",
+                                             "ask"});
+}
+
+TEST_CASE("WorkflowEngine: a stopped or failed step's stored result carries the structured `reason` "
+          "tokens the idempotent replay classifies by",
+          "[workflow_engine][pg][execute][parity][reason]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(parity_yaml("reason-tokens", {{"inst-a"}, {"inst-b"}}));
+    // The `reason` tokens a stored result carries: an object has at most one, an array of
+    // placeholders (one per item of the last attempt, plus a stop's own) any number.
+    const auto step_reason = [](const WorkflowStepResult& sr) {
+        std::vector<std::string> reasons;
+        const auto j = nlohmann::json::parse(sr.result_json, nullptr, false);
+        const auto take = [&reasons](const nlohmann::json& o) {
+            if (o.is_object() && o.contains("reason") && o.at("reason").is_string())
+                reasons.push_back(o.at("reason").get<std::string>());
+        };
+        if (j.is_array()) {
+            for (const auto& e : j)
+                take(e);
+        } else {
+            take(j);
+        }
+        return reasons;
+    };
+    using Reasons = std::vector<std::string>;
+    SECTION("a run bound (deadline / credential) stop: the step in flight and the skipped rest") {
+        WorkflowRunControl control;
+        control.before_attempt = [] { return false; };
+        REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), nullptr, nullptr, control)
+                    .has_value());
+        const auto exec = only_execution(engine, wf_id);
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "failed");
+        CHECK(step_reason(exec.step_results[0]) == Reasons{kStepReasonRunStopped});
+        CHECK(exec.step_results[1].status == "skipped");
+        CHECK(step_reason(exec.step_results[1]) == Reasons{kStepReasonRunStopped});
+    }
+    SECTION("a server stop before an attempt, on the LAST step: no skip row, the failed step says so") {
+        std::atomic<int> level{0};
+        WorkflowRunControl control;
+        control.should_stop = [&level] { return static_cast<WorkflowStopLevel>(level.load()); };
+        // The stop lands on the RETRY of the only (so last) step: the engine finds it before that
+        // attempt, writes the step failed, and has no later step to write a skip row on.
+        const auto retry_id = *engine.create_workflow(parity_yaml("reason-retry", {{"inst-a", 1}}));
+        StepDispatchFn fail_then_stop = [&level](const std::string&, const std::string&,
+                                                 const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            level = static_cast<int>(WorkflowStopLevel::kStop);
+            return std::unexpected(StepDispatchError{"transient", false});
+        };
+        REQUIRE(engine.execute(retry_id, {"agent-1"}, fail_then_stop, nullptr, nullptr, control)
+                    .has_value());
+        const auto exec = only_execution(engine, retry_id);
+        REQUIRE(exec.step_results.size() == 1);
+        CHECK(exec.step_results[0].status == "failed");
+        CHECK(step_reason(exec.step_results[0]) == Reasons{kStepReasonServerShutdown});
+    }
+    SECTION("a step whose dispatch threw") {
+        StepDispatchFn boom = [](const std::string& id, const std::string&, const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            if (id == "inst-b")
+                throw std::runtime_error("boom");
+            return std::string(R"({"status":"ok"})");
+        };
+        CHECK_THROWS(engine.execute(wf_id, {"agent-1"}, boom));
+        const auto exec = only_execution(engine, wf_id);
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "success");
+        CHECK(exec.step_results[1].status == "failed");
+        CHECK(step_reason(exec.step_results[1]) == Reasons{kStepReasonDispatchException});
+    }
 }

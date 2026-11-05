@@ -6732,8 +6732,9 @@ nothing is sent.
 | `503` | a zero-reach cause | The run started and no step reached any agent (below). |
 
 **Audit.** A keyed call carries `idempotency_key=<key>` in its `requested` and closing rows. A terminal
-replay (`completed`, `failed`, `indeterminate`) writes one `success` row (`idempotent_replay=true
-run_status=<status>`); a `running` replay writes none (counted on
+replay (every status but `running`) writes one `success` row (`idempotent_replay=true
+run_status=<the replay's status>`, the first-answer class in the table below, not the engine's
+word); a `running` replay writes none (counted on
 `yuzu_server_workflow_run_idempotent_total{outcome="in_progress"}`); a conflict is `denied`
 (`reason=idempotency_key_conflict`) and a lost claim race closes its `requested` row `denied`
 (`reason=idempotent_duplicate`). A `workflow.execute` row with `result=requested` is written before anything is sent; if
@@ -6757,14 +6758,22 @@ identical key is a different key) and stays bound to its run for the life of the
 prunes it. A repeat of the SAME key with the SAME request (the workflow id and the SET of agent ids:
 order and repeats do not matter; the stored step definitions are not part of it, so an instruction
 edited since does not turn a retry into a conflict) sends nothing and answers `202` with the thin body
-of the run the key is bound to:
+of the run the key is bound to. The replay says the class the FIRST answer said: it is judged from
+the run's stored step results (each step's final outcome), not from the engine's own run status,
+because the engine closes a run `completed` when an `onFailure: continue` step reached nobody. The
+two outcomes cannot disagree: the same rule classifies both.
 
 | `data.status` | Meaning | Extra fields |
 |---|---|---|
-| `completed` | The run completed. | none |
-| `failed` | The run failed, was stopped (deadline, shutdown, credential) or threw. Final: the key stays bound; a deliberate re-run needs a NEW key. | `retryable: false` |
+| `completed` | The run succeeded: the engine recorded it completed, no step was refused at send time, and every step's final attempt reached an agent. The ONLY status that means success. | none |
+| `partial` | Something was sent but the run did not succeed: some step's final attempt reached nobody (an `onFailure: continue` step), or the engine did not complete after a send. Final. | `retryable: false` |
+| `failed` | Nothing was sent, or the run threw. Final: the key stays bound; a deliberate re-run needs a NEW key. | `retryable: false` |
+| `aborted` | A step was refused at send time (its definition changed after approval or the preflight), or the run was stopped by its 60 second deadline or by the credential check. The replay does not say which of the stop causes (`data.reason` is absent). Final. | `retryable: false` |
+| `interrupted` | The stopping server ended the run. Final. | `retryable: false` |
 | `running` | The run is still in progress. **Poll `GET /api/v1/workflow-executions/{id}`; never re-send.** | `retry_after_ms: 2000`, `Retry-After: 2` |
-| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped). Not retryable. Read the run: a step with no `command_id` was never sent. Past about 2 minutes, treat a `running` answer the same way. | `retryable: false`, `remediation` |
+| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step with no `command_id` was never sent. Past about 2 minutes, treat a `running` answer the same way. | `retryable: false`, `remediation` |
+
+What the stored rows can and cannot say: a run the engine recorded `failed` or `cancelled` whose rows cannot be read back replays `failed`. A step-result write the engine dropped under a database brownout costs precision (a run may replay `partial` or `failed` where the first answer said `interrupted` or `aborted`), never correctness: the replay is never `completed` for a run it cannot prove succeeded. A `foreach` step is judged by its last attempt (every item of that attempt must have reached an agent); the engine sends one item today.
 
 Every replay body also carries `execution_id`, `workflow_id`, `idempotent_replay: true`, `started_at`
 (epoch seconds) and a `message`. It has NO `steps` and no `late_denied`: the engine does not keep a
@@ -6846,21 +6855,26 @@ execution `failed` (never left `running`) and answers `500 dispatch_exception` a
 **Success `202`** (a repeat of an `Idempotency-Key` answers with the thin body under **Idempotency**
 instead): `data.execution_id`, `data.workflow_id`, `data.status`, `data.late_denied` and
 `data.steps`, one entry per send attempt (retries and `foreach` add entries): `instruction_id`,
-`command_id`, `agents_reached`, and, when `agents_reached` is `0`, `reason`, `retryable` and the
+`attempt` (1-based: a retry of a step has the next number and the next step starts again at 1, so a
+reader can tell a retry from a new step), `command_id`, `agents_reached`, and, when `agents_reached` is `0`, `reason`, `retryable` and the
 withheld counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`.
 `data.status` is `completed` ONLY when the engine recorded the run `completed`, no step was refused
-at send time and every send attempt reached at least one agent (commands were sent; devices have not
-necessarily finished). A run that sent something and did not meet all three is still a `202` (a
+at send time and every step's FINAL send attempt reached at least one agent (commands were sent;
+devices have not necessarily finished). A run that sent something and did not meet all three is still a `202` (a
 `5xx` would invite a blind re-send of steps already sent) but is NOT a success: `data.status` is
-`partial` (some attempt reached nobody, or the engine did not complete after a send), `aborted` (a
+`partial` (some step's final attempt reached nobody, or the engine did not complete after a send), `aborted` (a
 step was refused at send time because its definition changed, the run reached its 60 second
 deadline, or the credential check stopped it: `data.reason` `deadline_exceeded`,
 `credential_revoked` or `credential_indeterminate`; the rest did not run) or `interrupted` (the server began stopping: `data.reason`
 `server_shutdown`), with
 `data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
-with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step retried
-to success still counts its earlier zero-reach attempt, so the run reads `partial`: the label errs
-toward failure.
+with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step is judged
+by its LAST attempt: one that reached nobody and was retried to success is reached, and a run whose
+every step ends reached reads `completed` (its earlier zero-reach entry stays in `data.steps` with
+its `attempt` number, and the closing audit row is a `success`). A step the engine left failed (an
+`onFailure: continue` step that never reached anyone) makes the run `partial`, retried or not. The same
+rule classifies a repeat of the key, so the replay says `completed` for a retried-to-success run and
+`partial` for the continue case.
 
 **Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
 with `error.reason` and `error.execution_id` (the run exists and is readable). `run_failed` (the

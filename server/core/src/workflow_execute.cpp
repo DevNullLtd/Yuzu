@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -166,6 +167,7 @@ nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,
     nlohmann::json steps = nlohmann::json::array();
     for (const auto& n : o.steps) {
         nlohmann::json e = {{"instruction_id", n.instruction_id},
+                            {"attempt", n.attempt},
                             {"command_id", n.command_id},
                             {"agents_reached", n.agents_reached}};
         if (n.agents_reached == 0) {
@@ -238,22 +240,61 @@ std::int64_t epoch_now(const WorkflowExecutePorts& ports) {
         .count();
 }
 
-/// What a replay of the engine's recorded `status` says. A `running`/`pending` row is `running`
-/// only while its age is believable: past the stale bound, or dated further in the future than
-/// that (a replica clock far ahead would otherwise leave it `running` for as long as the skew),
-/// it is `indeterminate`. An unknown status is `indeterminate` too, never `completed`.
-std::string_view replay_status_for(std::string_view engine_status, std::int64_t started_at,
-                                   std::int64_t now) {
-    if (engine_status == "completed")
+/// The replay `status` token of a class a stored run was judged to be.
+std::string_view replay_token_for(WorkflowRunOutcome outcome) {
+    switch (outcome) {
+    case WorkflowRunOutcome::kSucceeded:
         return kReplayCompleted;
-    if (engine_status == "failed" || engine_status == "cancelled")
+    case WorkflowRunOutcome::kPartial:
+        return kReplayPartial;
+    case WorkflowRunOutcome::kFailed:
         return kReplayFailed;
+    case WorkflowRunOutcome::kAborted:
+        return kReplayAborted;
+    case WorkflowRunOutcome::kInterrupted:
+        return kReplayInterrupted;
+    }
+    return kReplayIndeterminate;
+}
+
+/// What a replay of the run says. A `running`/`pending` row is `running` only while its age is
+/// believable: past the stale bound, or dated further in the future than that (a replica clock far
+/// ahead would otherwise leave it `running` for as long as the skew), it is `indeterminate`. A
+/// TERMINAL row is judged from its stored steps, never from the engine's status alone: that status
+/// says `completed` for a run whose `onFailure: continue` step reached nobody. What the rows
+/// cannot prove is never `completed`: unreadable or unsettled rows are `indeterminate` for a run
+/// the engine called completed and `failed` for one it called failed or cancelled. An unknown
+/// engine status is `indeterminate` too.
+std::string_view replay_status_for(const WorkflowExecutePorts& ports,
+                                   const WorkflowIdempotentRun& run, std::int64_t now) {
+    const std::string_view engine_status = run.status;
     if (engine_status == "running" || engine_status == "pending") {
-        const std::int64_t age = now - started_at;
+        const std::int64_t age = now - run.started_at;
         const std::int64_t bound = kIdempotentRunStaleAfter.count();
         return (age > bound || -age > bound) ? kReplayIndeterminate : kReplayRunning;
     }
-    return kReplayIndeterminate;
+    if (engine_status != "completed" && engine_status != "failed" && engine_status != "cancelled")
+        return kReplayIndeterminate;
+
+    // The steps are read only for a terminal run: a client polling a live one costs no extra read.
+    // A read that fails or throws is "could not prove", the same as rows that do not add up.
+    try {
+        const auto stored = ports.api->get_workflow_execution(run.execution_id);
+        if (!stored) {
+            spdlog::warn("workflow execute: replay step read failed: {}",
+                         genericize_db_error("workflow replay step read", stored.error()));
+        } else if (*stored && (*stored)->status == engine_status) {
+            // Two reads of one terminal row must agree before the rows are believed: a terminal
+            // status is final, so a disagreement is a row nobody can vouch for.
+            if (const auto outcome = classify_stored_workflow_run(**stored))
+                return replay_token_for(*outcome);
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("workflow execute: replay step read threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("workflow execute: replay step read threw a non-standard exception");
+    }
+    return engine_status == "completed" ? kReplayIndeterminate : kReplayFailed;
 }
 
 WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
@@ -264,9 +305,11 @@ WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
     o.execution_id = run.execution_id;
     o.run_status = run.status;
     o.started_at = run.started_at;
-    o.replay_status = std::string(replay_status_for(run.status, run.started_at, epoch_now(ports)));
+    o.replay_status = std::string(replay_status_for(ports, run, epoch_now(ports)));
     o.reason = "idempotent_replay";
     o.retryable = o.replay_status == kReplayRunning;
+    constexpr std::string_view kReadAndRerun =
+        "read get_workflow_execution for what ran; a deliberate re-run needs a new idempotency key";
     if (o.replay_status == kReplayRunning) {
         o.message = "this idempotency key is bound to a run that is still in progress; nothing was "
                     "sent for this call";
@@ -275,11 +318,23 @@ WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
     } else if (o.replay_status == kReplayCompleted) {
         o.message = "this idempotency key is bound to a run that already completed; nothing was "
                     "sent for this call";
+    } else if (o.replay_status == kReplayPartial) {
+        o.message = "this idempotency key is bound to a run that sent some steps but did not "
+                    "complete on every step; nothing was sent for this call";
+        o.remediation = std::string(kReadAndRerun);
+    } else if (o.replay_status == kReplayAborted) {
+        o.message = "this idempotency key is bound to a run that was stopped before it finished (a "
+                    "step was refused at dispatch, or the run reached its time budget or lost its "
+                    "credential); nothing was sent for this call";
+        o.remediation = std::string(kReadAndRerun);
+    } else if (o.replay_status == kReplayInterrupted) {
+        o.message = "this idempotency key is bound to a run that the server's shutdown stopped; "
+                    "nothing was sent for this call";
+        o.remediation = std::string(kReadAndRerun);
     } else if (o.replay_status == kReplayFailed) {
-        o.message = "this idempotency key is bound to a run that failed or was stopped; nothing "
-                    "was sent for this call";
-        o.remediation = "read get_workflow_execution for what ran; a deliberate re-run needs a new "
-                        "idempotency key";
+        o.message = "this idempotency key is bound to a run that failed; nothing was sent for "
+                    "this call";
+        o.remediation = std::string(kReadAndRerun);
     } else {
         o.message = "this idempotency key is bound to a run whose outcome could not be confirmed; "
                     "nothing was sent for this call";
@@ -435,23 +490,147 @@ std::string_view workflow_run_outcome_token(WorkflowRunOutcome outcome) {
     return "failed";
 }
 
-WorkflowRunOutcome classify_workflow_run(std::string_view run_status, bool late_denied,
-                                         const std::vector<WorkflowStepDispatchNote>& steps,
-                                         bool deadline_exceeded, bool interrupted,
-                                         bool credential_stopped) {
-    if (late_denied || deadline_exceeded || credential_stopped)
+WorkflowRunOutcome classify_workflow_run(std::string_view run_status, const WorkflowRunFacts& facts,
+                                         const std::vector<WorkflowStepFinal>& finals) {
+    if (facts.threw)
+        return WorkflowRunOutcome::kFailed;
+    if (facts.late_denied || facts.bound_stop)
         return WorkflowRunOutcome::kAborted;
-    if (interrupted)
+    if (facts.interrupted)
         return WorkflowRunOutcome::kInterrupted;
-    const bool any_reached = std::any_of(steps.begin(), steps.end(),
-                                         [](const auto& n) { return n.agents_reached > 0; });
-    const bool all_reached = std::all_of(steps.begin(), steps.end(),
-                                         [](const auto& n) { return n.agents_reached > 0; });
+    const bool any_sent = std::any_of(finals.begin(), finals.end(),
+                                      [](const auto& f) { return f.sent; });
+    const bool all_reached = std::all_of(finals.begin(), finals.end(),
+                                         [](const auto& f) { return f.reached; });
     // Only the engine's own "completed" counts: "unknown" (unreadable), "running" (a finalize
     // that did not land), "failed" and "cancelled" are all not success.
     if (run_status == "completed" && all_reached)
         return WorkflowRunOutcome::kSucceeded;
-    return any_reached ? WorkflowRunOutcome::kPartial : WorkflowRunOutcome::kFailed;
+    return any_sent ? WorkflowRunOutcome::kPartial : WorkflowRunOutcome::kFailed;
+}
+
+std::vector<WorkflowStepFinal> workflow_step_finals(const std::vector<WorkflowStepDispatchNote>& notes,
+                                                    const std::map<int, int>& attempts) {
+    std::vector<WorkflowStepFinal> out;
+    for (const auto& [step_index, last_attempt] : attempts) {
+        WorkflowStepFinal f{.step_index = step_index, .attempt = last_attempt};
+        bool any_note_at_last = false;
+        bool every_note_at_last_reached = true;
+        for (const auto& n : notes) {
+            if (n.step_index != step_index)
+                continue;
+            if (n.agents_reached > 0)
+                f.sent = true;
+            if (n.attempt != last_attempt)
+                continue;
+            any_note_at_last = true;
+            every_note_at_last_reached = every_note_at_last_reached && n.agents_reached > 0;
+        }
+        f.reached = any_note_at_last && every_note_at_last_reached;
+        out.push_back(f);
+    }
+    // A note nobody attributed to a step (a run port that never announces attempts) is its own step.
+    for (const auto& n : notes) {
+        if (n.step_index >= 0)
+            continue;
+        const bool reached = n.agents_reached > 0;
+        out.push_back(WorkflowStepFinal{.step_index = -1,
+                                        .attempt = n.attempt,
+                                        .reached = reached,
+                                        .sent = reached});
+    }
+    return out;
+}
+
+namespace {
+
+/// What one stored step result says beyond its status. Read defensively: a result is an object
+/// for a dispatched step, an array of `{"error": ...}` placeholders for a failed one, and `{}`
+/// for a step never begun; nothing here may throw out of a replay.
+struct StoredStepMarkers {
+    bool run_stopped{false};
+    bool shutdown{false};
+    bool threw{false};
+    bool late_denied{false};
+    bool condition_not_met{false};
+};
+
+void read_step_markers(const nlohmann::json& j, StoredStepMarkers& m) {
+    if (!j.is_object())
+        return;
+    if (const auto it = j.find("reason"); it != j.end() && it->is_string()) {
+        const auto& r = it->get_ref<const std::string&>();
+        if (r == kStepReasonRunStopped)
+            m.run_stopped = true;
+        else if (r == kStepReasonServerShutdown)
+            m.shutdown = true;
+        else if (r == kStepReasonDispatchException)
+            m.threw = true;
+        else if (r == kStepReasonConditionNotMet)
+            m.condition_not_met = true;
+    }
+    if (const auto it = j.find("error"); it != j.end() && it->is_string()) {
+        const auto& e = it->get_ref<const std::string&>();
+        if (e.starts_with(kStepErrorLateDenied) || e.starts_with(kStepErrorDefinitionChanged))
+            m.late_denied = true;
+    }
+}
+
+StoredStepMarkers stored_step_markers(const std::string& result_json) {
+    constexpr std::size_t kMaxParse = 256 * 1024; // a placeholder is a few hundred bytes
+    StoredStepMarkers m;
+    if (result_json.size() > kMaxParse)
+        return m;
+    const auto j = nlohmann::json::parse(result_json, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded())
+        return m;
+    if (j.is_array()) {
+        for (const auto& e : j)
+            read_step_markers(e, m);
+    } else {
+        read_step_markers(j, m);
+    }
+    return m;
+}
+
+} // namespace
+
+std::optional<WorkflowRunOutcome> classify_stored_workflow_run(const WorkflowExecution& stored) {
+    if (stored.status != "completed" && stored.status != "failed" && stored.status != "cancelled")
+        return std::nullopt;
+    const bool completed = stored.status == "completed";
+    WorkflowRunFacts facts;
+    std::vector<WorkflowStepFinal> finals;
+    bool unproven = stored.step_results.empty(); // a run always has its step rows
+    for (const auto& r : stored.step_results) {
+        const int attempt = std::max(r.attempt, 1);
+        if (r.status == "success") {
+            finals.push_back({.step_index = r.step_index, .attempt = attempt, .reached = true,
+                              .sent = true});
+        } else if (r.status == "failed") {
+            const auto m = stored_step_markers(r.result_json);
+            facts.late_denied = facts.late_denied || m.late_denied;
+            facts.bound_stop = facts.bound_stop || m.run_stopped;
+            facts.interrupted = facts.interrupted || m.shutdown;
+            facts.threw = facts.threw || m.threw;
+            finals.push_back({.step_index = r.step_index, .attempt = attempt, .reached = false,
+                              .sent = false});
+        } else if (r.status == "skipped") {
+            const auto m = stored_step_markers(r.result_json);
+            facts.bound_stop = facts.bound_stop || m.run_stopped;
+            facts.interrupted = facts.interrupted || m.shutdown;
+            // A skip a completed run can legitimately hold is its own condition's, or a stop's.
+            if (!m.condition_not_met && !m.run_stopped && !m.shutdown)
+                unproven = true;
+        } else {
+            unproven = true; // pending / running / unknown: the engine never settled this step
+        }
+    }
+    // A run the engine did not fail must have every step accounted for. A failed or cancelled
+    // one may legitimately hold unstarted steps, and is a non-success whatever they were.
+    if (completed && unproven)
+        return std::nullopt;
+    return classify_workflow_run(stored.status, facts, finals);
 }
 
 // ── admission ─────────────────────────────────────────────────────────────
@@ -800,6 +979,12 @@ struct RunProgress {
     std::string execution_id;
     int agents_sent{0};
     std::vector<WorkflowStepDispatchNote> notes;
+    /// The step and attempt the engine announced last (`WorkflowRunControl::on_attempt`), stamped
+    /// on every note the dispatch callback records, and the last attempt announced per step: what
+    /// `workflow_step_finals` judges the run by.
+    int current_step{-1};
+    int current_attempt{1};
+    std::map<int, int> attempts;
     bool late_denied{false};
     /// The engine asked `before_attempt` after the deadline and was told to stop.
     bool deadline_hit{false};
@@ -877,6 +1062,19 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     // ── 6. run: the engine drives the steps synchronously through this callback ──
     std::vector<WorkflowStepDispatchNote>& notes = progress.notes;
     bool& late_denied = progress.late_denied;
+    // Every note belongs to the step and attempt the engine announced just before the callback.
+    const auto stamped = [&progress](WorkflowStepDispatchNote n) {
+        n.step_index = progress.current_step;
+        n.attempt = progress.current_attempt;
+        return n;
+    };
+    // The note of a step refused at send time: nothing was sent, `reason` says why.
+    const auto refused_note = [&stamped](const std::string& instruction_id, const char* reason) {
+        WorkflowStepDispatchNote n;
+        n.instruction_id = instruction_id;
+        n.reason = reason;
+        return stamped(std::move(n));
+    };
     const StepDispatchFn dispatch_fn =
         [&](const std::string& instruction_id, const std::string& /*agent_ids_json*/,
             const std::string& parameters_json) -> std::expected<std::string, StepDispatchError> {
@@ -896,12 +1094,14 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         if (req.expected_step_effects && !step_matches_expected(*req.expected_step_effects, def)) {
             late_denied = true;
             deny_audit("definition_changed", " step=" + clip_token(instruction_id) + " (late)");
-            notes.push_back(WorkflowStepDispatchNote{.instruction_id = instruction_id,
-                                                     .reason = "definition_changed"});
+            notes.push_back(refused_note(instruction_id, "definition_changed"));
             // Permanent: the definition will not move back, and a retry would audit the same
-            // refusal again after a sleep.
-            return std::unexpected(
-                StepDispatchError{"step definition changed after approval; refused", true});
+            // refusal again after a sleep. The prefix is what the stored step result keeps of
+            // the refusal (kStepErrorDefinitionChanged).
+            return std::unexpected(StepDispatchError{
+                std::string(kStepErrorDefinitionChanged) +
+                    "step definition changed after approval; refused",
+                true});
         }
 
         // Re-run the admission against the FRESH definition: an instruction edited after the
@@ -914,18 +1114,22 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                 d.verdict == StepAdmission::kDestructiveNoVisibleTarget)
                 count_rejected(d.reason);
             deny_audit(d.reason, " step=" + clip_token(instruction_id) + " (late)");
-            notes.push_back(WorkflowStepDispatchNote{.instruction_id = instruction_id,
-                                                     .reason = "late_denied"});
-            // Permanent, as above: an authorization refusal never improves with a retry.
+            notes.push_back(refused_note(instruction_id, "late_denied"));
+            // Permanent, as above: an authorization refusal never improves with a retry. The
+            // prefix is what the stored step result keeps of the refusal (kStepErrorLateDenied).
             switch (d.verdict) {
             case StepAdmission::kApprovalRequired:
-                return std::unexpected(
-                    StepDispatchError{"step now requires approval; refused", true});
+                return std::unexpected(StepDispatchError{
+                    std::string(kStepErrorLateDenied) + "step now requires approval; refused",
+                    true});
             case StepAdmission::kUnclassified:
-                return std::unexpected(
-                    StepDispatchError{"step is not in the capability catalogue; refused", true});
+                return std::unexpected(StepDispatchError{
+                    std::string(kStepErrorLateDenied) +
+                        "step is not in the capability catalogue; refused",
+                    true});
             default:
-                return std::unexpected(StepDispatchError{std::string(d.message), true});
+                return std::unexpected(StepDispatchError{
+                    std::string(kStepErrorLateDenied) + std::string(d.message), true});
             }
         }
 
@@ -947,7 +1151,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             throw;
         }
         progress.agents_sent += out.sent;
-        WorkflowStepDispatchNote note;
+        WorkflowStepDispatchNote note = stamped({});
         note.instruction_id = instruction_id;
         note.command_id = out.command_id;
         note.agents_reached = out.sent;
@@ -987,6 +1191,11 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                                                 kWorkflowSyncBudget);
     control.deadline = deadline;
     control.on_interrupted = [&progress] { progress.interrupted = true; };
+    control.on_attempt = [&progress](int step_index, int attempt) {
+        progress.current_step = step_index;
+        progress.current_attempt = attempt;
+        progress.attempts[step_index] = attempt;
+    };
     if (claim) {
         control.idempotency = claim;
         control.on_replay = [&progress](const WorkflowRunReplay& r) { progress.replay = r; };
@@ -1055,10 +1264,18 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     o.deadline_exceeded = progress.deadline_hit;
     o.interrupted = progress.interrupted;
     o.credential_stop = progress.credential_stop;
-    o.run_outcome = classify_workflow_run(o.run_status, late_denied, o.steps, o.deadline_exceeded,
-                                          o.interrupted, !o.credential_stop.empty());
-    const bool any_reached = std::any_of(o.steps.begin(), o.steps.end(),
-                                         [](const auto& n) { return n.agents_reached > 0; });
+    // The judgement is over each step's FINAL outcome, the function the idempotent replay feeds
+    // from the stored rows: a step that failed and was retried to success is reached, a step the
+    // engine left failed (onFailure: continue) is not.
+    const auto finals = workflow_step_finals(o.steps, progress.attempts);
+    o.run_outcome = classify_workflow_run(
+        o.run_status,
+        WorkflowRunFacts{.late_denied = late_denied,
+                         .bound_stop = o.deadline_exceeded || !o.credential_stop.empty(),
+                         .interrupted = o.interrupted},
+        finals);
+    const bool any_reached = std::any_of(finals.begin(), finals.end(),
+                                         [](const auto& f) { return f.sent; });
     if (o.run_outcome == WorkflowRunOutcome::kSucceeded) {
         o.status = WorkflowExecuteStatus::kOk;
     } else if (any_reached || o.run_outcome == WorkflowRunOutcome::kInterrupted ||

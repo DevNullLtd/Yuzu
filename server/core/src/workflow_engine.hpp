@@ -176,7 +176,9 @@ public:
     /// dispatches nothing. See `WorkflowRunControl::idempotency`.
     ///
     /// `control` carries the run's bounds (`workflow_run_port.hpp`): before every dispatch attempt
-    /// the engine asks `control.before_attempt` and compares `control.deadline` with the steady
+    /// the engine first announces it (`control.on_attempt`: the step's index and the 1-based
+    /// attempt number, so a caller can attribute what each dispatch did to its step), then asks
+    /// `control.before_attempt` and compares `control.deadline` with the steady
     /// clock; either refusing STOPS the run (the attempt is not made, the step is recorded failed,
     /// the remaining steps are skipped `run stopped`, the execution is finalized `failed` through
     /// the same guarded UPDATE, and `on_failure` does not apply). A retry delay is cut to the time

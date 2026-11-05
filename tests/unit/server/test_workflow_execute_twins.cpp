@@ -117,6 +117,12 @@ struct Fx {
         dispatch_override;
 
     std::string engine_status{"completed"};
+    /// The step rows and status the stand-in engine persisted per execution id, as the real
+    /// engine's `workflow_step_results` would hold them: `get_workflow_execution` serves them.
+    /// An execution a test bound by hand (`bind`, or a literal `bound[...]`) has none here, and
+    /// is served the one row its status implies (`rows_implied_by`).
+    std::map<std::string, std::vector<WorkflowStepResult>> stored_rows;
+    std::map<std::string, std::string> stored_status;
     std::expected<std::string, std::string> engine_error{std::string{"exec-1"}};
     bool engine_called{false};
     // The stand-in engine throws before it admits the run (no execution id yet).
@@ -174,6 +180,8 @@ struct Fx {
     std::map<std::pair<std::string, std::string>, WorkflowIdempotentRun> bound;
     int find_calls{0};
     bool find_fault{false};
+    /// `get_workflow_execution` fails (the replay cannot read the stored steps back).
+    bool get_exec_fault{false};
     std::int64_t fixed_now{1'000'000};
     std::optional<WorkflowIdempotencyClaim> seen_claim;
     std::map<std::string, int> idem_counts;
@@ -189,6 +197,25 @@ struct Fx {
         for (const auto& id : ids)
             material += "\n" + id;
         return *sha256_hex(material);
+    }
+    /// The rows of a run a test bound by hand: one step, settled the way its status says. A
+    /// completed run holds a `success` row, a failed or cancelled one a `failed` row; anything
+    /// else holds none.
+    static std::vector<WorkflowStepResult> rows_implied_by(const std::string& status) {
+        WorkflowStepResult r;
+        r.step_index = 0;
+        r.instruction_id = "i-ro";
+        if (status == "completed") {
+            r.status = "success";
+            r.result_json = R"({"status":"dispatched","command_id":"cmd-i-ro","agents_reached":1})";
+            return {r};
+        }
+        if (status == "failed" || status == "cancelled") {
+            r.status = "failed";
+            r.result_json = R"j([{"error":"no agents reached for i-ro (no_agents_reached)"}])j";
+            return {r};
+        }
+        return {};
     }
     void bind(const std::string& principal, const std::string& key, const std::string& status,
               std::int64_t started_ago_s = 1, const std::string& wf = "wf-1",
@@ -238,10 +265,24 @@ struct Fx {
         };
         auto get_exec = [this](const std::string& id)
             -> std::expected<std::optional<WorkflowExecution>, std::string> {
+            if (get_exec_fault)
+                return std::unexpected(std::string{"db: boom"});
             WorkflowExecution e;
             e.id = id;
             e.workflow_id = "wf-1";
             e.status = engine_status;
+            if (const auto it = stored_status.find(id); it != stored_status.end()) {
+                e.status = it->second;
+            } else {
+                for (const auto& [k, run] : bound) {
+                    if (run.execution_id == id)
+                        e.status = run.status;
+                }
+            }
+            if (const auto it = stored_rows.find(id); it != stored_rows.end())
+                e.step_results = it->second;
+            else
+                e.step_results = rows_implied_by(e.status);
             return std::optional<WorkflowExecution>{e};
         };
         auto find = [this](const std::string& principal, const std::string& key)
@@ -294,33 +335,84 @@ struct Fx {
                 control.on_admitted(*engine_error);
             if (during_run)
                 during_run();
+            const std::string exec = *engine_error;
+            auto& rows = stored_rows[exec];
+            rows.clear();
+            for (size_t i = 0; i < step_ids.size(); ++i) {
+                WorkflowStepResult r;
+                r.step_index = static_cast<int>(i);
+                r.instruction_id = step_ids[i];
+                r.status = "pending";
+                r.result_json = "{}";
+                rows.push_back(r);
+            }
+            stored_status[exec] = "running";
+            const auto skip_from = [&](size_t from, const char* reason) {
+                for (size_t i = from; i < rows.size(); ++i) {
+                    rows[i].status = "skipped";
+                    rows[i].result_json = std::string(R"({"reason":")") + reason + R"("})";
+                }
+            };
             int position = -1;
             for (const auto& sid : step_ids) {
                 ++position;
+                auto& row = rows[static_cast<size_t>(position)];
                 if (position == interrupt_before_step) {
                     if (control.on_interrupted)
                         control.on_interrupted();
                     engine_stopped = true;
+                    skip_from(static_cast<size_t>(position), "server_shutdown");
                     break;
                 }
                 bool stopped = false;
-                for (int attempt = 0;; ++attempt) {
+                bool ok = false;
+                int attempt = 0;
+                std::string last;
+                for (;; ++attempt) {
+                    if (control.on_attempt)
+                        control.on_attempt(position, attempt + 1);
                     if (control.before_attempt && !control.before_attempt()) {
                         stopped = true;
+                        last = R"j([{"error":"run stopped before this attempt","reason":"run stopped"}])j";
                         break;
                     }
-                    const auto r = fn(sid, "[]", "{}");
-                    if (r)
+                    std::expected<std::string, StepDispatchError> r;
+                    try {
+                        r = fn(sid, "[]", "{}");
+                    } catch (...) {
+                        // As the real engine: the step failed, the rest skipped, the execution
+                        // closed failed, and the throw goes on to the caller.
+                        row.status = "failed";
+                        row.result_json =
+                            R"j({"error":"step dispatch threw","reason":"dispatch_exception"})j";
+                        row.attempt = attempt + 1;
+                        skip_from(static_cast<size_t>(position) + 1, "workflow aborted");
+                        stored_status[exec] = "failed";
+                        if (control.idempotency)
+                            bound[{control.idempotency->principal, control.idempotency->key}]
+                                .status = "failed";
+                        throw;
+                    }
+                    if (r) {
+                        ok = true;
+                        last = *r;
                         break;
+                    }
                     step_errors.push_back(r.error());
+                    last = nlohmann::json::array({nlohmann::json{{"error", r.error().message}}}).dump();
                     if (r.error().permanent || attempt >= engine_retries)
                         break;
                 }
+                row.status = ok ? "success" : "failed";
+                row.result_json = last;
+                row.attempt = attempt + 1;
                 if (stopped) {
                     engine_stopped = true;
+                    skip_from(static_cast<size_t>(position) + 1, "run stopped");
                     break;
                 }
             }
+            stored_status[exec] = engine_status;
             events.push_back("engine_returned");
             if (control.idempotency)
                 bound[{control.idempotency->principal, control.idempotency->key}].status =
@@ -881,12 +973,17 @@ TEST_CASE("workflow execute: a run where SOME step reached an agent but another 
     ConfinedDispatchOutcome zero;
     zero.denied_quarantined_count = 1;
     f.outcomes["i-ro2"] = zero;
-    const auto o = f.run();
+    auto req = f.request();
+    req.idempotency_key = "key-partial-0001";
+    const auto o = f.run(req);
     CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
     CHECK(o.run_outcome == WorkflowRunOutcome::kPartial);
     CHECK(o.reason == "partial");
     CHECK_FALSE(o.retryable);
-    CHECK(o.run_status == "completed"); // the engine's own word, kept apart from the label
+    // The engine's own word, kept apart from the label: an onFailure: continue step that reached
+    // nobody leaves the engine row `completed`. That is exactly why a replay must not take the
+    // engine's word for the class (hp2-1): the same call repeated says what this one said.
+    CHECK(o.run_status == "completed");
     REQUIRE(o.steps.size() == 2);
     CHECK(o.steps[0].agents_reached == 1);
     CHECK(o.steps[1].reason == "quarantined");
@@ -899,9 +996,25 @@ TEST_CASE("workflow execute: a run where SOME step reached an agent but another 
     CHECK(j["run_status"] == "completed");
     CHECK(j["retryable"] == false);
     CHECK(j["steps"].size() == 2);
+
+    const auto sent_before = std::count_if(f.events.begin(), f.events.end(), [](const auto& e) {
+        return e.starts_with("dispatch:");
+    });
+    const auto again = f.run(req);
+    REQUIRE(again.status == WorkflowExecuteStatus::kIdempotentReplay);
+    CHECK(again.run_status == "completed");
+    CHECK(again.replay_status == "partial"); // never `completed` for a run that was not
+    CHECK(std::count_if(f.events.begin(), f.events.end(),
+                        [](const auto& e) { return e.starts_with("dispatch:"); }) == sent_before);
+    CHECK(f.audit_details.back().find("idempotent_replay=true run_status=partial") !=
+          std::string::npos);
+    const auto rj = workflow_idempotent_replay_json(again, "wf-1");
+    CHECK(rj.at("status") == "partial");
+    CHECK(rj.at("retryable") == false);
 }
 
-TEST_CASE("workflow execute: only a completed run whose every attempt reached an agent is `success`",
+TEST_CASE("workflow execute: only a completed run whose every step's final attempt reached an agent is "
+          "`success`",
           "[workflow][twin][outcome]") {
     SECTION("completed and fully reached") {
         Fx f;
@@ -1013,39 +1126,111 @@ TEST_CASE("workflow execute: a step refused at send time AFTER an earlier step w
     CHECK(workflow_execute_result_json(o, "wf-1")["status"] == "aborted");
 }
 
-TEST_CASE("workflow execute: the run outcome is judged by ONE function and its tokens are closed",
+TEST_CASE("workflow execute: the run outcome is judged by ONE function over each step's FINAL "
+          "outcome, and its tokens are closed",
           "[workflow][twin][outcome]") {
-    const auto reached = [](int n) {
-        WorkflowStepDispatchNote note;
-        note.agents_reached = n;
-        return note;
-    };
+    // A step's final outcome: reached (its last attempt reached an agent), not reached (the engine
+    // left it failed), or reached nobody but something was sent earlier is not a thing.
+    const auto reached = [](int step) { return WorkflowStepFinal{step, 1, true, true}; };
+    const auto missed = [](int step) { return WorkflowStepFinal{step, 1, false, false}; };
     using O = WorkflowRunOutcome;
-    CHECK(classify_workflow_run("completed", false, {reached(1), reached(2)}) == O::kSucceeded);
-    CHECK(classify_workflow_run("completed", false, {}) == O::kSucceeded); // every step condition-skipped
-    CHECK(classify_workflow_run("completed", false, {reached(1), reached(0)}) == O::kPartial);
-    CHECK(classify_workflow_run("failed", false, {reached(1)}) == O::kPartial);
-    CHECK(classify_workflow_run("completed", false, {reached(0)}) == O::kFailed);
-    CHECK(classify_workflow_run("failed", false, {}) == O::kFailed);
-    CHECK(classify_workflow_run("unknown", false, {}) == O::kFailed);
-    CHECK(classify_workflow_run("cancelled", false, {reached(1)}) == O::kPartial);
-    CHECK(classify_workflow_run("completed", true, {reached(1), reached(0)}) == O::kAborted);
-    CHECK(classify_workflow_run("completed", true, {reached(0)}) == O::kAborted);
+    const WorkflowRunFacts none;
+    CHECK(classify_workflow_run("completed", none, {reached(0), reached(1)}) == O::kSucceeded);
+    CHECK(classify_workflow_run("completed", none, {}) == O::kSucceeded); // every step condition-skipped
+    CHECK(classify_workflow_run("completed", none, {reached(0), missed(1)}) == O::kPartial);
+    CHECK(classify_workflow_run("failed", none, {reached(0)}) == O::kPartial);
+    CHECK(classify_workflow_run("completed", none, {missed(0)}) == O::kFailed);
+    CHECK(classify_workflow_run("failed", none, {}) == O::kFailed);
+    CHECK(classify_workflow_run("unknown", none, {}) == O::kFailed);
+    CHECK(classify_workflow_run("cancelled", none, {reached(0)}) == O::kPartial);
+    CHECK(classify_workflow_run("completed", {.late_denied = true}, {reached(0), missed(1)}) ==
+          O::kAborted);
+    CHECK(classify_workflow_run("completed", {.late_denied = true}, {missed(0)}) == O::kAborted);
     CHECK(workflow_run_outcome_token(O::kSucceeded) == "succeeded");
     CHECK(workflow_run_outcome_token(O::kFailed) == "failed");
     CHECK(workflow_run_outcome_token(O::kPartial) == "partial");
     CHECK(workflow_run_outcome_token(O::kAborted) == "aborted");
     CHECK(workflow_run_outcome_token(O::kInterrupted) == "interrupted");
     // A server stop is its own outcome, whatever was sent, ...
-    CHECK(classify_workflow_run("failed", false, {reached(1)}, false, true) == O::kInterrupted);
-    CHECK(classify_workflow_run("failed", false, {}, false, true) == O::kInterrupted);
-    // ... except that a step refused at send time or a passed deadline is judged first.
-    CHECK(classify_workflow_run("failed", true, {reached(1)}, false, true) == O::kAborted);
-    CHECK(classify_workflow_run("failed", false, {reached(1)}, true, true) == O::kAborted);
-    // A credential stop is an abort whatever was sent, and is judged ahead of a server stop.
-    CHECK(classify_workflow_run("failed", false, {reached(1)}, false, false, true) == O::kAborted);
-    CHECK(classify_workflow_run("failed", false, {}, false, false, true) == O::kAborted);
-    CHECK(classify_workflow_run("failed", false, {reached(1)}, false, true, true) == O::kAborted);
+    CHECK(classify_workflow_run("failed", {.interrupted = true}, {reached(0)}) == O::kInterrupted);
+    CHECK(classify_workflow_run("failed", {.interrupted = true}, {}) == O::kInterrupted);
+    // ... except that a step refused at send time or a stopped run bound is judged first.
+    CHECK(classify_workflow_run("failed", {.late_denied = true, .interrupted = true},
+                                {reached(0)}) == O::kAborted);
+    CHECK(classify_workflow_run("failed", {.bound_stop = true, .interrupted = true},
+                                {reached(0)}) == O::kAborted);
+    // A deadline or a credential stop is an abort whatever was sent.
+    CHECK(classify_workflow_run("failed", {.bound_stop = true}, {reached(0)}) == O::kAborted);
+    CHECK(classify_workflow_run("failed", {.bound_stop = true}, {}) == O::kAborted);
+    // A dispatch that threw is a failed run whatever had been sent or stopped it, and is judged first.
+    CHECK(classify_workflow_run("failed", {.threw = true}, {reached(0), missed(1)}) == O::kFailed);
+    CHECK(classify_workflow_run("failed", {.late_denied = true, .threw = true}, {reached(0)}) ==
+          O::kFailed);
+    // `sent` is what separates partial from failed: a final that reached nobody, but whose step
+    // had sent something on another item, still means something left the server.
+    CHECK(classify_workflow_run("completed", none, {WorkflowStepFinal{0, 1, false, true}}) ==
+          O::kPartial);
+}
+
+TEST_CASE("workflow execute: a step's final outcome is its LAST attempt, per step and not per "
+          "instruction id",
+          "[workflow][twin][outcome][attempt]") {
+    const auto note = [](int step, int attempt, int reached) {
+        WorkflowStepDispatchNote n;
+        n.instruction_id = "i-same"; // one instruction named by every step below
+        n.step_index = step;
+        n.attempt = attempt;
+        n.agents_reached = reached;
+        return n;
+    };
+    using O = WorkflowRunOutcome;
+    const WorkflowRunFacts none;
+    SECTION("a step that failed and was retried to success is reached") {
+        const auto finals = workflow_step_finals({note(0, 1, 0), note(0, 2, 3)}, {{0, 2}});
+        REQUIRE(finals.size() == 1);
+        CHECK(finals[0].reached);
+        CHECK(finals[0].sent);
+        CHECK(finals[0].attempt == 2);
+        CHECK(classify_workflow_run("completed", none, finals) == O::kSucceeded);
+    }
+    SECTION("a step whose LAST attempt reached nobody is not, even after an earlier attempt") {
+        const auto finals = workflow_step_finals({note(0, 1, 0), note(0, 2, 0)}, {{0, 2}});
+        REQUIRE(finals.size() == 1);
+        CHECK_FALSE(finals[0].reached);
+        CHECK(classify_workflow_run("completed", none, finals) == O::kFailed);
+    }
+    SECTION("two steps naming the SAME instruction are two finals: a failed first step is not hidden "
+            "by a second that reached") {
+        const auto finals = workflow_step_finals({note(0, 1, 0), note(1, 1, 2)}, {{0, 1}, {1, 1}});
+        REQUIRE(finals.size() == 2);
+        CHECK_FALSE(finals[0].reached);
+        CHECK(finals[1].reached);
+        CHECK(classify_workflow_run("completed", none, finals) == O::kPartial);
+    }
+    SECTION("an attempt the engine announced but the dispatch callback never recorded is not reached") {
+        // attempt 2 started and was stopped / failed before a note: the step is failed.
+        const auto finals = workflow_step_finals({note(0, 1, 0)}, {{0, 2}});
+        REQUIRE(finals.size() == 1);
+        CHECK_FALSE(finals[0].reached);
+        CHECK_FALSE(finals[0].sent);
+    }
+    SECTION("every item of a foreach attempt must reach; one that did not fails the step but something "
+            "was sent") {
+        const auto finals = workflow_step_finals({note(0, 1, 2), note(0, 1, 0)}, {{0, 1}});
+        REQUIRE(finals.size() == 1);
+        CHECK_FALSE(finals[0].reached);
+        CHECK(finals[0].sent);
+    }
+    SECTION("a note no attempt was announced for is its own step") {
+        WorkflowStepDispatchNote a;
+        a.agents_reached = 1;
+        WorkflowStepDispatchNote b;
+        b.agents_reached = 0;
+        const auto finals = workflow_step_finals({a, b}, {});
+        REQUIRE(finals.size() == 2);
+        CHECK(finals[0].reached);
+        CHECK_FALSE(finals[1].reached);
+    }
 }
 
 TEST_CASE("workflow execute: a protective action never reports the three gate-withhold causes",
@@ -3399,4 +3584,407 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a lost clai
     CHECK(res->get_header_value("Retry-After") == "2");
     CHECK_FALSE(r.fx.dispatched_anything());
     CHECK(r.budget.active() == 0);
+}
+
+// ── REPLAY PARITY (#2146 hp2-1, hp2-2): the replay says what the first answer said ──────────────
+//
+// For each way a run can end: run it under a key, then repeat the call with the same key, and the
+// replay's status must be the first answer's class, `completed` ONLY for a run that succeeded. The
+// stand-in engine persists the step rows a real engine would (Fx::stored_rows), so the replay
+// judges stored data, never the engine's coarse status word. The real engine's own rows are
+// checked by the [pg] twin of this matrix in test_workflow_engine.cpp.
+
+namespace {
+
+/// The first answer's class as a token: the label every transport and the closing audit row carry.
+std::string first_answer_class(const WorkflowExecuteOutcome& o) {
+    if (o.status == WorkflowExecuteStatus::kRunFailed)
+        return std::string(workflow_run_outcome_token(WorkflowRunOutcome::kFailed));
+    return std::string(workflow_run_outcome_token(o.run_outcome));
+}
+
+struct ParityRun {
+    WorkflowExecuteOutcome first;
+    WorkflowExecuteOutcome replay;
+    std::string first_class;
+    long dispatches_after_first{0};
+    long dispatches_after_replay{0};
+};
+
+long dispatch_count(const Fx& f) {
+    return std::count_if(f.events.begin(), f.events.end(),
+                         [](const auto& e) { return e.starts_with("dispatch:"); });
+}
+
+/// Run `req` (keyed) on `f`, then repeat it. A run that throws is caught: its first answer is
+/// `kRunFailed`, which `run_workflow_execute` returns rather than throws.
+ParityRun run_then_replay(Fx& f, WorkflowExecuteRequest req) {
+    req.idempotency_key = kKey;
+    ParityRun p;
+    p.first = f.run(req);
+    p.first_class = first_answer_class(p.first);
+    p.dispatches_after_first = dispatch_count(f);
+    p.replay = f.run(req);
+    p.dispatches_after_replay = dispatch_count(f);
+    return p;
+}
+
+void expect_parity(const ParityRun& p, std::string_view expected_class) {
+    INFO("first answer class " << p.first_class);
+    CHECK(p.first_class == expected_class);
+    REQUIRE(p.replay.status == WorkflowExecuteStatus::kIdempotentReplay);
+    // The replay is the first answer's class, and `completed` is its word for `succeeded` alone.
+    const std::string want = expected_class == "succeeded" ? "completed" : std::string(expected_class);
+    CHECK(p.replay.replay_status == want);
+    CHECK((p.replay.replay_status == "completed") == (p.first_class == "succeeded"));
+    CHECK(p.dispatches_after_replay == p.dispatches_after_first); // a replay sends nothing
+    const auto j = workflow_idempotent_replay_json(p.replay, "wf-1");
+    CHECK(j.at("status") == want);
+    CHECK(j.at("idempotent_replay") == true);
+    if (want != "completed") {
+        REQUIRE(j.contains("retryable"));
+        CHECK(j.at("retryable") == false);
+    }
+}
+
+} // namespace
+
+TEST_CASE("replay parity: a succeeded run replays `completed`, and nothing else does",
+          "[workflow][twin][idempotency][outcome][parity]") {
+    Fx f;
+    f.step_ids = {"i-ro", "i-ro2"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    const auto p = run_then_replay(f, f.request());
+    CHECK(p.first.status == WorkflowExecuteStatus::kOk);
+    expect_parity(p, "succeeded");
+}
+
+TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves the engine `completed`, "
+          "the first answer partial, and the replay partial (hp2-1)",
+          "[workflow][twin][idempotency][outcome][parity]") {
+    SECTION("an earlier step reached, the later one did not") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        ConfinedDispatchOutcome zero;
+        zero.denied_quarantined_count = 1;
+        f.outcomes["i-ro2"] = zero;
+        const auto p = run_then_replay(f, f.request());
+        CHECK(p.first.run_status == "completed"); // the engine's word, which the replay must not echo
+        CHECK(p.replay.run_status == "completed");
+        expect_parity(p, "partial");
+    }
+    SECTION("the FIRST step reached nobody and a later one did") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        ConfinedDispatchOutcome zero;
+        zero.denied_quarantined_count = 1;
+        f.outcomes["i-ro"] = zero;
+        expect_parity(run_then_replay(f, f.request()), "partial");
+    }
+    SECTION("no step reached anyone: failed on both") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        ConfinedDispatchOutcome zero;
+        zero.denied_quarantined_count = 1;
+        f.outcomes["i-ro"] = zero;
+        f.outcomes["i-ro2"] = zero;
+        const auto p = run_then_replay(f, f.request());
+        CHECK(p.first.status == WorkflowExecuteStatus::kNoAgentsReached);
+        expect_parity(p, "failed");
+    }
+    SECTION("two steps naming the SAME instruction: the failed one is not hidden by the one that reached") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro"};
+        int calls = 0;
+        f.dispatch_override = [&](const WorkflowStepInstruction& d, const std::vector<std::string>&,
+                                  const DispatchCaller&) {
+            ConfinedDispatchOutcome out;
+            out.command_id = "cmd-" + d.id;
+            if (++calls == 1)
+                out.denied_quarantined_count = 1; // step 0 reaches nobody
+            else
+                out.sent = 1; // step 1 reaches an agent
+            return out;
+        };
+        const auto p = run_then_replay(f, f.request());
+        REQUIRE(p.first.steps.size() == 2);
+        CHECK(p.first.steps[0].step_index == 0);
+        CHECK(p.first.steps[1].step_index == 1);
+        expect_parity(p, "partial");
+    }
+}
+
+TEST_CASE("replay parity: a step retried to success is `completed` with run_outcome succeeded on BOTH "
+          "answers, and its steps entries number the attempts (hp2-2)",
+          "[workflow][twin][idempotency][outcome][parity][attempt]") {
+    Fx f;
+    f.step_ids = {"i-ro", "i-ro2"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    f.engine_retries = 1;
+    int calls_for_first_step = 0;
+    f.dispatch_override = [&](const WorkflowStepInstruction& d, const std::vector<std::string>&,
+                              const DispatchCaller&) {
+        ConfinedDispatchOutcome out;
+        out.command_id = "cmd-" + d.id;
+        if (d.id == "i-ro" && ++calls_for_first_step == 1)
+            out.denied_quarantined_count = 1; // attempt 1 reaches nobody
+        else
+            out.sent = 1;
+        return out;
+    };
+    const auto p = run_then_replay(f, f.request());
+    CHECK(p.first.status == WorkflowExecuteStatus::kOk);
+    CHECK(p.first.run_outcome == WorkflowRunOutcome::kSucceeded);
+    CHECK(f.audit_details[1].find("run_outcome") == std::string::npos); // the closing row is a success
+    REQUIRE(p.first.steps.size() == 3);
+    CHECK(p.first.steps[0].attempt == 1);
+    CHECK(p.first.steps[0].agents_reached == 0);
+    CHECK(p.first.steps[1].attempt == 2);
+    CHECK(p.first.steps[1].agents_reached == 1);
+    CHECK(p.first.steps[2].attempt == 1); // the next step starts again at 1
+    const auto j = workflow_execute_result_json(p.first, "wf-1");
+    CHECK(j.at("status") == "completed");
+    REQUIRE(j.at("steps").size() == 3);
+    CHECK(j.at("steps").at(0).at("attempt") == 1);
+    CHECK(j.at("steps").at(1).at("attempt") == 2);
+    CHECK_FALSE(j.contains("retryable"));
+    expect_parity(p, "succeeded");
+
+    SECTION("still failing on the last attempt is not rescued by an earlier or later note") {
+        Fx g;
+        g.engine_retries = 1;
+        ConfinedDispatchOutcome zero;
+        zero.denied_quarantined_count = 1;
+        g.outcomes["i-ro"] = zero;
+        const auto q = run_then_replay(g, g.request());
+        CHECK(q.first.steps.size() == 2);
+        expect_parity(q, "failed");
+    }
+}
+
+TEST_CASE("replay parity: a step refused at send time (late_denied, definition_changed) is aborted on "
+          "both answers",
+          "[workflow][twin][idempotency][outcome][parity][late]") {
+    SECTION("late_denied: the approval mode was raised after the preflight") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+        const auto p = run_then_replay(f, f.request());
+        CHECK(p.first.late_denied);
+        expect_parity(p, "aborted");
+    }
+    SECTION("late_denied as the FIRST step, with the engine's run closed failed") {
+        Fx f;
+        f.engine_status = "failed";
+        f.late_defs["i-ro"] = def("i-ro", "os_info", "os_version", "always");
+        const auto p = run_then_replay(f, f.request());
+        CHECK(p.first.late_denied);
+        expect_parity(p, "aborted");
+    }
+    SECTION("definition_changed: the step moved off the effect the ticket was bound to") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_uptime");
+        auto req = f.request();
+        req.expected_step_effects = WorkflowStepEffects{
+            {"i-ro", workflow_step_effect(f.defs["i-ro"])},
+            {"i-ro2", workflow_step_effect(f.defs["i-ro2"])}};
+        const auto p = run_then_replay(f, req);
+        CHECK(p.first.late_denied);
+        expect_parity(p, "aborted");
+    }
+}
+
+TEST_CASE("replay parity: a run the server's shutdown ended is interrupted on both answers, sent or not",
+          "[workflow][twin][idempotency][outcome][parity][shutdown]") {
+    SECTION("after step 1 was sent") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed";
+        f.interrupt_before_step = 1;
+        const auto p = run_then_replay(f, f.request());
+        CHECK(p.first.interrupted);
+        expect_parity(p, "interrupted");
+    }
+    SECTION("before anything was sent") {
+        Fx f;
+        f.engine_status = "failed";
+        f.interrupt_before_step = 0;
+        const auto p = run_then_replay(f, f.request());
+        CHECK_FALSE(f.dispatched_anything());
+        expect_parity(p, "interrupted");
+    }
+}
+
+TEST_CASE("replay parity: a run the credential check or the deadline stopped is aborted on both answers",
+          "[workflow][twin][idempotency][outcome][parity][credential][deadline]") {
+    SECTION("the credential was revoked before step 2") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed";
+        f.wire_reauth = true;
+        f.reauth_answers = {auth::CredentialCheck::kValid, auth::CredentialCheck::kRevoked};
+        const auto p = run_then_replay(f, f.request());
+        CHECK(p.first.credential_stop == kReasonCredentialRevoked);
+        expect_parity(p, "aborted");
+    }
+    SECTION("the credential could not be confirmed before the first step: nothing was sent") {
+        Fx f;
+        f.engine_status = "failed";
+        f.wire_reauth = true;
+        f.reauth_after = auth::CredentialCheck::kIndeterminate;
+        const auto p = run_then_replay(f, f.request());
+        CHECK_FALSE(f.dispatched_anything());
+        CHECK(p.first.credential_stop == kReasonCredentialIndeterminate);
+        expect_parity(p, "aborted");
+    }
+    SECTION("the deadline passed between step 1 and step 2") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed";
+        auto req = f.request();
+        req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+        const auto deadline = *req.deadline;
+        f.dispatch_override = [deadline](const WorkflowStepInstruction& d,
+                                         const std::vector<std::string>&, const DispatchCaller&) {
+            std::this_thread::sleep_until(deadline + std::chrono::milliseconds(5));
+            return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-" + d.id};
+        };
+        const auto p = run_then_replay(f, req);
+        CHECK(p.first.deadline_exceeded);
+        expect_parity(p, "aborted");
+    }
+    SECTION("the deadline had passed before the first attempt: nothing was sent") {
+        Fx f;
+        f.engine_status = "failed";
+        auto req = f.request();
+        req.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        const auto p = run_then_replay(f, req);
+        CHECK_FALSE(f.dispatched_anything());
+        CHECK(p.first.deadline_exceeded);
+        expect_parity(p, "aborted");
+    }
+}
+
+TEST_CASE("replay parity: a run whose dispatch threw is failed on both answers, and the engine ending "
+          "failed after every step reached is partial on both",
+          "[workflow][twin][idempotency][outcome][parity][throw]") {
+    SECTION("a dispatch that threw after step 1 was sent") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed";
+        f.dispatch_override = [](const WorkflowStepInstruction& d, const std::vector<std::string>&,
+                                 const DispatchCaller&) -> ConfinedDispatchOutcome {
+            if (d.id == "i-ro2")
+                throw std::runtime_error("registry exploded mid fan-out");
+            return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-" + d.id};
+        };
+        const auto p = run_then_replay(f, f.request());
+        CHECK(p.first.status == WorkflowExecuteStatus::kRunFailed);
+        // Step 1's send was real: the replay still calls the run failed, as the first answer did,
+        // and never completed.
+        expect_parity(p, "failed");
+    }
+    SECTION("the engine ended failed although every attempted step reached an agent") {
+        Fx f;
+        f.engine_status = "failed";
+        expect_parity(run_then_replay(f, f.request()), "partial");
+    }
+}
+
+TEST_CASE("replay parity: rows that cannot prove an outcome are never `completed`",
+          "[workflow][twin][idempotency][outcome][parity]") {
+    const auto settled = [](int index, const char* status, const char* result) {
+        WorkflowStepResult r;
+        r.step_index = index;
+        r.instruction_id = "i-ro";
+        r.status = status;
+        r.result_json = result;
+        return r;
+    };
+    const char* ack = R"j({"status":"dispatched","command_id":"c","agents_reached":1})j";
+    struct Row {
+        const char* name;
+        const char* engine_status;
+        std::vector<WorkflowStepResult> rows;
+        bool unreadable;
+        const char* expect;
+    };
+    const Row rows[] = {
+        {"completed, every step success", "completed", {settled(0, "success", ack)}, false, "completed"},
+        {"completed, the only other step skipped by its condition",
+         "completed",
+         {settled(0, "success", ack), settled(1, "skipped", R"j({"reason":"condition not met"})j")},
+         false,
+         "completed"},
+        {"completed, a step still pending (its write was dropped)",
+         "completed",
+         {settled(0, "success", ack), settled(1, "pending", "{}")},
+         false,
+         "indeterminate"},
+        {"completed, a step still running", "completed", {settled(0, "running", "{}")}, false,
+         "indeterminate"},
+        {"completed, a step skipped for a reason a completed run cannot hold",
+         "completed",
+         {settled(0, "success", ack), settled(1, "skipped", R"j({"reason":"workflow aborted"})j")},
+         false,
+         "indeterminate"},
+        {"completed, a step in a status this build does not know",
+         "completed",
+         {settled(0, "success", ack), settled(1, "mystery", "{}")},
+         false,
+         "indeterminate"},
+        {"completed, no step rows at all", "completed", {}, false, "indeterminate"},
+        {"completed, rows unreadable", "completed", {}, true, "indeterminate"},
+        {"failed, rows unreadable", "failed", {}, true, "failed"},
+        {"cancelled, rows unreadable", "cancelled", {}, true, "failed"},
+        {"failed, no step rows at all", "failed", {}, false, "failed"},
+        {"failed, a step reached and the rest were skipped",
+         "failed",
+         {settled(0, "success", ack), settled(1, "skipped", R"j({"reason":"workflow aborted"})j")},
+         false,
+         "partial"},
+        {"failed, a failed step with a garbled result",
+         "failed",
+         {settled(0, "failed", "not json at all")},
+         false,
+         "failed"},
+        {"failed, a failed step whose result is an array of non-objects",
+         "failed",
+         {settled(0, "failed", "[1,2,3]")},
+         false,
+         "failed"},
+    };
+    for (const auto& row : rows) {
+        INFO(row.name);
+        Fx f;
+        f.bind("alice", kKey, row.engine_status);
+        f.stored_rows["exec-bound"] = row.rows;
+        f.get_exec_fault = row.unreadable;
+        const auto out = f.run(keyed(f));
+        REQUIRE(out.status == WorkflowExecuteStatus::kIdempotentReplay);
+        CHECK(out.replay_status == row.expect);
+        CHECK_FALSE(f.dispatched_anything());
+    }
+    SECTION("the two reads of the run disagree on its terminal status: the rows are not believed") {
+        Fx f;
+        f.bind("alice", kKey, "completed");
+        f.stored_status["exec-bound"] = "failed"; // the read-back says failed; the key lookup said completed
+        f.stored_rows["exec-bound"] = {settled(0, "success", ack)};
+        CHECK(f.run(keyed(f)).replay_status == "indeterminate");
+        Fx g;
+        g.bind("alice", kKey, "failed");
+        g.stored_status["exec-bound"] = "completed";
+        g.stored_rows["exec-bound"] = {settled(0, "success", ack)};
+        CHECK(g.run(keyed(g)).replay_status == "failed");
+    }
 }

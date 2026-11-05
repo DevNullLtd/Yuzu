@@ -67,6 +67,18 @@ struct WorkflowRunReplay {
     std::int64_t started_at{0};
 };
 
+/// The `reason` token the engine writes into a step's stored result when it stops or fails a run
+/// (`workflow_step_results.result_json`). They are the contract between the engine that writes
+/// them and the reader that classifies a stored run (the idempotent replay,
+/// `workflow_execute.cpp`): `run stopped` is a run the deadline or the caller's credential check
+/// ended, `server_shutdown` a run the stopping server ended, `dispatch_exception` a step whose
+/// dispatch callback threw, `condition not met` a step skipped by its own condition (the one
+/// skip a completed run legitimately holds). The text beside them (`error`) is for people.
+inline constexpr char kStepReasonRunStopped[] = "run stopped";
+inline constexpr char kStepReasonServerShutdown[] = "server_shutdown";
+inline constexpr char kStepReasonDispatchException[] = "dispatch_exception";
+inline constexpr char kStepReasonConditionNotMet[] = "condition not met";
+
 /// The error text a run port returns when `on_replay` was called. A caller that set `on_replay`
 /// reads the replay from there and must not parse this text.
 inline constexpr char kWorkflowIdempotentReplayError[] = "idempotent replay";
@@ -76,12 +88,20 @@ inline constexpr char kWorkflowIdempotentReplayError[] = "idempotent replay";
 /// member it does not yet consume is ignored. Members are added here as the engine gains the
 /// matching hook, so the port signature never changes.
 ///
-/// Consumed today: `on_admitted`, `before_attempt`, `deadline`, `should_stop`, `on_interrupted`,
-/// `idempotency` and `on_replay`.
+/// Consumed today: `on_admitted`, `on_attempt`, `before_attempt`, `deadline`, `should_stop`,
+/// `on_interrupted`, `idempotency` and `on_replay`.
 struct WorkflowRunControl {
     /// Called once with the new run's execution id after the engine has admitted the run and
     /// before the first step is dispatched.
     std::function<void(const std::string& execution_id)> on_admitted;
+    /// Called before every dispatch attempt (each retry and each foreach item included), ahead of
+    /// `before_attempt`, with the step's `WorkflowStep::index` and the 1-based attempt number (the
+    /// items of one `foreach` attempt share it). It is how a caller that records what each
+    /// dispatch did attributes it to a step: the dispatch callback itself is told only the
+    /// instruction id, and a workflow may name one instruction in several steps. An attempt the
+    /// hook announced but the dispatch callback never answered (the run was stopped, the callback
+    /// failed before it recorded anything) is still an attempt of that step.
+    std::function<void(int step_index, int attempt)> on_attempt;
     /// Called before every dispatch attempt (each retry and each foreach item included); `false`
     /// stops the run: the attempt is not made, the step is recorded failed, the remaining steps
     /// are skipped and the execution is finalized `failed`. The caller records why it said no.

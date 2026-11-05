@@ -62,7 +62,9 @@
 ///
 /// THE CLOSING LABEL. The closing `workflow.execute` row is `success` only for
 /// `WorkflowRunOutcome::kSucceeded` (see `classify_workflow_run`): the engine's recorded status is
-/// `completed`, no step was refused at send time and every dispatch attempt reached an agent.
+/// `completed`, no step was refused at send time and every step's FINAL attempt reached an agent
+/// (a step that failed and was retried to success counts as reached; a step the engine left failed
+/// under `onFailure: continue` does not).
 /// Anything else is `failure` with `run_outcome=failed|partial|interrupted|aborted` in the detail.
 /// The engine's final state is read back through the existing `WorkflowApi::get_workflow_execution`
 /// after the run: the run is synchronous and the engine finalizes its row before `run` returns, so
@@ -147,12 +149,26 @@
 ///     workflow, status, `idempotent_replay:true` and `started_at`. The engine persists no
 ///     per-step outcome beyond each dispatch's return, so the original response cannot be rebuilt,
 ///     and a stored copy would be a second source of truth: the caller reads the run with
-///     `get_workflow_execution`. `completed`/`failed` are final; `running` carries `retry_after_ms`
-///     2000 and means POLL, never re-send; a `running` row older than `kIdempotentRunStaleAfter`
-///     is `indeterminate` (a crash or a dropped finalize leaves it `running` forever), not
-///     retryable, no retry hint. A deliberate re-run needs a NEW key.
-///   * AUDIT: a terminal replay (completed, failed, indeterminate) writes one `workflow.execute`
-///     `success` row `idempotent_replay=true run_status=<token>`; a `running` replay writes NONE
+///     `get_workflow_execution`. `running` carries `retry_after_ms` 2000 and means POLL, never
+///     re-send; a `running` row older than `kIdempotentRunStaleAfter` is `indeterminate` (a crash
+///     or a dropped finalize leaves it `running` forever), not retryable, no retry hint. Every
+///     other status is final, and a deliberate re-run needs a NEW key.
+///   * THE REPLAY'S STATUS IS THE FIRST ANSWER'S CLASS, derived from the STORED step results, not
+///     from the engine's coarse run status (an `onFailure: continue` step that reached nobody
+///     leaves the engine row `completed`). A terminal run is read back (`get_workflow_execution`)
+///     and judged by `classify_stored_workflow_run`, which feeds the SAME `classify_workflow_run`
+///     the first answer used: `completed` ONLY for `kSucceeded`, else `partial`, `failed`,
+///     `aborted` or `interrupted`. What the rows record is enough for every class but one
+///     distinction: a run the deadline stopped and a run the credential check stopped are both
+///     `aborted` (the replay does not say which), a step refused at send time is recognised by the
+///     `late_denied:`/`definition_changed:` prefix of its stored error, and the engine's stop
+///     tokens (`kStepReason*`) carry the rest. Anything the rows cannot prove is never
+///     `completed`: a completed run with an unsettled or missing step row, or one that cannot be
+///     read back, is `indeterminate`; a failed or cancelled run that cannot be read back is
+///     `failed`. A step-result write the engine dropped (best effort) therefore costs precision,
+///     never correctness.
+///   * AUDIT: a terminal replay (every status but `running`) writes one `workflow.execute`
+///     `success` row `idempotent_replay=true run_status=<replay status>`; a `running` replay writes NONE
 ///     (a client polling every 2 s would write 30 rows a minute; the counter is its record). The
 ///     key is neutralised (`clip_token`) in every detail. `yuzu_server_workflow_run_idempotent_total
 ///     {outcome=replayed|in_progress|conflict}` counts them.
@@ -193,6 +209,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -251,8 +268,19 @@ inline constexpr std::array<std::string_view, 3> kWorkflowRunIdempotentOutcomes{
 /// The `status` of a replay body (`workflow_idempotent_replay_json`). A closed set.
 inline constexpr std::string_view kReplayRunning = "running";
 inline constexpr std::string_view kReplayCompleted = "completed";
+inline constexpr std::string_view kReplayPartial = "partial";
 inline constexpr std::string_view kReplayFailed = "failed";
+inline constexpr std::string_view kReplayAborted = "aborted";
+inline constexpr std::string_view kReplayInterrupted = "interrupted";
 inline constexpr std::string_view kReplayIndeterminate = "indeterminate";
+
+/// The prefixes the dispatch callback puts on the error of a step it refuses at send time, so the
+/// stored step result (`{"error": ...}`) says why long after the run's memory is gone:
+/// `late_denied:` (the refreshed step no longer passes admission) and `definition_changed:` (it
+/// moved off the effect the approval ticket was bound to). `classify_stored_workflow_run` reads
+/// them back; they are a contract, not decoration.
+inline constexpr std::string_view kStepErrorLateDenied = "late_denied: ";
+inline constexpr std::string_view kStepErrorDefinitionChanged = "definition_changed: ";
 
 /// The closing reasons of a run the credential check stopped (`WorkflowExecuteOutcome::reason`,
 /// the closing audit row's `reason=` and the 2xx body's `reason`). A closed pair.
@@ -418,7 +446,7 @@ struct WorkflowExecuteBodyError {
 parse_workflow_execute_body(const nlohmann::json& body);
 
 enum class WorkflowExecuteStatus {
-    kOk,                         ///< the run COMPLETED and every dispatch attempt reached an agent (202)
+    kOk,                         ///< the run COMPLETED and every step's final attempt reached an agent (202)
     kUnavailable,                ///< a port is unwired / the instruction store is closed (503, nothing done)
     kNoPrincipal,                ///< the caller has no resolvable principal (500)
     kStoreFailed,                ///< a store read failed (503, retryable)
@@ -447,10 +475,11 @@ enum class WorkflowExecuteStatus {
 /// How a run that reached the engine ended, judged from what the engine recorded and what the
 /// steps did. `kSucceeded` is the ONLY value that labels the closing `workflow.execute` row
 /// `success`; every other value labels it `failure` and rides in the row's detail as
-/// `run_outcome=<token>` (`workflow_run_outcome_token`). A run is `kSucceeded` only if ALL of:
+/// `run_outcome=<token>` (`workflow_run_outcome_token`). A run is judged by each step's FINAL
+/// outcome, never by its attempts (see `WorkflowStepFinal`), and is `kSucceeded` only if ALL of:
 /// the engine's recorded status is `completed`, no step was refused at send time
-/// (`late_denied`), and every dispatch attempt reached at least one agent. The others, tested
-/// in this order:
+/// (`late_denied`), and every step's final attempt reached at least one agent. The others,
+/// tested in this order:
 ///   * `kAborted`     a step was refused at send time (`late_denied`): its definition moved off the
 ///                    preflight or off the ticket-bound effect, or it no longer passed admission;
 ///                    OR the run reached its deadline (`kWorkflowSyncBudget`) and the engine
@@ -464,14 +493,15 @@ enum class WorkflowExecuteStatus {
 ///                    is closed `failed`. Typed 2xx `status:"interrupted"`, reason
 ///                    `server_shutdown`, `retryable:false`, whether or not anything was sent.
 ///                    A server that is merely DRAINING does not interrupt a run.
-///   * `kFailed`      no dispatch attempt reached any agent: the engine ended `failed` (or in any
-///                    status other than `completed`, or unreadable) with nothing sent, or every
-///                    attempt reached nobody and the failed step's policy (abort, skip_remaining)
-///                    ended the run.
-///   * `kPartial`     at least one attempt reached an agent but the run is not `kSucceeded`: some
-///                    attempt reached nobody, or the engine ended in a status other than
-///                    `completed` after a send. A step retried to success still counts its failed
-///                    attempt, so such a run reads `partial`: the label errs toward failure.
+///   * `kFailed`      nothing was sent: the engine ended `failed` (or in any status other than
+///                    `completed`, or unreadable) with nothing sent, or every attempt reached
+///                    nobody and the failed step's policy (abort, skip_remaining) ended the run;
+///                    also a run whose dispatch callback THREW (the stored rows say so), whatever
+///                    it had sent before.
+///   * `kPartial`     at least one step reached an agent but the run is not `kSucceeded`: some
+///                    step's final attempt reached nobody (an `onFailure: continue` step the
+///                    engine left failed), or the engine ended in a status other than `completed`
+///                    after a send.
 enum class WorkflowRunOutcome {
     kSucceeded,
     kFailed,
@@ -488,6 +518,12 @@ enum class WorkflowRunOutcome {
 /// expansion produce more than one entry for a step.
 struct WorkflowStepDispatchNote {
     std::string instruction_id;
+    /// The step's `WorkflowStep::index` and the 1-based attempt this entry is, both announced by
+    /// the engine through `WorkflowRunControl::on_attempt`. `step_index` stays -1 (and `attempt`
+    /// 1) for a run port that never announces one: such an entry is then its own step. The
+    /// `attempt` is in the response `steps` entry so a reader can tell a retry from a new step.
+    int step_index{-1};
+    int attempt{1};
     std::string command_id;
     int agents_reached{0};
     /// Empty when `agents_reached > 0`. Otherwise a `zero_reach_token` ("no_agents_reached",
@@ -549,13 +585,61 @@ struct WorkflowExecuteOutcome {
     std::int64_t started_at{0};
 };
 
-/// The ONE judgement of how a finished run ended. `run_status` is the engine's recorded status
-/// after the step loop ("unknown" when it could not be read back, which is never success).
+/// One step's FINAL outcome: what it came to after its last attempt, which is what the engine
+/// itself recorded for the step. A step whose first attempt reached nobody and whose retry
+/// reached an agent is `reached` (the run did not fail there); a step the engine left failed is
+/// not, whatever it did before. `foreach`: an attempt is every item of one attempt number, and
+/// the step is `reached` only if EVERY item of its last attempt reached an agent, exactly the
+/// engine's own rule for a step to succeed (today's engine sends one item: a dispatch
+/// acknowledgement has no array to iterate). Steps the run never attempted (skipped by a
+/// condition, or after an abort) have no final.
+struct WorkflowStepFinal {
+    int step_index{-1};
+    int attempt{1}; ///< the last attempt the step made
+    bool reached{false}; ///< the last attempt reached an agent on every dispatch it made
+    bool sent{false};    ///< any attempt of the step reached an agent: something left the server
+};
+
+/// What cut a run short or marked it, besides how its steps ended. All independent; the
+/// classifier's precedence orders them (`threw`, then `late_denied`/`bound_stop`, then
+/// `interrupted`).
+struct WorkflowRunFacts {
+    /// A step was refused at send time (`late_denied` / `definition_changed`).
+    bool late_denied{false};
+    /// The deadline, or the caller's credential check, stopped the run. Both are `kAborted`, so the
+    /// classifier never needs to tell them apart.
+    bool bound_stop{false};
+    /// The stopping server ended the run.
+    bool interrupted{false};
+    /// A dispatch callback threw. The first answer never sets this (a throw is answered as
+    /// `kRunFailed` before any classification); the replay recovers it from the stored rows.
+    bool threw{false};
+};
+
+/// The ONE judgement of how a run ended, for the first answer AND the idempotent replay, over
+/// per-step FINAL outcomes. `run_status` is the engine's recorded status ("unknown" when it could
+/// not be read back, which is never success). No `finals` and `completed` is `kSucceeded` (every
+/// step skipped by its condition).
 [[nodiscard]] WorkflowRunOutcome
-classify_workflow_run(std::string_view run_status, bool late_denied,
-                      const std::vector<WorkflowStepDispatchNote>& steps,
-                      bool deadline_exceeded = false, bool interrupted = false,
-                      bool credential_stopped = false);
+classify_workflow_run(std::string_view run_status, const WorkflowRunFacts& facts,
+                      const std::vector<WorkflowStepFinal>& finals);
+
+/// The finals of a run from its dispatch notes and the last attempt the engine announced for each
+/// step (`attempts`: step index -> attempt; `WorkflowRunControl::on_attempt`). A step is `reached`
+/// iff it has at least one note at its last attempt and every note of that attempt reached an
+/// agent; an announced attempt with no note (the run was stopped first, the dispatch failed before
+/// it recorded one) is not reached. A note with no step index is its own step.
+[[nodiscard]] std::vector<WorkflowStepFinal>
+workflow_step_finals(const std::vector<WorkflowStepDispatchNote>& notes,
+                     const std::map<int, int>& attempts);
+
+/// The class a STORED run ended in, from the rows the engine persisted (`get_workflow_execution`):
+/// the same `classify_workflow_run` over the stored per-step results, with the facts recovered
+/// from the stored step texts. `nullopt` == the rows cannot prove an outcome: the engine says
+/// `completed` and a step row is still `pending`/`running`, unknown or absent, or carries a skip
+/// other than the condition's. Never `kSucceeded` unless every attempted step is `success`.
+[[nodiscard]] std::optional<WorkflowRunOutcome>
+classify_stored_workflow_run(const WorkflowExecution& stored);
 
 /// What `admit_workflow_run` decided. `lease` is engaged iff the run is admitted and must be held
 /// for the WHOLE run (a stack object in the transport, so a return or a throw releases it);
@@ -674,7 +758,8 @@ struct StepAdmissionDecision {
 
 /// The success body both transports return for a started run (kOk, kRunIncomplete or
 /// kNoAgentsReached): `execution_id`, `workflow_id`, `status` and `steps` (one entry per dispatch
-/// attempt: `instruction_id`, `command_id`, `agents_reached`, plus `reason`/`retryable` and the
+/// attempt: `instruction_id`, `attempt` (1-based; a retry of a step has the next number, and a
+/// new step starts again at 1), `command_id`, `agents_reached`, plus `reason`/`retryable` and the
 /// withheld counts when nothing was reached), `late_denied`, and `audit_persisted:false` only when
 /// the closing audit row failed. `status` is the engine's recorded dispatch-level status
 /// (`completed` for a full success). For kRunIncomplete it is the run's outcome token instead
@@ -685,9 +770,11 @@ struct StepAdmissionDecision {
                                                           const std::string& workflow_id);
 
 /// The THIN body of a `kIdempotentReplay` outcome, for both transports: `execution_id`,
-/// `workflow_id`, `status` (running | completed | failed | indeterminate), `idempotent_replay:true`
-/// and `started_at`, plus a `message`; `retry_after_ms` 2000 while running; `retryable:false` and
-/// (for indeterminate) a `remediation` otherwise. NO `steps` and no `late_denied`: the engine does
+/// `workflow_id`, `status` (running | completed | partial | failed | aborted | interrupted |
+/// indeterminate), `idempotent_replay:true` and `started_at`, plus a `message`; `retry_after_ms`
+/// 2000 while running; `retryable:false` and (for indeterminate) a `remediation` otherwise. No
+/// `reason`: the rows do not say which of the deadline and the credential check stopped an
+/// `aborted` run. NO `steps` and no `late_denied`: the engine does
 /// not persist them, so read the run with `get_workflow_execution`.
 [[nodiscard]] nlohmann::json workflow_idempotent_replay_json(const WorkflowExecuteOutcome& o,
                                                              const std::string& workflow_id);
