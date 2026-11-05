@@ -111,9 +111,10 @@ cadences.
   ecosystem is labelled `via:unknown`, never the bare `via:`. The catalogue treats a
   label as no vendor: it does not count towards the publisher total, never wins as a
   title's representative publisher over a declared one, and does not take part in title
-  matching (a title from `via:snap` matches the same title with no publisher). The
-  `publisher` filter and search match the literal text, so searching `via:` lists the
-  titles whose representative publisher is a label. The rpm vendor is read from the
+  matching (a title from `via:snap` matches the same title with no publisher). There is
+  no `publisher` filter parameter; the catalogue search matches the publisher text
+  literally, so searching `via:` lists the titles whose representative publisher is a
+  label. The rpm vendor is read from the
   package's `VENDOR` tag; the `PACKAGER` tag, which is usually a person or a build-system
   address, is the fallback when a package has no vendor.
 
