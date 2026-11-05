@@ -4734,8 +4734,8 @@ read and a `csrf.denied` row is written by the server-wide same-site check
 (`target_type=Endpoint`, `target_id` is the method and path of the request, for example
 `POST /api/v1/access-reviews/<id>/attestations`, and `detail` ends with `reason=<token>`).
 The route's own copy of the check is defence in depth and is not reached by a cookie session.
-A request that authenticates with an API token is not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
-the dashboard origin to `--csrf-trusted-origin`.
+A request that authenticates with an API token is not riding a cookie and is not gated.
+Behind a proxy that rewrites `Host`, add the dashboard origin to `--csrf-trusted-origin`.
 
 MCP twins (JSON only — the REST `?format=csv` export path has no MCP
 equivalent): `export_access_review`, `open_access_review`,
