@@ -1389,8 +1389,8 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   Registration does **no RFC 7050 discovery**, so it refuses only as far as the declared prefixes
   allow: an address behind a prefix the network advertises but the operator did not declare is
   judged as plain IPv6 at registration. That is safe because nothing fetches at registration and
-  the fetcher re-classifies every address (below). The MCP and REST descriptions say "declared
-  prefixes only at registration".
+  the fetcher re-classifies every address (below). The MCP and REST descriptions both state it
+  as "Declared prefixes only at registration".
 - **`PUT` replaces** the source's name, keys and URLs. This is how a renewed CA key is added. A
   `PUT` that drops a URL deletes that URL's `source_url` and `fetch_status` rows, and every held
   `crl` row fetched from it, in the same transaction. A `PUT` that drops a key deletes every held
