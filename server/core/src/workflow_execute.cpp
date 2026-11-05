@@ -5,6 +5,7 @@
 #include "dispatch_send_progress.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
+#include "instruction_execute.hpp" // definition_id_is_malformed (the one id predicate)
 #include "instruction_store.hpp"
 #include "mcp_input_bounds.hpp"
 #include "sha256_hex.hpp"
@@ -216,7 +217,7 @@ WorkflowInstructionLookupFn make_instruction_lookup(InstructionStore* store) {
 
 namespace {
 
-constexpr std::string_view kFingerprintDomain = "wf-exec-v1\n";
+constexpr std::string_view kFingerprintDomain = "wf-exec-v2\n";
 
 bool idempotency_key_char_ok(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
@@ -357,6 +358,17 @@ WorkflowExecuteOutcome conflict_outcome(const std::string& bound_execution_id) {
 
 } // namespace
 
+std::optional<WorkflowExecuteBodyError> check_workflow_id(std::string_view id) {
+    if (id.empty() || id.size() > mcp::kExecInstrIdentMaxLen ||
+        instruction_execute::definition_id_is_malformed(id))
+        return WorkflowExecuteBodyError{
+            "invalid_workflow_id",
+            "the workflow id must be 1 to " + std::to_string(mcp::kExecInstrIdentMaxLen) +
+                " bytes of valid UTF-8 with no control byte (below 0x20 or 0x7F); re-call with "
+                "the id exactly as the workflow list returns it"};
+    return std::nullopt;
+}
+
 std::optional<WorkflowExecuteBodyError> check_workflow_idempotency_key(std::string_view key) {
     if (key.size() < kIdempotencyKeyMinLen || key.size() > kIdempotencyKeyMaxLen ||
         !std::all_of(key.begin(), key.end(), idempotency_key_char_ok))
@@ -376,12 +388,17 @@ std::optional<std::string> workflow_request_fingerprint(const WorkflowExecutePor
     std::set<std::string_view> ids;
     for (const auto& id : agent_ids)
         ids.insert(id);
+    // Every field is `<byte length>:<bytes>`: an id holding any byte, `\n` and digits included,
+    // cannot move a field boundary, so two different requests never share a preimage.
     std::string material(kFingerprintDomain);
-    material += workflow_id;
-    for (const auto id : ids) {
-        material += '\n';
-        material += id;
-    }
+    const auto frame = [&material](std::string_view field) {
+        material += std::to_string(field.size());
+        material += ':';
+        material += field;
+    };
+    frame(workflow_id);
+    for (const auto id : ids)
+        frame(id);
     const auto digest = ports.fingerprint_digest ? ports.fingerprint_digest(material)
                                                  : sha256_hex(material);
     if (!digest || digest->size() != 64)

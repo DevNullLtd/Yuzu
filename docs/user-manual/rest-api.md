@@ -6709,6 +6709,7 @@ nothing is sent.
 | Status | `error.reason` | Meaning |
 |---|---|---|
 | `400` | `body_type`, `agent_ids_required`, `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `agent_id_len`, `agent_ids_count`, `scope_unsupported` | The body failed the targeting shape check. |
+| `400` | `invalid_workflow_id` | The workflow id in the path is empty, longer than 128 bytes, holds a control byte (below `0x20` or `0x7F`, NUL included) or is not valid UTF-8 (for example a percent-encoded `%00` or `%FF`). Never retryable: it can never succeed as sent. Checked first, before the key, the body, admission or any read, so nothing is leased, read, written or sent; the message does not echo the id. |
 | `400` | `idempotency_key_invalid` | The `Idempotency-Key` header is not 8 to 128 characters from `A-Z a-z 0-9 . _ : -`, or was sent more than once. Checked before anything is read or leased. |
 | `400` | `workflow_no_steps` | The workflow exists but has no steps. |
 | `400` | `unknown_instruction` | A step names an instruction that does not exist. |

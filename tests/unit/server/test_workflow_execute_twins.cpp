@@ -85,6 +85,8 @@ struct Fx {
     std::map<std::string, WorkflowStepInstruction> late_defs;
     std::map<std::string, int> lookup_count;
     bool store_fault{false};
+    /// Reads of the stored workflow (`get_workflow`): a refusal before any read leaves it at 0.
+    int get_workflow_calls{0};
 
     // Wiring switches.
     bool store_open{true};
@@ -193,9 +195,10 @@ struct Fx {
     static std::string fingerprint_of(const std::string& wf, std::vector<std::string> ids) {
         std::sort(ids.begin(), ids.end());
         ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-        std::string material = "wf-exec-v1\n" + wf;
+        const auto frame = [](const std::string& f) { return std::to_string(f.size()) + ":" + f; };
+        std::string material = "wf-exec-v2\n" + frame(wf);
         for (const auto& id : ids)
-            material += "\n" + id;
+            material += frame(id);
         return *sha256_hex(material);
     }
     /// The rows of a run a test bound by hand: one step, settled the way its status says. A
@@ -242,6 +245,7 @@ struct Fx {
 
     std::shared_ptr<test::FnWorkflowApi> api() {
         auto get = [this](const std::string& id) -> std::expected<std::optional<Workflow>, std::string> {
+            ++get_workflow_calls;
             if (store_fault)
                 return std::unexpected(std::string{"db: boom"});
             if (id != "wf-1")
@@ -2525,6 +2529,74 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a draining server refuses a new 
     CHECK(r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})")->status == 202);
 }
 
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a malformed workflow id is a non-retryable 400 "
+          "invalid_workflow_id before any key, read, lease, ticket-class write, audit row or send",
+          "[workflow][twin][rest][security]") {
+    const std::vector<std::pair<const char*, std::string>> bad = {
+        {"NUL", std::string("foo\0xyz", 7)},
+        {"%FF as raw 0xFF", std::string("foo\xFF")},
+        {"overlong C0 80", std::string("foo\xC0\x80")},
+        {"truncated UTF-8", std::string("foo\xE4\xB8")},
+        {"129 bytes", std::string(129, 'x')},
+        {"4 KB", std::string(4096, 'x')},
+        {"SOH", std::string("foo\x01")},
+        {"LF", std::string("foo\nbar")},
+        {"ESC", std::string("foo\x1b[31m")},
+        {"DEL", std::string("foo\x7f")},
+    };
+    for (const bool keyed_call : {false, true}) {
+        for (const auto& [what, id] : bad) {
+            INFO(what);
+            Rest r;
+            // A draining server must not mask the refusal: the id is judged first, so the answer
+            // is the same 400 and the budget is untouched.
+            r.draining = true;
+            const std::string path = "/api/v1/workflows/" + id + "/execute";
+            const std::unordered_map<std::string, std::string> hdrs =
+                keyed_call ? std::unordered_map<std::string, std::string>{{"Idempotency-Key", "key-0123456789"}}
+                           : std::unordered_map<std::string, std::string>{};
+            const auto res =
+                r.sink.dispatch("POST", path, R"({"agent_ids":["a1"]})", "application/json", hdrs);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            const auto j = body_of(*res);
+            CHECK(at_path(j, "/error/reason") == "invalid_workflow_id");
+            // Not retryable: no retry hint, and the message never echoes the id.
+            CHECK((!at_path(j, "/error").contains("retry_after_ms") ||
+                   at_path(j, "/error/retry_after_ms").is_null()));
+            CHECK(res->get_header_value("Retry-After").empty());
+            CHECK(res->body.find("foo") == std::string::npos);
+            CHECK(res->body.find(id) == std::string::npos);
+            // Nothing read, leased, run, audited or sent.
+            CHECK(r.fx.get_workflow_calls == 0);
+            CHECK(r.fx.lookup_count.empty());
+            CHECK(r.fx.find_calls == 0);
+            CHECK_FALSE(r.fx.engine_called);
+            CHECK(r.fx.bound.empty());
+            CHECK(r.fx.events.empty());
+            CHECK(r.fx.audit_details.empty());
+            CHECK(r.persist_calls == 0);
+            CHECK_FALSE(r.fx.dispatched_anything());
+            CHECK(r.budget.active() == 0);
+            CHECK(r.refused("draining") == 0);
+            CHECK(r.refused("per_principal_stream_cap") == 0);
+        }
+    }
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a well-formed multibyte or maximum-length id still "
+          "reaches the workflow read (the check does not over-refuse)",
+          "[workflow][twin][rest][security]") {
+    for (const auto& id : {std::string("caf\xc3\xa9"), std::string(128, 'x'), std::string("a.b_c-d:e")}) {
+        INFO(id);
+        Rest r;
+        const auto res = r.sink.Post("/api/v1/workflows/" + id + "/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 404); // unknown workflow: it was READ, found nothing
+        CHECK(r.fx.get_workflow_calls == 1);
+    }
+}
+
 TEST_CASE("POST /api/v1/workflows/{id}/execute: a malformed body is a 400 even at the cap, and takes no "
           "slot",
           "[workflow][twin][rest][cap]") {
@@ -3076,7 +3148,7 @@ TEST_CASE("idempotency: the fingerprint is sha256 over the domain, the workflow 
     const auto p = fx.ports(a);
     const auto fp = workflow_request_fingerprint(p, "wf-1", {"a2", "a1", "a1"});
     REQUIRE(fp);
-    CHECK(*fp == *sha256_hex(std::string("wf-exec-v1\nwf-1\na1\na2")));
+    CHECK(*fp == *sha256_hex(std::string("wf-exec-v2\n4:wf-12:a12:a2")));
     CHECK(*fp == Fx::fingerprint_of("wf-1", {"a1", "a2"}));
     CHECK(fp == workflow_request_fingerprint(p, "wf-1", {"a1", "a2"}));
     CHECK(fp != workflow_request_fingerprint(p, "wf-1", {"a1"}));
@@ -3085,6 +3157,90 @@ TEST_CASE("idempotency: the fingerprint is sha256 over the domain, the workflow 
     auto broken = p;
     broken.fingerprint_digest = [](std::string_view) { return std::optional<std::string>{}; };
     CHECK_FALSE(workflow_request_fingerprint(broken, "wf-1", {"a1"}));
+}
+
+TEST_CASE("idempotency: every field of the fingerprint is length-framed, so ids crafted to collide "
+          "under a newline join are different requests",
+          "[workflow][twin][idempotency][security]") {
+    Fx fx;
+    auto a = fx.api();
+    auto p = fx.ports(a);
+    const auto fp = [&](const std::string& wf, std::vector<std::string> ids) {
+        return workflow_request_fingerprint(p, wf, ids);
+    };
+    // The old preimage `wf-exec-v1\n` + wf + `\n` + ids joined by `\n` was equal for each pair.
+    CHECK(fp("X", {"a", "b"}) != fp("X\na", {"b"}));
+    CHECK(fp("wf-1", {"a\nb"}) != fp("wf-1", {"a", "b"}));
+    CHECK(fp("wf-1", {"a\nb", "c"}) != fp("wf-1", {"a", "b\nc"}));
+    CHECK(fp("wf-1", {"", "a"}) != fp("wf-1", {"\na"}));
+    // A length prefix is itself data inside a field: no forged prefix shifts a boundary.
+    CHECK(fp("wf-1", {"1:a"}) != fp("wf-1", {"a"}));
+    CHECK(fp("wf-1", {"2:a1"}) != fp("wf-1", {"a1"}));
+    CHECK(fp("wf-1", {"a", "2:bc"}) != fp("wf-1", {"a2:bc"}));
+    CHECK(fp("1:a", {"b"}) != fp("1:a1:b", {}));
+    // NUL and 0xFF bytes frame like any other byte.
+    CHECK(fp("wf-1", {std::string("a\0b", 3)}) != fp("wf-1", {"a"}));
+    CHECK(fp("wf-1", {"\xFF"}) != fp("wf-1", {"\xFE"}));
+
+    // The exact preimage, captured at the digest seam: domain, then <len>:<bytes> per field in
+    // sorted, deduped order.
+    std::string seen;
+    p.fingerprint_digest = [&seen](std::string_view m) {
+        seen.assign(m);
+        return sha256_hex(m);
+    };
+    REQUIRE(workflow_request_fingerprint(p, "wf-1", {"b", "a", "b", "a\nc"}));
+    CHECK(seen == std::string("wf-exec-v2\n4:wf-11:a3:a\nc1:b"));
+}
+
+TEST_CASE("idempotency: a key bound to {a,b} is a CONFLICT for {\"a\\nb\"}, never a replay",
+          "[workflow][twin][idempotency][security]") {
+    Fx fx;
+    const auto first = fx.run(keyed(fx, {"a", "b"}));
+    REQUIRE(first.status == WorkflowExecuteStatus::kOk);
+    REQUIRE(fx.bound.size() == 1);
+    fx.engine_called = false;
+    const auto out = fx.run(keyed(fx, {std::string("a\nb")}));
+    CHECK(out.status == WorkflowExecuteStatus::kIdempotencyConflict);
+    CHECK(out.reason == "idempotency_key_conflict");
+    CHECK_FALSE(fx.engine_called);
+}
+
+TEST_CASE("workflow id: 1 to 128 bytes of valid UTF-8 with no control byte, else invalid_workflow_id",
+          "[workflow][twin][security]") {
+    for (const auto& ok : {std::string("wf-1"), std::string("a"), std::string(128, 'x'),
+                           std::string("caf\xc3\xa9"), std::string("\xe4\xb8\xad\xe6\x96\x87"),
+                           std::string("with space"), std::string("a.b_c-d:e")}) {
+        INFO(ok);
+        CHECK_FALSE(check_workflow_id(ok));
+    }
+    const std::vector<std::pair<const char*, std::string>> bad = {
+        {"empty", std::string()},
+        {"NUL", std::string("foo\0xyz", 7)},
+        {"leading NUL", std::string("\0foo", 4)},
+        {"0xFF", std::string("foo\xFF")},
+        {"overlong C0 80", std::string("foo\xC0\x80")},
+        {"truncated sequence", std::string("foo\xE4\xB8")},
+        {"surrogate", std::string("\xED\xA0\x80")},
+        {"above U+10FFFF", std::string("\xF4\x90\x80\x80")},
+        {"SOH", std::string("foo\x01")},
+        {"LF", std::string("foo\nbar")},
+        {"CR", std::string("foo\rbar")},
+        {"ESC", std::string("foo\x1b[0m")},
+        {"US", std::string("foo\x1f")},
+        {"DEL", std::string("foo\x7f")},
+        {"129 bytes", std::string(129, 'x')},
+        {"4 KB", std::string(4096, 'x')},
+    };
+    for (const auto& [what, id] : bad) {
+        INFO(what);
+        const auto e = check_workflow_id(id);
+        REQUIRE(e);
+        CHECK(e->reason == "invalid_workflow_id");
+        // The message names the rule and never echoes the id.
+        CHECK(e->message.find("foo") == std::string::npos);
+        CHECK(e->message.find("xxxxxxxx") == std::string::npos);
+    }
 }
 
 TEST_CASE("idempotency: a keyless call is unchanged: no lookup, no claim, the run goes ahead",

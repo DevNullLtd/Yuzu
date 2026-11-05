@@ -129,8 +129,9 @@
 ///   * the key is `[A-Za-z0-9._:-]`, 8 to 128 bytes, bound-checked by the transport BEFORE any
 ///     ticket, lease or read (`check_workflow_idempotency_key`); it is scoped to the PRINCIPAL
 ///     (never global) and bound for the life of the run's row. An empty principal never holds a key.
-///   * the REQUEST FINGERPRINT is sha256 over `wf-exec-v1\n`, the workflow id and the agent ids
-///     SORTED and DEDUPED, joined by `\n`. It deliberately EXCLUDES the step digest: a later edit to
+///   * the REQUEST FINGERPRINT is sha256 over `wf-exec-v2\n`, the workflow id and the agent ids
+///     SORTED and DEDUPED, each framed as `<byte length>:<bytes>` (no id can forge a separator).
+///     It deliberately EXCLUDES the step digest: a later edit to
 ///     an instruction must not turn a retry into a 422 that pushes the client to a new key, which
 ///     is a second dispatch. The same key with a different fingerprint is `kIdempotencyConflict`
 ///     (REST 422, MCP -32602, reason `idempotency_key_conflict`), terminal.
@@ -709,6 +710,16 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
 [[nodiscard]] WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
                                                             const WorkflowExecuteRequest& req);
 
+/// Shape-checks the workflow id a transport received, reason `invalid_workflow_id` (REST 400, MCP
+/// -32602, never retryable): 1 to `kExecInstrIdentMaxLen` bytes, no control byte (NUL included),
+/// valid UTF-8 (`definition_id_is_malformed`, the instruction twin's own step-0 predicate). The
+/// transport calls it BEFORE any read, lease, ticket or fingerprint: the Postgres binding passes
+/// the id as a C string, so `"foo\0xyz"` would run workflow `foo` under audit, fingerprint and
+/// ticket records of a different string, and an invalid-UTF-8 id raises SQLSTATE 22021, which
+/// would read as a retryable 503 for an input that can never succeed. The message never echoes
+/// the id. `nullopt` == fine.
+[[nodiscard]] std::optional<WorkflowExecuteBodyError> check_workflow_id(std::string_view id);
+
 /// Bound-checks a client idempotency key: 8 to 128 bytes of `[A-Za-z0-9._:-]`. `nullopt` == fine.
 /// The transport calls it before any ticket, lease or read, so a bad key spends nothing. The
 /// message names the rule and never echoes the key.
@@ -716,7 +727,9 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
 check_workflow_idempotency_key(std::string_view key);
 
 /// The request fingerprint stored with a claim and compared on a repeat: sha256 over
-/// `wf-exec-v1\n` + workflow id + `\n` + the agent ids sorted and deduped, joined by `\n`.
+/// `wf-exec-v2\n` followed by the workflow id and then each agent id (sorted, deduped), each
+/// written as `<decimal byte length>:<bytes>`. The length prefix makes the framing unambiguous
+/// for any bytes, so no choice of ids can make two different requests share a preimage.
 /// `nullopt` on a digest failure (never a digest of zeros): the caller refuses the call.
 [[nodiscard]] std::optional<std::string>
 workflow_request_fingerprint(const WorkflowExecutePorts& ports, const std::string& workflow_id,

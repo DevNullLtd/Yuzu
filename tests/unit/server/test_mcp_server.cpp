@@ -49263,6 +49263,178 @@ TEST_CASE("MCP execute_workflow: idempotency_key is REQUIRED and bound-checked; 
     CHECK(fx.find_calls == 0); // not even a lookup: the key was refused before any read
 }
 
+namespace {
+
+// The workflow ids the MCP boundary can actually carry malformed: a JSON string holds NUL and the
+// other control bytes only as escapes, and an over-length id as plain bytes. (A raw 0xFF or an
+// overlong sequence never reaches the handler: the JSON parse refuses the body first.)
+struct WfBadIdRow {
+    const char* what;
+    std::string id;
+};
+
+std::vector<WfBadIdRow> wf_bad_ids() {
+    return {
+        {"NUL", std::string("foo\0xyz", 7)},
+        {"leading NUL", std::string("\0foo", 4)},
+        {"SOH", std::string("foo\x01")},
+        {"LF", std::string("foo\nbar")},
+        {"ESC", std::string("foo\x1b[31m")},
+        {"DEL", std::string("foo\x7f")},
+        {"129 bytes", std::string(129, 'x')},
+        {"130 bytes of 2-byte characters", [] {
+             std::string s;
+             for (int i = 0; i < 65; ++i)
+                 s += "\xc3\xa9";
+             return s;
+         }()},
+    };
+}
+
+std::string wf_bad_id_call(const std::string& id, int rpc_id) {
+    nlohmann::json a = {{"workflow_id", id}, {"agent_ids", {"a1"}}, {"idempotency_key", kWfDefaultKey}};
+    return wf_exec_call_raw(a.dump(), rpc_id);
+}
+
+// The audit rows a refused call wrote must never carry the raw id: no control byte, and no
+// verbatim copy of an over-length one.
+void wf_check_audit_has_no_raw_id(const McpTestServer& ts, std::size_t rows_before,
+                                  const std::string& id) {
+    REQUIRE(ts.audit_details.size() == ts.audit_log.size());
+    CHECK(ts.audit_log.size() == rows_before + 1);
+    for (std::size_t i = rows_before; i < ts.audit_log.size(); ++i) {
+        const auto& d = ts.audit_details[i];
+        CHECK(ts.audit_log[i].find("denied") != std::string::npos);
+        CHECK(d.find("reason=invalid_workflow_id") != std::string::npos);
+        for (const unsigned char c : d)
+            CHECK((c >= 0x20 && c != 0x7F));
+        CHECK(d.find(id) == std::string::npos);
+        CHECK(d.size() < 400); // the id is bounded to 128 bytes, then cleaned
+    }
+}
+
+} // namespace
+
+TEST_CASE("MCP execute_workflow: a malformed workflow_id is -32602 invalid_workflow_id, not retryable, "
+          "before any read, lease or run; the audit row never carries the raw id",
+          "[mcp][workflow][twin][security][targeting]") {
+    McpTestServer ts;
+    WfExecDispatchProbe probe;
+    int get_calls = 0;
+    int find_calls = 0;
+    auto bad_id_api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+        yuzu::server::test::FnWorkflowApi::ListFn{},
+        [&get_calls](const std::string&)
+            -> std::expected<std::optional<yuzu::server::Workflow>, std::string> {
+            ++get_calls;
+            return std::optional<yuzu::server::Workflow>{};
+        },
+        yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+    ts.workflow_api_for_test = bad_id_api;
+    bad_id_api->set_find_by_key(
+        [&find_calls](const std::string&, const std::string&)
+            -> std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string> {
+            ++find_calls;
+            return std::optional<yuzu::server::WorkflowIdempotentRun>{};
+        });
+    bool run_called = false;
+    ts.workflow_run_for_test = [&run_called](const std::string&, const std::vector<std::string>&,
+                                             yuzu::server::StepDispatchFn,
+                                             yuzu::server::ConditionEvalFn,
+                                             const yuzu::server::WorkflowRunControl&)
+        -> std::expected<std::string, std::string> {
+        run_called = true;
+        return std::string{"exec-1"};
+    };
+    ts.start_with_dispatch(probe.fn());
+    int rpc = 1;
+    for (const auto& row : wf_bad_ids()) {
+        INFO(row.what);
+        const auto rows_before = ts.audit_log.size();
+        auto res = ts.call(wf_bad_id_call(row.id, rpc++));
+        REQUIRE(res);
+        const auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == -32602);
+        REQUIRE(j["error"].contains("data"));
+        CHECK(j["error"]["data"]["reason"] == "invalid_workflow_id");
+        CHECK(j["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_FALSE(j["error"]["data"].contains("approval_id"));
+        CHECK(res->body.find("foo") == std::string::npos);
+        wf_check_audit_has_no_raw_id(ts, rows_before, row.id);
+    }
+    CHECK(get_calls == 0);
+    CHECK(find_calls == 0);
+    CHECK_FALSE(run_called);
+    CHECK_FALSE(probe.dispatched);
+
+    // A raw 0xFF in the JSON text is refused by the parse itself: nothing runs either.
+    const auto rows_before = ts.audit_log.size();
+    auto raw = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":99,"params":{"name":"execute_workflow","arguments":{"workflow_id":"foo)" +
+        std::string("\xFF") + R"(","agent_ids":["a1"],"idempotency_key":")" + kWfDefaultKey + R"("}}})");
+    REQUIRE(raw);
+    CHECK(nlohmann::json::parse(raw->body, nullptr, false).value("error", nlohmann::json{}).contains("code"));
+    CHECK(get_calls == 0);
+    CHECK_FALSE(run_called);
+    CHECK(ts.audit_log.size() == rows_before);
+
+    // A well-formed id is not over-refused: a 128-byte id and a multibyte id reach the read.
+    for (const auto& ok : {std::string(128, 'x'), std::string("caf\xc3\xa9")}) {
+        INFO(ok);
+        auto res = ts.call(wf_bad_id_call(ok, rpc++));
+        REQUIRE(res);
+        const auto j = nlohmann::json::parse(res->body);
+        // Past the id check: this harness wires no instruction store, so the shared sequence's own
+        // wiring refusal answers (-32603 "not available"), not a -32602 about the id.
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == -32603);
+        CHECK_FALSE((j.contains("error") && j["error"].contains("data") &&
+                     j["error"]["data"].contains("reason") &&
+                     j["error"]["data"]["reason"] == "invalid_workflow_id"));
+    }
+}
+
+TEST_CASE("MCP execute_workflow: at the supervised tier a malformed workflow_id mints NO ticket and "
+          "burns none, and takes no lease, lookup or send",
+          "[mcp][pg][workflow][twin][security][tier][approval][targeting]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    int rpc = 1;
+    for (const auto& row : wf_bad_ids()) {
+        INFO(row.what);
+        const auto rows_before = ts.audit_log.size();
+        auto res = ts.call(wf_bad_id_call(row.id, rpc++));
+        REQUIRE(res);
+        const auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == -32602);
+        CHECK_FALSE((j["error"].contains("data") && j["error"]["data"].contains("approval_id")));
+        // More than 128 BYTES is already refused by the tool's own input schema at this tier
+        // (its maxLength counts bytes), before the handler; both answers are a -32602 that
+        // spends nothing.
+        if (row.id.size() > 128)
+            continue;
+        REQUIRE(j["error"].contains("data"));
+        CHECK(j["error"]["data"]["reason"] == "invalid_workflow_id");
+        wf_check_audit_has_no_raw_id(ts, rows_before, row.id);
+    }
+    CHECK(appr.pending_count() == 0); // nothing minted
+    CHECK(fx.run_calls == 0);
+    CHECK(fx.dispatches == 0);
+    CHECK(fx.find_calls == 0); // not even a replay lookup
+    CHECK(fx.authorize_calls == 0);
+}
+
 TEST_CASE("MCP execute_workflow: the key rides in the ticket's bound arguments, so a different key is a "
           "different ticket and the same key dedupes",
           "[mcp][pg][workflow][twin][idempotency][tier][approval]") {

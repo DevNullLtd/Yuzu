@@ -1348,7 +1348,9 @@ static const ToolDef kTools[] = {
      "cap. NEVER re-send this call without the key you first used. A deliberate second run needs "
      "a NEW key; the key stays bound to its run for the life of the run record. The same key with "
      "a different workflow_id or agent_ids is refused -32602 reason idempotency_key_conflict "
-     "(terminal). A replay's status running (retry_after_ms 2000) means POLL get_workflow_execution, "
+     "(terminal). A workflow_id that is empty, over 128 bytes, holds a control byte (NUL "
+     "included) or is not valid UTF-8 is refused -32602 reason invalid_workflow_id (never "
+     "retryable) before anything is read or minted. A replay's status running (retry_after_ms 2000) means POLL get_workflow_execution, "
      "never re-send; past about 2 minutes treat a run that is still running as indeterminate "
      "(the server answers indeterminate, retryable false, once it has run for 180 seconds): "
      "read get_workflow_execution, where a step with no command_id was never sent, and inspect "
@@ -8489,10 +8491,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
                 const auto wf_id = param_string_strict(args, "workflow_id");
-                if (!wf_id || wf_id->empty() || wf_id->size() > mcp::kExecInstrIdentMaxLen) {
+                if (!wf_id || wf_id->empty()) {
                     res.set_content(error_response(id, kInvalidParams,
                                                    "workflow_id must be a non-empty string of at "
                                                    "most 128 bytes"),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                // Length, control bytes (NUL included) and UTF-8 validity, before the targeting
+                // parse, the key, the replay lookup, the lease or any ticket. The audit detail
+                // carries the id only bounded and cleaned, never raw.
+                if (const auto bad_id = check_workflow_id(*wf_id)) {
+                    mcp_audit("denied", "reason=" + bad_id->reason + " workflow=" +
+                                            ::yuzu::log_token(
+                                                instruction_execute::bounded_definition_id(*wf_id)));
+                    res.set_content(a4_error(kInvalidParams, bad_id->message,
+                                             "fix the workflow id; this input can never succeed "
+                                             "as sent",
+                                             -1, {}, true, bad_id->reason),
                                     "application/json");
                     return std::nullopt;
                 }

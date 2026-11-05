@@ -108,6 +108,19 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             const std::string cid = detail::ensure_correlation_id(res);
             const std::string workflow_id = req.matches[1].str();
 
+            // A malformed id (control byte, NUL included, invalid UTF-8, over-length) is refused
+            // before the key, the body, the lease or any read, and never retryable: the store would
+            // cut a NUL at the bind and run a DIFFERENT workflow, or raise 22021 and read as a 503.
+            // The message never echoes the id, and no audit row embeds it.
+            if (const auto bad_id = check_workflow_id(workflow_id)) {
+                res.status = 400;
+                nlohmann::json j = nlohmann::json::parse(
+                    detail::error_json_a4(400, bad_id->message, cid, detail::A4ErrorOpts{}));
+                j["error"]["reason"] = bad_id->reason;
+                res.set_content(j.dump(), "application/json");
+                return;
+            }
+
             // The optional client idempotency key, bound-checked before anything is read or
             // leased. Exactly one header: two values are ambiguous, and which one a proxy kept
             // is not something to guess at when the answer decides whether steps are re-sent.
