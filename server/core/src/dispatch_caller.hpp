@@ -147,9 +147,11 @@ struct DispatchCaller {
     /// with `approval_provenance == None`.
     /// MCP `execute_workflow` / `POST /api/v1/workflows/{id}/execute` (`workflow_execute.hpp`)
     /// are NOT stamping sites: they thread the caller's own `DispatchCaller` to every step
-    /// unchanged and leave this field `None` even after a consumed MCP ticket, because that
-    /// ticket binds the workflow id and agent list, not the step list, and must not lift a
-    /// step's own approval mode.
+    /// unchanged and leave this field `None` even after a consumed MCP ticket. That ticket binds
+    /// the workflow id, the agent list and the ordered step effects (a repoint is refused), but
+    /// the steps' pairs are resolved from stored instructions, so for the policy reason given
+    /// for the other store-resolved tools above an approval of them is not taken to lift a
+    /// step's own approval mode or ExecuteGate.
     /// A fifth stamping site (or a new pass-through conduit) is a diff
     /// against this stated list, not a silent addition — if you are adding
     /// one, update this comment too.

@@ -26,6 +26,7 @@ struct HttpShape {
     case S::kUnavailable:
         return {503, false}; // a missing dependency is not a transient fault
     case S::kNoPrincipal:
+    case S::kEffectDigestFailed:
         return {500, false};
     case S::kStoreFailed:
         return {503, true};
@@ -37,6 +38,7 @@ struct HttpShape {
     case S::kUnclassifiedStep:
     case S::kDestructiveUntargeted:
     case S::kExecuteFailed:
+    case S::kDefinitionChanged:
         return {400, false};
     case S::kApprovalRequired:
     case S::kDispatchDenied:

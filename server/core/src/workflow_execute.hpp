@@ -38,8 +38,10 @@
 ///      not retryable); then its approval mode admits this caller (`auto` always; `role-gated` only
 ///      for `caller.principal_is_admin`, which already mirrors the JIT-elevation-aware
 ///      `effective_role`; `always` and any unknown mode never).
-///      A consumed MCP approval ticket does NOT relax either check: the ticket binds the workflow
-///      id and agent list, not the step list, and the REST twin has no ticket to relax it with.
+///      A consumed MCP approval ticket does NOT relax either check: it is not a stamping site for
+///      `approval_provenance`, and the REST twin has no ticket to relax it with. When the request
+///      carries `expected_step_effects`, each step's instruction is first held to the effect the
+///      ticket was bound to (`definition_changed`, before the checks above).
 ///   4. per step: the capability is classified, and a Destructive/Forensics pair is targeted
 ///      explicitly (`evaluate_destructive_targeting`); a Destructive pair whose named agents are
 ///      all outside the caller's visible set is refused as `destructive_no_visible_target`.
@@ -58,9 +60,21 @@
 /// does NOT promise that every step will reach a device, only that the caller is allowed to ask.
 ///
 /// The `DispatchCaller` is the CALLER's, derived once by the transport (`caller_fn`), with
-/// `approval_provenance` left as the transport set it: REST leaves it `None`, MCP stamps `Ticket`
-/// only after the C8 gate consumed a ticket (dispatch_caller.hpp, stamping site 2). It is passed
-/// through unchanged to every step; this file never rebuilds a caller from a principal string.
+/// `approval_provenance` left as the transport set it: both REST and MCP leave it `None`, and MCP
+/// does so even after the C8 gate consumed a ticket (`execute_workflow` is not a stamping site,
+/// dispatch_caller.hpp). It is passed through unchanged to every step; this file never rebuilds a
+/// caller from a principal string.
+///
+/// STEP-EFFECT BINDING (MCP supervised tier only). The C8 approval ticket for `execute_workflow`
+/// binds the ORDERED step effects as well as the call's arguments: `workflow_effect_binding`
+/// renders `effect=["workflow",N,[first K "plugin.action"],"<sha256>"]` (summary first, hash
+/// second) over the ordered `(instruction_id, plugin, action, approval_mode, concurrency_mode)`
+/// tuples, and MCP prepends it to the canonical arguments exactly as `execute_instruction_definition`
+/// does. A workflow is immutable by id, so the mutable input behind an approved ticket is the
+/// stored instruction definitions its steps name. `WorkflowExecuteRequest::expected_step_effects`
+/// carries the bound tuples into the run: `prepare_workflow_execute` and every per-step dispatch
+/// re-read the instruction and refuse `definition_changed` when a step's tuple moved, before
+/// anything is sent for that step. REST has no ticket and leaves it unset.
 
 #include "agent_registry.hpp" // detail::DispatchDenial (the authorize port's error type)
 #include "command_capability.hpp"
@@ -125,6 +139,11 @@ using WorkflowAuditFn =
     std::function<bool(const std::string& action, const std::string& result,
                        const std::string& target_id, const std::string& detail)>;
 
+/// SHA-256 as 64 lowercase hex characters, or `nullopt` on a provider failure (never a digest of
+/// zeros). Unset on `WorkflowExecutePorts` == `sha256_hex` (sha256_hex.hpp); a seam so the
+/// fail-closed path is testable.
+using WorkflowDigestFn = std::function<std::optional<std::string>(std::string_view data)>;
+
 struct WorkflowExecutePorts {
     /// Reads only (`get_workflow`, `get_workflow_execution`).
     const WorkflowApi* api{nullptr};
@@ -143,6 +162,8 @@ struct WorkflowExecutePorts {
     WorkflowAuthorizeFn authorize;
     WorkflowStepDispatchFn dispatch;
     WorkflowAuditFn audit;
+    /// Optional: the digest used by `workflow_effect_binding` (default: `sha256_hex`).
+    WorkflowDigestFn digest;
     /// Optional: bumps `yuzu_server_dispatch_target_rejected_total{route="workflow",reason}`.
     std::function<void(std::string_view reason)> count_target_rejected;
     /// Optional: bumps `yuzu_server_dispatch_denied_total{reason}` with the chokepoint's own
@@ -150,11 +171,19 @@ struct WorkflowExecutePorts {
     std::function<void(std::string_view reason)> count_dispatch_denied;
 };
 
+/// instruction id -> `workflow_step_effect` text: what one step's instruction resolved to when the
+/// MCP approval ticket's effect line was computed.
+using WorkflowStepEffects = std::unordered_map<std::string, std::string>;
+
 struct WorkflowExecuteRequest {
     std::string workflow_id;
     std::vector<std::string> agent_ids; ///< from `parse_workflow_execute_body`: non-empty, bounded
     DispatchCaller caller;
     std::string audit_context; ///< "surface=rest" / "surface=mcp": a literal, never caller text
+    /// MCP supervised tier only: the step effects the consumed ticket was bound to (the probe's
+    /// snapshot, whose digest the ticket match proved equal to the approved one). Unset on REST,
+    /// which has no ticket, and on any call that carried none: nothing then holds the lookup.
+    std::optional<WorkflowStepEffects> expected_step_effects;
 };
 
 /// A parse refusal for the request body. `reason` is a closed token (the
@@ -190,6 +219,8 @@ enum class WorkflowExecuteStatus {
     kAuditFailed,                ///< the `requested` row did not persist; nothing was dispatched (503)
     kNoAgentsReached,            ///< the run started but no step reached any agent (503/reason)
     kExecuteFailed,              ///< the engine refused the run (400), message in `message`
+    kDefinitionChanged,          ///< a step's instruction moved from the ticket-bound effect (400, nothing sent for it)
+    kEffectDigestFailed,         ///< the step-effect digest could not be computed (500, no ticket minted)
 };
 
 /// One dispatch attempt as recorded while the engine drove the steps. Retries and `foreach`
@@ -199,8 +230,9 @@ struct WorkflowStepDispatchNote {
     std::string command_id;
     int agents_reached{0};
     /// Empty when `agents_reached > 0`. Otherwise a `zero_reach_token` ("no_agents_reached",
-    /// "quarantined", ...) or "late_denied" (the definition changed after the preflight and the
-    /// refreshed step no longer passed).
+    /// "quarantined", ...), "late_denied" (the definition changed after the preflight and the
+    /// refreshed step no longer passed) or "definition_changed" (it moved off the effect the
+    /// approval ticket was bound to).
     std::string reason;
     bool retryable{false};
     std::size_t agents_quarantined{0};
@@ -226,17 +258,40 @@ struct WorkflowExecuteOutcome {
     /// SENT, not that any device finished.
     std::string run_status;
     std::vector<WorkflowStepDispatchNote> steps;
+    /// A step was refused at dispatch after the preflight (its definition changed); the step's
+    /// note reason is `late_denied`, or `definition_changed` when it moved off the ticket-bound
+    /// effect.
     bool late_denied{false};
     /// False only when the closing outcome row failed to persist after the run had started.
     bool audit_persisted{true};
 };
 
-/// What `prepare_workflow_execute` hands to `run_workflow_execute`: only what the second half
-/// needs. The workflow and its instructions are re-read by the run itself (per step, fresh), so
-/// nothing a stale snapshot could widen is carried across.
+/// What `prepare_workflow_execute` hands to `run_workflow_execute`. The run needs only
+/// `step_count`: the workflow and its instructions are re-read by the run itself (per step,
+/// fresh), so nothing a stale snapshot could widen is carried across. `steps` is for the MCP
+/// probe's ticket binding (`workflow_effect_binding`, `workflow_step_effects`) and is never read
+/// by the run.
 struct WorkflowExecutePlan {
     std::size_t step_count{0};
+    /// The instruction each step resolved to, in step order (the preflight's own reads).
+    std::vector<WorkflowStepInstruction> steps;
 };
+
+/// One step's bound effect: the JSON array `[instruction_id, plugin, action, approval_mode,
+/// concurrency_mode]`. Invalid UTF-8 is replaced, not thrown, so two values differing only in
+/// invalid bytes bind identically (the `effect_binding` precedent; the authorizer refuses an
+/// unknown pair either way).
+[[nodiscard]] std::string workflow_step_effect(const WorkflowStepInstruction& def);
+
+/// `workflow_step_effect` for every step, keyed by instruction id.
+[[nodiscard]] WorkflowStepEffects workflow_step_effects(const WorkflowExecutePlan& plan);
+
+/// The ticket's effect line for `plan`, ending in `\n`:
+/// `effect=["workflow",N,[first K "plugin.action"],"<sha256 over the ordered tuples>"]`. A digest
+/// failure returns a `kEffectDigestFailed` outcome (500): the caller refuses the call and mints no
+/// ticket. Pure apart from `ports.digest`; no audit row.
+[[nodiscard]] std::expected<std::string, WorkflowExecuteOutcome>
+workflow_effect_binding(const WorkflowExecutePorts& ports, const WorkflowExecutePlan& plan);
 
 /// Steps 1-4 of the banner. No effect on any endpoint, no `requested` row. A refusal is returned
 /// as the outcome the transport renders; a refusal from the per-step checks also writes its

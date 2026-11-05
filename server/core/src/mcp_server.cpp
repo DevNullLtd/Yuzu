@@ -1364,9 +1364,15 @@ static const ToolDef kTools[] = {
      "have been sent when a later one reaches nobody. "
      "TIER AND TICKET: the operator tier is denied. At the supervised tier the first call returns "
      "kApprovalRequired with an approval_id; repeat the SAME arguments plus that approval_id "
-     "after an administrator approves. The ticket binds workflow_id and agent_ids, not the "
-     "workflow's step list: a definition edited between approval and the repeat call runs as "
-     "edited, with every precheck re-run at send time. "
+     "after an administrator approves. The ticket binds workflow_id, agent_ids and the ORDERED "
+     "step effects (each step's instruction id, plugin.action, approval mode and concurrency "
+     "mode; the approver is shown the step count and the first plugin.actions, then a digest "
+     "of all of them). If any step's instruction is repointed before the repeat call it is "
+     "refused -32003 with error.data.reason definition_changed (ticket unspent; repointing back "
+     "restores it, or request a fresh approval); a repoint landing after that check sends "
+     "nothing for that step and answers -32602 definition_changed with the ticket SPENT. An "
+     "edit to anything else in a definition runs as edited, with every precheck re-run at send "
+     "time. "
      "AUDIT: an 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
      "it cannot be saved the call fails with a retryable error and nothing was sent. A step "
      "refused at send time because its definition changed is audited at that moment. A closing "
@@ -1376,7 +1382,7 @@ static const ToolDef kTools[] = {
      "entry per send attempt: instruction_id, command_id, agents_reached; when 0, a reason). If "
      "NO step reached any agent the envelope instead carries status set to the cause with "
      "agents_reached 0 on every step: \"quarantined\", "
-     "\"plugin_not_found\", \"kill_switched_os\" and \"late_denied\" are PERMANENT "
+     "\"plugin_not_found\", \"kill_switched_os\", \"late_denied\" and \"definition_changed\" are PERMANENT "
      "(retry_after_ms null); \"containment_unreadable\", \"route_unreadable\", "
      "\"os_gate_unreadable\" and \"no_agents_reached\" (offline devices, or a concurrency "
      "claim) are retryable (retry_after_ms 5000). The execution still exists and is readable. "
@@ -7782,6 +7788,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // the dispatch stage so the definition that RUNS is the one the human approved.
             // Unset on the operator tier (no ticket, nothing to hold the lookup to).
             std::optional<std::string> ticket_bound_effect;
+            // The same binding for execute_workflow (#2146 sec-1): the per-step tuples the ticket's
+            // effect line was computed over, set by the C8 probe on the mint AND the recall and
+            // handed to the run as `expected_step_effects`. Unset when no ticket is in play.
+            std::optional<WorkflowStepEffects> workflow_bound_effects;
 
             // Audit helper. Returns true when the audit row persisted, false when it was
             // dropped, so SOC 2 read/write surfaces can
@@ -8454,6 +8464,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 WorkflowExecutePorts ports;
                 ports.api = workflow_api_.get();
                 ports.run = workflow_run_fn_;
+                ports.digest = workflow_digest_fn_;
                 ports.instruction_store_open = instruction_store && instruction_store->is_open();
                 ports.approval_gate_available = approval_manager != nullptr;
                 ports.lookup = make_instruction_lookup(instruction_store);
@@ -8512,7 +8523,8 @@ McpServer::HandlerFn McpServer::build_handler(
             const auto render_workflow_refusal = [&](const WorkflowExecuteOutcome& out) {
                 using WES = WorkflowExecuteStatus;
                 mcp_audit(out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
-                                  out.status == WES::kUnavailable
+                                  out.status == WES::kUnavailable ||
+                                  out.status == WES::kEffectDigestFailed
                               ? "error"
                               : "denied",
                           "reason=" + out.reason);
@@ -8525,7 +8537,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 case WES::kUnavailable:
                 case WES::kNoPrincipal:
+                case WES::kEffectDigestFailed:
                     res.set_content(error_response(id, kInternalError, out.message),
+                                    "application/json");
+                    return;
+                case WES::kDefinitionChanged:
+                    // Reached only after the ticket was consumed (a repoint before that is the
+                    // generic -32003 ticket-match refusal): the ticket is spent.
+                    res.set_content(a4_error(kInvalidParams, out.message,
+                                             "the approval ticket is spent; re-request approval "
+                                             "for the workflow as it is now and re-call",
+                                             -1, {}, true, out.reason),
                                     "application/json");
                     return;
                 case WES::kApprovalRequired:
@@ -8951,12 +8973,26 @@ McpServer::HandlerFn McpServer::build_handler(
                         if (!call)
                             return;
                         try {
-                            const auto plan =
-                                prepare_workflow_execute(make_workflow_ports(), call->wreq);
+                            const auto ports = make_workflow_ports();
+                            const auto plan = prepare_workflow_execute(ports, call->wreq);
                             if (!plan) {
                                 render_workflow_refusal(plan.error());
                                 return;
                             }
+                            // Bind the ORDERED step effects into the ticket's subject, exactly as
+                            // execute_instruction_definition binds its resolved pair: the approver
+                            // sees the step count and the first plugin.actions, and a repoint of
+                            // any step between approval and recall fails the ordinary match below
+                            // (no consume, nothing sent). A digest failure refuses here, before
+                            // any ticket exists.
+                            const auto effect = workflow_effect_binding(ports, *plan);
+                            if (!effect) {
+                                render_workflow_refusal(effect.error());
+                                return;
+                            }
+                            ticket_bound_effect = *effect;
+                            canon = *ticket_bound_effect + args_canon;
+                            workflow_bound_effects = workflow_step_effects(*plan);
                         } catch (const std::exception& e) {
                             respond_workflow_threw(e.what());
                             return;
@@ -22238,12 +22274,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!call)
                     return;
                 const auto ports = make_workflow_ports();
+                WorkflowExecuteRequest wreq = call->wreq;
+                // The effects the consumed ticket was bound to: the run holds every fresh read to
+                // them, and sends nothing for a step that moved (definition_changed).
+                wreq.expected_step_effects = workflow_bound_effects;
 
                 WorkflowExecuteOutcome out;
                 try {
                     // The real sequence, authoritative after any C8 probe: the whole of prepare
                     // runs again here against fresh reads, then the run.
-                    out = apply_workflow_execute(ports, call->wreq);
+                    out = apply_workflow_execute(ports, wreq);
                 } catch (const std::exception& e) {
                     respond_workflow_threw(e.what());
                     return;

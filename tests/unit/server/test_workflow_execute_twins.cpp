@@ -887,6 +887,269 @@ TEST_CASE("workflow execute: prepare alone has no effect and writes no `requeste
     CHECK(f.events.front() == "audit:requested");
 }
 
+// ───────────────────────────── step-effect binding (sec-1 / UP-1) ───────────────────────────
+
+namespace {
+
+// The ticket's effect line for the fixture's current definitions.
+std::string effect_line(Fx& f) {
+    auto a = f.api();
+    const auto p = f.ports(a);
+    auto req = f.request();
+    req.caller.principal_is_admin = true; // a role-gated step must not hide a field from the digest
+    const auto plan = prepare_workflow_execute(p, req);
+    REQUIRE(plan.has_value());
+    const auto line = workflow_effect_binding(p, *plan);
+    REQUIRE(line.has_value());
+    return *line;
+}
+
+void two_steps(Fx& f) {
+    f.step_ids = {"i-ro", "i-ro2"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "uptime");
+}
+
+} // namespace
+
+TEST_CASE("workflow execute: the effect line leads with a readable summary and ends in a digest of "
+          "the ordered step tuples",
+          "[workflow][twin][security][effect]") {
+    Fx f;
+    two_steps(f);
+    const std::string line = effect_line(f);
+    REQUIRE(line.starts_with("effect="));
+    REQUIRE(line.ends_with("\n"));
+    CHECK(line.find('\n') == line.size() - 1); // one line: the arguments are recognised after it
+    const auto j = json::parse(line.substr(7, line.size() - 8));
+    REQUIRE(j.is_array());
+    REQUIRE(j.size() == 4);
+    CHECK(j[0] == "workflow");
+    CHECK(j[1] == 2);
+    CHECK(j[2] == json::array({"os_info.os_version", "os_info.uptime"}));
+    REQUIRE(j[3].is_string());
+    const auto hex = j[3].get<std::string>();
+    CHECK(hex.size() == 64);
+    CHECK(hex.find_first_not_of("0123456789abcdef") == std::string::npos);
+    // Summary first, hash second: the readable part precedes the digest in the text.
+    CHECK(line.find("os_info.os_version") < line.find(hex));
+    // Stable for identical workflows.
+    Fx g;
+    two_steps(g);
+    CHECK(effect_line(g) == line);
+}
+
+TEST_CASE("workflow execute: the effect line names only the first steps but the digest covers all",
+          "[workflow][twin][security][effect]") {
+    Fx f;
+    f.step_ids = {"s1", "s2", "s3", "s4", "s5"};
+    for (const auto& id : f.step_ids)
+        f.defs[id] = def(id, "os_info", "os_version");
+    const std::string base = effect_line(f);
+    const auto j = json::parse(base.substr(7, base.size() - 8));
+    CHECK(j[1] == 5);
+    CHECK(j[2].size() == 3); // the summary is bounded; the digest is not
+    // A change confined to the LAST step, invisible in the summary, still moves the line.
+    f.defs["s5"].action = "uptime";
+    CHECK(effect_line(f) != base);
+}
+
+TEST_CASE("workflow execute: the effect line differs when ANY field of ANY step tuple differs, or "
+          "the step order does",
+          "[workflow][twin][security][effect]") {
+    Fx base_fx;
+    two_steps(base_fx);
+    const std::string base = effect_line(base_fx);
+    struct Row {
+        const char* what;
+        std::function<void(Fx&)> mutate;
+    };
+    const std::vector<Row> rows = {
+        {"plugin (with the action it needs)",
+         [](Fx& f) {
+             f.defs["i-ro2"].plugin = "network_config";
+             f.defs["i-ro2"].action = "adapters";
+         }},
+        {"action", [](Fx& f) { f.defs["i-ro2"].action = "os_version"; }},
+        {"approval_mode", [](Fx& f) { f.defs["i-ro2"].approval_mode = "role-gated"; }},
+        {"concurrency_mode", [](Fx& f) { f.defs["i-ro2"].concurrency_mode = "global"; }},
+        {"first step pair",
+         [](Fx& f) {
+             f.defs["i-ro"].plugin = "network_config";
+             f.defs["i-ro"].action = "adapters";
+         }},
+        {"instruction id (same content, other id)",
+         [](Fx& f) {
+             f.defs["i-ro3"] = def("i-ro3", "os_info", "uptime");
+             f.step_ids = {"i-ro", "i-ro3"};
+         }},
+        {"step order", [](Fx& f) { f.step_ids = {"i-ro2", "i-ro"}; }},
+        {"a step removed", [](Fx& f) { f.step_ids = {"i-ro"}; }},
+    };
+    for (const auto& row : rows) {
+        DYNAMIC_SECTION(row.what) {
+            Fx f;
+            two_steps(f);
+            row.mutate(f);
+            CHECK(effect_line(f) != base);
+        }
+    }
+}
+
+TEST_CASE("workflow execute: a digest that cannot be computed refuses the binding (no ticket can be "
+          "minted over it)",
+          "[workflow][twin][security][effect][failclosed]") {
+    Fx f;
+    auto a = f.api();
+    auto p = f.ports(a);
+    const auto plan = prepare_workflow_execute(p, f.request());
+    REQUIRE(plan.has_value());
+    SECTION("the provider reports failure") {
+        p.digest = [](std::string_view) { return std::optional<std::string>{}; };
+        const auto line = workflow_effect_binding(p, *plan);
+        REQUIRE_FALSE(line.has_value());
+        CHECK(line.error().status == WorkflowExecuteStatus::kEffectDigestFailed);
+        CHECK(line.error().reason == "effect_digest_unavailable");
+        CHECK_FALSE(line.error().retryable);
+    }
+    SECTION("a provider answer that is not a 64-character digest is not trusted") {
+        p.digest = [](std::string_view) { return std::optional<std::string>{"deadbeef"}; };
+        const auto line = workflow_effect_binding(p, *plan);
+        REQUIRE_FALSE(line.has_value());
+        CHECK(line.error().status == WorkflowExecuteStatus::kEffectDigestFailed);
+    }
+    CHECK_FALSE(f.dispatched_anything());
+}
+
+TEST_CASE("workflow execute: a step repointed after the ticket was bound is refused before anything is "
+          "sent, audited, with no requested row",
+          "[workflow][twin][security][effect]") {
+    Fx f;
+    two_steps(f);
+    auto a = f.api();
+    const auto probe_ports = f.ports(a);
+    const auto probe = prepare_workflow_execute(probe_ports, f.request());
+    REQUIRE(probe.has_value());
+    auto req = f.request();
+    req.expected_step_effects = workflow_step_effects(*probe);
+    f.events.clear();
+    f.authorize_calls.clear();
+
+    struct Row {
+        const char* what;
+        std::function<void(Fx&)> mutate;
+    };
+    const std::vector<Row> rows = {
+        {"another ungated pair", [](Fx& f2) { f2.defs["i-ro2"].action = "os_version"; }},
+        {"approval mode", [](Fx& f2) { f2.defs["i-ro"].approval_mode = "role-gated"; }},
+        {"concurrency mode", [](Fx& f2) { f2.defs["i-ro2"].concurrency_mode = "global"; }},
+    };
+    for (const auto& row : rows) {
+        DYNAMIC_SECTION(row.what) {
+            row.mutate(f);
+            const auto o = f.run(req);
+            CHECK(o.status == WorkflowExecuteStatus::kDefinitionChanged);
+            CHECK(o.reason == "definition_changed");
+            CHECK_FALSE(o.retryable);
+            CHECK_FALSE(f.dispatched_anything());
+            CHECK_FALSE(f.engine_called);
+            CHECK(f.position("audit:requested") == f.events.size()); // no requested row
+            REQUIRE(f.audit_details.size() == 1);
+            CHECK(f.events.back() == "audit:denied");
+            CHECK(f.audit_details.back().find("reason=definition_changed") != std::string::npos);
+            CHECK(f.audit_details.back().find("step=i-ro") != std::string::npos);
+            // Held BEFORE the authorizer: the moved step is never put to the chokepoint (only the
+            // unchanged step before it could have been).
+            CHECK(f.authorize_calls.size() < 2);
+        }
+    }
+}
+
+TEST_CASE("workflow execute: a step repointed between the preflight and its send is not sent, and "
+          "the refusal is audited at that moment; earlier steps stay sent",
+          "[workflow][twin][security][effect][late]") {
+    Fx f;
+    two_steps(f);
+    auto a = f.api();
+    const auto p = f.ports(a);
+    auto req = f.request();
+    const auto plan = prepare_workflow_execute(p, req);
+    REQUIRE(plan.has_value());
+    req.expected_step_effects = workflow_step_effects(*plan);
+    // The run's own reads (every read from here on) see step 2 pointed at another pair.
+    f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    f.events.clear();
+    const auto o = run_workflow_execute(p, req, *plan);
+    CHECK(f.events.at(0) == "audit:requested");
+    REQUIRE(f.dispatched_ids.size() == 1); // step 1 only
+    CHECK(f.events.at(1) == "dispatch:i-ro");
+    CHECK(o.late_denied);
+    REQUIRE(o.steps.size() == 2);
+    CHECK(o.steps[0].agents_reached == 1);
+    CHECK(o.steps[1].instruction_id == "i-ro2");
+    CHECK(o.steps[1].agents_reached == 0);
+    CHECK(o.steps[1].reason == "definition_changed");
+    CHECK_FALSE(o.steps[1].retryable);
+    // Audited at the moment of refusal: a denied row after step 1's dispatch and before the
+    // engine returned.
+    const auto denied = f.position("audit:denied");
+    REQUIRE(denied < f.events.size());
+    CHECK(denied > f.position("dispatch:i-ro"));
+    CHECK(denied < f.position("engine_returned"));
+    bool token = false;
+    for (const auto& d : f.audit_details)
+        token = token || (d.find("reason=definition_changed") != std::string::npos &&
+                          d.find("step=i-ro2") != std::string::npos &&
+                          d.find("(late)") != std::string::npos);
+    CHECK(token);
+}
+
+TEST_CASE("workflow execute: a definition repointed before the first send sends nothing and names the "
+          "cause",
+          "[workflow][twin][security][effect][late]") {
+    Fx f;
+    auto a = f.api();
+    const auto p = f.ports(a);
+    auto req = f.request();
+    const auto plan = prepare_workflow_execute(p, req);
+    REQUIRE(plan.has_value());
+    req.expected_step_effects = workflow_step_effects(*plan);
+    f.late_defs["i-ro"] = def("i-ro", "os_info", "uptime");
+    const auto o = run_workflow_execute(p, req, *plan);
+    CHECK_FALSE(f.dispatched_anything());
+    CHECK(o.late_denied);
+    CHECK(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+    CHECK(o.reason == "definition_changed");
+    CHECK_FALSE(o.retryable);
+    CHECK(o.message.find("approval ticket") != std::string::npos);
+}
+
+TEST_CASE("workflow execute: an unchanged workflow still runs under a bound effect, and a request with "
+          "no bound effect (REST) is not held to one",
+          "[workflow][twin][security][effect]") {
+    SECTION("bound and unchanged") {
+        Fx f;
+        two_steps(f);
+        auto a = f.api();
+        const auto p = f.ports(a);
+        auto req = f.request();
+        const auto plan = prepare_workflow_execute(p, req);
+        REQUIRE(plan.has_value());
+        req.expected_step_effects = workflow_step_effects(*plan);
+        const auto o = apply_workflow_execute(p, req);
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        CHECK_FALSE(o.late_denied);
+        CHECK(f.dispatched_ids.size() == 2);
+    }
+    SECTION("unbound: a repointed definition runs as edited (the prechecks still apply)") {
+        Fx f;
+        f.late_defs["i-ro"] = def("i-ro", "os_info", "uptime");
+        const auto o = f.run();
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        CHECK_FALSE(o.late_denied);
+        CHECK(f.dispatched_ids.size() == 1);
+    }
+}
+
 TEST_CASE("workflow execute: the caller's REAL DispatchCaller reaches every step unchanged",
           "[workflow][twin][security][caller]") {
     Fx f;
@@ -1063,6 +1326,18 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: success is 202 with the run and 
     REQUIRE(r.saw_caller);
     CHECK(r.seen_caller.principal == "alice");
     CHECK(r.seen_caller.approval_provenance == ApprovalProvenance::None);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: there is no ticket, so a repointed step runs as edited "
+          "(the step-effect binding is MCP-only)",
+          "[workflow][twin][rest][security][effect]") {
+    Rest r;
+    r.fx.late_defs["i-ro"] = def("i-ro", "os_info", "uptime");
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(body_of(*res)["data"]["late_denied"] == false);
+    CHECK(r.fx.dispatched_anything());
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: an unwired approval gate or closed instruction store "

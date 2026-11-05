@@ -6,6 +6,7 @@
 #include "dispatch_target_shape.hpp"
 #include "instruction_store.hpp"
 #include "mcp_input_bounds.hpp"
+#include "sha256_hex.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp" // audit_token (CWE-117)
 
@@ -42,6 +43,24 @@ WorkflowExecuteOutcome refuse(WorkflowExecuteStatus status, std::string message,
     o.retryable = retryable;
     return o;
 }
+
+// The approver-facing summary names this many steps; the digest covers all of them.
+constexpr std::size_t kEffectSummarySteps = 3;
+constexpr std::size_t kEffectLabelMax = 64;
+constexpr std::string_view kEffectDigestDomain = "yuzu-workflow-step-effects-v1\n";
+
+std::string dump_replacing(const nlohmann::json& j) {
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+bool step_matches_expected(const WorkflowStepEffects& expected, const WorkflowStepInstruction& def) {
+    const auto it = expected.find(def.id);
+    return it != expected.end() && it->second == workflow_step_effect(def);
+}
+
+constexpr std::string_view kDefinitionChangedMessage =
+    "a step's instruction changed after this call's approval ticket was checked; nothing was "
+    "sent for it";
 
 WorkflowStepInstruction to_step_instruction(const InstructionDefinition& d) {
     return WorkflowStepInstruction{d.id, d.plugin, d.action, d.approval_mode, d.concurrency_mode};
@@ -173,6 +192,46 @@ WorkflowInstructionLookupFn make_instruction_lookup(InstructionStore* store) {
     };
 }
 
+// ── step-effect binding ───────────────────────────────────────────────────
+
+std::string workflow_step_effect(const WorkflowStepInstruction& def) {
+    return dump_replacing(nlohmann::json::array(
+        {def.id, def.plugin, def.action, def.approval_mode, def.concurrency_mode}));
+}
+
+WorkflowStepEffects workflow_step_effects(const WorkflowExecutePlan& plan) {
+    WorkflowStepEffects out;
+    for (const auto& def : plan.steps)
+        out.emplace(def.id, workflow_step_effect(def));
+    return out;
+}
+
+std::expected<std::string, WorkflowExecuteOutcome>
+workflow_effect_binding(const WorkflowExecutePorts& ports, const WorkflowExecutePlan& plan) {
+    // A tuple dump holds no raw newline, so the join is unambiguous.
+    std::string material(kEffectDigestDomain);
+    for (const auto& def : plan.steps) {
+        material += workflow_step_effect(def);
+        material += '\n';
+    }
+    const auto digest = ports.digest ? ports.digest(material) : sha256_hex(material);
+    if (!digest || digest->size() != 64)
+        return std::unexpected(refuse(WorkflowExecuteStatus::kEffectDigestFailed,
+                                      "the workflow's step effects could not be bound for approval",
+                                      "effect_digest_unavailable"));
+    nlohmann::json labels = nlohmann::json::array();
+    for (std::size_t i = 0; i < plan.steps.size() && i < kEffectSummarySteps; ++i) {
+        std::string label = plan.steps[i].plugin + "." + plan.steps[i].action;
+        if (label.size() > kEffectLabelMax)
+            label.resize(kEffectLabelMax);
+        labels.push_back(std::move(label));
+    }
+    return "effect=" +
+           dump_replacing(nlohmann::json::array(
+               {"workflow", plan.steps.size(), std::move(labels), *digest})) +
+           "\n";
+}
+
 // ── the sequence ──────────────────────────────────────────────────────────
 
 namespace {
@@ -271,6 +330,8 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
     // The chokepoint dry run is asked once per distinct (plugin, action): its answer depends on
     // the caller and the pair only, never on the step or the targets.
     std::set<std::pair<std::string, std::string>> authorized;
+    WorkflowExecutePlan plan{.step_count = workflow.steps.size(), .steps = {}};
+    plan.steps.reserve(workflow.steps.size());
     for (const auto& step : workflow.steps) {
         const auto def_r = ports.lookup(step.instruction_id);
         if (!def_r) {
@@ -290,6 +351,18 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
         const std::string step_detail = " step=" + clip_token(step.instruction_id) +
                                         " action=" + clip_token(def.plugin) + "." +
                                         clip_token(def.action);
+        plan.steps.push_back(def);
+
+        // The effect an approval ticket was bound to, held BEFORE the authorizer, any row or any
+        // dispatch (the instruction twin's 1b): this is a second, fresh read of a definition an
+        // editor may have repointed since the probe saw it, and the ticket is already spent, so
+        // the only safe answer to a change is to send nothing.
+        if (req.expected_step_effects && !step_matches_expected(*req.expected_step_effects, def)) {
+            deny_audit("definition_changed", step_detail);
+            return std::unexpected(refuse(WorkflowExecuteStatus::kDefinitionChanged,
+                                          std::string(kDefinitionChangedMessage),
+                                          "definition_changed"));
+        }
 
         // Caller-level authority for the step's own pair, BEFORE any body or targeting work: a
         // caller who may not run this pair learns nothing about its targeting, and 403 precedes
@@ -360,7 +433,7 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
                                       refusal_message_for(d.verdict, step, def, d),
                                       std::string(d.reason)));
     }
-    return WorkflowExecutePlan{.step_count = workflow.steps.size()};
+    return plan;
 }
 
 WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
@@ -399,6 +472,17 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
         if (!*def_r)
             return std::unexpected("unknown instruction: " + instruction_id);
         const WorkflowStepInstruction& def = **def_r;
+
+        // Hold the fresh read to the effect the approval ticket was bound to, BEFORE the
+        // admission below: a step whose instruction was repointed since is not sent, and the
+        // refusal is audited now, with the same token as the instruction twin's.
+        if (req.expected_step_effects && !step_matches_expected(*req.expected_step_effects, def)) {
+            late_denied = true;
+            deny_audit("definition_changed", " step=" + clip_token(instruction_id) + " (late)");
+            notes.push_back(WorkflowStepDispatchNote{.instruction_id = instruction_id,
+                                                     .reason = "definition_changed"});
+            return std::unexpected("step definition changed after approval; refused");
+        }
 
         // Re-run the admission against the FRESH definition: an instruction edited after the
         // preflight (a safe action turned destructive, an approval mode raised) is refused here,
@@ -500,7 +584,10 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
         o.status = WorkflowExecuteStatus::kNoAgentsReached;
         o.reason = first_zero->reason;
         o.retryable = first_zero->retryable;
-        o.message = first_zero->reason == "late_denied"
+        o.message = first_zero->reason == "definition_changed"
+                        ? "the workflow started but a step was refused at dispatch because its "
+                          "definition changed after the approval ticket was checked"
+                    : first_zero->reason == "late_denied"
                         ? "the workflow started but a step was refused at dispatch because its "
                           "definition changed after the preflight"
                         : "the workflow started but no step reached any agent (" +

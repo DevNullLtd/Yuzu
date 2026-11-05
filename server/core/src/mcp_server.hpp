@@ -872,6 +872,12 @@ public:
     /// `execute_workflow` answers "workflow engine not available" and dispatches nothing.
     void set_workflow_run_fn(WorkflowRunFn fn) { workflow_run_fn_ = std::move(fn); }
 
+    /// The digest `execute_workflow` binds a ticket's step effects with. Unset (the production
+    /// default) is `sha256_hex`; set only by a test that drives the fail-closed refusal.
+    void set_workflow_digest_fn(std::function<std::optional<std::string>(std::string_view)> fn) {
+        workflow_digest_fn_ = std::move(fn);
+    }
+
     /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
     /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
     /// server.cpp wires the IDENTICAL instance so the eight Guardian read
@@ -1415,6 +1421,7 @@ private:
     std::shared_ptr<const WorkflowApi> workflow_api_;
     ConcurrencyDispatchFn workflow_concurrency_dispatch_fn_; // see set_workflow_concurrency_dispatch_fn
     WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
+    std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
