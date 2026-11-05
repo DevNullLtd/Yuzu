@@ -3667,11 +3667,16 @@ static const ToolDef kTools[] = {
      "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
      "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
      "engine-principal-revoke call an operator makes after reading this evidence. This is "
-     "an UPSERT: calling it again for the same (campaign_id, principal_type, principal_id, "
-     "role_name) OVERWRITES the prior reviewer's decision, reviewer, and justification — "
-     "the earlier evidence is not retained, so destructiveHint:true. Mirrors "
-     "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
-     "or access_review.flagged (by decision). Requires AccessReview:Attest.",
+     "FINAL and irreversible, so destructiveHint:true: the first decision on a "
+     "(campaign_id, principal_type, principal_id, role_name) grant sticks and cannot be "
+     "changed while the campaign is open (a second call is refused as already_decided; open "
+     "a new campaign to re-review). Separation of duties: the reviewer may NOT decide their "
+     "own grant (principal_type 'user' whose principal_id is the caller) nor an engine "
+     "principal they own — refused as self_attestation, and another reviewer must decide it. "
+     "Group grants are not covered by the owner check. Both refusals are audited with "
+     "result=denied. Mirrors POST /api/v1/access-reviews/{id}/attestations. Self-audited as "
+     "access_review.attested or access_review.flagged (by decision). Requires "
+     "AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
@@ -5753,7 +5758,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"raise_guardian_policy_generation",
      {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
-    // record_attestation: UPSERT that overwrites a prior reviewer decision → Destructive.
+    // record_attestation: writes a FINAL, irreversible reviewer decision (#4752 — once-only,
+    // no overwrite) → stays Destructive. Do NOT lower it: that would loosen tier gating, a
+    // security decision rather than a side effect of making the write once-only.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
@@ -6340,6 +6347,18 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // (and the matching 400 arm in rest_api_v1.cpp's access_review_error_status)
 // rather than letting it fall through to kInternalError.
 int mcp_error_for_access_review_msg(const std::string& msg) {
+    // #4752: a deliberate refusal of an attestation. self_attestation is a
+    // permission problem (the reviewer may not decide their own grant);
+    // already_decided is bad input against the row's current state. Neither is
+    // retryable, so neither may fall into kInternalError.
+    switch (classify_attestation_refusal(msg)) {
+    case AttestationRefusal::SelfAttestation:
+        return kPermissionDenied;
+    case AttestationRefusal::AlreadyDecided:
+        return kInvalidParams;
+    case AttestationRefusal::None:
+        break;
+    }
     return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
 }
 
@@ -29386,10 +29405,21 @@ McpServer::HandlerFn McpServer::build_handler(
                                                      ? "access_review.flagged"
                                                      : "access_review.attested";
                 if (!rec_res) {
+                    // #4752: a deliberate refusal is audited `denied` with a
+                    // stable token (matches the REST twin); other errors keep
+                    // `failure`.
+                    const auto refusal = classify_attestation_refusal(rec_res.error());
+                    const bool refused = refusal != AttestationRefusal::None;
                     const bool denied_audit_ok =
-                        audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
-                                rec_res.error());
-                    mcp_audit("failure", rec_res.error());
+                        refused ? audit_fn(req, audit_action, "denied", "AccessReview",
+                                           campaign_id + ":" + principal_type + ":" +
+                                               principal_id + ":" + role_name,
+                                           attestation_refusal_token(refusal))
+                                : audit_fn(req, audit_action, "failure", "AccessReview",
+                                           campaign_id, rec_res.error());
+                    mcp_audit(refused ? "denied" : "failure",
+                              refused ? std::string(attestation_refusal_token(refusal))
+                                      : rec_res.error());
                     res.set_content(
                         error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
                                        rec_res.error(),

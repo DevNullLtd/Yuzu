@@ -1009,6 +1009,9 @@ TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
     REQUIRE(h.rbac->create_role({.name = "AuditRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("bob", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac->assign_role({"user", "bob", "AuditRole"}).has_value());
+    // A second grant: decisions are final (#4752), so flagging needs its own row.
+    REQUIRE(h.auth_db->upsert_user("carl", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "carl", "AuditRole"}).has_value());
 
     auto export_res = h.sink.Get("/api/v1/access-reviews/export");
     REQUIRE(export_res);
@@ -1044,7 +1047,7 @@ TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
     auto flag_res = h.sink.Post(
         "/api/v1/access-reviews/" + cid + "/attestations",
         nlohmann::json{{"principal_type", "user"},
-                      {"principal_id", "bob"},
+                      {"principal_id", "carl"},
                       {"role_name", "AuditRole"},
                       {"decision", "flagged_revoke"}}
             .dump());
@@ -1055,6 +1058,143 @@ TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
         if (a.action == "access_review.flagged" && a.result == "success")
             flagged_audited = true;
     CHECK(flagged_audited);
+}
+
+// ── Separation of duties + final decisions (#4752) ──────────────────────────
+
+namespace {
+nlohmann::json sod_body(const std::string& principal_id, const std::string& role,
+                        const std::string& decision) {
+    return {{"principal_type", "user"},
+            {"principal_id", principal_id},
+            {"role_name", role},
+            {"decision", decision}};
+}
+
+bool audited(const AccessReviewHarness& h, const std::string& action, const std::string& result,
+             const std::string& detail) {
+    for (const auto& a : h.audit_log)
+        if (a.action == action && a.result == result && a.detail == detail)
+            return true;
+    return false;
+}
+} // namespace
+
+TEST_CASE("access-reviews: REST refuses a Reviewer deciding their own grant (403, audited denied)",
+          "[pg][access_review][rest][sod]") {
+    AccessReviewHarness h;
+    // The seeded Reviewer shape: Read + Attest, no admin.
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && (op == "Read" || op == "Attest");
+    };
+    h.session_user = "rita";
+    h.session_role = auth::Role::user;
+    REQUIRE(h.rbac->create_role({.name = "Reviewer2", .description = "d"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("rita", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "rita", "Reviewer2"}).has_value());
+    const auto cid = h.open_campaign_rest("sod rest");
+
+    for (const char* decision : {"attested", "flagged_revoke"}) {
+        auto res = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                               sod_body("rita", "Reviewer2", decision).dump());
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(audited(h, "access_review.attested", "denied", "self_attestation_blocked"));
+    CHECK(audited(h, "access_review.flagged", "denied", "self_attestation_blocked"));
+    // Nothing was recorded.
+    for (const auto& a : h.audit_log)
+        CHECK_FALSE((a.result == "success" && a.action.starts_with("access_review.at")));
+    auto view = h.access_review_store->get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == static_cast<int>(view->attestations.size()));
+}
+
+TEST_CASE("access-reviews: REST decisions are final — a second reviewer gets 409, audited denied",
+          "[pg][access_review][rest][sod]") {
+    AccessReviewHarness h;
+    REQUIRE(h.rbac->create_role({.name = "FinalRole", .description = "d"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("fred", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "fred", "FinalRole"}).has_value());
+    const auto cid = h.open_campaign_rest("final rest");
+
+    h.session_user = "carol";
+    auto first = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                             sod_body("fred", "FinalRole", "flagged_revoke").dump());
+    REQUIRE(first);
+    CHECK(first->status == 200);
+
+    h.session_user = "dave";
+    auto second = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                              sod_body("fred", "FinalRole", "attested").dump());
+    REQUIRE(second);
+    CHECK(second->status == 409);
+    CHECK(audited(h, "access_review.attested", "denied", "already_decided"));
+
+    // The subject's overwrite attempt is refused as a self-attestation (403).
+    h.session_user = "fred";
+    auto subject = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                               sod_body("fred", "FinalRole", "attested").dump());
+    REQUIRE(subject);
+    CHECK(subject->status == 403);
+
+    auto view = h.access_review_store->get_campaign(cid);
+    REQUIRE(view.has_value());
+    for (const auto& a : view->attestations)
+        if (a.principal_id == "fred") {
+            CHECK(a.decision == "flagged_revoke");
+            CHECK(a.reviewer == "carol");
+        }
+}
+
+TEST_CASE("MCP: record_attestation refuses self-attestation and a second decision, audited denied",
+          "[pg][access_review][mcp][sod]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && (op == "Read" || op == "Attest");
+    };
+    h.session_user = "mona";
+    h.session_role = auth::Role::user;
+    REQUIRE(h.rbac->create_role({.name = "McpSodRole", .description = "d"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("mona", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.auth_db->upsert_user("nell", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "mona", "McpSodRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "nell", "McpSodRole"}).has_value());
+
+    auto open_res = h.mcp_call_tool("open_access_review", {{"title", "mcp sod"}});
+    REQUIRE(open_res);
+    const std::string cid = nlohmann::json::parse(open_res->body)["result"]["structuredContent"]
+                                                  ["campaign_id"].get<std::string>();
+
+    auto self = h.mcp_call_tool("record_attestation", {{"campaign_id", cid},
+                                                        {"principal_type", "user"},
+                                                        {"principal_id", "mona"},
+                                                        {"role_name", "McpSodRole"},
+                                                        {"decision", "attested"}});
+    REQUIRE(self);
+    auto self_body = nlohmann::json::parse(self->body);
+    REQUIRE(self_body.contains("error"));
+    CHECK(self_body["error"]["code"].get<int>() == yuzu::server::mcp::kPermissionDenied);
+    CHECK(audited(h, "access_review.attested", "denied", "self_attestation_blocked"));
+
+    auto ok = h.mcp_call_tool("record_attestation", {{"campaign_id", cid},
+                                                      {"principal_type", "user"},
+                                                      {"principal_id", "nell"},
+                                                      {"role_name", "McpSodRole"},
+                                                      {"decision", "flagged_revoke"}});
+    REQUIRE(ok);
+    CHECK(ok->body.find("\"error\"") == std::string::npos);
+
+    auto again = h.mcp_call_tool("record_attestation", {{"campaign_id", cid},
+                                                         {"principal_type", "user"},
+                                                         {"principal_id", "nell"},
+                                                         {"role_name", "McpSodRole"},
+                                                         {"decision", "attested"}});
+    REQUIRE(again);
+    auto again_body = nlohmann::json::parse(again->body);
+    REQUIRE(again_body.contains("error"));
+    CHECK(again_body["error"]["code"].get<int>() == yuzu::server::mcp::kInvalidParams);
+    CHECK(audited(h, "access_review.attested", "denied", "already_decided"));
 }
 
 // ── GET /api/v1/access-reviews (list campaigns, H-2) ────────────────────────
@@ -1483,6 +1623,10 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
     REQUIRE(h.rbac->create_role({.name = "MetricsRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("metricsuser", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac->assign_role({"user", "metricsuser", "MetricsRole"}).has_value());
+    // A second grant to flag: decisions are final (#4752), so the flag cannot reuse the
+    // attested row.
+    REQUIRE(h.auth_db->upsert_user("metricsuser2", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "metricsuser2", "MetricsRole"}).has_value());
 
     // open_campaign increments campaigns_opened_total.
     const auto cid = h.open_campaign_rest("metrics test");
@@ -1507,7 +1651,7 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
     auto flag_res = h.sink.Post(
         "/api/v1/access-reviews/" + cid + "/attestations",
         nlohmann::json{{"principal_type", "user"},
-                      {"principal_id", "metricsuser"},
+                      {"principal_id", "metricsuser2"},
                       {"role_name", "MetricsRole"},
                       {"decision", "flagged_revoke"}}
             .dump());
@@ -1516,7 +1660,7 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
     CHECK(h.metrics
              .counter("yuzu_access_review_attestations_total", {{"decision", "flagged_revoke"}})
              .value() == 1);
-    // The re-attest (same grant) does not double-count the attested label.
+    // Flagging a second grant does not double-count the attested label.
     CHECK(h.metrics.counter("yuzu_access_review_attestations_total", {{"decision", "attested"}})
              .value() == 1);
 }

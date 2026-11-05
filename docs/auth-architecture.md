@@ -3725,6 +3725,118 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
+## Periodic access reviews (SOC 2 CC6.2)
+
+A reviewer periodically confirms that every role grant in the fleet is still
+appropriate, and the confirmation is kept as evidence. The surface is six
+operations on two transports: `GET /api/v1/access-reviews/export`,
+`GET /api/v1/access-reviews`, `POST /api/v1/access-reviews` (open),
+`GET /api/v1/access-reviews/{id}`, `POST /api/v1/access-reviews/{id}/attestations`
+and `POST /api/v1/access-reviews/{id}/close`, with the MCP twins
+`export_access_review`, `list_access_reviews`, `open_access_review`,
+`get_access_review`, `record_attestation` and `close_access_review`.
+Opening a campaign freezes one `pending` row per (principal, role) grant in
+`AccessReviewStore` (Postgres schema `access_review_store`); a reviewer then
+records `attested` or `flagged_revoke` against each row; closing stamps who and
+when. Design notes and the audit shape: `docs/security-reviews/access-reviews-2026-07-21.md`.
+
+### The gate is global, and dedicated (#2225)
+
+Reads need `AccessReview:Read`, writes `AccessReview:Attest`. Both are seeded
+only to `Administrator` and the non-admin `Reviewer` role. The global gate is
+deliberate: a grant has no per-agent or management-group boundary to
+admit-then-filter against, and a confinement-filtered slice would be worthless
+as CC6.2 evidence, because an auditor needs the complete grant population every
+time. Do not move these routes onto `authorize_list_read`.
+
+**#2225 round 2.** An earlier round gated the surface on `AuditLog:Read` /
+`AuditLog:Attest`. That over-disclosed the full fleet-wide grant population to
+the `Operator` and `PlatformEngineer` roles, which hold `AuditLog:Read` for
+unrelated reasons but neither holds `UserManagement:Read` or
+`EnginePrincipal:Read`, the permissions that gate the equivalent-sensitivity
+`/rbac/roles` and `/engine-principals/{id}/roles` routes (the latter moved off
+`Security:Read` in #2376). `AccessReview` was cut away from `AuditLog:*` and
+must not be put back.
+
+### Flag is not revoke
+
+`decision: "flagged_revoke"` records evidence only. It never calls
+`unassign_role` or revokes an engine principal. Acting on a flag is a separate,
+explicitly gated operator action.
+
+### The population is read from the grant table
+
+`build_access_review` reads the grant table directly
+(`RbacStore::list_all_principal_roles_checked()`), so a grant whose principal is
+in no roster (a deleted user, a stale IdP row, an orphan OIDC/SSO principal) is
+surfaced as `source="orphan"` instead of being omitted. A roster walk would hide
+exactly the grants an auditor most needs to see.
+
+### Campaigns are never pruned
+
+A closed campaign is the compliance evidence and is kept indefinitely. Do not
+copy the `/auto` Pre-flight 14-day prune. Any retention policy is a separate,
+explicitly reviewed decision.
+
+### Separation of duties and final decisions (#4752)
+
+Two rules, both enforced inside the single `UPDATE` in
+`AccessReviewStore::record_attestation`, so the MCP tool, the REST route and any
+future caller inherit them and no handler can forget either.
+
+**A reviewer may not decide their own grant.** The write is refused when the
+acting reviewer is:
+
+- the subject of a `user` grant (`principal_id` equals the reviewer's username,
+  compared byte for byte with no case folding or normalisation, so an alias is a
+  different principal), or
+- the owner of an `engine` principal, as frozen into the row's `grant_snapshot`
+  (`owner_or_email`) when the campaign was opened. The owner is frozen, not
+  looked up live: the reviewed population is frozen at open, and the check needs
+  no cross-store read. An empty or legacy snapshot has no owner and is not
+  blocked.
+
+The reviewer is always the session's username. An API-token or MCP-token session
+acts as the token's owner, so attesting through your own token is caught the
+same way. An engine-classed session can never be a reviewer (both transports
+refuse it before the store is reached).
+
+**A decision is final.** A grant moves from `pending` to `attested` or
+`flagged_revoke` exactly once while its campaign is open. A second call, by
+anyone, is refused and the first decision, reviewer and justification stay
+untouched. This stops a subject from quietly replacing another reviewer's
+`flagged_revoke` with `attested`, which would leave the closed campaign showing
+only the self-signed result. If a decision was a mistake, open a new campaign.
+(This also closes #2326 item 2, the silent last-write-wins between two
+concurrent reviewers.)
+
+When both rules apply to one attempt, `self_attestation` is reported, because a
+subject trying to overwrite a decision about their own grant is the signal that
+matters.
+
+**How a refusal reaches the caller.** The store returns a prefixed error and the
+two transports translate it with the shared `classify_attestation_refusal`
+helper, so they cannot disagree:
+
+| Store prefix | REST | MCP | Audit row |
+|---|---|---|---|
+| `self_attestation:` | 403 | `kPermissionDenied` | `access_review.attested` or `access_review.flagged`, `result=denied`, detail `self_attestation_blocked` |
+| `already_decided:` | 409 | `kInvalidParams` | same verbs, `result=denied`, detail `already_decided` |
+| `not_found:` | 404 | `kInvalidParams` | `result=failure` (unchanged) |
+
+**Known limits, stated plainly.**
+
+- `group` grants have no owner, and group membership is a cross-store read, so a
+  member of a group is not blocked from deciding that group's grant.
+- An engine principal's `created_by` is not in the snapshot and is not checked.
+  Ownership moved by `transfer_owner` after a campaign opens is not reflected.
+- Nothing here stops two colluding reviewers deciding each other's grants.
+  Four-eyes on distinct human roots is a separate control.
+- `record_attestation` stays `Destructive` on MCP because the write is now final
+  and irreversible. Lowering the annotation would loosen tier gating and is a
+  security decision of its own. It remains exempt from MFA step-up as evidence
+  capture under its own securable (`step_up_detail::kEvidenceCapture`).
+
 ## Render-time permission probes (capability hints)
 
 Six `AuthRoutes` methods answer a permission question without writing a denial row for an

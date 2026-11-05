@@ -40,7 +40,7 @@ was corrected).
   `pending` attestation rows in one transaction; `POST
   /api/v1/access-reviews/{id}/attestations` records a reviewer decision
   (`attested`/`flagged_revoke`) against one frozen `(principal, role)` grant
-  — an UPSERT that overwrites a prior decision on a re-call; `POST
+  — recorded once and then final (an UPSERT until #4752, see "Update 2026-11-05" below); `POST
   /api/v1/access-reviews/{id}/close` closes the campaign; `GET
   /api/v1/access-reviews/{id}` returns the full evidentiary state
   (metadata + every attestation row + `pending_count`).
@@ -73,7 +73,7 @@ was corrected).
   (hardening round), `close_access_review` (hardening round) — JSON only;
   the REST `?format=csv` export has no MCP equivalent.
   `record_attestation` carries `destructiveHint:true` (hardening round —
-  it is a decision-overwriting UPSERT); every other twin is
+  it writes a final, irreversible decision; it was a decision-overwriting UPSERT until #4752); every other twin is
   `destructiveHint:false`.
 - **Audit actions:** `access_review.exported`, `.list` (hardening round),
   `.campaign_opened`, `.attested`, `.flagged`, `.closed`, `.get`.
@@ -458,3 +458,23 @@ reference.
   "open a new campaign automatically every quarter" primitive. An operator
   or an external scheduler (e.g. a cron'd `open_access_review` MCP call)
   must drive the cadence today.
+
+## Update 2026-11-05 (#4752): separation of duties and final decisions
+
+The first version of `record_attestation` had no reviewer-versus-subject check and
+no once-only guard. A holder of `AccessReview:Attest` (the seeded non-admin
+`Reviewer` role has it) could sign off their own grant, and a subject could
+replace another reviewer's `flagged_revoke` with `attested` while the campaign was
+open, leaving the closed campaign showing only the self-signed result.
+
+Owner ruling (2026-11-05): decisions are final. Now, inside the single `UPDATE`:
+
+- the reviewer may not be the subject of a `user` grant, nor the owner (frozen
+  into `grant_snapshot` at open) of an `engine` principal, and
+- a grant that already has a decision is not written again.
+
+Refusals are audited `result=denied` (`self_attestation_blocked`,
+`already_decided`) and answered 403/409 on REST and permission-denied/invalid-params
+on MCP. Group grants have no owner and are not covered. This also closes #2326
+item 2. Full statement of the rule and its limits: `docs/auth-architecture.md`
+"Periodic access reviews".

@@ -28,6 +28,25 @@ constexpr const char* kStoreName = "access_review_store";
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
 
+// The ONE definition of "the reviewer is the subject of this grant" (#4752),
+// spliced into both the guarded UPDATE and its diagnosing SELECT so the two
+// can never drift. Expects alias `a` on access_review_attestation and the
+// reviewer as $5. Exact byte comparison, no case folding — a fold that is wrong
+// in the permissive direction would let someone sign off their own access
+// (same stance as `is_self_target` / `same_human_root`).
+//   user   — the grant's principal_id is the reviewer's username.
+//   engine — the engine's owner, FROZEN into grant_snapshot at campaign open
+//            (`owner_or_email` holds `owner_username` for engine rows). Frozen,
+//            not live: the reviewed population is frozen at open and this needs
+//            no cross-store read. The `LIKE '{%'` guard keeps an empty or legacy
+//            snapshot from ever reaching the ::jsonb cast.
+//   group  — not covered (no owner; membership is a cross-store read). Known,
+//            documented limit.
+constexpr const char* kSelfSubject =
+    "(a.principal_type='user' AND a.principal_id=$5) OR "
+    "(a.principal_type='engine' AND COALESCE(CASE WHEN a.grant_snapshot LIKE '{%' "
+    "THEN (a.grant_snapshot::jsonb)->>'owner_or_email' END, '') = $5)";
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
     // the migration txn. Runtime statements below schema-qualify explicitly.
@@ -233,32 +252,79 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         role_name.empty())
         return std::unexpected("campaign_id/principal_type/principal_id/role_name required");
 
+    // Fail closed on an unidentified reviewer, the same way `is_self_target`
+    // treats an empty username as "self": without an identity the
+    // reviewer-vs-subject comparison below has nothing to compare.
+    if (reviewer.empty())
+        return std::unexpected("reviewer required");
+
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("database unavailable — try again");
 
-    // The `EXISTS (... status='open')` guard makes a closed campaign's
-    // attestation rows immutable — no separate pre-check-then-write race
-    // (the whole thing is one statement).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE access_review_store.access_review_attestation "
-        "SET decision=$5, reviewer=$6, decided_at_ms=$7::bigint, justification=$8 "
-        "WHERE campaign_id=$1 AND principal_type=$2 AND principal_id=$3 AND role_name=$4 "
-        "  AND EXISTS (SELECT 1 FROM access_review_store.access_review_campaign c "
+    // The decision is written by ONE statement whose WHERE clause carries
+    // every rule, so there is no check-then-write race and no caller can
+    // skip a rule:
+    //   * `EXISTS (... status='open')` — a closed campaign's rows are
+    //     immutable evidence.
+    //   * `decision='pending'` — a decision is FINAL (#4752; owner ruling
+    //     2026-11-05). The first Attest/Flag sticks; a second reviewer, or
+    //     the subject, can never replace it. Also closes #2326 item 2.
+    //   * `kSelfSubject` — separation of duties: the reviewer may not be the
+    //     subject of the grant (user), nor the owner of an engine principal
+    //     as frozen into `grant_snapshot` at campaign open.
+    // `COALESCE(..., '')` is load-bearing: `NOT (true AND NULL)` is NULL, which
+    // a WHERE clause treats as false, so an engine row with an empty snapshot
+    // would otherwise become unattestable instead of attestable.
+    const std::string update_sql =
+        std::string("UPDATE access_review_store.access_review_attestation a "
+                    "SET reviewer=$5, decision=$6, decided_at_ms=$7::bigint, justification=$8 "
+                    "WHERE a.campaign_id=$1 AND a.principal_type=$2 AND a.principal_id=$3 "
+                    "  AND a.role_name=$4 AND a.decision='pending' AND NOT (") +
+        kSelfSubject +
+        ") AND EXISTS (SELECT 1 FROM access_review_store.access_review_campaign c "
         "              WHERE c.campaign_id=$1 AND c.status='open') "
-        "RETURNING campaign_id",
-        std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, decision,
-                                 reviewer, std::to_string(now_ms()), justification});
+        "RETURNING a.campaign_id";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), update_sql.c_str(),
+        std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, reviewer,
+                                 decision, std::to_string(now_ms()), justification});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string("record_attestation write failed: ") +
                                PQerrorMessage(lease.get()));
-    if (PQntuples(res.get()) == 0)
+    if (PQntuples(res.get()) != 0)
+        return {};
+
+    // Zero rows: say WHY. This read only chooses the error text — the write
+    // above is the sole guard, so a campaign closing between the two
+    // statements can at worst mislabel a refusal, never permit a write.
+    const std::string why_sql =
+        std::string("SELECT c.status, a.decision, (") + kSelfSubject +
+        ") AS is_self "
+        "FROM access_review_store.access_review_attestation a "
+        "JOIN access_review_store.access_review_campaign c ON c.campaign_id = a.campaign_id "
+        "WHERE a.campaign_id=$1 AND a.principal_type=$2 AND a.principal_id=$3 "
+        "  AND a.role_name=$4";
+    pg::PgResult why = pg::exec_params(
+        lease.get(), why_sql.c_str(),
+        std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, reviewer});
+    if (why.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("record_attestation diagnosis failed: ") +
+                               PQerrorMessage(lease.get()));
+    if (PQntuples(why.get()) == 0 || std::string_view(PQgetvalue(why.get(), 0, 0)) != "open")
         return std::unexpected(
             "not_found: no pending grant matches (campaign_id, principal_type, principal_id, "
             "role_name) in an open campaign — it was never in the frozen population, the "
             "campaign is closed, or the campaign_id is unknown");
-    return {};
+    // Self-attestation outranks already-decided: a subject trying to overwrite
+    // a decision about their own grant is the security-relevant signal.
+    if (std::string_view(PQgetvalue(why.get(), 0, 2)) == "t")
+        return std::unexpected(
+            "self_attestation: the acting reviewer is the subject of this grant (or the "
+            "owner of this engine principal) and may not decide it — another reviewer must");
+    return std::unexpected(
+        "already_decided: this grant already has a recorded decision in this open campaign "
+        "and decisions are final — open a new campaign to re-review it");
 }
 
 std::expected<CampaignView, std::string>

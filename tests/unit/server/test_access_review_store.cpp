@@ -5,8 +5,9 @@
  * Covers:
  *  - R3 freeze-at-open: `open_campaign` inserts every frozen grant as a
  *    `decision='pending'` row, in one call.
- *  - `record_attestation` transitions a pending row and upserts in place on
- *    a re-attest (no duplicate row).
+ *  - `record_attestation` transitions a pending row ONCE; the decision is then
+ *    final (#4752), and the reviewer may not be the subject of the grant (user)
+ *    or the frozen owner of an engine principal (separation of duties).
  *  - the closed-campaign guard: a write into a closed campaign is rejected.
  *  - the `not_found: ` prefix contract on attestation/get/close.
  *  - fail-closed construction, both the migration-drift case (a live but
@@ -318,9 +319,9 @@ TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error
     CHECK(view_res.error().find("attestation read failed") != std::string::npos);
 }
 
-// ── record_attestation: transition + upsert ─────────────────────────────────
+// ── record_attestation: transition, then FINAL (#4752) ─────────────────────
 
-TEST_CASE("record_attestation transitions a pending row and upserts in place on re-attest",
+TEST_CASE("record_attestation transitions a pending row once and the decision is then final",
           "[access_review][store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -349,25 +350,153 @@ TEST_CASE("record_attestation transitions a pending row and upserts in place on 
     }
     CHECK(found_attested);
 
-    // Re-attest the SAME grant with a different decision: overwrites in
-    // place — still exactly one row for this (campaign, principal, role).
+    // A second decision on the SAME grant — by a different reviewer, with the
+    // opposite decision — is refused and leaves the first decision untouched.
     auto rec2 =
         store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "stale");
-    REQUIRE(rec2.has_value());
+    REQUIRE_FALSE(rec2.has_value());
+    CHECK(rec2.error().starts_with("already_decided:"));
+    CHECK(yuzu::server::classify_attestation_refusal(rec2.error()) ==
+          yuzu::server::AttestationRefusal::AlreadyDecided);
     auto view2 = store.get_campaign(cid);
     REQUIRE(view2.has_value());
-    CHECK(view2->attestations.size() == 3); // no new row added
+    CHECK(view2->attestations.size() == 3);
     int matches = 0;
     for (const auto& a : view2->attestations) {
         if (a.principal_type == "user" && a.principal_id == "alice" && a.role_name == "Admin") {
             ++matches;
-            CHECK(a.decision == "flagged_revoke");
-            CHECK(a.reviewer == "dave");
-            CHECK(a.justification == "stale");
+            CHECK(a.decision == "attested");
+            CHECK(a.reviewer == "carol");
+            CHECK(a.justification == "ok");
         }
     }
     CHECK(matches == 1);
-    CHECK(view2->pending_count == 2); // unchanged — still one non-pending row
+    CHECK(view2->pending_count == 2);
+}
+
+// ── separation of duties (#4752) ────────────────────────────────────────────
+
+TEST_CASE("record_attestation refuses a reviewer deciding their own user grant",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("SoD", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    for (const char* decision : {"attested", "flagged_revoke"}) {
+        auto self = store.record_attestation(cid, "user", "alice", "Admin", decision, "alice", "");
+        REQUIRE_FALSE(self.has_value());
+        CHECK(self.error().starts_with("self_attestation:"));
+        CHECK(yuzu::server::classify_attestation_refusal(self.error()) ==
+              yuzu::server::AttestationRefusal::SelfAttestation);
+    }
+    // Nothing was written: the row is still pending.
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+
+    // Comparison is exact: a different-case username is a different principal.
+    CHECK(store.record_attestation(cid, "user", "alice", "Admin", "attested", "Alice", "")
+              .has_value());
+}
+
+TEST_CASE("record_attestation: the subject cannot overwrite another reviewer's flagged_revoke",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("SoD2", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "carol",
+                                     "too broad")
+                .has_value());
+
+    // The scenario from the issue: alice un-flags the revoke recommendation
+    // against herself. Refused — and as self-attestation, not merely
+    // already-decided, because that is the security-relevant signal.
+    auto overwrite =
+        store.record_attestation(cid, "user", "alice", "Admin", "attested", "alice", "fine");
+    REQUIRE_FALSE(overwrite.has_value());
+    CHECK(overwrite.error().starts_with("self_attestation:"));
+
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    for (const auto& a : view->attestations) {
+        if (a.principal_id == "alice") {
+            CHECK(a.decision == "flagged_revoke");
+            CHECK(a.reviewer == "carol");
+            CHECK(a.justification == "too broad");
+        }
+    }
+}
+
+TEST_CASE("record_attestation refuses an engine principal's frozen owner, allows anyone else",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::vector<GrantRef> grants{
+        GrantRef{"engine", "engine:owned", "Writer",
+                 R"({"display_name":"owned","owner_or_email":"olivia"})"},
+        // Legacy/empty snapshot shapes must stay attestable (NULL-safe) and must
+        // never reach the ::jsonb cast with a non-object.
+        GrantRef{"engine", "engine:nosnap", "Writer", ""},
+        GrantRef{"engine", "engine:noowner", "Writer", R"({"display_name":"x"})"},
+    };
+    auto open_res = store.open_campaign("SoD3", "admin", grants, "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto owner =
+        store.record_attestation(cid, "engine", "engine:owned", "Writer", "attested", "olivia", "");
+    REQUIRE_FALSE(owner.has_value());
+    CHECK(owner.error().starts_with("self_attestation:"));
+
+    CHECK(store.record_attestation(cid, "engine", "engine:owned", "Writer", "attested", "carol", "")
+              .has_value());
+    CHECK(store.record_attestation(cid, "engine", "engine:nosnap", "Writer", "attested", "olivia",
+                                   "")
+              .has_value());
+    CHECK(store.record_attestation(cid, "engine", "engine:noowner", "Writer", "attested", "olivia",
+                                   "")
+              .has_value());
+}
+
+TEST_CASE("record_attestation: group grants are not subject to the owner check (documented limit)",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("SoD4", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    // Pins the stated limit so widening it is a deliberate, reviewed change.
+    CHECK(store.record_attestation(*open_res, "group", "eng", "Reader", "attested", "eng", "")
+              .has_value());
+}
+
+TEST_CASE("record_attestation requires an identified reviewer", "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("SoD5", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    auto rec = store.record_attestation(*open_res, "user", "alice", "Admin", "attested", "", "");
+    REQUIRE_FALSE(rec.has_value());
+    CHECK(rec.error() == "reviewer required");
 }
 
 TEST_CASE("record_attestation rejects a decision outside {attested,flagged_revoke}",
