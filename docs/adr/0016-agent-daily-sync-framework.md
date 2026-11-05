@@ -1078,9 +1078,10 @@ not verify is rolled back alone and the others of the call still apply.
 
 **Change ledger (`software_changes`).** Every applied section writes one row per install, remove
 or upgrade, in the same transaction (one `unnest()` statement per section). `observed_at` is the
-server receipt time in seconds and, with `agent_id`, groups the rows of one apply call: calls for
-an agent are serialised by its advisory lock. A row's identity is its `instance_key` (stored on the
-ledger row; `installed_software.install_id` churns on a full replace and is not recorded). The rows come from a pure
+replica's own server clock in whole seconds (not the database clock) and, with `agent_id`, groups
+the rows of one apply call: calls for an agent are serialised by its advisory lock, but two calls
+inside the same second share an `observed_at`, so rows are ordered by `change_id` within a group.
+A row's identity is its `instance_key`, stored on the ledger row. The rows come from a pure
 diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`; one removed row pairs
 with one added row of the same identity stem (`identity_key` with its version segment blanked), in
 sorted `instance_key` order. A pair whose versions differ is one `upgrade(from, to)`; a pair whose
@@ -1089,13 +1090,17 @@ leftovers are `remove` and `install`. **There are no tombstones on `installed_so
 removal is a hard delete plus a `remove` row carrying name, publisher and version, so no read
 needs a `removed_at` filter.
 
-**Baseline rule.** A `full` section is a BASELINE (rows written, no ledger rows) only when its
-facet is not held at all (a device's first contact, which includes the first v3 call that applies a
-section and so deletes the device's v2 rows) or its previous status was `disabled` (a switch-off and switch-on produce no events; changes
-made while a facet was disabled are therefore never recorded, by design). In every other case the
-held rows are still in the table, because a status-only section leaves them in place, so the full
-section is diffed against them: a timeout followed by a full carrying an upgrade writes one
-`upgrade`, and an honest-empty full followed by a populated one writes the installs.
+**Baseline rule.** A `full` section is a BASELINE (rows written, no ledger rows) unless the
+server holds the facet's rows: a facet state with a non-empty section hash whose status is not
+`disabled`. A baseline is therefore a device's first contact for the facet (including the first v3
+call that applies a section, which deletes the device's v2 rows), a facet whose only prior section
+was status-only (that creates a facet state with no hash), and a facet switched off and on again
+(a status-only section over a `disabled` facet clears its stored hash, so a timeout after the
+switch-off does not turn the next full into a diff). Changes made while a facet was disabled are
+never recorded, by design. In every other case the held rows are still in the table, because a
+status-only section leaves them in place, so the full section is diffed against them: a timeout
+followed by a full carrying an upgrade writes one `upgrade`, and an honest-empty full followed by
+a populated one writes the installs.
 
 **Components (`software_components`).** The component table lives in this store's schema, owned
 by `SoftwareInventoryStore`, because a component section is applied in the same transaction as
@@ -1105,7 +1110,7 @@ the exact path bytes. A component canonical record is `kind US name US version U
 US path US size US mtime US anchor_app RS`; a row hash is the SHA-256 of one record (the value a
 `-` names); the section hash is the SHA-256 of the records sorted by those fields (size and mtime
 numerically) and de-duplicated. A full section deletes the agent's components then inserts
-(`first_seen = last_seen` = server receipt, the time the row was written); a delta deletes by
+(`first_seen` = the time the row was written); a delta deletes by
 `row_hash`, inserts, and verifies `expect`, and does not touch the rows it does not name. Freshness
 of a delta-maintained facet is `software_facet_state.last_confirmed_at`, not a per-row column.
 An honest-empty full
@@ -1118,7 +1123,9 @@ the device, so they have no prune.
 **Retention.** `run_retention_prune_changes` prunes `software_changes` through the shared
 clock-guarded helper (all seven parts, `docs/clock-guarded-retention.md` register): 400-day window
 in epoch seconds, a missing anchor declines, 50,000 rows per pass, ticked hourly beside the
-deployment prune. `decommission` (`delete_agent`) removes an agent's ledger and component rows.
+deployment prune. The rows are stamped by the replica's clock while the cutoff reads Postgres
+`now()`: the two clock domains are split, which the 400-day window absorbs (the register records
+why). `decommission` (`delete_agent`) removes an agent's ledger and component rows.
 
 **Observability.** `yuzu_software_changes_total{kind}` counts ledger rows by kind (a baseline
 counts none); its closed `kind` set (`install`, `remove`, `upgrade`) is created at 0 at boot beside
