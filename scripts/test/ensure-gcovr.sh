@@ -34,16 +34,19 @@
 # pip may also write its own cache under ~/.cache/pip.
 #
 # OWNERSHIP: the script deletes or moves a directory only when it can show the directory is its own.
-# That takes a marker or a stamp it wrote, WITH its content, and a layout a venv has: the marker file
-# `.yuzu-gcovr-venv` holds exactly the line `yuzu-gcovr-venv v1` (an earlier version of this script wrote
-# it empty; see below), the stamp `.requirements-ci.sha256` holds exactly a SHA-256, and every top-level
-# entry is one a venv of this script has (bin, lib, lib64, include, share, pyvenv.cfg, .gitignore -- Python
-# 3.13+ writes one -- and the two ownership files). A file named like a marker in a directory of yours does
-# not make it ours, and neither does a copied marker next to your own files: a directory with any other
-# top-level entry is refused and named. An EMPTY marker (the earlier version of this script, never
-# released) counts only for a directory that holds nothing but ownership files or is shaped like a venv
-# (pyvenv.cfg with a `home =` line). The same rule decides every question below: replacing $VENV, sweeping
-# leftovers, removing a half-built venv.
+# That takes a marker or a stamp it wrote, WITH its exact content, and a layout a venv has: the marker file
+# `.yuzu-gcovr-venv` holds exactly the line `yuzu-gcovr-venv v1` and nothing else (byte for byte: a trailing
+# space, a second newline or NUL padding fails), the stamp `.requirements-ci.sha256` holds exactly one
+# SHA-256 and a newline, and every top-level entry is one a venv of this script has (bin, lib, lib64,
+# include, share, pyvenv.cfg, .gitignore -- Python 3.13+ writes one -- and the two ownership files). A file
+# named like a marker in a directory of yours does not make it ours, and neither does a copied marker next
+# to your own files: a directory with any other top-level entry is refused and named. There is no weaker
+# tier: a marker without the token (an empty file, as an earlier build of this branch wrote) is NOT accepted,
+# so the one thing a user-planted file could satisfy is gone; such a directory is refused and the message
+# gives the command to remove it by hand. The entries are read with ONE helper (list_entries: a bash glob
+# with dotglob and nullglob, no `find -printf`, no process substitution), and any failure to read a directory
+# means "not ours", never "no entries". The same rule decides every question below: replacing $VENV,
+# sweeping leftovers, removing a half-built venv.
 #
 # RECOVERY / SAFETY: a rebuild MOVES the old venv aside (one atomic rename) before building, then removes
 # the moved copy, so an interrupt can never leave a half-deleted directory at $VENV. The aside name comes
@@ -96,6 +99,9 @@ fi
 
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
 [[ "$HOME" == /* ]] || die "HOME must be an absolute path (it is '$HOME'); a relative one would make the gcovr link dangle"
+case "/$HOME/" in
+    */./*|*/../*) die "HOME ($HOME) must not contain a '.' or '..' path segment; the gcovr virtualenv and link are placed under it" ;;
+esac
 VENV="${YUZU_GCOVR_VENV:-${HOME%/}/.local/share/yuzu/gcovr-venv}"
 while [[ "$VENV" == */ && "$VENV" != "/" ]]; do VENV="${VENV%/}"; done
 [[ -n "$VENV" && "$VENV" != "/" ]] || die "YUZU_GCOVR_VENV must not be empty or /"
@@ -184,6 +190,11 @@ if already_ready; then
     exit 0
 fi
 
+# What the ownership and move-aside logic below leans on; without one of them it could not tell what is its own.
+for _tool in cmp find mktemp stat; do
+    command -v "$_tool" >/dev/null 2>&1 || die "'$_tool' is not on PATH; this script needs cmp (diffutils), find (findutils), mktemp and stat (coreutils)"
+done
+
 if [[ -e "$LINK" && ! -L "$LINK" ]]; then
     die "$LINK exists and is not a symlink; move it aside so the pinned gcovr can be linked there"
 fi
@@ -231,65 +242,74 @@ if command -v flock >/dev/null 2>&1; then
     fi
 fi
 
-# Empty means EMPTY: a directory this process cannot list (no read or search permission) also prints nothing,
-# and must never be mistaken for an empty one, so it has to be readable and searchable first.
-empty_dir() { [[ -d "$1" && ! -L "$1" && -r "$1" && -x "$1" && -z "$(ls -A "$1" 2>/dev/null)" ]]; }
+# list_entries DIR: fill the array ENTRIES with the NAMES in DIR (dotfiles included, never . or ..). It is the
+# ONE place a directory's contents are read for a decision (empty? a venv's layout?). Status 0 only when the
+# directory could be read; anything else (not a directory, a link, no read or search permission) returns 1 with
+# ENTRIES empty, and every caller reads that as "not ours" / "not empty", never as "no entries". A bash glob, on
+# purpose: `find -printf` does not exist in BusyBox find, and a process substitution swallows the failure of the
+# command inside it, which once made a failed enumeration look like an empty (so acceptable) directory. The
+# shell options it sets are put back.
+ENTRIES=()
+list_entries() {
+    local d="$1" i had_dot=0 had_null=0
+    ENTRIES=()
+    [[ -d "$d" && ! -L "$d" && -r "$d" && -x "$d" ]] || return 1
+    shopt -q dotglob && had_dot=1
+    shopt -q nullglob && had_null=1
+    shopt -s dotglob nullglob
+    ENTRIES=("$d"/*)
+    (( had_dot )) || shopt -u dotglob
+    (( had_null )) || shopt -u nullglob
+    for ((i = 0; i < ${#ENTRIES[@]}; i++)); do ENTRIES[i]="${ENTRIES[i]##*/}"; done
+    return 0
+}
+# Empty means a directory we could READ that has no entries.
+empty_dir() { list_entries "$1" && (( ${#ENTRIES[@]} == 0 )); }
 
 # The top-level entries a venv of this script has (see OWNERSHIP in the header). An exact comparison, not a
-# substring test: a directory entry called "bin lib" must not pass.
+# substring test: a directory entry called "bin lib" must not pass. A directory that cannot be read has no
+# known layout.
 layout_ok() {
-    local d="$1" name allowed ok
-    [[ -r "$d" && -x "$d" ]] || return 1       # a directory we cannot list is not known to be a venv's
-    while IFS= read -r -d '' name; do
+    local name allowed ok
+    list_entries "$1" || return 1
+    for name in ${ENTRIES[@]+"${ENTRIES[@]}"}; do
         ok=0
         for allowed in bin lib lib64 include share pyvenv.cfg .gitignore "$MARKER" "$STAMPNAME"; do
             [[ "$name" == "$allowed" ]] && { ok=1; break; }
         done
         [[ "$ok" == 1 ]] || return 1
-    done < <(find "$d" -mindepth 1 -maxdepth 1 -printf '%f\0' 2>/dev/null)
+    done
     return 0
 }
-# A small regular file (never a link) whose whole content is exactly $2 (size capped so a user's huge
-# file of that name is never read).
+# A regular file (never a link) whose bytes are EXACTLY "$2" followed by one newline: a trailing space, a
+# second newline, NUL padding or more content all fail, and cmp stops at the first difference, so a user's huge
+# file of that name is never read in full.
 file_is() {
-    [[ -f "$1" && ! -L "$1" && "$(wc -c < "$1" 2>/dev/null | tr -d ' ')" -le 64 && "$(head -c 64 "$1" 2>/dev/null)" == "$2" ]]
+    [[ -f "$1" && ! -L "$1" ]] && cmp -s "$1" - <<< "$2" 2>/dev/null
 }
-# A stamp is exactly one SHA-256 line.
+# A stamp is exactly one lowercase SHA-256 and a newline, byte for byte.
 stamp_ok() {
-    local f="$1" c
-    [[ -f "$f" && ! -L "$f" && "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" -le 65 ]] || return 1
-    c="$(head -c 65 "$f" 2>/dev/null)"
-    [[ "$c" =~ ^[0-9a-f]{64}$ ]]
+    local f="$1" h
+    [[ -f "$f" && ! -L "$f" ]] || return 1
+    h="$(head -c 64 "$f" 2>/dev/null)"
+    [[ "$h" =~ ^[0-9a-f]{64}$ ]] && file_is "$f" "$h"
 }
-# owned DIR: DIR is a real directory (never a link) whose top-level entries are a venv's, and that carries
-# this script's marker with its token, or a stamp with a SHA-256 in it. An EMPTY marker (the earlier,
-# unreleased version of this script) counts only for a directory that holds nothing else, or one that has a
-# pyvenv.cfg with a `home =` line. A marker with any other content, or a stamp that is not a SHA-256, is not
-# ours.
+# owned DIR: DIR is a real directory (never a link), every top-level entry is one a venv has, and it carries this
+# script's marker with its exact token and/or a stamp that is exactly a SHA-256. A marker or a stamp with any
+# other content makes it not ours; so does a marker with no token at all (an empty file included).
 owned() {
-    local d="$1" token=0 stamp=0 legacy=0 name others=0
+    local d="$1" token=0 stamp=0
     [[ -d "$d" && ! -L "$d" ]] || return 1
     layout_ok "$d" || return 1
     if [[ -e "$d/$MARKER" || -L "$d/$MARKER" ]]; then
-        if file_is "$d/$MARKER" "$OWN_TOKEN"; then
-            token=1
-        elif [[ -f "$d/$MARKER" && ! -L "$d/$MARKER" && ! -s "$d/$MARKER" ]]; then
-            legacy=1
-        else
-            return 1
-        fi
+        file_is "$d/$MARKER" "$OWN_TOKEN" || return 1
+        token=1
     fi
     if [[ -e "$d/$STAMPNAME" || -L "$d/$STAMPNAME" ]]; then
         stamp_ok "$d/$STAMPNAME" || return 1
         stamp=1
     fi
-    (( token || stamp )) && return 0
-    (( legacy )) || return 1
-    while IFS= read -r -d '' name; do
-        [[ "$name" == "$MARKER" || "$name" == "$STAMPNAME" ]] || others=1
-    done < <(find "$d" -mindepth 1 -maxdepth 1 -printf '%f\0' 2>/dev/null)
-    (( others == 0 )) && return 0
-    [[ -f "$d/pyvenv.cfg" && ! -L "$d/pyvenv.cfg" ]] && grep -q '^home = ' "$d/pyvenv.cfg" 2>/dev/null
+    (( token || stamp ))
 }
 # remove_owned_tree DIR: delete a directory that is owned (checked again here). The contents go first and
 # the two ownership files LAST, so a kill part-way leaves a tree that is still recognisably ours (rm -rf in
@@ -320,30 +340,35 @@ remove_leftovers() {
 }
 remove_leftovers loud
 
-# A failed rebuild gives the previous venv back. OLD_ASIDE is the directory mktemp made for it; OLD_MOVED is
-# set once the venv was renamed over it; OLD_INODE is the venv's inode before that. The EXIT trap acts only
-# on a non-zero exit, so a successful run, a refusal that happens before any rebuild, and the failures that
-# come after the new venv is complete (OLD_ASIDE is cleared then) never restore. Positive evidence only:
-# what stands at OLD_ASIDE must still be the directory this run moved (same inode), and what stands at
-# $VENV must be what THIS run started (owned, or empty) -- never a symlink, never anything else. Every
-# notice it prints goes before the cause, which is then printed again as the LAST line.
+# A failed rebuild gives the previous venv back. OLD_ASIDE is the directory mktemp made for it and ASIDE_INODE
+# its inode as made; OLD_INODE is the venv's inode before it was renamed over OLD_ASIDE. Whether the venv WAS
+# moved is decided from the disk, never from a flag set after the rename (a signal between the rename and such a
+# flag would leave the old venv stranded): OLD_ASIDE is the old venv exactly when it is a real directory whose
+# inode is OLD_INODE. The EXIT trap acts only on a non-zero exit, so a successful run, a refusal that happens
+# before any rebuild, and the failures that come after the new venv is complete (OLD_ASIDE is cleared then)
+# never restore. Positive evidence only: what stands at $VENV must be what THIS run started (owned, or empty) --
+# never a symlink, never anything else; a directory mktemp made and nothing moved into is removed only while it
+# is still empty and still has the inode it was made with. Every notice it prints goes before the cause, which is
+# then printed again as the LAST line.
 OLD_ASIDE=""
-OLD_MOVED=0
 OLD_INODE=""
+ASIDE_INODE=""
 RESTORE_SAID=0
 rsay() { RESTORE_SAID=1; say "$*" >&2; }
 _restore_body() {
-    local rc="$1"
+    local rc="$1" aside_now=""
     [[ -n "$OLD_ASIDE" && "$rc" -ne 0 ]] || return 0
-    if [[ "$OLD_MOVED" != 1 ]]; then
-        # reserved but never moved into: drop the empty directory mktemp made, nothing else
-        if [[ -d "$OLD_ASIDE" && ! -L "$OLD_ASIDE" ]] && empty_dir "$OLD_ASIDE"; then
-            rmdir "$OLD_ASIDE" 2>/dev/null || true
-        fi
-        return 0
+    if [[ -d "$OLD_ASIDE" && ! -L "$OLD_ASIDE" ]]; then
+        aside_now="$(stat -c %i "$OLD_ASIDE" 2>/dev/null || true)"
     fi
-    if [[ -L "$OLD_ASIDE" || ! -d "$OLD_ASIDE" || "$(stat -c %i "$OLD_ASIDE" 2>/dev/null || true)" != "$OLD_INODE" ]]; then
-        rsay "NOT restoring the previous virtualenv: $OLD_ASIDE is not the directory this run moved aside (it was replaced or changed); leaving it, and whatever is at $VENV, as they are"
+    if [[ -z "$OLD_INODE" || -z "$aside_now" || "$aside_now" != "$OLD_INODE" ]]; then
+        # the old venv is not here: either it was never moved (the empty directory mktemp made, if it is still
+        # that directory and still empty, is dropped; nothing else is touched), or what is here is no longer it
+        if [[ -n "$aside_now" && "$aside_now" == "$ASIDE_INODE" ]] && empty_dir "$OLD_ASIDE"; then
+            rmdir "$OLD_ASIDE" 2>/dev/null || true
+        elif [[ -n "$OLD_INODE" ]]; then
+            rsay "NOT restoring the previous virtualenv: $OLD_ASIDE is not the directory this run moved aside (it was replaced or changed); leaving it, and whatever is at $VENV, as they are"
+        fi
         return 0
     fi
     if [[ -L "$VENV" ]]; then
@@ -368,8 +393,11 @@ _restore_body() {
     fi
 }
 restore_old_venv() {
-    local rc=$?
-    trap '' INT TERM        # a second Ctrl-C or TERM must not abort the restore
+    # The first thing it does, so a second Ctrl-C or TERM cannot abort the restore. (The exit status arrives as
+    # $1, from the EXIT trap string, so nothing has to run before this line. The one residual: a signal that is
+    # delivered before this single builtin executes still takes the default action.)
+    trap '' INT TERM
+    local rc="${1:-1}"
     trap - EXIT
     set +e
     _restore_body "$rc"
@@ -386,11 +414,15 @@ if managed_ok; then
 else
     if [[ -e "$VENV" ]]; then
         if ! owned "$VENV" && ! empty_dir "$VENV"; then
-            die "refusing to replace $VENV: it is not known to be a virtualenv of this script (no marker with this script's token or SHA-256 stamp, or it holds entries a virtualenv does not); point YUZU_GCOVR_VENV at an unused path, or if it is the leftover of an interrupted run of this script, remove it by hand (rm -rf) and re-run"
+            hint=""
+            if [[ -e "$VENV/$MARKER" || -L "$VENV/$MARKER" ]] && ! file_is "$VENV/$MARKER" "$OWN_TOKEN"; then
+                hint="; it has a '${MARKER}' file WITHOUT this script's token (an earlier build of this branch wrote it empty, and a file planted by somebody else looks the same), which is not accepted. If the directory is yours to delete, run: rm -rf '$VENV'  and re-run"
+            fi
+            die "refusing to replace $VENV: it is not known to be a virtualenv of this script (no marker with this script's exact token or SHA-256 stamp, or it holds entries a virtualenv does not, or it could not be read); point YUZU_GCOVR_VENV at an unused path, or if it is the leftover of an interrupted run of this script, remove it by hand (rm -rf) and re-run${hint}"
         fi
         # The EXIT/INT/TERM traps go in first, so a failure or a signal anywhere below puts it back. The
         # signal traps record the cause too, so the last line of the log names it.
-        trap restore_old_venv EXIT
+        trap 'restore_old_venv $?' EXIT
         trap 'DIE_MSG="ensure-gcovr: NOT READY: interrupted (SIGINT)"; exit 130' INT
         trap 'DIE_MSG="ensure-gcovr: NOT READY: interrupted (SIGTERM)"; exit 143' TERM
         # A name that is certainly free and certainly ours: mktemp -d makes a NEW empty directory beside the
@@ -400,14 +432,17 @@ else
         # Atomic: after the rename $VENV does not exist, and the old tree is deleted afterwards; a kill
         # during the delete leaves only a <venv>.yuzu-gcovr-old.* directory, never a half-deleted $VENV.
         aside="$(mktemp -d "$VENV.yuzu-gcovr-old.XXXXXX")" || die "cannot create a directory beside $VENV to move the old virtualenv into"
+        # Recorded at once, so that ANY refusal below lets the restore drop the directory mktemp made (it does
+        # so only while it still has this inode and is still empty; a foreign directory, a link or a file that
+        # is somehow at this name is never touched).
+        OLD_ASIDE="$aside"
+        ASIDE_INODE="$(stat -c %i "$aside" 2>/dev/null || true)"
         if [[ -L "$aside" || ! -d "$aside" ]] || ! empty_dir "$aside"; then
             die "refusing to move $VENV aside: '$aside' is not a fresh empty directory, and the old virtualenv was left untouched"
         fi
-        OLD_ASIDE="$aside"
         OLD_INODE="$(stat -c %i "$VENV" 2>/dev/null || true)"
         [[ -n "$OLD_INODE" ]] || die "cannot read the inode of $VENV"
         mv -T "$VENV" "$OLD_ASIDE" || die "cannot move $VENV aside"
-        OLD_MOVED=1
     fi
 
     say "installing gcovr==${pin} with hashes from requirements-ci.txt into ${VENV}"
@@ -422,7 +457,6 @@ else
     printf '%s\n' "$req_sha" > "$STAMP" || die "cannot write $STAMP"
     # The new venv is complete: from here a failure (the link, PATH) must NOT give the old one back.
     OLD_ASIDE=""
-    OLD_MOVED=0
     remove_leftovers
 fi
 ln -sfn "$VENV/bin/gcovr" "$LINK" || die "cannot link $LINK"

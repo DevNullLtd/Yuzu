@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_DIR = Path(os.environ.get("YUZU_ENSURE_SCRIPT_DIR", ROOT / "scripts" / "test"))
 FARM_TOOLS = ("bash sh dirname basename sed head grep readlink sha256sum shasum cut cat ls mkdir rm ln mv "
-              "uname touch chmod tr mktemp tail wc od find rmdir sleep stat").split()
+              "uname touch chmod tr mktemp tail wc od find rmdir sleep stat cmp").split()
 
 # What the script writes, and what a stale stamp looks like (a SHA-256, as the script requires of a stamp).
 TOKEN = "yuzu-gcovr-venv v1\n"
@@ -1710,11 +1710,9 @@ class EnsureGcovr(GcovrCase):
         for i, (name, files) in enumerate((
                 ("empty directory", {}),
                 ("half-built venv: the marker with its token only", {".yuzu-gcovr-venv": TOKEN}),
-                ("half-built venv of the earlier script: an empty marker only", {".yuzu-gcovr-venv": ""}),
                 ("finished venv of ours: a SHA-256 stamp only", {".requirements-ci.sha256": ZERO_SHA}),
                 ("a venv with the layout python -m venv and pip leave, token and stamp", self.REAL_LAYOUT),
-                ("the earlier script's venv: an empty marker and a venv shape",
-                 {".yuzu-gcovr-venv": "", "pyvenv.cfg": "home = /usr/bin\n", "bin/python": "x\n"}))):
+                )):
             with self.subTest(name):
                 venv = self.sb.tmp / f"venv_{i}"
                 venv.mkdir()
@@ -1737,8 +1735,7 @@ class EnsureGcovr(GcovrCase):
                               ("99", {}),                                                  # empty, no markers of any kind
                               ("456", {".yuzu-gcovr-venv": TOKEN, "bin/x": "x\n"}),         # half-deleted but still marked
                               ("457", {".requirements-ci.sha256": ZERO_SHA, "lib/y": "x\n"}),  # finished venv, stamp only
-                              ("789", {**self.REAL_LAYOUT}),
-                              ("x12", {".yuzu-gcovr-venv": "", "pyvenv.cfg": "home = /x\n", "bin/p": "x\n"})):  # the earlier script's
+                              ("789", {**self.REAL_LAYOUT})):
             d = parent / f"{name}.yuzu-gcovr-old.{suffix}"
             d.mkdir()
             for f, content in files.items():
@@ -1749,6 +1746,12 @@ class EnsureGcovr(GcovrCase):
         # older version of this script has none either. Left in place, named on stderr.
         unowned = [self.write(parent / f"{name}.yuzu-gcovr-old.{sfx}" / "notes.txt", "not known to be ours\n")
                    for sfx in ("700", "701", "")]
+        # a marker WITHOUT the token is not a weaker form of ownership, it is none: an empty one, with a
+        # venv-shaped directory, is exactly what a planted file would look like
+        unowned.append(self.write(parent / f"{name}.yuzu-gcovr-old.702" / "notes.txt", "not known to be ours\n"))
+        self.write(parent / f"{name}.yuzu-gcovr-old.702" / "bin" / "x", "x\n")
+        self.write(parent / f"{name}.yuzu-gcovr-old.702" / ".yuzu-gcovr-venv", "")
+        self.write(parent / f"{name}.yuzu-gcovr-old.702" / "pyvenv.cfg", "home = /usr/bin\n")
         # Nothing else either: other people's `.old.N` directories, names that merely start like ours.
         for leftover in (f"{name}.old.3", f"{name}.old.123", f"{name}.old.keep", f"{name}.old.",
                          f"{name}.yuzu-gcovr-old", f"{name}.yuzu-gcovr-oldx",
@@ -2115,6 +2118,19 @@ class EnsureGcovr(GcovrCase):
             "an empty marker and a pyvenv.cfg without a home line": {".yuzu-gcovr-venv": "", "pyvenv.cfg": "x\n", "bin/x": "x\n"},
             "the token marker and an entry named like two allowed ones": {".yuzu-gcovr-venv": TOKEN, "bin lib": "mine\n"},
             "a file named like the marker that is huge": {".yuzu-gcovr-venv": "x" * 5000, "bin/x": "x\n"},
+            "an empty marker and nothing else": {".yuzu-gcovr-venv": ""},
+            "an empty marker and a venv-shaped directory with a pyvenv.cfg home line": {".yuzu-gcovr-venv": "", "pyvenv.cfg": "home = /usr/bin\n", "bin/python": "x\n"},
+            "the token and a trailing space": {".yuzu-gcovr-venv": "yuzu-gcovr-venv v1 \n", "bin/x": "x\n"},
+            "the token and a second newline": {".yuzu-gcovr-venv": TOKEN + "\n", "bin/x": "x\n"},
+            "the token without its newline": {".yuzu-gcovr-venv": "yuzu-gcovr-venv v1", "bin/x": "x\n"},
+            "the token and NUL padding": {".yuzu-gcovr-venv": TOKEN + "\0\0\0", "bin/x": "x\n"},
+            "a longer file that starts with the token": {".yuzu-gcovr-venv": TOKEN + "x" * 100, "bin/x": "x\n"},
+            "the token in capitals": {".yuzu-gcovr-venv": "YUZU-GCOVR-VENV V1\n", "bin/x": "x\n"},
+            "a stamp of 63 hex digits": {".requirements-ci.sha256": "0" * 63 + "\n", "bin/x": "x\n"},
+            "a stamp of 64 hex digits without a newline": {".requirements-ci.sha256": "0" * 64, "bin/x": "x\n"},
+            "a stamp and a trailing space": {".requirements-ci.sha256": "0" * 64 + " \n", "bin/x": "x\n"},
+            "a stamp and NUL padding": {".requirements-ci.sha256": "0" * 64 + "\n\0", "bin/x": "x\n"},
+            "a stamp in capitals": {".requirements-ci.sha256": "A" * 64 + "\n", "bin/x": "x\n"},
         }
         for i, (name, files) in enumerate(cases.items()):
             with self.subTest(name):
@@ -2412,6 +2428,171 @@ class EnsureGcovr(GcovrCase):
         self.expect(self.run_script(), 0, "ready")
         self.assertEqual(self.tree(victim), before)
         self.assertTrue(link.is_symlink())
+
+    # --- batch 3: one enumeration helper, no tokenless tier, exact bytes, the move window --------------
+
+    def find_stub(self, mode):
+        """A `find` that misbehaves when it is asked for -printf (BusyBox has none) and otherwise runs the real
+        one: mode 'fail' prints nothing and exits 1, mode 'partway' prints one entry and then exits 1."""
+        real = shutil.which("find")
+        body = {"fail": "exit 1", "partway": "printf 'bin\\0'; exit 1"}[mode]
+        self.sb.stub("find", f'#!/bin/sh\ncase "$*" in *-printf*) {body};; esac\nexec {real} "$@"\n')
+
+    def test_a_failing_find_never_makes_a_users_directory_ours(self):
+        # The enumeration used to be `find -printf` read through a process substitution: when find failed, the
+        # loop saw ZERO entries and every directory passed the layout check. The user's directory below holds the
+        # exact token and a file of the user's; it must be refused whatever find does.
+        for mode in ("fail", "partway"):
+            for env_name, env in (("a fresh run", {}), ("a run whose pip fails", {"STUB_PIP_RC": "1"})):
+                with self.subTest(f"{mode} / {env_name}"):
+                    self.find_stub(mode)
+                    venv = self.sb.tmp / f"find_{mode}_{len(env)}"
+                    for f, content in {".yuzu-gcovr-venv": TOKEN, "notes.txt": "mine\n"}.items():
+                        self.write(venv / f, content)
+                    before = self.tree(venv)
+                    self.sb.reset_logs()
+                    r = self.run_script(YUZU_GCOVR_VENV=str(venv), **env)
+                    self.expect(r, 1, "refusing to replace")
+                    self.assertEqual(self.tree(venv), before, "the user's directory must be left exactly as it was")
+                    self.assertEqual(self.pip_calls(), [])
+                    self.assertEqual(self.old_dirs(venv), [])
+
+    def test_a_failing_find_never_makes_a_leftover_ours(self):
+        for mode in ("fail", "partway"):
+            with self.subTest(mode):
+                self.find_stub(mode)
+                left = self.sb.venv.parent / f"{self.sb.venv.name}.yuzu-gcovr-old.{mode}"
+                for f, content in {".yuzu-gcovr-venv": TOKEN, "notes.txt": "mine\n"}.items():
+                    self.write(left / f, content)
+                before = self.tree(left)
+                self.expect(self.run_script(), 0, "ready")
+                self.assertEqual(self.tree(left), before)
+
+    def test_the_directory_listing_is_read_in_one_place_without_find_printf_or_a_process_substitution(self):
+        text = (SCRIPT_DIR / "ensure-gcovr.sh").read_text()
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("-printf", code)
+        self.assertNotIn("< <(", code, "a process substitution hides the status of the command inside it")
+        self.assertNotIn("ls -A", code)
+        self.assertEqual(code.count("list_entries()"), 1)
+        self.assertEqual(code.count('"$d"/*'), 1, "the only glob over a directory's entries is in list_entries")
+
+    def test_a_user_directory_with_only_an_empty_marker_is_refused_in_every_mode(self):
+        for name, env in (("a fresh run", {}), ("a run whose pip fails", {"STUB_PIP_RC": "1"})):
+            with self.subTest(name):
+                venv = self.sb.tmp / f"only_marker_{len(env)}"
+                self.write(venv / ".yuzu-gcovr-venv", "")
+                before = self.tree(venv)
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=str(venv), **env)
+                self.expect(r, 1, "refusing to replace")
+                self.assertIn("WITHOUT this script's token", r.stderr)
+                self.assertIn(f"rm -rf '{venv}'", r.stderr, "the recovery command is printed")
+                self.assertEqual(self.tree(venv), before)
+                self.assertEqual(self.pip_calls(), [])
+                self.assertEqual(self.old_dirs(venv), [])
+        with self.subTest("the leftover sweep"):
+            left = self.sb.venv.parent / f"{self.sb.venv.name}.yuzu-gcovr-old.31"
+            self.write(left / ".yuzu-gcovr-venv", "")
+            r = self.run_script()
+            self.expect(r, 0, "ready")
+            self.assertTrue(left.is_dir() and (left / ".yuzu-gcovr-venv").exists())
+            self.assertIn(f"leaving {left} alone", r.stderr)
+
+    def test_a_directory_that_cannot_be_read_is_refused_in_every_mode(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        for name, mode in (("no permissions at all", 0o000), ("read but no search", 0o444), ("search but no read", 0o311)):
+            with self.subTest(name):
+                venv = self.sb.tmp / f"unreadable_{mode:o}"
+                self.write(venv / "precious.txt", "mine\n")
+                self.write(venv / ".yuzu-gcovr-venv", TOKEN)
+                venv.chmod(mode)
+                self.addCleanup(venv.chmod, 0o755)
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=str(venv))
+                venv.chmod(0o755)
+                self.expect(r, 1, "refusing to replace")
+                self.assertEqual(self.old_dirs(venv), [])
+                self.assertEqual(self.pip_calls(), [])
+                self.assertEqual(sorted(p.name for p in venv.iterdir()), [".yuzu-gcovr-venv", "precious.txt"])
+        with self.subTest("an unreadable leftover"):
+            left = self.sb.venv.parent / f"{self.sb.venv.name}.yuzu-gcovr-old.41"
+            self.write(left / ".yuzu-gcovr-venv", TOKEN)
+            left.chmod(0o000)
+            self.addCleanup(left.chmod, 0o755)
+            r = self.run_script()
+            left.chmod(0o755)
+            self.expect(r, 0, "ready")
+            self.assertTrue((left / ".yuzu-gcovr-venv").exists())
+            self.assertIn(f"leaving {left} alone", r.stderr)
+
+    def test_the_layout_python_m_venv_really_leaves_is_one_the_script_owns(self):
+        # a REAL venv (no network: nothing is installed into it), marked the way this script marks one, stale so
+        # the script has to replace it; the stub python3 then builds the new one
+        real = self.sb.tmp / "real_venv"
+        made = subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(real)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest("python -m venv is not available here: " + made.stderr[-200:])
+        (real / ".yuzu-gcovr-venv").write_text(TOKEN)
+        (real / ".requirements-ci.sha256").write_text(ZERO_SHA)
+        self.write(real / "share" / "sentinel", "old\n")
+        self.expect(self.run_script(YUZU_GCOVR_VENV=str(real)), 0, "ready")
+        self.assertEqual((real / ".requirements-ci.sha256").read_text().strip(), self.sb.req_sha())
+        self.assertEqual(self.old_dirs(real), [])
+
+    def test_a_missing_tool_the_ownership_checks_rely_on_is_named_and_nothing_is_touched(self):
+        for tool in ("cmp", "find", "mktemp", "stat"):
+            with self.subTest(tool):
+                (self.sb.farm / tool).unlink(missing_ok=True)
+                venv = self.sb.tmp / f"tools_{tool}"
+                self.write(venv / "precious.txt", "mine\n")
+                before = self.tree(venv)
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=str(venv))
+                self.expect(r, 1, f"'{tool}' is not on PATH")
+                self.assertEqual(self.tree(venv), before)
+                self.assertEqual(self.sb.calls(), [])
+                (self.sb.farm / tool).symlink_to(shutil.which(tool))
+
+    # L1: a TERM between the rename and any bookkeeping must not strand the old venv
+
+    def test_a_term_right_after_the_old_venv_was_moved_aside_still_restores_it(self):
+        self.stale_old_venv()
+        real_mv = shutil.which("mv")
+        # do the move, THEN signal the script (this stub's parent): bash runs the TERM trap as soon as mv returns,
+        # before the next statement of the script, which is exactly the window
+        self.sb.stub("mv", f'#!/bin/sh\n{real_mv} "$@" || exit $?\nfor a in "$@"; do last="$a"; done\n'
+                           f'case "$last" in *.yuzu-gcovr-old.*) kill -TERM "$PPID";; esac\nexit 0\n')
+        r = self.run_script()
+        self.assertEqual(r.returncode, 143, r.stdout + r.stderr)
+        self.assertIn("restored the previous virtualenv", r.stderr)
+        self.assert_previous_venv_is_back()
+        self.assertIn("interrupted (SIGTERM)", self.last_line(r))
+
+    # L2: a refused or failed move drops the empty directory mktemp made
+
+    def test_a_failed_move_aside_removes_the_empty_directory_it_made_and_leaves_the_old_venv(self):
+        self.stale_old_venv()
+        before = self.tree(self.sb.venv)
+        real_mv = shutil.which("mv")
+        self.sb.stub("mv", f'#!/bin/sh\nfor a in "$@"; do last="$a"; done\ncase "$last" in *.yuzu-gcovr-old.*) exit 1;; esac\nexec {real_mv} "$@"\n')
+        r = self.run_script()
+        self.expect(r, 1, "cannot move")
+        self.assertEqual(self.tree(self.sb.venv), before)
+        self.assertEqual(self.old_dirs(), [], "the empty directory mktemp made must not be left behind")
+        self.assert_cause_last(r, "cannot move")
+
+    # L5: the message names the variable that is wrong
+
+    def test_a_home_with_dot_segments_is_refused_naming_home(self):
+        for home in ("/tmp/x/../y", "/tmp/./x"):
+            with self.subTest(home):
+                r = self.run_script(HOME=home)
+                self.expect(r, 1, "HOME (")
+                self.assertIn("must not contain a '.' or '..' path segment", r.stderr)
+                self.assertNotIn("YUZU_GCOVR_VENV", r.stderr)
+                self.assertEqual(self.sb.calls(), [])
 
     def test_regular_file_at_the_link_is_not_replaced(self):
         self.link.parent.mkdir(parents=True)
