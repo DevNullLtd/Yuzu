@@ -107,11 +107,46 @@ class ValidityTests(unittest.TestCase):
         open(os.path.join(rd.dir, "fault_ms"), "w").write("1000000")
         open(os.path.join(rd.dir, "undo_ms"), "w").write("1480000")
         self.assertTrue(any("no packet-capture" in w for w in self.check(rd)))
-        cap = "---COUNTS---\nin10s 1010 3\nout10s 1020 0\nout10s 1030 0\n"
+        cap = "---COUNTS---\nout10s 990 9\nin10s 990 9\nin10s 1010 3\nout10s 1020 0\nout10s 1030 0\n"
         open(os.path.join(rd.dir, "cap-victim-50055.txt"), "w").write(cap)
         self.assertEqual(self.check(rd), [])
         open(os.path.join(rd.dir, "cap-victim-50055.txt"), "w").write(cap + "out10s 1040 7\n")
         self.assertTrue(any("drop did not hold" in w for w in self.check(rd)))
+
+
+class HardeningTests(unittest.TestCase):
+    def fault_run(self, cap, **kw):
+        rd = RunDir(good_rows(), scenario="F3-2r", **kw); self.addCleanup(rd.close)
+        open(os.path.join(rd.dir, "fault_ms"), "w").write("1000000")
+        open(os.path.join(rd.dir, "undo_ms"), "w").write("1480000")
+        if cap is not None:
+            open(os.path.join(rd.dir, "cap-victim-50055.txt"), "w").write(cap)
+        return rd
+
+    def test_header_only_capture_is_not_evidence(self):
+        rd = self.fault_run("---COUNTS---\n")
+        self.assertTrue(any("no traffic both ways" in w for w in pc.run_validity(rd.dir, rd.rows())))
+
+    def test_capture_with_traffic_before_and_none_during_is_valid(self):
+        rd = self.fault_run("---COUNTS---\nout10s 990 9\nin10s 990 9\nin10s 1010 2\n")
+        self.assertEqual(pc.run_validity(rd.dir, rd.rows()), [])
+
+    def test_attestation_refused_when_meta_has_a_client_sha(self):
+        rd = RunDir(good_rows(), complete=False); self.addCleanup(rd.close)
+        with open(os.path.join(rd.dir, "meta.txt"), "a") as f:
+            f.write("client_sha=abc\n")
+        w = pc.run_validity(rd.dir, rd.rows(), require_complete=True, legacy_unmarked=True)
+        self.assertTrue(any("attestation refused" in x for x in w))
+
+    def test_complete_marker_seals_probes_jsonl(self):
+        import hashlib
+        rd = RunDir(good_rows()); self.addCleanup(rd.close)
+        pj = os.path.join(rd.dir, "probes.jsonl")
+        open(os.path.join(rd.dir, "COMPLETE"), "w").write(hashlib.sha256(open(pj, "rb").read()).hexdigest() + "\n")
+        self.assertEqual(pc.run_validity(rd.dir, rd.rows(), require_complete=True), [])
+        with open(pj, "a") as f:
+            f.write(json.dumps(row("+420s", 1, "v1", "agent-a")) + "\n")
+        self.assertTrue(any("changed after" in w for w in pc.run_validity(rd.dir, rd.rows(), require_complete=True)))
 
 
 class ScoreTests(unittest.TestCase):
@@ -161,6 +196,18 @@ class ExportTests(unittest.TestCase):
         empty = tempfile.mkdtemp(prefix="yuzu_test_probe_"); self.addCleanup(shutil.rmtree, empty, True)
         with self.assertRaises(SystemExit):
             self.run_export(empty, out)
+        self.assertEqual(open(committed).read(), "committed\n")
+
+    def test_only_untagged_runs_never_replace_the_committed_csvs(self):
+        state = tempfile.mkdtemp(prefix="yuzu_test_probe_"); self.addCleanup(shutil.rmtree, state, True)
+        out = tempfile.mkdtemp(prefix="yuzu_test_probe_"); self.addCleanup(shutil.rmtree, out, True)
+        rows = [{k: v for k, v in r.items() if k != "cohort"} for r in good_rows()]
+        rd = RunDir(rows, name="run-untagged"); self.addCleanup(rd.close)
+        shutil.move(rd.dir, os.path.join(state, "run-untagged"))
+        committed = os.path.join(out, "probe-summary.csv")
+        open(committed, "w").write("committed\n")
+        with self.assertRaises(SystemExit):
+            self.run_export(state, out)
         self.assertEqual(open(committed).read(), "committed\n")
 
     def test_good_run_exports_valid_and_bad_run_exports_not_valid(self):

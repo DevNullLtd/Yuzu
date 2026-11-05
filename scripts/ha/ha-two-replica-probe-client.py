@@ -111,9 +111,11 @@ def classify_cohorts(rows):
     return sorted(bad)
 
 
-def capture_outbound_in_window(rd, t0, t_end):
-    """Outbound packets seen on :50055 in the 10 s buckets that fall wholly between t0 and t_end (seconds), or None
-    when there is no capture counts section to read."""
+def capture_evidence(rd, t0, t_end):
+    """What the :50055 capture shows, from its 10 s bucket counts: packets each way in the buckets wholly BEFORE the
+    fault, and outbound packets in the buckets wholly between the fault and t_end (all seconds). None when there
+    is no counts section. A header-only file (tcpdump never started) gives zeros everywhere, which the caller must
+    not read as 'the drop held': it needs traffic BEFORE the fault to mean anything."""
     p = os.path.join(rd, "cap-victim-50055.txt")
     if not os.path.exists(p):
         return None
@@ -122,12 +124,18 @@ def capture_outbound_in_window(rd, t0, t_end):
         return None
     lo = int(t0 // 10 * 10 + (0 if t0 % 10 == 0 else 10))
     hi = int(t_end // 10 * 10)
-    n = 0
+    fault_bucket = int(t0 // 10 * 10)
+    ev = {"pre_out": 0, "pre_in": 0, "out_in_window": 0}
     for line in txt.split("---COUNTS---", 1)[1].splitlines():
         f = line.split()
-        if len(f) == 3 and f[0] == "out10s" and lo <= int(f[1]) < hi:
-            n += int(f[2])
-    return n
+        if len(f) != 3 or f[0] not in ("out10s", "in10s"):
+            continue
+        b, n = int(f[1]), int(f[2])
+        if b < fault_bucket:
+            ev["pre_out" if f[0] == "out10s" else "pre_in"] += n
+        elif f[0] == "out10s" and lo <= b < hi:
+            ev["out_in_window"] += n
+    return ev
 
 
 def run_validity(rd, rows, require_complete=False, legacy_unmarked=False):
@@ -139,8 +147,18 @@ def run_validity(rd, rows, require_complete=False, legacy_unmarked=False):
     why = []
     if os.path.exists(os.path.join(rd, "INVALID")):
         why.append("INVALID marker: " + open(os.path.join(rd, "INVALID")).read().strip())
-    if require_complete and not os.path.exists(os.path.join(rd, "COMPLETE")) and not legacy_unmarked:
+    cpath = os.path.join(rd, "COMPLETE")
+    meta0 = open(os.path.join(rd, "meta.txt")).read() if os.path.exists(os.path.join(rd, "meta.txt")) else ""
+    if legacy_unmarked and "client_sha=" in meta0:
+        why.append("attestation refused: the run's meta.txt records a client sha, so it postdates the COMPLETE marker and must carry one")
+        legacy_unmarked = False
+    if require_complete and not os.path.exists(cpath) and not legacy_unmarked:
         why.append("no COMPLETE marker (the run did not finish, or predates the marker and is not attested)")
+    if os.path.exists(cpath):
+        sealed = open(cpath).read().strip()
+        pj = os.path.join(rd, "probes.jsonl")
+        if sealed and os.path.exists(pj) and sealed != hashlib.sha256(open(pj, "rb").read()).hexdigest():
+            why.append("probes.jsonl changed after the run was marked COMPLETE (its SHA-256 no longer matches the marker)")
     if not rows:
         return why + ["no probe rows"]
     meta = open(os.path.join(rd, "meta.txt")).read() if os.path.exists(os.path.join(rd, "meta.txt")) else ""
@@ -180,11 +198,13 @@ def run_validity(rd, rows, require_complete=False, legacy_unmarked=False):
             why.append("no fault_ms: the fault was not recorded as injected")
         else:
             end = (tu / 1000.0) if tu else (t0 / 1000.0 + window)
-            out = capture_outbound_in_window(rd, t0 / 1000.0, end)
-            if out is None:
+            ev = capture_evidence(rd, t0 / 1000.0, end)
+            if ev is None:
                 why.append("no packet-capture counts: nothing shows the egress drop took effect")
-            elif out > 0:
-                why.append("%d outbound packets on :50055 during the fault window: the drop did not hold" % out)
+            elif ev["pre_out"] == 0 or ev["pre_in"] == 0:
+                why.append("the capture shows no traffic both ways before the fault (tcpdump may not have run): a zero in the fault window proves nothing")
+            elif ev["out_in_window"] > 0:
+                why.append("%d outbound packets on :50055 during the fault window: the drop did not hold" % ev["out_in_window"])
     return why
 
 
@@ -714,13 +734,16 @@ def cmd_export(a):
                         "yes" if os.path.exists(os.path.join(rd, "COMPLETE")) else ("attested by the author (predates the marker)" if run in legacy else "no"),
                         "yes" if not vreasons else "no", "; ".join(vreasons),
                         hashlib.sha256(open(pj, "rb").read()).hexdigest()])
-    if skipped and a.runs:
+    exported = len(runs) - len(skipped)
+    if exported == 0 or (skipped and a.runs):
         for q in (tmp_f, tmp_g):
             os.path.exists(q) and os.remove(q)
-        sys.exit("export: named run(s) %s carry no cohort tag; nothing was replaced" % ", ".join(skipped))
+        sys.exit("export: %s; nothing was replaced" % (
+            "every matching run is untagged or none was exported" if exported == 0 else
+            "named run(s) %s carry no cohort tag" % ", ".join(skipped)))
     os.replace(tmp_f, os.path.join(a.out, "probe-summary.csv"))
     os.replace(tmp_g, os.path.join(a.out, "run-timeline.csv"))
-    print("exported %d runs to %s" % (len(runs), a.out))
+    print("exported %d runs to %s" % (exported, a.out))
 
 
 def main():

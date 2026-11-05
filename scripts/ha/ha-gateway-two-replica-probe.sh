@@ -197,7 +197,7 @@ EOF
 }
 
 ramp() { # ramp N : bring the agent count up in batches of 50
-    case "${1:-}" in ''|*[!0-9]*|0) die "ramp: the agent count must be a positive integer (got '${1:-}')";; esac
+    case "${1:-}" in ''|*[!0-9]*|0|0[0-9]*) die "ramp: the agent count must be a positive integer without a leading zero (got '${1:-}')";; esac
     local n="$1" k step=20; k="$(compose ps -q agent | wc -l)"; [ "$k" -gt 0 ] && step=50
     while [ "$k" -lt "$n" ]; do
         k=$(( k + step )); [ "$k" -gt "$n" ] && k="$n"; step=50
@@ -447,7 +447,7 @@ cmd_scenario() {
     [ -s "$run/registrations.txt" ] || fail "registrations.txt is empty: the sampled agents' registration lines were not captured"
     python3 -I "$CLIENT" analyse --run "$run" || fail "analyse failed"
     if [ "$FAILS" -eq 0 ]; then
-        : > "$run/COMPLETE"; RUN_FINISHED=1
+        sha256sum "$run/probes.jsonl" | cut -d' ' -f1 > "$run/COMPLETE"; RUN_FINISHED=1   # the marker seals probes.jsonl
     else
         echo "the run finished with $FAILS failure(s); see the log" > "$run/INVALID"; RUN_FINISHED=1
     fi
