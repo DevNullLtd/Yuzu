@@ -94,12 +94,12 @@ A partial roster would delete stored rows, so a constrained `packages` or `store
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`managers` / Windows** — measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; chocolatey is found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); its own version is not read (the bootstrap package has no loose nuspec and bin\\choco.exe is a shim), so its version column is `-`
+- **`managers` / Windows** — measured as a virtual service account (NT SERVICE\\<name>, non-admin) and as the interactive admin user, NT SERVICE\\YuzuAgent itself not used; chocolatey is found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); its own version is not read (the bootstrap package has no loose nuspec and bin\\choco.exe is a shim), so its version column is `-`
 - **`managers` / macOS** — cask rows, non-zero tap counts and the Intel prefix are exercised by synthetic in-code layouts only, never a real capture
-- **`packages` / Windows** — measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; chocolatey is found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); a directory without a loose nuspec (the chocolatey bootstrap package) is not listed; an unreadable nuspec gives a row with an empty version
+- **`packages` / Windows** — measured as a virtual service account (NT SERVICE\\<name>, non-admin) and as the interactive admin user, NT SERVICE\\YuzuAgent itself not used; chocolatey is found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); a directory without a loose nuspec (the chocolatey bootstrap package) is not listed; an unreadable nuspec gives a row with an empty version
 - **`packages` / macOS** — cask rows and the Intel prefix are exercised by synthetic in-code layouts only, never a real capture
 - **`packages` / Linux** — installed_apps.list_inventory owns the Linux package roster
-- **`store_packages` / Windows** — measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; per-user packages are not enumerated and Deprovisioned rows are not collected as software
+- **`store_packages` / Windows** — measured as a virtual service account (NT SERVICE\\<name>, non-admin) and as the interactive admin user, NT SERVICE\\YuzuAgent itself not used; per-user packages are not enumerated and Deprovisioned rows are not collected as software
 - **`store_packages` / macOS** — installed_apps owns the macOS application list
 <!-- END GENERATED -->
 
