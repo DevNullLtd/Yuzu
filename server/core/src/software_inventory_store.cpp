@@ -591,6 +591,14 @@ void append_section_record(std::string& out, const SoftwareEntry& e) {
 // checks it against the SQL, so change them together).
 constexpr std::size_t kInsertColumnCount = 20;
 
+// Copies a failed result's SQLSTATE into `*out` when the caller asked for it.
+void take_sqlstate(const pg::PgResult& res, std::string* out) {
+    if (!out)
+        return;
+    const char* st = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+    *out = st ? st : "";
+}
+
 // Batched insert (#1664): one statement carrying the per-row columns as parallel text[]
 // arrays — agent_id is the scalar $1, so the param count is a constant 21 regardless of row
 // count. A multi-row VALUES would hit libpq's 65535-parameter ceiling at ~3.1k rows (21
@@ -651,10 +659,7 @@ bool insert_entries(PGconn* c, const std::string& agent_id_s,
         "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink, pu)",
         params);
     if (ins.status() != PGRES_COMMAND_OK) {
-        if (sqlstate) {
-            const char* st = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
-            *sqlstate = st ? st : "";
-        }
+        take_sqlstate(ins, sqlstate);
         return false;
     }
     return true;
@@ -780,10 +785,7 @@ bool insert_components(PGconn* c, const std::string& agent_id_s,
         "AS t(k, ph, p, n, v, vs, sz, mt, aa, rh)",
         params);
     if (ins.status() != PGRES_COMMAND_OK) {
-        if (sqlstate) {
-            const char* st = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
-            *sqlstate = st ? st : "";
-        }
+        take_sqlstate(ins, sqlstate);
         return false;
     }
     return true;
