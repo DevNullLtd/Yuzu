@@ -10065,7 +10065,8 @@ not the effective state, in the same shape as the `GET` above.
 
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
-may not have been applied: read the switch back, or repeat the `PUT`, which is safe to repeat), `503` (store
+may not have been applied: read the switch back with the same `plugin`, `action` and `os`, or repeat
+the `PUT`, which is safe to repeat), `503` (store
 unavailable, or the audit row could not be saved).
 
 ---
@@ -10195,7 +10196,7 @@ Returns the session's status, for example so an agent can resume. Send `X-Yuzu-U
 final state. An expired session never answers `200`: it gets `410 expired`. Neither `upload_id` nor the declared size is returned.
 
 **Errors:** `401 session_unknown`; `410 expired`. When this request wins the expiry transition, it
-also discards the partial file, if it can be removed.
+also tries to discard the partial file (a removal that fails is logged and the file stays).
 
 #### `PUT /api/v1/uploads/{upload_id}/chunk`
 
@@ -10211,11 +10212,11 @@ from there); `409 session_terminal`; `410 expired`; `413 chunk_too_large`; `413 
 asserted `total` or the running total exceeds the grant's `declared_max_size`); `500` (the file could
 not be opened or written).
 
-**`size_exceeded` ends the session:** the server attempts to cancel it and, when that cancel succeeds, discards the partial file. The request answers `413` either way.
+**`size_exceeded` attempts to end the session:** the server tries to cancel it and, when that cancel succeeds, discards the partial file. The request answers `413` either way.
 
 **Audit:** chunks are not audited one by one. Only `upload_grant.chunk` `failure` rows for `expired`
-and `size_exceeded` are written, and on a best-effort basis: a row that cannot be persisted sets
-`Sec-Audit-Failed` on the response and the request still completes.
+and `size_exceeded` are written. Like the other device-side upload rows, this is set-and-proceed: a row
+that cannot be persisted sets `Sec-Audit-Failed` on the response and the request still completes.
 
 #### `POST /api/v1/uploads/{upload_id}/commit`
 
