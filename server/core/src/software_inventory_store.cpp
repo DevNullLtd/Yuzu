@@ -426,8 +426,8 @@ const std::vector<pg::PgMigration>& migrations() {
          // A removal is a hard delete from installed_software plus a `remove` row here carrying
          // name/publisher/version: there are NO tombstones on installed_software. observed_at is
          // the SERVER receipt time in seconds (the retention column) and, with agent_id, groups
-         // the rows of one apply call (calls are serialised per agent). install_id is the
-         // inserted row's id (0 for a remove). Indexes serve the
+         // the rows of one apply call (calls are serialised per agent). instance_key is the stable
+         // row identity (installed_software.install_id churns on a full replace). Indexes serve the
          // per-device history read ((agent_id, observed_at, change_id)) and the retention probe
          // ((observed_at)).
          // software_components: the current component set per device, hard-deleted when a
@@ -447,7 +447,6 @@ const std::vector<pg::PgMigration>& migrations() {
          "  publisher    TEXT   NOT NULL DEFAULT '',"
          "  identity_key TEXT   NOT NULL DEFAULT '',"
          "  instance_key TEXT   NOT NULL DEFAULT '',"
-         "  install_id   BIGINT NOT NULL DEFAULT 0,"
          "  from_version TEXT   NOT NULL DEFAULT '',"
          "  to_version   TEXT   NOT NULL DEFAULT '',"
          "  observed_at  BIGINT NOT NULL);"
@@ -1238,7 +1237,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
          "bytes_read, updated_at"},
         {"software_changes",
          "change_id, agent_id, facet, kind, name, publisher, identity_key, instance_key, "
-         "install_id, from_version, to_version, observed_at"},
+         "from_version, to_version, observed_at"},
         {"software_components",
          "agent_id, kind, path_hash, path, name, version, version_source, size, mtime, "
          "anchor_app, row_hash, first_seen, last_seen"},
@@ -1575,8 +1574,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         };
 
         // The ledger rows of one section: ONE unnest() statement (the insert_entries shape).
-        // install_id is looked up by the new row's instance_key in the same transaction (0 for a
-        // remove). Counts are added to the commit-time totals by the caller on success.
+        // Counts are added to the commit-time totals by the caller on success.
         const auto write_ledger = [&](const std::string& facet,
                                       const std::vector<SoftwareChange>& changes) {
             if (changes.empty())
@@ -1597,14 +1595,11 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
             pg::PgResult ins = pg::exec_params(
                 c,
                 "INSERT INTO software_inventory_store.software_changes "
-                "(agent_id, facet, kind, name, publisher, identity_key, instance_key, install_id, "
+                "(agent_id, facet, kind, name, publisher, identity_key, instance_key, "
                 " from_version, to_version, observed_at) "
-                "SELECT $1, $2, t.kind, t.name, t.publisher, t.ik, t.ink, "
-                "       COALESCE(s.install_id, 0), t.fv, t.tv, $3::bigint "
+                "SELECT $1, $2, t.kind, t.name, t.publisher, t.ik, t.ink, t.fv, t.tv, $3::bigint "
                 "FROM unnest($4::text[], $5::text[], $6::text[], $7::text[], $8::text[], "
-                "            $9::text[], $10::text[]) AS t(kind, name, publisher, ik, ink, fv, tv) "
-                "LEFT JOIN software_inventory_store.installed_software s "
-                "  ON s.agent_id = $1 AND s.instance_key = t.ink AND t.kind <> 'remove'",
+                "            $9::text[], $10::text[]) AS t(kind, name, publisher, ik, ink, fv, tv)",
                 params);
             return ins.status() == PGRES_COMMAND_OK;
         };

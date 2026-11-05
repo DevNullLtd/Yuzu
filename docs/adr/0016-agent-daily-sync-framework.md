@@ -1079,7 +1079,8 @@ not verify is rolled back alone and the others of the call still apply.
 **Change ledger (`software_changes`).** Every applied section writes one row per install, remove
 or upgrade, in the same transaction (one `unnest()` statement per section). `observed_at` is the
 server receipt time in seconds and, with `agent_id`, groups the rows of one apply call: calls for
-an agent are serialised by its advisory lock. `install_id` is the inserted row's id, 0 for a remove. The rows come from a pure
+an agent are serialised by its advisory lock. A row's identity is its `instance_key` (stored on the
+ledger row; `installed_software.install_id` churns on a full replace and is not recorded). The rows come from a pure
 diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`; one removed row pairs
 with one added row of the same identity stem (`identity_key` with its version segment blanked), in
 sorted `instance_key` order. A pair whose versions differ is one `upgrade(from, to)`; a pair whose

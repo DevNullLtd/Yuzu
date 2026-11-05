@@ -5174,10 +5174,10 @@ V3Section v3_delta(const std::string& facet, const std::string& base,
     return s;
 }
 
-// Ledger rows of one agent, oldest first: kind, name, from, to, install_id, observed_at.
+// Ledger rows of one agent, oldest first: kind, name, from, to, instance_key, observed_at.
 SqlTable ledger(PgPool& pool, const std::string& agent) {
     return sql_rows(pool,
-                    "SELECT kind, name, from_version, to_version, install_id::text, "
+                    "SELECT kind, name, from_version, to_version, instance_key, "
                     "observed_at::text FROM software_inventory_store.software_changes "
                     "WHERE agent_id = $1 ORDER BY change_id",
                     {agent});
@@ -5199,9 +5199,9 @@ std::string facet_status(PgPool& pool, const std::string& agent, const std::stri
     return t.empty() ? std::string("<none>") : t[0][0];
 }
 
-std::string install_id_of(PgPool& pool, const std::string& agent, const std::string& name) {
+std::string instance_key_of(PgPool& pool, const std::string& agent, const std::string& name) {
     return sql_rows(pool,
-                    "SELECT install_id::text FROM software_inventory_store.installed_software "
+                    "SELECT instance_key FROM software_inventory_store.installed_software "
                     "WHERE agent_id = $1 AND name = $2",
                     {agent, name})[0][0];
 }
@@ -5296,8 +5296,8 @@ TEST_CASE("v3: a delta upgrade applies as -old +new, writes one upgrade row and 
     CHECK(led[0][1] == "Alpha");
     CHECK(led[0][2] == "1.0");
     CHECK(led[0][3] == "2.0");
-    CHECK(led[0][4] == install_id_of(pool, "agent-up", "Alpha")); // the inserted row's id
-    CHECK(led[0][4] != "0");
+    CHECK(led[0][4] == instance_key_of(pool, "agent-up", "Alpha")); // the stable row identity
+    CHECK_FALSE(led[0][4].empty());
 
     // A chained delta: the held section hash is now `after`, and a delta on the OLD base asks for
     // a full section.
@@ -5311,7 +5311,7 @@ TEST_CASE("v3: a delta upgrade applies as -old +new, writes one upgrade row and 
     REQUIRE(led2.size() == 2);
     CHECK(led2[1][0] == "remove");
     CHECK(led2[1][1] == "Beta");
-    CHECK(led2[1][4] == "0"); // a remove has no inserted row
+    CHECK_FALSE(led2[1][4].empty()); // a remove still names the removed row's instance_key
 }
 
 TEST_CASE("v3: a delta on a base the server does not hold is need-full and writes nothing",
