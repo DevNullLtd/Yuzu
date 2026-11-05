@@ -4,7 +4,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 ## Behaviour change: installed-software `publisher` is never empty (`via:` origin labels)
 
-- **What the agent sends:** every installed-software row carries a `publisher`. It is the vendor the source declares (rpm `VENDOR`, falling back to `PACKAGER`; deb `Maintainer`; Windows `Publisher`; the macOS signing certificate; `Microsoft` for Windows optional features; `Homebrew` for the Homebrew presence row; the vendor column of a Python interpreter; `IBM` for IBM MQ) or, when the source declares none, the origin label `via:<ecosystem>` (`via:brew`, `via:snap`, `via:flatpak`, `via:pacman`, `via:apk`, `via:macos_pkgutil` and so on), so the field is never empty.
+- **What the agent sends:** every row has a non-empty publisher: the declared vendor, else the origin label `via:<ecosystem>`; the per-source table is in the installed-software inventory manual.
 - **Hash:** the publisher is part of the inventory hash, which the agent and the server of the same build compute identically. Bring up every server replica before the agents of the same build enroll.
 - **What the server does with a label:** it treats a `via:` publisher as no vendor. The catalogue's publisher total excludes labels, a title's representative publisher prefers a declared vendor, and title matching ignores the label. The match is exact and case-sensitive on the lower-case prefix the agent writes, so a real publisher that happens to start with `VIA:` is still a vendor.
 - **Title dimension:** the software title dimension and curation queue are keyed on the raw (name, publisher, ecosystem) triple, so a title with no declared vendor is recorded under its `via:` label, not under an empty publisher.

@@ -3176,11 +3176,6 @@ TEST_CASE("runtimes python adapter: macOS ignores the vendor column (a bundle id
         CHECK(r.entries[0].publisher == "org.python.python");
         CHECK(r.entries[1].publisher == "Some Vendor");
     }
-    SECTION("the default follows the host OS") {
-        const auto r = parse_runtimes_python_output(out, kFailPolicy);
-        REQUIRE(r.entries.size() == 2);
-        CHECK(r.entries[0].publisher.empty() == !yuzu::agent::kPythonVendorColumnIsVendor);
-    }
 }
 
 TEST_CASE("runtimes python adapter: rows built by the producer round-trip through escaped pipes",
@@ -3221,7 +3216,7 @@ TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dro
     const auto r = parse_runtimes_python_output(
         nl({"status|python|supported|-", "python|unmodelled|-|/usr/bin/python3.x|-",
             "python|cpython|3.1|/p", "jvm|jdk|17|/x|-", "python|cpython|3.2|/p|v|extra"}),
-        kFailPolicy);
+        kFailPolicy, /*vendor_column_is_vendor=*/true);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].version.empty());
@@ -3232,26 +3227,29 @@ TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dro
 TEST_CASE("runtimes python adapter: status grammar decides the answer", "[sync][parse][adapter][runtimes]") {
     using Status = AdaptedRows::Status;
     // No status row, or one for another action: bad status.
-    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}), kFailPolicy).status ==
-          Status::failed);
-    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy).status ==
-          Status::failed);
+    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}), kFailPolicy,
+                                       /*vendor_column_is_vendor=*/true)
+              .status == Status::failed);
+    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy,
+                                       /*vendor_column_is_vendor=*/true)
+              .status == Status::failed);
     // constrained under the table row's drop_source policy: status withheld, zero entries even
     // though a row was present, reason = the status tokens (what the collector logs).
     const auto w = parse_runtimes_python_output(
         nl({"status|python|constrained|linux:runtimes:permission_denied",
             "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
-        ConstrainedPolicy::drop_source);
+        ConstrainedPolicy::drop_source, /*vendor_column_is_vendor=*/true);
     CHECK(show(w) == res("withheld", "linux:runtimes:permission_denied"));
     // the adapter still honours an explicit fail policy
     const auto c = parse_runtimes_python_output(
         nl({"status|python|constrained|linux:runtimes:permission_denied",
             "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
-        ConstrainedPolicy::fail);
+        ConstrainedPolicy::fail, /*vendor_column_is_vendor=*/true);
     CHECK(c.status == Status::failed);
     CHECK(c.reason == "linux:runtimes:permission_denied");
     // unsupported is skipped with no entries.
-    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}), kFailPolicy);
+    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}), kFailPolicy,
+                                                /*vendor_column_is_vendor=*/true);
     CHECK(u.status == Status::unsupported);
     CHECK(u.entries.empty());
 }

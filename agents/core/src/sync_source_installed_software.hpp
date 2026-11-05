@@ -171,7 +171,7 @@ inline constexpr bool kPythonVendorColumnIsVendor = true;
 /// these rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
 YUZU_EXPORT AdaptedRows parse_runtimes_python_output(
     const std::string& out, ConstrainedPolicy policy,
-    bool vendor_column_is_vendor = kPythonVendorColumnIsVendor);
+    bool vendor_column_is_vendor);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM
