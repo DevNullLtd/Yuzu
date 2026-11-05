@@ -379,8 +379,9 @@ handler gate. Other mutating routes (73 REST rows are still
 `kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
 release. The decision no longer lives only in each handler:
 `step_up_policy.hpp`'s `kStepUpPolicy` classifies every mutating route by its
-exact `(method, registered pattern)`, and the pre-request stage
-(`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`)
+exact `(method, registered pattern)`, and the post-read stage
+(`run_post_read_stage` in `step_up_wiring.hpp`, installed by `server.cpp` through
+`PostReadStageRegistry` and run by the route sink)
 evaluates it before any handler runs. The gate's decision tree is unchanged;
 only where it is invoked, the order relative to the handler's authorization
 and its own CSRF copy (step-up first; for a cookie session the server-wide
@@ -583,14 +584,14 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.enroll.initiated` | `POST /api/settings/mfa/init` — secret generated |
 | `mfa.enroll.required` | `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3) |
 | `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll`: first code accepted. A Settings confirm also stamps a step-up proof on the confirming session; the detail is `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped (bearer principal, absent or mismatched cookie, or a store failure) |
-| `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled) |
+| `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled). A CSPRNG fault minting a recovery code or its salt is audited with `detail` starting `csprng_unavailable: ` and, at the login bootstrap, event `reason=csprng_unavailable` (earlier builds: `store_unavailable`) (#6995). |
 | `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
 | `mfa.enroll.cancelled` | Result `ok` — "benign, nothing enrolled", not "enrollment succeeded". The provisional secret the first code was verified against was no longer the stored one when the enrollment was committed (#3808). The store cannot tell why — a disable, a re-init, the stale-provisional sweep, `--mfa-reset` or an online KEK rewrap all look the same — so the detail states only the fact: `reason=provisional_secret_changed; nothing enrolled`. Not a bad code (`mfa.enroll.failed`) and not a store outage (no 503, no `yuzu_auth_secret_unavailable_total`). `POST /login/mfa/enroll` answers 409 and the pending token is spent (sign in again); Settings shows "Enrollment was cancelled or replaced. Start enrollment again." with the Set-up button |
 | `mfa.disabled` | `POST /api/settings/mfa/disable` (an `attempted` + `MFA clear requested via Settings` intent row first, written before the factor is touched and fail-closed: the route answers `503` and changes nothing if it is not accepted; then the outcome row: `ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; `partial` + `sessions_ended=failed` when the factor was cleared but its sessions were not ended; `error` + `disable failed (sessions_ended=<n>\|failed)` when the clear itself failed (its sessions are still ended); `denied` + `reason=factor_changed expected_gen=<n>` when the account's factor changed after the step-up check admitted the request (nothing was changed); `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |
 | `mfa.login.failed` | `POST /login/mfa` rejected (TOTP or recovery) |
-| `mfa.recovery_codes.generated` | Enrollment, regenerate, or login bootstrap |
+| `mfa.recovery_codes.generated` | Enrollment, regenerate, or login bootstrap. A refused regeneration caused by a CSPRNG fault is `result=error`, `detail=csprng_unavailable: mfa_recovery ...` (#6995). |
 | `mfa.recovery_code.used` | `POST /login/mfa` accepted a recovery code |
 
 PR 2 adds `mfa.step_up.required`, `mfa.step_up.passed`,
@@ -706,7 +707,10 @@ regress:
    deactivated or deleted row, a failed classify query and a miss no fact
    explains still fail closed as `WriteFailed` (503). `CredentialChanged` and
    `MfaAlreadyEnrolled` outrank it (a password reset also wipes the provisional
-   secret).
+   secret). A CSPRNG failure while minting a TOTP secret, a recovery code or its salt is not
+   `WriteFailed`: it is `EntropyUnavailable` (#6995), still a fail-closed 503 and still inside
+   `is_store_unavailable()`, but counted in `yuzu_secure_random_failure_total` and not as a store
+   outage (`is_entropy_failure()` / `is_store_fault()` split the two).
 4. **`mfa_pending_` token TTL is enforced on every access** via
    `reap_mfa_pending_locked`. A 5-minute window between password
    success and TOTP submission is a credential-stuffing surface — keep
@@ -750,8 +754,11 @@ regress:
 
 9. **There is one step-up table, and it fails closed.** The set of routes that
    need a fresh MFA proof is `kStepUpPolicy` in `step_up_policy.hpp`, evaluated
-   once per request by the chokepoint in the pre-request stage
-   (`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`).
+   once per request by the chokepoint in the post-read stage
+   (`run_post_read_stage` in `step_up_wiring.hpp`, installed by `server.cpp` through
+   `PostReadStageRegistry` and run by the route sink).
+   The stage is a handler wrapper, so coverage is per route registered through the
+   sink, and the install must precede the first route.
    Regressions to guard against: (a) a second list of gated routes, or a new
    per-handler `step_up_fn` call used as the only enforcement for a route (a
    handler can forget it; the table cannot be bypassed by omission); (b) a
@@ -802,3 +809,12 @@ regress:
    or proof. Chokepoint PR 2: the pass and the in-handler calls may be deleted once handlers
    consume the centrally resolved session or the repeated resolves are removed (#6200); the
    binding stays until then, and ideally then carries the resolved session itself. (h) a local enrolled proof judged anywhere but `judge_local_mfa_binding` (`mfa_factor_state.hpp`, shared by the central check and the approver gate); a `kFactorCredential` row made hatch-exempt or admitting a non-local session; a binding read that ignores `binding_enforced`; a Settings Disable clear that does not compare the admitted factor generation under the row lock (`AuthDB::mfa_disable_report`).
+   Also: (i) a route served with no stage, or a stage that runs before the body is read: a stage
+   not installed for the server (or installed after the first route, so that route is left
+   unwrapped), a registration that bypasses the sink, or an `ExemptNoStage` beyond the plaintext
+   redirect listener. The sink throws on a stageless server and `install` throws once a route
+   is recorded; a best-effort source scan pins the single production exemption (constructed on
+   the redirect server member), the absence of a literal direct verb call on either server
+   member (`web_server_->`, `redirect_server_->`), and the absence of a literal-path mutating
+   registration on any receiver other than `sink`. It does not see an alias with a variable
+   path, a `ContentReader` overload or a custom-method route.

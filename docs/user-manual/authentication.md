@@ -91,6 +91,8 @@ Yuzu supports RFC 6238 TOTP (Time-based One-Time Passwords) as a second factor f
 3. Scan the QR code with your authenticator app, or type the base32 secret in manually if you can't scan.
 4. Enter the next 6-digit code shown by your authenticator app and click **Confirm**.
 5. The server confirms enrollment and reveals 10 single-use recovery codes in the format `XXXX-XXXX-XXXX-XXXX` (80 bits of entropy). **Save the codes somewhere safe** — they are shown exactly once.
+
+   If the server cannot draw random numbers at that moment, it refuses the enrolment, issues no codes and leaves you not enrolled; retry later. See [Random-number failure during MFA enrolment](security-hardening.md#random-number-failure-during-mfa-enrolment).
 6. From now on, every login by this account will prompt for a TOTP code after the password.
 
 The confirming code counts as a fresh step-up proof, so a just-enrolled administrator can regenerate recovery codes or disable two-factor straight away, but only inside the factor-credential window (`min(--mfa-step-up-window-secs, 300)` seconds, 300 when the setting is `0` or less; default 300 s) and only from the session that confirmed. Any other session, and this one once the window has passed, needs a fresh proof (see the next two sections). The session is stamped only when it is a local cookie session of the same user; a bearer principal, an absent or mismatched cookie, or a store failure leaves it unstamped, which `mfa.enroll.verified` records in its detail (`step_up_proof=stamped` or `step_up_proof=not_stamped`; `not_stamped;factor_changed` when the factor changed again while the code was being confirmed, `not_stamped;verification_future_dated` when the database clock stepped back in between). The proof is stored with the generation of the factor just enrolled, so it counts as belonging to that factor straight away.
@@ -132,6 +134,8 @@ This route is step-up-gated in the same way as regeneration, with the same limit
 #### Recovery when locked out
 
 If a user loses both their authenticator and all 10 recovery codes (or is locked out by MFA enforcement), an operator clears their MFA on the server host with the audited break-glass command `yuzu-server --mfa-reset <username>`, which also ends every session of the account (API tokens are untouched). See `docs/ops-runbooks/auth-db-recovery.md` "Emergency MFA disable" for the full procedure (it writes an `mfa.reset.breakglass` intent row before it clears anything, and an outcome row after; a direct-SQL fallback is documented for hosts without the binary).
+
+If nobody can sign in or enrol and the cause is the host's random-number generator rather than a lost authenticator, `--mfa-reset` does not help (it clears an enrolment, and the blocked account has none). See [MFA enrolment refused: random-number failure](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503).
 
 #### Configuration flags
 
@@ -1280,11 +1284,11 @@ MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier`
 |---|---|
 | `readonly` | Read-only tools only (list agents, query audit log, check compliance, etc.) |
 | `operator` | Read-only tools + tag writes + auto-approved instruction executions |
-| `supervised` | All operations, but destructive actions require admin approval via the approval workflow |
+| `supervised` | All operations, but destructive actions require admin approval via the approval workflow, except the closed exempt list of MCP tools (currently only `cancel_execution`; see "Tier details" in `mcp.md`) |
 
 Tier enforcement happens *before* RBAC checks. A tier can block an operation even when RBAC would permit it; conversely, if the tier permits but RBAC denies, the request is still blocked. Both layers must allow.
 
-The `supervised` tier marks destructive operations as approval-gated, and the behaviour now depends on the transport. On the MCP `/mcp/v1/` transport these run through the **ticket-then-recall** approval flow: the first call mints a pending approval, and after an admin approves it, a recall carrying the `approval_id` executes the operation. On a non-MCP transport (the REST API) an approval-gated operation is denied with an `auth.approval_required` audit; only Reads and trivially-allowed operations succeed there.
+The `supervised` tier marks destructive operations as approval-gated, except for a closed list of exempt MCP tools (currently only `cancel_execution`, which only marks a tracker record cancelled and sends nothing to a device; the exemption is MCP only, and "Tier details" in `mcp.md` explains it), and the behaviour now depends on the transport. On the MCP `/mcp/v1/` transport these run through the **ticket-then-recall** approval flow: the first call mints a pending approval, and after an admin approves it, a recall carrying the `approval_id` executes the operation. On a non-MCP transport (the REST API) an approval-gated operation is denied with an `auth.approval_required` audit; only Reads and trivially-allowed operations succeed there.
 
 ### Creating an MCP Token
 

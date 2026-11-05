@@ -39,10 +39,13 @@
 #include <atomic>
 #include <cctype> // std::isalnum / std::toupper
 #include <chrono>
+#include <cstdint>
 #include <cstdlib> // std::strtoll
 #include <mutex>
 #include <span>
+#include <stdexcept> // std::runtime_error: the salt-draw catch (#6995)
 #include <thread>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -541,7 +544,7 @@ regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
             spdlog::error("regenerate_recovery_codes: CSPRNG failure minting a recovery code "
                           "for '{}' — refusing to issue recovery codes",
                           username);
-            return std::unexpected(AuthDBError::WriteFailed);
+            return std::unexpected(AuthDBError::EntropyUnavailable); // #6995: not a store fault
         }
         auto code = std::move(*minted);
         std::string norm;
@@ -551,7 +554,25 @@ regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
                 continue;
             norm += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         }
-        auto salt = auth::AuthManager::random_bytes(16);
+        // #6995 (gov UP-1/CO-1): the per-code salt is drawn through AuthManager::random_bytes,
+        // which THROWS (std::runtime_error) when the CSPRNG fails, unlike the typed
+        // mfa::random_recovery_code draw above. Left uncaught it unwinds through the txn
+        // callback (PgTxn still rolls back) into httplib, which installs no exception handler:
+        // a bare 500 with NO audit row, NO event and NO counter, for the very fault class this
+        // follow-up exists to make visible. Catch it HERE, inside the callback's helper, so the
+        // rollback is unchanged and the fault takes the same audited EntropyUnavailable path.
+        std::vector<std::uint8_t> salt;
+        try {
+            salt = auth::AuthManager::random_bytes(16);
+        } catch (const std::runtime_error& e) {
+            // runtime_error is all random_bytes throws for an entropy failure (RAND_bytes or
+            // BCryptGenRandom); a std::bad_alloc is NOT an entropy fault and must propagate rather
+            // than be audited and counted as one.
+            spdlog::error("regenerate_recovery_codes: CSPRNG failure drawing a recovery-code salt "
+                          "for '{}' ({}) - refusing to issue recovery codes",
+                          username, e.what());
+            return std::unexpected(AuthDBError::EntropyUnavailable);
+        }
         auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
         auto hash = auth::AuthManager::pbkdf2_sha256(norm, salt, kRecoveryCodePbkdfIters);
 
@@ -1967,7 +1988,7 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
             spdlog::error("mfa_init_enrollment: CSPRNG failure minting TOTP secret for '{}' — "
                           "refusing enrollment",
                           username);
-            return std::unexpected(AuthDBError::WriteFailed);
+            return std::unexpected(AuthDBError::EntropyUnavailable); // #6995: not a store fault
         }
         auto secret_bytes = std::move(*minted_secret);
         auto secret_view = std::string_view(reinterpret_cast<const char*>(secret_bytes.data()),

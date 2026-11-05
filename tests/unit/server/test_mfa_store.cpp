@@ -21,16 +21,22 @@
 #include "../../../server/core/src/totp.hpp"
 #include "pg/pg_exec.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_forced_csprng_failure.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::auth::AuthManager;
@@ -371,31 +377,13 @@ TEST_CASE("mfa_init_enrollment aborts with no plaintext/partial write when encry
 // consumed by the first `fill_random` on this thread, which in these paths is
 // the mfa::random_secret / mfa::random_recovery_code call under test.
 //
-// KNOWN LIMIT: the hook always fails the FIRST draw, so the regeneration case
-// below fails on recovery code #0 (the DELETE has run, no INSERT has). A failure
-// at code #1..#9 (DELETE plus k INSERTs already issued) takes the same
-// `unexpected(WriteFailed)` -> `with_txn_for` rollback path, so it is covered by
-// reading `run_in_txn`, not by this test.
+// KNOWN LIMIT: this typed-draw hook always fails the FIRST draw, so the regeneration case
+// below fails on recovery code #0 (the DELETE has run, no INSERT has). A failure at code #1..#9
+// (DELETE plus k INSERTs already issued) takes the same `unexpected(EntropyUnavailable)` ->
+// `with_txn_for` rollback path; that mid-batch rollback IS covered, for the per-code SALT draw, by the
+// `FailNthSaltDraw` tests further down (nth 5 and 10, and the concurrent case).
 
-namespace {
-
-/// Arms the one-shot CSPRNG failure hook and GUARANTEES it is disarmed on scope
-/// exit. Without this, a REQUIRE that throws before the hooked draw runs would
-/// leave the flag armed on this thread and poison the next test case's first
-/// `fill_random` (#4763). Test-only; never used from production code.
-struct ForcedCsprngFailure {
-    ForcedCsprngFailure() { yuzu::server::test_hooks::force_next_failure_for_this_thread(); }
-    ~ForcedCsprngFailure() {
-        if (yuzu::server::test_hooks::is_failure_forced_for_this_thread()) {
-            std::array<std::uint8_t, 1> drain{};
-            (void)yuzu::server::fill_random(std::span<std::uint8_t>{drain}); // consumes the flag
-        }
-    }
-    ForcedCsprngFailure(const ForcedCsprngFailure&) = delete;
-    ForcedCsprngFailure& operator=(const ForcedCsprngFailure&) = delete;
-};
-
-} // namespace
+using yuzu::test::ForcedCsprngFailure; // shared with the route tests (#6995)
 
 TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment fails closed on a CSPRNG failure (#4763)",
                  "[pg][mfa][store]") {
@@ -403,13 +391,13 @@ TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment fails closed on a CSPRNG failu
         ForcedCsprngFailure forced;
         auto r = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
         // Checked BEFORE the guard drains it: proves the mint draw was reached and
-        // consumed the hook, i.e. the WriteFailed below is the CSPRNG path and not
+        // consumed the hook, i.e. the EntropyUnavailable below is the CSPRNG path and not
         // an unrelated earlier failure.
         REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
         return r;
     }();
     REQUIRE_FALSE(init.has_value());
-    REQUIRE(init.error() == AuthDBError::WriteFailed);
+    REQUIRE(init.error() == AuthDBError::EntropyUnavailable);
 
     // Nothing was written: not enrolled, and a retry mints a real, non-zero secret.
     auto s = db->mfa_status("alice");
@@ -441,7 +429,7 @@ TEST_CASE_METHOD(MfaFixture,
         return r;
     }();
     REQUIRE_FALSE(regen.has_value());
-    REQUIRE(regen.error() == AuthDBError::WriteFailed);
+    REQUIRE(regen.error() == AuthDBError::EntropyUnavailable);
 
     // The txn rolled back: the user keeps all ten ORIGINAL codes (not wiped,
     // not a partial new set), and one of them still redeems.
@@ -519,7 +507,7 @@ TEST_CASE_METHOD(MfaFixture,
         return r;
     }();
     REQUIRE_FALSE(failed.has_value());
-    REQUIRE(failed.error() == AuthDBError::WriteFailed);
+    REQUIRE(failed.error() == AuthDBError::EntropyUnavailable);
 
     auto s = db->mfa_status("alice");
     REQUIRE(s.has_value());
@@ -535,3 +523,130 @@ TEST_CASE_METHOD(MfaFixture,
     REQUIRE(after->enrolled);
     REQUIRE(after->recovery_codes_remaining == 10);
 }
+
+// ── #6995 (gov UP-1/CH-1): the recovery-code SALT draw is part of the same fault class ──────────
+// The salt comes from AuthManager::random_bytes, which calls RAND_bytes directly and THROWS on
+// failure. Before #6995 that exception unwound out of the txn callback into httplib (a bare 500,
+// no audit row, no counter). `FailNthSaltDraw` fails exactly the Nth 16-byte RAND_bytes call; a
+// recovery code is 10 bytes and a TOTP secret 20, so only a salt can match.
+#ifndef _WIN32
+TEST_CASE_METHOD(MfaFixture,
+                 "mfa_regenerate_recovery_codes maps a salt-draw failure to EntropyUnavailable "
+                 "and rolls back (#6995)",
+                 "[pg][mfa][store]") {
+    auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto original = db->mfa_verify_enrollment("alice", code_for_now(init->secret_base32),
+                                              std::nullopt);
+    REQUIRE(original.has_value());
+    REQUIRE(original->size() == 10);
+
+    // First, middle and last code of the batch: the DELETE and k-1 INSERTs have run each time.
+    for (const int nth : {1, 5, 10}) {
+        INFO("salt draw #" << nth);
+        auto regen = [&] {
+            yuzu::test::FailNthSaltDraw fail{nth};
+            auto r = db->mfa_regenerate_recovery_codes("alice");
+            REQUIRE(fail.fired()); // proves the intended draw was reached, not another failure
+            return r;
+        }();
+        REQUIRE_FALSE(regen.has_value());
+        REQUIRE(regen.error() == AuthDBError::EntropyUnavailable);
+
+        // Rolled back: all ten ORIGINAL codes remain (no wipe, no partial set).
+        auto s = db->mfa_status("alice");
+        REQUIRE(s.has_value());
+        REQUIRE(s->recovery_codes_remaining == 10);
+    }
+    auto consumed = db->mfa_consume_recovery_code("alice", (*original)[0]);
+    REQUIRE(consumed.has_value());
+    REQUIRE(*consumed);
+
+    // Healthy RNG afterwards: regeneration works again.
+    auto fresh = db->mfa_regenerate_recovery_codes("alice");
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->size() == 10);
+}
+
+TEST_CASE_METHOD(MfaFixture,
+                 "mfa_verify_enrollment rolls the enrol back on a salt-draw failure and the same "
+                 "code can retry (#6995)",
+                 "[pg][mfa][store]") {
+    auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    const auto code = code_for_now(init->secret_base32);
+
+    auto failed = [&] {
+        yuzu::test::FailNthSaltDraw fail{1};
+        auto r = db->mfa_verify_enrollment("alice", code, std::nullopt);
+        REQUIRE(fail.fired());
+        return r;
+    }();
+    REQUIRE_FALSE(failed.has_value());
+    REQUIRE(failed.error() == AuthDBError::EntropyUnavailable);
+
+    auto s = db->mfa_status("alice");
+    REQUIRE(s.has_value());
+    REQUIRE_FALSE(s->enrolled); // the enrolling UPDATE and the TOTP counter rolled back together
+    REQUIRE(s->recovery_codes_remaining == 0);
+
+    auto ok = db->mfa_verify_enrollment("alice", code, std::nullopt); // same code, healthy RNG
+    REQUIRE(ok.has_value());
+    REQUIRE(ok->size() == 10);
+}
+// CH-2 (gov Gate 5): a fault in one regeneration racing a clean one. The two serialise on the
+// auth.users row lock; whichever order they run in, the faulting caller must roll back to nothing and
+// the clean caller's set must be the one that remains -- never a mix of old and new codes. The salt
+// counter is thread-local, so only the faulting thread's draw is failed.
+TEST_CASE_METHOD(MfaFixture,
+                 "concurrent regenerate: one caller's salt-draw failure never leaves a mixed set "
+                 "(#6995)",
+                 "[pg][mfa][store]") {
+    auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto original = db->mfa_verify_enrollment("alice", code_for_now(init->secret_base32),
+                                              std::nullopt);
+    REQUIRE(original.has_value());
+
+    std::atomic<bool> go{false};
+    std::expected<std::vector<std::string>, AuthDBError> faulting =
+        std::unexpected(AuthDBError::WriteFailed);
+    std::expected<std::vector<std::string>, AuthDBError> clean =
+        std::unexpected(AuthDBError::WriteFailed);
+    bool fired = false;
+
+    std::thread a{[&] {
+        yuzu::test::FailNthSaltDraw fail{5};
+        while (!go.load())
+            std::this_thread::yield();
+        faulting = db->mfa_regenerate_recovery_codes("alice");
+        fired = fail.fired();
+    }};
+    std::thread b{[&] {
+        while (!go.load())
+            std::this_thread::yield();
+        clean = db->mfa_regenerate_recovery_codes("alice");
+    }};
+    go.store(true);
+    a.join();
+    b.join();
+
+    REQUIRE(fired);
+    REQUIRE_FALSE(faulting.has_value());
+    CHECK(faulting.error() == AuthDBError::EntropyUnavailable);
+    REQUIRE(clean.has_value());
+    REQUIRE(clean->size() == 10);
+
+    // Exactly the clean caller's ten codes remain: none of the originals, and no partial set.
+    auto s = db->mfa_status("alice");
+    REQUIRE(s.has_value());
+    CHECK(s->recovery_codes_remaining == 10);
+    auto old_code = db->mfa_consume_recovery_code("alice", (*original)[0]);
+    REQUIRE(old_code.has_value());
+    CHECK_FALSE(*old_code);
+    auto new_code = db->mfa_consume_recovery_code("alice", (*clean)[0]);
+    REQUIRE(new_code.has_value());
+    CHECK(*new_code);
+}
+
+#endif // !_WIN32

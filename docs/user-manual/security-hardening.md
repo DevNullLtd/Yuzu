@@ -188,7 +188,7 @@ certificate the install CA signed with that URI, so a deployment that guards the
 the server key should stay in `pin` mode or use `identity` with a pin (which requires both). The identity also trusts the issuing CA's issuance policy: do not enable it where the listener's `cacertfile` is a corporate CA that lets a requester choose a URI SAN with serverAuth (stay in `pin`), and an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (a bundle, or an empty, unreadable or half-written file) refuses to boot unless the mode is `identity` with a pin configured (`identity_over_ca_bundle`). A serial
 deny-list, `mgmt_peer_denied`, refuses a withdrawn certificate in every mode and is read at boot (a change
 takes effect at the next gateway restart, which disconnects the node's agents; a gateway rolled back to a
-pre-#6016 binary does not honour it). Revoking the server certificate in the CA inventory does NOT remove its command-plane access (the gateway reads no CRL until the follow-up; under the old pin default, replacing the pinned file withdrew a key within a few seconds without a restart; now withdrawal is a serial in `mgmt_peer_denied` plus a gateway restart, which disconnects the node's agents, and agents without the #5183 fix stay wedged). The gateway **refuses to boot** when a
+pre-#6016 binary does not honour it). Revoking the server certificate in the CA inventory removes its command-plane access only on a gateway that sets `{yuzu_gw, mgmt_crl_source}`: that gateway reads the CA's CRL (verified by signature against the management listener's CA, fetched over verified TLS) and refuses a listed serial with `crl_revoked` within `mgmt_crl_refresh_ms` of the server publishing it, with no restart, and refuses every stream (`revocation_unknown`, `revocation_stale`) when it holds no usable CRL or one past `nextUpdate` plus `mgmt_crl_grace_s`. A gateway with no source reads no CRL, so for it withdrawal is a serial in `mgmt_peer_denied` plus a gateway restart, which disconnects the node's agents, and agents without the #5183 fix stay wedged; the boot logs a WARN for that case. See "Withdrawing a server certificate" in [gateway.md](gateway.md). The gateway **refuses to boot** when a
 network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
@@ -257,6 +257,12 @@ For HashiCorp Vault integration, use a wrapper script that fetches secrets at st
 export YUZU_OIDC_CLIENT_SECRET=$(vault kv get -field=secret secret/yuzu/oidc)
 exec /usr/local/bin/yuzu-server "$@"
 ```
+
+## Random-number failure during MFA enrolment
+
+If the host's random source fails while the server is generating an MFA TOTP secret, a recovery code or a recovery code's salt, the server refuses the request and issues nothing: no TOTP secret, no recovery codes and no partial enrolment. An enrolment being confirmed at that moment is rolled back and the existing recovery codes stay valid. The operator sees a retryable "Authentication store is temporarily unavailable" message (HTTP `503` at sign-in) and can retry once the host recovers. Stored enrolments and recovery codes are untouched.
+
+These attempts are audited with a `detail` starting `csprng_unavailable: ` and counted in `yuzu_secure_random_failure_total{site="mfa_enroll"|"mfa_recovery"}`, separately from a database outage. The same random source also mints sign-in and session tokens, and those draws are **not** counted or audited: if the source is wholly dead, new sign-ins fail with a bare `500` (already-established sessions keep working, but an action that mints a random identifier, such as dispatching a command from the dashboard, can fail too), and the only signals are the sign-in error rate and the server log. At the enrolment confirm step the session is minted after the enrolment has committed, so a failure there leaves the account enrolled with recovery codes the user never saw; regenerate them from Settings. See [Secret-minting failure metric](metrics.md#secret-minting-csprng-failure-metric) and the [response runbook](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503).
 
 ## Rate Limiting
 

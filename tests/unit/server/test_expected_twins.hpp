@@ -45,6 +45,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"list_discovered_devices", "Infrastructure", "Read", true},
     // The MCP twin of POST /api/v1/hardware/sync (same Execution:Execute gate).
     {"sync_hardware_software", "Execution", "Execute", false},
+    // #2146: the MCP twin of POST /api/v1/instructions/{id}/execute (and the legacy
+    // POST /api/instructions/{id}/execute): the same plain Execution:Execute gate.
+    {"execute_instruction_definition", "Execution", "Execute", false},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},

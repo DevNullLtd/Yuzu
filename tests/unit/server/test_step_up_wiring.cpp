@@ -1,18 +1,20 @@
 /**
- * test_step_up_wiring.cpp - the MFA step-up chokepoint as wired into the pre-request handler,
+ * test_step_up_wiring.cpp - the MFA step-up chokepoint as wired as the post-read stage,
  * driven through a REAL httplib::Server over a loopback socket.
  *
  * test_step_up_gate.cpp proves the pieces (decide, render, `apply_step_up_chokepoint`) with
- * hand-built `httplib::Request`s. None of that proves that httplib hands the pre-request handler
+ * hand-built `httplib::Request`s. None of that proves that httplib hands the post-read stage
  * a `matched_route` equal to the registered pattern for a regex route, that the refusal reaches the
  * client with its headers, or that a pass is visible to the route handler on the same worker
- * thread. This file installs `detail::run_pre_request_stage` (step_up_wiring.hpp, the function
- * `server.cpp`'s `set_pre_request_handler` lambda calls) on a real server, with a stubbed session
- * resolver and MFA store, and sends real requests. It needs no Postgres except for the one `[pg]`
+ * thread. This file installs `detail::run_post_read_stage` (step_up_wiring.hpp, the function
+ * `server.cpp`'s `PostReadStageRegistry::install` lambda calls) on a real server through the
+ * route sink, as production does, with a stubbed session resolver and MFA store, and sends real
+ * requests. It needs no Postgres except for the one `[pg]`
  * case that gives the approval handler a real `ApprovalManager`.
  *
- * Mutation check (recorded in the commit message): making `run_pre_request_stage` skip
- * `apply_step_up_chokepoint` turns the refusal test red.
+ * Mutation check: making `run_post_read_stage` skip `apply_step_up_chokepoint` is expected to
+ * turn the stale-proof refusal test red ("a stale-proof local session is refused on a regex
+ * kRequired route before the handler").
  */
 
 #include "../../../server/core/src/approval_manager.hpp"
@@ -21,6 +23,7 @@
 #include "../../../server/core/src/same_site_write_gate.hpp"
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "../../../server/core/src/step_up_wiring.hpp"
+#include "post_read_stage_test_support.hpp"
 
 #include "auth_routes.hpp"
 #include "oidc_provider.hpp"
@@ -190,6 +193,9 @@ struct ListenerThread {
 
 struct WiringServer {
     httplib::Server svr;
+    // Declared after `svr`, so it is destroyed BEFORE `svr` (members are destroyed in reverse
+    // declaration order); see post_read_stage_test_support.hpp.
+    std::optional<yuzu::test::PostReadStageScope> stage_scope;
     int port{0};
 
     // Per-request inputs, mutated between requests by the test thread and read by worker threads.
@@ -276,11 +282,11 @@ struct WiringServer {
                 detail::clear_step_up_pass();
             return httplib::Server::HandlerResponse::Unhandled;
         });
-        // The SAME function server.cpp's set_pre_request_handler lambda calls. The deps are built
+        // The SAME function server.cpp's PostReadStageRegistry::install lambda calls. The deps are built
         // per request, as in production.
-        svr.set_pre_request_handler(
-            [this](const httplib::Request& req,
-                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+        stage_scope.emplace(
+            svr, [this](const httplib::Request& req,
+                       httplib::Response& res) -> httplib::Server::HandlerResponse {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
@@ -289,7 +295,7 @@ struct WiringServer {
                                                 .metrics = &metrics,
                                                 .window_secs = 300,
                                                 .mfa_enforcement = "optional"};
-                return detail::run_pre_request_stage(req, res, deps);
+                return detail::run_post_read_stage(req, res, deps);
             });
         // Mirrors server.cpp's post-routing handler: an unconsumed pass on a 2xx is counted, and
         // the stash is always cleared.
@@ -297,7 +303,8 @@ struct WiringServer {
             detail::finish_step_up_pass(req, res, &metrics);
         });
 
-        svr.Post(std::string(kRotatePattern),
+        HttplibRouteSink route_sink{svr};
+        route_sink.Post(std::string(kRotatePattern),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      rotate_handler_calls.fetch_add(1);
                      rotate_req_addr.store(&req);
@@ -313,7 +320,7 @@ struct WiringServer {
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
-        svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
+        route_sink.Post(std::string(kRaisePath), [this](const httplib::Request& req,
                                                  httplib::Response& res) {
             raise_handler_calls.fetch_add(1);
             raise_req_addr.store(&req);
@@ -359,7 +366,7 @@ struct WiringServer {
             res.status = 200;
             res.set_content("{\"ok\":true}", "application/json");
         });
-        svr.Post(std::string(kUnclassifiedPath),
+        route_sink.Post(std::string(kUnclassifiedPath),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      unclassified_handler_calls.fetch_add(1);
                      unclassified_req_addr.store(&req);
@@ -468,7 +475,7 @@ TEST_CASE("wiring: a fresh proof reaches the handler, which consumes the pass on
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(s.rotate_handler_calls.load() == 1);
-    // The stash armed in the pre-request handler was visible to the route handler (same thread).
+    // The stash armed in the post-read stage was visible to the route handler (same thread).
     CHECK(s.handler_consumed_pass.load());
     CHECK(s.audit_rows().empty());
     CHECK(s.gate_count("pass", "local", "rest") == 1);
@@ -576,7 +583,7 @@ TEST_CASE("wiring: a bearer principal passes a kRequired route and an unresolved
 
 namespace {
 
-// The REAL approval routes (approval_routes.cpp) behind the same pre-request stage as production.
+// The REAL approval routes (approval_routes.cpp) behind the same post-read stage as production.
 // With no ApprovalManager wired (the default), a request that gets past the handler's class check
 // answers 503 ("service unavailable") before the handler's own step-up call, so no store is
 // needed to see WHERE each caller class is stopped. With a real manager (the `[pg]` case) the
@@ -585,6 +592,9 @@ namespace {
 // consumes the chokepoint's pass for exactly that label, and any other call fails closed 503).
 struct ApprovalWiringServer {
     httplib::Server svr;
+    // Declared after `svr`, so it is destroyed BEFORE `svr` (members are destroyed in reverse
+    // declaration order); see post_read_stage_test_support.hpp.
+    std::optional<yuzu::test::PostReadStageScope> stage_scope;
     int port{0};
 
     ApprovalManager* approval_manager{nullptr};
@@ -664,9 +674,9 @@ struct ApprovalWiringServer {
             }
             return httplib::Server::HandlerResponse::Unhandled;
         });
-        svr.set_pre_request_handler(
-            [this](const httplib::Request& req,
-                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+        stage_scope.emplace(
+            svr, [this](const httplib::Request& req,
+                       httplib::Response& res) -> httplib::Server::HandlerResponse {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
@@ -675,7 +685,7 @@ struct ApprovalWiringServer {
                                                 .metrics = &metrics,
                                                 .window_secs = window_secs,
                                                 .mfa_enforcement = "optional"};
-                return detail::run_pre_request_stage(req, res, deps);
+                return detail::run_post_read_stage(req, res, deps);
             });
         svr.set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
             detail::finish_step_up_pass(req, res, &metrics);
@@ -1008,13 +1018,13 @@ TEST_CASE("wiring: the approve handler does not consume a pass earned by another
 
 // COVERAGE NOTE (policy-generation raise). The real route's handler (rest_api_v1.cpp) is driven
 // by test_guardian_generation_raise.cpp through RbacRoleHarness, whose `TestRouteSink` does not run
-// the pre-request stage, so a test of the REAL handler behind the REAL central check would need the
+// the post-read stage, so a test of the REAL handler behind the REAL central check would need the
 // harness re-plumbed onto a socket-backed sink and its stores. That is not done here. What covers
 // the route instead: the kRequired table row and its label (test_step_up_route_inventory.cpp pins
 // the row and that the handler's call site carries the same label), the handler's own refusals
 // (test_guardian_generation_raise.cpp), and this case, which registers a STUB handler at the real
 // path so the central decision for that row (engine, stale proof, fresh proof) runs through the
-// production pre-request stage over a socket. It proves the chokepoint's behaviour for the row, not
+// production post-read stage over a socket. It proves the chokepoint's behaviour for the row, not
 // the handler's.
 TEST_CASE("wiring: the policy-generation raise row is decided by the central check before the "
           "handler",
@@ -1298,6 +1308,9 @@ namespace {
 // credential on one request, the cookie ceasing to validate between two resolutions.
 struct RealResolveServer {
     httplib::Server svr;
+    // Declared after `svr`, so it is destroyed BEFORE `svr` (members are destroyed in reverse
+    // declaration order); see post_read_stage_test_support.hpp.
+    std::optional<yuzu::test::PostReadStageScope> stage_scope;
     int port{0};
 
     yuzu::test::ApiTokenStorePg api_tokens;
@@ -1345,9 +1358,9 @@ struct RealResolveServer {
             detail::clear_step_up_pass();
             return httplib::Server::HandlerResponse::Unhandled;
         });
-        svr.set_pre_request_handler(
-            [this](const httplib::Request& req,
-                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+        stage_scope.emplace(
+            svr, [this](const httplib::Request& req,
+                       httplib::Response& res) -> httplib::Server::HandlerResponse {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
@@ -1355,12 +1368,13 @@ struct RealResolveServer {
                                                 .metrics = &metrics,
                                                 .window_secs = 300,
                                                 .mfa_enforcement = "optional"};
-                return detail::run_pre_request_stage(req, res, deps);
+                return detail::run_post_read_stage(req, res, deps);
             });
         svr.set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
             detail::finish_step_up_pass(req, res, &metrics);
         });
-        svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
+        HttplibRouteSink route_sink{svr};
+        route_sink.Post(std::string(kRaisePath), [this](const httplib::Request& req,
                                                  httplib::Response& res) {
             const auto first = routes->resolve_session(req); // `auth_fn`
             if (!first) {
@@ -1406,12 +1420,15 @@ struct RealResolveServer {
 } // namespace
 
 namespace {
-// The REAL `AuthRoutes::resolve_session` behind the real pre-request stage with no ApiTokenStore
+// The REAL `AuthRoutes::resolve_session` behind the real post-read stage with no ApiTokenStore
 // (no Postgres): cookie sessions only. The handler replaces the request's Cookie header with
 // another principal's session between its two resolutions, as a later resolution that lands on a
 // different credential would see.
 struct CookieResolveServer {
     httplib::Server svr;
+    // Declared after `svr`, so it is destroyed BEFORE `svr` (members are destroyed in reverse
+    // declaration order); see post_read_stage_test_support.hpp.
+    std::optional<yuzu::test::PostReadStageScope> stage_scope;
     int port{0};
 
     Config cfg{};
@@ -1451,9 +1468,9 @@ struct CookieResolveServer {
             detail::clear_step_up_pass();
             return httplib::Server::HandlerResponse::Unhandled;
         });
-        svr.set_pre_request_handler(
-            [this](const httplib::Request& req,
-                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+        stage_scope.emplace(
+            svr, [this](const httplib::Request& req,
+                       httplib::Response& res) -> httplib::Server::HandlerResponse {
                 const StepUpChokepointDeps deps{.resolve_session = &resolver,
                                                 .auth_db = nullptr,
                                                 .mfa_status = &mfa_status,
@@ -1461,12 +1478,13 @@ struct CookieResolveServer {
                                                 .metrics = &metrics,
                                                 .window_secs = 300,
                                                 .mfa_enforcement = "optional"};
-                return detail::run_pre_request_stage(req, res, deps);
+                return detail::run_post_read_stage(req, res, deps);
             });
         svr.set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
             detail::finish_step_up_pass(req, res, &metrics);
         });
-        svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
+        HttplibRouteSink route_sink{svr};
+        route_sink.Post(std::string(kRaisePath), [this](const httplib::Request& req,
                                                  httplib::Response& res) {
             const auto first = routes->resolve_session(req); // `auth_fn`
             if (!first) {
@@ -1676,7 +1694,7 @@ TEST_CASE("wiring: an over-cap body is refused 413 by the body cap, before the c
     const std::string big(cap + 1, 'x');
 
     auto r = s.post(path, big);
-    // The server reads the whole body before the pre-request handler runs (that is why the cap
+    // The server reads the whole body before the post-read stage runs (that is why the cap
     // is a post-read stage here), so the 413 is written after the upload completes.
     REQUIRE(r);
     CHECK(r->status == 413);
@@ -1719,12 +1737,13 @@ std::size_t count_of(const std::string& hay, std::string_view needle) {
 } // namespace
 
 TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and post-routing, and "
-          "installs the extracted pre-request stage once",
+          "installs the extracted post-read stage once",
           "[stepup][wiring][lexical]") {
     const std::string src = read_server_cpp();
     constexpr std::string_view kClear = "detail::clear_step_up_pass();";
     constexpr std::string_view kFinish = "detail::finish_step_up_pass(req, res, &metrics_);";
-    constexpr std::string_view kStage = "detail::run_pre_request_stage(req, res, step_up_deps);";
+    constexpr std::string_view kStage = "detail::run_post_read_stage(req, res, step_up_deps);";
+    constexpr std::string_view kInstall = "PostReadStageRegistry::instance().install(";
 
     REQUIRE(count_of(src, kClear) == 1);
     REQUIRE(count_of(src, kFinish) == 1);
@@ -1732,25 +1751,32 @@ TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and p
 
     const auto pre_routing = src.find("web_server_->set_pre_routing_handler(");
     const auto clear = src.find(kClear);
-    const auto pre_request = src.find("web_server_->set_pre_request_handler(");
+    const auto pre_request = src.find(kInstall);
     const auto stage = src.find(kStage);
     const auto post_routing = src.find("web_server_->set_post_routing_handler(");
     const auto finish = src.find(kFinish);
     REQUIRE(pre_routing != std::string::npos);
     REQUIRE(pre_request != std::string::npos);
     REQUIRE(post_routing != std::string::npos);
+    // The stage is installed through the registry, never as httplib's pre-request handler: from
+    // cpp-httplib v0.47.0 that handler runs before the body is read.
+    CHECK(src.find("set_pre_request_handler(") == std::string::npos);
+    REQUIRE(count_of(src, kInstall) == 1);
 
     // Pre-routing top: the clear sits in the pre-routing handler, next to the quota-slot reset
-    // that has the same worker-thread-affinity reasoning, and before the pre-request handler.
+    // that has the same worker-thread-affinity reasoning, and before the post-read stage install.
     CHECK(pre_routing < clear);
     CHECK(clear < pre_request);
     const auto quota_reset = src.rfind("detail::tls_quota_slot().reset();", clear);
     REQUIRE(quota_reset != std::string::npos);
     CHECK(clear - quota_reset < 1200);
-
-    // The stage is called from the pre-request handler, not from anywhere else.
+    // The stage is called from the install, not from anywhere else, and the install precedes the
+    // first route registered on the web server: the sink reads the stage at registration time.
     CHECK(pre_request < stage);
     CHECK(stage < post_routing);
+    const auto first_route = src.find("auth_routes_->register_routes(*web_server_);");
+    REQUIRE(first_route != std::string::npos);
+    CHECK(stage < first_route);
 
     // Post-routing: the finish call sits in the post-routing handler, after the handler's
     // first-local scope guard, before the quota-slot release and before the response headers are
@@ -1766,6 +1792,7 @@ TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and p
     REQUIRE(headers != std::string::npos);
     CHECK(finish < headers);
 }
+
 
 namespace {
 
@@ -1913,6 +1940,66 @@ std::string read_file(const std::filesystem::path& path) {
 
 } // namespace
 
+TEST_CASE("wiring: server.cpp owns the post-read stage registration through a scope guard",
+          "[stepup][wiring][lexical]") {
+    // Run over comment- and literal-stripped text: a mention in a comment or a string cannot
+    // count as the call.
+    const std::string raw = read_server_cpp();
+    const auto stripped = strip_comments_and_literals(raw);
+    REQUIRE(stripped.clean);
+    const std::string& src = stripped.text;
+    constexpr std::string_view kAdopt = "post_read_stage_ = ScopedPostReadStage(*web_server_);";
+    constexpr std::string_view kReset = "post_read_stage_.reset();";
+    constexpr std::string_view kInstall = "PostReadStageRegistry::instance().install(";
+    REQUIRE(count_of(src, kAdopt) == 1);
+    REQUIRE(count_of(src, kReset) == 1);
+
+    const auto install = src.find(kInstall);
+    const auto adopt = src.find(kAdopt);
+    const auto first_route = src.find("auth_routes_->register_routes(*web_server_);");
+    REQUIRE(install != std::string::npos);
+    REQUIRE(first_route != std::string::npos);
+    // The guard adopts the registration right after the install and before the first route.
+    CHECK(install < adopt);
+    CHECK(adopt < first_route);
+    // No hand-paired forget of the web server's stage survives apart from the construction-time
+    // one that clears a reused address before the install.
+    CHECK(count_of(src, "PostReadStageRegistry::instance().forget(web_server_.get());") == 1);
+}
+
+// A `std::logic_error` out of start_web_server() must become a startup failure, not an exception
+// unwinding out of run() after the gRPC listeners are bound. The triggers are (a) a sink
+// registration with no stage installed, (b) `PostReadStageRegistry::install` misuse (an empty
+// stage, a second install, or a route already recorded), (c) a registration after the route table
+// is sealed (no current caller in start_web_server(): the seal runs after the last registration),
+// and (d) any incidental `std::logic_error` subtype. An unclassified route BEFORE the seal is not
+// a trigger: the pre-seal sweep sets `startup_failed_` without throwing, and is not redundant with
+// this catch. Exceptions that are not logic errors (bad_alloc, std::system_error,
+// filesystem_error) still unwind to main.
+TEST_CASE("wiring: server.cpp turns a refused route registration into a startup failure",
+          "[stepup][wiring][lexical]") {
+    const auto stripped = strip_comments_and_literals(read_server_cpp());
+    REQUIRE(stripped.clean);
+    std::string flat = stripped.text;
+    std::erase_if(flat, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
+    constexpr std::string_view kGuarded =
+        "try{start_web_server();}catch(conststd::logic_error&e){"
+        "spdlog::critical(\"\",e.what());startup_failed_=true;}";
+    CHECK(count_of(flat, kGuarded) == 1);
+    // The only call: a second, unguarded one would escape.
+    CHECK(count_of(flat, "start_web_server();") == 1);
+    // ... and the recheck that follows it stops the already-bound listeners and returns.
+    const auto guarded = flat.find(kGuarded);
+    REQUIRE(guarded != std::string::npos);
+    const auto recheck = flat.find("if(startup_failed_){", guarded);
+    REQUIRE(recheck != std::string::npos);
+    const auto recheck_return = flat.find("return;", recheck);
+    REQUIRE(recheck_return != std::string::npos);
+    // `stop();return;` adjacent: the recheck block stops the listeners and returns straight after.
+    CHECK(flat.substr(recheck, recheck_return + 7 - recheck).find("stop();return;") !=
+          std::string::npos);
+}
+
 // The stripper behind the validator floor below. A desync (a digit separator read as the start of
 // a character literal, a raw string ended at an inner quote) would hide a real call from the floor
 // without any other symptom, so each failure mode has its own case.
@@ -2042,7 +2129,7 @@ TEST_CASE("wiring: every direct session or token validator is either the resolve
     }
 }
 
-TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps name the right "
+TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the post-read deps name the right "
           "sources",
           "[stepup][wiring][lexical]") {
     const std::string src = read_server_cpp();
@@ -2088,12 +2175,12 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps nam
     CHECK(count_of(src, "auth_routes_->durable_mfa_proof_for(") == 4);
     CHECK(count_of(src, "auth_mgr_.read_durable_mfa_proof(") == 1);
 
-    // The pre-request deps block, built per request inside the pre-request handler.
-    const auto pre_request = src.find("web_server_->set_pre_request_handler(");
+    // The post-read deps block, built per request inside the installed stage.
+    const auto pre_request = src.find("PostReadStageRegistry::instance().install(");
     const auto deps = src.find("const StepUpChokepointDeps step_up_deps{", pre_request);
     REQUIRE(pre_request != std::string::npos);
     REQUIRE(deps != std::string::npos);
-    const auto stage = src.find("detail::run_pre_request_stage(req, res, step_up_deps);", deps);
+    const auto stage = src.find("detail::run_post_read_stage(req, res, step_up_deps);", deps);
     REQUIRE(stage != std::string::npos);
     const std::string block = src.substr(deps, stage - deps);
     for (const std::string_view needle :

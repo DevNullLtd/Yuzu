@@ -702,12 +702,28 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 235 mutating REST rows: 35 `kRequired`, 2 `kFactorCredential`, 3 `kOwnGate`,
-  122 `kExempt` and 73 `kPendingRuling`.
-- **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
-  body of the pre-request handler `server.cpp` installs: after the route
-  is matched and the body is read (and after the post-read body cap, which
-  lives in the same function), before any handler. The order for a `kRequired` route is therefore: session
+  table has 242 mutating REST rows: 35 `kRequired`, 2 `kFactorCredential`, 3 `kOwnGate`,
+  129 `kExempt` and 73 `kPendingRuling`.
+- **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
+  body of the post-read stage `server.cpp` installs through
+  `PostReadStageRegistry` and the route sink runs in front of every handler
+  registered through the sink: after the route is matched and the body is read
+  (and after the post-read body cap, which lives in the same function), before
+  the handler. Coverage is per route registered through the sink, not
+  server-wide: the stage is installed before the first route (`install` throws
+  if the server already has a route recorded, and `ScopedPostReadStage` owns the
+  registration), and the sink fails closed, so registering a route on a server
+  with no stage installed throws and a route owner on such a server cannot serve
+  an ungated route; the plaintext redirect listener is the one production
+  server built with the explicit `StageRequirement::ExemptNoStage`. A route
+  registered on the server outside the sink would be neither wrapped nor
+  inventoried; a best-effort source scan flags literal verb calls on `web_server_->` and
+  `redirect_server_->`, literal-path mutating registrations (Post, Put, Patch, Delete) on any
+  receiver other than `sink` in sources, any literal mutating registration in a header (so an alias
+  with a literal path is seen), and any second `ExemptNoStage`. It does not see an alias with a variable path, a
+  `ContentReader` overload or a custom-method route (a review concern). The stage is not
+  httplib's `set_pre_request_handler`, which runs before the body is read from
+  cpp-httplib v0.47.0. The order for a `kRequired` route is therefore: session
   resolution (`401` when there is none), for a cookie session the server-wide
   same-site gate (`403` `cross-site request refused`; pre-routing, see
   [Same-site gate for cookie-session writes](#same-site-gate-for-cookie-session-writes);
@@ -927,7 +943,7 @@ by each handler.
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (65 rows: 19 `kExempt`, 46
+  a second table, `step_up_mcp_policy.hpp` (68 rows: 22 `kExempt`, 46
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
   plus a separate list of tools added after it (today two), legal only for a tool
@@ -5360,6 +5376,13 @@ outage** — the latter also moves on a plain pool blip (it counts every
 store-unavailable `503` on the secret path, not only secret-decrypt failures).
 The approve and reject routes (`route="approval"`) increment only the coarser counter, never
 `yuzu_auth_read_degrade_total`, so that series does not cover them.
+One refusal in the initial `POST /login` handler is deliberately in NEITHER of those two
+counters: an MFA enrol-init that fails because the host's random-number generator failed
+(`AuthDBError::EntropyUnavailable`, #6995). No query failed, so it is counted in
+`yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_enroll"}` instead; it is still
+the same fail-closed `503`. Test `is_entropy_failure()` before `is_store_unavailable()` at any site
+that attributes a refusal to a metric (`is_store_fault()` is the "count as a store outage"
+predicate).
 The other `is_store_unavailable`→`503` auth sites (`/login/mfa`, step-up,
 enrollment, elevate) are not yet reason-instrumented (finer cardinality and
 wider coverage tracked as #2401).

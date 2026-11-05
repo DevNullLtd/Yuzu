@@ -94,14 +94,15 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (48 passes). Verified against the source sweep
+/// The exhaustive inventory (49 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
 /// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, the #5678
 /// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12, and the #5513
-/// addition of `guardian_reconcile_gate.sweep`, and the 2a-1b addition of
-/// `inventory_store.purge_typed_sources`); keep the count
+/// addition of `guardian_reconcile_gate.sweep`, the 2a-1b addition of
+/// `inventory_store.purge_typed_sources`, and the SAM.4 addition of
+/// `software_normalization_job.run_tick`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -110,11 +111,12 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"result_set_store.materialize", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "execute-once via status='pending' CAS UPDATE; device rows ON CONFLICT DO NOTHING"},
     {"result_set_store.gc_sweep", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
-     "clock-guarded (ADR-0036/0040); regenerable scratch, a double-gc of already-expired rows is harmless"},
+     "clock-guarded (ADR-0036/0040); regenerable scratch, a double-gc of already-expired rows is "
+     "harmless"},
     {"response_store.reap_expired", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (ADR-0039)"},
-    {"guaranteed_state_store.reap_expired", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
-     "clock-guarded + advisory lock (ADR-0038, #2663)"},
+    {"guaranteed_state_store.reap_expired", "result_set_maint_thread_",
+     BackgroundJobClass::ReplicaSafe, "clock-guarded + advisory lock (ADR-0038, #2663)"},
     {"session_store.reap_expired", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory-lock own-statement (ADR-2002 §4)"},
     {"execution_tracker.reap_command_execution_mappings", "result_set_maint_thread_",
@@ -122,15 +124,19 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"execution_tracker.reconcile_stale_concurrency_claims", "result_set_maint_thread_",
      BackgroundJobClass::DisabledUntilFixed,
      "advisory-lock SINGLE-WRITER (pg_try_advisory_xact_lock, WS-10 10.2, this change) — prevents "
-     "concurrent double-reconcile — but NOT yet safe for a 2nd replica: its clock authority is still "
-     "replica-local system_clock (both the claim expires_at write via now_epoch() and the reconcile "
-     "read/compare), NOT shared PG-now, so a skewed winner could release a live claim early. Named fix: "
-     "concurrency_claims DB-clock-authority migration (WS-1 class, #3715 shape, tracked #4093). Same "
+     "concurrent double-reconcile — but NOT yet safe for a 2nd replica: its clock authority is "
+     "still "
+     "replica-local system_clock (both the claim expires_at write via now_epoch() and the "
+     "reconcile "
+     "read/compare), NOT shared PG-now, so a skewed winner could release a live claim early. Named "
+     "fix: "
+     "concurrency_claims DB-clock-authority migration (WS-1 class, #3715 shape, tracked #4093). "
+     "Same "
      "posture as nvd_sync.do_sync (a pending prerequisite migration → DisabledUntilFixed), NOT "
      "ReplicaSafe — the advisory lock is real progress but does not make two replicas' clocks one "
      "authority. Runs on the single replica today; the class gates a 2nd replica on the fix"},
-    {"execution_tracker.reap_event_outbox", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
-     "clock-guarded + pg_try_advisory_xact_lock"},
+    {"execution_tracker.reap_event_outbox", "result_set_maint_thread_",
+     BackgroundJobClass::ReplicaSafe, "clock-guarded + pg_try_advisory_xact_lock"},
     {"execution_tracker.reap_stuck_running_executions", "result_set_maint_thread_",
      BackgroundJobClass::ReplicaSafe,
      "clock-guarded + pg_try_advisory_xact_lock, all-but-holder skip (#4982 fix round 2 — was "
@@ -152,59 +158,81 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "behind on system_clock could still see a fresh dispatch as already past the stuck-exec "
      "window. Not yet fixed; stamping dispatched_at from DB time is the closing move, tracked "
      "alongside the concurrency_claims migration (#4093-shape)"},
-    {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
+    {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_",
+     BackgroundJobClass::ReplicaSafe,
      "MUST run per-replica — cross-replica SSE delivery (ADR-2002 §5); NEVER leader-gate"},
-    {"gateway_route_store.reap_stale_routes", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
+    {"gateway_route_store.reap_stale_routes", "result_set_maint_thread_",
+     BackgroundJobClass::ReplicaSafe,
      "clock-guarded (SessionStore shape, clock-guard part 1 carved out, part 4 adopted "
      "direction-keyed decline-once/drain-on-repeat) + pg_try_advisory_xact_lock own-statement; "
      "DB-clock-authored leases — every replica may tick it, all but the advisory-lock holder "
-     "skip (PR #4299 round-2 external review); matches the other reaper classifications (WS-4 4.2a)"},
+     "skip (PR #4299 round-2 external review); matches the other reaper classifications (WS-4 "
+     "4.2a)"},
     {"result_set_store.counts", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "read-only gauge refresh"},
 
     // ---- typed_purge_thread_ (one-shot at boot) ----
     {"inventory_store.purge_typed_sources", "typed_purge_thread_", BackgroundJobClass::ReplicaSafe,
-     "idempotent keyset-batched DELETE of rows that must not exist (typed sources); one-shot per boot, "
-     "no clock cutoff (clock-guarded-retention parts 1-4/6/7 n/a, part 5 cap = the per-batch bound; "
-     "see docs/clock-guarded-retention.md), so a concurrent purge on another replica only finds fewer rows"},
+     "idempotent keyset-batched DELETE of rows that must not exist (typed sources); one-shot per "
+     "boot, "
+     "no clock cutoff (clock-guarded-retention parts 1-4/6/7 n/a, part 5 cap = the per-batch "
+     "bound; "
+     "see docs/clock-guarded-retention.md), so a concurrent purge on another replica only finds "
+     "fewer rows"},
 
     // ---- app_perf_rollup_thread_ (1h tick) ----
     {"app_perf_rollup.roll_window", "app_perf_rollup_thread_", BackgroundJobClass::ReplicaSafe,
      "idempotent upsert (ON CONFLICT (app_name,version,day) DO UPDATE)"},
-    {"app_perf_fleet_store.run_retention_prune", "app_perf_rollup_thread_", BackgroundJobClass::ReplicaSafe,
-     "clock-guarded + advisory lock (WS-10 10.2)"},
+    {"app_perf_fleet_store.run_retention_prune", "app_perf_rollup_thread_",
+     BackgroundJobClass::ReplicaSafe, "clock-guarded + advisory lock (WS-10 10.2)"},
 
     // ---- preflight_runner_thread_ (60s tick) ----
     {"preflight_runner.redispatch_readonly_checks", "preflight_runner_thread_",
      BackgroundJobClass::ReplicaSafe,
-     "read-only/idempotent check re-dispatch to a frozen cohort (routed concern: safe ONLY while read-only)"},
-    {"preflight_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
-     "clock-guarded + advisory lock (WS-10 10.2)"},
-    {"deployment_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
+     "read-only/idempotent check re-dispatch to a frozen cohort (routed concern: safe ONLY while "
+     "read-only)"},
+    {"preflight_run_store.run_retention_prune", "preflight_runner_thread_",
+     BackgroundJobClass::ReplicaSafe, "clock-guarded + advisory lock (WS-10 10.2)"},
+    {"deployment_run_store.run_retention_prune", "preflight_runner_thread_",
+     BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2); piggybacks the preflight thread"},
-    {"offline_endpoint_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
+    {"offline_endpoint_store.run_retention_prune", "preflight_runner_thread_",
+     BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (#5678 / #1545 UP-4); piggybacks the preflight thread"},
 
     // ---- policy_eval_thread_ (10s tick) — tick() SPLITS into two passes (PR #4134) ----
     {"policy_evaluator.collect_ready", "policy_eval_thread_", BackgroundJobClass::ReplicaSafe,
-     "MUST run per-replica: the ONLY completion path that matures an in-flight Check/FixWait created by "
-     "the operator-synchronous evaluate_now()/remediate() plane (accepted on any replica, ungated) to a "
-     "terminal verdict — gating it strands an operator remediation as `fixing` forever on a non-leader "
-     "(two-dispatch-planes rule). Replica-local + in-memory; the durable per-(policy,agent) remediation "
-     "claim it RELEASES at FixWait maturation (WS-3 3.4) is held only by this dispatching replica, so "
+     "MUST run per-replica: the ONLY completion path that matures an in-flight Check/FixWait "
+     "created by "
+     "the operator-synchronous evaluate_now()/remediate() plane (accepted on any replica, ungated) "
+     "to a "
+     "terminal verdict — gating it strands an operator remediation as `fixing` forever on a "
+     "non-leader "
+     "(two-dispatch-planes rule). Replica-local + in-memory; the durable per-(policy,agent) "
+     "remediation "
+     "claim it RELEASES at FixWait maturation (WS-3 3.4) is held only by this dispatching replica, "
+     "so "
      "there is still nothing to fence"},
     {"policy_evaluator.dispatch_due", "policy_eval_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "side-effecting due-policy scheduling dispatch; ADR-0056 claim_due_policies is fleet-safe but the leader-only gate cuts non-leader churn (WS-3 3.2). The operator remediation plane (WS-3 3.4) is a SEPARATE, ungated path with its own durable per-(policy,agent) CAS — not this due-scheduling dispatch"},
+     "side-effecting due-policy scheduling dispatch; ADR-0056 claim_due_policies is fleet-safe but "
+     "the leader-only gate cuts non-leader churn (WS-3 3.2). The operator remediation plane (WS-3 "
+     "3.4) is a SEPARATE, ungated path with its own durable per-(policy,agent) CAS — not this "
+     "due-scheduling dispatch"},
 
     // ---- schedule_tick_thread_ (30s schedule eval; 5s outbox delivery sub-tick) ----
     {"schedule_runner.tick", "schedule_tick_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "side-effecting scheduled dispatch — enqueues a durable outbox occurrence; double-enqueue across replicas without a fenced leader (WS-3 3.2/3.3)"},
+     "side-effecting scheduled dispatch — enqueues a durable outbox occurrence; double-enqueue "
+     "across replicas without a fenced leader (WS-3 3.2/3.3)"},
     {"command_outbox.deliver", "schedule_tick_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "side-effecting wire dispatch of pending command-outbox occurrences (WS-3 3.3); effectively-once holds via the stable command_id + agent dedup, but the leader gate keeps a second replica from redundantly re-driving"},
+     "side-effecting wire dispatch of pending command-outbox occurrences (WS-3 3.3); "
+     "effectively-once holds via the stable command_id + agent dedup, but the leader gate keeps a "
+     "second replica from redundantly re-driving"},
 
     // ---- quarantine_reconcile_thread_ (20s tick) ----
-    {"quarantine_reconciler.tick", "quarantine_reconcile_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "side-effecting containment re-dispatch (WS-3 3.2; confirm WS-4/5 stream-locality interaction)"},
+    {"quarantine_reconciler.tick", "quarantine_reconcile_thread_",
+     BackgroundJobClass::FencedLeaderOnly,
+     "side-effecting containment re-dispatch (WS-3 3.2; confirm WS-4/5 stream-locality "
+     "interaction)"},
 
     // ---- quarantine_snapshot_refresh_thread_ (20s tick) ----
     {"quarantine_store.list_quarantined_snapshot", "quarantine_snapshot_refresh_thread_",
@@ -212,21 +240,28 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
 
     // ---- health_recompute_thread_ (15s tick) ----
     {"health_store.recompute_metrics", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
-     "per-replica read-only fleet gauges (incl. stream-budget/pg-pool/KEK-state/cohort-perf gauges)"},
+     "per-replica read-only fleet gauges (incl. stream-budget/pg-pool/KEK-state/cohort-perf "
+     "gauges)"},
     {"software_inventory_store.count_stale_agents", "health_recompute_thread_",
      BackgroundJobClass::ReplicaSafe, "read-only inventory-freshness gauge"},
     {"registry.reap_stale_sessions", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory Subscribe-stream reap (local presence)"},
     {"ca.publish_crl", "health_recompute_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "DB-WRITE: freshness re-publish; numbering is safe on any replica (WS-6 6.1 table lock), gated only to avoid N redundant CRLs per stale tick"},
-    {"registry.teardown_revoked_streams", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
+     "DB-WRITE: freshness re-publish; numbering is safe on any replica (WS-6 6.1 table lock), "
+     "gated only to avoid N redundant CRLs per stale tick"},
+    {"registry.teardown_revoked_streams", "health_recompute_thread_",
+     BackgroundJobClass::ReplicaSafe,
      "per-replica: tears down only the Subscribe streams connected to THIS replica"},
     {"mcp_stream_bridge.sweep", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
-     "per-replica in-memory: pin-ack/session-death/age-reaper teardown over THIS replica's ≤256 bridge records; no shared state"},
+     "per-replica in-memory: pin-ack/session-death/age-reaper teardown over THIS replica's ≤256 "
+     "bridge records; no shared state"},
     {"mcp_session_registry.gc", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
-     "per-replica in-memory: destroys expired MCP session streams held by THIS replica; no shared state"},
+     "per-replica in-memory: destroys expired MCP session streams held by THIS replica; no shared "
+     "state"},
     {"guardian_reconcile_gate.sweep", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
-     "per-replica in-memory (#5513): bounded erase of stale per-agent heartbeat-reconcile claims in THIS replica's gate; steady_clock cutoff over no store, no shared state, never leader-gated"},
+     "per-replica in-memory (#5513): bounded erase of stale per-agent heartbeat-reconcile claims "
+     "in THIS replica's gate; steady_clock cutoff over no store, no shared state, never "
+     "leader-gated"},
 
     // ---- engine_rotation_sweep_thread_ (60s tick) ----
     {"api_token_store.sweep_expired_rotations", "engine_rotation_sweep_thread_",
@@ -247,26 +282,63 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"audit_store.cleanup_once", "AuditStore::cleanup_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (the canonical retention reference impl)"},
     {"analytics_event_store.drain_batch", "AnalyticsEventStore::drain_thread_",
-     BackgroundJobClass::ReplicaSafe, "SHARED-PG outbox, advisory-lock SINGLE-SWEEPER: a pg_try_advisory_xact_lock claim + UPDATE...RETURNING claims a batch (drained=true), then delivers to the registered sink(s) with NO lease held (revert-on-failure) — concurrent replicas serialize on the lock, one sweeper per tick"},
+     BackgroundJobClass::ReplicaSafe,
+     "SHARED-PG outbox, advisory-lock SINGLE-SWEEPER: a pg_try_advisory_xact_lock claim + "
+     "UPDATE...RETURNING claims a batch (drained=true), then delivers to the registered sink(s) "
+     "with NO lease held (revert-on-failure) — concurrent replicas serialize on the lock, one "
+     "sweeper per tick"},
     {"nvd_sync.do_sync", "NvdSyncManager::sync_thread_", BackgroundJobClass::DisabledUntilFixed,
-     "engine-tier migration pending (ADR-1005 Phase 7 / ADR-0023); only a process-local single-flight (sync_active_ CAS), not cross-replica — must move to the engine tier or be leader-gated before a 2nd replica"},
+     "engine-tier migration pending (ADR-1005 Phase 7 / ADR-0023); only a process-local "
+     "single-flight (sync_active_ CAS), not cross-replica — must move to the engine tier or be "
+     "leader-gated before a 2nd replica"},
 
     // ---- other dedicated component threads (added by the 2026-09-07 exhaustive sweep) ----
     {"cert_reloader.run_loop", "CertReloader::thread_", BackgroundJobClass::ReplicaSafe,
-     "per-replica: polls THIS replica's on-disk cert/key mtimes and hot-swaps its own in-process SSL_CTX; each reload also writes ONE audit row (an unconditional INSERT, not deduplicated — per-replica audit observations are expected to differ)"},
+     "per-replica: polls THIS replica's on-disk cert/key mtimes and hot-swaps its own in-process "
+     "SSL_CTX; each reload also writes ONE audit row (an unconditional INSERT, not deduplicated — "
+     "per-replica audit observations are expected to differ)"},
     {"software_catalog_rollup.refresh_catalog_rollup", "SoftwareCatalogRollup::thread_",
      BackgroundJobClass::ReplicaSafe,
-     "SHARED-PG, SINGLE-WRITER: refresh_catalog_rollup ALREADY takes a transaction-scoped pg_try_advisory_xact_lock (skip-if-held) before its one-txn DELETE+INSERT atomic replace of the catalogue rollup tables, and is keep-last-good on failure — so concurrent replicas serialize on the lock (a loser skips), never racing the unique-key replace"},
+     "SHARED-PG, SINGLE-WRITER: refresh_catalog_rollup ALREADY takes a transaction-scoped "
+     "pg_try_advisory_xact_lock (skip-if-held) before its one-txn DELETE+INSERT atomic replace of "
+     "the catalogue rollup tables, and is keep-last-good on failure — so concurrent replicas "
+     "serialize on the lock (a loser skips), never racing the unique-key replace"},
+    {"software_normalization_job.run_tick", "SoftwareNormalizationJob::thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "SHARED-PG, SINGLE-WRITER: every pass runs in its own transaction and, after its SET LOCAL "
+     "statement_timeout, takes "
+     "pg_try_advisory_xact_lock(hashtextextended('software_normalization', 0)); a loser skips; "
+     "pass SELECTION is changes-only (a settled title is re-selected only when the pack version "
+     "changes or a registry write marks it stale) and its writes are deterministic upserts keyed "
+     "on the title triple, so a replay converges; the hourly queue reconcile writes only the open "
+     "rows whose device count moved or that are a day stale"},
     {"auth_db.cleanup_provisional_mfa", "AuthDB::cleanup_thread_", BackgroundJobClass::ReplicaSafe,
-     "SHARED-PG, idempotent: a single predicate-scoped UPDATE expiring stale provisional-MFA rows on a PG now() cutoff (shared clock) — an already-cleared row ceases to match, so concurrent replicas converge with no advisory lock. NOT row-count-bounded (no LIMIT; kWriteTimeout bounds the connection acquire, not the rows) and not a would-wipe reaper"},
-    {"ota_transfer_watchdog.sweep_once", "OtaTransferWatchdog::sweeper_", BackgroundJobClass::ReplicaSafe,
-     "per-replica: cancels only the OTA transfers registered on THIS replica's gRPC server (borrowed ServerContext*); the sole per-replica OTA deadline enforcer — MUST run per-replica, never leader-gate; no shared state"},
-    {"mcp_stream_bridge.run_projector", "McpStreamBridge::projector_", BackgroundJobClass::ReplicaSafe,
-     "per-replica in-process: projects ExecutionEventBus progress/terminal frames to the MCP SSE listeners connected to THIS replica; MUST run per-replica; no shared state (terminals are durably re-fetchable)"},
+     "SHARED-PG, idempotent: a single predicate-scoped UPDATE expiring stale provisional-MFA rows "
+     "on a PG now() cutoff (shared clock) — an already-cleared row ceases to match, so concurrent "
+     "replicas converge with no advisory lock. NOT row-count-bounded (no LIMIT; kWriteTimeout "
+     "bounds the connection acquire, not the rows) and not a would-wipe reaper"},
+    {"ota_transfer_watchdog.sweep_once", "OtaTransferWatchdog::sweeper_",
+     BackgroundJobClass::ReplicaSafe,
+     "per-replica: cancels only the OTA transfers registered on THIS replica's gRPC server "
+     "(borrowed ServerContext*); the sole per-replica OTA deadline enforcer — MUST run "
+     "per-replica, never leader-gate; no shared state"},
+    {"mcp_stream_bridge.run_projector", "McpStreamBridge::projector_",
+     BackgroundJobClass::ReplicaSafe,
+     "per-replica in-process: projects ExecutionEventBus progress/terminal frames to the MCP SSE "
+     "listeners connected to THIS replica; MUST run per-replica; no shared state (terminals are "
+     "durably re-fetchable)"},
     {"store_worker_pool.worker_loop", "StoreWorkerPool::workers_", BackgroundJobClass::ReplicaSafe,
-     "per-replica in-process delivery-queue drain (WebhookStore + OffloadTargetStore delivery_pool_): POSTs the events THIS replica enqueued via submit(); MUST run per-replica. CAVEAT/tracked: the pass itself is replica-local, but whether a given logical event is enqueued once-per-fleet or once-per-replica is an EMIT-SITE concern (verify webhook/offload emit sites are per-replica-origin before a 2nd replica, or a fleet-triggered emit double-delivers; tracked #4098)"},
+     "per-replica in-process delivery-queue drain (WebhookStore + OffloadTargetStore "
+     "delivery_pool_): POSTs the events THIS replica enqueued via submit(); MUST run per-replica. "
+     "CAVEAT/tracked: the pass itself is replica-local, but whether a given logical event is "
+     "enqueued once-per-fleet or once-per-replica is an EMIT-SITE concern (verify webhook/offload "
+     "emit sites are per-replica-origin before a 2nd replica, or a fleet-triggered emit "
+     "double-delivers; tracked #4098)"},
     {"pg_reachability_probe.tick", "PgReachabilityProbe::thread_", BackgroundJobClass::ReplicaSafe,
-     "HA WS-8 per-replica read-only probe (pg_is_in_recovery() / transaction_read_only on its own dedicated connection) feeding THIS replica's /readyz pg_reachable row; MUST run per-replica — each replica measures its OWN path to Postgres; never leader-gate (a follower would then report stale/unready and be evicted from the LB)"},
+     "HA WS-8 per-replica read-only probe (pg_is_in_recovery() / transaction_read_only on its own "
+     "dedicated connection) feeding THIS replica's /readyz pg_reachable row; MUST run per-replica "
+     "— each replica measures its OWN path to Postgres; never leader-gate (a follower would then "
+     "report stale/unready and be evicted from the LB)"},
 });
 
 /// Index of `pass` in kBackgroundJobs, or -1 if absent. consteval so a site

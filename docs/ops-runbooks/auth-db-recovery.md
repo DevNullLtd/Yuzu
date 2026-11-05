@@ -52,6 +52,11 @@ process refuses to start; only those two recovery one-shots open without the ref
 for the `SessionStore` it opens to end the account's sessions), and serving and every other mode that opens
 the bootstrap store (for example `--generate-tokens`) still refuse.
 
+A server that is **running** and `/readyz` is green but refuses MFA enrolment or recovery-code
+regeneration with a `503` "Authentication store is temporarily unavailable" is a different case: the
+host's random-number generator may have failed, not the database. See
+[MFA enrolment refused: random-number failure](#mfa-enrolment-refused-random-number-failure-503).
+
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
 within `StartLimitIntervalSec=60`, then enters `failed`:
 
@@ -1273,6 +1278,83 @@ sudo systemctl restart yuzu-server
 ```
 
 To enrol a non-admin approver deliberately (rather than recover from a lockout), see the next section.
+
+**Security note for this procedure.** While the flag is relaxed, every account that has no enrolled second
+factor, administrators included, signs in with its password alone, and an attacker holding such a password
+can enrol their own authenticator. Do it for the shortest possible window, from a restricted network, with
+the security owner's approval and a ticket recording the start and end time (no audit row covers the
+window), enrol the affected administrators first, and afterwards review the `auth.login` and
+`mfa.enroll.verified` rows from the window for accounts you did not expect. Enforcement is read per replica
+at startup, so restart every replica.
+
+If new enrolments are being refused under `--mfa-enforcement=required` and the cause is the host's
+random-number generator (not a misconfiguration), do **not** start here: see
+[MFA enrolment refused: random-number failure](#mfa-enrolment-refused-random-number-failure-503), because
+relaxing the flag does not help when the fault is host-wide.
+
+## MFA enrolment refused: random-number failure (503)
+
+The server draws random values for MFA secrets, recovery codes and their salts, and for session and
+sign-in tokens. When the host's random source fails you will see one of two shapes.
+
+**Shape 1: the MFA secret or recovery-code draws fail (audited, counted).** MFA enrolment (sign-in under
+`--mfa-enforcement`, or Settings → Security and sign-in → Two-factor sign-in) or **Regenerate recovery
+codes** is refused. The operator sees "Authentication store is temporarily unavailable — retry shortly"
+(a `503` at sign-in), but the database is fine:
+
+- `/readyz` is green, and `yuzu_auth_secret_unavailable_total` and `yuzu_auth_read_degrade_total` are flat;
+- `yuzu_secure_random_failure_total{site="mfa_enroll"}` (the TOTP secret) or `{site="mfa_recovery"}`
+  (a recovery code or its salt) is rising;
+- the audit row (`mfa.enroll.required` at sign-in enrolment, `mfa.enroll.initiated` or `mfa.enroll.failed`
+  in Settings, `mfa.enroll.failed` at the sign-in confirm step, or `mfa.recovery_codes.generated`) has a
+  `detail` starting `csprng_unavailable: `. Only the sign-in confirm step also emits the
+  `mfa.enroll.failed` event, with `reason=csprng_unavailable`; a refusal at sign-in enrol-init is audit-only;
+- the server log has a `CSPRNG failure` line.
+
+Nothing was issued or changed: no TOTP secret, no recovery codes and no partial enrolment, and stored
+enrolments and recovery codes are untouched.
+
+**Shape 2: the whole random source is dead (not audited, not counted).** The same source also mints sign-in
+pending tokens and session tokens, and those draws are not covered by the counter or the audit trail. If the
+source is wholly dead, sign-in itself, including for already-enrolled accounts, fails with a bare `500`, and
+you will see **no audit row for the failure and flat counters**. A bare `500` at sign-in with the
+`RAND_bytes failed` log line is this shape. These draws are tracked follow-ups (#6996, #7018); until then
+the signals are the sign-in 5xx rate and that log line. If `site=api_token`, `device_token` or
+`engine_principal` is moving as well, the fault is host-wide and not specific to MFA.
+
+One ordering matters: at the sign-in enrolment confirm step the session-token draw runs *after* the
+enrolment has committed and its success audit rows (`mfa.enroll.verified`, `mfa.recovery_codes.generated`)
+have been written. If that draw fails the account is enrolled, the user never saw the recovery codes, and
+the response is a bare `500`; once the host recovers, the user signs in and regenerates the codes from
+Settings (#7018). PBKDF2 hashing of a recovery code can also throw (a provider failure, not a random draw;
+#7012).
+
+**Cause.** The host's random source failed: `getrandom` or `/dev/urandom` blocked or denied in a container
+(seccomp, a read-only `/dev`), a FIPS or OpenSSL provider that did not initialise, or an entropy shortage
+in a very early boot or a freshly cloned VM. Check as the service user:
+
+```bash
+openssl rand -hex 8                      # must print 16 hex characters
+python3 -c "import os; os.getrandom(8)"  # must not raise (Linux)
+```
+
+**Fix: restore the entropy source first.** Do not restart the server until `openssl rand -hex 8` works for
+the service user: a server whose random source is dead can fail to boot as well, which turns a degraded
+server into an outage. Once the source is back, retry; no change to the auth store is needed.
+
+**Keeping sign-in working under `--mfa-enforcement=required`.** While the fault lasts no *new* account can
+enrol, and under `required` an un-enrolled account cannot sign in. `--mfa-reset` does **not** help: it clears
+an enrolment, and the blocked account has none. Relaxing `--mfa-enforcement` can help only in Shape 1, when
+sign-in itself still works. If sign-in returns `500` (Shape 2), no flag change helps: restore entropy.
+If you do use the lever, follow the security note in
+[Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
+(shortest possible window, approval, restricted network, enrol administrators first, restart every
+replica, review the window's `auth.login` and `mfa.enroll.verified` rows afterwards).
+
+**During a rolling upgrade.** Counters are per replica. An un-upgraded replica still reports a Shape 1
+fault as `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` (and at sign-in also
+`yuzu_auth_read_degrade_total{route="login"}`) with a `store_unavailable` audit detail. Alert on both signals
+until every replica runs the same build.
 
 ## Enrolling a non-admin approver
 

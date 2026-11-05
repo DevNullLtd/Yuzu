@@ -14,7 +14,7 @@
 ///   apply_step_up_chokepoint() the pre-handler stage: table lookup, session
 ///                             resolution, decide, and on refusal the audit row,
 ///                             metric and rendered response. A thin caller,
-///                             `run_pre_request_stage` in `step_up_wiring.hpp`,
+///                             `run_post_read_stage` in `step_up_wiring.hpp`,
 ///                             owns only the httplib Handled/Unhandled return.
 ///
 /// `require_mfa_step_up` (`mfa_step_up.hpp`) is a thin wrapper over
@@ -242,7 +242,7 @@ namespace detail {
 /// escape. The function is deliberately NOT `noexcept`: that guarantee holds by construction, not
 /// by the type, and if a later edit breaks it the caller's own handler in `server.cpp` answers
 /// (413) instead of the process terminating. Keyed on `req.method` and `req.matched_route`, which
-/// httplib sets to the registered pattern before the pre-request handler runs.
+/// httplib sets to the registered pattern before the route's handler (and so the post-read stage) runs.
 [[nodiscard]] StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req,
                                                               httplib::Response& res,
                                                               const StepUpChokepointDeps& deps);
@@ -303,7 +303,7 @@ struct StepUpPassIdentity {
 ///     authorises the request the principal the step-up check was made for.
 ///
 /// Thread affinity: the stash and the binding are thread-local. A session resolution made on a
-/// thread other than the one that ran the pre-request stage is unbound (admitted, as for any
+/// thread other than the one that ran the post-read stage is unbound (admitted, as for any
 /// non-gated request). No kRequired route resolves off the worker thread today.
 ///
 /// Chokepoint PR 2: the pass and the in-handler calls (with `consume_step_up_pass`,

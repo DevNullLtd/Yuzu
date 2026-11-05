@@ -38,6 +38,7 @@
 #include "saml_principal.hpp"
 #include "session_store.hpp"
 #include "test_auth_db_rbac_pg_template.hpp" // clone already carries the rbac_store schema
+#include "post_read_stage_test_support.hpp"
 #include "test_loopback_http.hpp"
 #include "../test_log_capture.hpp"
 #include "test_principal_lock_gate.hpp"
@@ -2783,6 +2784,13 @@ namespace {
 /// (and, now, against wiring it before the on-behalf-of guard either).
 struct ScimIntegrationServer {
     httplib::Server svr;
+    // Declared after `svr`, so it is destroyed BEFORE `svr` (reverse declaration order);
+    // production registers its routes behind a post-read stage and the sink refuses a server
+    // without one. A pass-through stage keeps this fixture about SCIM, not the cap.
+    yuzu::test::PostReadStageScope stage_scope{
+        svr, [](const httplib::Request&, httplib::Response&) {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }};
     std::thread server_thread;
     int port{0};
     // PG-gated (yuzu::test::AuthDbPg): SKIPs the current TEST_CASE at
@@ -7074,10 +7082,13 @@ TEST_CASE("ScimRoutes: classify_role_read maps every AuthDB role-read outcome (#
 
     // Every AuthDBError value is either a store fault (is_store_unavailable) or Refused:
     // the classifier is exactly is_store_unavailable plus the role comparison.
-    static_assert(static_cast<unsigned>(AuthDBError::MfaEnrollmentCancelled) == 10,
+    static_assert(static_cast<unsigned>(AuthDBError::EntropyUnavailable) == 11,
                   "AuthDBError grew: extend the classify_role_read coverage loop and revisit "
                   "is_store_unavailable");
-    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(AuthDBError::MfaEnrollmentCancelled);
+    // #6995: the loop now reaches EntropyUnavailable (11), which is_store_unavailable() accepts, so
+    // classify_role_read keeps failing it CLOSED (Unavailable). No role read can actually return it
+    // (only the MFA mint paths draw entropy); this pins the classifier for a future caller.
+    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(AuthDBError::EntropyUnavailable);
          ++v) {
         const auto e = static_cast<AuthDBError>(v);
         const auto verdict = classify_role_read(Read{std::unexpected(e)});
