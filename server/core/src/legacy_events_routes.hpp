@@ -22,11 +22,11 @@
 /// fully exercised through the sink; the wire-level chunked SSE framing
 /// itself is deliberately NOT unit-tested (covered by UAT/integration
 /// instead) because `TestRouteSink` does not drive httplib's actual socket
-/// I/O loop. `HttplibRouteSink::Get` forwards byte-identically to
-/// `httplib::Server::Get` in production, so nothing about moving this
-/// route's REGISTRATION onto the sink changes its runtime behaviour — only
-/// its TEST reachability changes (for the better: this route previously had
-/// NO unit coverage at all). `test_legacy_events_routes.cpp` mirrors
+/// I/O loop. `HttplibRouteSink::Get` registers the handler wrapped by the server's
+/// post-read stage (and throws `std::logic_error` when the server has none and the sink is
+/// not `ExemptNoStage`); the wrapper runs the stage before this handler. Moving this
+/// route's REGISTRATION onto the sink also changes its TEST reachability (for the better:
+/// this route previously had NO unit coverage at all). `test_legacy_events_routes.cpp` mirrors
 /// `test_rest_api_events.cpp`'s split exactly.
 ///
 /// Every handler body is copied verbatim from server.cpp; the changes are
