@@ -5607,8 +5607,7 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
     }
 }
 
-TEST_CASE("v3: component sections: full stores rows, delta applies and bumps last_seen, "
-          "honest-empty deletes",
+TEST_CASE("v3: component sections: full stores rows, delta applies, honest-empty deletes",
           "[pg][software_inventory][v3][components]") {
     SWINV_SHARED(store, pool);
     const auto c1 = comp("log4j-core", "/opt/app/log4j-core.jar", "2.14.1");
@@ -5625,7 +5624,6 @@ TEST_CASE("v3: component sections: full stores rows, delta applies and bumps las
     CHECK(rows[0][0] == "guava");
     CHECK(rows[0][2] == rows[0][3]); // first_seen == last_seen on a full section
     CHECK(rows[0][2] != "0");
-    const std::string first_seen = rows[0][2];
     // path_hash is the SHA-256 of the exact path bytes and row_hash names the record.
     const auto keys = sql_rows(pool, "SELECT path_hash, row_hash FROM "
                                      "software_inventory_store.software_components "
@@ -5643,9 +5641,9 @@ TEST_CASE("v3: component sections: full stores rows, delta applies and bumps las
           InventoryIngestOutcome::kTouched);
     CHECK(ledger_count(pool, "agent-cp") == "0"); // components never write the install ledger
 
-    // A delta: drop c2, add c3. c1 survives with a bumped last_seen.
+    // A delta: drop c2, add c3. c1 survives untouched: a delta rewrites only the rows it names.
     sql_ok(pool, "UPDATE software_inventory_store.software_components SET first_seen = 1, "
-                 "last_seen = 1 WHERE agent_id = 'agent-cp'"); // so a bump is observable
+                 "last_seen = 1 WHERE agent_id = 'agent-cp'"); // so a rewrite is observable
     res = store.apply_installed_software_v3(
         "agent-cp", v3_report({comp_delta(comp_hash_of({c1, c2}), {c1, c3}, {c2}, {c3})}));
     REQUIRE(res[0].outcome == V3SectionOutcome::kStored);
@@ -5653,7 +5651,7 @@ TEST_CASE("v3: component sections: full stores rows, delta applies and bumps las
     REQUIRE(rows.size() == 2);
     CHECK(rows[0][0] == "log4j-core"); // ORDER BY name: log4j-core, slf4j
     CHECK(rows[0][2] == "1");          // the survivor keeps first_seen ...
-    CHECK(rows[0][3] != "1");          // ... and its last_seen was bumped
+    CHECK(rows[0][3] == "1");          // ... and last_seen: it was not rewritten
     CHECK(rows[1][0] == "slf4j");
     CHECK(rows[1][2] == rows[1][3]);
     CHECK(facet_status(pool, "agent-cp", kV3Comp) == "delta/" + comp_hash_of({c1, c3}));
@@ -5674,7 +5672,6 @@ TEST_CASE("v3: component sections: full stores rows, delta applies and bumps las
     REQUIRE(res[0].outcome == V3SectionOutcome::kStored);
     CHECK(comp_rows(pool, "agent-cp").empty());
     CHECK(facet_status(pool, "agent-cp", kV3Comp) == std::string("full/") + kEmptySectionHash);
-    (void)first_seen;
 }
 
 TEST_CASE("v3: a component PK collision inside one section is a mismatch, rolled back",

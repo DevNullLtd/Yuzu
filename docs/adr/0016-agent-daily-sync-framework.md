@@ -1104,8 +1104,10 @@ the exact path bytes. A component canonical record is `kind US name US version U
 US path US size US mtime US anchor_app RS`; a row hash is the SHA-256 of one record (the value a
 `-` names); the section hash is the SHA-256 of the records sorted by those fields (size and mtime
 numerically) and de-duplicated. A full section deletes the agent's components then inserts
-(`first_seen = last_seen` = server receipt); a delta deletes by `row_hash`, inserts, bumps
-`last_seen` of every row the device still carries, and verifies `expect`. An honest-empty full
+(`first_seen = last_seen` = server receipt, the time the row was written); a delta deletes by
+`row_hash`, inserts, and verifies `expect`, and does not touch the rows it does not name. Freshness
+of a delta-maintained facet is `software_facet_state.last_confirmed_at`, not a per-row column.
+An honest-empty full
 deletes the rows. A repeated `(kind, path)` inside one section is a producer defect: `mismatch`.
 The facet now carries a real section hash and enters the report hash. A row a delta removes is
 hard-deleted with no history row: component change history is out of scope. Components are

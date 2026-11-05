@@ -1749,15 +1749,6 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                     return sqlstate_is_unique(state) ? Step::kMismatch : Step::kFail;
             }
             if (sec.status == V3Status::kDelta) {
-                // Every row this section still carries was seen now: the survivors of the delta
-                // as much as the rows it added.
-                pg::PgResult seen = pg::exec_params(
-                    c,
-                    "UPDATE software_inventory_store.software_components "
-                    "SET last_seen = $2::bigint WHERE agent_id = $1 RETURNING 1",
-                    std::vector<std::string>{agent_id_s, ts_s});
-                if (seen.status() != PGRES_TUPLES_OK)
-                    return Step::kFail;
                 std::vector<V3Component> now_rows;
                 if (!read_components(c, agent_id_s, now_rows))
                     return Step::kFail;
