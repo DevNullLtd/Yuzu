@@ -17,12 +17,16 @@
 ///      connections. Default 0 (single-node shutdown unchanged).
 ///   2. In-flight executions — the pre-existing wait, capped at
 ///      `kExecutionDrainCap` from drain start. Two things count: the tracker's `running`
-///      executions and the workflow runs the workflow engine holds IN-PROCESS
-///      (`WorkflowEngine::in_flight_runs()`, a counter of runs inside `execute()`, never a count
-///      of `running` rows in Postgres: an orphan left by a crash, or a run owned by another
-///      replica, must not hold this replica's shutdown). `keep_draining_for_work` is the one
-///      decision over both, and the same cap bounds it: a workflow run still going at the cap is
-///      stopped (`WorkflowStopLevel::kStop`) when `stop_requested_` is set, not waited for.
+///      executions and the workflow runs this process holds IN-PROCESS, never a count of
+///      `running` rows in Postgres (an orphan left by a crash, or a run owned by another replica,
+///      must not hold this replica's shutdown). A run is counted two ways, combined by
+///      `workflow_runs_to_drain`: the `StreamBudget` `kWorkflowRun` leases (taken at admission,
+///      so a run still in PREPARE counts, and held until the adapter returns, so the final audit
+///      write counts) and `WorkflowEngine::in_flight_runs()` (runs inside `execute()`, kept as
+///      the count for a caller that holds no lease). `keep_draining_for_work` is the one
+///      decision over both kinds of work, and the same cap bounds it: a workflow run still going
+///      at the cap is stopped (`WorkflowStopLevel::kStop`) when `stop_requested_` is set, not
+///      waited for.
 ///
 /// Total wait is therefore max(N, time for executions to finish), normally at
 /// most max(N, kExecutionDrainCap). Residual: the executions query runs on a
@@ -47,6 +51,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <limits>
 
 namespace yuzu::server::shutdown_drain {
 
@@ -59,6 +64,18 @@ constexpr bool keep_draining(std::chrono::steady_clock::duration elapsed,
     if (elapsed < min_grace)
         return true;
     return executions_running && elapsed < kExecutionDrainCap;
+}
+
+/// How many workflow runs the drain waits on: the larger of the engine's in-process count and the
+/// `kWorkflowRun` lease count. Every adapter takes its lease before the run's first read and
+/// holds it past `execute()`, so the lease count covers the engine count and a MAX counts each run
+/// once (a sum would report every leased run twice in the progress log). The engine count stays in
+/// as the floor for a run that holds no lease. Only non-zero changes the decision.
+constexpr int workflow_runs_to_drain(int engine_runs, std::size_t leased_runs) noexcept {
+    constexpr auto kIntMax = static_cast<std::size_t>(std::numeric_limits<int>::max());
+    const int leased = static_cast<int>(leased_runs > kIntMax ? kIntMax : leased_runs);
+    const int engine = engine_runs > 0 ? engine_runs : 0;
+    return leased > engine ? leased : engine;
 }
 
 /// `keep_draining` over BOTH kinds of in-flight work: `tracker_running` executions the tracker

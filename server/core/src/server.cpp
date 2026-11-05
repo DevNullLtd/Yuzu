@@ -10777,11 +10777,17 @@ public:
                 // has no client-side deadline and can overrun the cap.
                 if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
                     running = execution_tracker_->query_executions({.status = "running"}).size();
-                // Workflow runs the engine holds in-process (a synchronous run pins an HTTP
-                // worker): an atomic read, so it is taken every tick whatever the tracker
-                // says, and never a table count (orphans and other replicas must not hold
-                // this replica's shutdown). The same cap bounds it.
-                const int workflow_runs = workflow_engine_ ? workflow_engine_->in_flight_runs() : 0;
+                // Workflow runs this process holds (a synchronous run pins an HTTP worker): the
+                // engine's in-process counter and the kWorkflowRun leases, both lock-light
+                // reads taken every tick whatever the tracker says, and never a table count
+                // (orphans and other replicas must not hold this replica's shutdown). The lease
+                // is taken before prepare, so a run that has not reached the engine yet is
+                // counted. The same cap bounds it.
+                const int workflow_runs = shutdown_drain::workflow_runs_to_drain(
+                    workflow_engine_ ? workflow_engine_->in_flight_runs() : 0,
+                    stream_budget_ ? stream_budget_->active_for_surface(
+                                         yuzu::server::detail::SseSurface::kWorkflowRun)
+                                   : 0);
                 if (!shutdown_drain::keep_draining_for_work(elapsed, min_grace, running,
                                                             workflow_runs))
                     break;

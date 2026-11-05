@@ -74,6 +74,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -105,6 +106,16 @@ std::string collapse_ws(std::string_view in) {
     return out;
 }
 
+// `in` with every whitespace character removed.
+std::string squeeze_ws(std::string_view in) {
+    std::string out;
+    for (const char c : in) {
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+            out.push_back(c);
+    }
+    return out;
+}
+
 // Offset of the ')' matching the '(' at `open`, or npos. The scanned spans hold no string literal
 // containing a parenthesis.
 std::size_t matching_paren(std::string_view text, std::size_t open) {
@@ -126,8 +137,14 @@ bool starts_with(std::string_view s, std::string_view prefix) {
     return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
 }
 
+// The run count the drain waits on: the engine's in-process counter AND the kWorkflowRun lease
+// count (a run still in prepare holds a lease but is not yet inside the engine), combined by the
+// rule header's own helper. Compared with ALL whitespace removed so a reflow cannot move the pin.
 constexpr std::string_view kDrainCountDecl =
-    "const int workflow_runs = workflow_engine_ ? workflow_engine_->in_flight_runs() : 0;";
+    "const int workflow_runs = shutdown_drain::workflow_runs_to_drain("
+    "workflow_engine_ ? workflow_engine_->in_flight_runs() : 0,"
+    "stream_budget_ ? stream_budget_->active_for_surface("
+    "yuzu::server::detail::SseSurface::kWorkflowRun) : 0);";
 constexpr std::string_view kDrainRuleCall = "shutdown_drain::keep_draining_for_work(";
 constexpr std::string_view kShouldStopCall = "workflow_engine_->set_should_stop(";
 constexpr std::string_view kStopBranch =
@@ -170,8 +187,10 @@ std::vector<std::string> drain_wiring_problems(const std::string& text) {
             out.push_back("no drain loop (`for (;;)`) between the draining_ store and the rule call");
         else if (count_at < loop_at)
             out.push_back("the workflow run count is read above the drain loop, not inside it");
-        else if (text.find(kDrainCountDecl) == std::string::npos)
-            out.push_back("the run count is not bound as `const int workflow_runs = ...`");
+        else if (squeeze_ws(text.substr(loop_at, rule_at - loop_at)).find(squeeze_ws(kDrainCountDecl)) ==
+                 std::string::npos)
+            out.push_back("the loop does not bind `workflow_runs` as workflow_runs_to_drain(engine "
+                          "in_flight_runs(), kWorkflowRun lease count)");
         // The call: its last two arguments are the tracker count then the engine count, it is the
         // condition of `if (!...) break;`, so neither a constant nor a dropped result survives.
         const std::size_t open = rule_at + kDrainRuleCall.size() - 1;
@@ -368,9 +387,19 @@ TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the 
         const char* name;
         std::string text;
     };
-    // The hoist: the declaration line leaves the loop and lands above it.
-    std::string hoisted = mutated(text, kDrainCountDecl, "");
-    hoisted = mutated(hoisted, loop_head, std::string(kDrainCountDecl) + "\n            " + loop_head);
+    // The run count's declaration as it stands in the loop (comment-stripped source, 16-space
+    // indent), in its three parts: the head, the engine argument, the lease argument.
+    const std::string decl_head = "const int workflow_runs = shutdown_drain::workflow_runs_to_drain(\n";
+    const std::string engine_arg = "workflow_engine_ ? workflow_engine_->in_flight_runs() : 0,\n";
+    const std::string lease_arg =
+        "stream_budget_ ? stream_budget_->active_for_surface(\n"
+        "                                         yuzu::server::detail::SseSurface::kWorkflowRun)\n"
+        "                                   : 0);";
+    const std::string full_decl = "                " + decl_head + "                    " + engine_arg +
+                                  "                    " + lease_arg;
+    // The hoist: the whole declaration leaves the loop and lands above it.
+    std::string hoisted = mutated(text, full_decl, "");
+    hoisted = mutated(hoisted, loop_head, full_decl + "\n            " + loop_head);
     const std::vector<Case> cases = {
         {"count argument replaced by 0", mutated(text, call_tail, "0))")},
         {"tracker count passed twice", mutated(text, "min_grace, running,", "min_grace, running, running,")},
@@ -380,6 +409,11 @@ TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the 
         {"no break on the result", mutated(text, "workflow_runs))\n                    break;",
                                            "workflow_runs)) {}")},
         {"count read hoisted above the loop", hoisted},
+        {"lease count zeroed (a run in prepare is not drained)", mutated(text, lease_arg, "0);")},
+        {"lease count read from another surface",
+         mutated(text, "SseSurface::kWorkflowRun)\n                                   : 0);",
+                 "SseSurface::kMcpGet)\n                                   : 0);")},
+        {"engine count dropped from the combined count", mutated(text, engine_arg, "0,\n")},
         {"log branch no longer sees the engine count", mutated(text, log_cond, "if (running > 0) {")},
         {"log branch removed", mutated(text, log_cond, "if (false) {")},
         {"set_should_stop assigned something else",
@@ -424,6 +458,40 @@ TEST_CASE("shutdown_drain: a workflow run in flight extends the wait, and the SA
     CHECK(keep_draining_for_work(1s, 0s, 2, 0));
     CHECK(keep_draining_for_work(5s, 10s, 0, 0));
     CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0));
+}
+
+TEST_CASE("shutdown_drain: a run holding a lease but not yet in the engine (in prepare) keeps the "
+          "drain going, and the SAME cap releases it",
+          "[shutdown_drain]") {
+    using namespace std::chrono_literals;
+    using yuzu::server::shutdown_drain::keep_draining_for_work;
+    using yuzu::server::shutdown_drain::kExecutionDrainCap;
+    using yuzu::server::shutdown_drain::workflow_runs_to_drain;
+    // Lease taken, engine not entered: the engine count alone would stop the drain.
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 1)));
+    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, workflow_runs_to_drain(0, 2)));
+    // Both zero stops; the cap releases a lease-held run exactly as it releases an engine one.
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 0)));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, workflow_runs_to_drain(0, 1)));
+    // The minimum grace is unchanged.
+    CHECK(keep_draining_for_work(5s, 10s, 0, workflow_runs_to_drain(0, 0)));
+    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, workflow_runs_to_drain(0, 0)));
+}
+
+TEST_CASE("shutdown_drain: workflow_runs_to_drain is the larger of the two counts, never a sum, "
+          "never negative, never wrapping",
+          "[shutdown_drain]") {
+    using yuzu::server::shutdown_drain::workflow_runs_to_drain;
+    CHECK(workflow_runs_to_drain(0, 0) == 0);
+    CHECK(workflow_runs_to_drain(0, 1) == 1);  // in prepare: lease only
+    CHECK(workflow_runs_to_drain(1, 0) == 1);  // a caller with no lease: engine only
+    CHECK(workflow_runs_to_drain(2, 2) == 2);  // the same two runs seen by both counters
+    CHECK(workflow_runs_to_drain(1, 3) == 3);
+    CHECK(workflow_runs_to_drain(3, 1) == 3);
+    CHECK(workflow_runs_to_drain(-1, 0) == 0);
+    CHECK(workflow_runs_to_drain(0, static_cast<std::size_t>(-1)) ==
+          std::numeric_limits<int>::max());
 }
 
 // require_one_line fails loudly on zero or on more than one occurrence (uniqueness kept
