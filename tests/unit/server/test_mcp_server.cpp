@@ -48104,6 +48104,10 @@ struct WfMcpFx {
     int dispatches{0};
     int authorize_calls{0};
     std::optional<int> deny_gated_from; // 0-based authorizer call index; unset == admit everything
+    // 1-based index of the dispatch whose send fan-out throws on its 3rd send (two sends were
+    // accepted first); unset == never throws.
+    std::optional<int> throw_on_dispatch;
+    std::vector<yuzu::server::StepDispatchError> step_errors; // failed step callbacks, in order
     std::function<void(int)> on_authorize; // called with the 0-based authorizer call index
     std::shared_ptr<yuzu::server::test::FnWorkflowApi> api;
 
@@ -48182,11 +48186,16 @@ struct WfMcpFx {
         ts.workflow_run_for_test = [this](const std::string&, const std::vector<std::string>&,
                                           yuzu::server::StepDispatchFn fn,
                                           yuzu::server::ConditionEvalFn,
-                                          const yuzu::server::WorkflowRunControl&)
+                                          const yuzu::server::WorkflowRunControl& control)
             -> std::expected<std::string, std::string> {
             ++run_calls;
-            for (const auto& sid : step_ids)
-                (void)fn(sid, "[]", "{}");
+            if (control.on_admitted) // as the real engine: once admitted, before step 1
+                control.on_admitted("exec-1");
+            for (const auto& sid : step_ids) {
+                const auto r = fn(sid, "[]", "{}");
+                if (!r)
+                    step_errors.push_back(r.error());
+            }
             return std::string{"exec-1"};
         };
         ts.authorize_dispatch_fn_for_test =
@@ -48221,6 +48230,8 @@ struct WfMcpFx {
                       const std::string&, const yuzu::server::DispatchCaller&)
                    -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatches;
+            if (throw_on_dispatch && dispatches == *throw_on_dispatch)
+                return yuzu::test::dispatch_throwing_on_nth_send({"x1", "x2", "x3"}, 3);
             return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatches)};
         };
     }
@@ -48548,7 +48559,10 @@ TEST_CASE("MCP execute_workflow: a step repointed mid-run is not sent, is audite
         ++fx.run_calls;
         (void)fn(fx.step_ids[0], "[]", "{}");
         WfMcpFx::repoint(store, fx.gated_id, "filesystem", "list");
-        (void)fn(fx.step_ids[1], "[]", "{}");
+        const auto late = fn(fx.step_ids[1], "[]", "{}");
+        // The refusal is PERMANENT: the engine must not retry it with sleeps.
+        REQUIRE_FALSE(late.has_value());
+        CHECK(late.error().permanent);
         return std::string{"exec-1"};
     };
     ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
@@ -48568,6 +48582,77 @@ TEST_CASE("MCP execute_workflow: a step repointed mid-run is not sent, is audite
     CHECK(payload["steps"][1]["retryable"] == false);
     CHECK(wf_audit_has(ts, "denied", "reason=definition_changed"));
     CHECK(wf_audit_has(ts, "denied", "(late)"));
+}
+
+TEST_CASE("MCP execute_workflow: a run that throws after the requested row is -32603 dispatch_exception "
+          "naming the execution and the sends, with NO retry hint",
+          "[mcp][pg][workflow][twin][security][tier][approval][throw]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    fx.throw_on_dispatch = 2; // step 1 is sent (1 agent); step 2's fan-out throws after 2 sends
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    const std::string approval_id = wf_mint_and_approve(ts, appr);
+    auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+    REQUIRE(recall);
+    INFO(recall->body);
+    const auto j = nlohmann::json::parse(recall->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == yuzu::server::mcp::kInternalError);
+    const auto& data = j["error"]["data"];
+    CHECK(data["reason"] == "dispatch_exception");
+    CHECK(data["execution_id"] == "exec-1");
+    CHECK(data["agents_sent"] == 3);
+    CHECK(data["retry_after_ms"].is_null());
+    CHECK(data["remediation"].get<std::string>().find("get_workflow_execution") != std::string::npos);
+    CHECK_FALSE(data.contains("audit_persisted"));
+    CHECK(fx.run_calls == 1);
+    CHECK(fx.dispatches == 2);
+    CHECK(wf_audit_has(ts, "failure", "reason=dispatch_exception"));
+    CHECK(wf_audit_has(ts, "failure", "execution_id=exec-1"));
+    CHECK(wf_audit_has(ts, "failure", "agents_sent=3"));
+    CHECK_FALSE(wf_audit_has(ts, "success", "execution_id"));
+}
+
+TEST_CASE("MCP execute_workflow: a throw BEFORE the requested row keeps the retry hint, because "
+          "nothing was sent",
+          "[mcp][pg][workflow][twin][security][tier][approval][throw]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    const std::string approval_id = wf_mint_and_approve(ts, appr);
+    // The mint probe made authorizer calls 0 and 1, the recall probe 2 and 3; call 4 is the
+    // handler's own prepare, which is before the `requested` row.
+    REQUIRE(fx.authorize_calls == 2);
+    fx.on_authorize = [](int n) {
+        if (n == 4)
+            throw std::runtime_error("authorizer exploded");
+    };
+    auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+    REQUIRE(recall);
+    INFO(recall->body);
+    const auto j = nlohmann::json::parse(recall->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(j["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK_FALSE(j["error"]["data"].contains("execution_id"));
+    CHECK(fx.dispatches == 0);
+    CHECK(fx.run_calls == 0);
 }
 
 TEST_CASE("MCP execute_workflow: if the step-effect digest cannot be computed the call is refused with "

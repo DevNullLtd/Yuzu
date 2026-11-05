@@ -27,6 +27,7 @@ struct HttpShape {
         return {503, false}; // a missing dependency is not a transient fault
     case S::kNoPrincipal:
     case S::kEffectDigestFailed:
+    case S::kRunFailed: // started, failed part-way: steps may have been sent, so NO retry hint
         return {500, false};
     case S::kStoreFailed:
         return {503, true};
@@ -52,7 +53,9 @@ struct HttpShape {
 }
 
 /// A4 error body plus the route-local `reason` (and `execution_id` once a run exists), the same
-/// extension the instruction-execute route's zero-reach 503s carry.
+/// extension the instruction-execute route's zero-reach 503s carry. A run that threw part-way
+/// names its row as a typed `execution_id` (empty when none was admitted) and the lower-bound
+/// `agents_sent` when known, as the instruction-execute route's `dispatch_exception` does.
 std::string error_body(httplib::Response& res, const WorkflowExecuteOutcome& o, int code,
                        bool retry_hint, std::string_view remediation = {}) {
     const std::string cid = detail::ensure_correlation_id(res);
@@ -64,8 +67,13 @@ std::string error_body(httplib::Response& res, const WorkflowExecuteOutcome& o, 
     if (j.contains("error") && j["error"].is_object()) {
         if (!o.reason.empty())
             j["error"]["reason"] = o.reason;
-        if (!o.execution_id.empty())
+        if (o.status == WorkflowExecuteStatus::kRunFailed) {
             j["error"]["execution_id"] = o.execution_id;
+            if (o.agents_sent > 0)
+                j["error"]["agents_sent"] = o.agents_sent;
+        } else if (!o.execution_id.empty()) {
+            j["error"]["execution_id"] = o.execution_id;
+        }
     }
     return j.dump();
 }
@@ -168,6 +176,17 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                 } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
                 }
             };
+            ports.count_run_threw = [&] {
+                if (!d.metrics)
+                    return;
+                try {
+                    d.metrics
+                        ->counter("yuzu_server_dispatch_fanout_throw_total",
+                                  {{"route", "workflow"}, {"phase", "dispatch"}})
+                        .increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the answer
+                }
+            };
             ports.count_dispatch_denied = [&](std::string_view reason) {
                 if (!d.metrics)
                     return;
@@ -190,6 +209,8 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             try {
                 out = apply_workflow_execute(ports, wreq);
             } catch (const std::exception& e) {
+                // Reached only for a throw BEFORE the `requested` row (the prepare half): nothing
+                // was sent, so retrying is safe. A throw after that row comes back as kRunFailed.
                 spdlog::error("workflow execute (REST v1) threw: {}", e.what());
                 out.status = WorkflowExecuteStatus::kStoreFailed;
                 out.message = "workflow execution failed";
@@ -211,7 +232,8 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             const auto shape = http_shape(out);
             res.status = shape.code;
             if (out.status == WorkflowExecuteStatus::kAuditFailed ||
-                (!out.execution_id.empty() && !out.audit_persisted))
+                ((!out.execution_id.empty() || out.status == WorkflowExecuteStatus::kRunFailed) &&
+                 !out.audit_persisted))
                 res.set_header("Sec-Audit-Failed", "true");
             const std::string_view remediation =
                 out.status == WorkflowExecuteStatus::kApprovalRequired

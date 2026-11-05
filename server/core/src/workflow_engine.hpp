@@ -123,11 +123,20 @@ public:
     /// Fails (workflow-not-found error) if the workflow does not exist OR was soft-deleted —
     /// admission is checked atomically at execution-row creation (ADR-0064 "New atomicity"),
     /// closing the race between an earlier `get_workflow` read and this call.
+    ///
+    /// A failed step is recorded, not returned; a `permanent` StepDispatchError is not retried and
+    /// is not slept on (the step's `on_failure` policy applies at once). A THROW from `dispatch_fn`,
+    /// `condition_fn` or `on_admitted` is a failed, never-retried step: the execution is closed
+    /// `failed` through the guarded finalize, the remaining steps are marked skipped, and the
+    /// exception is rethrown to the caller, so a run is never left `running` behind a throw.
+    /// `on_admitted` is called once with the new execution id after admission and before the first
+    /// step.
     std::expected<std::string, std::string> execute(
         const std::string& workflow_id,
         const std::vector<std::string>& agent_ids,
         StepDispatchFn dispatch_fn,
-        ConditionEvalFn condition_fn = nullptr);
+        ConditionEvalFn condition_fn = nullptr,
+        std::function<void(const std::string& execution_id)> on_admitted = nullptr);
 
     /// Get execution status with step results.
     std::expected<std::optional<WorkflowExecution>, std::string> get_execution(

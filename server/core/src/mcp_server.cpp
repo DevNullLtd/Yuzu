@@ -1375,8 +1375,13 @@ static const ToolDef kTools[] = {
      "time. "
      "AUDIT: an 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
      "it cannot be saved the call fails with a retryable error and nothing was sent. A step "
-     "refused at send time because its definition changed is audited at that moment. A closing "
-     "row records the outcome (audit_persisted:false if that one was lost). "
+     "refused at send time because its definition changed is audited at that moment and is not "
+     "retried. A closing row records the outcome (audit_persisted:false if that one was lost). "
+     "A run that THROWS after that row is answered -32603 with error.data.reason "
+     "dispatch_exception, error.data.execution_id and error.data.agents_sent (a lower bound, "
+     "present when known) and retry_after_ms null: steps may already have been sent, so do NOT "
+     "re-send; read get_workflow_execution. A throw before that row is retryable "
+     "(retry_after_ms 5000) because nothing was sent. "
      "RESULT: a success envelope with execution_id, workflow_id, status (the engine's recorded "
      "dispatch-level status, completed or failed; it means sent, not finished) and steps (one "
      "entry per send attempt: instruction_id, command_id, agents_reached; when 0, a reason). If "
@@ -8510,8 +8515,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
                     }
                 };
+                ports.count_run_threw = [&] {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_fanout_throw_total",
+                                      {{"route", "workflow"}, {"phase", "dispatch"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the answer
+                    }
+                };
                 return ports;
             };
+            // Reached only for a throw BEFORE the sequence's `requested` row (the prepare half):
+            // nothing was sent, so the retry hint is honest. A throw after that row is answered
+            // by the sequence itself as kRunFailed (no retry hint, see render_workflow_refusal).
             const auto respond_workflow_threw = [&](const char* what) {
                 spdlog::error("MCP execute_workflow: threw: {}", what);
                 mcp_audit("failure", "exception");
@@ -8524,11 +8543,30 @@ McpServer::HandlerFn McpServer::build_handler(
                 using WES = WorkflowExecuteStatus;
                 mcp_audit(out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
                                   out.status == WES::kUnavailable ||
-                                  out.status == WES::kEffectDigestFailed
+                                  out.status == WES::kEffectDigestFailed ||
+                                  out.status == WES::kRunFailed
                               ? "error"
                               : "denied",
                           "reason=" + out.reason);
                 switch (out.status) {
+                case WES::kRunFailed: {
+                    // The run THREW after steps may have been sent: -32603 with NO retry hint
+                    // (retry_after_ms null on purpose; a blind re-send could dispatch twice) and
+                    // the typed handles a worker reads the run with, as execute_instruction_definition's
+                    // dispatch_exception carries them.
+                    nlohmann::json data{{"correlation_id", yuzu::server::detail::make_correlation_id()},
+                                        {"retry_after_ms", nullptr},
+                                        {"remediation", out.remediation},
+                                        {"reason", out.reason},
+                                        {"execution_id", out.execution_id}};
+                    if (out.agents_sent > 0)
+                        data["agents_sent"] = out.agents_sent;
+                    if (!out.audit_persisted)
+                        data["audit_persisted"] = false;
+                    res.set_content(error_response(id, kInternalError, out.message, data.dump()),
+                                    "application/json");
+                    return;
+                }
                 case WES::kStoreFailed:
                 case WES::kAuditFailed:
                     res.set_content(a4_error(kInternalError, out.message, {},

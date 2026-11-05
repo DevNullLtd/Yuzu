@@ -52,6 +52,14 @@
 ///      through the caller's own `DispatchCaller`, so the shared chokepoint confines each step to
 ///      the caller.
 ///
+/// A THROW after the `requested` row (any port: the engine, a step dispatch, the read-back) never
+/// escapes `run_workflow_execute`. The engine closes its own row `failed` and skips the rest, and
+/// the sequence writes the closing `failure` row and answers `kRunFailed`: NOT retryable, because
+/// steps may already have been sent, carrying `execution_id` and `agents_sent` so the caller reads
+/// the run (`get_workflow_execution`) instead of re-sending. Only a throw BEFORE that row (the
+/// prepare half, the `requested` row itself) escapes, and a transport maps that one retryable:
+/// nothing had been sent.
+///
 /// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
 /// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches
 /// is decided later, per step, at the dispatch chokepoint (visibility, containment, plugin
@@ -169,6 +177,9 @@ struct WorkflowExecutePorts {
     /// Optional: bumps `yuzu_server_dispatch_denied_total{reason}` with the chokepoint's own
     /// denial token (`forbidden`, `approval_required`, `kill_switched`, ...).
     std::function<void(std::string_view reason)> count_dispatch_denied;
+    /// Optional: bumps `yuzu_server_dispatch_fanout_throw_total{route="workflow",phase="dispatch"}`
+    /// when a run throws after its `requested` row.
+    std::function<void()> count_run_threw;
 };
 
 /// instruction id -> `workflow_step_effect` text: what one step's instruction resolved to when the
@@ -221,6 +232,7 @@ enum class WorkflowExecuteStatus {
     kExecuteFailed,              ///< the engine refused the run (400), message in `message`
     kDefinitionChanged,          ///< a step's instruction moved from the ticket-bound effect (400, nothing sent for it)
     kEffectDigestFailed,         ///< the step-effect digest could not be computed (500, no ticket minted)
+    kRunFailed,                  ///< the run THREW after the `requested` row: steps may have been sent (500, NOT retryable)
 };
 
 /// One dispatch attempt as recorded while the engine drove the steps. Retries and `foreach`
@@ -251,8 +263,12 @@ struct WorkflowExecuteOutcome {
     /// wording, the ExecuteGate case rewritten because no ticket lifts a workflow step's gate).
     std::string remediation;
     bool retryable{false};
-    /// Set for kOk and kNoAgentsReached (the run exists in both).
+    /// Set for kOk and kNoAgentsReached (the run exists in both), and for kRunFailed when the
+    /// engine had admitted the run before the throw ("" otherwise).
     std::string execution_id;
+    /// kRunFailed only: a lower bound on the agents the send path had accepted a send to when the
+    /// run threw, summed over the steps (0 = none known). Never a receipt.
+    int agents_sent{0};
     /// The engine's recorded status after the step loop ("completed", "failed", ...), or
     /// "unknown" when it could not be read back. Dispatch-level only: it says the commands were
     /// SENT, not that any device finished.
@@ -307,8 +323,9 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
                                                           const WorkflowExecutePlan& plan);
 
 /// Run the sequence in the header banner: prepare, then run. Never throws for an expected
-/// refusal; a thrown port is the caller's to catch (the transports wrap it, as they wrap every
-/// other handler body).
+/// refusal. A port that throws BEFORE the `requested` row is the caller's to catch (the transports
+/// wrap it, and answer retryable: nothing was sent); one that throws after it is answered as
+/// `kRunFailed` (see the banner).
 [[nodiscard]] WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
                                                             const WorkflowExecuteRequest& req);
 

@@ -2,6 +2,7 @@
 
 #include "compliance_eval.hpp"
 #include "dispatch_denial_text.hpp"
+#include "dispatch_send_progress.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
 #include "instruction_store.hpp"
@@ -436,9 +437,21 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
     return plan;
 }
 
-WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
-                                            const WorkflowExecuteRequest& req,
-                                            const WorkflowExecutePlan& plan) {
+namespace {
+
+/// What a run has done so far. Owned by `run_workflow_execute`, outside the function that drives
+/// the run, so the throw arm can still read the execution id, the sends and the step notes after
+/// the driver has unwound.
+struct RunProgress {
+    std::string execution_id;
+    int agents_sent{0};
+    std::vector<WorkflowStepDispatchNote> notes;
+    bool late_denied{false};
+};
+
+/// Step 6 and the closing row. Anything it throws is answered by the caller as `kRunFailed`.
+WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const WorkflowExecuteRequest& req,
+                                 RunProgress& progress) {
     const std::string target_id = clip_token(req.workflow_id);
     auto deny_audit = [&](std::string_view reason, const std::string& extra) {
         (void)ports.audit(std::string(kActionExecute), "denied", target_id,
@@ -449,20 +462,12 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
             ports.count_target_rejected(reason);
     };
 
-    // ── 5. the requested row, BEFORE anything is dispatched ──────────────
-    if (!ports.audit(std::string(kActionExecute), "requested", target_id,
-                     req.audit_context + " agents=" + std::to_string(req.agent_ids.size()) +
-                         " steps=" + std::to_string(plan.step_count)))
-        return refuse(WorkflowExecuteStatus::kAuditFailed,
-                      "audit subsystem unavailable; refusing to dispatch without durable evidence",
-                      "audit_unavailable", /*retryable=*/true);
-
     // ── 6. run: the engine drives the steps synchronously through this callback ──
-    std::vector<WorkflowStepDispatchNote> notes;
-    bool late_denied = false;
+    std::vector<WorkflowStepDispatchNote>& notes = progress.notes;
+    bool& late_denied = progress.late_denied;
     const StepDispatchFn dispatch_fn =
         [&](const std::string& instruction_id, const std::string& /*agent_ids_json*/,
-            const std::string& parameters_json) -> std::expected<std::string, std::string> {
+            const std::string& parameters_json) -> std::expected<std::string, StepDispatchError> {
         // The engine hands back the JSON of the list it was given, which is ours; the request's
         // own vector is used so a parse of it cannot narrow or widen the target set.
         const auto def_r = ports.lookup(instruction_id);
@@ -481,7 +486,10 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
             deny_audit("definition_changed", " step=" + clip_token(instruction_id) + " (late)");
             notes.push_back(WorkflowStepDispatchNote{.instruction_id = instruction_id,
                                                      .reason = "definition_changed"});
-            return std::unexpected("step definition changed after approval; refused");
+            // Permanent: the definition will not move back, and a retry would audit the same
+            // refusal again after a sleep.
+            return std::unexpected(
+                StepDispatchError{"step definition changed after approval; refused", true});
         }
 
         // Re-run the admission against the FRESH definition: an instruction edited after the
@@ -496,13 +504,16 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
             deny_audit(d.reason, " step=" + clip_token(instruction_id) + " (late)");
             notes.push_back(WorkflowStepDispatchNote{.instruction_id = instruction_id,
                                                      .reason = "late_denied"});
+            // Permanent, as above: an authorization refusal never improves with a retry.
             switch (d.verdict) {
             case StepAdmission::kApprovalRequired:
-                return std::unexpected("step now requires approval; refused");
+                return std::unexpected(
+                    StepDispatchError{"step now requires approval; refused", true});
             case StepAdmission::kUnclassified:
-                return std::unexpected("step is not in the capability catalogue; refused");
+                return std::unexpected(
+                    StepDispatchError{"step is not in the capability catalogue; refused", true});
             default:
-                return std::unexpected(std::string(d.message));
+                return std::unexpected(StepDispatchError{std::string(d.message), true});
             }
         }
 
@@ -513,7 +524,17 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
                 params[k] = v.is_string() ? v.get<std::string>() : v.dump();
         }
 
-        const ConfinedDispatchOutcome out = ports.dispatch(def, req.agent_ids, params, req.caller);
+        // Sends accepted before a throw, summed over the steps (dispatch_send_progress.hpp).
+        SendProgress sends;
+        ConfinedDispatchOutcome out;
+        try {
+            const SendProgressScope scope(sends);
+            out = ports.dispatch(def, req.agent_ids, params, req.caller);
+        } catch (...) {
+            progress.agents_sent += sends.sent;
+            throw;
+        }
+        progress.agents_sent += out.sent;
         WorkflowStepDispatchNote note;
         note.instruction_id = instruction_id;
         note.command_id = out.command_id;
@@ -542,8 +563,11 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
         return evaluate_compliance_bool(expression, fields);
     };
 
-    const auto run = ports.run(req.workflow_id, req.agent_ids, dispatch_fn, condition_fn,
-                               WorkflowRunControl{});
+    WorkflowRunControl control;
+    control.on_admitted = [&progress](const std::string& execution_id) {
+        progress.execution_id = execution_id;
+    };
+    const auto run = ports.run(req.workflow_id, req.agent_ids, dispatch_fn, condition_fn, control);
     if (!run) {
         const bool db = is_generic_db_error(run.error());
         const bool gone = run.error().starts_with("workflow not found");
@@ -610,6 +634,69 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
             (late_denied ? " late_denied=true" : "") +
             (o.status == WorkflowExecuteStatus::kNoAgentsReached ? " reason=" + o.reason : ""));
     return o;
+}
+
+} // namespace
+
+WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
+                                            const WorkflowExecuteRequest& req,
+                                            const WorkflowExecutePlan& plan) {
+    const std::string target_id = clip_token(req.workflow_id);
+
+    // ── 5. the requested row, BEFORE anything is dispatched ──────────────
+    if (!ports.audit(std::string(kActionExecute), "requested", target_id,
+                     req.audit_context + " agents=" + std::to_string(req.agent_ids.size()) +
+                         " steps=" + std::to_string(plan.step_count)))
+        return refuse(WorkflowExecuteStatus::kAuditFailed,
+                      "audit subsystem unavailable; refusing to dispatch without durable evidence",
+                      "audit_unavailable", /*retryable=*/true);
+
+    // From here a throw means steps may already have been sent, so it is answered as a started,
+    // failed run and never as a retryable fault. The strings and the outcome are built BEFORE the
+    // run (instruction_execute.cpp's throw arm): a second allocation failure in the arm must not
+    // lose the closing row.
+    std::string threw_detail = req.audit_context + " reason=dispatch_exception";
+    WorkflowExecuteOutcome threw = refuse(
+        WorkflowExecuteStatus::kRunFailed, "workflow run failed part-way",
+        "dispatch_exception");
+    threw.remediation =
+        "the run failed part-way and some steps may already have been sent to agents, so it was "
+        "not retried and must not be re-sent; read the run with get_workflow_execution "
+        "(GET /api/v1/workflow-executions/{id}), where a step with no command_id was never "
+        "sent, before starting another";
+    RunProgress progress;
+    try {
+        return drive_run(ports, req, progress);
+    } catch (const std::exception& e) {
+        spdlog::error("workflow execute: run threw: {}", e.what());
+    } catch (...) {
+        spdlog::error("workflow execute: run threw a non-standard exception");
+    }
+    // ORDER: the closing row first, then the metric, then the bookkeeping that can allocate.
+    try {
+        threw_detail += " execution_id=" + clip_token(progress.execution_id) +
+                        " agents_sent=" + std::to_string(progress.agents_sent);
+    } catch (...) { // NOLINT(bugprone-empty-catch): the pre-built row text stands
+    }
+    try {
+        threw.audit_persisted =
+            ports.audit(std::string(kActionExecute), "failure", target_id, threw_detail);
+    } catch (...) {
+        threw.audit_persisted = false;
+    }
+    try {
+        if (ports.count_run_threw)
+            ports.count_run_threw();
+    } catch (...) { // NOLINT(bugprone-empty-catch): observability must not fail the answer
+    }
+    threw.agents_sent = progress.agents_sent;
+    threw.late_denied = progress.late_denied;
+    try {
+        threw.execution_id = progress.execution_id;
+        threw.steps = std::move(progress.notes);
+    } catch (...) { // NOLINT(bugprone-empty-catch): the typed fields above stand
+    }
+    return threw;
 }
 
 WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,

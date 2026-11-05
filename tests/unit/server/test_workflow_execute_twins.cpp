@@ -24,6 +24,7 @@
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_scope_ladder.hpp"
+#include "dispatch_send_progress.hpp"
 #include "dispatch_target_shape.hpp"
 #include "dispatch_zero_reach.hpp"
 #include "mcp_policy.hpp"
@@ -44,6 +45,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -111,6 +113,12 @@ struct Fx {
     std::string engine_status{"completed"};
     std::expected<std::string, std::string> engine_error{std::string{"exec-1"}};
     bool engine_called{false};
+    // The stand-in engine throws before it admits the run (no execution id yet).
+    bool engine_throws_before_admit{false};
+    // What each step's dispatch callback answered with when it failed (the engine reads
+    // `permanent` to decide whether to retry).
+    std::vector<StepDispatchError> step_errors;
+    int run_threw_count{0};
 
     WorkflowExecuteRequest request(std::vector<std::string> ids = {"a1"}) {
         WorkflowExecuteRequest r;
@@ -159,13 +167,20 @@ struct Fx {
     /// (on_failure=continue semantics).
     WorkflowRunFn run_fn() {
         return [this](const std::string&, const std::vector<std::string>&, StepDispatchFn fn,
-                      ConditionEvalFn, const WorkflowRunControl&)
+                      ConditionEvalFn, const WorkflowRunControl& control)
                    -> std::expected<std::string, std::string> {
             engine_called = true;
             if (!engine_error)
                 return engine_error;
-            for (const auto& sid : step_ids)
-                (void)fn(sid, "[]", "{}");
+            if (engine_throws_before_admit)
+                throw std::runtime_error("engine exploded before admission");
+            if (control.on_admitted) // as the real engine, once admitted and before step 1
+                control.on_admitted(*engine_error);
+            for (const auto& sid : step_ids) {
+                const auto r = fn(sid, "[]", "{}");
+                if (!r)
+                    step_errors.push_back(r.error());
+            }
             events.push_back("engine_returned");
             return engine_error;
         };
@@ -241,6 +256,7 @@ struct Fx {
             counted_rejections.emplace_back(r);
         };
         p.count_dispatch_denied = [this](std::string_view r) { counted_denials.emplace_back(r); };
+        p.count_run_threw = [this] { ++run_threw_count; };
         return p;
     }
 
@@ -525,6 +541,108 @@ TEST_CASE("workflow execute: a lost CLOSING row is reported, not hidden, and the
     CHECK(o.status == WorkflowExecuteStatus::kOk);
     CHECK_FALSE(o.audit_persisted);
     CHECK(f.dispatched_anything());
+}
+
+TEST_CASE("workflow execute: a refusal at send time is a PERMANENT step failure, a store fault is not",
+          "[workflow][twin][security][late][permanent]") {
+    SECTION("an approval mode raised after the preflight") {
+        Fx f;
+        f.late_defs["i-ro"] = def("i-ro", "os_info", "os_version", "always");
+        (void)f.run();
+        REQUIRE(f.step_errors.size() == 1);
+        CHECK(f.step_errors[0].permanent);
+    }
+    SECTION("a step turned Destructive and out of view after the preflight") {
+        Fx f;
+        f.late_defs["i-ro"] = def("i-ro", "filesystem", "delete_lines");
+        auto req = f.request({"a1"});
+        req.caller.exec_visible = authz::VisibleSet{std::unordered_set<std::string>{"other"}};
+        (void)f.run(req);
+        REQUIRE(f.step_errors.size() == 1);
+        CHECK(f.step_errors[0].permanent);
+    }
+    SECTION("a step repointed off the ticket-bound effect") {
+        Fx f;
+        auto a = f.api();
+        const auto p = f.ports(a);
+        auto req = f.request();
+        const auto plan = prepare_workflow_execute(p, req);
+        REQUIRE(plan.has_value());
+        req.expected_step_effects = workflow_step_effects(*plan);
+        f.late_defs["i-ro"] = def("i-ro", "os_info", "uptime");
+        (void)run_workflow_execute(p, req, *plan);
+        REQUIRE(f.step_errors.size() == 1);
+        CHECK(f.step_errors[0].permanent);
+    }
+    SECTION("a step that reaches nobody stays transient (the engine may retry it)") {
+        Fx f;
+        f.outcomes["i-ro"] = ConfinedDispatchOutcome{.sent = 0};
+        (void)f.run();
+        REQUIRE(f.step_errors.size() == 1);
+        CHECK_FALSE(f.step_errors[0].permanent);
+    }
+}
+
+TEST_CASE("workflow execute: a run that THROWS after the requested row is a failed run with its "
+          "execution id and send count, never a retryable fault",
+          "[workflow][twin][security][audit][throw]") {
+    Fx f;
+    f.step_ids = {"i-ro", "i-ro2"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    f.dispatch_override = [&](const WorkflowStepInstruction& d, const std::vector<std::string>&,
+                              const DispatchCaller&) -> ConfinedDispatchOutcome {
+        if (d.id == "i-ro")
+            return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-1"};
+        // Two sends were accepted by the send path when the fan-out of step 2 blew up.
+        REQUIRE(SendProgressScope::current() != nullptr);
+        SendProgressScope::current()->sent += 2;
+        throw std::runtime_error("registry exploded mid fan-out");
+    };
+    const auto o = f.run();
+    CHECK(o.status == WorkflowExecuteStatus::kRunFailed);
+    CHECK_FALSE(o.retryable);
+    CHECK(o.reason == "dispatch_exception");
+    CHECK(o.execution_id == "exec-1");
+    CHECK(o.agents_sent == 3); // step 1's completed send plus step 2's two accepted before the throw
+    CHECK(o.remediation.find("get_workflow_execution") != std::string::npos);
+    CHECK(o.audit_persisted);
+    CHECK(f.run_threw_count == 1);
+    // requested first; the closing row is a `failure` that names both handles; no `success`.
+    REQUIRE(f.audit_details.size() == 2);
+    CHECK(f.events.front() == "audit:requested");
+    CHECK(f.events.back() == "audit:failure");
+    CHECK(f.position("audit:success") == f.events.size());
+    CHECK(f.audit_details[1].find("reason=dispatch_exception") != std::string::npos);
+    CHECK(f.audit_details[1].find("execution_id=exec-1") != std::string::npos);
+    CHECK(f.audit_details[1].find("agents_sent=3") != std::string::npos);
+    CHECK(f.audit_details[1].find("surface=test") != std::string::npos);
+    // The notes of the step that was sent survive the throw.
+    REQUIRE(o.steps.size() == 1);
+    CHECK(o.steps[0].agents_reached == 1);
+}
+
+TEST_CASE("workflow execute: a throw before the engine admitted the run is still a failed run, with "
+          "no execution id and no sends",
+          "[workflow][twin][security][audit][throw]") {
+    Fx f;
+    f.engine_throws_before_admit = true;
+    const auto o = f.run();
+    CHECK(o.status == WorkflowExecuteStatus::kRunFailed);
+    CHECK_FALSE(o.retryable);
+    CHECK(o.execution_id.empty());
+    CHECK(o.agents_sent == 0);
+    CHECK_FALSE(f.dispatched_anything());
+    CHECK(f.events.back() == "audit:failure");
+}
+
+TEST_CASE("workflow execute: a lost closing row on a thrown run is reported, not hidden",
+          "[workflow][twin][security][audit][throw]") {
+    Fx f;
+    f.engine_throws_before_admit = true;
+    f.audit_fails_on_call = 1; // 0 = requested (persists), 1 = the closing `failure` row
+    const auto o = f.run();
+    CHECK(o.status == WorkflowExecuteStatus::kRunFailed);
+    CHECK_FALSE(o.audit_persisted);
 }
 
 TEST_CASE("workflow execute: a step edited after the preflight is refused AT SEND TIME and audited "
@@ -1224,6 +1342,7 @@ struct Rest {
     Fx fx;
     std::string gate_type, gate_op;
     bool gate_admits{true};
+    bool dispatch_throws{false};
     int gate_calls{0};
     int persist_calls{0};
     DispatchCaller caller{.principal = "alice",
@@ -1254,8 +1373,11 @@ struct Rest {
                                     const std::string& result, const std::string&,
                                     const std::string&, const std::string& detail) {
             ++persist_calls;
+            const size_t idx = fx.audit_details.size();
             fx.events.push_back("audit:" + result);
             fx.audit_details.push_back(detail);
+            if (fx.audit_fails_on_call && *fx.audit_fails_on_call == idx)
+                return false;
             return fx.audit_ok;
         };
         d.workflow_api = api;
@@ -1274,6 +1396,11 @@ struct Rest {
             fx.dispatched_ids.push_back(ids);
             seen_caller = c;
             saw_caller = true;
+            if (dispatch_throws) {
+                if (auto* p = SendProgressScope::current())
+                    p->sent += 2; // accepted by the send path before the fan-out failed
+                throw std::runtime_error("registry exploded mid fan-out");
+            }
             return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-rest"};
         };
         d.caller_fn = [this](const httplib::Request&) { return caller; };
@@ -1369,6 +1496,88 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a requested row that cannot be s
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK_FALSE(r.fx.dispatched_anything());
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a run that throws after the requested row is a 500 "
+          "naming the execution and the sends, with NO retry hint",
+          "[workflow][twin][rest][security][audit][throw]") {
+    Rest r;
+    r.dispatch_throws = true;
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    const auto j = body_of(*res);
+    CHECK(j["error"]["reason"] == "dispatch_exception");
+    CHECK(j["error"]["execution_id"] == "exec-1");
+    CHECK(j["error"]["agents_sent"] == 2);
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["remediation"].get<std::string>().find("get_workflow_execution") !=
+          std::string::npos);
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+    CHECK(r.fx.events.front() == "audit:requested");
+    CHECK(r.fx.events.back() == "audit:failure");
+    CHECK(r.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "workflow"}, {"phase", "dispatch"}})
+              .value() == 1);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a lost closing row on a thrown run adds "
+          "Sec-Audit-Failed",
+          "[workflow][twin][rest][security][audit][throw]") {
+    Rest r;
+    r.dispatch_throws = true;
+    r.fx.audit_fails_on_call = 1;
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a throw BEFORE the requested row stays a retryable "
+          "503, because nothing was sent",
+          "[workflow][twin][rest][security][throw]") {
+    Rest r;
+    r.fx.wire_authorize = true;
+    // The authorizer is read by the route deps at construction, so build a second instance whose
+    // authorizer throws (the preflight half).
+    yuzu::server::test::TestRouteSink sink;
+    WorkflowExecuteRouteDeps d;
+    d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    d.persist_audit_fn = [&](const httplib::Request&, const std::string&, const std::string&,
+                             const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    d.workflow_api = r.api;
+    d.workflow_run = r.fx.run_fn();
+    d.instruction_store_open = [] { return true; };
+    d.approval_gate_available = [] { return true; };
+    auto ports = r.fx.ports(r.api);
+    d.lookup = ports.lookup;
+    d.classify = ports.classify;
+    d.authorize = [](const DispatchCaller&, std::string_view,
+                     std::string_view) -> std::expected<CommandCapability, detail::DispatchDenial> {
+        throw std::runtime_error("authorizer exploded");
+    };
+    d.command_dispatch_fn = [&](const std::string&, const std::string&,
+                                const std::vector<std::string>&, const std::string&,
+                                const std::unordered_map<std::string, std::string>&,
+                                const std::string&, const DispatchCaller&) {
+        r.fx.events.push_back("dispatch:rest");
+        return ConfinedDispatchOutcome{.sent = 1};
+    };
+    d.caller_fn = [](const httplib::Request&) {
+        return DispatchCaller{.principal = "alice", .exec_visible = std::nullopt};
+    };
+    register_workflow_execute_v1_route(sink, std::move(d));
+    const auto res = sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(body_of(*res)["error"].contains("execution_id"));
     CHECK_FALSE(r.fx.engine_called);
     CHECK_FALSE(r.fx.dispatched_anything());
 }

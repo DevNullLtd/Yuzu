@@ -2664,7 +2664,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller,
              capability_registry, &late_targeting_denied, &late_targeting_reason](  // BR2-001/BR4-001
                 const std::string& instruction_id, const std::string& agent_ids_json,
-                const std::string& parameters_json) -> std::expected<std::string, std::string> {
+                const std::string& parameters_json)
+            -> std::expected<std::string, yuzu::server::StepDispatchError> {
             // Look up the instruction definition to get plugin + action
             if (!instruction_store || !instruction_store->is_open())
                 return std::unexpected<std::string>("instruction store not available");
@@ -2759,7 +2760,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     // see the capture-site comment above).
                     late_targeting_denied = true;
                     late_targeting_reason = std::string(gate.refusal_reason);
-                    return std::unexpected<std::string>(std::string(gate.refusal_message));
+                    // Permanent: a targeting refusal repeats on every retry, so the engine
+                    // records the step failed without the retry sleeps.
+                    return std::unexpected(yuzu::server::StepDispatchError{
+                        std::string(gate.refusal_message), /*permanent=*/true});
                 }
             }
 

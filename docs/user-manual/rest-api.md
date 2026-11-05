@@ -6576,6 +6576,9 @@ The per-step approval check (a step whose instruction is not `auto` is refused w
 unknown-instruction `400` run only when the approval manager and the instruction store are both
 wired and open; if either is not, this legacy route skips them and goes on to dispatch. The v1 twin
 refuses with `503` instead. The route replies `202` after the steps have been dispatched.
+A step refused at send time by the targeting gate is recorded failed at once, with no retry and no
+retry sleep. If a step throws, the engine closes the execution `failed` (never left `running`),
+marks its remaining steps `skipped`, and the request fails with the server's generic `500`.
 
 **Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). Such a token runs a workflow through the MCP tool `execute_workflow`, which takes an approval ticket (`-32006` with an `approval_id`, approval, recall), or from a session or a non-MCP API token. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
 
@@ -6695,8 +6698,9 @@ nothing is sent.
 | `404` | `workflow_not_found` | Unknown or soft-deleted workflow. |
 | `404` | `destructive_no_visible_target` | A Destructive or Forensics step whose named agents are all outside the caller's view. |
 | `500` | `no_principal` | The session has no principal. |
+| `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step with no `command_id` was never sent) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
 | `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
-| `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). |
+| `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). Also the answer to an unexpected fault BEFORE the `requested` row (the preflight half): nothing was sent, so retrying is safe. |
 | `503` | `audit_unavailable` | The `requested` row could not be saved (`Sec-Audit-Failed: true`); nothing was sent. |
 | `503` | a zero-reach cause | The run started and no step reached any agent (below). |
 
@@ -6716,7 +6720,12 @@ been sent, including step retries and delays, so it can be slow. Each step is se
 agents the caller can see (the same confinement as every other dispatch); a named agent outside the
 caller's view is dropped silently. Read the run with `GET /api/v1/workflow-executions/{execution_id}`
 and each device's output with the step's `command_id`. Do not repeat the call to retry: every step is
-sent again.
+sent again. A started run that fails part-way is never retried blind: a step the engine records as
+failed is retried only when its failure is transient (`retry_count` times, with `retry_delay_seconds`
+between attempts); a step refused at send time (its definition changed, or it no longer passes the
+caller's approval or targeting checks) is a permanent failure, recorded at once with no retry and no
+sleep, and the step's `on_failure` policy applies. A fault that throws out of the run closes the
+execution `failed` (never left `running`) and answers `500 dispatch_exception` as above.
 
 **Success `202`:** `data.execution_id`, `data.workflow_id`, `data.status` (the engine's recorded
 dispatch-level status, `completed` or `failed`: commands were sent, devices have not necessarily

@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -439,6 +440,247 @@ TEST_CASE("WorkflowEngine: execute retries exhaust and the step is recorded fail
     REQUIRE((*exec)->step_results.size() == 1);
     CHECK((*exec)->step_results[0].status == "failed");
     CHECK((*exec)->step_results[0].attempt == 3); // the last (also failed) attempt number
+}
+
+
+// ── Typed permanent failure and finalize-on-throw (#2146) ────────────────────
+
+namespace {
+
+const std::string kThreeStepYaml = "kind: Workflow\n"
+                                   "metadata:\n"
+                                   "  displayName: three-step\n"
+                                   "spec:\n"
+                                   "  steps:\n"
+                                   "    - instruction: inst-1\n"
+                                   "    - instruction: inst-2\n"
+                                   "    - instruction: inst-3\n";
+
+/// The newest (only) execution of `wf_id`, read back from the store.
+WorkflowExecution only_execution(WorkflowEngine& engine, const std::string& wf_id) {
+    auto execs = engine.list_executions(wf_id);
+    REQUIRE(execs.has_value());
+    REQUIRE(execs->size() == 1);
+    auto got = engine.get_execution((*execs)[0].id);
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    return **got;
+}
+
+} // namespace
+
+TEST_CASE("WorkflowEngine: a PERMANENT step failure is not retried and not slept on",
+          "[workflow_engine][pg][execute][retry][permanent]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: permanent-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      retryCount: 3\n"
+                             "      retryDelay: 2\n"
+                             "    - instruction: inst-2\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    int attempts = 0;
+    StepDispatchFn refused = [&attempts](const std::string& instruction_id, const std::string&,
+                                         const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        if (instruction_id == "inst-1") {
+            ++attempts;
+            return std::unexpected(StepDispatchError{"refused for good", /*permanent=*/true});
+        }
+        return std::string(R"({"status":"ok"})");
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, refused);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE(exec_result.has_value());
+    CHECK(attempts == 1); // 3 retries were configured; none ran
+    // retryDelay is 2 s: a retry sleep would have cost at least 2 s.
+    CHECK(elapsed < std::chrono::milliseconds(1500));
+
+    const auto exec = only_execution(engine, wf_id);
+    CHECK(exec.status == "failed");
+    REQUIRE(exec.step_results.size() == 2);
+    CHECK(exec.step_results[0].status == "failed");
+    CHECK(exec.step_results[1].status == "skipped"); // on_failure=abort still applies
+}
+
+TEST_CASE("WorkflowEngine: a permanent failure still obeys on_failure=continue",
+          "[workflow_engine][pg][execute][retry][permanent]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: permanent-continue\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      retryCount: 2\n"
+                             "      retryDelay: 2\n"
+                             "      onFailure: continue\n"
+                             "    - instruction: inst-2\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    int attempts = 0;
+    StepDispatchFn refused = [&attempts](const std::string& instruction_id, const std::string&,
+                                         const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        if (instruction_id == "inst-1") {
+            ++attempts;
+            return std::unexpected(StepDispatchError{"refused for good", true});
+        }
+        return std::string(R"({"status":"ok"})");
+    };
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, refused);
+    REQUIRE(exec_result.has_value());
+    CHECK(attempts == 1);
+    const auto exec = only_execution(engine, wf_id);
+    CHECK(exec.status == "completed");
+    REQUIRE(exec.step_results.size() == 2);
+    CHECK(exec.step_results[0].status == "failed");
+    CHECK(exec.step_results[1].status == "success");
+}
+
+TEST_CASE("WorkflowEngine: a plain string failure is still TRANSIENT and retried",
+          "[workflow_engine][pg][execute][retry][permanent]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: transient-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      retryCount: 2\n"
+                             "      retryDelay: 0\n";
+    auto wf_id = *engine.create_workflow(yaml);
+    int attempts = 0;
+    StepDispatchFn fn = [&attempts](const std::string&, const std::string&,
+                                    const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        ++attempts;
+        return std::unexpected(std::string("flaky")); // a std::string means transient
+    };
+    REQUIRE(engine.execute(wf_id, {"agent-1"}, fn).has_value());
+    CHECK(attempts == 3);
+}
+
+TEST_CASE("WorkflowEngine: a dispatch_fn that THROWS fails the run, skips the rest, closes the row "
+          "and rethrows",
+          "[workflow_engine][pg][execute][throw]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kThreeStepYaml);
+
+    SECTION("the first step throws") {
+        int attempts = 0;
+        StepDispatchFn boom = [&attempts](const std::string&, const std::string&,
+                                          const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            ++attempts;
+            throw std::runtime_error("registry exploded");
+        };
+        CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, boom), std::runtime_error);
+        CHECK(attempts == 1); // a throw is never retried
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed"); // NOT left `running`
+        CHECK(exec.completed_at != 0);
+        REQUIRE(exec.step_results.size() == 3);
+        CHECK(exec.step_results[0].status == "failed");
+        CHECK(exec.step_results[1].status == "skipped");
+        CHECK(exec.step_results[2].status == "skipped");
+    }
+    SECTION("a later step throws: the earlier step keeps its result, the throwing one fails") {
+        StepDispatchFn boom = [](const std::string& instruction_id, const std::string&,
+                                 const std::string&) -> std::expected<std::string, StepDispatchError> {
+            if (instruction_id == "inst-2")
+                throw 42; // a non-standard exception is finalized and rethrown too
+            return std::string(R"({"status":"ok"})");
+        };
+        CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, boom), int);
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 3);
+        CHECK(exec.step_results[0].status == "success");
+        CHECK(exec.step_results[1].status == "failed");
+        CHECK(exec.step_results[2].status == "skipped");
+    }
+}
+
+TEST_CASE("WorkflowEngine: a retrying step whose dispatch THROWS on the retry is not retried again",
+          "[workflow_engine][pg][execute][throw][retry]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: throw-retry\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      retryCount: 5\n"
+                             "      retryDelay: 0\n";
+    auto wf_id = *engine.create_workflow(yaml);
+    int attempts = 0;
+    StepDispatchFn fn = [&attempts](const std::string&, const std::string&,
+                                    const std::string&) -> std::expected<std::string, StepDispatchError> {
+        if (++attempts == 1)
+            return std::unexpected(std::string("flaky"));
+        throw std::runtime_error("second attempt exploded");
+    };
+    CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, fn), std::runtime_error);
+    CHECK(attempts == 2);
+    CHECK(only_execution(engine, wf_id).status == "failed");
+}
+
+TEST_CASE("WorkflowEngine: a condition_fn that THROWS fails the run and is finalized",
+          "[workflow_engine][pg][execute][throw]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: cond-throw\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "    - instruction: inst-2\n"
+                             "      condition: result.status == 'ok'\n"
+                             "    - instruction: inst-3\n";
+    auto wf_id = *engine.create_workflow(yaml);
+    ConditionEvalFn boom = [](const std::string&,
+                              const std::map<std::string, std::string>&) -> bool {
+        throw std::runtime_error("evaluator exploded");
+    };
+    CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), boom), std::runtime_error);
+    const auto exec = only_execution(engine, wf_id);
+    CHECK(exec.status == "failed");
+    REQUIRE(exec.step_results.size() == 3);
+    CHECK(exec.step_results[0].status == "success");
+    CHECK(exec.step_results[1].status == "failed");
+    CHECK(exec.step_results[2].status == "skipped");
+}
+
+TEST_CASE("WorkflowEngine: on_admitted gets the new execution id before the first step; a throwing "
+          "on_admitted still closes the row",
+          "[workflow_engine][pg][execute][throw][admitted]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kTwoStepYaml);
+
+    SECTION("called once, before any dispatch, with the id execute() returns") {
+        std::vector<std::string> events;
+        StepDispatchFn fn = [&events](const std::string& id, const std::string&,
+                                      const std::string&) -> std::expected<std::string, StepDispatchError> {
+            events.push_back("dispatch:" + id);
+            return std::string(R"({"status":"ok"})");
+        };
+        std::string admitted_id;
+        auto r = engine.execute(wf_id, {"agent-1"}, fn, nullptr,
+                                [&](const std::string& id) {
+                                    events.push_back("admitted");
+                                    admitted_id = id;
+                                });
+        REQUIRE(r.has_value());
+        CHECK(admitted_id == *r);
+        REQUIRE(events.size() == 3);
+        CHECK(events[0] == "admitted");
+    }
+    SECTION("a throwing on_admitted: nothing dispatched, the run is failed and skipped") {
+        int dispatches = 0;
+        StepDispatchFn fn = [&dispatches](const std::string&, const std::string&,
+                                          const std::string&) -> std::expected<std::string, StepDispatchError> {
+            ++dispatches;
+            return std::string(R"({"status":"ok"})");
+        };
+        CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, fn, nullptr,
+                                       [](const std::string&) {
+                                           throw std::runtime_error("hook exploded");
+                                       }),
+                        std::runtime_error);
+        CHECK(dispatches == 0);
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 2);
+        CHECK(exec.step_results[0].status == "skipped");
+        CHECK(exec.step_results[1].status == "skipped");
+    }
 }
 
 TEST_CASE("WorkflowEngine: execute skips a step whose condition evaluates false",

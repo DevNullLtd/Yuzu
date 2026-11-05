@@ -1740,7 +1740,8 @@ public:
             "guarded() post-dispatch helper) that THREW rather than failing cleanly, "
             "by which one; and, with phase=\"dispatch\" on route command_v1, "
             "instruction_execute or mcp, the dispatch call itself throwing (its execution "
-            "row is left running). A well-behaved sink/helper should fail via its own "
+            "row is left running), and, with route workflow, a workflow run throwing after its "
+            "requested audit row (the engine closes the execution failed). A well-behaved sink/helper should fail via its own "
             "return value, not an exception; a non-zero rate points at a bug in that sink/"
             "helper rather than at ordinary degradation.",
             "counter");
@@ -1754,10 +1755,12 @@ public:
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
                              {{"route", "command"}, {"phase", phase}});
         // `phase="dispatch"` is the dispatch call ITSELF throwing (not a post-dispatch helper),
-        // counted by the three v1/MCP surfaces that catch it: POST /api/v1/commands, the
-        // instruction-definition execute twins (REST + MCP). The legacy /api/command route does
-        // not catch a throwing dispatch, so it has no such series. The same alert covers them.
-        for (const char* route : {"command_v1", "instruction_execute", "mcp"})
+        // counted by the surfaces that catch it: POST /api/v1/commands, the
+        // instruction-definition execute twins (REST + MCP) and, as route `workflow`, a workflow
+        // run that throws after its `requested` row (REST v1 + MCP execute_workflow). The legacy
+        // /api/command route does not catch a throwing dispatch, so it has no such series. The
+        // same alert covers them.
+        for (const char* route : {"command_v1", "instruction_execute", "mcp", "workflow"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
                              {{"route", route}, {"phase", "dispatch"}});
 
@@ -19501,7 +19504,8 @@ private:
         // The run port behind POST /api/v1/workflows/{id}/execute and MCP execute_workflow
         // (workflow_run_port.hpp): ONE closure over the engine, shared by both, kept out of the
         // read seam above. Null when the engine was never opened, like `workflow_api`. The engine
-        // does not take a WorkflowRunControl yet, so the control is not forwarded.
+        // consumes only `on_admitted` of the WorkflowRunControl so far; the other members are not
+        // forwarded.
         yuzu::server::WorkflowRunFn workflow_run_fn;
         if (workflow_engine_)
             workflow_run_fn = [engine = workflow_engine_.get()](
@@ -19509,9 +19513,9 @@ private:
                                   const std::vector<std::string>& agent_ids,
                                   yuzu::server::StepDispatchFn dispatch_fn,
                                   yuzu::server::ConditionEvalFn condition_fn,
-                                  const yuzu::server::WorkflowRunControl& /*control*/) {
+                                  const yuzu::server::WorkflowRunControl& control) {
                 return engine->execute(workflow_id, agent_ids, std::move(dispatch_fn),
-                                       std::move(condition_fn));
+                                       std::move(condition_fn), control.on_admitted);
             };
         // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam — ONE
         // instance backing 8 of the 9 GET /api/v1/guaranteed-state/* resources
