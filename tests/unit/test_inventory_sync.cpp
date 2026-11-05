@@ -3675,7 +3675,7 @@ TEST_CASE("vendor_or_origin: a declared vendor stays, an empty one becomes via:<
     CHECK(no_eco.publisher == "via:unknown");
 
     // The fallback lives in the collector, not in the blob builder: a fixture entry with an empty
-    // publisher still hashes with an empty slot 3, which is what keeps the cross-pins above fixed.
+    // publisher hashes an empty slot 3, so the cross-pins above are independent of the fallback.
     SwEntry bare;
     bare.name = "n";
     bare.ecosystem = "brew";

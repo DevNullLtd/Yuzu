@@ -107,14 +107,15 @@ cadences.
   A label is a fixed, lower-case, exact `via:` prefix: Homebrew, Snap and Flatpak are read
   without starting a process, so they carry no vendor and always read `via:brew`,
   `via:snap` and `via:flatpak`; `pacman` and `apk` have no vendor field in their package
-  list; a macOS installer receipt id is an identifier, not a vendor. The catalogue treats a
+  list; a macOS installer receipt id is an identifier, not a vendor. A row with no
+  ecosystem is labelled `via:unknown`, never the bare `via:`. The catalogue treats a
   label as no vendor: it does not count towards the publisher total, never wins as a
   title's representative publisher over a declared one, and does not take part in title
   matching (a title from `via:snap` matches the same title with no publisher). The
-  `publisher` filter and search still match the literal text, so searching `via:` lists
-  every labelled row. The rpm vendor is read from the package's `VENDOR` tag; the
-  `PACKAGER` tag, which is usually a person or a build-system address, is kept only when a
-  package has no vendor.
+  `publisher` filter and search match the literal text, so searching `via:` lists the
+  titles whose representative publisher is a label. The rpm vendor is read from the
+  package's `VENDOR` tag; the `PACKAGER` tag, which is usually a person or a build-system
+  address, is the fallback when a package has no vendor.
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic

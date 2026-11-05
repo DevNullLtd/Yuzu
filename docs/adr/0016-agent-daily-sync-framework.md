@@ -1060,11 +1060,12 @@ vectors on both sides.
 
 **The value rule.** A row's publisher is the vendor its source declares; when the source
 declares none it is the origin label `via:<ecosystem>`, where the ecosystem is the row's own
-`ecosystem` value. The fallback is applied in exactly one place, the collector loop in
+`ecosystem` value (`via:unknown` when that is empty, never the bare `via:`). The fallback is applied in exactly one place, the collector loop in
 `make_installed_software_source` (`vendor_or_origin`, after each adapter has run and the row's
-`source` is stamped), not inside `installed_software_canonical_blob`. The blob builder therefore
-still hashes a fixture entry with an empty publisher as an empty slot, and the fixture
-cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) did not move.
+`source` is stamped), not inside `installed_software_canonical_blob`. The blob builder hashes the
+publisher as given (a fixture entry with an empty publisher hashes an empty slot), so the fixture
+cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) are independent of
+the fallback.
 
 | Source (`source`) | Publisher | Fallback |
 |---|---|---|
@@ -1080,17 +1081,17 @@ cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) di
 | `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
 | `runtimes.python`, Windows and Linux | the row's vendor column, unescaped | `via:python` when the column is `-` |
 | `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
-| `middleware.ibm_mq` | `IBM`, from the product table (unchanged) | n/a |
+| `middleware.ibm_mq` | `IBM`, from the product table | n/a |
 
-The rpm `list_inventory` query format gains a tenth column, `%{VENDOR}`, at the end; the pinned
-argv literal in `docs/agent-spawn-sink-manifest.md` is updated to match, and `parse_rpm_inv_line`
-now requires ten tokens. The `list` action keeps its own columns.
+The rpm `list_inventory` query format has ten columns, `%{VENDOR}` the last; the pinned argv
+literal in `docs/agent-spawn-sink-manifest.md` carries the same format, and `parse_rpm_inv_line`
+takes ten tokens. The `list` action has its own columns.
 
 **The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
 `kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
 is case-sensitive and exact: the agent writes the prefix in lower case, so a Windows publisher of
 `VIA:Acme` is a vendor and normalises as one, and a vendor that merely contains `via:` is not a
-label. A labelled title therefore keys like a vendorless one (`norm_key` is unchanged for it).
+label. A labelled title therefore keys like a vendorless one.
 The catalogue treats a label as no vendor in two more places: `total_publishers` excludes
 `publisher LIKE 'via:%'`, and the representative publisher of a title (the rollup statement and
 the single-device catalogue read) prefers a non-label value and falls back to the plain maximum
@@ -1114,5 +1115,5 @@ against the `''` triple is not carried over to it, so a curator rejects the labe
 if it is still unwanted.
 
 **Hash.** The publisher is part of each row's hash. The agent's collector characterisation
-digests over the real capture samples include it. The fixture cross-pins are independent of the
-fallback, which is applied in the collector, not in the blob builder.
+digests over the real capture samples include it, and the agent and the server pin the same
+labelled row to the same digests.

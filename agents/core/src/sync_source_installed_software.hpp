@@ -203,7 +203,7 @@ inline constexpr std::string_view kOriginLabelPrefix = "via:";
 /// label `via:<ecosystem>` (`via:unknown` when the entry's ecosystem is empty, never the bare
 /// `via:`). A declared vendor is left alone. The server's normalize_vendor treats
 /// a raw `via:` prefix (case-sensitive, exact) as "no vendor". Applied after every adapter, not
-/// inside installed_software_canonical_blob, so fixture-built blobs hash unchanged.
+/// inside installed_software_canonical_blob, which hashes the publisher as given.
 YUZU_EXPORT void vendor_or_origin(SwEntry& e);
 
 /// Canonical wire blob: sorted + deduped; fields unit-separated (0x1F), entries
