@@ -1942,9 +1942,9 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         if (done[i] == O::kMismatch &&
             mismatch_seen.fetch_add(1, std::memory_order_relaxed) % kReadDegradeLogSample == 0) {
             spdlog::warn("SoftwareInventoryStore: agent={} sent a '{}' {} section that did not "
-                         "verify (a `-` naming a row not held, a key or path collision, a cap "
-                         "breach, or a hash other than its expect); rolled back, asking for a "
-                         "full section",
+                         "verify (a `-` naming a row not held, a key collision, a repeated "
+                         "component (kind, path), a cap breach, or a hash other than its "
+                         "expect); rolled back, asking for a full section",
                          agent_id, results[i].facet,
                          std::string(v3_status_name(report.sections[i].status)));
         }

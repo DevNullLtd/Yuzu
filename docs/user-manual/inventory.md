@@ -346,22 +346,28 @@ shows the same software from two report formats.
 A `delta` section lists only what changed (rows removed by hash, rows added) and carries the hash
 the device holds once it has applied it. The server applies it to the rows it holds and checks
 its own result against that hash. If the device's starting point is not the one the server holds,
-a removal names a row the server does not have, the result does not match, or the facet would
-hold more than the per-call record cap (20,000), the section is undone on its own (the other
-sections of the report apply) and asked for again in full, so nothing is lost. The
+a removal names a row the server does not hold, an added row has the key of a held row, the result
+does not match, or the facet would hold more than the per-call record cap (20,000), the section is
+undone on its own (the other sections of the report apply) and asked for again in full, which
+repairs a delta that went out of step. The
 `component_inventory` section is stored the same way, per device, as the current list of
 components found (`full` replaces the list, `delta` changes it, an empty `full` clears it). A
 component section that names one kind and path twice (two components of one kind with an empty
-path, for example) is answered the same way and does not repair itself: the resend repeats the
-pair, so none of that section is stored until the agent's component writer sends each path once.
+path, for example) is answered the same way, but the full section the agent sends in answer
+repeats the pair, so it does not repair itself and none of that section is stored. The fix is in
+the agent's component writer, which must send each path once; the server's "did not verify"
+warning names the agent (that line is sampled, about 1 in 100).
 
 The server also keeps a change history for installed software: one entry for every install,
 removal or upgrade a stored installed-software section produced, with the from and to versions
 written as `[epoch:]version[-release]` (non-empty parts only), so a release-only or epoch-only
 update (a distribution backport, a Flatpak commit) is an upgrade too. The first full
-section the server receives for a collector, and the first one after that collector was switched
-off and on again, set the starting point and produce no history. Removed software is simply deleted from the device's list; the
-history entry is the record that it was there. History older than 400 days is pruned. Nothing in
+section the server receives for a collector, the first one following a switch-off and switch-on
+of that collector, and a full section for a collector whose stored rows do not match its stored
+section hash (an out-of-band change to the table) set the starting point and produce no history;
+the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
+software is simply deleted from the device's list; the history entry is the record that it was
+there. History older than 400 days is pruned. Nothing in
 the dashboard or the API shows the change history or the components yet. No shipped agent sends v3
 yet; the agent side arrives in a later release. Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
