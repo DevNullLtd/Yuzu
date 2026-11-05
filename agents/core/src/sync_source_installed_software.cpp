@@ -682,6 +682,9 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
+    // Nightly maintenance window, 01:00-05:00 machine-local time (a compile-time default:
+    // no settings channel exists yet). Each agent keeps a stable moment inside it.
+    src.window = SyncWindow{60, 300};
     // A retry re-runs at most one call per table action in-process (no fan-out); the backoff
     // caps that at four extra runs per outage.
     src.skip_backoff = true;
