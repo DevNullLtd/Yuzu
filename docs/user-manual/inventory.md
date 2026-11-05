@@ -1227,11 +1227,13 @@ sync, defeating the hash-skip protocol.
   reports `server:row_count_mismatch` alone. Neither token is stored: both are worked out each
   time the record is read, so they never appear in the `device_ci_section` query further down.
   Reading the record again does not clear either token. **Only a full device-record sync
-  repairs it** (a device whose hardware has not changed sends only a hash on its daily sync,
+  repairs either** (a device whose hardware has not changed sends only a hash on its daily sync,
   which leaves the rows alone): use **Sync now** on the device's Hardware page, or
   `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
   `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed
-  software only and do not repair a section. Otherwise it clears on the device's next hardware
+  software only and do not repair a section, and there is no MCP tool that does: an agentic
+  client should ask an operator to run Sync now on the device, or call
+  `POST /api/v1/hardware/{id}/sync` if it holds REST access. Otherwise it clears on the device's next hardware
   change or its weekly full report (at most 7 days). A section stored before these checks existed
   (before migration 3) has neither a recorded count nor a digest and is not verified until that
   device's next full sync, so a freshly upgraded server verifies a device only after that sync.
@@ -1239,8 +1241,12 @@ sync, defeating the hash-skip protocol.
   that is stored; never taken from the agent) and is an integrity check against accident and
   non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
   digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
-  layout version prefix (`v1:` then the SHA-256); a stored digest in a layout this server does
-  not know is treated as unverified, never as a mismatch.
+  layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
+  version (for example `v2:` followed by a digest) is treated as unverified, because this server
+  cannot recompute it. Any other stored value that is not the current form (an empty or damaged
+  value, `V1:`, a bare hex string, a malformed version) is reported as
+  `server:content_digest_mismatch`, so a damaged column cannot let an edited section read as
+  complete; only an absent value (a section stored before migration 3) is unverified.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.

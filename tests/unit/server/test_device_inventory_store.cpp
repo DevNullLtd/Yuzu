@@ -2393,10 +2393,11 @@ TEST_CASE("a full replace rewrites the content digest (never stale)", "[pg][devi
     CHECK(persisted_digests(pool, "agent-rw").at("dimm") == d2);
 }
 
-// Kills: a verifier that early-returns on a stored digest that is not 64 characters (a truncated or
-// garbage column reading as verified), or one that compares only the head of it. A stored value
-// WITH the v1 prefix is a digest this build recomputes, so any difference from it is a mismatch.
-TEST_CASE("a corrupt v1 content digest is served constrained with the digest reason",
+// Kills: a verifier that early-returns (reads as verified) on a damaged stored digest - the wrong
+// length, a bare hex value, an empty or whitespace column, a malformed version - or that compares
+// only the head of it. Every non-NULL stored value other than a well-formed digest of another layout
+// version is a mismatch: a damaged column must not let a same-count edit read as complete.
+TEST_CASE("a damaged stored content digest is served constrained with the digest reason",
           "[pg][device_ci][v2][digest]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
@@ -2411,6 +2412,19 @@ TEST_CASE("a corrupt v1 content digest is served constrained with the digest rea
         {"one char short", "left(content_digest, 66)"},
         {"right head wrong tail", "left(content_digest, 11) || repeat('0', 56)"},
         {"upper-cased hex", "'v1:' || upper(substr(content_digest, 4))"},
+        {"empty string", "''"},
+        {"whitespace", "' '"},
+        {"leading space on a valid value", "' ' || content_digest"},
+        {"trailing space on a valid value", "content_digest || ' '"},
+        {"V1 prefix", "'V1:' || substr(content_digest, 4)"},
+        {"bare 64 hex", "substr(content_digest, 4)"},
+        {"65 chars after the prefix", "content_digest || 'a'"},
+        {"v: only", "'v:'"},
+        {"vx: garbage", "'vx:abc'"},
+        {"v01: leading zero", "'v01:abc'"},
+        {"v0: version zero", "'v0:abc'"},
+        {"v1 with no colon", "'v1'"},
+        {"v2: with nothing after it", "'v2:'"},
     };
     for (const auto& [what, expr] : corruptions) {
         INFO(what);
@@ -2431,9 +2445,9 @@ TEST_CASE("a corrupt v1 content digest is served constrained with the digest rea
     }
 }
 
-// Kills: reading a layout this build does not know as drift. The bare-hex form is what an
-// intermediate build of this branch stored; a future prefix is the case the version exists for.
-TEST_CASE("a content digest with an unknown prefix is unverified and the section reads as before",
+// Kills: reading a well-formed digest of another layout version as drift. That is the one case a
+// stored value is unverified instead of a mismatch (a future layout bump); NULL is the other.
+TEST_CASE("a well-formed digest of another layout version is unverified and the section reads as before",
           "[pg][device_ci][v2][digest]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
@@ -2441,7 +2455,7 @@ TEST_CASE("a content digest with an unknown prefix is unverified and the section
     DeviceInventoryStore store{pool};
     REQUIRE(store.is_open());
     REQUIRE(put_record(store, "agent-up2", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
-    const char* forms[] = {"substr(content_digest, 4)", "'v2:' || substr(content_digest, 4)"};
+    const char* forms[] = {"'v2:' || substr(content_digest, 4)", "'v10:abc'"};
     for (const char* expr : forms) {
         INFO(expr);
         exec_stmt(pool, std::string("UPDATE device_inventory_store.device_ci_section SET content_digest = ") +

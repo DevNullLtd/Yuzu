@@ -1601,14 +1601,33 @@ TEST_CASE("section_content_digest: the stored form is the v1 prefix then 64 lowe
     REQUIRE(d.has_value());
     CHECK(d->size() == 3 + 64);
     CHECK(d->substr(0, 3) == "v1:");
-    CHECK(section_digest_is_current(*d));
+    CHECK(classify_stored_digest(*d) == StoredDigestForm::kCurrent);
     for (const char c : d->substr(3))
         CHECK(((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')));
-    CHECK_FALSE(section_digest_is_current(d->substr(3))); // the bare-hex form of an intermediate build
-    CHECK_FALSE(section_digest_is_current("v2:" + d->substr(3)));
-    CHECK_FALSE(section_digest_is_current("V1:" + d->substr(3)));
-    CHECK_FALSE(section_digest_is_current(""));
-    CHECK_FALSE(section_digest_is_current("v1"));
+}
+
+// The CLOSED classification of a stored (non-NULL) digest. Only a well-formed digest of a layout
+// version other than 1 is unverified; everything else that is not the current form is damage.
+TEST_CASE("classify_stored_digest: only a well-formed digest of another layout version is unverified",
+          "[hardware][model][sections][digest]") {
+    using F = StoredDigestForm;
+    const std::string hex(64, 'a');
+    // Current form.
+    CHECK(classify_stored_digest("v1:" + hex) == F::kCurrent);
+    CHECK(classify_stored_digest("v1:") == F::kCurrent); // compared (and mismatches): never unverified
+    CHECK(classify_stored_digest("v1:xyz") == F::kCurrent);
+    // A well-formed digest of another layout version: unverified.
+    for (const char* v : {"v2:abc", "v10:abc", "v9:x", "v123456:z", "v2: leading space is the remainder"})
+        CHECK(classify_stored_digest(v) == F::kOtherLayout);
+    CHECK(classify_stored_digest("v2:" + hex) == F::kOtherLayout);
+    // Everything else is malformed (a mismatch at the verifier).
+    for (const char* v : {"", " ", "  ", "\n", "v", "v:", "v1", "vx:abc", "v0:abc", "v01:abc", "v001:abc",
+                          "v2", "v2:", "v10:", "v1234567:abc", "V1:abc", "V2:abc", "x1:abc", "1:abc",
+                          "sha256:abc", "garbage", "v-1:abc", "v+1:abc", " v2:abc", "v 2:abc", "v2 :abc"})
+        CHECK(classify_stored_digest(v) == F::kMalformed);
+    CHECK(classify_stored_digest(hex) == F::kMalformed);               // bare hex
+    CHECK(classify_stored_digest(" v1:" + hex) == F::kMalformed);       // leading space
+    CHECK(classify_stored_digest("V1:" + hex) == F::kMalformed);
 }
 
 // Kills: a digest over the cell WITH its NULs. pg::to_text_array drops 0x00 on store, so the cell
@@ -1728,6 +1747,20 @@ TEST_CASE("verify_section_content: a wrong or damaged v1 digest is a mismatch",
         "v1:" + hex + "0",                           // one long
         "v1:" + hex.substr(0, 8) + std::string(56, '0'), // right head, wrong tail
         "v1:" + upper,                               // case changed
+        "",                                          // empty
+        " ",                                         // whitespace
+        " " + *good,                                 // valid, leading space
+        *good + " ",                                 // valid, trailing space
+        "V1:" + hex,                                 // wrong case of the prefix
+        hex,                                         // bare 64 hex (never shipped)
+        "v1:" + hex + std::string(2, 'a'),           // 66 chars after the prefix
+        "v:",                                        // malformed version forms
+        "vx:abc",
+        "v01:abc",
+        "v0:abc",
+        "v1",
+        "v2:",                                       // another layout with nothing after it
+        "garbage",
     };
     for (const auto& bad : bad_values) {
         INFO(bad);
@@ -1739,14 +1772,15 @@ TEST_CASE("verify_section_content: a wrong or damaged v1 digest is a mismatch",
     }
 }
 
-// Kills: treating a layout this build cannot recompute as drift (a false alarm on every row after a
-// future layout bump), and the reverse, treating it as verified.
-TEST_CASE("verify_section_content: a stored digest with an unknown prefix is unverified and not a mismatch",
+// Kills: reading a well-formed digest of another layout version as drift (a false alarm on every
+// row after a future layout bump), and the reverse: reading damage as unverified.
+TEST_CASE("verify_section_content: a well-formed digest of another layout version is unverified",
           "[hardware][model][sections][digest]") {
     const auto good = section_content_digest(def_of("cpu"), cpu_rows(2));
     REQUIRE(good.has_value());
     const std::string hex = good->substr(3);
-    for (const std::string& stored : {hex, "v2:" + hex, "V1:" + hex, std::string("sha256:") + hex, std::string("x")}) {
+    for (const std::string& stored : {"v2:" + hex, std::string("v2:abc"), std::string("v10:abc"),
+                                      std::string("v99:x")}) {
         INFO(stored);
         auto s = digested_section("cpu", "ok", "", cpu_rows(2));
         s.content_digest = stored;

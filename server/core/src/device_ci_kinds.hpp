@@ -80,13 +80,15 @@ struct DeviceCiSectionDef {
 };
 
 // WARNING - stored integrity data depends on this table. For every table-backed kind the store
-// persists `device_ci_section.row_count` and `content_digest`, and the digest preimage binds the
-// kind's `section` name, `n_fields` and column order (device_ci_section_digest.hpp). Changing
-// `section`, `n_fields` or the column list/order of a kind that is already stored makes every
-// stored digest of that kind recompute differently, so the section would read as
-// `server:content_digest_mismatch` (a false integrity alarm) until each device's next full sync,
-// up to the weekly floor. A hash-only daily report does NOT rewrite rows. Do one of: (a) bump the
-// digest layout prefix (`kSectionDigestPrefix`) so old values read as unverified, or (b) ship a
+// persists `device_ci_section.row_count` and `content_digest`. The digest preimage binds the
+// kind's `section` name and `n_fields` (device_ci_section_digest.hpp) and hashes the cells
+// POSITIONALLY, in the registry's column (SELECT) order, so reordering columns changes which value
+// sits where. Changing `section`, `n_fields` or the column list/order of a kind that is already
+// stored therefore makes every stored digest of that kind recompute differently: the section would
+// read as `server:content_digest_mismatch` (a false integrity alarm) until each device's next full
+// sync, up to the weekly floor, because a hash-only daily report does NOT rewrite rows. Do one of:
+// (a) bump the digest layout version (`kSectionDigestPrefix`, e.g. to `v2:`), so values stored under
+// the old version are a well-formed digest of another layout and read as unverified; or (b) ship a
 // migration that sets `row_count` and `content_digest` to NULL for that kind. Adding a new
 // table-backed kind is safe (it gets a digest automatically); the whole-registry test in
 // test_device_inventory_store.cpp fails if a kind persists none.

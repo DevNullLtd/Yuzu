@@ -17,10 +17,22 @@
 /// rows only, not the section's level or reason columns.
 ///
 /// STORED FORM: `v1:<64 lowercase hex>` (`kSectionDigestPrefix` + the SHA-256). The prefix names the
-/// preimage layout below. A reader that meets a stored value without the prefix it understands
-/// treats it as UNVERIFIED (never as a mismatch), so a later layout change, or a registry change
-/// that moves a kind's columns, can be rolled out by writing a new prefix instead of raising a
-/// false integrity alarm on every stored row. See the warning in `device_ci_kinds.hpp`.
+/// preimage layout below. What a reader does with the stored column is a CLOSED list
+/// (`classify_stored_digest`):
+///   - SQL NULL (a pre-feature row, or a status-only kind): UNVERIFIED, served as the count rule left
+///     it. Decided by the caller; it never reaches the classifier.
+///   - `v1:` first: the current layout, compared with the recomputed digest. Any difference at all
+///     (wrong, truncated, extended, case-changed) is a MISMATCH.
+///   - a WELL-FORMED digest of a different layout version (`v`, one or more digits that do not start
+///     with 0 and are not "1", `:`, a non-empty remainder; e.g. `v2:...`): UNVERIFIED. This build
+///     cannot recompute a layout it does not know, so a later layout change, or a registry change
+///     that moves a kind's columns, can be rolled out by writing a new prefix instead of raising a
+///     false integrity alarm on every stored row.
+///   - EVERYTHING ELSE is a MISMATCH: an empty or whitespace-containing value, `V1:`, a bare hex
+///     value, garbage, a malformed version (`v:`, `vx:`, `v0:`, `v01:`, `v1` with no colon), a
+///     different layout version with nothing after the colon. A damaged column must never read as
+///     "unverified" and let a same-count edit through as complete. See the warning in
+///     `device_ci_kinds.hpp`.
 ///
 /// Pure: no store, no PG, no I/O. The digest provider is OpenSSL's one-shot SHA-256
 /// (`sha256_hex`), which reports failure rather than returning a zero digest.
@@ -96,16 +108,40 @@ inline void digest_put_cell(std::string& out, std::string_view s) {
     return out;
 }
 
-/// The layout version a stored digest names. A stored value that does not start with this is not
-/// a digest this build can recompute, so it is UNVERIFIED (see `section_digest_is_current`).
+/// The layout version this build writes and recomputes.
 inline constexpr std::string_view kSectionDigestPrefix = "v1:";
 
-/// True iff `stored` is in the form this build writes (`kSectionDigestPrefix` first). False for an
-/// older or newer layout, or for the bare-hex form of an intermediate build: the caller serves
-/// that section as the count rule left it, never as a mismatch.
-[[nodiscard]] inline bool section_digest_is_current(std::string_view stored) noexcept {
-    return stored.size() >= kSectionDigestPrefix.size() &&
-           stored.substr(0, kSectionDigestPrefix.size()) == kSectionDigestPrefix;
+/// What a non-NULL stored digest is, for the verifier. Only `kOtherLayout` is unverified.
+enum class StoredDigestForm {
+    kCurrent,     ///< starts with `v1:`: compare it with the recomputed digest
+    kOtherLayout, ///< a well-formed digest of a layout version other than 1: unverified
+    kMalformed,   ///< anything else: a mismatch
+};
+
+/// The most digits a layout version may have. A longer run of digits is damage, not a version.
+inline constexpr std::size_t kMaxDigestLayoutDigits = 6;
+
+/// Classifies a stored (non-NULL) digest. Pure and total. A different-layout value is
+/// `v<version>:<remainder>` with a version of 1 to 6 ASCII digits, no leading zero (so no `v0`, no
+/// `v01`) that is not 1 (that is `kCurrent`), and a NON-EMPTY remainder: a layout bump always
+/// writes a digest after the colon, so `v2:` alone is a truncated column, not a future layout. The
+/// remainder is otherwise opaque to this build.
+[[nodiscard]] inline StoredDigestForm classify_stored_digest(std::string_view stored) noexcept {
+    if (stored.substr(0, kSectionDigestPrefix.size()) == kSectionDigestPrefix)
+        return StoredDigestForm::kCurrent;
+    if (stored.empty() || stored[0] != 'v')
+        return StoredDigestForm::kMalformed;
+    std::size_t i = 1;
+    while (i < stored.size() && stored[i] >= '0' && stored[i] <= '9')
+        ++i;
+    const std::size_t digits = i - 1;
+    if (digits == 0 || digits > kMaxDigestLayoutDigits || stored[1] == '0')
+        return StoredDigestForm::kMalformed;
+    if (i >= stored.size() || stored[i] != ':')
+        return StoredDigestForm::kMalformed;
+    if (i + 1 >= stored.size())
+        return StoredDigestForm::kMalformed; // nothing after the colon
+    return StoredDigestForm::kOtherLayout;
 }
 
 /// `v1:` + SHA-256 (64 lowercase hex) of `section_content_preimage` for a REGISTERED table-backed

@@ -815,9 +815,13 @@ SHA-256 of a canonical, length-prefixed serialization of the section's rows (sec
 count, row count, then each row's position and cells, with any NUL byte in a cell skipped because the
 store cannot keep one), computed by the server from the rows it inserts in the same transaction,
 never taken from the agent. It is stored as `v1:<64 hex>`: the prefix names the preimage layout, and a
-stored value in a layout this server does not know is treated as unverified, never as a mismatch, so a
-later layout change or a registry column change (see the warning in `device_ci_kinds.hpp`) cannot
-raise a false integrity alarm on every stored row. One pure function
+stored digest that is a well-formed digest of a different layout version (`v<n>:` with a non-empty
+remainder, n not 1, no leading zero) is treated as unverified, never as a mismatch; every other
+non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex, a malformed version,
+`v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
+same-count edit read as complete. A later layout change or a registry column change (see the warning in
+`device_ci_kinds.hpp`) can therefore be rolled out under a new prefix without raising a false integrity
+alarm on every stored row. One pure function
 (`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
 read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
 row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
@@ -838,8 +842,8 @@ for up to a week after upgrade. The wire format and the agent are unchanged. Mig
 additive `ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, ADD COLUMN IF
 NOT EXISTS content_digest TEXT NULL` (the digest column is folded into v3 because v3 had not shipped;
 the runner is gated on the recorded version only, so a development database that already recorded the
-earlier row-count-only v3 must have its `schema_meta` version for this store set back to 2 or be
-recreated). The rollback note above
+earlier row-count-only v3 must be reset with `UPDATE public.schema_meta SET version = 2 WHERE store =
+'device_inventory_store';` and a server restart, or recreated). The rollback note above
 holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
 there, so the sections it writes are unverified until a v3 server next does a full replace for that
 device.

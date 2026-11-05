@@ -34,7 +34,8 @@ struct DeviceCiSection {
     /// (`section_content_digest`, device_ci_section_digest.hpp), persisted with the status row so an
     /// out-of-band edit, restore or swap of child rows - including one that keeps the row count -
     /// is detectable. nullopt = a status-only kind, or a row written before migration v3: not
-    /// verifiable, read exactly as before; so is a value in a layout this build does not know. An
+    /// verifiable, read exactly as before; so is a well-formed digest of a different layout version
+    /// (`v2:...`). Any other non-NULL value that is not the current `v1:` form is a mismatch. An
     /// integrity check against accident and non-malicious drift, NOT tamper resistance. See
     /// `verify_section_content` (hardware_list_model.hpp).
     std::optional<std::string> content_digest;
