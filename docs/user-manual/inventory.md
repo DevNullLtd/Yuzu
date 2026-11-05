@@ -1243,10 +1243,14 @@ sync, defeating the hash-skip protocol.
   digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
   layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
   version (for example `v2:` followed by a digest) is treated as unverified, because this server
-  cannot recompute it. Any other stored value that is not the current form (an empty or damaged
-  value, `V1:`, a bare hex string, a malformed version) is reported as
-  `server:content_digest_mismatch`, so a damaged column cannot let an edited section read as
-  complete; only an absent value (a section stored before migration 3) is unverified.
+  cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
+  by a colon and a non-empty remainder). Any other stored value that is not the current form (an
+  empty or damaged value, `V1:`, a bare hex string, a malformed version) is compared as a
+  mismatch and reported as `server:content_digest_mismatch`, so a damaged column cannot let an
+  edited section read as complete. Only an absent value (a section stored before migration 3, or
+  a status-only kind) or a well-formed digest of another layout version is unverified. A section
+  whose row count already disagrees reports the count token alone, and an `unavailable` or
+  `permission_denied` section is never compared.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.

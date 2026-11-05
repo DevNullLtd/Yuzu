@@ -23,13 +23,14 @@
 ///     it. Decided by the caller; it never reaches the classifier.
 ///   - `v1:` first: the current layout, compared with the recomputed digest. Any difference at all
 ///     (wrong, truncated, extended, case-changed) is a MISMATCH.
-///   - a WELL-FORMED digest of a different layout version (`v`, one or more digits that do not start
+///   - a WELL-FORMED digest of a different layout version (`v`, one to six digits that do not start
 ///     with 0 and are not "1", `:`, a non-empty remainder; e.g. `v2:...`): UNVERIFIED. This build
 ///     cannot recompute a layout it does not know, so a later layout change, or a registry change
 ///     that moves a kind's columns, can be rolled out by writing a new prefix instead of raising a
 ///     false integrity alarm on every stored row.
 ///   - EVERYTHING ELSE is a MISMATCH: an empty or whitespace-containing value, `V1:`, a bare hex
-///     value, garbage, a malformed version (`v:`, `vx:`, `v0:`, `v01:`, `v1` with no colon), a
+///     value, garbage, a malformed version (`v:`, `vx:`, `v0:`, `v01:`, `v1` with no colon, more
+///     than six digits), a
 ///     different layout version with nothing after the colon. A damaged column must never read as
 ///     "unverified" and let a same-count edit through as complete. See the warning in
 ///     `device_ci_kinds.hpp`.

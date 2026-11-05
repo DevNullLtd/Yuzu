@@ -816,7 +816,7 @@ count, row count, then each row's position and cells, with any NUL byte in a cel
 store cannot keep one), computed by the server from the rows it inserts in the same transaction,
 never taken from the agent. It is stored as `v1:<64 hex>`: the prefix names the preimage layout, and a
 stored digest that is a well-formed digest of a different layout version (`v<n>:` with a non-empty
-remainder, n not 1, no leading zero) is treated as unverified, never as a mismatch; every other
+remainder, n one to six digits, not 1, no leading zero) is treated as unverified, never as a mismatch; every other
 non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex, a malformed version,
 `v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
 same-count edit read as complete. A later layout change or a registry column change (see the warning in

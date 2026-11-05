@@ -257,7 +257,8 @@ inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:
 /// Pure. Rules, on top of the row-count rules above:
 ///  - `content_digest == nullopt` (a status-only kind, or a row written before migration v3):
 ///    not verifiable, served as the row-count rule left it. So is a WELL-FORMED digest of a
-///    different layout version (`classify_stored_digest` == `kOtherLayout`, e.g. `v2:...`): this
+///    different layout version (`classify_stored_digest` == `kOtherLayout`, e.g. `v2:...`; the
+///    version is one to six digits): this
 ///    build cannot recompute it. Any other non-NULL value that is not the current `v1:` form (an
 ///    empty or whitespace value, `V1:`, bare hex, garbage, a malformed version, `v2:` with nothing
 ///    after it) is a MISMATCH, never unverified: a damaged column must not let an edit through.
