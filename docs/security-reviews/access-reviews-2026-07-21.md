@@ -511,10 +511,12 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   520 bytes (an estimate, not measured). The response is built whole in memory (the store result, the view
   structures, the JSON builders and the serialised body are live together), the route has no concurrency limit
   of its own, so each request in flight holds its own copies, and the MCP twin puts its payload in the result twice
-  (2.04 to 2.16 times the REST body, peak memory about 1.3 to 1.5 times the REST peak: 463 MB against 331 MB and
-  1.14 GB against 0.79 GB, fresh process per measurement, three runs each). The Access page fragment peaks at about
-  200 MB for 1000 grants with 100 decisions each (260 MB with four-byte characters), a 27 to 46 MB body; the
-  browser's own cost for it was not measured. No
+  (2.04 to 2.16 times the REST body; at 1000 grants of 100 decisions each the peak memory is about 1.3 to 1.5 times
+  the REST peak, about 453 MB against 323 MB and 1.09 GB against 0.75 GB, and about 1.14 times at 200 grants;
+  fresh processes, three runs for each MCP figure and one for each REST figure in the comparison, VmHWM divided by
+  1024). The Access page fragment peaks at about 195 MB for 1000 grants with 100 decisions each (about 255 MB with
+  four-byte characters; it renders at most 1000 grants), a 27 to 46 MB body; the browser's own cost for it was not
+  measured. No
   shipped deployment configuration sets a memory limit and the only shipped server-restart alert is
   `YuzuServerRestartLoop`; the sizing advice, the scaled break-even and the existing `yuzu_server_memory_bytes{type="rss"}` metric are in
   `docs/auth-architecture.md`, "The decision history". The full

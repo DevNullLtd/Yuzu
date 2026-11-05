@@ -3976,13 +3976,16 @@ builders and the serialised body at once, and there is no per-campaign budget, n
 no concurrency limit on the route itself, so each request in flight holds its own copies. The grant's top-level
 `justification` repeats its latest history entry, so the latest entry's text is in the response twice. The MCP twin
 puts its payload in the tool result twice (the `content` text and `structuredContent`), so its response is larger than
-the REST body: measured at 2.04 to 2.16 times its bytes, and at about 1.3 to 1.5 times its peak memory
-(463 MB against 331 MB for the 32 MB ASCII case, 1.14 GB against 0.79 GB for the 105 MB control-character case; one
-fresh process per measurement, three runs each, on one host). The Access page's campaign fragment, measured the same
-way, peaks at about 200 MB for 1000 grants with 100 decisions each (260 MB with four-byte characters): it shows only
-the latest justification whole and 64 characters of each earlier one, so its body is 27 to 46 MB. The browser's own
-cost for a document of that size was not measured. No
-shipped deployment configuration (the `deploy/docker` compose files, the `deploy/systemd` unit, the HA compose file)
+the REST body: measured at 2.04 to 2.16 times its bytes, and at about 1.3 to 1.5 times its peak memory for 1000
+grants with 100 decisions each (about 453 MB against 323 MB for the 32 MB ASCII case, 1.09 GB against 0.75 GB for the
+105 MB control-character case; at 200 grants the ratio is about 1.14 because the baseline dominates; the growth above
+the baseline is about 1.4 to 1.6 times the REST growth, the figure to scale by when sizing for concurrent requests). These were
+fresh processes on one host, three runs for each MCP figure and one run for each REST figure in the comparison, on the
+`VmHWM` divided by 1024 convention above; the three-run REST figures above agree with those single runs within about 3
+percent. The Access page's campaign fragment, measured the same way, peaks at about 195 MB for 1000 grants with 100
+decisions each (about 255 MB with four-byte characters), and the page renders at most 1000 grants: it shows only the
+latest justification whole and 64 characters of each earlier one, so its body is 27 to 46 MB. The browser's own cost
+for a document of that size was not measured. No shipped deployment configuration (the `deploy/docker` compose files, the `deploy/systemd` unit, the HA compose file)
 sets a memory limit, and the only shipped server-restart alert is `YuzuServerRestartLoop` (more than 3 resets of
 `yuzu_server_uptime_seconds` in 3 hours, sustained for 15 minutes, `docs/prometheus/yuzu-alerts.yml`). One out-of-memory
 kill is one uptime reset, below that threshold, so that alert will not fire on a single kill. Size the server's memory

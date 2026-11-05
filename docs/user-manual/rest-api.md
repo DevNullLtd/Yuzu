@@ -4586,7 +4586,9 @@ route, for the separation-of-duties refusals and the store failures and refusals
 refusal stands. A failed refusal row does not set it for a cross-site request (all
 three routes), for a wrong Content-Type (open and attestation; close takes no body)
 or for a store refusal on open or close: those rows are attempted and a failure to
-save one is ignored.
+save one is ignored. A refusal by the permission check writes its own row and sets no
+header, and a malformed request (a bad id, bad JSON, a field over its bound) writes no
+row.
 
 Both machine contracts declare the signal: the OpenAPI success responses of the three
 write routes (201 for open, 200 for attest and close) document the `Sec-Audit-Failed` header, and
