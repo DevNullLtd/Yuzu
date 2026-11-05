@@ -1735,7 +1735,8 @@ struct Rest {
     }
 
     std::int64_t refused(const char* reason) {
-        return metrics.counter(kWorkflowRunRefusedMetric, {{"reason", reason}}).value();
+        return static_cast<std::int64_t>(
+            metrics.counter(kWorkflowRunRefusedMetric, {{"reason", reason}}).value());
     }
 };
 

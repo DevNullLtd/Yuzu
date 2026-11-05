@@ -66,6 +66,21 @@ call site would pass every existing test. This gate closes that:
      dropping either compiles cleanly, passes every unit test, and leaves a revoked credential able
      to finish a workflow run it started; only production wiring can be pinned, here.
 
+  8. (#2146 sec-3/I1/I6, workflow run cap, shutdown drain and audit) Six seams of the workflow-execute
+     twins are OPTIONAL by construction (a null `StreamBudget` is "unmetered", an empty `draining`
+     is "never draining", an empty audit sink is "audit off", a `{}` control disables the deadline,
+     the idempotency claim, the stop level and the safety hooks), so dropping or rewriting any of
+     them compiles and passes every unit rig, which wires its own. Pinned as active lines in
+     server.cpp, each EXACTLY ONCE: `wf_deps.stream_budget = stream_budget_.get();` (the one
+     ADR-0034 budget the held-open cap leases from); `wf_deps.draining` and
+     `mcp_server_->set_draining_fn` with the body `draining_ || stop_requested_` (REST and MCP
+     admission refuse a new run once shutdown begins); the run adapter's
+     `return engine->execute(..., control.on_admitted, control);` (the whole control reaches the
+     engine, never `{}`); `wf_deps.audit_fn` and `wf_deps.persist_audit_fn` (the REST route's audit
+     sinks; an unwired sink passes vacuously as "audit off"); and `workflow_engine_->set_should_stop`
+     with its body (stop wins over draining). The drain loop's own feed is pinned in
+     tests/unit/server/test_shutdown_join_order.cpp.
+
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
 `/* */` block that comments out an entire real site while preserving its exact leading
@@ -102,10 +117,57 @@ AUDIT_SESSION = r"[ \t\r\f\v]*rest_api_v1_->set_audit_as_session_fn\(auth_routes
 REGISTER_ROUTES = r"[ \t\r\f\v]*rest_api_v1_->register_routes\("
 REVALIDATE_ASSIGN = r"[ \t\r\f\v]*wf_deps\.revalidate = .*"
 REVALIDATE_BODY = r"[ \t\r\f\v]*return auth_routes_->revalidate_stream\(req, principal\);"
+# Clause 8: multi-line, matched over the whole source with re.M; `^[ \t]*` keeps a `//` copy out.
+_STOP_OR_DRAIN = (r"\{\s*return draining_\.load\(std::memory_order_acquire\) \|\|\s*"
+                  r"stop_requested_\.load\(std::memory_order_acquire\);\s*\}")
+WF_STREAM_BUDGET = r"^[ \t]*wf_deps\.stream_budget = stream_budget_\.get\(\);.*$"
+WF_DRAINING = r"^[ \t]*wf_deps\.draining = \[this\] " + _STOP_OR_DRAIN + r";"
+MCP_DRAINING = r"^[ \t]*mcp_server_->set_draining_fn\(\[this\] " + _STOP_OR_DRAIN + r"\);"
+RUN_ADAPTER = (r"^[ \t]*return engine->execute\(workflow_id, agent_ids, std::move\(dispatch_fn\),\s*"
+               r"std::move\(condition_fn\), control\.on_admitted, control\);")
+WF_AUDIT_FN = r"^[ \t]*wf_deps\.audit_fn = audit_fn;.*$"
+WF_PERSIST_AUDIT_FN = r"^[ \t]*wf_deps\.persist_audit_fn = audit_fn;.*$"
+SHOULD_STOP = (r"^[ \t]*workflow_engine_->set_should_stop\(\[this\] \{\s*"
+               r"if \(stop_requested_\.load\(std::memory_order_acquire\)\)\s*"
+               r"return yuzu::server::WorkflowStopLevel::kStop;\s*"
+               r"if \(draining_\.load\(std::memory_order_acquire\)\)\s*"
+               r"return yuzu::server::WorkflowStopLevel::kDraining;\s*"
+               r"return yuzu::server::WorkflowStopLevel::kNone;\s*\}\);")
+
+
+def count_rx(pattern, src):
+    return len(re.findall(pattern, src, re.M))
+
+
+WORKFLOW_PINS = (
+    ("wf_deps.stream_budget", WF_STREAM_BUDGET),
+    ("wf_deps.draining", WF_DRAINING),
+    ("mcp_server_->set_draining_fn", MCP_DRAINING),
+    ("engine->execute", RUN_ADAPTER),
+    ("wf_deps.audit_fn", WF_AUDIT_FN),
+    ("wf_deps.persist_audit_fn", WF_PERSIST_AUDIT_FN),
+    ("set_should_stop", SHOULD_STOP),
+)
+WORKFLOW_PIN_ADVICE = {
+    "wf_deps.stream_budget": "'wf_deps.stream_budget = stream_budget_.get();' -- a null budget is unmetered, so the "
+                             "workflow run cap and the held-open lease count nothing",
+    "wf_deps.draining": "'wf_deps.draining = [this] { return draining_ || stop_requested_; };' -- an empty one is "
+                        "'never draining', so REST admits runs during shutdown",
+    "mcp_server_->set_draining_fn": "'mcp_server_->set_draining_fn([this] { return draining_ || stop_requested_; });' "
+                                    "-- an unset one is 'never draining', so MCP admits runs during shutdown",
+    "engine->execute": "the run adapter's 'return engine->execute(workflow_id, agent_ids, std::move(dispatch_fn), "
+                       "std::move(condition_fn), control.on_admitted, control);' -- a '{}' control disables the "
+                       "deadline, the idempotency claim, the stop level and the safety hooks",
+    "wf_deps.audit_fn": "'wf_deps.audit_fn = audit_fn;' -- an unwired sink is 'audit off' to the workflow route",
+    "wf_deps.persist_audit_fn": "'wf_deps.persist_audit_fn = audit_fn;' -- the persisted sink the route prefers; "
+                                "unwired it falls back to the best-effort one",
+    "set_should_stop": "'workflow_engine_->set_should_stop([this] {...});' with stop_requested_ -> kStop checked "
+                       "before draining_ -> kDraining -- an unset one means no run ever learns of a shutdown",
+}
 
 
 def problems(src):
-    """One message per violated clause, in clause order (1 to 6); [] when clean."""
+    """One message per violated clause, in clause order (1 to 8); [] when clean."""
     lines = src.split("\n")
     total = sum(1 for ln in lines if CALL in ln)
     designated = sum(1 for ln in lines if re.fullmatch(DESIGNATED, ln))
@@ -119,6 +181,7 @@ def problems(src):
     register_at = [i for i, ln in enumerate(lines) if re.match(REGISTER_ROUTES, ln)]
     revalidate_assign = sum(1 for ln in lines if re.fullmatch(REVALIDATE_ASSIGN, ln))
     revalidate_body = sum(1 for ln in lines if re.fullmatch(REVALIDATE_BODY, ln))
+    wf_counts = {name: count_rx(pat, src) for name, pat in WORKFLOW_PINS}
     out = []
     if designated != 1:
         out.append("expected exactly 1 designated-init site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "
@@ -166,6 +229,11 @@ def problems(src):
                    f"assignment={revalidate_assign}, body={revalidate_body}. Either seam is optional and an "
                    "empty one is 'no check', so a dropped line compiles and passes every unit rig while a "
                    "revoked credential finishes the workflow run it started.")
+    for name, _ in WORKFLOW_PINS:
+        if wf_counts[name] != 1:
+            out.append(f"expected {WORKFLOW_PIN_ADVICE[name]} exactly once as an active line in server.cpp; found "
+                       f"{wf_counts[name]}. The seam is optional by construction, so a dropped or rewritten line "
+                       "compiles and passes every unit rig (each wires its own) while production loses the control.")
     return out
 
 
@@ -178,6 +246,17 @@ AUDIT_SESSION_LINE = "        rest_api_v1_->set_audit_as_session_fn(auth_routes_
 REVALIDATE_ASSIGN_LINE = "        wf_deps.revalidate = [this](const httplib::Request& req, const std::string& principal) {\n"
 REVALIDATE_BODY_LINE = "\n            return auth_routes_->revalidate_stream(req, principal);\n"  # leading newline: the MCP site is indented deeper
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
+STREAM_BUDGET_LINE = "        wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface\n"
+WF_DRAINING_HEAD = "        wf_deps.draining = [this] {\n"
+MCP_DRAINING_HEAD = "            mcp_server_->set_draining_fn([this] {\n"
+RUN_ADAPTER_TAIL = "                                       std::move(condition_fn), control.on_admitted, control);\n"
+AUDIT_FN_LINE = "        wf_deps.audit_fn = audit_fn;\n"
+PERSIST_AUDIT_FN_LINE = "        wf_deps.persist_audit_fn = audit_fn; // #4990: the drawer's response.forensics.read row\n"
+SHOULD_STOP_HEAD = "                workflow_engine_->set_should_stop([this] {\n"
+SHOULD_STOP_STOP = ("                    if (stop_requested_.load(std::memory_order_acquire))\n"
+                    "                        return yuzu::server::WorkflowStopLevel::kStop;\n")
+SHOULD_STOP_DRAIN = ("                    if (draining_.load(std::memory_order_acquire))\n"
+                     "                        return yuzu::server::WorkflowStopLevel::kDraining;\n")
 
 
 class TierPolicyWiringLexical(unittest.TestCase):
@@ -193,7 +272,9 @@ class TierPolicyWiringLexical(unittest.TestCase):
     def test_mutations_are_caught(self):
         src = self.src
         for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE,
-                  REVALIDATE_ASSIGN_LINE, REVALIDATE_BODY_LINE):
+                  REVALIDATE_ASSIGN_LINE, REVALIDATE_BODY_LINE, STREAM_BUDGET_LINE, WF_DRAINING_HEAD, MCP_DRAINING_HEAD,
+                  RUN_ADAPTER_TAIL, AUDIT_FN_LINE, PERSIST_AUDIT_FN_LINE, SHOULD_STOP_HEAD, SHOULD_STOP_STOP,
+                  SHOULD_STOP_DRAIN):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
@@ -252,6 +333,74 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T19 a third revalidate_stream body appended",
              src + REVALIDATE_BODY_LINE.lstrip("\n"),
              ["wf_deps.revalidate"]),
+            ("T20 the workflow stream budget wiring dropped (compiles: a null budget is unmetered)",
+             src.replace(STREAM_BUDGET_LINE, STREAM_BUDGET_LINE.replace("wf_deps.stream_budget", "wf_deps.unrelated"), 1),
+             ["wf_deps.stream_budget"]),
+            ("T21 the workflow stream budget wiring commented out (anchoring proof)",
+             src.replace(STREAM_BUDGET_LINE, "// " + STREAM_BUDGET_LINE, 1),
+             ["wf_deps.stream_budget"]),
+            ("T22 the workflow stream budget wired to nullptr",
+             src.replace(STREAM_BUDGET_LINE, STREAM_BUDGET_LINE.replace("stream_budget_.get()", "nullptr"), 1),
+             ["wf_deps.stream_budget"]),
+            ("T23 a second stream budget assignment appended",
+             src + STREAM_BUDGET_LINE,
+             ["wf_deps.stream_budget"]),
+            ("T24 wf_deps.draining dropped (compiles: an empty one is never draining)",
+             src.replace(WF_DRAINING_HEAD, WF_DRAINING_HEAD.replace("wf_deps.draining", "wf_deps.unrelated"), 1),
+             ["wf_deps.draining"]),
+            ("T25 wf_deps.draining answers only draining_ (stop_requested_ dropped)",
+             src.replace(WF_DRAINING_HEAD + "            return draining_.load(std::memory_order_acquire) ||\n"
+                         "                   stop_requested_.load(std::memory_order_acquire);\n",
+                         WF_DRAINING_HEAD + "            return draining_.load(std::memory_order_acquire);\n", 1),
+             ["wf_deps.draining"]),
+            ("T26 wf_deps.draining always false",
+             src.replace(WF_DRAINING_HEAD, WF_DRAINING_HEAD + "            return false;\n", 1),
+             ["wf_deps.draining"]),
+            ("T27 mcp set_draining_fn dropped (compiles: an unset one is never draining)",
+             src.replace(MCP_DRAINING_HEAD, MCP_DRAINING_HEAD.replace("set_draining_fn", "set_unrelated_fn"), 1),
+             ["set_draining_fn"]),
+            ("T28 mcp set_draining_fn commented out (anchoring proof)",
+             src.replace(MCP_DRAINING_HEAD, "// " + MCP_DRAINING_HEAD, 1),
+             ["set_draining_fn"]),
+            ("T29 mcp set_draining_fn always false",
+             src.replace(MCP_DRAINING_HEAD, MCP_DRAINING_HEAD + "                return false;\n", 1),
+             ["set_draining_fn"]),
+            ("T30 the run adapter passes an empty control instead of `control`",
+             src.replace(RUN_ADAPTER_TAIL, RUN_ADAPTER_TAIL.replace("control.on_admitted, control", "{}, {}"), 1),
+             ["engine->execute"]),
+            ("T31 the run adapter drops the control argument",
+             src.replace(RUN_ADAPTER_TAIL, RUN_ADAPTER_TAIL.replace(", control);", ");"), 1),
+             ["engine->execute"]),
+            ("T32 the run adapter passes a default-constructed control",
+             src.replace(RUN_ADAPTER_TAIL,
+                         RUN_ADAPTER_TAIL.replace("control.on_admitted, control", "control.on_admitted, "
+                                                  "yuzu::server::WorkflowRunControl{}"), 1),
+             ["engine->execute"]),
+            ("T33 the workflow route audit sink dropped (compiles: unwired is audit off)",
+             src.replace(AUDIT_FN_LINE, AUDIT_FN_LINE.replace("wf_deps.audit_fn", "wf_deps.unrelated"), 1),
+             ["wf_deps.audit_fn"]),
+            ("T34 the workflow route persisted audit sink dropped",
+             src.replace(PERSIST_AUDIT_FN_LINE,
+                         PERSIST_AUDIT_FN_LINE.replace("wf_deps.persist_audit_fn", "wf_deps.unrelated"), 1),
+             ["wf_deps.persist_audit_fn"]),
+            ("T35 the workflow route persisted audit sink commented out (anchoring proof)",
+             src.replace(PERSIST_AUDIT_FN_LINE, "// " + PERSIST_AUDIT_FN_LINE, 1),
+             ["wf_deps.persist_audit_fn"]),
+            ("T36 the workflow route audit sink wired to an empty function",
+             src.replace(AUDIT_FN_LINE, AUDIT_FN_LINE.replace("= audit_fn", "= {}"), 1),
+             ["wf_deps.audit_fn"]),
+            ("T37 set_should_stop wiring dropped (compiles: an unset one never learns of a shutdown)",
+             src.replace(SHOULD_STOP_HEAD, SHOULD_STOP_HEAD.replace("set_should_stop", "set_unrelated"), 1),
+             ["set_should_stop"]),
+            ("T38 set_should_stop wiring commented out (anchoring proof)",
+             src.replace(SHOULD_STOP_HEAD, "// " + SHOULD_STOP_HEAD, 1),
+             ["set_should_stop"]),
+            ("T39 set_should_stop checks draining_ before stop_requested_ (stop must win)",
+             src.replace(SHOULD_STOP_STOP + SHOULD_STOP_DRAIN, SHOULD_STOP_DRAIN + SHOULD_STOP_STOP, 1),
+             ["set_should_stop"]),
+            ("T40 set_should_stop maps stop_requested_ to kDraining",
+             src.replace(SHOULD_STOP_STOP, SHOULD_STOP_STOP.replace("kStop", "kDraining"), 1),
+             ["set_should_stop"]),
             ("T11 the writer wired after register_routes (count stays one)",
              src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1) + AUDIT_SESSION_LINE,
              ["BEFORE"]),

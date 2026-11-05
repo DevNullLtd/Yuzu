@@ -73,16 +73,164 @@
 #include "shutdown_drain_rules.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "source_scan.hpp"
 
 namespace {
 
+using yuzu::test::source_scan::count_occurrences;
 using yuzu::test::source_scan::occurrence_lines;
 using yuzu::test::source_scan::require_one_line;
 using yuzu::test::source_scan::stripped_source;
+
+// Runs of whitespace collapsed to one space, ends trimmed: a reflow of the scanned text must not
+// move a pin, a rewritten token must.
+std::string collapse_ws(std::string_view in) {
+    std::string out;
+    bool pending_space = false;
+    for (const char c : in) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            pending_space = !out.empty();
+            continue;
+        }
+        if (pending_space)
+            out.push_back(' ');
+        pending_space = false;
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Offset of the ')' matching the '(' at `open`, or npos. The scanned spans hold no string literal
+// containing a parenthesis.
+std::size_t matching_paren(std::string_view text, std::size_t open) {
+    int depth = 0;
+    for (std::size_t i = open; i < text.size(); ++i) {
+        if (text[i] == '(')
+            ++depth;
+        else if (text[i] == ')' && --depth == 0)
+            return i;
+    }
+    return std::string_view::npos;
+}
+
+bool ends_with(std::string_view s, std::string_view suffix) {
+    return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
+}
+
+bool starts_with(std::string_view s, std::string_view prefix) {
+    return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
+}
+
+constexpr std::string_view kDrainCountDecl =
+    "const int workflow_runs = workflow_engine_ ? workflow_engine_->in_flight_runs() : 0;";
+constexpr std::string_view kDrainRuleCall = "shutdown_drain::keep_draining_for_work(";
+constexpr std::string_view kShouldStopCall = "workflow_engine_->set_should_stop(";
+constexpr std::string_view kStopBranch =
+    "if (stop_requested_.load(std::memory_order_acquire)) return "
+    "yuzu::server::WorkflowStopLevel::kStop;";
+constexpr std::string_view kDrainBranch =
+    "if (draining_.load(std::memory_order_acquire)) return "
+    "yuzu::server::WorkflowStopLevel::kDraining;";
+constexpr std::string_view kNoneReturn = "return yuzu::server::WorkflowStopLevel::kNone;";
+
+// Every defect in how ServerImpl::stop() feeds the workflow engine's in-process run count into the
+// drain, and how the engine learns of the shutdown; empty when clean. A pure function of the
+// (comment-stripped) text so the mutation cases below can prove each pin fails when its line is
+// removed or rewritten. A scan that ignores the call's arguments or its result, or the position of
+// the read, is the false green this exists to prevent (qe2-4).
+std::vector<std::string> drain_wiring_problems(const std::string& text) {
+    std::vector<std::string> out;
+    const auto sole = [&](std::string_view needle) -> std::size_t {
+        if (count_occurrences(text, needle) != 1) {
+            out.push_back("expected exactly one '" + std::string(needle) + "', found " +
+                          std::to_string(count_occurrences(text, needle)));
+            return std::string::npos;
+        }
+        return text.find(needle);
+    };
+    const std::size_t draining_at = sole("draining_.store(true, std::memory_order_release)");
+    const std::size_t count_at = sole("workflow_engine_->in_flight_runs()");
+    const std::size_t rule_at = sole(kDrainRuleCall);
+    const std::size_t stop_at = sole("stop_requested_.store(true, std::memory_order_release)");
+    const std::size_t should_stop_at = sole(kShouldStopCall);
+    if (draining_at != std::string::npos && count_at != std::string::npos &&
+        rule_at != std::string::npos && stop_at != std::string::npos) {
+        if (!(draining_at < count_at && count_at < rule_at && rule_at < stop_at))
+            out.push_back("order must be draining_ store, run count read, keep_draining_for_work, "
+                          "stop_requested_ store");
+        // The count is read INSIDE the drain loop, every tick: the `for (;;)` opening the loop that
+        // holds the rule call must come before the read. A hoisted read freezes the count.
+        const std::size_t loop_at = text.rfind("for (;;)", rule_at);
+        if (loop_at == std::string::npos || loop_at < draining_at)
+            out.push_back("no drain loop (`for (;;)`) between the draining_ store and the rule call");
+        else if (count_at < loop_at)
+            out.push_back("the workflow run count is read above the drain loop, not inside it");
+        else if (text.find(kDrainCountDecl) == std::string::npos)
+            out.push_back("the run count is not bound as `const int workflow_runs = ...`");
+        // The call: its last two arguments are the tracker count then the engine count, it is the
+        // condition of `if (!...) break;`, so neither a constant nor a dropped result survives.
+        const std::size_t open = rule_at + kDrainRuleCall.size() - 1;
+        const std::size_t close = matching_paren(text, open);
+        if (close == std::string::npos) {
+            out.push_back("unbalanced keep_draining_for_work( call");
+        } else {
+            const std::string call = collapse_ws(text.substr(rule_at, close + 1 - rule_at));
+            if (call != "shutdown_drain::keep_draining_for_work(elapsed, min_grace, running, workflow_runs)")
+                out.push_back("keep_draining_for_work must read `(elapsed, min_grace, running, "
+                              "workflow_runs)`, found `" + call + "`");
+            const std::string before = collapse_ws(text.substr(0, rule_at));
+            if (!ends_with(before, "if (!"))
+                out.push_back("keep_draining_for_work must be the negated condition of an `if (!...)`");
+            const std::string after = collapse_ws(text.substr(close + 1, 48));
+            if (!starts_with(after, ") break;"))
+                out.push_back("the `if (!keep_draining_for_work(...))` must `break;` directly");
+            // The progress log fires for an engine run too, so an operator sees what holds the drain.
+            const std::string tail = collapse_ws(text.substr(close, stop_at - close));
+            if (tail.find("if (running > 0 || workflow_runs > 0) {") == std::string::npos)
+                out.push_back("the `if (running > 0 || workflow_runs > 0)` log branch is missing");
+        }
+    }
+    if (should_stop_at != std::string::npos) {
+        const std::size_t open = should_stop_at + kShouldStopCall.size() - 1;
+        const std::size_t close = matching_paren(text, open);
+        if (close == std::string::npos) {
+            out.push_back("unbalanced set_should_stop( call");
+        } else {
+            const std::string arg = collapse_ws(text.substr(open + 1, close - open - 1));
+            const std::size_t stop_branch = arg.find(kStopBranch);
+            const std::size_t drain_branch = arg.find(kDrainBranch);
+            const std::size_t none_return = arg.rfind(kNoneReturn);
+            if (!starts_with(arg, "[this] {"))
+                out.push_back("set_should_stop must take a `[this]` lambda");
+            if (stop_branch == std::string::npos)
+                out.push_back("set_should_stop lambda lacks `stop_requested_ -> kStop`");
+            if (drain_branch == std::string::npos)
+                out.push_back("set_should_stop lambda lacks `draining_ -> kDraining`");
+            if (stop_branch != std::string::npos && drain_branch != std::string::npos &&
+                !(stop_branch < drain_branch))
+                out.push_back("set_should_stop must test stop_requested_ before draining_ (stop wins)");
+            if (drain_branch != std::string::npos &&
+                (none_return == std::string::npos || none_return < drain_branch))
+                out.push_back("set_should_stop lambda must end by returning kNone");
+        }
+    }
+    return out;
+}
+
+// `text` with the sole occurrence of `from` replaced; fails loudly when the anchor is not sole, so a
+// mutation that silently did nothing cannot pass for a proof.
+std::string mutated(const std::string& text, std::string_view from, std::string_view to) {
+    INFO("mutation anchor: " << from);
+    REQUIRE(count_occurrences(text, from) == 1);
+    std::string out = text;
+    out.replace(out.find(from), from.size(), to);
+    return out;
+}
 
 } // namespace
 
@@ -198,24 +346,65 @@ TEST_CASE("server.cpp: the drain loop waits on the workflow engine's in-process 
           "draining_ and stop_requested_ (#2146)",
           "[shutdown_order][shutdown_drain]") {
     const std::string& text = stripped_source("server.cpp");
-    const int draining_line =
-        require_one_line(text, "draining_.store(true, std::memory_order_release)",
-                         "draining_.store(true)");
-    const int count_line = require_one_line(text, "workflow_engine_->in_flight_runs()",
-                                            "workflow_engine_->in_flight_runs()");
-    const int rule_line = require_one_line(text, "shutdown_drain::keep_draining_for_work(",
-                                           "shutdown_drain::keep_draining_for_work(");
-    const int stop_line = require_one_line(text, "stop_requested_.store(true, std::memory_order_release)",
-                                           "stop_requested_.store(true)");
-    INFO("draining_ " << draining_line << " count " << count_line << " rule " << rule_line
-                      << " stop_requested_ " << stop_line);
-    CHECK(draining_line < count_line);
-    CHECK(count_line < rule_line);
-    CHECK(rule_line < stop_line);
-    // The engine learns of the shutdown through ONE wiring, from the same two flags.
-    const int should_stop_line = require_one_line(text, "workflow_engine_->set_should_stop(",
-                                                  "workflow_engine_->set_should_stop(");
-    CHECK(should_stop_line > 0);
+    const auto problems = drain_wiring_problems(text);
+    for (const auto& p : problems)
+        UNSCOPED_INFO(p);
+    CHECK(problems.empty());
+}
+
+// Each survivor the quality-engineer listed (qe2-4), plus the neighbours the same scan must stop:
+// every mutation starts from the real source and must produce at least one problem.
+TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the wiring (#2146)",
+          "[shutdown_order][shutdown_drain]") {
+    const std::string& text = stripped_source("server.cpp");
+    REQUIRE(drain_wiring_problems(text).empty());
+
+    const std::string call_head = "if (!shutdown_drain::keep_draining_for_work(";
+    const std::string call_tail = "workflow_runs))";
+    const std::string log_cond = "if (running > 0 || workflow_runs > 0) {";
+    const std::string loop_head = "for (;;) {\n                const auto elapsed = steady_clock::now() - drain_start;";
+
+    struct Case {
+        const char* name;
+        std::string text;
+    };
+    // The hoist: the declaration line leaves the loop and lands above it.
+    std::string hoisted = mutated(text, kDrainCountDecl, "");
+    hoisted = mutated(hoisted, loop_head, std::string(kDrainCountDecl) + "\n            " + loop_head);
+    const std::vector<Case> cases = {
+        {"count argument replaced by 0", mutated(text, call_tail, "0))")},
+        {"tracker count passed twice", mutated(text, "min_grace, running,", "min_grace, running, running,")},
+        {"result ignored", mutated(mutated(text, call_head, "(void)shutdown_drain::keep_draining_for_work("),
+                                   call_tail, "workflow_runs);")},
+        {"negation dropped", mutated(text, call_head, "if (shutdown_drain::keep_draining_for_work(")},
+        {"no break on the result", mutated(text, "workflow_runs))\n                    break;",
+                                           "workflow_runs)) {}")},
+        {"count read hoisted above the loop", hoisted},
+        {"log branch no longer sees the engine count", mutated(text, log_cond, "if (running > 0) {")},
+        {"log branch removed", mutated(text, log_cond, "if (false) {")},
+        {"set_should_stop assigned something else",
+         mutated(text, kShouldStopCall, "workflow_engine_->set_unrelated(")},
+        {"set_should_stop lambda never reports a stop",
+         mutated(text, "WorkflowStopLevel::kStop;", "WorkflowStopLevel::kDraining;")},
+        {"set_should_stop lambda never reports a drain",
+         mutated(text, "WorkflowStopLevel::kDraining;\n                    return yuzu::server::WorkflowStopLevel::kNone;",
+                 "WorkflowStopLevel::kNone;\n                    return yuzu::server::WorkflowStopLevel::kNone;")},
+        {"draining wins over stop",
+         mutated(mutated(mutated(text, "if (stop_requested_.load(std::memory_order_acquire))\n"
+                                       "                        return yuzu::server::WorkflowStopLevel::kStop;",
+                                 "@@STOP@@"),
+                         "if (draining_.load(std::memory_order_acquire))\n"
+                         "                        return yuzu::server::WorkflowStopLevel::kDraining;",
+                         "if (stop_requested_.load(std::memory_order_acquire))\n"
+                         "                        return yuzu::server::WorkflowStopLevel::kStop;"),
+                 "@@STOP@@",
+                 "if (draining_.load(std::memory_order_acquire))\n"
+                 "                        return yuzu::server::WorkflowStopLevel::kDraining;")},
+    };
+    for (const auto& c : cases) {
+        INFO("mutation: " << c.name);
+        CHECK_FALSE(drain_wiring_problems(c.text).empty());
+    }
 }
 
 TEST_CASE("shutdown_drain: a workflow run in flight extends the wait, and the SAME cap releases it",
