@@ -25,6 +25,11 @@
 /// structurally denied there - REST has no maker-checker flow); MCP passes `kMcp` (its own ladder
 /// - tier, `requires_approval`'s ticket - governs). The parameter has no default, as the
 /// predicate's own does.
+///
+/// REVIEW ROUTING. This file is an `is_rbac_administrator` call site, so the A2/A1 RBAC
+/// administration row of `.claude/routed-concerns-access-control.md` covers it: `security-guardian`
+/// + `cpp-safety` on every change. The row does not name this file only because that table is at
+/// its character budget.
 
 #include "rbac_admin_predicate.hpp"
 #include "revocation_source_service.hpp"
