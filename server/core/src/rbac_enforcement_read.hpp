@@ -11,9 +11,11 @@
 ///     treated as on, and a stale "on" is on either way (`enabled:false, unconfirmed:true` and
 ///     `enabled:true, unconfirmed:true` are both possible). `unconfirmed` is one bit and does not
 ///     say WHY the view is unconfirmed. EXTENSION POINT: a later change may add a separate field
-///     naming the cause; if it does, every cause still reads `unconfirmed:true`, the client rule
-///     above is unchanged, and clients must ignore fields they do not recognise. Nothing emits a
-///     cause today; do not repurpose `unconfirmed` or `enabled` to carry one.
+///     naming the cause; if it does, any cause of an unconfirmed view still reads `unconfirmed:true`
+///     and the client rule above is unchanged. REST clients must ignore fields they do not
+///     recognise; the MCP `outputSchema` is closed (`additionalProperties:false`, mcp_server.cpp),
+///     so the same change must widen it. Nothing emits a cause today; do not repurpose
+///     `unconfirmed` or `enabled` to carry one.
 ///   * `administrator` is `rbac_admin_hint` on the CALLER's surface. The builder calls it once and
 ///     neither forces nor suppresses the result when the view is degraded. The predicate behind
 ///     it does consult the cached enforcement label, but only to choose which durable source

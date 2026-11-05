@@ -3364,9 +3364,10 @@ the same word. They answer different questions and can disagree in any combinati
 combination in the table below is legitimate.
 
 **Forward compatibility.** `unconfirmed` is a single boolean and does not say why the view is
-unconfirmed. A later release may add a separate field that names the cause. If it does, every
-cause still reports `unconfirmed: true`, so the client rule above holds unchanged. Clients must
-ignore response fields they do not recognise. No such field is returned today.
+unconfirmed. A later release may add a separate field that names the cause. If it does, any
+cause of an unconfirmed view still reports `unconfirmed: true`, so the client rule above holds
+unchanged. Clients must ignore response fields they do not recognise (the MCP twin's output schema
+is closed, see the `get_rbac_enforcement` row in [mcp.md](mcp.md)). No such field is returned today.
 
 **`administrator`.**
 
