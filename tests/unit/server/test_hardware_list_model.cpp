@@ -708,7 +708,7 @@ HardwareCiDetail v2_detail(std::vector<DeviceCiSection> sections) {
 const nlohmann::json& section_of(const nlohmann::json& j, std::string_view kind) {
     static const nlohmann::json none;
     for (const auto& s : j["ci"]["sections"])
-        if (s["kind"] == kind)
+        if (s["kind"] == std::string(kind)) // not string_view: MSVC reads json == string_view as ambiguous (C2666)
             return s;
     return none;
 }
