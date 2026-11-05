@@ -1053,9 +1053,9 @@ only; `find_by_purl` is a store method with no caller).
 ### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
 
 Every row of every `installed_software` source carries a non-empty `publisher`, so slot 3 of the
-row (hashed on both the v2 and the v3 path) is always populated. There is no new wire
-slot and no parser refusal: the server parses and hashes slot 3 on both paths, so the
-change is a value rule on the agent, one recognition rule in the server normaliser, and golden
+row (hashed on both the v2 and the v3 path) is always populated. The wire layout has no extra
+slot and the parser refuses nothing: the server parses and hashes slot 3 on both paths, so the
+mechanism is a value rule on the agent, one recognition rule in the server normaliser, and golden
 vectors on both sides.
 
 **The value rule.** A row's publisher is the vendor its source declares; when the source

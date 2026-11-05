@@ -3171,7 +3171,7 @@ TEST_CASE("runtimes python adapter: macOS ignores the vendor column (a bundle id
         CHECK(r.entries[0].publisher.empty());
         CHECK(r.entries[1].publisher.empty());
     }
-    SECTION("vendor column is a vendor (Windows, Linux): kept") {
+    SECTION("vendor column is a vendor (Windows, Linux): read as the publisher") {
         const auto r = parse_runtimes_python_output(out, kFailPolicy, /*vendor_column_is_vendor=*/true);
         REQUIRE(r.entries.size() == 2);
         CHECK(r.entries[0].publisher == "org.python.python");

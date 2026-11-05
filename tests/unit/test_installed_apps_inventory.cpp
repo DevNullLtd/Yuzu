@@ -283,7 +283,7 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
             "Rocky Enterprise Software Foundation");
         REQUIRE(rocky.has_value());
         CHECK(rocky->publisher == "Rocky Enterprise Software Foundation");
-        // VENDOR (none), PACKAGER set: the fallback keeps the packager rather than going empty.
+        // VENDOR (none), PACKAGER set: the fallback is the packager, not an empty publisher.
         const auto fallback = parse_rpm_inv_line(
             "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\tFedora (43) Signing\td\t(none)\t(none)\t(none)");
         REQUIRE(fallback.has_value());

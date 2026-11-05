@@ -681,7 +681,7 @@ TEST_CASE("a title keyed under an empty publisher re-keys under its via: label: 
     sql(pool, "UPDATE product_registry_store.curation_queue SET status = 'rejected' "
               "WHERE raw_name = 'Rejected Tool'");
 
-    // The rollup is rebuilt from the live inventory: the same two titles, now keyed `via:brew`.
+    // The rollup is rebuilt from the live inventory: the same two titles keyed `via:brew`.
     sql(pool, "DELETE FROM software_inventory_store.title_triples");
     triple(pool, "Mystery Tool", "via:brew", "brew", 5);
     triple(pool, "Rejected Tool", "via:brew", "brew", 4);
@@ -702,7 +702,8 @@ TEST_CASE("a title keyed under an empty publisher re-keys under its via: label: 
     // A rejected '' row stays, and the rejection is NOT carried over to the label's row.
     CHECK(queue("Rejected Tool", "", "status") == "rejected");
     CHECK(queue("Rejected Tool", "via:brew", "status") == "open");
-    // Dimension rows are permanent: the old keys remain, the label keys are new unnormalized rows.
+    // Dimension rows are permanent: the '' keys keep their rows and the label keys have their own
+    // unnormalized rows.
     CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
                        "WHERE raw_publisher = ''") == "2");
     CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
