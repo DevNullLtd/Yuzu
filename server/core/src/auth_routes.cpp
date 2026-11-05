@@ -24,6 +24,7 @@
 #include "http_route_sink.hpp"
 #include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter (not a store outage)
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
 #include "step_up_gate.hpp"
@@ -62,6 +63,11 @@ constexpr std::size_t kMaxJustificationLength = 1024;
 // pre-seeded in server.cpp. Any error that is not is_store_unavailable() must
 // never reach a 503 degrade site, so the default ("query_error") is a
 // belt-and-braces fallback, not an expected path.
+//
+// #6995: `AuthDBError::EntropyUnavailable` MUST NEVER be passed here. It is inside
+// is_store_unavailable() (so it stays a fail-closed 503) but is not a store outage, and the
+// default arm would silently label it `query_error` -- the misattribution that change removed.
+// The one caller tests is_entropy_failure() first and counts the fault elsewhere.
 [[nodiscard]] const char* degrade_reason(AuthDBError e) noexcept {
     switch (e) {
     case AuthDBError::StoreBusy:
@@ -2652,6 +2658,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // never a generic 500 that could be confused with a
                 // harmless one-off. No session is minted either way.
                 const bool store_unavailable = is_store_unavailable(init.error());
+                // #6995: a CSPRNG fault is still a fail-closed 503, but no query FAILED, so it is
+                // counted in yuzu_secure_random_failure_total and NOT in the store-outage
+                // counters below. The response itself (503, Retry-After: 2, retry_after_ms) is
+                // deliberately UNCHANGED from #4763 so callers see no new status or header; the
+                // 2 s hint is store-derived and is not tuned for a possibly persistent fault.
+                const bool entropy_unavailable = is_entropy_failure(init.error());
                 res.status = store_unavailable ? 503 : 500;
                 if (store_unavailable)
                     res.set_header("Retry-After", "2"); // #2396 honest backoff hint (503 only)
@@ -2661,7 +2673,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                            {.retry_after_ms = 2000})
                         : detail::a4_error(res, "Could not initiate MFA enrollment"),
                     "application/json");
-                if (store_unavailable) {
+                if (entropy_unavailable) {
+                    mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteEnroll);
+                } else if (store_unavailable) {
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
                             .increment();
@@ -2674,7 +2688,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
                 audit_log_for_principal(req, "mfa.enroll.required", "error", username,
                                         auth::role_to_string(*role_opt), "User", username,
-                                        store_unavailable
+                                        entropy_unavailable
+                                            ? "csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
+                                              "fail-closed)"
+                                        : store_unavailable
                                             ? "mfa_init_enrollment: secret/store unavailable "
                                               "(fail-closed)"
                                             : "mfa_init_enrollment failed");
@@ -3184,6 +3201,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         std::vector<std::string> recovery_codes;
         bool verified = false;
         bool store_unavailable = false;
+        bool entropy_unavailable = false; // #6995: store_unavailable, but a CSPRNG fault
         bool already_enrolled = false;
         bool credential_changed = false;
         bool enrollment_cancelled = false;
@@ -3223,6 +3241,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // this only routes to a distinct fail-closed 503 below
                 // instead of burning an attempt on a transient outage.
                 store_unavailable = true;
+                entropy_unavailable = is_entropy_failure(r.error());
             }
         }
 
@@ -3281,18 +3300,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
-            if (auto* m = auth_mgr_.metrics_registry()) {
+            if (entropy_unavailable) {
+                // #6995: the recovery-code draw faulted and the enrolment rolled back.
+                mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteRecovery);
+            } else if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                     .increment();
             }
             audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "mfa_verify_enrollment: secret/store unavailable "
-                                    "(fail-closed, no session minted)");
+                                    entropy_unavailable
+                                        ? "csprng_unavailable: mfa_recovery (mfa_verify_enrollment, "
+                                          "fail-closed, enrollment rolled back, no session minted)"
+                                        : "mfa_verify_enrollment: secret/store unavailable "
+                                          "(fail-closed, no session minted)");
             emit_event("mfa.enroll.failed", req,
                        {{"source_ip", req.remote_addr},
                         {"username", entry.username},
-                        {"reason", "store_unavailable"}},
+                        {"reason", entropy_unavailable ? "csprng_unavailable"
+                                                       : "store_unavailable"}},
                        {}, Severity::kCritical);
             return;
         }

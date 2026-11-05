@@ -21,6 +21,7 @@ using yuzu::server::is_lapsed;
 using yuzu::server::kExpiryAlertBuckets;
 using yuzu::server::kExpiryWarnDays;
 using yuzu::server::kRearmSecs;
+using yuzu::server::make_norm_key;
 using yuzu::server::match_confidence;
 using yuzu::server::match_product;
 using yuzu::server::norm_key;
@@ -59,6 +60,17 @@ TEST_CASE("normalize_title lowercases, collapses whitespace, strips version/arch
     SECTION("no edition token → empty edition") {
         CHECK(normalize_title("Google Chrome x64").edition == "");
     }
+}
+
+TEST_CASE("normalize_title returns the first stripped version token as version", "[normalize]") {
+    CHECK(normalize_title("7-Zip 23.01 (x64)").version == "23.01");
+    CHECK(normalize_title("Visual Studio v2.1 2019").version == "2.1");
+    CHECK(normalize_title("Mozilla Firefox 120.0.1").title == "mozilla firefox");
+}
+
+TEST_CASE("normalize_title leaves version empty when the title carries none", "[normalize]") {
+    CHECK(normalize_title("Mozilla Firefox").version.empty());
+    CHECK(normalize_title("v").version.empty());
 }
 
 TEST_CASE("normalize_title extracts edition tokens", "[normalize]") {
@@ -137,6 +149,11 @@ TEST_CASE("norm_key is deterministic and stable across raw form variants", "[nor
 
     SECTION("repeated calls agree") {
         CHECK(norm_key("7-Zip 23.01", "Igor Pavlov") == norm_key("7-Zip 23.01", "Igor Pavlov"));
+    }
+
+    SECTION("make_norm_key owns the shape norm_key ends in") {
+        CHECK(make_norm_key("microsoft", "microsoft office", "professional") == k);
+        CHECK(make_norm_key("google", "google chrome", "") == "google:google chrome");
     }
 }
 

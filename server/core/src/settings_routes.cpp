@@ -46,6 +46,7 @@
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
 #include "settings_security_render.hpp" // Security page: pure SSO / 2FA / HTTPS / mTLS renderers
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter (not a store outage)
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -7011,6 +7012,7 @@ void SettingsRoutes::register_routes(
         }
         if (!init) {
             const char* msg = "Enrollment failed";
+            bool csprng_detail = false; // #6995: audit detail only; the operator msg is unchanged
             if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
                 msg = "MFA is already enabled — disable it first to re-enroll";
             } else if (is_store_unavailable(init.error())) {
@@ -7019,13 +7021,21 @@ void SettingsRoutes::register_routes(
                 // never mislead the operator into retrying a fundamentally
                 // broken step; no MFA state changes either way.
                 msg = "Authentication store is temporarily unavailable — retry shortly";
-                if (metrics_registry_) {
+                if (is_entropy_failure(init.error())) {
+                    // #6995: a CSPRNG fault, not a store outage — own counter, same 503-class msg.
+                    mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteEnroll);
+                    csprng_detail = true;
+                } else if (metrics_registry_) {
                     metrics_registry_
                         ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                         .increment();
                 }
             }
-            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
+            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
+                      csprng_detail
+                          ? std::string{"csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
+                                        "fail-closed)"}
+                          : std::string{msg});
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
@@ -7125,15 +7135,24 @@ void SettingsRoutes::register_routes(
                           return;
                       }
                       const bool store_unavailable = is_store_unavailable(codes_res.error());
-                      if (store_unavailable && metrics_registry_) {
+                      // #6995: a recovery-code CSPRNG fault rolled the enrolment back. Still the
+                      // same 503-class operator message, but counted in
+                      // yuzu_secure_random_failure_total, not as a store outage.
+                      const bool entropy_unavailable = is_entropy_failure(codes_res.error());
+                      if (entropy_unavailable) {
+                          mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteRecovery);
+                      } else if (store_unavailable && metrics_registry_) {
                           metrics_registry_
                               ->counter("yuzu_auth_secret_unavailable_total",
                                        {{"route", "mfa_enroll"}})
                               .increment();
                       }
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
-                                store_unavailable ? "secret/store unavailable (fail-closed)"
-                                                  : "code rejected");
+                                entropy_unavailable
+                                    ? "csprng_unavailable: mfa_recovery (mfa_verify_enrollment, "
+                                      "fail-closed, enrollment rolled back)"
+                                : store_unavailable ? "secret/store unavailable (fail-closed)"
+                                                    : "code rejected");
                       const char* msg =
                           store_unavailable
                               ? "Authentication store is temporarily unavailable — retry shortly."
@@ -7239,8 +7258,26 @@ void SettingsRoutes::register_routes(
                   }
                   auto codes = db->mfa_regenerate_recovery_codes(session->username);
                   if (!codes) {
+                      // #6995: a refused regeneration is counted like its siblings. A CSPRNG
+                      // fault goes to yuzu_secure_random_failure_total; any other store fault to
+                      // yuzu_auth_secret_unavailable_total{route="mfa_recovery"}. A business
+                      // outcome (e.g. UserNotFound) stays audit-only: not an alertable fault.
+                      const bool entropy_unavailable = is_entropy_failure(codes.error());
+                      if (entropy_unavailable) {
+                          mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteRecovery);
+                      } else if (is_store_fault(codes.error()) && metrics_registry_) {
+                          metrics_registry_
+                              ->counter("yuzu_auth_secret_unavailable_total",
+                                        {{"route", "mfa_recovery"}})
+                              .increment();
+                      }
                       audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
-                                session->username, "regeneration failed");
+                                session->username,
+                                entropy_unavailable
+                                    ? "csprng_unavailable: mfa_recovery "
+                                      "(mfa_regenerate_recovery_codes, fail-closed, existing codes "
+                                      "unchanged)"
+                                    : "regeneration failed");
                       res.set_content(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes. Your existing "
