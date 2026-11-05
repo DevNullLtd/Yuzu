@@ -67,10 +67,10 @@ namespace yuzu::server {
 ///
 /// WHY: a pre-routing handler answers before httplib reads the request body. From httplib 0.59 a
 /// response below 400 that leaves a declared request body unread must carry `Connection: close`
-/// (httplib.h v0.59.0:14797-14806); the response therefore closes the connection. httplib sets that
-/// header itself for a status of 400 or more (13455-13461), so only a status below 400 is left to
-/// us. A request with no declared body is left alone so ordinary keep-alive GETs keep their
-/// connection.
+/// (httplib.h v0.59.0:14797-14806); the response therefore closes the connection. httplib sets
+/// that header itself for a status of 400 or more (13455-13461), so only
+/// a status below 400 is left to us. A request with no declared body is left alone so ordinary
+/// keep-alive GETs keep their connection.
 inline void close_if_unread_framed_body(const httplib::Request& req, httplib::Response& res) {
     if (res.status >= 400 || req.body_consumed_)
         return;

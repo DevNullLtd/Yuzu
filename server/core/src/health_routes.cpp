@@ -1206,10 +1206,10 @@ void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string we
             res.set_redirect(location, 301);
             if (res.status != 301)
                 res.status = 400;
-            // This listener answers before any body is read and never consumes one. httplib
-            // 0.59 a response below 400 that leaves a declared request body unread must carry
-            // `Connection: close` (httplib.h v0.59.0:14797-14806); the response therefore closes
-            // the connection. The redirect answer closes unconditionally, with
+            // This listener answers before any body is read and never consumes one. From
+            // httplib 0.59 a response below 400 that leaves a declared request body unread must
+            // carry `Connection: close` (httplib.h v0.59.0:14797-14806); the response therefore
+            // closes the connection. The redirect answer closes unconditionally, with
             // or without a declared body; the probe requests this handler leaves to the normal
             // routes (Unhandled above) are not affected.
             // Pinned by test_health_routes.cpp (the 301 head and EOF over a raw socket).
