@@ -56,7 +56,6 @@ public:
     struct Error {
         enum class Kind {
             Unavailable,     ///< store closed, no connection in time, or a read failed
-            NotFound,        ///< reserved; a missing row is `nullopt`, not an error
             InvalidInput,    ///< the document or group id cannot be stored; nothing ran
             InvalidTimezone, ///< the zone is not in the database's zone table
             Conflict,        ///< expected_version did not match; `current` carries the stored row

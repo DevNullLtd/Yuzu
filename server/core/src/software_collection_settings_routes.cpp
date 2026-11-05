@@ -51,19 +51,12 @@ json window_json(const std::optional<cs::Window>& w) {
     return w ? json{{"start_min", w->start_min}, {"end_min", w->end_min}} : json(nullptr);
 }
 
-json plugins_json(const std::map<std::string, bool>& plugins) {
-    json j = json::object();
-    for (const auto& [name, on] : plugins)
-        j[name] = on;
-    return j;
-}
-
 json document_json(const cs::StoredDocument& d) {
     return {{"group_id", d.group_id},
             {"interval_s", d.settings.interval_s},
             {"window", window_json(d.settings.window)},
             {"timezone", d.settings.timezone},
-            {"plugins", plugins_json(d.settings.plugins)},
+            {"plugins", d.settings.plugins},
             {"priority", d.settings.priority},
             {"version", d.version},
             {"updated_at", d.updated_at},
@@ -74,7 +67,7 @@ json effective_json(const cs::EffectiveSettings& e) {
     return {{"interval_s", e.interval_s},
             {"window", window_json(e.window)},
             {"timezone", e.timezone},
-            {"plugins", plugins_json(e.plugins)}};
+            {"plugins", e.plugins}};
 }
 
 // A store error that is not the caller's mistake: every kind but the ones a PUT maps itself.

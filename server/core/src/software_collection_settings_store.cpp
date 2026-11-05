@@ -84,13 +84,6 @@ Error statement_error(std::string_view op, const pg::PgResult& res, Kind kind) {
     return Error{kind, std::string(op) + ": query failed", std::nullopt};
 }
 
-std::string plugins_text(const std::map<std::string, bool>& plugins) {
-    nlohmann::json j = nlohmann::json::object();
-    for (const auto& [name, on] : plugins)
-        j[name] = on;
-    return j.dump();
-}
-
 // One audit/history rendering of a settings document.
 std::string settings_text(const cs::CollectionSettings& s) {
     nlohmann::json j = nlohmann::json::object();
@@ -99,7 +92,7 @@ std::string settings_text(const cs::CollectionSettings& s) {
                                             {"end_min", s.window->end_min}}
                            : nlohmann::json(nullptr);
     j["timezone"] = s.timezone;
-    j["plugins"] = nlohmann::json::parse(plugins_text(s.plugins));
+    j["plugins"] = s.plugins;
     j["priority"] = s.priority;
     return j.dump();
 }
@@ -240,7 +233,7 @@ SoftwareCollectionSettingsStore::put(const std::string& group_id,
     if (!version)
         return fail(Kind::WriteFailed, "digest provider failed");
 
-    const std::string plugins = plugins_text(settings.plugins);
+    const std::string plugins = nlohmann::json(settings.plugins).dump();
     const std::string after_json = settings_text(settings);
     const std::vector<std::optional<std::string>> write_params{
         group_id,
