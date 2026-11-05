@@ -1,0 +1,157 @@
+run,scenario,victim,holder_replica,round,cohort,probed_replica,role,arm,delivered,refused,server_synthesised,accepted_no_result,timeout,invalid,total,refusal_reasons
+run-F3-2r-162443,F3-2r,gateway-1,1,control,clean,1,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,control,clean,1,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,control,clean,2,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,control,clean,2,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,control,stale_other,1,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-162443,F3-2r,gateway-1,1,control,stale_other,2,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-162443,F3-2r,gateway-1,1,+60s,clean,1,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,+60s,clean,1,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,+60s,clean,2,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,+60s,clean,2,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,+60s,stale_other,1,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-162443,F3-2r,gateway-1,1,+60s,stale_other,2,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-162443,F3-2r,gateway-1,1,+120s,clean,1,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,+120s,clean,1,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,+120s,clean,2,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-162443,F3-2r,gateway-1,1,+120s,clean,2,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-162443,F3-2r,gateway-1,1,+120s,stale_other,1,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-162443,F3-2r,gateway-1,1,+120s,stale_other,2,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-162443,F3-2r,gateway-1,1,+300s,clean,1,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,+300s,clean,1,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,+300s,clean,2,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-162443,F3-2r,gateway-1,1,+300s,clean,2,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-162443,F3-2r,gateway-1,1,+300s,stale_other,1,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-162443,F3-2r,gateway-1,1,+300s,stale_other,2,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-162443,F3-2r,gateway-1,1,+420s,clean,1,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,+420s,clean,1,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,+420s,clean,2,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-162443,F3-2r,gateway-1,1,+420s,clean,2,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-162443,F3-2r,gateway-1,1,+420s,stale_other,1,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-162443,F3-2r,gateway-1,1,+420s,stale_other,2,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+0s,clean,1,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+0s,clean,1,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+0s,clean,2,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+0s,clean,2,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+0s,stale_other,1,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+0s,stale_other,2,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+5s,clean,1,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+5s,clean,1,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+5s,clean,2,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+5s,clean,2,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+5s,stale_other,1,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-162443,F3-2r,gateway-1,1,recovery+5s,stale_other,2,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-164225,F3-2r,gateway-2,2,control,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,control,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,control,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,control,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,control,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-164225,F3-2r,gateway-2,2,control,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-164225,F3-2r,gateway-2,2,+60s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,+60s,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,+60s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,+60s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,+60s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-164225,F3-2r,gateway-2,2,+60s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-164225,F3-2r,gateway-2,2,+120s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-164225,F3-2r,gateway-2,2,+120s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-164225,F3-2r,gateway-2,2,+120s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,+120s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,+120s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-164225,F3-2r,gateway-2,2,+120s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-164225,F3-2r,gateway-2,2,+300s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-164225,F3-2r,gateway-2,2,+300s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-164225,F3-2r,gateway-2,2,+300s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,+300s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,+300s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-164225,F3-2r,gateway-2,2,+300s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-164225,F3-2r,gateway-2,2,+420s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-164225,F3-2r,gateway-2,2,+420s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-164225,F3-2r,gateway-2,2,+420s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,+420s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,+420s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-164225,F3-2r,gateway-2,2,+420s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+0s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+0s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+0s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+0s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+0s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+0s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+5s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+5s,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+5s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+5s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+5s,stale_other,1,non-holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-164225,F3-2r,gateway-2,2,recovery+5s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-170006,F3-2r,gateway-3,2,control,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,control,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,control,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,control,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,control,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-170006,F3-2r,gateway-3,2,control,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-170006,F3-2r,gateway-3,2,+60s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,+60s,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,+60s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,+60s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,+60s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-170006,F3-2r,gateway-3,2,+60s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-170006,F3-2r,gateway-3,2,+120s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-170006,F3-2r,gateway-3,2,+120s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-170006,F3-2r,gateway-3,2,+120s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,+120s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,+120s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-170006,F3-2r,gateway-3,2,+120s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-170006,F3-2r,gateway-3,2,+300s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-170006,F3-2r,gateway-3,2,+300s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-170006,F3-2r,gateway-3,2,+300s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,+300s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,+300s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-170006,F3-2r,gateway-3,2,+300s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-170006,F3-2r,gateway-3,2,+420s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-170006,F3-2r,gateway-3,2,+420s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-170006,F3-2r,gateway-3,2,+420s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,+420s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,+420s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-170006,F3-2r,gateway-3,2,+420s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+0s,clean,1,non-holder,ids,0,20,0,0,0,0,20,legacy bare 503 x10; no_agents_reached x10
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+0s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+0s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+0s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+0s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+0s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+5s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+5s,clean,1,non-holder,scope,0,1,0,0,0,0,1,no_agents_reached x1
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+5s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+5s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+5s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-F3-2r-170006,F3-2r,gateway-3,2,recovery+5s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,control,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,control,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,control,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,control,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,control,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-NOFAULT-160202,NOFAULT,gateway-3,2,control,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+60s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+60s,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+60s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+60s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+60s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+60s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+120s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+120s,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+120s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+120s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+120s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+120s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+300s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+300s,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+300s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+300s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+300s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+300s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+420s,clean,1,non-holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+420s,clean,1,non-holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+420s,clean,2,holder,ids,20,0,0,0,0,0,20,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+420s,clean,2,holder,scope,1,0,0,0,0,0,1,
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+420s,stale_other,1,non-holder,ids,0,4,0,0,0,0,4,legacy bare 503 x2; no_agents_reached x2
+run-NOFAULT-160202,NOFAULT,gateway-3,2,+420s,stale_other,2,holder,ids,4,0,0,0,0,0,4,
