@@ -130,6 +130,7 @@ struct Twin {
     std::map<std::string, int> dex_by_id;
     int roster_calls = 0;
     int ci_calls = 0;
+    std::vector<bool> ci_with_sections; // the `with_sections` argument of every ci_detail_fn call
     std::vector<std::string> dex_calls_for;
 
     // Domain-verb audit sink (deps.audit_fn on both transports).
@@ -184,8 +185,9 @@ struct Twin {
             out.tags_degraded = tags_degraded;
             return out;
         };
-        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id) {
+        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id, bool with_sections) {
             ++ci_calls;
+            ci_with_sections.push_back(with_sections);
             const auto it = ci_by_id.find(id);
             return it != ci_by_id.end() ? it->second : absent_detail();
         };
@@ -851,6 +853,25 @@ TEST_CASE("mcp hardware twins: every answer conforms to the published output sch
     sparse.software_last_seen.reset();
     t.ci_by_id["s"] = sparse;
     t.ci_by_id["d"] = HardwareCiDetail{};
+    // a v2 record with a populated, a constrained and a failed section, a v2 record whose ci could
+    // not be read (sections_state degraded), and one whose sections read failed (an error, below)
+    HardwareCiDetail v2 = full_detail("v2");
+    {
+        DeviceCiSection cpu;
+        cpu.kind = "cpu";
+        cpu.level = "constrained";
+        cpu.reason = "agent:partial";
+        cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+        DeviceCiSection swap;
+        swap.kind = "swap";
+        swap.level = "unavailable";
+        swap.reason = "linux:planned";
+        v2.ci_sections = std::vector<DeviceCiSection>{cpu, swap};
+    }
+    t.ci_by_id["v2"] = v2;
+    HardwareCiDetail v2_ci_degraded = full_detail("v2d");
+    v2_ci_degraded.ci = std::unexpected(CiReadError::kDegraded);
+    t.ci_by_id["v2d"] = v2_ci_degraded;
 
     auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
@@ -866,12 +887,93 @@ TEST_CASE("mcp hardware twins: every answer conforms to the published output sch
     }
     CHECK(schema_violation(list_schema, t.call("list_hardware_ci", {{"limit", 1}})
                                             ["result"]["structuredContent"]) == "");
-    for (const char* id : {"a", "s", "d"}) {
+    for (const char* id : {"a", "s", "d", "v2", "v2d"}) {
         INFO("device " << id);
         const json r = t.call("get_hardware_ci", {{"agent_id", id}});
         REQUIRE_FALSE(r.contains("error"));
         CHECK(schema_violation(get_schema, r["result"]["structuredContent"]) == "");
     }
+    // sections_state degraded means ci itself could not be read (ci is null), never a failed
+    // sections read: that one is a retryable error (its own test below), as the REST 503 is.
+    const json degraded = t.call("get_hardware_ci", {{"agent_id", "v2d"}})["result"]["structuredContent"];
+    CHECK(degraded["sections_state"] == "degraded");
+    CHECK(degraded["ci"].is_null());
+    const json ok = t.call("get_hardware_ci", {{"agent_id", "v2"}})["result"]["structuredContent"];
+    CHECK(ok["sections_state"] == "found");
+    CHECK(ok["ci"]["sections"].size() == 2);
+}
+
+// The REST twin answers a failed sections read 503 + retry_after_ms 5000 and withholds the record:
+// MCP answers the same condition with the same kind of failure (a retryable error, the record
+// withheld, a failure audit row on both the domain verb and the generic row), never a result.
+// Kills: serving the record with `sections: null` as a 200.
+TEST_CASE("mcp hardware twins: a failed sections read is a retryable error and withholds the record",
+          "[mcp][hardware][sections]") {
+    Twin t;
+    HardwareCiDetail d = full_detail("a");
+    DeviceCiRecord rec = **d.ci;
+    rec.blob_version = 2;
+    d.ci = std::optional<DeviceCiRecord>(rec);
+    d.ci_sections = std::unexpected(CiReadError::kDegraded);
+    t.ci_by_id["a"] = d;
+    const json r = t.call("get_hardware_ci", {{"agent_id", "a"}});
+    REQUIRE(r.contains("error"));
+    CHECK_FALSE(r.contains("result"));
+    CHECK(r["error"]["code"] == mcp::kInternalError);
+    CHECK(r["error"]["message"] == "hardware sections unavailable");
+    CHECK(r["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    CHECK(mcp::kMcpStoreFaultRetryMs == 5000);
+    CHECK(t.domain_rows == std::vector<std::string>{"inventory.device.ci|failure|Agent|a"});
+    CHECK(t.generic_rows == std::vector<std::string>{"mcp.get_hardware_ci|failure"});
+    CHECK(t.domain_details.back() == "hardware CI record (MCP) state=sections unreadable");
+    // the sections arm is reached only after the scope check: an out-of-scope id stays "not found"
+    t.clear_audit();
+    t.scope = std::unordered_set<std::string>{"other"};
+    const json hidden = t.call("get_hardware_ci", {{"agent_id", "a"}});
+    REQUIRE(hidden.contains("error"));
+    CHECK(hidden["error"]["message"] == "not found");
+    // a lost audit row on the failure path is reported, not hidden
+    Twin w;
+    w.ci_by_id["a"] = d;
+    w.domain_audit_ok = false;
+    const json lost = w.call("get_hardware_ci", {{"agent_id", "a"}});
+    REQUIRE(lost.contains("error"));
+    CHECK(lost["error"]["message"] == "hardware sections unavailable");
+    CHECK(lost["error"]["data"]["audit_persisted"] == false);
+}
+
+// Only the REST record route and this tool ask for the sections.
+TEST_CASE("mcp hardware twins: get_hardware_ci asks for the sections and list_hardware_ci never composes a record",
+          "[mcp][hardware][sections]") {
+    Twin t;
+    t.roster_rows = {make_row("a", "host-a", "linux", true)};
+    t.ci_by_id["a"] = full_detail("a");
+    (void)t.call("get_hardware_ci", {{"agent_id", "a"}});
+    REQUIRE(t.ci_with_sections.size() == 1);
+    CHECK(t.ci_with_sections.back() == true);
+    (void)t.call("list_hardware_ci");
+    CHECK(t.ci_with_sections.size() == 1);
+}
+
+// The tool description is machine metadata (A5): it names the retryable error and the meaning of
+// complete:false, and the output schema describes sections_state.
+TEST_CASE("mcp hardware twins: the get_hardware_ci description states the sections contract",
+          "[mcp][hardware][sections]") {
+    Twin t;
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json listed = json::parse(res->body);
+    const json& tool = tool_entry(listed, "get_hardware_ci");
+    const std::string desc = tool["description"].get<std::string>();
+    const json& schema = tool["outputSchema"];
+    REQUIRE_FALSE(desc.empty());
+    CHECK(desc.find("not a full read") != std::string::npos);
+    CHECK(desc.find("failed sections read") != std::string::npos);
+    CHECK(desc.find("retry_after_ms") != std::string::npos);
+    CHECK(desc.find("complete false means constrained") == std::string::npos); // the old, wrong wording
+    CHECK(schema["properties"]["sections_state"]["description"].get<std::string>().find("retryable") !=
+          std::string::npos);
+    CHECK_FALSE(schema["properties"]["ci"]["properties"]["sections"]["items"]["properties"]["kind"].contains("enum"));
 }
 
 // ───────────────────────── audit row contents ──────────────────────────────────

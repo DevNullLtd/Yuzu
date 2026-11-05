@@ -39,6 +39,25 @@ TEST_CASE("attach_device_ci: fills a visible row's CI fields", "[inventory][ci-j
     REQUIRE(rows[0].ci_serial == "SN-1");
 }
 
+// The list search (H.7) reads these three off the row; the join is the only place they are filled.
+TEST_CASE("attach_device_ci: carries the v2 identifiers the Hardware list search reads",
+          "[inventory][ci-join]") {
+    std::vector<InventoryDeviceRow> rows(1);
+    rows[0].agent_id = "a1";
+    auto ci = make_ci("a1", "SN-1");
+    ci.chassis_asset_tag = "AT-7";
+    ci.chassis_serial = "CHS-7";
+    ci.board_serial = "BRD-7";
+    std::unordered_map<std::string, DeviceCiRecord> ci_by_agent;
+    ci_by_agent.emplace("a1", ci);
+
+    attach_device_ci(rows, ci_by_agent);
+
+    CHECK(rows[0].ci_chassis_asset_tag == "AT-7");
+    CHECK(rows[0].ci_chassis_serial == "CHS-7");
+    CHECK(rows[0].ci_board_serial == "BRD-7");
+}
+
 TEST_CASE("attach_device_ci: out-of-scope CI in the map is never attached or manufactured",
           "[inventory][ci-join]") {
     // `rows` holds only "a1" (as if the roster never contained "a2"); confinement is
