@@ -328,8 +328,9 @@ enum class V3SectionOutcome {
     kStored,     ///< full section replaced the facet's rows, or a delta section was applied
     kStatusOnly, ///< status-only section: facet state recorded, rows untouched
     kNeedFull,   ///< not applied: a delta on a base the server does not hold
-    kMismatch,   ///< a delta/component section that did not verify (stale `-`, key collision or
-                 ///< a post-apply hash != the agent's `expect`): rolled back, the facet is nacked
+    kMismatch,   ///< a section that did not verify (a `-` naming a row not held, a key or path
+                 ///< collision, a facet left over the per-call record cap, or a post-apply hash !=
+                 ///< the agent's `expect`): rolled back, the facet is nacked
     kRejected,   ///< the section broke the grammar and was refused
     kError,      ///< the transaction failed; nothing of this call was applied
 };
@@ -480,8 +481,9 @@ public:
     ///    section hash equal to the delta's `base`, else kNeedFull (nothing written). The `-` set
     ///    is ONE DELETE ... instance_key = ANY(...) RETURNING; the rows it returns must equal the
     ///    unique `-` count. The facet's rows are then re-read and their section hash must equal the
-    ///    agent's `expect`. A stale `-`, an instance_key collision on a `+`, or a hash that
-    ///    differs rolls that section back to its savepoint and answers kMismatch (the other
+    ///    agent's `expect`. A stale `-`, an instance_key collision on a `+`, a facet left over
+    ///    the per-call record cap, or a hash that differs rolls that section back to its
+    ///    savepoint and answers kMismatch (the other
     ///    sections of the call still apply and the facet is nacked); on success the facet state
     ///    carries status 'delta' and `expect` as its section hash.
     ///  - LEDGER: every applied section writes `software_changes` rows (install | remove |
@@ -494,7 +496,8 @@ public:
     ///  - `component_inventory`: full replaces the agent's `software_components` rows, delta
     ///    applies `-` row_hash / `comp` changes (same verification), in THIS store's schema and
     ///    transaction so the section hash joins the report hash atomically. An honest-empty full
-    ///    deletes the rows. A primary-key collision inside one section is a producer defect: kMismatch.
+    ///    deletes the rows. A primary-key collision inside one section is a producer defect:
+    ///    kMismatch, as is a component set left over the per-call cap.
     ///  - a refused section (V3Section::refusal) is kRejected; the others still apply.
     /// A SQL failure rolls the whole call back and answers kError for every section in it that
     /// was not refused (a refused section stays kRejected).
