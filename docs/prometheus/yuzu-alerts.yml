@@ -7252,7 +7252,10 @@ groups:
             yuzu_exec_correlation_write_degrade_total and the server log line "pool
             exhausted for command_id" (at most one per minute per cause). The responses
             already stored unverified are not repaired when the store recovers; re-run the
-            affected commands.
+            affected commands. While this fires the WS-3 command outbox's redelivery
+            horizon (#3678) counts those dispatches only on the instance that failed to
+            write them; treat the protection against re-sending an old scheduled command
+            as weakened until it clears.
 
       # #4990: the READ side of the same record. A response frame whose record lookup
       # fails twice (one retry) is stored `~unverified` with the same consequences. Only

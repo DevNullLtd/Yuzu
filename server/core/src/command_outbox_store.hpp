@@ -81,8 +81,8 @@
 /// origin never moves forward); the delivery loop dead-letters (`mark_failed`,
 /// `redelivery_horizon_exceeded`) a re-drive once the sequence has advanced by
 /// `kMaxOutboxRedeliveryHorizonCommands`. This store does not decide that -- it only carries the
-/// stamp; the rule is `CommandOutboxDelivery` rule R4. The count half of #4167 (the age and
-/// attempts caps are still open there).
+/// stamp; the rule is `CommandOutboxDelivery` rule R4. It is the count half of #4167; the age and
+/// attempts caps are still open there.
 ///
 /// SPENT-TICKET LEDGER (#6096). `ScheduleRunner` reads each row's `approval_id` back
 /// (`occurrences_for_approval`) to decide that an approved scheduled ticket was already used.
@@ -332,9 +332,15 @@ public:
     /// `attempts`, and push `next_attempt_at` out by `delay` (so a transient
     /// delivery failure — a degraded dispatch chokepoint — backs off instead of
     /// hot-looping). Same return contract as `mark_sent`.
+    ///
+    /// `clear_first_send_stamp` (#3678) also NULLs `dispatch_seq_first_sent` in the same fenced
+    /// write. Pass `true` ONLY when the attempt that wrote the stamp provably reached no agent
+    /// (it wrote the stamp in this very call and `sent == 0`): a stamp that predates the call may
+    /// guard an earlier attempt that really sent.
     [[nodiscard]] std::expected<bool, CommandOutboxError>
     reschedule(const std::string& occurrence_id, const std::string& leader_lock_name,
-               std::int64_t leader_epoch, std::chrono::seconds delay);
+               std::int64_t leader_epoch, std::chrono::seconds delay,
+               bool clear_first_send_stamp = false);
 
     /// Every occurrence key committed for approval ticket `approval_id` (#6096; order is not
     /// promised). This is the schedule runner's SPENT-TICKET LEDGER: an

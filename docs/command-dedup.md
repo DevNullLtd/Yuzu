@@ -115,11 +115,21 @@ claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
   This is a compile-time check, not prose: `kMaxDedupRows` is `yuzu::kAgentDedupRingRows` and
   `kMaxOutboxRedeliveryHorizonCommands` is `static_assert`ed to at most half of it, both in
   `common/include/yuzu/command_replay_horizon.hpp`. The WS-3 command outbox
-  (`command_outbox_delivery.cpp`) enforces the horizon by stamping the fleet-wide dispatch sequence
-  (`ExecutionTracker::current_dispatch_seq`) on a row before its first send and dead-lettering any
-  redrive once the sequence has advanced by the horizon (`redelivery_horizon_exceeded`). The bound is
-  an upper bound by construction (every ring-consuming send is one dispatch call), not something a
-  test observes on a real agent at the production ring size.
+  (`command_outbox_delivery.cpp`) enforces the horizon by stamping the dispatch sequence
+  (`ExecutionTracker::current_dispatch_seq`) on a row before its first attempt and dead-lettering any
+  redrive once the sequence has advanced by the horizon (`redelivery_horizon_exceeded`).
+  **What the bound is, honestly.** Every ring-consuming send is one dispatch call, so a count of
+  dispatch calls estimates how many newer commands an agent has seen. It is an estimate, not a
+  proof, and it errs both ways. It OVER-counts (safe: a row is dead-lettered early and a scheduled
+  fire is lost, audited): the sequence is fleet-wide, a per-target push (Guardian, asset-tag, sync)
+  counts once per target although each agent receives one command, and `__guard__` counts although
+  it takes no ring slot. It can UNDER-count (unsafe: a redrive after the agent evicted the id): a
+  dispatch whose record write failed is added back from this process's own count, but a failure on a
+  replica other than the one reading the sequence is not counted, so a sustained record-write outage
+  elsewhere can let the horizon trip late. The 2x margin absorbs the race between the check and the
+  agent's claim; it is not sized for a sustained uncounted outage. Closing that needs the agent to
+  refuse an id older than its own ring (a wire change, tracked separately). No test observes a real
+  agent at the production ring size.
 
 ## Related
 

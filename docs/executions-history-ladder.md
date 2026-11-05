@@ -95,6 +95,15 @@ reap counters above, and the alert `YuzuDispatchRecordWriteFailing` fires on a s
 skipped by a tripped per-loop latch (next paragraph) counts there too, so one real write attempt in an
 outage push yields one degrade per target.
 
+The dispatch-time write also advances `execution_tracker.dispatch_seq` (#3678), the sequence the WS-3
+command outbox measures its redelivery horizon on (`common/include/yuzu/command_replay_horizon.hpp`).
+A dispatch whose record is NOT written (a failed write, a latch skip, no tracker wired) is still sent and
+still takes an agent dedup-ring slot, so `AgentServiceImpl::record_command_dispatch` counts it into the
+process-local `ExecutionTracker::note_unrecorded_dispatch`, which `current_dispatch_seq()` adds to the
+shared value. Only the process that fails to write counts it: a write outage on a replica other than the
+one running the outbox is not seen there, so while `YuzuDispatchRecordWriteFailing` fires on any replica
+the horizon protection should be read as weakened, not as in force.
+
 A loop that writes one record per target is bounded differently, so that an outage costs the loop one
 short wait instead of one per target. `DispatchRecordLatch` (`dispatch_record_policy.hpp`) is declared
 per loop: its writes use a 250 ms lease budget (`kFanOutRecordLeaseTimeout`), and after the first

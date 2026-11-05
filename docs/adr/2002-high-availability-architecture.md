@@ -372,15 +372,21 @@ claim-commit and the external send is unavoidable:
   - **Redelivery horizon (#3678).** The agent's dedup is a ring over the most recent
     `kAgentDedupRingRows` TERMINAL commands, so a stable `command_id` re-sent after that many newer
     commands is a fresh claim and RE-EXECUTES. The outbox therefore bounds a redrive by a COUNT, not a
-    clock: each row is stamped with the fleet-wide dispatch sequence (`ExecutionTracker::current_dispatch_seq`,
-    advanced once per dispatch call at the one dispatch chokepoint) BEFORE its first send, and a redrive
-    whose sequence has advanced by `kMaxOutboxRedeliveryHorizonCommands` — or gone backwards — is
-    dead-lettered `redelivery_horizon_exceeded`, never sent. One dispatch call is at most one ring slot on
-    any agent, so the fleet-wide count upper-bounds every single agent's; the constant is `static_assert`ed
-    to at most half the ring (`common/include/yuzu/command_replay_horizon.hpp`). An unreadable or unwired
-    sequence HOLDS the row (the direction that cannot re-execute). Not covered: a stuck row on a quiet
+    clock: each row is stamped with the dispatch sequence (`ExecutionTracker::current_dispatch_seq`: the
+    shared count of dispatch calls made at the one dispatch chokepoint, plus this process's count of
+    dispatches whose record write failed) BEFORE its first attempt, and a redrive whose sequence has
+    advanced by `kMaxOutboxRedeliveryHorizonCommands` is dead-lettered `redelivery_horizon_exceeded`, and one
+    whose sequence went backwards `redelivery_sequence_regressed`; neither is sent. One dispatch call is at
+    most one ring slot on any agent, so the count ESTIMATES any single agent's consumption; the constant is
+    `static_assert`ed to at most half the ring (`common/include/yuzu/command_replay_horizon.hpp`). It is an
+    estimate, not a proof: it over-counts (fleet-wide, per-target fan-out, `__guard__` — safe, an early
+    dead-letter) and can under-count when record writes fail on a replica other than the reading one (unsafe;
+    the 2x margin is not sized for a sustained uncounted outage, and the sound close is agent-side). An
+    unreadable or unwired sequence HOLDS the row and ends the tick (the direction that cannot re-execute). A
+    stamp written by an attempt that provably reached no agent is cleared. Not covered: a stuck row on a quiet
     fleet is not capped by count (the age and attempts caps remain #4167); `DeploymentEngine`'s
-    fresh-`command_id` re-dispatch takes a new ring slot each time and is not a replay.
+    fresh-`command_id` re-dispatch takes a new ring slot each time and is not a replay;
+    `forward_gateway_pending` re-sends the same `command_id` a bounded number of times over about 900 s.
 - **Fencing token in the claim transaction:** every claim CAS checks the leader's fencing token, so a
   stale ex-leader cannot commit a claim even before it notices its lock dropped. A boolean "I am
   leader" cached outside the lock connection is prohibited.

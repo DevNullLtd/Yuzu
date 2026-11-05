@@ -26,6 +26,7 @@
 /// Wave-4 SQLite components — `InstructionDbPool` is deleted once this
 /// store moves.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -643,12 +644,30 @@ public:
         const std::string& command_id, const std::string& plugin, const std::string& execution_id,
         std::optional<std::chrono::milliseconds> lease_timeout = std::nullopt);
 
-    /// #3678: the fleet-wide dispatch sequence `record_command_dispatch` advances once per call.
-    /// Returns the number of dispatch records written so far (monotonic across replicas and
-    /// restarts; a crash can skip values forward, never backward), or nullopt when the store is
-    /// closed or the read degraded. NEVER treat nullopt as 0: the WS-3 command outbox refuses to
-    /// send on an unreadable sequence. See `common/include/yuzu/command_replay_horizon.hpp`.
+    /// #3678: the EFFECTIVE dispatch sequence the WS-3 command outbox measures its redelivery
+    /// horizon on: the shared `dispatch_seq` (advanced once per recorded dispatch call, so it is
+    /// common to every replica) PLUS this process's own count of dispatches whose record was NOT
+    /// written (`note_unrecorded_dispatch`). The second term is what keeps the count honest when
+    /// record writes fail: an unrecorded dispatch still consumed an agent ring slot, and without
+    /// it the shared sequence would freeze exactly while the ring fills.
+    ///
+    /// Monotonic within one process. It is NOT monotonic across a restart or a leader change (the
+    /// local term resets, a restore can move the shared one back); the outbox treats a value
+    /// below a row's stamp as a dead-letter, which is the safe direction. Failures on a replica
+    /// OTHER than the one reading are not counted: that residual is documented in
+    /// `common/include/yuzu/command_replay_horizon.hpp`.
+    ///
+    /// Returns nullopt when the store is closed or the read degraded. NEVER treat nullopt as 0:
+    /// the outbox refuses to send on an unreadable sequence.
     [[nodiscard]] std::optional<std::int64_t> current_dispatch_seq() const;
+
+    /// #3678: count one dispatch whose `record_command_dispatch` write did not happen -- failed,
+    /// refused, skipped by a tripped `DispatchRecordLatch`, or made with no tracker wired. The
+    /// command was still sent, so it may have consumed an agent dedup-ring slot. Lock-free;
+    /// called from the dispatch path. Over-counting is the safe direction.
+    void note_unrecorded_dispatch() noexcept {
+        unrecorded_dispatches_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     /// Resolves a previously recorded dispatch. Returns nullopt for an unknown command id (a
     /// forged or never-issued id, a failed record write, a reaped record) AND for a degraded read;
@@ -1079,6 +1098,10 @@ private:
 
     pg::PgPool& pool_;
     bool open_{false};
+    /// #3678: dispatches this process sent without a recorded `dispatch_seq` advance (see
+    /// `note_unrecorded_dispatch`). Process-local on purpose: it exists only for the failure case
+    /// where the shared database cannot be written.
+    std::atomic<std::int64_t> unrecorded_dispatches_{0};
     /// HA WS-2a-2: this process's outbox instance identity (a boot-time random
     /// hex string). Stamped as `origin_replica` on every durable append so the
     /// cross-replica poll loop can SKIP this replica's own rows (already

@@ -58,6 +58,7 @@ HORIZON_HPP = ROOT / "common" / "include" / "yuzu" / "command_replay_horizon.hpp
 TAGS_HPP = ROOT / "server" / "core" / "src" / "dedup_fleet_tags.hpp"
 AGENT_REGISTRY_CPP = ROOT / "server" / "core" / "src" / "agent_registry.cpp"
 SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
+AGENT_SERVICE_CPP = ROOT / "server" / "core" / "src" / "agent_service_impl.cpp"
 METRICS_MD = ROOT / "docs" / "user-manual" / "metrics.md"
 ALERTS_YML = ROOT / "docs" / "prometheus" / "yuzu-alerts.yml"
 ALERTS_TEST = ROOT / "tests" / "prometheus" / "yuzu-alerts.test.yml"
@@ -250,6 +251,29 @@ def problems() -> list:
         out.append(f"tests/prometheus/yuzu-alerts.test.yml has {cases} 'dedup store degraded' cases, "
                    f"expected at least {MIN_PROMTOOL_CASES}: deleting cases leaves a rule that parses "
                    f"but is no longer behaviour-tested (#2553)")
+
+    # 9. #3678: the outbox redelivery horizon is measured on a sequence the server must WIRE and the
+    # dispatch-record failure sites must COUNT. Both are silent when missing: an unwired reader
+    # fails closed (the whole outbox stalls), and an uncounted failure site freezes the horizon
+    # exactly while record writes fail and the agent's dedup ring fills. A C++ test cannot see
+    # either, because server.cpp and the call sites are not built into the test targets.
+    srv = strip_line_comments(read(SERVER_CPP))
+    at = srv.find("CommandOutboxDelivery::Deps{")
+    window = srv[at:at + 6000] if at >= 0 else ""
+    if at < 0:
+        out.append("server.cpp no longer constructs CommandOutboxDelivery::Deps{...} (stale pattern)")
+    elif not re.search(r"\.dispatch_seq_fn\s*=", window) or "current_dispatch_seq()" not in window:
+        out.append("server.cpp's CommandOutboxDelivery::Deps no longer wires .dispatch_seq_fn to "
+                   "ExecutionTracker::current_dispatch_seq() (#3678): the outbox would hold every row")
+    svc = strip_line_comments(read(AGENT_SERVICE_CPP))
+    m = re.search(r"void AgentServiceImpl::record_command_dispatch\(.*?\n\}\n", svc, re.S)
+    body = m.group(0) if m else ""
+    if not body:
+        out.append("could not find AgentServiceImpl::record_command_dispatch in agent_service_impl.cpp")
+    elif body.count("note_unrecorded_dispatch()") < 2:
+        out.append("AgentServiceImpl::record_command_dispatch must call note_unrecorded_dispatch() at "
+                   "BOTH its latch-skip and its failed-write sites (#3678): an uncounted unrecorded "
+                   "dispatch freezes the outbox redelivery horizon while the agent ring fills")
     return out
 
 
@@ -317,6 +341,16 @@ class DedupFleetTagsLexical(unittest.TestCase):
     def test_self_check_detects_a_stale_ring_bound_in_the_help(self):
         found = self._problems_with(HORIZON_HPP, lambda s: re.sub(r"(kAgentDedupRingRows\s*=\s*)20000", r"\g<1>30000", s))
         self.assertTrue(any("kMaxDedupRows" in p for p in found), found)
+
+    def test_self_check_detects_an_unwired_dispatch_seq_reader(self):
+        found = self._problems_with(
+            SERVER_CPP, lambda s: s.replace(".dispatch_seq_fn = [this]", ".dispatch_seq_fx = [this]", 1))
+        self.assertTrue(any("no longer wires .dispatch_seq_fn" in p for p in found), found)
+
+    def test_self_check_detects_an_uncounted_unrecorded_dispatch_site(self):
+        found = self._problems_with(
+            AGENT_SERVICE_CPP, lambda s: s.replace("tracker->note_unrecorded_dispatch();", "", 1))
+        self.assertTrue(any("note_unrecorded_dispatch()" in p for p in found), found)
 
     def test_self_check_detects_a_store_ring_bound_that_forks_the_shared_constant(self):
         found = self._problems_with(

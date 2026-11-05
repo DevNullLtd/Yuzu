@@ -1550,6 +1550,19 @@ TEST_CASE("ExecutionTracker: the dispatch record carries the plugin; the plugin 
         const auto s4 = tracker.current_dispatch_seq();
         REQUIRE(s4.has_value());
         CHECK(*s4 == *s3);
+
+        // A dispatch whose record was NOT written still consumed an agent ring slot, so the
+        // process counts it into the EFFECTIVE sequence the outbox measures its horizon on.
+        tracker.note_unrecorded_dispatch();
+        tracker.note_unrecorded_dispatch();
+        const auto s5 = tracker.current_dispatch_seq();
+        REQUIRE(s5.has_value());
+        CHECK(*s5 == *s4 + 2);
+        // ...and a recorded dispatch still adds exactly one on top of it.
+        REQUIRE(tracker.record_command_dispatch("seq-d", "echo", ""));
+        const auto s6 = tracker.current_dispatch_seq();
+        REQUIRE(s6.has_value());
+        CHECK(*s6 == *s5 + 1);
     }
     SECTION("a record without a plugin, or without a command id, is refused") {
         CHECK_FALSE(tracker.record_command_dispatch("cmd-3", "", "exec-1"));
@@ -1697,6 +1710,12 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades "
     auto reaped = closed.reap_command_execution_mappings();
     REQUIRE_FALSE(reaped.has_value());
     CHECK(reaped.error() == "execution tracker not open");
+
+    // #3678: an unreadable sequence is nullopt, NEVER 0 -- the outbox holds on nullopt, and a
+    // 0 would read as "no dispatches yet" and let a stale stamp look young. Counting an
+    // unrecorded dispatch on a closed store must not make it readable either.
+    closed.note_unrecorded_dispatch();
+    CHECK_FALSE(closed.current_dispatch_seq().has_value());
 }
 
 TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "

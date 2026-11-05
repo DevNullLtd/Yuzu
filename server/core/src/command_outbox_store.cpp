@@ -11,10 +11,10 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
-#include <system_error>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace yuzu::server {
@@ -123,15 +123,13 @@ CREATE INDEX outbox_approval_idx ON outbox (approval_id) WHERE approval_id <> ''
         // sequential scan must not run under the pool's 30 s statement timeout.
         {3, "SET LOCAL statement_timeout = 0;"
             "UPDATE outbox SET plugin = 'echo' WHERE plugin = 'tar';"},
-        // v4 (#3678): the fleet-wide dispatch sequence (`ExecutionTracker::current_dispatch_seq`)
-        // read just before the row's FIRST send. A redrive compares the current sequence against
-        // it and dead-letters the row once the gap reaches the redelivery horizon
-        // (`command_replay_horizon.hpp`), so a stable command_id is never re-sent after the agent
+        // v4 (#3678): the dispatch sequence (`ExecutionTracker::current_dispatch_seq`) read just
+        // before the row's FIRST delivery attempt. A redrive compares the current sequence
+        // against it and dead-letters the row once the gap reaches the redelivery horizon
+        // (`command_replay_horizon.hpp`), so a stable command_id is not re-sent after the agent
         // dedup ring could have evicted it. Nullable, no default: a metadata-only ALTER (no table
-        // rewrite, so no statement_timeout lift is needed, unlike v2/v3). A row still `pending`
-        // across the upgrade has NULL and is stamped at its next delivery attempt; if its first
-        // send happened before the upgrade, the horizon is measured from that later stamp (a
-        // one-time, documented window).
+        // rewrite, so no statement_timeout lift is needed, unlike v2/v3). A `pending` row with
+        // NULL is stamped at its next delivery attempt.
         {4, "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatch_seq_first_sent BIGINT;"},
     };
     return kMigrations;
@@ -479,18 +477,24 @@ CommandOutboxStore::stamp_first_send(const std::string& occurrence_id,
 std::expected<bool, CommandOutboxError>
 CommandOutboxStore::reschedule(const std::string& occurrence_id,
                                const std::string& leader_lock_name, std::int64_t leader_epoch,
-                               std::chrono::seconds delay) {
+                               std::chrono::seconds delay, bool clear_first_send_stamp) {
     const std::string fence = LeaderElector::epoch_fence_sql(leader_lock_name, leader_epoch);
     // Stay pending; bump attempts; push the retry out by `delay` so a transient
-    // delivery failure backs off instead of hot-looping the delivery tick.
+    // delivery failure backs off instead of hot-looping the delivery tick. #3678: optionally
+    // clear `dispatch_seq_first_sent` in the SAME write, when the caller proved the attempt
+    // that wrote it reached no agent.
     const std::string sql =
         "UPDATE command_outbox_store.outbox "
         "SET attempts = attempts + 1, updated_at = now(), "
-        "    next_attempt_at = now() + ($2 || ' seconds')::interval "
+        "    next_attempt_at = now() + ($2 || ' seconds')::interval, "
+        "    dispatch_seq_first_sent = CASE WHEN $3::boolean THEN NULL "
+        "                                   ELSE dispatch_seq_first_sent END "
         "WHERE occurrence_id=$1 AND state='pending' AND " + fence + " RETURNING occurrence_id";
     return fenced_transition(
         sql.c_str(),
-        std::vector<std::string>{occurrence_id, std::to_string(delay.count())}, "reschedule");
+        std::vector<std::string>{occurrence_id, std::to_string(delay.count()),
+                                 clear_first_send_stamp ? "true" : "false"},
+        "reschedule");
 }
 
 } // namespace yuzu::server

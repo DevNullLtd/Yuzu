@@ -46,13 +46,23 @@
 ///  clock: the sequence (`Deps::dispatch_seq_fn`, `ExecutionTracker::current_dispatch_seq`) is
 ///  stamped on the row BEFORE its first send (`CommandOutboxStore::stamp_first_send`), and a
 ///  redrive whose sequence has advanced by `redelivery_horizon_commands` (or gone backwards)
-///  is dead-lettered `redelivery_horizon_exceeded` instead of sent. Every unreadable-sequence,
-///  unwired-reader or failed-stamp case HOLDS the row (no send) -- the direction that cannot
-///  re-execute. The horizon is `kMaxOutboxRedeliveryHorizonCommands`
-///  (`common/include/yuzu/command_replay_horizon.hpp`, static_asserted below the ring) and the
-///  constructor clamps any larger `Deps` value down to it. A dead-lettered row is NOT
-///  force-cancelled (`decline_or_cancel_exec` is not called): the first attempt may have
-///  reached agents and their responses may still be arriving.
+///  is dead-lettered instead of sent (`redelivery_horizon_exceeded`, or
+///  `redelivery_sequence_regressed` for a sequence that went backwards). Every
+///  unreadable-sequence, unwired-reader or failed-stamp case HOLDS the row (no send) -- the
+///  direction that cannot re-execute; an unreadable or unwired sequence also ends the tick. A
+///  stamp written by an attempt that provably reached no agent (`sent == 0` on a retry outcome)
+///  is cleared in the same fenced reschedule, so a row blocked only by an unreadable gate is
+///  never aged toward a dead-letter without having been sent. The horizon is
+///  `kMaxOutboxRedeliveryHorizonCommands` (`common/include/yuzu/command_replay_horizon.hpp`,
+///  static_asserted below the ring) and the constructor clamps any larger `Deps` value down to
+///  it. A dead-lettered row is NOT force-cancelled (`decline_or_cancel_exec` is not called): an
+///  earlier attempt may have reached agents and their responses may still be arriving.
+///
+///  The sequence is a count of dispatch CALLS plus this process's unrecorded dispatches
+///  (`ExecutionTracker::note_unrecorded_dispatch`). It is conservative in two ways that can
+///  dead-letter a row early (a fan-out push records one call per target; any principal's
+///  dispatches advance it) and has one residual that can dead-letter it LATE: record-write
+///  failures on a replica other than the one reading are not counted.
 ///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
 /// historical discipline): a systemic transient gate/directory failure
@@ -165,6 +175,9 @@ public:
 
 private:
     void deliver(const OutboxCommand& c, const std::string& lock_name, std::int64_t epoch);
+    /// R4 (#3678): record a HOLD (no send, no fail, no reschedule). `systemic` also ends the
+    /// current tick via `hold_remaining_`.
+    void hold_row(const OutboxCommand& c, const char* cause, bool systemic);
     void audit(const OutboxCommand& c, const std::string& result, const std::string& detail);
 
     /// governance Gate 4+ systematic fix (unhappy-path BLOCKING finding, then
@@ -218,6 +231,8 @@ private:
     void count_cause(const char* name, const char* cause);
 
     Deps d_;
+    /// Set by `hold_row(systemic)` and read by `tick()`; both run on the one delivery thread.
+    bool hold_remaining_{false};
 };
 
 } // namespace yuzu::server

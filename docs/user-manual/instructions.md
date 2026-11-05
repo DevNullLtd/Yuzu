@@ -856,7 +856,7 @@ delivery loop then drains the outbox and performs the actual dispatch, within
 Delivery emits its own `command.outbox_delivered` audit event recording the
 real send outcome: `success` (dispatched, with the agents-reached count),
 `failure` (no agents currently in scope — recorded and skipped, not retried;
-or a malformed occurrence), or `denied` (authority was revoked between
+a malformed occurrence; or a redelivery-limit dead-letter, below), or `denied` (authority was revoked between
 enqueue and delivery). The execution row's targeted-agent count fills in at
 delivery, once the real outcome is known. A systemic delivery-gate failure
 (for example, containment status unreadable) is treated as transient: the
@@ -865,18 +865,37 @@ same occurrence is retried with back-off rather than failed outright.
 A retry re-sends the occurrence's original command ID, so that an agent which
 already ran it can recognise and absorb the repeat. An agent only remembers the
 most recent 20,000 completed commands, so the server bounds how long an
-occurrence may keep being retried: it records the fleet-wide dispatch count
-just before the first send attempt and, once that count has advanced by 10,000
-(half the agent's memory) before a retry, it stops. That occurrence is marked
-failed with the note `redelivery_horizon_exceeded` and a `failure`
-`command.outbox_delivered` audit event, and it is never sent again — an earlier
-attempt may already have run, so the run is not cancelled and its execution row
-is left as it was. If the dispatch count cannot be read at all, the occurrence
-is held (neither sent nor failed) and tried again on the next cycle; the
-`yuzu_server_command_outbox_deliver_degrade_total` counter rises while that
-lasts. The cap counts commands, not time, so an occurrence stuck on a quiet
-fleet is not ended by it. The count half is delivered under #3678; a
-time-based cap and a retry-count cap remain open under #4167.
+occurrence may keep being retried. It records the server's dispatch count just
+before the first delivery attempt and, once that count has advanced by 10,000
+(half the agent's memory) before a retry, it stops: the occurrence is marked
+failed with the note `redelivery_horizon_exceeded` (or
+`redelivery_sequence_regressed` if the count went backwards, for example after a
+database restore), a `failure` `command.outbox_delivered` audit event is
+written, and it is never sent again. The failed occurrence may have executed
+once, or may never have been sent at all (for example while a delivery gate
+stayed unreadable on some agents), so check the agents' responses before running
+it again. Its execution row is not cancelled by this step; if no agent ever
+answered, the stuck-execution sweep may cancel it later.
+
+A first attempt that reached no agent at all (the delivery gate was unreadable)
+does not start that clock: the count is recorded again at the next attempt.
+If the dispatch count cannot be read, or its recording does not commit, the
+occurrence is held (neither sent nor failed) and tried again on the next cycle;
+an unreadable count holds every pending occurrence for that cycle. The
+`yuzu_server_command_outbox_deliver_degrade_total` counter and the
+`yuzu_server_command_outbox_deliver_hold_cause_total{cause}` counter rise while
+that lasts.
+
+The count is an estimate, not a clock, and it can err in both directions. It is
+fleet-wide, so any operator's or any push's dispatches advance it: a Guardian,
+asset-tag or sync push counts once for every target, and one push to 10,000
+devices ends every occurrence that is waiting to be retried at that moment. That
+loses a scheduled run early, visibly. It can also fall behind: if dispatch
+records fail to write on a different server replica from the one delivering, the
+count under-reports and the limit can trip late. It is not a time limit, so an
+occurrence stuck on a quiet fleet is not ended by it. The count half is
+delivered under #3678; a time-based cap and a retry-count cap remain open under
+#4167.
 
 Approval-gated runs (the schedule's `requires_approval` flag, or a definition
 whose `approvalMode` is not `auto` — there is no operator session on the

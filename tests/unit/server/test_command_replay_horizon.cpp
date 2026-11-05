@@ -29,18 +29,18 @@ static_assert(::yuzu::agent::CommandDedupStore::kMaxDedupRows == ::yuzu::kAgentD
 
 TEST_CASE("command replay horizon: the outbox horizon leaves headroom under the agent ring (#3678)",
           "[command_outbox][3678]") {
-    // Copied into locals first: CommandDedupStore is YUZU_EXPORT, and binding a class static to
-    // a reference parameter (what REQUIRE does) ODR-uses it, which a dllexport class on the
-    // Windows leg can turn into an unresolved external.
+    // CommandDedupStore is a YUZU_EXPORT class: dllimport in this target on Windows, which does
+    // not link the agent library. Only CONSTANT-EXPRESSION uses of its static member are made
+    // here (the static_asserts above and these constexpr copies); it is never bound to a
+    // reference, which is what CHECK/REQUIRE would otherwise do.
     constexpr std::int64_t ring = ::yuzu::agent::CommandDedupStore::kMaxDedupRows;
     constexpr std::int64_t horizon = ::yuzu::kMaxOutboxRedeliveryHorizonCommands;
-    constexpr std::int64_t prune = static_cast<std::int64_t>(::yuzu::agent::CommandDedupStore::kPruneInterval);
 
     CHECK(horizon > 0);
     CHECK(horizon < ring);
-    // The 2x margin covers failed/skipped dispatch records and the check-vs-claim race; the ring
-    // itself may hold up to one prune interval more than `ring`, which is extra slack only and is
-    // deliberately NOT counted on.
+    // The 2x margin covers the race between the horizon check and the agent's claim and the
+    // staleness of a tick; it is NOT sized to absorb a sustained, uncounted record-write outage
+    // (see command_replay_horizon.hpp). The ring itself may hold up to one prune interval more
+    // than `ring`, which is extra slack only and is deliberately not counted on.
     CHECK(2 * horizon <= ring);
-    CHECK(prune > 0);
 }

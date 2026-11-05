@@ -10,8 +10,8 @@
  * replays the ORIGINAL result rather than a bare REJECTED.
  *
  * Why replay matters: the server's at-least-once delivery (and the WS-3 command
- * outbox, which re-sends a stable command_id) can redeliver a command whose first terminal ack was
- * lost. Without outcome replay the honest guarantee is only "effect-once,
+ * outbox, which re-sends a stable command_id) can redeliver a command whose first
+ * terminal ack was lost. Without outcome replay the honest guarantee is only "effect-once,
  * result-maybe-lost": the side effect ran once, but the operator sees REJECTED
  * and the real SUCCESS/output is gone. This store closes that. It is
  * effectively-once, NOT exactly-once (ADR-2002 §Guarantees): a command claimed
@@ -185,9 +185,8 @@ public:
      * outcome aged out of the ring produces a fresh Claimed on redelivery, not a
      * Miss, so that path is not separately detectable here (it is bounded by
      * kMaxDedupRows exceeding the server's outbox redelivery horizon, #3678, not
-     * observed). Best-
-     * effort + noexcept: a failure only degrades durability. Miss on an empty id /
-     * closed store returns Miss / Error respectively.
+     * observed). Best-effort + noexcept: a failure only degrades durability. Miss on
+     * an empty id / closed store returns Miss / Error respectively.
      */
     RecordOutcome record_terminal(std::string_view command_id,
                                   std::string_view serialized_response) noexcept;

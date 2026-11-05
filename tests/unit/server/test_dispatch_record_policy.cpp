@@ -267,6 +267,43 @@ TEST_CASE("dispatch record: an unlatched (operator) dispatch keeps the ordinary 
     CHECK(f.degrades() == 1.0); // only the latched write above degraded
 }
 
+// #3678: the outbox redelivery horizon is measured on a dispatch sequence that only advances when
+// a record is WRITTEN. A command whose record failed or was skipped is still sent and still takes
+// an agent dedup-ring slot, so the failure sites must count it or the horizon freezes exactly
+// while the ring fills. The sequence is the shared `dispatch_seq` PLUS this process's count.
+TEST_CASE("dispatch record: a failed or skipped record still advances the EFFECTIVE dispatch "
+          "sequence the outbox horizon reads (#3678)",
+          "[pg][server][dispatch_record][3678]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_record_tpl);
+    Fixture f(db.dsn());
+    constexpr std::size_t kAgents = 20;
+
+    const auto s0 = f.tracker->current_dispatch_seq();
+    REQUIRE(s0.has_value());
+    {
+        auto held = f.exhaust();
+        DispatchRecordLatch latch{"sequence loop"};
+        for (std::size_t i = 0; i < kAgents; ++i)
+            f.svc.record_command_dispatch(Fixture::id_of("seqa", i), kPlugin, "", &latch);
+        // One real write attempt failed and the rest were skipped: none was written.
+        CHECK(latch.tripped());
+        CHECK(latch.skipped() == kAgents - 1);
+    }
+    const auto s1 = f.tracker->current_dispatch_seq();
+    REQUIRE(s1.has_value());
+    // Every one of the 20 commands is counted even though no record reached the database.
+    CHECK(*s1 - *s0 == static_cast<std::int64_t>(kAgents));
+    for (std::size_t i = 0; i < kAgents; ++i)
+        CHECK_FALSE(f.recorded(Fixture::id_of("seqa", i)));
+
+    // A healthy record adds exactly one, so a recovered process is not double-counted.
+    f.svc.record_command_dispatch(Fixture::id_of("seqb", 0), kPlugin, "", nullptr);
+    const auto s2 = f.tracker->current_dispatch_seq();
+    REQUIRE(s2.has_value());
+    CHECK(*s2 - *s1 == 1);
+    CHECK(f.recorded(Fixture::id_of("seqb", 0)));
+}
+
 TEST_CASE("dispatch record: no tracker wired trips the latch and counts every write",
           "[pg][server][forensics_tier][provenance][dispatch_record]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dispatch_record_tpl);

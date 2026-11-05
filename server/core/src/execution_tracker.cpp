@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <random>
 #include <string_view>
 #include <unordered_set>
@@ -2807,7 +2808,13 @@ std::optional<std::int64_t> ExecutionTracker::current_dispatch_seq() const {
     const auto parsed = parse_reap_i64(col_str(res.get(), 0, 0));
     if (!parsed || *parsed < 0)
         return std::nullopt;
-    return *parsed;
+    // Effective sequence = shared sequence + this process's unrecorded dispatches (#3678).
+    // Saturating: a sum that would overflow int64 is clamped, never wrapped negative (a wrapped
+    // value would read as "the sequence went backwards" and dead-letter every stamped row).
+    const std::int64_t local = unrecorded_dispatches_.load(std::memory_order_relaxed);
+    if (local > 0 && *parsed > std::numeric_limits<std::int64_t>::max() - local)
+        return std::numeric_limits<std::int64_t>::max();
+    return *parsed + local;
 }
 
 std::optional<CommandRecord>
