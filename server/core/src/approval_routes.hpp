@@ -30,7 +30,7 @@
 ///
 /// APPROVER ASSURANCE (#6061, four-eyes MVP PR1) -- approve/reject. Both routes
 /// are kRequired rows in the central step-up table, so the central check runs
-/// in the pre-request stage, before the handler (and after the server-wide
+/// in the post-read stage, before the handler (and after the server-wide
 /// same-site gate, which answers a cross-site cookie write first): a stale or
 /// absent proof is a 401, a SAML session a 403, and an engine principal a 403
 /// (`engine_principal_denied`, audited as `mfa.step_up.required`); the handler

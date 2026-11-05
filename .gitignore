@@ -86,6 +86,8 @@ CLion.ini
 .env
 .env.*
 !.env.example
+# Public CA/leaf CERTIFICATES for the gateway CRL tests (#6016): no private keys.
+!gateway/apps/yuzu_gw/test/fixtures/crl/*.pem
 
 # OS
 .DS_Store
