@@ -230,7 +230,7 @@ cadences.
   use `signature_status` as tamper detection or as a Gatekeeper/notarization
   result. (Deep verification — `SecStaticCodeCheckValidity` — is not performed;
   adding it would turn this into a validity verdict and need a third state, an
-  open contract decision.) `publisher` is empty for ad-hoc-signed and unsigned
+  open contract decision.) `publisher` is `via:macos` for ad-hoc-signed and unsigned
   apps. Enrichment covers up to 5000 located apps per collection; that guard is
   a runaway bound rather than a routine limit, and reaching it makes the agent
   report the collection degraded (see below) instead of publishing rows whose
@@ -278,11 +278,9 @@ cadences.
   normal, not degraded. A value-level failure (a non-REG_SZ or over-64 KiB
   DisplayName) is not distinguished from an absent value (plugin README caveat
   1).
-- **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
-  the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
-  only — the release moved to its own `release` column (was fused
-  `VERSION-RELEASE`). Fleet-wide version rollups on Linux change shape
-  accordingly on the first post-upgrade sync.
+- **rpm fields:** `publisher` is the rpm **VENDOR** tag, else the **PACKAGER**
+  tag (a person or a build-system address), else `via:rpm`; `version` is the
+  upstream version only and the release is its own `release` column.
 - **No end-user profiles / personal data in the daily sync.** We do **not** use
   the plugin's per-user enumeration (`list_per_user`), so no logged-in-user
   profiles and no usernames are collected by the sync — no end-user PII. The
