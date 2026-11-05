@@ -5049,6 +5049,7 @@ struct LiveRun {
     // collect (the row lands).
     template <class Write>
     void transition(Write&& write, std::function<bool(const RegistryEtwEvent&)> await_event = {}) {
+        const std::uint64_t pushed_before = src->buffer_for_test().pushed();
         write();
         REQUIRE(dirty->wait_dirty_for_test(root, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
         if (await_event && etw_running()) {
@@ -5056,19 +5057,25 @@ struct LiveRun {
                 await_event, std::chrono::steady_clock::now() + std::chrono::seconds(15));
             if (!seen) {
                 // #7135: on the shared CI box this wait timed out with nothing in the job log to
-                // say why. The session is system-wide, so name what it did deliver and what it
-                // says it lost: a large events_lost or rt_buffers_lost with events still arriving
-                // is the session overflowing under load (this write's event was dropped); zero
-                // loss and no events at all is a session that is not delivering. If
-                // loss_query_ok is 0 the counters are not evidence.
+                // say why. The session is system-wide, so name what it delivered since this write
+                // (all writers), whether our own buffer evicted any (buffer_evicted), and what the
+                // session says it lost. Events arriving while events_lost or rt_buffers_lost grow
+                // points at the session overflowing under load, which would have dropped this
+                // write's event; no events at all with etw_running=1 and zero loss points at a
+                // session that is not delivering; etw_running=0 means the session died during the
+                // wait. The counters are cumulative for the session, and zero loss does not prove
+                // nothing was dropped (provider-side drops are not counted). If loss_query_ok is 0
+                // the counters are not evidence.
                 const SessionLoss loss = session_loss();
+                const auto evicted = src->buffer_for_test().drop_info().count;
                 FAIL("no ETW event from this write within 15 s. session delivered "
-                     << src->buffer_for_test().pushed()
-                     << " events from all writers since it started ("
-                     << src->buffer_for_test().size() << " still buffered); events_lost="
-                     << loss.events_lost << " rt_buffers_lost=" << loss.rt_buffers_lost
+                     << (src->buffer_for_test().pushed() - pushed_before)
+                     << " events from all writers since this write ("
+                     << src->buffer_for_test().size() << " buffered, " << evicted
+                     << " evicted since the session started); events_lost=" << loss.events_lost
+                     << " rt_buffers_lost=" << loss.rt_buffers_lost
                      << " decode_failed=" << loss.decode_failed
-                     << " loss_query_ok=" << loss.query_ok);
+                     << " loss_query_ok=" << loss.query_ok << " etw_running=" << etw_running());
             }
         }
         tick(t.db, *src);

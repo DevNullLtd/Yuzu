@@ -1149,10 +1149,10 @@ foreach shard, spec : agent_shard_specs
     args: [spec, '--allow-running-no-tests', '--durations=yes'],
     suite: ['agent', 'agent-shard'],
     # 480s per shard (#7135; was 240s, the old single entry's figure). Measured on the
-    # Windows MSVC debug leg (Actions runs 41919798385 attempt 5, 42040619981): shard C ran
-    # 185s and 212s on passing attempts and hit the 240s limit once under load with no code
-    # change on a rerun (run 41919798385 attempt 4); #7135 records ~222s for it alone on a
-    # 16-thread host. The worst case is therefore at least 240s (a timeout is a floor, not a
+    # Windows MSVC debug leg: shard C ran 185s (run 41919798385 attempt 5) and 212s (run
+    # 42040619981, job 127290311756) on passing attempts and hit the 240s limit once under load
+    # with no code change on a rerun (run 41919798385 attempt 4); #7135 records ~222s for it
+    # alone on a 16-thread host. The worst case is therefore at least 240s (a timeout is a floor, not a
     # measurement) and the limit is 2x that. Shards A (98-102s) and B (70s) are well under, so
     # this is sized off C. Do not shorten tests to fit; split the shard instead if C outgrows
     # this. The one other measured contention

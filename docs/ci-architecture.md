@@ -1478,7 +1478,9 @@ job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
-`timeout-minutes: 120`. At np=2 the Linux slot-wait case was the one that
+`timeout-minutes: 120` (a hung agent shard or echo entry now adds up to 8 minutes
+more, per #7135's 480 s and 180 s limits, and a flake-retry re-run of it the same
+again). At np=2 the Linux slot-wait case was the one that
 needed attention: the "revisit the 700s per-shard budget or the Linux
 `--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
 above) had a less severe trigger than at 16 shards (the all-at-cap ceiling alone
