@@ -12,7 +12,6 @@
 #pragma comment(lib, "bcrypt.lib")
 #else
 #include <openssl/hmac.h>
-#include <openssl/rand.h>
 #endif
 
 namespace yuzu::server::mfa {
@@ -64,20 +63,6 @@ void hmac_sha1(std::string_view key, std::string_view data, uint8_t (&out)[20]) 
                         &len);
     if (!result) {
         std::memset(out, 0, sizeof(out));
-    }
-#endif
-}
-
-void csprng_fill(uint8_t* buf, std::size_t n) {
-#ifdef _WIN32
-    BCryptGenRandom(nullptr, buf, static_cast<ULONG>(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-#else
-    if (RAND_bytes(buf, static_cast<int>(n)) != 1) {
-        // Match the throw-on-failure posture of AuthManager::random_bytes;
-        // the alternative (silently returning zeroed bytes) would mint a
-        // predictable TOTP secret and is far worse than crashing the
-        // enrollment request.
-        throw std::runtime_error("RAND_bytes failed");
     }
 #endif
 }
@@ -250,21 +235,25 @@ std::string otpauth_uri(std::string_view issuer, std::string_view account,
     return out;
 }
 
-std::vector<uint8_t> random_secret() {
-    std::vector<uint8_t> out(kTotpSecretBytes);
-    csprng_fill(out.data(), out.size());
+std::expected<std::vector<uint8_t>, SecureRandomError> random_secret() {
+    std::vector<uint8_t> out(kTotpSecretBytes); // zero-initialised: never returned on failure
+    if (auto rc = fill_random(out); !rc.has_value())
+        return std::unexpected(rc.error());
     return out;
 }
 
-std::string random_recovery_code() {
+std::expected<std::string, SecureRandomError> random_recovery_code() {
     // 10 bytes of CSPRNG entropy → 16 base32 chars = 80 bits. Up from
     // 50 bits in PR1's first cut (enterprise-readiness ASSURANCE-3 +
     // unhappy-path UP-7) — single-use bypass tokens for an MFA-strip
     // primitive must clear the 80-bit "look-up secret" floor for SOC 2
     // and NIST SP 800-63B Authentication Assurance Level 2. Format
     // remains hyphen-grouped for human transcription.
-    uint8_t raw[10];
-    csprng_fill(raw, sizeof(raw));
+    // Value-initialised as defence in depth: `raw` is never read on the failure
+    // path below, but a future edit must not be able to reach indeterminate stack.
+    uint8_t raw[10]{};
+    if (auto rc = fill_random(std::span<uint8_t>{raw}); !rc.has_value())
+        return std::unexpected(rc.error());
     auto enc = base32_encode(std::string_view(reinterpret_cast<const char*>(raw), sizeof(raw)));
     // base32 of 10 bytes is 16 chars. Group 4-4-4-4 for readability.
     enc.resize(16);

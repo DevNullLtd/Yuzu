@@ -956,14 +956,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
         {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
-        {"hardware.chassis", "Chassis type, serial and asset tag (planned on every OS this release; one unsupported status row)"},
-        {"hardware.baseboard", "Baseboard vendor, product and serial (planned on every OS this release; one unsupported status row)"},
-        {"hardware.swap", "Swap devices and page files with total and used size (planned on every OS this release; one unsupported status row)"},
-        {"hardware.machine_id", "Keyed hash of the OS machine identifier (planned on every OS this release; one unsupported status row)"},
+        {"hardware.chassis", "Chassis type, serial and asset tag (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.baseboard", "Baseboard vendor, product and serial (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.swap", "Swap devices and page files with total and used size (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.machine_id", "Fixed-label HMAC-SHA256 of the OS machine identifier, a stable pseudonym that is not secret from a holder of the raw id (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
         // disk_actions
         {"disk_actions.smart", "Per-physical-drive health: model, transport, media type and, where the OS exposes it, wear indicators"},
         {"disk_actions.volumes", "Mapping between physical drives and the logical volumes they back, with mount points"},
-        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (planned on every OS this release; one unsupported status row)"},
+        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (read on Windows via WMI: Win32_DiskPartition view, no Microsoft Reserved partition, drive letters only, unmeasured on dynamic disks/BitLocker/Storage Spaces; planned on Linux and macOS: one unsupported status row)"},
         {"disk_actions.topology", "LVM, md, multipath and APFS container layers above the physical disks (planned on every OS this release; one unsupported status row)"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
@@ -1161,6 +1161,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "List installed Python interpreters by flavour, version, install path and vendor "
          "(Windows PEP 514 registry keys, macOS python.org framework, Linux python3.<minor> "
          "files with major.minor only; standard roots only, no subprocess)"},
+        // middleware
+        {"middleware.ibm_mq",
+         "List installed IBM MQ installations by version and install path from installer metadata "
+         "(Linux: mqinst.ini + swidtag names; no subprocess; Windows and macOS planned)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},

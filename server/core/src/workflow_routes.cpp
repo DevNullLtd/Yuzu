@@ -147,9 +147,12 @@ void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
                      "(HTTP 400). reason=schema_invalid: the stored schema cannot be prepared, so "
                      "the call fails closed (HTTP 500).",
                      "counter");
-    for (const char* reason : kParamRejectReasons)
-        metrics.counter("yuzu_server_instruction_param_rejected_total",
-                        {{"route", kParamRejectRoute}, {"reason", reason}});
+    // The v1 REST twin shares the legacy route's label (same capability); the MCP twin
+    // (execute_instruction_definition) uses the `mcp` label. See instruction_execute.hpp.
+    for (const char* route : {kParamRejectRoute, "mcp"})
+        for (const char* reason : kParamRejectReasons)
+            metrics.counter("yuzu_server_instruction_param_rejected_total",
+                            {{"route", route}, {"reason", reason}});
 }
 
 // #4029: `product_pack_error_status`/`product_pack_client_message` moved to

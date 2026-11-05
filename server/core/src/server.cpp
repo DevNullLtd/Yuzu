@@ -103,6 +103,8 @@
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
+#include "instruction_execute_ports.hpp"  // #2146: shared core of the instruction-definition execute twins
+#include "instruction_execute_routes.hpp" // POST /api/v1/instructions/{id}/execute
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
@@ -111,6 +113,7 @@
 #include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
+#include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
@@ -176,6 +179,7 @@
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
+#include "command_v1_routes.hpp" // POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
@@ -233,12 +237,16 @@
 #include "device_containment_routes.hpp"
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
+#include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
 #include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
 #include "home_panels_routes.hpp" // HM-2: Dashboard policies + events fragments
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
+#include "software_normalization_job.hpp"
+#include "software_normalization_pack.hpp"
+#include "software_title_dimension.hpp"
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
@@ -281,6 +289,7 @@
 #include "mcp_retry.hpp"  // kMcpPollTotalMetric (#3344) — direct, not transitive
 #include "mcp_server.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter names (boot pre-seed)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
 #include "integrations_sync_routes.hpp"
@@ -313,6 +322,7 @@
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "cidr_match.hpp"
+#include "gateway_forward_guard.hpp"
 #include "gateway_mgmt_stub_pool.hpp"
 #include "gateway_route_store.hpp"
 #include "gateway_peer_audit.hpp"
@@ -1496,9 +1506,12 @@ public:
         // emitted-but-unseeded, which passes its own test and silently breaks
         // absent() alerting. This commit's six targeting reasons went into
         // that array, not into a list here - which is the tether working.
+        // execute_instruction_definition (#2146) bounds its arguments with the same closed
+        // reason set (mcp_instruction_execute.cpp's check_args), so it is the second emitter.
         for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
-            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
-                             {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
+            for (const char* tool : {"execute_instruction", "execute_instruction_definition"})
+                metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                                 {{"tool", tool}, {"reason", std::string(reason)}});
         }
         // #4353 follow-up (Gate 2 finding on #4364): the 19 kFieldBoundTools
         // share the SAME counter as execute_instruction above but a single
@@ -1523,8 +1536,9 @@ public:
                           "Dispatch calls refused because a supplied targeting argument "
                           "named no device, plus dispatch-closure calls that named no target at "
                           "all (#2500), plus Destructive-class capabilities targeted without "
-                          "explicit agent_ids on REST (route=command), MCP execute_instruction "
-                          "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
+                          "explicit agent_ids on REST (route=command, route=command_v1), MCP "
+                          "execute_instruction (route=mcp) or the dashboard exec console "
+                          "(route=dashboard) (#3685). "
                           "Both labels are closed sets; every reachable pair "
                           "is pre-seeded at boot so absent() stays meaningful. The "
                           "withhold reasons quarantined, unknown_plugin and "
@@ -1546,7 +1560,7 @@ public:
         // can never emit them. Seeding the full product would publish series
         // that no code path can reach, which reads on a dashboard as "this has
         // never happened" when the truth is "this cannot happen" (governance).
-        for (const char* route : {"command", "instruction_execute"}) {
+        for (const char* route : {"command", "instruction_execute", "command_v1"}) {
             for (const auto reason : yuzu::server::kTargetingShapeReasons)
                 metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", route}, {"reason", std::string(reason)}});
@@ -1573,32 +1587,76 @@ public:
         // only on first use reads as ABSENT until the first refusal, which is
         // exactly the absent()-alerting break the single-array discipline exists
         // to prevent -- and three docs tell operators to alert on this series.
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
         // Stored `parameter_schema` refusals on the instruction execute route: a separate
         // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
         seed_instruction_param_rejected_metrics(metrics_);
+        // Approval-submit refusals on the instruction execute core (REST v1 + MCP
+        // execute_instruction_definition) and the MCP C8 ticket mint's per-principal cap. A
+        // saturated per-principal share is the early signal for a looping client; the global
+        // queue (1000) filling is what it protects. Closed reason set, every member pre-seeded so
+        // an absent() alert reads "never happened", not "no series yet".
+        metrics_.describe(yuzu::server::instruction_execute::kApprovalRefusedMetric,
+                          "Approval-gated execute calls refused at the approval-submit step, by "
+                          "reason: approval_cap_reached (this principal already holds about 25 pending "
+                          "approvals, a per-principal soft bound; HTTP 429 on REST, JSON-RPC -32004 "
+                          "with error.data.reason approval_cap_reached on MCP), approval_unavailable (no "
+                          "approval manager, or the pending count could not be read), "
+                          "approval_queue_full (the global pending queue is full: only a reviewer "
+                          "or the expiry clears it), approval_submit_failed (the approval store "
+                          "otherwise refused the row). No approval row is created on a refusal.",
+                          "counter");
+        for (const auto reason : yuzu::server::instruction_execute::kApprovalRefusedReasons)
+            metrics_.counter(yuzu::server::instruction_execute::kApprovalRefusedMetric,
+                             {{"reason", std::string(reason)}});
+        // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
+        // `event_type` set, pre-seeded. Only the v1 / MCP twins count here (event_emit_hook.hpp);
+        // the legacy routes' own emit calls do not touch this counter.
+        metrics_.describe(yuzu::server::kEventEmitFailedMetric,
+                          "Legacy-equivalent platform events (execution.created, "
+                          "execution.completed, command.dispatched, instruction.executed, "
+                          "approval.created) that the v1 REST and MCP twins tried to publish "
+                          "after a successful effect and whose emit hook THREW (a payload "
+                          "serialisation or hook defect). NOT an analytics-drop signal: the "
+                          "analytics emit itself is fail-soft, so an event that is dropped (for "
+                          "example when no analytics store is wired) does not move this counter. The "
+                          "request is unaffected (emission is best effort, after the effect).",
+                          "counter");
+        for (const auto event : yuzu::server::kEmittedEvents)
+            metrics_.counter(yuzu::server::kEventEmitFailedMetric,
+                             {{"event_type", std::string(event)}});
         // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them
         // (a Forensics row is never Destructive, but reaches the same gate).
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
-        // #2557: `destructive_no_visible_target` is emitted ONLY by
-        // `/api/command`'s confine-to-visible-agents 404 arm today — unlike
-        // its `destructive_untargeted` sibling above, MCP's execute_instruction
+        // #2557: `destructive_no_visible_target` is emitted by the two REST
+        // routes' (`/api/command`, `POST /api/v1/commands`) confine-to-visible-agents
+        // 404 arm and, since #2146, by the instruction-definition execute twins (below),
+        // unlike its `destructive_untargeted` sibling above, MCP's raw execute_instruction
         // and the dashboard exec console have no equivalent post-authz
         // confinement step, so seeding those routes here would publish a
         // series claiming a reachability that does not exist (same rule the
         // per-route seeding throughout this block already follows).
-        metrics_.counter(
-            "yuzu_server_dispatch_target_rejected_total",
-            {{"route", "command"},
-             {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
+        for (const char* route : {"command", "command_v1"})
+            metrics_.counter(
+                "yuzu_server_dispatch_target_rejected_total",
+                {{"route", route},
+                 {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
+        // #2146: the v1 instruction-definition execute twin (instruction_execute.cpp) confines a
+        // Destructive / Forensics pair's named targets to the operator's visible agents exactly
+        // as `/api/command` does, so it emits the same reason; the MCP twin shares the `mcp`
+        // route label and is seeded with it.
+        for (const char* route : {"instruction_execute", "mcp"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
         for (const auto reason : {yuzu::server::kReasonParentIdType,
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
@@ -1670,7 +1728,7 @@ public:
         // at boot — an oversight this closes now that `command_routes.cpp`'s
         // shared `guarded()` catch block also feeds this same series, widening
         // `phase` from the wrapper's original two values to every `guarded()`
-        // post-dispatch site name. `route` is `command` only today (the one
+        // post-dispatch site name. For those phases `route` is `command` only (the one
         // surface either emitter wraps). `phase` is a closed set spelled out
         // here rather than iterated from a shared array — unlike the `reason`
         // constants above, these are hardcoded per-call-site string literals
@@ -1685,8 +1743,10 @@ public:
             "yuzu_server_dispatch_fanout_throw_total",
             "POST /api/command post-dispatch side effects (the audit sink, or any "
             "guarded() post-dispatch helper) that THREW rather than failing cleanly, "
-            "by which one. A well-behaved sink/helper should fail via its own return "
-            "value, not an exception; a non-zero rate points at a bug in that sink/"
+            "by which one; and, with phase=\"dispatch\" on route command_v1, "
+            "instruction_execute or mcp, the dispatch call itself throwing (its execution "
+            "row is left running). A well-behaved sink/helper should fail via its own "
+            "return value, not an exception; a non-zero rate points at a bug in that sink/"
             "helper rather than at ordinary degradation.",
             "counter");
         for (const char* phase : {"success", "denial", "audit_quarantine_dispatch_fail_closed",
@@ -1698,6 +1758,13 @@ public:
                                   "thead_for_plugin"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
                              {{"route", "command"}, {"phase", phase}});
+        // `phase="dispatch"` is the dispatch call ITSELF throwing (not a post-dispatch helper),
+        // counted by the three v1/MCP surfaces that catch it: POST /api/v1/commands, the
+        // instruction-definition execute twins (REST + MCP). The legacy /api/command route does
+        // not catch a throwing dispatch, so it has no such series. The same alert covers them.
+        for (const char* route : {"command_v1", "instruction_execute", "mcp"})
+            metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
+                             {{"route", route}, {"phase", "dispatch"}});
 
         // The containment gate's own outcome series, seeded across its whole
         // closed label set for the same reason. Without this, `absent()` on
@@ -2055,11 +2122,14 @@ public:
                           "a report skipped because another report for the same agent held its "
                           "lock, certificate_inventory only - not a failure)",
                           "counter");
+        // Closed facet x outcome label set, pre-seeded so the first refused section counts.
+        seed_section_ingest_series(metrics_);
         cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
-                          "(full = full-payload replace; hash_only = hash-skip compare)",
+                          "(full = full-payload replace; hash_only = hash-skip compare; "
+                          "v3 = sectioned apply)",
                           "histogram");
         // RbacStore observability (ADR-0041). Described + zero-seeded up front so
         // the HELP/TYPE lines and closed dims exist on an idle server — critical
@@ -2456,6 +2526,37 @@ public:
                           "Epoch seconds of the last successful catalogue rollup refresh; alert when "
                           "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
                           "/inventory catalogue silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_pass_total",
+                          "Software-title normalisation ticks by outcome (success/error); hourly, "
+                          "or every 60 s while a backlog remains or the catalogue rollup has not "
+                          "yet filled the candidate source. A cancelled tick (shutdown) is "
+                          "neither. Keep-last-good on error.",
+                          "counter");
+        metrics_.describe("yuzu_software_normalization_duration_seconds",
+                          "Wall-clock of the last software-title normalisation tick",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_last_success_timestamp",
+                          "Epoch seconds of the last successful software-title normalisation tick; "
+                          "0 until the first success. Alert when now - this exceeds two cadences",
+                          "gauge");
+        metrics_.describe("yuzu_software_titles",
+                          "Distinct installed-software titles by normalisation status "
+                          "(normalized/unnormalized/pending)",
+                          "gauge");
+        metrics_.describe("yuzu_software_unnormalized_ratio",
+                          "Fraction of installed-software installs (device-title pairs) whose "
+                          "title is not yet normalized (unnormalized or pending). Not exported "
+                          "until the first non-empty read of the title source; unchanged while "
+                          "that source is empty (a stalled catalogue rollup is not a perfect "
+                          "ratio)",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_curation_queue_size",
+                          "Open titles in the software normalisation curation queue",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_pack_info",
+                          "Loaded software normalisation alias pack (value 1 on the current "
+                          "pack_version label)",
                           "gauge");
         metrics_.describe("yuzu_app_perf_read_degrade_total",
                           "Authoritative B1 (per-device app-perf) reads that returned a degrade "
@@ -3076,15 +3177,28 @@ public:
                           "clock-anomaly detection across a restart",
                           "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
-        // Increments in the token-create handlers (api_token, device_token)
+        // Increments in the token-create handlers (api_token, device_token,
+        // engine_principal)
         // when `secure_random::fill_random` returns prng_failure (entropy
-        // exhaustion). Operators wire a Prometheus rule like
+        // exhaustion), and (#6995) in the MFA enrolment / recovery-code
+        // handlers when AuthDB reports EntropyUnavailable. Operators wire a
+        // Prometheus rule like
         //   rate(yuzu_secure_random_failure_total[5m]) > 0
-        // to page on-call short of grepping audit logs.
+        // to page on-call short of grepping audit logs; it is label-agnostic,
+        // so it covers the MFA sites with no change.
         metrics_.describe("yuzu_secure_random_failure_total",
                           "CSPRNG (RAND_bytes / BCryptGenRandom) failures during token "
-                          "issuance, labelled by reason and call site",
+                          "issuance and MFA enrolment / recovery-code minting, labelled by "
+                          "reason and call site",
                           "counter");
+        // #6995: every site (the four token sites and the two MFA sites) exists from
+        // boot, so absent() alerts and a first scrape see 0, not a missing series, and
+        // a lone first fault still produces a rate. Names come from the one header.
+        for (auto site : mfa_entropy::kAllSites) {
+            metrics_.counter(std::string{mfa_entropy::kMetric},
+                             {{"reason", std::string{mfa_entropy::kReason}},
+                              {"site", std::string{site}}});
+        }
         // W1.3 (#826 + #1052 + #1053): device-token rejection counters.
         // Three high-signal variants each get their own counter so SRE
         // can alert directly without a labels selector. The remaining
@@ -3281,12 +3395,18 @@ public:
         // docs/observability-conventions.md, so absent() alerts stay
         // meaningful.
         metrics_.describe("yuzu_auth_secret_unavailable_total",
-                          "Total requests refused 503 by a fail-closed store-unavailable "
+                          "Total requests refused (503, or a retry fragment on Settings) by a "
+                          "fail-closed store-unavailable "
                           "guard on the auth/MFA surface, by route (route=approval also counts "
-                          "an unreadable durable session proof)",
+                          "an unreadable durable session proof; route=mfa_recovery counts a "
+                          "refused Settings recovery-code regeneration; a CSPRNG fault is "
+                          "never counted here, see yuzu_secure_random_failure_total)",
                           "counter");
+        // route=mfa_recovery (#6995): a refused Settings recovery-code
+        // regeneration on a store fault. A CSPRNG fault there is NOT counted
+        // here; it goes to yuzu_secure_random_failure_total{site=mfa_recovery}.
         for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
-                           "password_change", "approval"}) {
+                           "password_change", "approval", "mfa_recovery"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -3302,7 +3422,9 @@ public:
         // password change (route=password_change, which shares its lockout
         // helper, #5342) are instrumented; the other is_store_unavailable->503
         // auth sites (login/mfa, stepup, enroll, elevate) keep only
-        // yuzu_auth_secret_unavailable_total{route}. Reason
+        // yuzu_auth_secret_unavailable_total{route}. A CSPRNG fault at login
+        // enrol-init is NOT counted here (#6995: no query failed; it goes to
+        // yuzu_secure_random_failure_total{site=mfa_enroll}). Reason
         // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
         // closed label set per docs/observability-conventions.md so absent()
         // alerts stay meaningful.
@@ -3741,7 +3863,10 @@ public:
                           "already committed, so a lost audit row does not roll it back. This "
                           "metric is the CC6.8 evidence-integrity alert signal - a sustained "
                           "non-zero rate means the SCIM audit trail has gaps, not that the "
-                          "mutation itself failed",
+                          "mutation itself failed. Exception: the `store_unavailable` failure "
+                          "rows of a request answered 503 (#6835/#6836) record an attempt that "
+                          "changed nothing, so a lost one moves this counter without any "
+                          "committed change losing its evidence",
                           "counter");
         metrics_.describe("yuzu_scim_provenance_denied_total",
                           "Total SCIM mutations refused because the target account's "
@@ -3753,14 +3878,17 @@ public:
                           "signal",
                           "counter");
         metrics_.describe("yuzu_scim_guard_store_unavailable_total",
-                          "Total SCIM mutations answered 503 (retryable) because the AuthDB "
-                          "read inside the provenance or role guard FAILED (a lease timeout or "
-                          "query error), by guard (provenance|role); the role guard includes "
-                          "the POST-revive role re-check. Distinct from "
-                          "yuzu_scim_provenance_denied_total: nothing was refused and nothing "
-                          "was mutated by the failed guard, the IdP is expected to retry. A "
-                          "sustained rate means SCIM deprovisioning is being delayed by an "
-                          "auth-store fault",
+                          "Total SCIM requests answered 503 (retryable) because a read of the "
+                          "store they depend on FAILED (a lease timeout or query error), by "
+                          "guard: provenance and role are the AuthDB reads of the deprovision "
+                          "and revive guards (role includes the POST-revive role re-check), "
+                          "bearer is the SCIM token check (was a false 401), resource is a "
+                          "user or group lookup (was a false 404/409). Distinct from "
+                          "yuzu_scim_provenance_denied_total and "
+                          "yuzu_scim_auth_failures_total: nothing was refused, no credential "
+                          "was judged bad, and nothing was mutated by the failed read; the IdP "
+                          "is expected to retry. A sustained rate means SCIM provisioning, and "
+                          "above all leaver deactivation, is being delayed by a store fault",
                           "counter");
         // SCIM v2 Groups->role application core (#2021). Bumped only when
         // recompute_scim_user_role ACTUALLY changes a role (promotion or
@@ -8087,6 +8215,34 @@ public:
                 startup_failed_ = true;
             } else {
                 product_registry_store_->set_metrics(&metrics_);
+                // Software-title normalisation. The seed is build-embedded, deterministic
+                // content, so a parse failure is a defective build; a load failure is that or
+                // a database fault (including a transient one): either way fail closed, the
+                // same posture as the CPE resolver. Loaded only when the PG row is absent; a
+                // later binary's newer seed is logged, not applied.
+                if (software_inventory_store_ && software_inventory_store_->is_open()) {
+                    auto seed = parse_normalization_pack(kSoftwareNormalizationSeed);
+                    if (!seed) {
+                        spdlog::error("[PG] Refusing to start: embedded software normalisation "
+                                      "seed is invalid: {}",
+                                      seed.error());
+                        startup_failed_ = true;
+                    } else if (auto loaded = product_registry_store_->load_pack_if_empty(*seed, "seed");
+                               !loaded) {
+                        spdlog::error("[PG] Refusing to start: software normalisation pack load "
+                                      "failed: {}",
+                                      loaded.error());
+                        startup_failed_ = true;
+                    } else {
+                        software_title_dimension_ = std::make_unique<SoftwareTitleDimension>(
+                            *pg_pool_, *product_registry_store_, *software_inventory_store_,
+                            &metrics_);
+                        software_normalization_job_ = std::make_unique<SoftwareNormalizationJob>(
+                            *software_title_dimension_,
+                            std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
+                        software_normalization_job_->start();
+                    }
+                }
             }
         }
 
@@ -10530,6 +10686,8 @@ public:
             // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
             if (software_catalog_rollup_)
                 software_catalog_rollup_->request_stop();
+            if (software_normalization_job_)
+                software_normalization_job_->request_stop();
             const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
                                                shutdown_drain::kMaxShutdownDrainSeconds)};
             if (min_grace.count() > 0) {
@@ -11146,6 +11304,10 @@ public:
         // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
         // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
         software_catalog_rollup_.reset();
+        // SAM.4 normalisation job + its owner borrow software_inventory_store_,
+        // product_registry_store_ and the pool - join/drop them before any of the three.
+        software_normalization_job_.reset();
+        software_title_dimension_.reset();
         agent_service_.set_software_inventory_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
@@ -13877,11 +14039,16 @@ private:
         }
     }
 
-    /// #4672: synthesize and apply a terminal FAILURE `CommandResponse` for a
+    /// #4672: apply a terminal FAILURE `CommandResponse` (built by
+    /// `yuzu::server::build_gateway_forward_terminal_failure`, the free function in the
+    /// gateway-forward response header) for a
     /// gateway-forwarded command whose delivery will never otherwise resolve
     /// (`forward_gateway_pending`'s `unauthenticated` / exhausted
     /// `unavailable` / `unknown_cluster` / no-legitimate-resolution
-    /// `agent_mismatch` branches — see that function's own comments). Routes
+    /// `agent_mismatch` branches, the generic "other" branch, and the
+    /// spawn/setup guard `gateway_forward_spawn_failed` that resolves a
+    /// command whose forward thread could not be started — see that
+    /// function's own comments). Routes
     /// through `process_gateway_response` — the SAME mechanism every real
     /// gateway response already takes at this function's other call sites —
     /// so the command_id resolves via the one established
@@ -13904,14 +14071,26 @@ private:
     /// than closing this issue's own scope. See `forward_gateway_pending`'s
     /// doc comment for the resulting, deliberate design boundary: every
     /// branch here resolves IMMEDIATELY rather than rescheduling.
+    static void apply_gateway_forward_terminal_response(
+        detail::AgentServiceImpl* svc, const std::string& agent_id,
+        const ::yuzu::agent::v1::CommandResponse& resp) {
+        svc->process_gateway_response(agent_id, resp);
+    }
+
+    /// Build-then-apply wrapper: it calls the free function
+    /// `yuzu::server::build_gateway_forward_terminal_failure` (the build half, which allocates
+    /// and can throw) and then `apply_gateway_forward_terminal_response` above (the apply half,
+    /// the only non-idempotent part). A call site that must know whether the apply half was
+    /// reached builds the response itself first.
     static void apply_gateway_forward_terminal_failure(detail::AgentServiceImpl* svc,
                                                         const std::string& agent_id,
                                                         const std::string& command_id,
                                                         const std::string& reason_code,
                                                         const std::string& detail_msg) {
-        svc->process_gateway_response(
-            agent_id, yuzu::server::build_gateway_forward_terminal_failure(
-                          command_id, reason_code, detail_msg));
+        apply_gateway_forward_terminal_response(
+            svc, agent_id,
+            yuzu::server::build_gateway_forward_terminal_failure(command_id, reason_code,
+                                                                  detail_msg));
     }
 
     /// Forward any commands queued for gateway-connected agents.
@@ -13926,8 +14105,15 @@ private:
     /// FortitudeEtc/Codex+Kimi, MINOR, 2026-09-22: this comment previously
     /// said "four", undercounting the pre-existing "other" branch this same
     /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
-    /// now calls `apply_gateway_forward_terminal_failure` exactly once
-    /// before giving up, gated on `applied_terminal` so a genuinely
+    /// now resolves the command terminally exactly once before giving up: four of them
+    /// through `apply_gateway_forward_terminal_failure`, and the unknown-cluster branch by
+    /// building the response itself and calling `apply_gateway_forward_terminal_response`
+    /// directly (so the handler can tell whether the apply half was reached). (A SIXTH
+    /// reason code, at a further call site: the spawn/setup guard around
+    /// the whole per-command body, resolves a command whose forwarding could not be set up
+    /// or started with `gateway_forward_spawn_failed`; it is best effort, since
+    /// the resolver allocates too and can fail under the same pressure, which
+    /// is logged at error level), gated on `applied_terminal` so a genuinely
     /// unresolved command_id ALWAYS eventually reaches a terminal state —
     /// "ALWAYS" describes the per-command retry loop below; the null/empty
     /// `gw_mgmt_pool_` short-circuit above this function's retry loop, and
@@ -13937,8 +14123,8 @@ private:
     /// (see that branch's own comment); the latter is not, and is tracked.
     ///
     /// DELIBERATELY immediate-terminal, not a durable outbox re-drive, for
-    /// ALL FIVE branches — including the transient-looking exhausted-
-    /// `unavailable` case, which ADR-2002 §7's design note originally
+    /// ALL FIVE branches (and the spawn/setup guard) — including the
+    /// transient-looking exhausted-`unavailable` case, which ADR-2002 §7's design note originally
     /// intended to "stay pending... and be re-driven [with backoff]" the way
     /// WS-3 3.3's `command_outbox_store`/`command_outbox_delivery` already
     /// does for `route_unreadable`/`containment_unreadable`. Two independent
@@ -14009,11 +14195,18 @@ private:
                     "just dropped) — see the earlier boot-time error for why "
                     "(mutual-TLS credential construction likely failed)",
                     gw_pending.size());
-                metrics_
-                    .counter("yuzu_server_gateway_forward_total",
-                             {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
-                              {"status", "unavailable"}})
-                    .increment(static_cast<double>(gw_pending.size()));
+                // Observability must not block the resolution below: the counter builds a label
+                // map under a lock and can throw (bad_alloc, system_error); an escape here would
+                // skip every drained command's terminal response.
+                try {
+                    metrics_
+                        .counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id",
+                                   std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                                  {"status", "unavailable"}})
+                        .increment(static_cast<double>(gw_pending.size()));
+                } catch (...) { // NOLINT(bugprone-empty-catch): a lost increment only
+                }
                 // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
                 // the metric/log above previously left every drained command's
                 // command_id unresolved -- the exact "stuck forever" shape
@@ -14023,17 +14216,46 @@ private:
                 // per-command retry loop below uses, so this path is no
                 // longer a silent exception to the "always reaches a
                 // terminal state" contract.
-                for (auto& gp : gw_pending) {
-                    apply_gateway_forward_terminal_failure(
-                        &agent_service_, gp.agent_id, gp.cmd.command_id(), "gateway_unavailable",
-                        "Gateway command forwarding is configured but not usable "
-                        "(mutual-TLS credential construction likely failed at boot) "
-                        "— command not delivered");
-                }
+                // Each resolution runs under its own guard (up-2): one throw (bad_alloc
+                // building the response, or process_gateway_response failing) must not
+                // unwind this loop and leave every later drained command, already counted as
+                // SENT, with no terminal response. A failed resolution is logged and NOT
+                // retried (process_gateway_response is not idempotent).
+                yuzu::server::for_each_resolution_guarded(
+                    gw_pending,
+                    [&](auto& gp) {
+                        apply_gateway_forward_terminal_failure(
+                            &agent_service_, gp.agent_id, gp.cmd.command_id(),
+                            "gateway_unavailable",
+                            "Gateway command forwarding is configured but not usable "
+                            "(mutual-TLS credential construction likely failed at boot) "
+                            "— command not delivered");
+                    },
+                    [&](auto& gp) {
+                        spdlog::error(
+                            "Gateway SendCommand for agent {} command {}: the unusable-pool "
+                            "terminal write threw; not retried (process_gateway_response is "
+                            "not idempotent), so the command may be left unresolved and its "
+                            "execution can stay running until an operator cancels it",
+                            ::yuzu::log_id_token(gp.agent_id),
+                            ::yuzu::log_id_token(gp.cmd.command_id()));
+                    });
             }
             return;
         }
-        for (auto& gp : gw_pending) {
+        // The per-command body runs under `yuzu::server::guarded_forward`
+        // (gateway_forward_guard.hpp): everything from the first allocating statement (the
+        // resolution's label copy, the id copies, the closure captures) through the thread spawn
+        // can throw bad_alloc / system_error under exactly the resource pressure that makes a
+        // spawn fail, and an escape would unwind this loop and destroy every not-yet-forwarded
+        // drained command with no terminal response (dispatch already counted each as SENT).
+        // The guard's `ForwardAttempt` holds the three values that must OUTLIVE the body so its
+        // handler can name the command it is resolving; the body below reaches them through
+        // the `cmd_id` / `expected_agent_id` references and `attempt.resolve_attempted`.
+        yuzu::server::ForwardAttempt fwd_attempt;
+        const auto forward_one = [&](yuzu::server::ForwardAttempt& attempt, auto& gp) {
+            std::string& cmd_id = attempt.cmd_id;
+            std::string& expected_agent_id = attempt.agent_id;
             // HA WS-4 4.3: resolve per-command, against the eager pool built
             // at boot — see GatewayMgmtStubPool's file header for the
             // two-mode resolution rule (single-cluster mode ignores
@@ -14042,7 +14264,7 @@ private:
             // mirroring the pre-existing UNAUTHENTICATED "retry cannot help"
             // treatment).
             auto resolution = gw_mgmt_pool_->resolve(gp.cluster_id);
-            auto cmd_id = gp.cmd.command_id();
+            cmd_id = gp.cmd.command_id();
             if (!resolution.stub) {
                 spdlog::error(
                     "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
@@ -14063,21 +14285,37 @@ private:
                 // --gateway-cluster-addr, which time alone does not fix.
                 // Resolve the command_id terminally now rather than leaving
                 // it stuck forever.
-                apply_gateway_forward_terminal_failure(
-                    &agent_service_, gp.agent_id, cmd_id, "gateway_unknown_cluster",
-                    "No configured mgmt address for cluster '" +
-                        gp.cluster_id.value_or("<none>") + "' — command not delivered");
-                continue;
+                // Every allocation (the detail text, the protobuf) happens BEFORE the flag is set:
+                // a bad_alloc there leaves the flag false, so the handler below still resolves
+                // the command. The flag goes up immediately before the one non-idempotent step,
+                // process_gateway_response, whose partial failure is NOT retried by the handler.
+                yuzu::server::resolve_with_flag(
+                    attempt,
+                    [&] {
+                        return yuzu::server::build_gateway_forward_terminal_failure(
+                            cmd_id, "gateway_unknown_cluster",
+                            "No configured mgmt address for cluster '" +
+                                gp.cluster_id.value_or("<none>") + "' — command not delivered");
+                    },
+                    [&](const auto& unknown_cluster_response) {
+                        apply_gateway_forward_terminal_response(&agent_service_, gp.agent_id,
+                                                                unknown_cluster_response);
+                    });
+                return;
             }
             auto* stub = resolution.stub;
             auto* svc = &agent_service_;
             auto* metrics = &metrics_;
-            auto expected_agent_id = gp.agent_id;
+            expected_agent_id = gp.agent_id;
             auto cluster_label = resolution.label;
             spdlog::debug("Forwarding command {} to gateway (cluster '{}') for agent {}", cmd_id,
                          cluster_label, gp.agent_id);
-            std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id, expected_agent_id,
-                        cluster_label]() {
+            // The worker is a NAMED closure so the spawn can be guarded below without
+            // re-indenting the body: std::thread's constructor throws std::system_error when the
+            // OS refuses a thread (or bad_alloc), and an unguarded throw here would unwind this
+            // loop, destroying every not-yet-spawned drained command with no terminal response.
+            auto forward_worker = [stub, svc, metrics, gp = std::move(gp), cmd_id,
+                                   expected_agent_id, cluster_label]() {
                 ::yuzu::server::v1::SendCommandRequest req;
                 req.add_agent_ids(gp.agent_id);
                 *req.mutable_command() = gp.cmd;
@@ -14106,11 +14344,11 @@ private:
                 bool applied_terminal = false;
 
                 // Retry up to 3 times on transient connection failures
-                for (int attempt = 0; attempt < 3; ++attempt) {
-                    if (attempt > 0) {
+                for (int try_no = 0; try_no < 3; ++try_no) {
+                    if (try_no > 0) {
                         spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
-                                     attempt + 1);
-                        std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+                                     try_no + 1);
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << try_no));
                     }
 
                     grpc::ClientContext ctx;
@@ -14341,7 +14579,7 @@ private:
                         return; // non-transient error — don't retry
                     }
                     spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                 cmd_id, attempt + 1,
+                                 cmd_id, try_no + 1,
                                  ::yuzu::log_key_token(status.error_message()));
                 }
                 spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
@@ -14366,7 +14604,48 @@ private:
                         svc, expected_agent_id, cmd_id, "gateway_unavailable",
                         "Gateway unreachable after 3 attempts — command not delivered");
                 }
-            }).detach();
+            };
+            std::thread(std::move(forward_worker)).detach();
+        };
+        for (auto& gp : gw_pending) {
+            yuzu::server::guarded_forward(
+                fwd_attempt,
+                [&](yuzu::server::ForwardAttempt& attempt) { forward_one(attempt, gp); },
+                [&]() -> const std::string& { return gp.cmd.command_id(); },
+                [&]() -> const std::string& { return gp.agent_id; },
+                // Best effort, and honest about it. Dispatch has already counted this command as
+                // SENT (send_to returned true at the queue push), so an unresolved command_id
+                // here leaves its execution row `running` with a targeted count it can never
+                // complete (the reaper skips rows with agents_targeted > 0). The guard resolves
+                // it terminally now, exactly like every other no-delivery branch of this
+                // function, and keeps going: every later drained command gets its own attempt.
+                // The resolver allocates too, so under the same pressure it can fail as well;
+                // that is logged at error level (with the ids) rather than swallowed, because a
+                // command left unresolved here is only closed by an operator cancel. A command
+                // whose unknown-cluster resolution already ran (`resolve_attempted`) is never
+                // resolved a second time: process_gateway_response is not idempotent.
+                [&](const std::string& aid, const std::string& cid, std::string_view reason,
+                    std::string_view detail) {
+                    apply_gateway_forward_terminal_failure(&agent_service_, aid, cid,
+                                                           std::string(reason),
+                                                           std::string(detail));
+                },
+                [&](const std::string& aid, const std::string& cid, bool resolved) {
+                    spdlog::error("Gateway SendCommand for agent {} command {}: forwarding could "
+                                  "not be set up (thread creation or allocation failed); {}",
+                                  ::yuzu::log_id_token(aid), ::yuzu::log_id_token(cid),
+                                  resolved ? "the command was resolved as failed"
+                                           : "the terminal write ALSO failed, so the execution "
+                                             "stays running until an operator cancels it");
+                },
+                [&](const std::string& cid) {
+                    spdlog::error("Gateway SendCommand for command {}: the unknown-cluster "
+                                  "terminal write threw part-way; not retried "
+                                  "(process_gateway_response is not idempotent), so the command "
+                                  "may be left unresolved and its execution can stay running "
+                                  "until an operator cancels it",
+                                  ::yuzu::log_id_token(cid));
+                });
         }
     }
 
@@ -15958,7 +16237,7 @@ private:
         // turning that mistake into a boot failure. Every registration on
         // `*web_server_` follows this call (the first is
         // `auth_routes_->register_routes(*web_server_)` below). The plaintext
-        // redirect listener (`redirect_server_`, which only answers 301) has
+        // redirect listener (`redirect_server_`, which answers 301 and four bodyless GET health probes) has
         // its own server key and NO stage, so its handlers register unwrapped;
         // `TestRouteSink` never consults the registry.
         //
@@ -16208,7 +16487,7 @@ private:
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         if (cfg_.https_enabled && cfg_.https_redirect) {
             redirect_server_ = std::make_unique<httplib::Server>();
-            // This listener runs no post-read stage (it only answers 301): drop any stage a
+            // This listener runs no post-read stage (301s and four bodyless GET probes): drop any stage a
             // destroyed server left under a reused address so the sink registers unwrapped.
             RouteInventory::instance().forget(redirect_server_.get());
             PostReadStageRegistry::instance().forget(redirect_server_.get());
@@ -16236,9 +16515,10 @@ private:
                 count_http_request);
         }
 #endif
-        // The plaintext redirect listener only answers 301 and has no post-read stage by design;
-        // this is the ONLY production sink that opts out of the stage (pinned by
-        // test_step_up_route_inventory.cpp's source scan).
+        // The plaintext redirect listener answers 301 and four bodyless GET health probes and has no
+        // post-read stage by design; this is the ONLY production sink that opts out of the stage
+        // (pinned by test_step_up_route_inventory.cpp's source scan). A body-bearing or mutating
+        // route added to it would run with no cap and no step-up.
         if (redirect_server_)
             redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_,
                                                                 StageRequirement::ExemptNoStage);
@@ -19857,6 +20137,20 @@ private:
                              .forensics_plugins = forensics_plugins(),
                          });
 
+        // Software normalisation curation REST (queue, curated aliases, pack replace). The
+        // routes borrow product_registry_store_ and are served only until web_server_->stop(),
+        // which precedes the store reset in stop(); the class holds no state of its own.
+        {
+            HttplibRouteSink curation_sink{*web_server_};
+            SoftwareCurationRoutes{}.register_routes(
+                curation_sink, SoftwareCurationRoutes::Deps{
+                                   .auth_fn = auth_fn,
+                                   .perm_fn = perm_fn,
+                                   .audit_fn = audit_fn,
+                                   .registry = product_registry_store_.get(),
+                               });
+        }
+
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
         // attention, estate state). Every figure arrives through a closure over an
         // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
@@ -20408,7 +20702,7 @@ private:
         // pre-existing `/fragments/echo/...` HTML routes stay on perm_fn_ this
         // round — see the recorded-exception comment at their registration.
         echo_tree_routes_->set_fleet_read_fn(fleet_read_fn);
-        // #4143 review fix — same unfiltered source list_agents' agents_fn and
+        // #4143 review fix — same unfiltered source list_agents' DeviceApi and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's
         // direct-membership pre-filter. See set_all_devices_fn's doc comment.
@@ -20439,10 +20733,12 @@ private:
         dashboard_routes_ = std::make_unique<DashboardRoutes>();
         // #2537: declare the external origins BEFORE register_routes — the
         // handlers capture `this` at registration and read the member per
-        // request, so setting it afterwards would never reach a live route.
+        // request, so setting it afterwards would race the request threads.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
-        // ADR-0033 section 9: the expression-targeted Send writes its `attempted` row through
-        // this persist-reporting sink BEFORE it dispatches (unwired = that path refuses).
+        // ADR-0033 section 9: every DashboardRoutes mutation (each console send,
+        // group-from-results, Echo re-enable and purge; not EchoTreeRoutes' capture-sources push)
+        // writes its `attempted` row through this persist-reporting sink BEFORE it acts (#3619;
+        // unwired = those mutations refuse with 503).
         dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined
@@ -21758,6 +22054,8 @@ private:
         static_assert(std::is_same_v<RestApiV1::AuthorizeDispatchFn,
                                      mcp::McpServer::AuthorizeDispatchFn>,
                       "REST and MCP must take the identical authorize-dispatch callable type");
+        // Legacy-equivalent events for POST /api/v1/executions/{id}/cancel|rerun.
+        rest_api_v1_->set_emit_event_fn(emit_event_fn);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -22239,6 +22537,126 @@ private:
             // below, never a route-local one. Unwired would make those routes answer 500.
             authorize_dispatch);
 
+        // POST /api/v1/commands (#2146): the REST v1 twin of POST /api/command and of MCP
+        // execute_instruction. Every closure below is the SAME one the sibling surfaces hold --
+        // the confined dispatch seam, the authorize-dispatch dry run, the classifier, the
+        // session-bound audit writer and `derive_dispatch_caller` -- so this route cannot
+        // observe a different decision for the same caller. It constructs no DispatchCaller of
+        // its own. See command_v1_routes.hpp for the order of checks.
+        {
+            HttplibRouteSink command_v1_sink{*web_server_};
+            yuzu::server::command_v1::register_command_v1_routes(
+                command_v1_sink,
+                yuzu::server::command_v1::Deps{
+                    .auth_fn = [this](const httplib::Request& req, httplib::Response& res)
+                        -> std::optional<auth::Session> { return require_auth(req, res); },
+                    .perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                      const std::string& type, const std::string& op) -> bool {
+                        return require_permission(req, res, type, op);
+                    },
+                    .audit_fn = [this](const httplib::Request& req, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id,
+                                       const std::string& detail) -> bool {
+                        return audit_log(req, action, result, target_type, target_id, detail);
+                    },
+                    .audit_as_session = auth_routes_->audit_as_session_fn(),
+                    .classify_fn = [this](std::string_view p, std::string_view a) {
+                        return capability_registry_.classify(p, a);
+                    },
+                    .authorize_dispatch_fn = authorize_dispatch,
+                    .dispatch_fn = command_dispatch_caller_fn,
+                    .derive_caller_fn = [this](const auth::Session& sess) {
+                        return derive_dispatch_caller(sess);
+                    },
+                    .visible_agents_fn =
+                        [this](const std::string& username)
+                        -> std::optional<std::vector<std::string>> {
+                        if (!mgmt_group_store_)
+                            return std::nullopt; // fail closed: none visible
+                        return mgmt_group_store_->get_visible_agents(username);
+                    },
+                    .execution =
+                        {.create =
+                             [this](const std::string& by, const std::string& scope,
+                                    const std::string& parameter_values_json)
+                             -> std::expected<std::string, std::string> {
+                            if (!execution_tracker_)
+                                return std::unexpected(std::string("no execution tracker"));
+                            Execution exec;
+                            exec.status = "running";
+                            exec.scope_expression = scope;
+                            exec.parameter_values = parameter_values_json;
+                            exec.dispatched_by = by;
+                            return execution_tracker_->create_execution(exec);
+                        },
+                         .mark_cancelled =
+                             [this](const std::string& id, const std::string& by) {
+                                 return execution_tracker_ &&
+                                        execution_tracker_->mark_cancelled(id, by);
+                             },
+                         .set_targeted =
+                             [this](const std::string& id, int reached) {
+                                 if (!execution_tracker_)
+                                     return false;
+                                 return yuzu::server::command_v1::set_targeted_then_refresh(
+                                     *execution_tracker_, id, reached);
+                             }},
+                    .metrics = &metrics_,
+                    // The legacy /api/command's command.dispatched event.
+                    .emit_event_fn = emit_event_fn,
+                });
+        }
+
+        // #2146 (ledger row post.api-instructions-param-execute): the v1 REST twin of
+        // POST /api/instructions/{id}/execute. The stores, the dispatch closure, the
+        // authorizer and the validator cache are the SAME ones the legacy route, MCP and
+        // /api/v1/quarantine use; only the wire envelope and audit action are route-local.
+        // Shared with the MCP twin (set_instruction_execute_ports below): one binding of the
+        // stores, one dispatch closure, one authorizer, so the two surfaces cannot disagree.
+        yuzu::server::instruction_execute::Ports instr_exec_ports;
+        {
+            yuzu::server::instruction_execute::StoreBindings instr_exec_bindings;
+            instr_exec_bindings.instruction_store = instruction_store_.get();
+            instr_exec_bindings.execution_tracker = execution_tracker_.get();
+            instr_exec_bindings.approval_manager = approval_manager_.get();
+            instr_exec_bindings.mgmt_store = mgmt_group_store_.get();
+            instr_exec_bindings.capability_registry = &capability_registry_;
+            instr_exec_bindings.authorize = authorize_dispatch;
+            instr_exec_bindings.validators = param_validator_cache_;
+            instr_exec_bindings.dispatch = command_dispatch_concurrency_fn;
+            instr_exec_bindings.metrics = &metrics_;
+            yuzu::server::instruction_execute::RouteDeps instr_exec_deps;
+            instr_exec_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                             const std::string& securable_type,
+                                             const std::string& operation) {
+                return require_permission(req, res, securable_type, operation);
+            };
+            instr_exec_deps.audit_fn = [this](const httplib::Request& req,
+                                              const std::string& action, const std::string& result,
+                                              const std::string& target_type,
+                                              const std::string& target_id,
+                                              const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
+            };
+            // The SAME derivation the legacy execute route uses (wf_deps.caller_fn above):
+            // an unresolved session yields an empty principal with a present-EMPTY set.
+            instr_exec_deps.caller_fn =
+                [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
+                httplib::Response throwaway;
+                if (auto s = require_auth(req, throwaway))
+                    return derive_dispatch_caller(*s);
+                return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+            };
+            // The legacy route's approval.created / instruction.executed events.
+            instr_exec_deps.emit_event_fn = emit_event_fn;
+            instr_exec_ports = yuzu::server::instruction_execute::make_ports(instr_exec_bindings);
+            instr_exec_deps.ports = instr_exec_ports;
+            HttplibRouteSink instr_exec_sink{*web_server_};
+            yuzu::server::instruction_execute::register_instruction_execute_routes(
+                instr_exec_sink, std::move(instr_exec_deps));
+        }
+
         // -- Register MCP server routes ----------------------------------------
 
         if (cfg_.mcp_disable) {
@@ -22336,6 +22754,12 @@ private:
             // presence). The closure itself is `authorize_dispatch`, defined before the REST
             // registration above (#6065 PR-Q): one definition, two consumers.
             mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);
+            // #2146: execute_instruction_definition runs the SAME pipeline, over the SAME
+            // bindings, as POST /api/v1/instructions/{id}/execute (instr_exec_ports above).
+            mcp_server_->set_instruction_execute_ports(instr_exec_ports);
+            // Legacy-equivalent events for cancel_execution, record_execution_rerun and
+            // execute_instruction_definition (event_emit.hpp).
+            mcp_server_->set_emit_event_fn(emit_event_fn);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit
@@ -23894,6 +24318,10 @@ private:
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
+    // SAM.4: declared AFTER the stores they borrow so they destruct first; stop() also
+    // resets them explicitly before the stores and pool.
+    std::unique_ptr<SoftwareTitleDimension> software_title_dimension_;
+    std::unique_ptr<SoftwareNormalizationJob> software_normalization_job_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;

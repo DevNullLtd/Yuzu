@@ -94,7 +94,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | services | Service state/startup enums | SCManager, systemctl, launchctl |
 | diagnostics | Uptime calculation | Plugin context reads |
 | network_config | MAC formatting, IP parsing | GetAdaptersAddresses, ip/ifconfig |
-| hardware | Size conversion, CPUID parsing | WMI, dmidecode, sysctl |
+| hardware | Size conversion, CPUID parsing; the Windows estate layer (`hardware_estate_parsers.hpp` — chassis/baseboard/swap/machine_id row formatters, outcome contract, filler/UTF-8 scrubbing, stepping decode, swap constraint precedence, cpu/dimm row escaping — `test_hardware_estate_parsers.cpp`), the shared HMAC-SHA256 and machine-id hash (`test_hmac_sha256.cpp`), the SMBIOS chassis-type table (`test_smbios_parsers.cpp`) | WMI, RSMB (`GetSystemFirmwareTable`), registry `MachineGuid`, dmidecode, sysctl |
 | processes | Case-insensitive name matching | CreateToolhelp32Snapshot, /proc |
 | users | Wide string conversion, FILETIME formatting | Net API, utmp, dscl |
 | procfetch | Pipe escaping | File hashing, process enum |

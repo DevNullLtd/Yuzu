@@ -349,6 +349,7 @@ agent_test_exe = executable(
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
+    'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
@@ -593,6 +594,8 @@ agent_test_exe = executable(
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
     'unit/test_sha256.cpp',             # shared in-memory SHA-256 (agents/shared/sha256.hpp), portable
+    'unit/test_hmac_sha256.cpp',        # H.5: shared HMAC-SHA-256 (RFC 4231 vectors) + the machine-id hash contract (agents/shared/machine_id_hash.hpp), portable
+    'unit/test_hardware_estate_parsers.cpp', # H.5: pure chassis/baseboard/swap/machine_id row formatters + outcome contract (hardware_estate_parsers.hpp), portable
     'unit/test_base64.cpp',             # shared strict RFC 4648 base64 (agents/shared/base64.hpp), portable
     'unit/test_email_redaction.cpp',    # shared [redacted-email] helper (agents/shared/email_redaction.hpp), portable
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
@@ -648,6 +651,10 @@ agent_test_exe = executable(
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
+    'unit/test_middleware_parsers.cpp',   # SAM.2: product table, pure kv/file-name parsers and the generic runner over a FakeFs, unguarded on every OS
+    'unit/test_middleware_linux_parsers.cpp',       # SAM.2: Linux leg over a materialized tree manifest (REAL registered-install capture plus labelled inline cases; body POSIX-only)
+    'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
+    '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -673,6 +680,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
     include_directories('../agents/plugins/pkg_inventory/src'),  # Wave 10 PR10.1-c: pkg_inventory_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/middleware/src'),  # middleware_parsers.hpp / middleware_runner.hpp (SAM.2 pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -866,6 +874,7 @@ agent_test_exe = executable(
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
                 pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
+                middleware_plugin_lib,  # SAM.2: test_middleware_local_dispatcher.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1355,6 +1364,8 @@ echo_test_exe = executable(
     'unit/test_echo_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_echo_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
+    'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
+    'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1366,6 +1377,8 @@ echo_test_exe = executable(
     '../agents/plugins/echo/src/echo_diff.cpp',
     '../agents/plugins/echo/src/echo_software_core.cpp',
     '../agents/plugins/echo/src/echo_schema_registry.cpp',
+    '../agents/plugins/echo/src/echo_fold_schema.cpp',
+    '../agents/plugins/echo/src/echo_fold.cpp',
     '../agents/plugins/echo/src/echo_aggregator.cpp',
     '../agents/plugins/echo/src/echo_usage.cpp',
     '../agents/plugins/echo/src/echo_perf.cpp',
@@ -1400,7 +1413,10 @@ echo_test_exe = executable(
   link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: echo_test_deps,
 )
-test('echo unit tests', echo_test_exe, args: ['--durations=yes'], suite: 'echo', timeout: 90)
+# The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
+# longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 90)
+test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -1474,6 +1490,7 @@ if build_server
       'unit/server/test_pg_retention_guard.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
+      'unit/server/test_audit_token_hostile_bytes.cpp',
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
       'unit/server/test_rest_audit_query.cpp',
@@ -1562,6 +1579,8 @@ if build_server
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
       'unit/server/test_gateway_mgmt_stub_pool.cpp', # HA WS-4 4.3: parse_gateway_cluster_addrs + GatewayMgmtStubPool resolution (cross-cluster fan-out)
+      'unit/server/test_gateway_forward_guard.cpp', # #2146 D7: forward_gateway_pending spawn/setup guard seam (resolve-once, flag ordering, loop continues)
+      'unit/server/test_checked_pending_count.cpp', # #2146 D7: MCP approval mint pending-count throw-folding wrapper
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
@@ -1707,6 +1726,7 @@ if build_server
       'unit/server/test_sle_routes.cpp',
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
+      'unit/server/test_software_normalization_job.cpp',
       'unit/server/test_echo_process_tree.cpp',
       'unit/server/test_echo_timeline_render.cpp', # Echo timeline: pure renderer, goldens, CSS pin
       'unit/server/test_echo_timeline_page.cpp', # Echo timeline page: shell pins, flag default, escaping, script pins
@@ -1822,6 +1842,9 @@ if build_server
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
+      'unit/server/test_command_v1_routes.cpp', # POST /api/v1/commands (#2146): exact send sets over a real AgentRegistry, destructive gate, zero-reach table, audit fail-closed
+      'unit/server/test_instruction_execute.cpp', # #2146: the shared instruction-definition execute core + the v1 REST twin; every store is a Ports seam (the [pg]-tagged wedge cases alone use a real ExecutionTracker + reaper)
+      'unit/server/test_dispatch_zero_reach.cpp', # classify_zero_reach: pure cause priority, protective suppression, tokens, retryable (new v1 routes / MCP tools)
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
       'unit/server/test_plugin_result_audit.cpp', # registry.write audit extraction from mutating-action output frames (pure) + live ingest on both frame paths
       'unit/server/test_rundown_gate.cpp', # the shutdown rundown behind the registry.write hook (pure): enter/close/drain, the wake-up, a latch race against one close
@@ -1858,6 +1881,7 @@ if build_server
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_software_catalogue.cpp',   # GET /api/v1/inventory/software/catalogue[/versions]
+      'unit/server/test_rest_software_curation.cpp',    # software normalisation curation REST routes
       'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
@@ -1926,6 +1950,7 @@ if build_server
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_rest_executions_v1_twins.cpp',
+      'unit/server/test_execution_cancel_rerun_twins.cpp', # #2146 batch B: cancel/rerun REST v1 + shared sequence, no Postgres
       'unit/server/test_rest_responses_v1_twins.cpp', # #2146 A2-R2: GET /api/v1/responses{,/aggregate,/export}
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
@@ -1947,6 +1972,8 @@ if build_server
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_inventory_blob_v3.cpp',          # pure blob-v3 grammar + install-type table
+      'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
@@ -1959,6 +1986,8 @@ if build_server
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
+      'unit/server/test_software_normalization_pack.cpp',
+      'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
       'unit/server/test_app_usage_store.cpp',       # Wave 7b PR7b.2
@@ -3130,7 +3159,7 @@ if build_server
       args: [files('../scripts/ci/check_core_presentation_link.py'),
              '--build-dir', meson.project_build_root(), '--verbose'],
       suite: ['server', 'server-checks'],
-      depends: [yuzu_server_core_lib],
+      depends: [yuzu_server_core_lib, yuzu_server_routes_lib],
       timeout: 60,
     )
   endif
@@ -3379,6 +3408,17 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Compose default credentials (#4817): no tracked compose may run Grafana with a
+# known admin password - GF_SECURITY_ADMIN_PASSWORD must be the required
+# ${YUZU_GRAFANA_ADMIN_PASSWORD:?...} - and the UAT launchers must load the
+# password before every `docker compose` call. Stdlib + bash, no Docker.
+test('compose default credentials',
+  _python3_test,
+  args: [files('test_compose_default_credentials.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
 # every compose stack that runs a Prometheus next to a gateway scrapes the
 # gateway's metrics port. Stdlib only, no Docker.
@@ -3599,6 +3639,15 @@ test('firmware_posture definition columns',
 test('runtimes definition columns',
   _python3_test,
   args: [files('test_runtimes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# middleware's definition-column contract (content/definitions/middleware.yaml): row_kind first and the
+# column order match the wire row middleware_parsers.hpp emits; parses the YAML directly.
+test('middleware definition columns',
+  _python3_test,
+  args: [files('test_middleware_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4094,6 +4143,15 @@ test('typed-source purge wiring lexical gate (2a-1b)',
   timeout: 30,
 )
 
+# Blob v3: the section counter is read through increase(), so server.cpp must pre-seed its closed
+# facet x outcome series at boot. Source-text only; suite 'docs' as the gate above.
+test('section ingest series seed wiring lexical gate',
+  _python3_test,
+  args: [files('test_section_ingest_seed_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
 # audit store read that returns nullopt for a closed store). Source-text only, so Python.
 # Suite 'docs' for the same reason as the Users page gate above.
@@ -4482,6 +4540,15 @@ test('forensics tier wiring lexical',
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #3619: every audit row DashboardRoutes writes has its persist outcome checked (ADR-0033 §9).
+# Pins the bool AuditFn and the absence of direct sink calls; the script self-checks its detector.
+test('dashboard audit checked lexical',
+  _python3_test,
+  args: [files('test_dashboard_audit_checked_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

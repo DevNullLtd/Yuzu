@@ -277,6 +277,22 @@ inline std::string html_escape(const std::string& s) {
     return ::yuzu::log_token(s); // shared mapping: common/include/yuzu/log_token.hpp
 }
 
+/// Put a store or driver error text on ONE line for use inside an audit detail. libpq error
+/// messages end with a newline and often carry a second CONTEXT line, so a suffix appended
+/// after one (`; credentials_revoked=N`) would land on its own physical line and a log reader
+/// would miss it. Each CR or LF becomes a space (a CRLF pair therefore gives two) and trailing
+/// space and tab are dropped; nothing else is changed (use `audit_token` for a caller-supplied
+/// value, which is stricter).
+[[nodiscard]] inline std::string flatten_audit_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s)
+        out += (c == '\r' || c == '\n') ? ' ' : c;
+    while (!out.empty() && (out.back() == ' ' || out.back() == '\t'))
+        out.pop_back();
+    return out;
+}
+
 /// Percent-decode a URL-encoded string (also handles + as space).
 inline std::string url_decode(const std::string& s) {
     auto hexval = [](char c) -> int {

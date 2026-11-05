@@ -221,6 +221,20 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/configevil/log_level",                         4u * 1024 * 1024, false, "default"},
     {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp software_curation / software_alias_pack rows: the software-title
+    // curation routes. ANY method; the pack row (1 MiB, mirrors kMaxPackBytes) is longer than
+    // the 64 KiB subtree row and wins; segment-boundary probes prove lookalikes fall to default.
+    {"POST",   "/api/v1/inventory/software/normalization/aliases",                64u * 1024, false, "software_curation"},
+    {"POST",   "/api/v1/inventory/software/normalization/queue/abc/reject",       64u * 1024, false, "software_curation"},
+    {"GET",    "/api/v1/inventory/software/normalization/status",                 64u * 1024, false, "software_curation"},
+    {"POST",   "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
+    {"PUT",    "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
+    {"POST",   "/api/v1/inventory/software/normalization/packevil",               64u * 1024, false, "software_curation"},
+    {"POST",   "/api/v1/inventory/software/normalizationevil/aliases",            4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp commands row - POST /api/v1/commands (the REST v1 twin of MCP
+    // execute_instruction). requires_measurable like the /mcp/ row; segment-boundary probe below.
+    {"POST",   "/api/v1/commands",                                     4u * 1024 * 1024, true,  "commands"},
+    {"POST",   "/api/v1/commandsevil",                                 4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -231,6 +245,7 @@ constexpr ExpectedResolution kExpected[] = {
 /// emit — locks metric cardinality separately from the per-row cap values.
 constexpr std::string_view kExpectedPathClasses[] = {
     "mcp",
+    "commands",
     "bundles",
     "ota_upload",
     "json_to_csv_export",
@@ -261,6 +276,8 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "dex_score_policy",
     "crypto",
     "config",
+    "software_curation",
+    "software_alias_pack",
     "default",
 };
 
@@ -396,7 +413,8 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 36 = mcp(1) +
+    // check while still silently growing the table. 39 = mcp(1) +
+    // commands(1: POST /api/v1/commands, the REST v1 twin of execute_instruction) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
     // ca_revoke(1) +
@@ -417,8 +435,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // dex_score_policy(1: the DEX score policy document) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
+    // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 36);
+    CHECK(std::size(kBodyCapTable) == 39);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -581,6 +600,8 @@ struct UnifiedBodyCapTestServer {
         // the post-read-stage tests below so a genuine chunked over-cap body
         // stays cheap to send in a test.
         sink.Post("/api/v1/ca/import-chain", ok_handler);
+        sink.Post("/api/v1/inventory/software/normalization/aliases", ok_handler);
+        sink.Post("/api/v1/inventory/software/normalization/pack", ok_handler);
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
@@ -764,6 +785,40 @@ TEST_CASE("Pre-routing body cap: a GET with an oversized declared Content-Length
     const auto resp = raw_request_status_line(ts.port, req);
     CHECK(resp.starts_with("HTTP/1.1 413"));
     CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: the software curation routes refuse an oversized body "
+          "pre-auth and admit an in-limit one",
+          "[body_cap][bounds][integration]") {
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    // Over-cap declared Content-Length (never sent): refused before any read.
+    const auto over = [&](const char* path, std::size_t len) {
+        return raw_request_status_line(
+            ts.port, std::string("POST ") + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+                         "Content-Length: " + std::to_string(len) + "\r\n\r\n");
+    };
+    CHECK(over("/api/v1/inventory/software/normalization/aliases", 64u * 1024 + 1)
+              .starts_with("HTTP/1.1 413"));
+    CHECK(over("/api/v1/inventory/software/normalization/pack", 1u * 1024 * 1024 + 1)
+              .starts_with("HTTP/1.1 413"));
+    CHECK(ts.handler_calls.load() == 0);
+
+    // The pack route admits a body the alias class would refuse (the longer prefix wins).
+    httplib::Client cli("127.0.0.1", ts.port);
+    auto pack_big = cli.Post("/api/v1/inventory/software/normalization/pack",
+                             std::string(64u * 1024 + 1, 'x'), "text/csv");
+    REQUIRE(pack_big);
+    CHECK(pack_big->status == 200);
+    CHECK(ts.handler_calls.load() == 1);
+
+    // In-limit bodies reach the handler on both routes.
+    auto alias_ok = cli.Post("/api/v1/inventory/software/normalization/aliases",
+                             std::string(64u * 1024, 'x'), "application/json");
+    REQUIRE(alias_ok);
+    CHECK(alias_ok->status == 200);
+    CHECK(ts.handler_calls.load() == 2);
 }
 
 TEST_CASE("Pre-routing body cap: POST /health with an oversized declared Content-Length "
