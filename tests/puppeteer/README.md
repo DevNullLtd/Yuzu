@@ -27,7 +27,9 @@ variables (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `npm_config_registry`) reach np
 
 If no Chrome for Testing build exists for your platform (for example Linux arm64) or the box has no
 route to the download, point `PUPPETEER_EXECUTABLE_PATH` at an existing Chrome for Testing binary. That
-variable only skips the browser download: `npm ci` still runs unless `node_modules` is already present.
+variable only skips the browser download: `npm ci` still runs unless `node_modules` was installed by the
+script from the current `package-lock.json` (it records the lockfile's SHA-256 in
+`node_modules/.yuzu-package-lock.sha256`; a missing or different stamp reinstalls).
 
 ### Recovery
 

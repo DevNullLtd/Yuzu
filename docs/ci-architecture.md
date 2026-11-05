@@ -195,7 +195,7 @@ launches headless; if it cannot, the run aborts before the build. A missing
 `/test` Phase 0b also runs `scripts/test/ensure-gcovr.sh` (Linux only). A gcovr you already have at the
 version pinned in `requirements-ci.in` that can produce the gate's reports is used as it is; otherwise it
 installs that version from the hash-pinned `requirements-ci.txt` (the file CI uses) into a private
-virtualenv. If neither works, default mode records WARN and Phase 7b measures nothing; `--full` stops.
+virtualenv. If neither works, default mode records WARN and Phase 7b measures nothing; `--full` stops in Phase 0b. Phase 7b re-checks gcovr before it measures (another worktree may have rebuilt the shared virtualenv since): if it is no longer usable the Coverage gate is not run and is recorded as WARN in default mode and as FAIL in `--full`.
 Shared browser mechanics are in `tests/puppeteer/lib/harness.mjs`;
 `tests/puppeteer/README.md` covers running it by hand.
 

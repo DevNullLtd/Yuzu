@@ -773,9 +773,14 @@ gcovr_usable() {
         && bash scripts/test/ensure-gcovr.sh > "$LOG_DIR/ensure-gcovr-7b.log" 2>&1
 }
 if ! gcovr_usable; then
+    # --full ENFORCES the coverage baseline, so "not measured" is a FAIL there, exactly as Phase 0b stops a
+    # --full run whose gcovr cannot be installed: recording a WARN would let a --full run that measured
+    # nothing finish as if coverage held (the overall status is FAIL when any gate is FAIL). Default mode
+    # is report-only, so it stays a WARN.
+    if [[ "$MODE" == "full" ]]; then COVERAGE_UNUSABLE=FAIL; else COVERAGE_UNUSABLE=WARN; fi
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 7 --gate "Coverage" \
-        --status WARN --duration 0 \
+        --status "$COVERAGE_UNUSABLE" --duration 0 \
         --notes "not measured: the pinned gcovr is not usable (see the gcovr install row and the ensure-gcovr logs in the run's log directory)"
     if [[ "$MODE" == "default" ]]; then
         bash scripts/test/test-db-write.sh gate \
