@@ -1402,9 +1402,10 @@ static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
 }
 
 /// An ISO-8601 UTC instant ("2026-04-19T12:00:00Z", whole seconds) as nanoseconds since the epoch;
-/// 0 when the text does not parse. The Guardian census orders by a key the ingest boundary derives
-/// from the agent's wire stamp, so a test that builds an event row directly and wants its
-/// timestamp to decide the order supplies the same instant as `agent_ns`.
+/// 0 when the text does not parse or the instant is past what int64 nanoseconds can hold. The
+/// Guardian census orders by a key the ingest boundary derives from the agent's wire stamp, so a
+/// test that builds an event row directly and wants its timestamp to decide the order supplies the
+/// same instant as `agent_ns`.
 inline std::int64_t iso8601_to_ns(const std::string& ts) {
     // "YYYY-MM-DDTHH:MM:SSZ": a strtol walk with range checks (the scanf family is not used in
     // new code, docs/cpp-conventions.md).
@@ -1436,6 +1437,10 @@ inline std::int64_t iso8601_to_ns(const std::string& ts) {
     const sys_days date{ymd};
     const seconds secs = date.time_since_epoch() + hours{hour_v} + minutes{minute_v} +
                          seconds{second_v};
+    // Past 2262-04-11 the nanosecond count no longer fits in int64: report it as unparsed rather
+    // than overflow (the same bound guardian_ingest.cpp applies to an agent stamp).
+    if (secs.count() > INT64_MAX / 1'000'000'000LL)
+        return 0;
     return static_cast<std::int64_t>(secs.count()) * 1'000'000'000LL;
 }
 

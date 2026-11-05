@@ -1964,3 +1964,12 @@ TEST_CASE(
           "drifted|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|true");
     CHECK(pending_count(db.dsn()) == "0");
 }
+
+TEST_CASE("census ordering: iso8601_to_ns reports an instant past int64 nanoseconds as unparsed",
+          "[census][ordering][helper]") {
+    // 2262-04-11T23:47:16Z is the last whole second whose nanosecond count fits in int64.
+    CHECK(yuzu::test::iso8601_to_ns("1970-01-01T00:00:01Z") == 1'000'000'000LL);
+    CHECK(yuzu::test::iso8601_to_ns("2262-04-11T23:47:16Z") == 9'223'372'036'000'000'000LL);
+    CHECK(yuzu::test::iso8601_to_ns("2262-04-11T23:47:17Z") == 0);
+    CHECK(yuzu::test::iso8601_to_ns("9999-12-31T23:59:59Z") == 0);
+}
