@@ -6,6 +6,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "device_ci_section_digest.hpp"
 #include "sha256_hex.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -156,12 +157,15 @@ std::string migration_v2_sql() {
 }
 
 // Migration v3 (additive, online-safe, ADR-0008): the number of child rows stored for the
-// section, written in the same transaction as the rows. NULL = status-only kind (no child rows)
-// or a row written before v3 (count unknown) - both read exactly as before (never verified).
-// Nullable with no default and no CHECK: the ALTER is metadata-only and cannot fail on existing
-// rows. Unqualified DDL - the runner sets search_path to the store schema.
+// section (`row_count`) and the SHA-256 of their canonical serialization (`content_digest`),
+// both written in the same transaction as the rows. NULL = status-only kind (no child rows) or a
+// row written before v3 (unknown) - both read exactly as before (never verified). Nullable with
+// no default and no CHECK: the ALTERs are metadata-only and cannot fail on existing rows.
+// v3 is unreleased, so the digest column is folded into it rather than adding a v4.
+// Unqualified DDL - the runner sets search_path to the store schema.
 constexpr const char* kMigrationV3Sql =
-    "ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL;";
+    "ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL, "
+    "ADD COLUMN content_digest TEXT NULL;";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -467,6 +471,10 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         // a status-only kind (-> NULL: nothing to verify). The read side compares this to the
         // rows it reads.
         std::vector<std::string> row_counts;
+        // Per kept section: the content digest of the rows inserted (server-computed from the same
+        // padded rows the INSERT stores, via the one shared serialization), or "" -> NULL for a
+        // status-only kind. Written in the same transaction as the rows and the status row.
+        std::vector<std::string> digests;
         for (const auto& sec : r.sections) {
             const auto si = device_ci_section_index(sec.kind);
             if (!si)
@@ -477,14 +485,21 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             reasons.emplace_back(sec.reason);
             if (def.table == nullptr) {
                 row_counts.emplace_back(); // status-only kind: NULL
-                continue;
-            }
-            if (sec.rows.empty()) {
-                row_counts.emplace_back("0"); // table-backed, nothing inserted
+                digests.emplace_back();
                 continue;
             }
             const auto cols = split_columns(def.columns);
             const std::size_t ncol = cols.size();
+            // Computed from exactly what is about to be stored (short rows pad, long rows
+            // truncate to the registry's columns - the same rule the INSERT applies below).
+            const auto digest = section_content_digest(def, sec.rows);
+            if (!digest)
+                return fail("digest");
+            digests.push_back(*digest);
+            if (sec.rows.empty()) {
+                row_counts.emplace_back("0"); // table-backed, nothing inserted
+                continue;
+            }
             std::vector<std::string> ords;
             ords.reserve(sec.rows.size());
             std::vector<std::vector<std::string_view>> arrays(ncol);
@@ -532,14 +547,16 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             pg::PgResult si = pg::exec_params(
                 c,
                 "INSERT INTO device_inventory_store.device_ci_section (agent_id, kind, level, "
-                "reason, row_count) SELECT $1, k, l, r, NULLIF(n, '')::integer "
-                "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) "
-                "AS t(k, l, r, n)",
+                "reason, row_count, content_digest) SELECT $1, k, l, r, NULLIF(n, '')::integer, "
+                "NULLIF(d, '') FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], "
+                "$6::text[]) AS t(k, l, r, n, d)",
                 std::vector<std::string>{
                     agent_id_s, pg::to_text_array(kinds), pg::to_text_array(levels),
                     pg::to_text_array(reasons),
                     pg::to_text_array(std::vector<std::string_view>(row_counts.begin(),
-                                                                    row_counts.end()))});
+                                                                    row_counts.end())),
+                    pg::to_text_array(std::vector<std::string_view>(digests.begin(),
+                                                                    digests.end()))});
             if (si.status() != PGRES_COMMAND_OK)
                 return fail("section_insert");
         }
@@ -644,7 +661,8 @@ bool read_sections_in_txn(PGconn* c, const std::string& agent_id_s, std::vector<
     std::array<DeviceCiSection, kDeviceCiSectionCount> sections;
     pg::PgResult sres = pg::exec_params(
         c,
-        "SELECT kind, level, reason, row_count FROM device_inventory_store.device_ci_section "
+        "SELECT kind, level, reason, row_count, content_digest "
+        "FROM device_inventory_store.device_ci_section "
         "WHERE agent_id = $1",
         std::vector<std::string>{agent_id_s});
     if (sres.status() != PGRES_TUPLES_OK)
@@ -659,6 +677,8 @@ bool read_sections_in_txn(PGconn* c, const std::string& agent_id_s, std::vector<
         // NULL = status-only kind, or a row written before migration v3: never verified.
         if (!PQgetisnull(sres.get(), i, 3))
             sections[*si].row_count = static_cast<int>(to_i64(PQgetvalue(sres.get(), i, 3)));
+        if (!PQgetisnull(sres.get(), i, 4))
+            sections[*si].content_digest = PQgetvalue(sres.get(), i, 4);
     }
     // Registry order (deterministic).
     for (std::size_t si = 0; si < kDeviceCiSectionCount; ++si) {

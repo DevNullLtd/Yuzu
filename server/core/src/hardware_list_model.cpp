@@ -3,6 +3,7 @@
 
 #include "hardware_list_model.hpp"
 
+#include "device_ci_section_digest.hpp" // the one digest function the store also writes with
 #include "device_ci_kinds.hpp" // the section registry: kind order and declared columns (constexpr only)
 #include "tag_store.hpp" // TagStore::validate_key - the .cpp only; the header stays store-free (#6558)
 
@@ -221,7 +222,7 @@ std::vector<std::string_view> ci_columns(const DeviceCiSectionDef& def) {
 }
 
 /// `ci.sections`: one entry per section the device reported, in registry order. `complete` is true
-/// only for level `ok` after the row-count check (`verify_section_row_count`). Rows are served
+/// only for level `ok` after the row-count and content-digest checks (`verify_section_content`). Rows are served
 /// only for `ok` and `constrained` (a constrained section is
 /// a bounded or partial projection, so its `complete:false` is the whole point); every other level
 /// - `unavailable`, `permission_denied`, or a level this server does not know - renders its reason
@@ -241,10 +242,10 @@ nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
             source = ci_json_ph(ci.board_source);
         else if (std::string_view(def.section) == "machine_id")
             source = ci_json_ph(ci.machine_id_source);
-        // The served level/reason: the stored status reconciled with the rows actually read.
-        // A downgrade only ever moves ok -> constrained, so the row-serving test below is
-        // unchanged by it.
-        const SectionVerdict verdict = def.table != nullptr ? verify_section_row_count(*it)
+        // The served level/reason: the stored status reconciled with the rows actually read
+        // (count, then content digest). A downgrade only ever moves ok -> constrained, so the
+        // row-serving test below is unchanged by it.
+        const SectionVerdict verdict = def.table != nullptr ? verify_section_content(*it)
                                                             : SectionVerdict{it->level, it->reason};
         nlohmann::json rows = nlohmann::json::array();
         if (def.table != nullptr && (it->level == "ok" || it->level == "constrained")) {
@@ -962,20 +963,51 @@ void apply_ci_with_sections_read(HardwareCiDetail& detail,
     }
 }
 
-SectionVerdict verify_section_row_count(const DeviceCiSection& section) {
-    SectionVerdict v{section.level, section.reason};
+namespace {
+
+/// True iff the section carries a persisted count, serves rows, and the rows read disagree with it.
+bool row_count_disagrees(const DeviceCiSection& section) {
     if (!section.row_count.has_value())
-        return v; // not verifiable: served exactly as stored
+        return false; // not verifiable
     if (section.level != "ok" && section.level != "constrained")
-        return v; // no rows by contract: nothing to reconcile
-    if (static_cast<long long>(section.rows.size()) == static_cast<long long>(*section.row_count))
-        return v;
-    v.level = "constrained"; // ok -> constrained; constrained stays
-    if (v.reason.find(kSectionRowCountMismatchReason) == std::string::npos) {
+        return false; // no rows by contract: nothing to reconcile
+    return static_cast<long long>(section.rows.size()) != static_cast<long long>(*section.row_count);
+}
+
+/// ok -> constrained (constrained stays) and `token` appended after any existing reason, once.
+void downgrade_with(SectionVerdict& v, std::string_view token) {
+    v.level = "constrained";
+    if (v.reason.find(token) == std::string::npos) {
         if (!v.reason.empty())
             v.reason += ';';
-        v.reason += kSectionRowCountMismatchReason;
+        v.reason += token;
     }
+}
+
+} // namespace
+
+SectionVerdict verify_section_row_count(const DeviceCiSection& section) {
+    SectionVerdict v{section.level, section.reason};
+    if (row_count_disagrees(section))
+        downgrade_with(v, kSectionRowCountMismatchReason);
+    return v;
+}
+
+SectionVerdict verify_section_content(const DeviceCiSection& section) {
+    SectionVerdict v = verify_section_row_count(section);
+    if (row_count_disagrees(section))
+        return v; // the count already reports the loss; a lost row always changes the digest too
+    if (!section.content_digest.has_value())
+        return v; // not verifiable: served as the count rule left it
+    if (section.level != "ok" && section.level != "constrained")
+        return v; // no rows by contract: nothing to hash
+    const auto idx = device_ci_section_index(section.kind);
+    if (!idx || kDeviceCiSections[*idx].table == nullptr)
+        return v; // not a table-backed registered kind: no digest to compare
+    const auto computed = section_content_digest(kDeviceCiSections[*idx], section.rows);
+    if (computed.has_value() && *computed == *section.content_digest)
+        return v;
+    downgrade_with(v, kSectionContentDigestMismatchReason);
     return v;
 }
 

@@ -808,14 +808,29 @@ the same transaction and never from the agent. The read side compares it with th
 same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
 restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
 `server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
-rows that were read are still served. The check detects lost rows only: rows replaced out of band by
-the same number of different rows are not detected. A status-only section (chassis, baseboard,
-machine_id) and a section written before v3 store NULL, are not verified, and read exactly as before.
+rows that were read are still served.
+
+The status row also records `content_digest` (the same migration v3, additive and nullable): the
+SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
+count, row count, then each row's position and cells), computed by the server from the rows it
+inserts in the same transaction, never taken from the agent. One pure function
+(`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
+read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
+row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
+and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
+reason. The rows that were read are still served, but they are not the values the agent reported. A
+lost row is reported by the count token alone, since it changes the digest too. This is an integrity
+check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
+tables can also rewrite the digest column, and the digest covers the rows only, not the section's
+level or reason. It closes the same-count content drift that the count alone could not see (finding
+`up2r-up-3`). A status-only section (chassis, baseboard, machine_id) and a section written before v3
+store NULL for both, are not verified, and read exactly as before.
 Only a full replace records the count and repairs a mismatched section: a device whose hash is
 unchanged sends only a hash, which leaves the rows alone, so this happens on a hardware change, an
 operator Sync now, or the weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
 for up to a week after upgrade. The wire format and the agent are unchanged. Migration 3 is a single
-additive `ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL`. The rollback note above
+additive `ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL, ADD COLUMN content_digest
+TEXT NULL` (the digest column is folded into v3 because v3 had not shipped). The rollback note above
 holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
 there, so the sections it writes are unverified until a v3 server next does a full replace for that
 device.

@@ -29,6 +29,14 @@ struct DeviceCiSection {
     /// migration v3 - not verifiable, and read exactly as before. See `verify_section_row_count`
     /// (hardware_list_model.hpp) for the one decision that consumes it.
     std::optional<int> row_count;
+    /// READ SIDE ONLY (the writer derives it from the rows it inserts, never from the agent): the
+    /// SHA-256 of the canonical serialization of the section's child rows
+    /// (`section_content_digest`, device_ci_section_digest.hpp), persisted with the status row so an
+    /// out-of-band edit, restore or swap of child rows - including one that keeps the row count -
+    /// is detectable. nullopt = a status-only kind, or a row written before the digest existed:
+    /// not verifiable, read exactly as before. An integrity check against accident, NOT tamper
+    /// resistance. See `verify_section_content` (hardware_list_model.hpp).
+    std::optional<std::string> content_digest;
 };
 
 /// One device-CI record — the typed projection of the `device_ci` canonical wire

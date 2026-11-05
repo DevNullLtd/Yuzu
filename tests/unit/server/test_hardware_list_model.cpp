@@ -23,6 +23,7 @@
 ///    the independent nullopt-vs-present-empty signal for software/tags.
 
 #include "device_ci_kinds.hpp"
+#include "device_ci_section_digest.hpp"
 #include "hardware_list_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -1472,4 +1473,227 @@ TEST_CASE("hardware_ci_json: a status-only section never takes the row-count che
     const auto j = hardware_ci_json(d, 0);
     CHECK(section_of(j, "chassis")["status"] == "ok");
     CHECK(section_of(j, "chassis")["complete"] == true);
+}
+
+// ── The section content digest (up2r-up-3): same-count drift the row count cannot see ──────────
+
+namespace {
+
+using Rows = std::vector<std::vector<std::string>>;
+
+const DeviceCiSectionDef& def_of(std::string_view kind) {
+    const auto idx = device_ci_section_index(kind);
+    REQUIRE(idx.has_value());
+    return kDeviceCiSections[*idx];
+}
+
+Rows cpu_rows(std::size_t n) {
+    Rows r;
+    for (std::size_t i = 0; i < n; ++i)
+        r.push_back({std::to_string(i), "M", "4", "8", "2800", "S", "1"});
+    return r;
+}
+
+// A section exactly as the store would hand it back: the count AND the digest of its own rows.
+DeviceCiSection digested_section(std::string kind, std::string level, std::string reason, Rows rows) {
+    const auto& def = def_of(kind);
+    const auto digest = section_content_digest(def, rows);
+    REQUIRE(digest.has_value());
+    const auto n = static_cast<int>(rows.size());
+    auto s = make_section(std::move(kind), std::move(level), std::move(reason), std::move(rows));
+    s.row_count = n;
+    s.content_digest = *digest;
+    return s;
+}
+
+} // namespace
+
+// Kills: a serialization where cell boundaries can shift (the classic ambiguity of a delimiter join).
+TEST_CASE("section_content_digest: moving a byte across a cell boundary changes the digest",
+          "[hardware][model][sections][digest]") {
+    const auto& def = def_of("swap"); // 3 columns
+    const auto a = section_content_digest(def, Rows{{"ab", "c", "d"}});
+    const auto b = section_content_digest(def, Rows{{"a", "bc", "d"}});
+    const auto c = section_content_digest(def, Rows{{"a", "b", "cd"}});
+    REQUIRE(a.has_value());
+    CHECK(a != b);
+    CHECK(b != c);
+    CHECK(a != c);
+    // A delimiter-looking byte inside a cell is just a byte.
+    CHECK(section_content_digest(def, Rows{{"a|b", "", ""}}) != section_content_digest(def, Rows{{"a", "b", ""}}));
+}
+
+// Kills: treating an empty cell and a missing cell, or an empty row and no row, as different - and
+// the reverse: treating two different shapes as the same.
+TEST_CASE("section_content_digest: a short row pads to blanks and an extra cell is ignored",
+          "[hardware][model][sections][digest]") {
+    const auto& def = def_of("swap");
+    // The writer stores a short row padded with blanks and truncates a long one, so the digest of
+    // the wire shape and of the stored shape must agree.
+    CHECK(section_content_digest(def, Rows{{"d", "1"}}) == section_content_digest(def, Rows{{"d", "1", ""}}));
+    CHECK(section_content_digest(def, Rows{{"d", "1", "s", "ignored"}}) ==
+          section_content_digest(def, Rows{{"d", "1", "s"}}));
+    // But a blank row is not the absence of a row.
+    CHECK(section_content_digest(def, Rows{{"", "", ""}}) != section_content_digest(def, Rows{}));
+    CHECK(section_content_digest(def, Rows{{"", "", ""}, {"", "", ""}}) !=
+          section_content_digest(def, Rows{{"", "", ""}}));
+}
+
+// Kills: a digest that ignores row order (a generation swap that permutes rows is still drift).
+TEST_CASE("section_content_digest: row order is part of the content and the kind is part of the preimage",
+          "[hardware][model][sections][digest]") {
+    const Rows fwd{{"d0", "1", "s"}, {"d1", "2", "s"}};
+    const Rows rev{{"d1", "2", "s"}, {"d0", "1", "s"}};
+    const auto& swap = def_of("swap");
+    CHECK(section_content_digest(swap, fwd) != section_content_digest(swap, rev));
+    // Stable: the same rows always give the same 64-hex digest.
+    const auto d = section_content_digest(swap, fwd);
+    REQUIRE(d.has_value());
+    CHECK(d->size() == 64);
+    CHECK(d == section_content_digest(swap, fwd));
+    // Same bytes under another kind of the same width never collide.
+    const auto& other = def_of("swap");
+    DeviceCiSectionDef renamed = other;
+    renamed.section = "swapx";
+    CHECK(section_content_digest(renamed, fwd) != d);
+}
+
+// Pins the serialization itself: a silent change would make every stored digest read as drift.
+TEST_CASE("section_content_preimage layout is pinned", "[hardware][model][sections][digest]") {
+    const std::string pre = section_content_preimage("swap", 3, Rows{{"a", "", "c"}});
+    std::string want = "yuzu.device_ci.section.v1";
+    auto u64 = [&](std::uint64_t v) {
+        for (int sh = 56; sh >= 0; sh -= 8)
+            want.push_back(static_cast<char>((v >> sh) & 0xff));
+    };
+    auto str = [&](std::string_view x) {
+        u64(x.size());
+        want.append(x);
+    };
+    str("swap");
+    u64(3); // ncol
+    u64(1); // nrows
+    u64(0); // ord
+    str("a");
+    str("");
+    str("c");
+    CHECK(pre == want);
+}
+
+TEST_CASE("verify_section_content: an intact section is served exactly as stored",
+          "[hardware][model][sections][digest]") {
+    for (const char* level : {"ok", "constrained"}) {
+        INFO(level);
+        auto v = verify_section_content(digested_section("cpu", level, "r", cpu_rows(3)));
+        CHECK(v.level == level);
+        CHECK(v.reason == "r");
+    }
+    // A verified-empty section too.
+    const auto e = verify_section_content(digested_section("cpu", "ok", "", Rows{}));
+    CHECK(e.level == "ok");
+    CHECK(e.reason.empty());
+}
+
+// Kills (by mutation: the verifier ignores the digest) the up2r-up-3 defect - same-count drift.
+TEST_CASE("verify_section_content: a same-count edit of one cell downgrades ok to constrained",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.rows[1][1] = "Edited"; // count unchanged: the count rule alone sees nothing
+    CHECK(verify_section_row_count(s).level == "ok");
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:content_digest_mismatch");
+    // Also with a reason already present, and idempotently.
+    auto t = digested_section("cpu", "ok", "agent:note", cpu_rows(3));
+    t.rows[0][2] = "9";
+    CHECK(verify_section_content(t).reason == "agent:note;server:content_digest_mismatch");
+    auto u = digested_section("cpu", "constrained", "server:content_digest_mismatch", cpu_rows(3));
+    u.rows[0][2] = "9";
+    CHECK(verify_section_content(u).reason == "server:content_digest_mismatch");
+    // A capped section keeps its token and gains the digest one.
+    auto cap = digested_section("cpu", "constrained", "server_cap:32", cpu_rows(3));
+    cap.rows[2][0] = "x";
+    const auto cv = verify_section_content(cap);
+    CHECK(cv.level == "constrained");
+    CHECK(cv.reason == "server_cap:32;server:content_digest_mismatch");
+}
+
+TEST_CASE("verify_section_content: rows swapped for another generation of the same size are caught",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+    Rows other = cpu_rows(2);
+    other[0][1] = "Other";
+    other[1][1] = "Other";
+    s.rows = other;
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:content_digest_mismatch");
+}
+
+// Composition: a lost row reports the count token alone (the digest necessarily changes too).
+TEST_CASE("verify_section_content: a count mismatch is reported alone and wins over the digest",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.rows.pop_back();
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:row_count_mismatch");
+    // And with the count unverifiable (NULL) the digest still catches the loss.
+    auto n = digested_section("cpu", "ok", "", cpu_rows(3));
+    n.row_count.reset();
+    n.rows.pop_back();
+    CHECK(verify_section_content(n).reason == "server:content_digest_mismatch");
+}
+
+// Kills: verifying (or downgrading) a section that has no stored digest - the pre-feature path.
+TEST_CASE("verify_section_content: a NULL digest leaves the section as the count rule left it",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.content_digest.reset();
+    s.rows[0][1] = "Edited";
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "ok");
+    CHECK(v.reason.empty());
+    // The count rule still applies on its own.
+    s.rows.pop_back();
+    CHECK(verify_section_content(s).reason == "server:row_count_mismatch");
+}
+
+TEST_CASE("verify_section_content: levels with no rows by contract are never touched",
+          "[hardware][model][sections][digest]") {
+    for (const char* level : {"unavailable", "permission_denied", "novel", ""}) {
+        INFO(level);
+        auto s = digested_section("cpu", "ok", "why", cpu_rows(2));
+        s.level = level;
+        s.rows[0][1] = "Edited";
+        const auto v = verify_section_content(s);
+        CHECK(v.level == level);
+        CHECK(v.reason == "why");
+    }
+}
+
+TEST_CASE("verify_section_content: a status-only or unregistered kind never takes the digest check",
+          "[hardware][model][sections][digest]") {
+    auto c = digested_section("cpu", "ok", "", cpu_rows(1));
+    c.kind = "chassis"; // status-only
+    c.rows[0][1] = "Edited";
+    CHECK(verify_section_content(c).level == "ok");
+    auto u = digested_section("cpu", "ok", "", cpu_rows(1));
+    u.kind = "nosuchkind";
+    CHECK(verify_section_content(u).level == "ok");
+}
+
+// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows read.
+TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and incomplete with its rows",
+          "[hardware][model][json][sections][digest]") {
+    auto cpu = digested_section("cpu", "ok", "", cpu_rows(2));
+    cpu.rows[0][1] = "Edited";
+    auto d = v2_detail({std::move(cpu), digested_section("disk", "ok", "", Rows{})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& c = section_of(j, "cpu");
+    CHECK(c["status"] == "constrained");
+    CHECK(c["complete"] == false);
+    CHECK(c["reason"] == "server:content_digest_mismatch");
+    CHECK(c["rows"].size() == 2); // served, but NOT the reported generation: see the verdict doc
+    CHECK(section_of(j, "disk")["complete"] == true);
 }

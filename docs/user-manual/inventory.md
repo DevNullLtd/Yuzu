@@ -1224,8 +1224,17 @@ sync, defeating the hash-skip protocol.
   or wait for its next hardware change or the weekly full report (at most 7 days). A section
   stored before this check existed has no recorded count and is not checked until that
   device's next full sync, so a freshly upgraded server verifies a device only after that
-  sync. The check detects lost rows only: rows replaced out of band by the same number of
-  different rows are not detected.
+  sync. `server:content_digest_mismatch` means the number of rows still matches but the rows
+  no longer hash to the digest the server recorded beside the section's status when the device
+  last synced in full (a row was edited, or the rows were swapped for another sync's out of
+  band): the section is served `constrained` and incomplete, with the rows that were read, but
+  those rows are **not** the values the agent reported, so do not rely on them. A lost row
+  reports `server:row_count_mismatch` alone. Both are repaired only by a full sync (see above),
+  and a section stored before the digest existed has none and is checked by its row count
+  alone until that sync. The digest is computed by the server from the rows it stored (never
+  taken from the agent) and is an integrity check against accident and non-malicious drift,
+  not tamper resistance: someone who can write the table can rewrite the digest. It covers the
+  rows only, not the section's `status` or `reason`.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.

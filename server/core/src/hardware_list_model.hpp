@@ -243,6 +243,36 @@ struct SectionVerdict {
 };
 [[nodiscard]] SectionVerdict verify_section_row_count(const DeviceCiSection& section);
 
+/// The reason token a section carries when the rows read back do not hash to the content digest
+/// persisted beside its status row (`device_ci_section.content_digest`, migration v3): the child
+/// rows were edited, swapped for another generation's, or otherwise changed out of band - a
+/// change the row count alone cannot see when the number of rows is unchanged.
+inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:content_digest_mismatch";
+
+/// The level and reason a table-backed section is SERVED with: `verify_section_row_count` first,
+/// then the content digest. This is the function every serving path uses (`ci_sections_json`);
+/// anything that serves raw `get_device_ci_sections` levels must call it.
+///
+/// Pure. Rules, on top of the row-count rules above:
+///  - `content_digest == nullopt` (a status-only kind, or a row written before the digest
+///    existed): not verifiable, served as the row-count rule left it.
+///  - `unavailable`, `permission_denied`, an unknown or blank level: never touched (no rows by
+///    contract).
+///  - If the row count already disagrees, that verdict is returned alone: the count token is the
+///    more specific report of the same loss, and a lost row always changes the digest too, so a
+///    second token would only repeat it.
+///  - Otherwise the digest of the rows read (`section_content_digest`, the writer's own function)
+///    is compared with the stored one; any difference - or a digest the server cannot compute -
+///    DOWNGRADES `ok` to `constrained` and appends `server:content_digest_mismatch` to the reason
+///    (`;`-joined, idempotent). An already `constrained` section keeps its level and tokens.
+///  - The rows that were read are STILL SERVED (as for the count mismatch). On a digest mismatch
+///    they are NOT the generation the agent reported: they may be edited or swapped values, so a
+///    consumer must not treat them as the device's reported hardware.
+/// Scope: an integrity check against accident and non-malicious drift. Anyone who can write the
+/// child tables can also rewrite the digest, so this is not tamper resistance. The digest covers
+/// the rows only, not the level or reason columns.
+[[nodiscard]] SectionVerdict verify_section_content(const DeviceCiSection& section);
+
 inline constexpr std::size_t kHwSoftwareCap = 2000;
 
 /// Sync-on-demand (`__sync__.now`) shipped in the 0.13.1 dev line; a release
