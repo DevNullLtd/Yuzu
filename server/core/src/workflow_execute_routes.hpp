@@ -31,6 +31,7 @@ struct WorkflowExecuteRouteDeps {
     /// `audit_fn` is used and counted as persisted: the established audit-off contract.
     WorkflowRoutes::PersistAuditFn persist_audit_fn;
     std::shared_ptr<const WorkflowApi> workflow_api;
+    WorkflowRunFn workflow_run; ///< unset == engine not available
     std::function<bool()> instruction_store_open; ///< unset == not available
     std::function<bool()> approval_gate_available; ///< unset == not available
     WorkflowInstructionLookupFn lookup;

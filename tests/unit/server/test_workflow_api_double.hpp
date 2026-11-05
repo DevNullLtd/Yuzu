@@ -35,21 +35,13 @@ public:
     using ListExecutionsFn = std::function<std::expected<yuzu::server::WorkflowExecutionPage, std::string>(
         const yuzu::server::WorkflowExecutionListQuery&, const yuzu::server::authz::VisibleSet&)>;
 
-    /// Receives exactly what the shared execute sequence hands the engine, including the per-step
-    /// dispatch callback, so a test can both observe the call and DRIVE the callback the way the
-    /// engine would (once per step, synchronously).
-    using ExecuteFn = std::function<std::expected<std::string, std::string>(
-        const std::string& workflow_id, const std::vector<std::string>& agent_ids,
-        yuzu::server::StepDispatchFn dispatch_fn, yuzu::server::ConditionEvalFn condition_fn)>;
-
-    // The fourth and fifth functions default to unwired so the existing three-argument
-    // construction sites (which never list or execute) stay unchanged.
+    // The fourth function defaults to unwired so the existing three-argument construction sites
+    // (which never list) stay unchanged.
     FnWorkflowApi(ListFn list_fn, GetFn get_fn, GetExecutionFn get_execution_fn,
-                  ListExecutionsFn list_executions_fn = {}, ExecuteFn execute_fn = {})
+                  ListExecutionsFn list_executions_fn = {})
         : list_fn_(std::move(list_fn)), get_fn_(std::move(get_fn)),
           get_execution_fn_(std::move(get_execution_fn)),
-          list_executions_fn_(std::move(list_executions_fn)),
-          execute_fn_(std::move(execute_fn)) {}
+          list_executions_fn_(std::move(list_executions_fn)) {}
 
     [[nodiscard]] std::expected<std::vector<yuzu::server::Workflow>, std::string>
     list_workflows(const yuzu::server::WorkflowQuery& q) const override {
@@ -80,21 +72,11 @@ public:
         return list_executions_fn_(q, scope);
     }
 
-    [[nodiscard]] std::expected<std::string, std::string>
-    execute_workflow(const std::string& workflow_id, const std::vector<std::string>& agent_ids,
-                     yuzu::server::StepDispatchFn dispatch_fn,
-                     yuzu::server::ConditionEvalFn condition_fn) const override {
-        if (!execute_fn_)
-            return std::unexpected(std::string{"FnWorkflowApi: execute_workflow unwired"});
-        return execute_fn_(workflow_id, agent_ids, std::move(dispatch_fn), std::move(condition_fn));
-    }
-
 private:
     ListFn list_fn_;
     GetFn get_fn_;
     GetExecutionFn get_execution_fn_;
     ListExecutionsFn list_executions_fn_;
-    ExecuteFn execute_fn_;
 };
 
 } // namespace yuzu::server::test

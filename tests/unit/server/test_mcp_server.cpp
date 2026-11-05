@@ -1077,6 +1077,10 @@ struct McpTestServer {
     /// workflow_engine_for_test-derived seam below when set.
     std::shared_ptr<const yuzu::server::WorkflowApi> workflow_api_for_test;
 
+    /// #2146 batch B: the run port `execute_workflow` starts a run through (the engine adapter in
+    /// production). Empty (the default) leaves the tool answering "workflow engine not available".
+    yuzu::server::WorkflowRunFn workflow_run_for_test;
+
     /// #2146 A2-R1: optionally wire a real ScheduleEngine so list_schedules'
     /// definition_id/enabled_only filters can be exercised end-to-end.
     /// Default nullptr preserves the pre-existing "Schedule engine
@@ -1905,6 +1909,8 @@ private:
         // answering engine via workflow_engine_for_test AND a distinguishing
         // seam double at once, proving the three tools call the seam and not
         // the raw engine (see workflow_api_for_test's own doc comment).
+        if (workflow_run_for_test)
+            mcp.set_workflow_run_fn(workflow_run_for_test);
         if (workflow_api_for_test) {
             mcp.set_workflow_api(workflow_api_for_test);
         } else if (workflow_engine_for_test) {
@@ -48005,6 +48011,15 @@ TEST_CASE("MCP execute_workflow: unwired instruction store / approval gate is a 
     ts.workflow_api_for_test = std::make_shared<yuzu::server::test::FnWorkflowApi>(
         yuzu::server::test::FnWorkflowApi::ListFn{}, yuzu::server::test::FnWorkflowApi::GetFn{},
         yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+    bool run_called = false;
+    ts.workflow_run_for_test = [&run_called](const std::string&, const std::vector<std::string>&,
+                                             yuzu::server::StepDispatchFn,
+                                             yuzu::server::ConditionEvalFn,
+                                             const yuzu::server::WorkflowRunControl&)
+        -> std::expected<std::string, std::string> {
+        run_called = true;
+        return std::string{"exec-1"};
+    };
     ts.start_with_dispatch(probe.fn());
     auto res = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})"));
     REQUIRE(res);
@@ -48013,6 +48028,7 @@ TEST_CASE("MCP execute_workflow: unwired instruction store / approval gate is a 
     CHECK(j["error"]["code"] == -32603);
     CHECK(j["error"]["message"].get<std::string>().find("not available") != std::string::npos);
     CHECK_FALSE(probe.dispatched);
+    CHECK_FALSE(run_called);
 }
 
 TEST_CASE("MCP execute_workflow: arguments are strict and name explicit devices",

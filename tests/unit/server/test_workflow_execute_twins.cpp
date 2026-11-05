@@ -82,6 +82,7 @@ struct Fx {
     bool store_open{true};
     bool approval_gate{true};
     bool wire_api{true};
+    bool wire_run{true};
     bool audit_ok{true};
     std::optional<size_t> audit_fails_on_call; // 0-based index of the audit call that fails
 
@@ -142,26 +143,30 @@ struct Fx {
             e.status = engine_status;
             return std::optional<WorkflowExecution>{e};
         };
-        auto exec = [this](const std::string&, const std::vector<std::string>&, StepDispatchFn fn,
-                           ConditionEvalFn) -> std::expected<std::string, std::string> {
+        return std::make_shared<test::FnWorkflowApi>(test::FnWorkflowApi::ListFn{}, get, get_exec);
+    }
+
+    /// The stand-in for the engine behind the run port: it drives the steps in order,
+    /// synchronously, one callback per step; a failed step does not stop the loop here
+    /// (on_failure=continue semantics).
+    WorkflowRunFn run_fn() {
+        return [this](const std::string&, const std::vector<std::string>&, StepDispatchFn fn,
+                      ConditionEvalFn, const WorkflowRunControl&)
+                   -> std::expected<std::string, std::string> {
             engine_called = true;
             if (!engine_error)
                 return engine_error;
-            // The engine drives the steps in order, synchronously, one callback per step; a
-            // failed step does not stop the loop here (on_failure=continue semantics).
             for (const auto& sid : step_ids)
                 (void)fn(sid, "[]", "{}");
             events.push_back("engine_returned");
             return engine_error;
         };
-        return std::make_shared<test::FnWorkflowApi>(
-            test::FnWorkflowApi::ListFn{}, get, get_exec,
-            test::FnWorkflowApi::ListExecutionsFn{}, exec);
     }
 
     WorkflowExecutePorts ports(const std::shared_ptr<test::FnWorkflowApi>& a) {
         WorkflowExecutePorts p;
         p.api = wire_api ? a.get() : nullptr;
+        p.run = wire_run ? run_fn() : WorkflowRunFn{};
         p.instruction_store_open = store_open;
         p.approval_gate_available = approval_gate;
         p.lookup = [this](const std::string& id)
@@ -242,6 +247,7 @@ TEST_CASE("workflow execute: an unwired or closed dependency refuses with 503 an
         {"approval gate not wired", [](Fx& f) { f.approval_gate = false; }, "approval_gate_unavailable"},
         {"instruction store not open", [](Fx& f) { f.store_open = false; }, "instruction_store_unavailable"},
         {"workflow API not wired", [](Fx& f) { f.wire_api = false; }, "workflow_engine_unavailable"},
+        {"workflow run port not wired", [](Fx& f) { f.wire_run = false; }, "workflow_engine_unavailable"},
     };
     for (const auto& r : rows) {
         INFO(r.what);
@@ -790,6 +796,7 @@ struct Rest {
             return fx.audit_ok;
         };
         d.workflow_api = api;
+        d.workflow_run = fx.run_fn();
         d.instruction_store_open = [this] { return fx.store_open; };
         d.approval_gate_available = [this] { return fx.approval_gate; };
         auto ports = fx.ports(api);
@@ -963,6 +970,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: no step reaching any agent is a 
         return true;
     };
     d.workflow_api = r.api;
+    d.workflow_run = r.fx.run_fn();
     d.instruction_store_open = [] { return true; };
     d.approval_gate_available = [] { return true; };
     auto ports = r.fx.ports(r.api);
@@ -1004,6 +1012,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: an unwired caller derivation is 
         return true;
     };
     d.workflow_api = r.api;
+    d.workflow_run = r.fx.run_fn();
     d.instruction_store_open = [] { return true; };
     d.approval_gate_available = [] { return true; };
     auto ports = r.fx.ports(r.api);

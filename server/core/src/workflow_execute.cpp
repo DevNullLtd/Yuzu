@@ -215,7 +215,7 @@ WorkflowExecuteStatus status_for(StepAdmission v) {
 WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
                                               const WorkflowExecuteRequest& req) {
     // ── 1. wiring: fail CLOSED, before any read or effect ────────────────
-    if (!ports.api)
+    if (!ports.api || !ports.run)
         return refuse(WorkflowExecuteStatus::kUnavailable, "workflow engine not available",
                       "workflow_engine_unavailable");
     if (!ports.instruction_store_open || !ports.lookup)
@@ -369,8 +369,8 @@ WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
         return evaluate_compliance_bool(expression, fields);
     };
 
-    const auto run = ports.api->execute_workflow(req.workflow_id, req.agent_ids, dispatch_fn,
-                                                 condition_fn);
+    const auto run = ports.run(req.workflow_id, req.agent_ids, dispatch_fn, condition_fn,
+                               WorkflowRunControl{});
     if (!run) {
         const bool db = is_generic_db_error(run.error());
         const bool gone = run.error().starts_with("workflow not found");

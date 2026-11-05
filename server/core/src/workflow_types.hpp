@@ -50,8 +50,8 @@ struct Workflow {
 // ── Dispatch callback type ───────────────────────────────────────────────────
 // The workflow engine invokes this callback to dispatch a step to agents.
 // Returns a JSON result string on success, or an error string on failure.
-// (Relocated from workflow_engine.hpp so the abstract `WorkflowApi::execute_workflow` can name it
-// without reaching the Postgres-backed engine class; std-only, so the pure-header rule holds.)
+// (Relocated from workflow_engine.hpp so the store-free run port, `workflow_run_port.hpp`, can name
+// it without reaching the Postgres-backed engine class; std-only, so the pure-header rule holds.)
 using StepDispatchFn = std::function<std::expected<std::string, std::string>(
     const std::string& instruction_id,
     const std::string& agent_ids_json,

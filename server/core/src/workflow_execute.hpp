@@ -18,8 +18,9 @@
 ///   * an unclassified step is refused up front instead of failing later at the chokepoint.
 ///
 /// Ports, not stores: every dependency arrives as a `std::function` or a flag, so the whole
-/// sequence is testable without Postgres (the engine call goes through `WorkflowApi`, which
-/// `FnWorkflowApi` doubles). `make_instruction_lookup` is the one adapter from the real
+/// sequence is testable without Postgres (reads go through `WorkflowApi`, which `FnWorkflowApi`
+/// doubles; the run goes through the `WorkflowRunFn` port, `workflow_run_port.hpp`).
+/// `make_instruction_lookup` is the one adapter from the real
 /// `InstructionStore`.
 ///
 /// ORDER (each step refuses before the next runs; nothing is dispatched until step 6):
@@ -35,7 +36,7 @@
 ///      explicitly (`evaluate_destructive_targeting`); a Destructive pair whose named agents are
 ///      all outside the caller's visible set is refused as `destructive_no_visible_target`.
 ///   5. the `requested` audit row. A persist failure refuses the run (kAuditFailed).
-///   6. `WorkflowApi::execute_workflow`, whose per-step dispatch callback re-runs steps 3 and 4
+///   6. `WorkflowExecutePorts::run`, whose per-step dispatch callback re-runs steps 3 and 4
 ///      against a FRESH read of the instruction (so a definition edited after the preflight is
 ///      refused at dispatch, audited there) and then dispatches through the caller's own
 ///      `DispatchCaller`, so the shared chokepoint confines each step to the caller.
@@ -50,6 +51,7 @@
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_zero_reach.hpp"
 #include "workflow_api.hpp"
+#include "workflow_run_port.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -99,7 +101,10 @@ using WorkflowAuditFn =
                        const std::string& target_id, const std::string& detail)>;
 
 struct WorkflowExecutePorts {
+    /// Reads only (`get_workflow`, `get_workflow_execution`).
     const WorkflowApi* api{nullptr};
+    /// Starts the run; the engine adapter built in server.cpp. Unset == engine not available.
+    WorkflowRunFn run;
     /// `InstructionStore* != nullptr && is_open()`, computed by the transport at call time.
     bool instruction_store_open{false};
     /// `ApprovalManager* != nullptr`. The manager is not consulted for a decision (per-step

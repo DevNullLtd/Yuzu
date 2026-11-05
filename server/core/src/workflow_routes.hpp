@@ -23,6 +23,7 @@
 #include "tag_store.hpp"
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the v1 workflow reads
 #include "workflow_engine.hpp"
+#include "workflow_run_port.hpp" // WorkflowRunFn (Deps::workflow_run)
 
 #include <httplib.h>
 
@@ -218,6 +219,11 @@ public:
         /// is (server.cpp) — see `workflow_api.hpp`'s own doc comment for
         /// the full carve-out list.
         std::shared_ptr<const WorkflowApi> workflow_api;
+        /// The run port behind `POST /api/v1/workflows/{id}/execute` (`workflow_run_port.hpp`),
+        /// built in server.cpp from `workflow_engine_`; the same closure MCP `execute_workflow`
+        /// gets. Unset ⇒ that route answers "workflow engine not available". The legacy
+        /// `POST /api/workflows/{id}/execute` keeps its own `workflow_engine` call.
+        WorkflowRunFn workflow_run;
         /// ADR-0031 WS-A4 (seventh family): the schedule-read seam — replaces
         /// a direct `ScheduleEngine*` reach for `GET /fragments/schedules` /
         /// `GET /api/v1/schedules` (the seamed read triad; the unversioned

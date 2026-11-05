@@ -2865,6 +2865,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             .audit_fn = audit_fn,
             .persist_audit_fn = persist_audit_fn,
             .workflow_api = workflow_api,
+            .workflow_run = deps.workflow_run,
             .instruction_store_open =
                 [instruction_store] { return instruction_store && instruction_store->is_open(); },
             .approval_gate_available = [approval_manager] { return approval_manager != nullptr; },

@@ -44,7 +44,7 @@ namespace yuzu::server {
 
 // `StepDispatchFn` (the per-step dispatch callback `execute()` invokes) and `ConditionEvalFn` (the
 // step-condition evaluator) now live in `workflow_types.hpp`, included above, so the store-free
-// `WorkflowApi` seam can name them. Same types, same namespace: no includer changes.
+// `WorkflowRunFn` port can name them. Same types, same namespace: no includer changes.
 
 // ── Execution-list SQL ──────────────────────────────────────────────────────
 

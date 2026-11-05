@@ -75,6 +75,7 @@
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
+#include "workflow_run_port.hpp" // WorkflowRunFn: the run port set_workflow_run_fn takes
 // #4027: DeviceRow (via device_routes.hpp) + EchoRetentionPausedScan/
 // EchoPausedSourceRow + the echo_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
@@ -866,6 +867,11 @@ public:
         workflow_concurrency_dispatch_fn_ = std::move(fn);
     }
 
+    /// The run port `execute_workflow` starts a run through (`workflow_run_port.hpp`); server.cpp
+    /// wires the identical closure the REST route gets. Unset (the default) means
+    /// `execute_workflow` answers "workflow engine not available" and dispatches nothing.
+    void set_workflow_run_fn(WorkflowRunFn fn) { workflow_run_fn_ = std::move(fn); }
+
     /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
     /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
     /// server.cpp wires the IDENTICAL instance so the eight Guardian read
@@ -1408,6 +1414,7 @@ private:
     // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
     std::shared_ptr<const WorkflowApi> workflow_api_;
     ConcurrencyDispatchFn workflow_concurrency_dispatch_fn_; // see set_workflow_concurrency_dispatch_fn
+    WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
