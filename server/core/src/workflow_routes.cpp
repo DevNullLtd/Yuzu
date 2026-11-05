@@ -249,6 +249,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto persist_audit_fn = std::move(deps.persist_audit_fn); // #4990
     auto probe_perm_fn = std::move(deps.probe_perm_fn);
     auto emit_fn = std::move(deps.emit_fn);
+    auto emit_event_fn = std::move(deps.emit_event_fn);
     auto scope_fn = std::move(deps.scope_fn);
     auto* workflow_engine = deps.workflow_engine;
     auto* execution_tracker = deps.execution_tracker;
@@ -2959,7 +2960,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             .caller_fn = caller_fn,
             .metrics = metrics,
             .stream_budget = deps.stream_budget,
-            .draining = deps.draining});
+            .draining = deps.draining,
+            .emit_event_fn = emit_event_fn});
 
     // GET /api/workflow-executions/:id -- get execution status
     sink.Get(R"(/api/workflow-executions/([^/]+))", [fleet_read_fn,

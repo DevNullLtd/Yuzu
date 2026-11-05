@@ -198,6 +198,7 @@
 #include "dispatch_caller.hpp"
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_zero_reach.hpp"
+#include "event_emit_hook.hpp"  // EventEmitHook (request-free: no DIRECT <httplib.h> include)
 #include "stream_budget.hpp" // detail::StreamBudget: a run leases from the ONE held-open budget
 #include "workflow_api.hpp"
 #include "workflow_run_port.hpp"
@@ -420,6 +421,14 @@ struct WorkflowExecutePorts {
     /// Optional: epoch seconds now, to age a `running` replay against `started_at` (default: the
     /// system clock, the clock the engine stamped `started_at` with). A seam for the stale test.
     std::function<std::int64_t()> now_epoch;
+    /// Optional, bound per request by the surface (`bind_event_emit`): publishes the platform
+    /// event `workflow.executed` that the legacy `POST /api/workflows/{id}/execute` publishes,
+    /// with the legacy's null attributes and payload. Called exactly once per call whose run the
+    /// engine admitted (the run port returned an execution id), whatever its outcome, after the
+    /// closing audit row. A refusal, an idempotent replay (a pre-check hit or a lost claim), an
+    /// engine refusal and a run that threw publish nothing. Best effort: it never changes the
+    /// outcome. Unset == no event.
+    EventEmitHook emit;
 };
 
 /// instruction id -> `workflow_step_effect` text: what one step's instruction resolved to when the

@@ -10,6 +10,7 @@
 /// Registered from `WorkflowRoutes::register_routes` (one call), with copies of the deps the
 /// legacy execute route already uses, so a harness that wires `WorkflowRoutes` gets both.
 
+#include "event_emit.hpp" // EmitEventFn / bind_event_emit: the httplib adapter half
 #include "workflow_execute.hpp"
 #include "workflow_routes.hpp"
 
@@ -60,6 +61,10 @@ struct WorkflowExecuteRouteDeps {
     /// True while the server is draining. A run is refused then (`StreamBudget::try_acquire` does
     /// not consult its own closing flag). Unset = never draining (test harnesses).
     std::function<bool()> draining;
+    /// The server's platform-event emitter (`ServerImpl::emit_event`'s 4-argument shape), bound
+    /// to the request per call. The run publishes the legacy route's `workflow.executed` through
+    /// it (see `WorkflowExecutePorts::emit`). Unset = no event.
+    yuzu::server::EmitEventFn emit_event_fn;
 };
 
 void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRouteDeps deps);

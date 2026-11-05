@@ -142,6 +142,8 @@ MCP_IDEMP = (r"^[ \t]*mcp_server_->set_workflow_idempotency_lookup_fn\("
              r"workflow_idempotency_lookup_fn\);")
 WF_AUDIT_FN = r"^[ \t]*wf_deps\.audit_fn = audit_fn;.*$"
 WF_PERSIST_AUDIT_FN = r"^[ \t]*wf_deps\.persist_audit_fn = audit_fn;.*$"
+WF_EMIT = r"^[ \t]*wf_deps\.emit_event_fn = emit_event_fn;.*$"
+MCP_EMIT = r"^[ \t]*mcp_server_->set_emit_event_fn\(emit_event_fn\);"
 SHOULD_STOP = (r"^[ \t]*workflow_engine_->set_should_stop\(\[this\] \{\s*"
                r"if \(stop_requested_\.load\(std::memory_order_acquire\)\)\s*"
                r"return yuzu::server::WorkflowStopLevel::kStop;\s*"
@@ -164,6 +166,8 @@ WORKFLOW_PINS = (
     ("set_workflow_idempotency_lookup_fn", MCP_IDEMP),
     ("wf_deps.audit_fn", WF_AUDIT_FN),
     ("wf_deps.persist_audit_fn", WF_PERSIST_AUDIT_FN),
+    ("wf_deps.emit_event_fn", WF_EMIT),
+    ("set_emit_event_fn", MCP_EMIT),
     ("set_should_stop", SHOULD_STOP),
 )
 WORKFLOW_PIN_ADVICE = {
@@ -188,6 +192,11 @@ WORKFLOW_PIN_ADVICE = {
     "wf_deps.audit_fn": "'wf_deps.audit_fn = audit_fn;' -- an unwired sink makes the workflow route answer 503 audit_unavailable",
     "wf_deps.persist_audit_fn": "'wf_deps.persist_audit_fn = audit_fn;' -- the persisted sink the route prefers; "
                                 "unwired it falls back to the best-effort one",
+    "wf_deps.emit_event_fn": "'wf_deps.emit_event_fn = emit_event_fn;' -- the emitter is optional, so unwired the REST "
+                             "v1 execute twin quietly stops publishing the legacy route's workflow.executed",
+    "set_emit_event_fn": "'mcp_server_->set_emit_event_fn(emit_event_fn);' -- the emitter is optional, so unwired "
+                         "MCP execute_workflow (and the other event-publishing tools) quietly stop publishing "
+                         "the legacy routes' events",
     "set_should_stop": "'workflow_engine_->set_should_stop([this] {...});' with stop_requested_ -> kStop checked "
                        "before draining_ -> kDraining -- an unset one means no run ever learns of a shutdown",
 }
@@ -283,6 +292,8 @@ WF_IDEMP_LINE = ("        wf_deps.workflow_idempotency_lookup = workflow_idempot
 MCP_IDEMP_LINE = "            mcp_server_->set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_fn);\n"
 AUDIT_FN_LINE = "        wf_deps.audit_fn = audit_fn;\n"
 PERSIST_AUDIT_FN_LINE = "        wf_deps.persist_audit_fn = audit_fn; // #4990: the drawer's response.forensics.read row\n"
+WF_EMIT_LINE = "        wf_deps.emit_event_fn = emit_event_fn; // the v1 execute twin's workflow.executed\n"
+MCP_EMIT_LINE = "            mcp_server_->set_emit_event_fn(emit_event_fn);\n"
 SHOULD_STOP_HEAD = "                workflow_engine_->set_should_stop([this] {\n"
 SHOULD_STOP_STOP = ("                    if (stop_requested_.load(std::memory_order_acquire))\n"
                     "                        return yuzu::server::WorkflowStopLevel::kStop;\n")
@@ -304,7 +315,8 @@ class TierPolicyWiringLexical(unittest.TestCase):
         src = self.src
         for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE,
                   REVALIDATE_ASSIGN_LINE, REVALIDATE_BODY_LINE, STREAM_BUDGET_LINE, WF_DRAINING_HEAD, MCP_DRAINING_HEAD,
-                  RUN_ADAPTER_TAIL, AUDIT_FN_LINE, PERSIST_AUDIT_FN_LINE, SHOULD_STOP_HEAD, SHOULD_STOP_STOP,
+                  RUN_ADAPTER_TAIL, AUDIT_FN_LINE, PERSIST_AUDIT_FN_LINE, WF_EMIT_LINE, MCP_EMIT_LINE,
+                  SHOULD_STOP_HEAD, SHOULD_STOP_STOP,
                   SHOULD_STOP_DRAIN):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
@@ -452,6 +464,21 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T46 mcp set_workflow_idempotency_lookup_fn wired to an empty function",
              src.replace(MCP_IDEMP_LINE, MCP_IDEMP_LINE.replace("(workflow_idempotency_lookup_fn)", "({})"), 1),
              ["set_workflow_idempotency_lookup_fn"]),
+            ("T47 wf_deps.emit_event_fn dropped (compiles: the emitter is optional)",
+             src.replace(WF_EMIT_LINE, WF_EMIT_LINE.replace("wf_deps.emit_event_fn", "wf_deps.unrelated"), 1),
+             ["wf_deps.emit_event_fn"]),
+            ("T48 wf_deps.emit_event_fn commented out (anchoring proof)",
+             src.replace(WF_EMIT_LINE, "// " + WF_EMIT_LINE, 1),
+             ["wf_deps.emit_event_fn"]),
+            ("T49 wf_deps.emit_event_fn wired to an empty function",
+             src.replace(WF_EMIT_LINE, WF_EMIT_LINE.replace("= emit_event_fn", "= {}"), 1),
+             ["wf_deps.emit_event_fn"]),
+            ("T50 mcp set_emit_event_fn dropped",
+             src.replace(MCP_EMIT_LINE, MCP_EMIT_LINE.replace("set_emit_event_fn", "set_unrelated_fn"), 1),
+             ["set_emit_event_fn"]),
+            ("T51 mcp set_emit_event_fn wired to an empty function",
+             src.replace(MCP_EMIT_LINE, MCP_EMIT_LINE.replace("(emit_event_fn)", "({})"), 1),
+             ["set_emit_event_fn"]),
             ("T11 the writer wired after register_routes (count stays one)",
              src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1) + AUDIT_SESSION_LINE,
              ["BEFORE"]),

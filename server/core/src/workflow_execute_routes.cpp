@@ -246,6 +246,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                 };
             }
             ports.audit = audit;
+            ports.emit = bind_event_emit(d.emit_event_fn, req, d.metrics);
             ports.count_target_rejected = [&](std::string_view reason) {
                 if (!d.metrics)
                     return;

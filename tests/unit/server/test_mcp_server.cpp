@@ -49909,6 +49909,129 @@ TEST_CASE("MCP execute_workflow: a caller with no tier (the handler path) claims
     CHECK(fx.dispatches == 2);
 }
 
+TEST_CASE("MCP execute_workflow: publishes the legacy workflow.executed once for an admitted run of "
+          "any outcome, none for a refusal, a replay or a run that threw, and a throwing emitter "
+          "changes nothing",
+          "[mcp][pg][workflow][twin][events]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    const std::string args = R"({"workflow_id":"wf-1","agent_ids":["a1"]})";
+
+    SECTION("completed: one event with the legacy null shape; a repeat of the key adds none") {
+        WfMcpFx fx;
+        fx.seed(store);
+        McpEmitted em;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.emit_event_fn_for_test = em.fn();
+        ts.start_with_dispatch(fx.dispatch_fn());
+        auto first = ts.call(wf_exec_call(args, 1));
+        REQUIRE(first);
+        CHECK(wf_payload(*first)["status"] == "completed");
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "workflow.executed");
+        CHECK(em.events[0].attrs.is_null());
+        CHECK(em.events[0].payload.is_null());
+        auto second = ts.call(wf_exec_call(args, 2));
+        REQUIRE(second);
+        CHECK(wf_payload(*second)["idempotent_replay"] == true);
+        CHECK(em.events.size() == 1);
+    }
+    SECTION("partial: a step that reached nobody after step 1 was sent") {
+        WfMcpFx fx;
+        fx.seed(store);
+        fx.zero_on_dispatch = 2;
+        McpEmitted em;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.emit_event_fn_for_test = em.fn();
+        ts.start_with_dispatch(fx.dispatch_fn());
+        auto res = ts.call(wf_exec_call(args, 1));
+        REQUIRE(res);
+        CHECK(wf_payload(*res)["status"] == "partial");
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "workflow.executed");
+    }
+    SECTION("nothing reached any agent is still a run the engine admitted") {
+        WfMcpFx fx;
+        fx.seed(store);
+        fx.zero_all_with = [](yuzu::server::ConfinedDispatchOutcome&) {};
+        McpEmitted em;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.emit_event_fn_for_test = em.fn();
+        ts.start_with_dispatch(fx.dispatch_fn());
+        auto res = ts.call(wf_exec_call(args, 1));
+        REQUIRE(res);
+        CHECK(em.events.size() == 1);
+    }
+    SECTION("aborted: a step repointed mid-run and refused at send time") {
+        WfMcpFx fx;
+        fx.seed(store);
+        McpEmitted em;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.emit_event_fn_for_test = em.fn();
+        ts.workflow_run_for_test = [&](const std::string&, const std::vector<std::string>&,
+                                       yuzu::server::StepDispatchFn fn,
+                                       yuzu::server::ConditionEvalFn,
+                                       const yuzu::server::WorkflowRunControl&)
+            -> std::expected<std::string, std::string> {
+            ++fx.run_calls;
+            (void)fn(fx.step_ids[0], "[]", "{}");
+            WfMcpFx::repoint(store, fx.gated_id, "filesystem", "list");
+            (void)fn(fx.step_ids[1], "[]", "{}");
+            return std::string{"exec-1"};
+        };
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        const std::string approval_id = wf_mint_and_approve(ts, appr);
+        auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+        REQUIRE(recall);
+        CHECK(wf_payload(*recall)["status"] == "aborted");
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "workflow.executed");
+    }
+    SECTION("a refusal (unknown workflow) and a run that threw publish nothing") {
+        WfMcpFx fx;
+        fx.seed(store);
+        McpEmitted em;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.emit_event_fn_for_test = em.fn();
+        ts.start_with_dispatch(fx.dispatch_fn());
+        auto missing = ts.call(wf_exec_call(R"({"workflow_id":"wf-none","agent_ids":["a1"]})", 1));
+        REQUIRE(missing);
+        CHECK(nlohmann::json::parse(missing->body).contains("error"));
+        CHECK(em.events.empty());
+        fx.throw_on_dispatch = 2;
+        auto threw = ts.call(wf_exec_call(args, 2));
+        REQUIRE(threw);
+        CHECK(nlohmann::json::parse(threw->body)["error"]["data"]["reason"] == "dispatch_exception");
+        CHECK(em.events.empty());
+    }
+    SECTION("a throwing emitter does not fail the call or its evidence") {
+        WfMcpFx fx;
+        fx.seed(store);
+        McpEmitted em;
+        em.throws = true;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.emit_event_fn_for_test = em.fn();
+        ts.start_with_dispatch(fx.dispatch_fn());
+        auto res = ts.call(wf_exec_call(args, 1));
+        REQUIRE(res);
+        const auto payload = wf_payload(*res);
+        CHECK(payload["status"] == "completed");
+        CHECK(payload["execution_id"] == "exec-1");
+        CHECK(em.events.size() == 1);
+        CHECK(wf_audit_has(ts, "success", "execution_id=exec-1"));
+    }
+}
+
 TEST_CASE("MCP execute_workflow: the served tool leads with the key, requires it, bounds it, keeps "
           "idempotentHint false and declares the thin replay in its output schema",
           "[mcp][workflow][twin][idempotency][schema]") {

@@ -101,6 +101,16 @@ struct Fx {
     // What happened, in order. "audit:<result>", "dispatch:<instr>", "engine_returned".
     std::vector<std::string> events;
     std::vector<std::string> audit_details;
+    // The platform events the run published (the `emit` port), with the number of audit rows
+    // that existed when each was published, and the attributes/payload it carried.
+    struct Emitted {
+        std::string type;
+        json attrs, payload;
+        size_t audit_rows_at;
+    };
+    std::vector<Emitted> emitted;
+    bool wire_emit{true};
+    bool emit_throws{false};
     std::vector<std::string> counted_rejections;
     std::vector<std::string> counted_denials;
     // The chokepoint dry run is the REAL classify_and_authorize_dispatch + kill_switch_denial over
@@ -508,6 +518,12 @@ struct Fx {
         p.count_run_threw = [this] { ++run_threw_count; };
         p.count_idempotent = [this](std::string_view o) { ++idem_counts[std::string(o)]; };
         p.now_epoch = [this] { return fixed_now; };
+        if (wire_emit)
+            p.emit = [this](std::string_view type, const json& attrs, const json& payload) {
+                emitted.push_back({std::string(type), attrs, payload, audit_details.size()});
+                if (emit_throws)
+                    throw std::runtime_error("analytics sink blew up");
+            };
         return p;
     }
 
@@ -1874,6 +1890,10 @@ struct Rest {
     // is THIS request (not a copy made at registration).
     std::vector<std::string> reauth_principals;
     std::vector<std::string> reauth_tokens;
+    // The platform events the route's emitter received (the server's 4-argument EmitEventFn).
+    std::vector<std::string> emitted;
+    std::vector<json> emitted_attrs, emitted_payloads;
+    bool emit_throws{false};
     yuzu::server::test::TestRouteSink sink;
 
     explicit Rest(bool wire_audit = true) {
@@ -1936,6 +1956,14 @@ struct Rest {
         d.stream_budget = &budget;
         d.draining = [this] { return draining; };
         d.reauthorize_retry_delay = std::chrono::milliseconds(1);
+        d.emit_event_fn = [this](const std::string& type, const httplib::Request&,
+                                 const json& attrs, const json& payload) {
+            emitted.push_back(type);
+            emitted_attrs.push_back(attrs);
+            emitted_payloads.push_back(payload);
+            if (emit_throws)
+                throw std::runtime_error("analytics sink blew up");
+        };
         d.revalidate = [this](const httplib::Request& req, const std::string& principal) {
             reauth_principals.push_back(principal);
             reauth_tokens.push_back(req.get_header_value("X-Yuzu-Token"));
@@ -4637,4 +4665,247 @@ TEST_CASE("workflow.execute audit join: workflow_audit_target keeps a normal id 
             throw std::runtime_error("sink exploded");
         },
         "surface=rest", "cid", "r", "wf-1"));
+}
+
+// ───────────────────────────── workflow.executed (the legacy route's event) ───────────────────
+
+TEST_CASE("workflow execute: a run the engine admitted publishes workflow.executed once, with the "
+          "legacy null shape, AFTER the closing audit row, whatever its outcome",
+          "[workflow][twin][events]") {
+    const auto expect_one = [](const Fx& f) {
+        REQUIRE(f.emitted.size() == 1);
+        CHECK(f.emitted[0].type == "workflow.executed");
+        CHECK(f.emitted[0].attrs.is_null());
+        CHECK(f.emitted[0].payload.is_null());
+        // Every row of the call (requested, any late denial, the closing one) existed when it was
+        // published, and the closing row is the last.
+        CHECK(f.emitted[0].audit_rows_at == f.audit_details.size());
+        CHECK(f.audit_details.size() >= 2);
+        CHECK(f.events.front() == "audit:requested");
+    };
+    SECTION("completed") {
+        Fx f;
+        CHECK(f.run().status == WorkflowExecuteStatus::kOk);
+        expect_one(f);
+    }
+    SECTION("partial: the engine ended failed after a send") {
+        Fx f;
+        f.engine_status = "failed";
+        CHECK(f.run().status == WorkflowExecuteStatus::kRunIncomplete);
+        expect_one(f);
+    }
+    SECTION("aborted: a step refused at send time after step 1 was sent") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+        const auto o = f.run();
+        CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+        expect_one(f);
+    }
+    SECTION("interrupted by a server stop") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed";
+        f.interrupt_before_step = 1;
+        CHECK(f.run().run_outcome == WorkflowRunOutcome::kInterrupted);
+        expect_one(f);
+    }
+    SECTION("a run in which no step reached any agent is still a run the engine admitted") {
+        Fx f;
+        f.outcomes["i-ro"] = ConfinedDispatchOutcome{.sent = 0, .command_id = "cmd-0"};
+        CHECK(f.run().status == WorkflowExecuteStatus::kNoAgentsReached);
+        expect_one(f);
+    }
+    SECTION("a lost closing audit row does not suppress it") {
+        Fx f;
+        f.audit_fails_on_call = 1;
+        const auto o = f.run();
+        CHECK_FALSE(o.audit_persisted);
+        REQUIRE(f.emitted.size() == 1);
+    }
+}
+
+TEST_CASE("workflow execute: a refusal, a replay, an engine refusal and a run that threw publish "
+          "no workflow.executed",
+          "[workflow][twin][events]") {
+    SECTION("an unknown workflow") {
+        Fx f;
+        f.step_ids.clear();
+        CHECK(f.run(f.request()).status != WorkflowExecuteStatus::kOk);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("a step whose approval mode does not admit the caller") {
+        Fx f;
+        f.defs["i-ro"].approval_mode = "always";
+        CHECK(f.run().status == WorkflowExecuteStatus::kApprovalRequired);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("an unwired dependency") {
+        Fx f;
+        f.approval_gate = false;
+        CHECK(f.run().status == WorkflowExecuteStatus::kUnavailable);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("the requested row could not be saved") {
+        Fx f;
+        f.audit_ok = false;
+        CHECK(f.run().status == WorkflowExecuteStatus::kAuditFailed);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("the engine refused the run") {
+        Fx f;
+        f.engine_error = std::unexpected(std::string{"rejected by the engine"});
+        CHECK(f.run().status == WorkflowExecuteStatus::kExecuteFailed);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("an idempotent replay found by the pre-check") {
+        Fx f;
+        f.bind("alice", kKey, "completed");
+        CHECK(f.run(keyed(f)).status == WorkflowExecuteStatus::kIdempotentReplay);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("a conflict") {
+        Fx f;
+        f.bind("alice", kKey, "completed", 1, "wf-1", {"a1"});
+        CHECK(f.run(keyed(f, {"a1", "a2"})).status == WorkflowExecuteStatus::kIdempotencyConflict);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("a call that lost the engine's claim") {
+        Fx f;
+        f.before_claim = [&](const WorkflowIdempotencyClaim& c) {
+            f.bound[{c.principal, c.key}] = WorkflowIdempotentRun{
+                "exec-winner", "wf-1", c.fingerprint, "running", f.fixed_now};
+        };
+        CHECK(f.run(keyed(f)).status == WorkflowExecuteStatus::kIdempotentReplay);
+        CHECK(f.emitted.empty());
+    }
+    SECTION("a run that threw after the requested row (the legacy handler publishes nothing then)") {
+        Fx f;
+        f.dispatch_override = [](const WorkflowStepInstruction&, const std::vector<std::string>&,
+                                 const DispatchCaller&) -> ConfinedDispatchOutcome {
+            throw std::runtime_error("registry exploded mid fan-out");
+        };
+        CHECK(f.run().status == WorkflowExecuteStatus::kRunFailed);
+        CHECK(f.emitted.empty());
+    }
+}
+
+TEST_CASE("workflow execute: an emitter that throws, or none at all, never changes the outcome",
+          "[workflow][twin][events]") {
+    SECTION("a throwing hook") {
+        Fx f;
+        f.emit_throws = true;
+        const auto o = f.run();
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        CHECK(o.audit_persisted);
+        CHECK(f.emitted.size() == 1);
+        CHECK(f.events.back() == "audit:success");
+    }
+    SECTION("no hook wired") {
+        Fx f;
+        f.wire_emit = false;
+        CHECK(f.run().status == WorkflowExecuteStatus::kOk);
+        CHECK(f.emitted.empty());
+    }
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: publishes workflow.executed once for an admitted "
+          "run of any outcome and none for a refusal or a replay; a throwing emitter changes nothing",
+          "[workflow][twin][rest][events]") {
+    const auto post = [](Rest& r) {
+        return r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    };
+    SECTION("completed") {
+        Rest r;
+        const auto res = post(r);
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        REQUIRE(r.emitted.size() == 1);
+        CHECK(r.emitted[0] == "workflow.executed");
+        CHECK(r.emitted_attrs[0].is_null());
+        CHECK(r.emitted_payloads[0].is_null());
+    }
+    SECTION("partial") {
+        Rest r;
+        r.fx.engine_status = "failed";
+        const auto res = post(r);
+        REQUIRE(res);
+        CHECK(body_of(*res)["data"]["status"] == "partial");
+        CHECK(r.emitted == std::vector<std::string>{"workflow.executed"});
+    }
+    SECTION("aborted") {
+        Rest r;
+        r.fx.step_ids = {"i-ro", "i-ro2"};
+        r.fx.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        r.fx.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+        const auto res = post(r);
+        REQUIRE(res);
+        CHECK(body_of(*res)["data"]["status"] == "aborted");
+        CHECK(r.emitted == std::vector<std::string>{"workflow.executed"});
+    }
+    SECTION("a run in which nothing reached an agent (503 with the cause)") {
+        Rest r;
+        r.dispatch_result = ConfinedDispatchOutcome{.sent = 0, .command_id = "cmd-0"};
+        const auto res = post(r);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(r.emitted == std::vector<std::string>{"workflow.executed"});
+    }
+    SECTION("a refused call (unknown workflow, a malformed body, a denied gate)") {
+        Rest r;
+        r.fx.step_ids.clear();
+        CHECK(post(r)->status != 202);
+        CHECK(r.sink.Post("/api/v1/workflows/wf-1/execute", "not json")->status == 400);
+        r.gate_admits = false;
+        CHECK(post(r)->status == 403);
+        CHECK(r.emitted.empty());
+    }
+    SECTION("a cap or draining refusal") {
+        Rest r;
+        r.draining = true;
+        CHECK(post(r)->status == 503);
+        CHECK(r.emitted.empty());
+    }
+    SECTION("a run that threw after the requested row") {
+        Rest r;
+        r.dispatch_throws = true;
+        const auto res = post(r);
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(r.emitted.empty());
+    }
+    SECTION("a replay and a conflict") {
+        Rest r;
+        const auto first = post_with_key(r, kKey);
+        REQUIRE(first);
+        CHECK(first->status == 202);
+        REQUIRE(r.emitted.size() == 1);
+        const auto replay = post_with_key(r, kKey);
+        REQUIRE(replay);
+        CHECK(body_of(*replay)["data"]["idempotent_replay"] == true);
+        const auto conflict = post_with_key(r, kKey, R"({"agent_ids":["a1","a2"]})");
+        REQUIRE(conflict);
+        CHECK(conflict->status == 422);
+        CHECK(r.emitted.size() == 1); // still only the first call's event
+    }
+    SECTION("a throwing emitter leaves the 202 and the audit evidence as they were") {
+        Rest r;
+        r.emit_throws = true;
+        const auto res = post(r);
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        CHECK(body_of(*res)["data"]["status"] == "completed");
+        CHECK(r.emitted.size() == 1);
+        CHECK(r.metrics.counter(kEventEmitFailedMetric, {{"event_type", "workflow.executed"}})
+                  .value() == 1);
+    }
+}
+
+TEST_CASE("kEmittedEvents names workflow.executed once, so its failure counter has its own series",
+          "[workflow][twin][events]") {
+    CHECK(std::count(kEmittedEvents.begin(), kEmittedEvents.end(), "workflow.executed") == 1);
+    CHECK(kEmittedEvents.back() == "other");
 }

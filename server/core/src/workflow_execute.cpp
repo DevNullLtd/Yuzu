@@ -1440,6 +1440,10 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                      o.interrupted || !o.credential_stop.empty()
                  ? " reason=" + o.reason
                  : ""));
+    // The legacy route's event: the engine admitted and ran this call, so it is published whatever
+    // the outcome (a failed run is still a run). Last, after the evidence row, and never able to
+    // change the answer.
+    emit_event_guarded(ports.emit, "workflow.executed");
     return o;
 }
 

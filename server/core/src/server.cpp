@@ -1658,7 +1658,8 @@ public:
         metrics_.describe(yuzu::server::kEventEmitFailedMetric,
                           "Legacy-equivalent platform events (execution.created, "
                           "execution.completed, command.dispatched, instruction.executed, "
-                          "approval.created) that the v1 REST and MCP twins tried to publish "
+                          "approval.created, workflow.executed) that the v1 REST and MCP twins "
+                          "tried to publish "
                           "after a successful effect and whose emit hook THREW (a payload "
                           "serialisation or hook defect). NOT an analytics-drop signal: the "
                           "analytics emit itself is fail-soft, so an event that is dropped (for "
@@ -21049,6 +21050,7 @@ private:
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);
         };
+        wf_deps.emit_event_fn = emit_event_fn; // the v1 execute twin's workflow.executed
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {

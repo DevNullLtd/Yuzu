@@ -8637,6 +8637,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     return yuzu::server::detail::try_persist_audit(
                         audit_fn, req, action, result_status, "workflow", target_id, detail_text);
                 };
+                // The legacy route's workflow.executed, published by the run itself.
+                ports.emit = bind_event_emit(emit_event_fn_, req, metrics);
                 ports.count_target_rejected = [&](std::string_view reason) {
                     if (!metrics)
                         return;

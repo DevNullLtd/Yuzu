@@ -12,6 +12,7 @@
 #include "authz_model.hpp" // yuzu::server::authz::VisibleSet (K-R7-02 / #1788)
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
+#include "event_emit.hpp"       // yuzu::server::EmitEventFn: the 4-argument emitter the v1 execute twin binds
 #include "execution_tracker.hpp"
 #include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
@@ -205,6 +206,10 @@ public:
         /// `POST /api/instructions/{id}/execute`. Empty = same-host only.
         std::vector<std::string> csrf_trusted_origins;
         EmitEventFn emit_fn;
+        /// The same emitter in the 4-argument shape `bind_event_emit` takes, for the v1 execute
+        /// twin's `workflow.executed` (the legacy route above publishes it through `emit_fn`).
+        /// Unset = the twin publishes no event.
+        yuzu::server::EmitEventFn emit_event_fn;
         ScopeEstimateFn scope_fn;
         /// Kept for the legacy unversioned GET/mutator routes above (`GET
         /// /api/workflows[/{id}]`, `GET /api/workflow-executions/{id}`,
