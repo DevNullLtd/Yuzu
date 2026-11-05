@@ -2,6 +2,29 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Upgrade note: the server now requires a `revocation_source_store` schema (CRL sources, ADR-0070 R1)
+
+This release adds the registered-CRL-source store (`/api/v1/crypto/revocation-sources`). It is
+**fail-closed like the other authoritative stores**: at start the server creates the
+`revocation_source_store` schema in the PostgreSQL database, and if it cannot, **it refuses to
+start**.
+
+- **Privilege.** The database role the server connects as needs `CREATE` on the database (to create the
+  schema on first start), exactly as for the other `*_store` schemas. A role that was restricted
+  after the earlier schemas were created will now fail here.
+- **The refusing-to-start log line** is `[PG] Refusing to start: revocation-source store
+  migration/open failed (database reachable but the revocation_source_store schema could not be
+  created/opened)`, followed by exit status `1`. It names this store, not a generic database
+  failure; the lines above it carry the PostgreSQL error.
+- **`/readyz`** includes `revocation_source_store` in its gating checks; a node that did not open it
+  does not serve.
+- **Rolling back** to an older server leaves the `revocation_source_store` schema in place; the older
+  binary ignores it. Nothing is dropped, and upgrading again reuses it (registrations, and the CAs'
+  anti-rollback marks, survive a rollback).
+- **Four new step-up routes and 39 securable types.** The four mutating routes are step-up gated (41 gated
+  routes in total), and RBAC now seeds a `RevocationSource` securable (Administrator only; see
+  [RBAC](rbac.md)). Nothing is fetched yet: this release registers CRL sources only.
+
 ## Behaviour change: installed-software schema v10 (the server accepts the sectioned report)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.
@@ -826,14 +849,14 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 
 ## ⚠️ Breaking: MFA step-up is checked once, before the route's own checks, and two more routes need a fresh proof
 
-A fresh MFA proof is required on 37 named high-risk routes (the list is in
+A fresh MFA proof is required on 41 named high-risk routes (the list is in
 [REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints), which also names the three
 JIT-elevation routes) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
 un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied.
 "High-risk" names these routes; it is not a claim that every high-risk operation is covered. Other
-mutating routes and all MCP tools are not MFA-step-up gated in this release. The check on those 37
+mutating routes and all MCP tools are not MFA-step-up gated in this release. The check on those 41
 routes now runs in one place, in the server's request pipeline, instead of inside each handler,
-and two of the 37 are existing routes that are newly gated; six more are routes that are new in this release (see below). The proof each caller needs and the step-up window are unchanged. The
+and two of the 41 are existing routes that are newly gated; ten more are routes that are new in this release (see below). The proof each caller needs and the step-up window are unchanged. The
 three JIT-elevation routes keep their own handler gate. What an operator or script can notice:
 
 - **Two routes are newly gated.** `POST /api/settings/mfa/recovery-codes` (the Settings page's
@@ -848,16 +871,18 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
   failure). An account with no MFA enrolled is not affected.
 - **What is newly gated, measured against the last release (v0.14.1).** Only the two Settings MFA
-  routes above are gated for the first time by this change. Of the other 35, 25 already called the
-  step-up check from their handlers in v0.14.1. The remaining ten were gated in their handlers
+  routes above are gated for the first time by this change. Of the other 39, 25 already called the
+  step-up check from their handlers in v0.14.1. The remaining fourteen were gated in their handlers
   earlier in this release cycle, so they need a fresh proof too, but
   not through this change. Four are existing routes that v0.14.1 did not step-up gate: the
   dashboard API-token create and revoke routes (see "Behaviour change: dashboard API-token create
   and revoke apply MFA step-up" below), and `POST /api/approvals/{id}/approve` and
-  `POST /api/approvals/{id}/reject` (documented in their own Breaking section below). The other six
+  `POST /api/approvals/{id}/reject` (documented in their own Breaking section below). The other ten
   are routes that did not exist in v0.14.1: the local password change and the administrator
   password reset, the Guardian guard Edit and Delete routes,
-  `POST /api/v1/guaranteed-state/policy-generation/raise` and `PUT /api/v1/config/{key}`. For those ten, this change alters the order of checks and the engine-principal denial
+  `POST /api/v1/guaranteed-state/policy-generation/raise`, `PUT /api/v1/config/{key}` and the four
+  CRL-source mutation routes (`POST /api/v1/crypto/revocation-sources`, `PUT` and `DELETE
+  /api/v1/crypto/revocation-sources/{id}` and `POST .../reset-high-water`). For those fourteen, this change alters the order of checks and the engine-principal denial
   described below, not the proof the caller needs.
 - **Step-up comes before authorization, and after the server-wide same-site check.** A session with
   a stale or missing MFA proof is answered with the `401` step-up envelope before the route's own
@@ -896,7 +921,7 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   step-up envelope, no engine quota and no step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit,
   the `401` for no session, the engine quota `429`) and the `503` of a server with no wired
   authentication store, which every caller class gets. An engine principal cannot satisfy a TOTP
-  challenge, so it is never asked to. **The audit shape changes on these 37 routes.** The denial is
+  challenge, so it is never asked to. **The audit shape changes on these 41 routes.** The denial is
   now recorded as `mfa.step_up.required` (`result=error`, `reason=engine_principal_denied`). The
   per-route handler denial row (`result=denied`, detail `engine_session_denied`) and the older body
   text `engine principals cannot access this endpoint` are no longer produced there, and the body
@@ -916,13 +941,13 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   must treat a `503` as "retry shortly" and prompt for a code only on a `401`. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it.
-- **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 37 routes (reason
+- **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 41 routes (reason
   `saml_session_no_mfa_this_release`, see #4935), unless `--mfa-step-up-window-secs` is `0` or less:
-  the disabled window is checked before the SAML refusal, so SAML sessions then pass all 37. A
+  the disabled window is checked before the SAML refusal, so SAML sessions then pass all 41. A
   deployment whose only interactive sign-in is SAML has no session route to any of them. The
   refusal's remediation says SAML sessions cannot satisfy step-up in this release (re-authenticating
   does not help) and to use an existing untiered, unscoped API token where the route accepts one, or
-  ask an administrator; that applies to all 37 routes, not only the token routes, and a SAML session
+  ask an administrator; that applies to all 41 routes, not only the token routes, and a SAML session
   cannot mint a token itself. A token helps only on a route that accepts one (some routes, such as
   the password-change routes, refuse a token session), so otherwise ask an administrator who signs in
   locally or through OIDC. For the token
@@ -974,17 +999,17 @@ The same test suite also classifies every non-Read MCP tool in a second table an
 missing or stale row; that table is data only and changes no MCP behaviour.
 
 **Action.** None required for a stock deployment. Check any script that signs in with a session
-cookie and calls one of the 37 routes: it may now see `401` where it saw `403`. Measured from
+cookie and calls one of the 41 routes: it may now see `401` where it saw `403`. Measured from
 v0.14.1, six existing routes that needed no fresh proof now need one inside the window: the two
 Settings MFA routes (gated by this change) and the four existing routes listed under "What is newly gated"
-above (gated earlier in this release cycle). The six routes that are new in this release need one too.
+above (gated earlier in this release cycle). The ten routes that are new in this release need one too.
 `--mfa-step-up-window-secs 0` (or less) disables
-the stale-proof requirement on the 37 routes and still logs a startup `WARN`. While it is in
+the stale-proof requirement on the 41 routes and still logs a startup `WARN`. While it is in
 force no stale proof is refused (so none is recorded), and the SAML refusal and the
 authentication-store read are skipped too, so SAML sessions also pass; engine denials and
 unwired-store refusals still apply and are still recorded. The JIT-elevation routes keep a 300 s window (the global
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
-window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the six routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
+window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the ten routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
 
 ## Behaviour change: /health and /api/health per-source budget
 
@@ -1015,7 +1040,7 @@ window is 0 or less. This release has no supported return to v0.14.1 (see "Deplo
 
 ## ⚠️ Breaking: the OpenAPI document is larger and typed, every operation has an `operationId`, and there is a `/swagger` page
 
-**What changed.** `GET /api/v1/openapi.json` now gives 271 of its 273 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 32 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}` and `GET`, `PUT` and `DELETE /dex/score-policy`; all 32 are typed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. This changes the description of the API, not the API: no route, request or response changed, so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
+**What changed.** `GET /api/v1/openapi.json` now gives 277 of its 279 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 38 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}` and `GET`, `PUT` and `DELETE /dex/score-policy`; all 38 are typed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. This changes the description of the API, not the API: no route, request or response changed, so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
 
 **Who is affected.** Anyone who generates a client from the document (typed return types, renamed methods and a changed security-scheme model can break generated code), anyone who compares or hash-pins the document byte for byte, and any agentic worker that reads `yuzu://openapi` into its context.
 
@@ -2003,7 +2028,7 @@ customer-distribution lane. Before switching lanes, read the
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The built-in server certificate is re-issued once with a server identity URI (#6016).** Same root, same key, so existing `mgmt_peer_pins` stay valid and the gateway needs no action for the re-issue. The gateway in this release can also admit the server by that identity (`mgmt_peer_auth_mode`, `mgmt_peer_identity`, `mgmt_peer_denied`; new reasons on `yuzu_gw_mgmt_auth_rejected_total`, new counter `yuzu_gw_mgmt_auth_admitted_total`, new alert `YuzuServerIdentityUriAbsent`): the identity is an explicit opt-in (release N: its shipped reference configs were `pin`, and an unset mode is `pin` in every release; from release N+1 the shipped configs set `identity`, see the release N+1 row below), so nothing changes for a config of your own until you set `identity_or_pin` or `identity`. The old certificate shows as revoked with reason `superseded` in the CA inventory and the next CRL (bookkeeping, not a compromise). New audit action `server.default_certs_server_identity_upgraded`, new gauge `yuzu_server_identity_uri_present`. See [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity) and "Behaviour change: the built-in server certificate is re-issued once with a server identity URI". |
 | after 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway: the shipped reference configs now admit the server by its identity (#6016, release N+1; gateway restart required, breaking for own-certificate installs that take the new config).** The reference gateway configs (`gateway/config/sys.config.prod`, `deploy/docker/reference-gateway-sys.config`) set `{mgmt_peer_auth_mode, identity}` with no pin. An unset mode is still `pin` (the boot logs a WARN), so a config of your own that does not set the key is unchanged. Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key` carry no identity: **set `{mgmt_peer_auth_mode, pin}` and keep your pin before you take the new config**, or every command is refused `no_uri_san`. Upgrade the server first (the gateway needs a server that mints the identity, #6072). Read "Behaviour change: the shipped gateway configs admit the server by its identity" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Breaking, fresh deployment only: stored responses of Forensics-tier plugins are served only to callers holding `Forensics:Read` (#4990).** Applies to every stored-response read path (REST, MCP, dashboard) and to the server-side consumers of those rows (bundle collation, result-set membership, policy checks, the live output stream, execution error text), with the limits listed under "Known limits" in that section; other readers see the rows as absent, with counts and caps computed over what they may read, so an empty result no longer implies no data. Viewer, Operator, PlatformEngineer and ITServiceOwner, and with RBAC off every non-administrator session, no longer see these rows. New built-in `ForensicsAnalyst` role (read-only, assign it fleet-wide with RBAC on) and new audit action `response.forensics.read`. A read whose authority cannot be determined is refused with a retryable error rather than a partial result. This release is a hard cutover: it supports initial deployment into a fresh database only and provides no upgrade path from an earlier server's database (see "Deployment contract" in the section; the agent and gateway columns above are the minimum agent and gateway versions, not a supported upgrade starting point for the database). See "Behaviour change: stored responses of Forensics-tier plugins need `Forensics:Read` (#4990, fresh deployment only)". |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 37 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 41 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Seven runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for non-administrator and MCP-tier callers; server restart only, no agent or gateway change, no migration).** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days` now answer `403` to a supervised-tier MCP token and, with RBAC on, to a non-administrator role that holds `Infrastructure:Write`; every other config key is unchanged. Server restart only; see the first section on this page. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The runtime-configuration read shows a caller only the overrides it could write (breaking for MCP-tier and non-administrator readers; server restart only, no agent or gateway change, no migration).** `GET /api/config`, `GET /api/v1/config` and the MCP tool `get_runtime_config` leave out the `oidc_*`, `plugin_signing_required`, DEX alert and `audit_retention_days` overrides unless the caller could write them; an administrator account's `GET /api/config` body is unchanged apart from `log_level` reading `warn`. `heartbeat_timeout` is limited to 30 to 86400 seconds on every write route. Mixed-version fleets are not a concern (server-side only). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The Settings Engine Principals panel needs EnginePrincipal:Read (breaking for an account administrator without it; server restart only, no agent or gateway change, no migration).** See the section above. |

@@ -644,13 +644,13 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **Step-up on high-risk surfaces** — `cfg.mfa_step_up_window_secs` (300 s
   default) controls how long after a TOTP proof high-risk endpoints
   accept the session as "stepped up." PR 2 introduced the gate on 11
-  sites and the `/login/mfa/stepup` proof route; it now covers 39 mutating
-  routes (user delete and role change, token, session, engine-principal,
+  sites and the `/login/mfa/stepup` proof route; it now covers 44 mutating
+  routes (41 enforced by the chokepoint plus the 3 JIT-elevation routes) (user delete and role change, token, session, engine-principal,
   RBAC-assignment and enforcement-toggle lifecycle, password reset and
   unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
   software-package write, software-deploy start, approval approve and reject
   (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
-  regeneration and MFA disable, JIT elevation). 37 are enforced by the
+  regeneration and MFA disable, JIT elevation). 41 are enforced by the
   central chokepoint described under "MFA step-up chokepoint" below; the
   three JIT-elevation routes apply their own stricter gate in the handler.
   Other mutating routes and all MCP tools are not MFA-step-up gated in
@@ -688,7 +688,7 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; today's 37 enforced routes, 34 of
+  `kRequired` (a fresh proof is needed; today's 41 enforced routes, 34 of
   them with the audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
@@ -696,7 +696,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 242 REST rows: 37 `kRequired`, 3 `kOwnGate`, 129 `kExempt` and 73
+  table has 246 REST rows: 41 `kRequired`, 3 `kOwnGate`, 129 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
   body of the post-read stage `server.cpp` installs through
@@ -759,7 +759,7 @@ by each handler.
   `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
   `kRequired` rows, but neither the engine denial nor the null-store check
   below. The escape hatch precedes the SAML denial and the store read in
-  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 37
+  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 41
   routes and the authentication store is not read; no stale proof is refused
   (so none is recorded), while engine denials and unwired-store refusals are
   still recorded. The elevation routes use the global window when it is positive
@@ -837,7 +837,7 @@ by each handler.
   calls may be deleted once handlers consume the centrally resolved session or the
   repeated resolves are removed (#6200); the binding stays until then. Until then
   the in-handler calls remain
-  as defence in depth (39 distinct labels: one per `kRequired` row, 37, plus
+  as defence in depth (43 distinct labels: one per `kRequired` row, 41, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
@@ -887,19 +887,19 @@ by each handler.
   server's route table is sealed: a later mutating registration through the
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
-- **Scope.** A fresh MFA proof is required on 37 named high-risk routes (plus
+- **Scope.** A fresh MFA proof is required on 41 named high-risk routes (plus
   the three JIT-elevation routes, whose handlers apply their own gate) for
   MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
   un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
-  "High-risk" names these 37 routes; it is not a completeness claim. Other
+  "High-risk" names these 41 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (68 rows: 22 `kExempt`, 46
+  a second table, `step_up_mcp_policy.hpp` (72 rows: 22 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
-  plus a separate list of tools added after it (today two), legal only for a tool
+  plus a separate list of tools added after it (today six), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
   consumer enforces `kRequired` yet. PR 2 promotes pending rows; how it resolves the MCP rows
@@ -2183,16 +2183,16 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any step-up-gated route (the 39 listed in the REST API
+session hitting any step-up-gated route (the 44 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
 deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable,
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 37 routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 41 routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
-300 s window, so those still deny SAML). Approval approve/reject are among the 37 central
+300 s window, so those still deny SAML). Approval approve/reject are among the 41 central
 routes, so with the window enabled the central check answers a SAML session first with this
 generic 403, and the handler never runs. They also carry their own, stricter approver gate
 (#6079), which refuses a SAML session in every configuration; the typed
@@ -3525,7 +3525,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 38 securable types, per-operation permissions, deny-override logic.
+- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 39 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
@@ -3724,6 +3724,15 @@ only when a change cannot be expressed as an idempotent additive re-seed
 (`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
+
+### The revocation-source surface: a registered-egress-target floor class and a further administrator-predicate call site (ADR-0070 R1)
+
+`RevocationSource:Read` is floored (`authz_topology_floor.hpp`) under a class the header's inclusion test now names: **the read discloses operator-registered egress targets** (registered CRL URLs, their confirmed address classes and fetch status map internal network topology). It fits none of the earlier classes, and the header says so rather than stretching one. The floor is only the RBAC-off half: the whole surface (`/api/v1/crypto/revocation-sources*` and the six `*_revocation_source*` MCP tools) is **also** gated on the durable-administrator predicate in **both** RBAC states, through `revocation_source_admin_gate.hpp`'s `decide_admin`, which composes `is_rbac_administrator` (`RbacAdminSurface::kRest` for the REST routes, `kMcp` for the tools) and, for a write, `RbacStore::check_caller_authorized_under_current_regime`. It adds no rule to the predicate (EXTEND it, never fork it). Consequences, each tested:
+
+- **Not grantable.** `RevocationSource` is seeded to `Administrator` only, but a custom role can still be granted `RevocationSource:Read`/`:Write` under RBAC on; such a holder is refused on every route and tool, because the securable is necessary and never sufficient. The access-review export lists any such grant. The reason the grant is refused: the fetch-status fields would otherwise make the fetcher a blind request-forgery and port-scan oracle for whoever holds it.
+- **Service-scoped tokens** are refused by the securable gate (neither pair is in `kServiceScopeGlobalSafe`) and by the predicate; **MCP-tier bearer tokens** are refused on REST by the predicate (`kRest`).
+- **`RevocationSource:Write` is a deliberate entry on `mcp::requires_approval`'s supervised list** (`mcp_policy.hpp`): removal, reset and registration are all a `Write`, never a `Delete`, so without the entry a supervised MCP token held by an administrator would change the registry with no ticket. On REST an MCP-tier token is refused outright (the predicate with `kRest` denies any non-empty `mcp_tier`), so the entry gates MCP only.
+- The four mutations are `kRequired` rows in `step_up_policy.hpp` (and `pending` on the MCP side with a `kRequired` twin).
 
 ## Render-time permission probes (capability hints)
 

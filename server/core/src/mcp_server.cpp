@@ -48,6 +48,7 @@
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
+#include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + RevocationSourceService (shared REST+MCP)
 #include "guardian_generation_raise.hpp"   // raise_guardian_policy_generation: shared REST+MCP parse/audit-detail/result builders
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
@@ -4463,6 +4464,148 @@ static const ToolDef kTools[] = {
      R"j("can_access_settings":{"type":"boolean","description":"Whether the admin-only settings pages admit this session; always false for an MCP tier or service-scoped token"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["username","display_name","role","principal_kind","auth_source","mcp_tier","scope_service","rbac_enabled","rbac_roles_resolved","effective_role","elevated","can_access_settings"],"additionalProperties":false})j"},
+
+    // ── Revocation sources (ADR-0070 R1, slice 2b-1a) ─────────────────────────────────────────
+    // Registered CRL sources: a CA plus the CRL URLs the server may fetch for it. Admin-only in
+    // both RBAC states (the RevocationSource securable AND the durable-administrator predicate),
+    // so not grantable; removal is a Write. REST twins: /api/v1/crypto/revocation-sources.
+    {"list_revocation_sources",
+     "List the registered CRL sources: each is one CA (its certificate keys, by sha256 / SKI / "
+     "SPKI hash) and the CRL URLs the server may fetch for it, with the address classes the "
+     "administrator confirmed, a per-URL fetch status and the source's crl_status. This release "
+     "registers sources only: crl_status reads no_crl_fetched and every fetch_status reads "
+     "never_fetched until the fetcher ships, so a source here is NOT evidence that any "
+     "certificate was checked. The result carries crl_past_next_update, the count of registered "
+     "CRL scopes whose held CRL (base or delta) is past its nextUpdate (always 0 until CRLs are held). Scope: facts only; the only "
+     "built-in checks are D13's named rules and windows, each shown with its criterion. Requires "
+     "the RevocationSource:Read grant AND a durable Administrator role (not grantable: a custom "
+     "role holding the pair is still refused); denied outright to a service-scoped token. "
+     "Audited as crypto.revocation_source.list; if that row cannot be written the list is still "
+     "returned with audit_persisted false. A degraded store is a retryable error, never an empty "
+     "list. Mirrors GET /api/v1/crypto/revocation-sources.",
+     R"({"type":"object","properties":{},"additionalProperties":false})",
+     R"j({"type":"object","properties":{"sources":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls"]}},"total":{"type":"integer","minimum":0},"max_sources":{"type":"integer"},"crl_past_next_update":{"type":"integer","minimum":0,"description":"Registered CRL scopes whose held CRL (base or delta) is past its nextUpdate (a count of scopes, not of sources)"},"audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"}},"required":["sources","total","max_sources","crl_past_next_update"]})j"},
+
+    {"get_revocation_source",
+     "Show one registered CRL source by id: its name, the CA subject hash, each CA certificate "
+     "(cert_sha256, ski, spki_sha256), each CRL URL with the address classes the administrator "
+     "confirmed and its fetch status, config_version, who registered it and when. Fetch status "
+     "reads never_fetched until the fetcher ships. Scope: facts only; the only built-in checks are D13's "
+     "named rules and windows, each shown with its criterion. Requires RevocationSource:Read AND "
+     "a durable Administrator role; denied outright to a service-scoped token. Audited as "
+     "crypto.revocation_source.view; if that row cannot be written the source is still returned "
+     "with audit_persisted false. An unknown id is a non-retryable invalid_params error (MCP has no 404 code); a degraded store is "
+     "a retryable error. Mirrors GET /api/v1/crypto/revocation-sources/{id}.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id from list_revocation_sources"}},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls"]})j"},
+
+    {"register_revocation_source",
+     "Register a CA and the CRL URLs the server may fetch for it. This adds an outbound fetch "
+     "target: the server will request exactly these URLs, and an address the administrator did "
+     "not confirm is never fetched. ca_certificates are 1..8 PEM CERTIFICATE blocks (one CA: "
+     "every certificate must share one subject Name, each must be a CA with basicConstraints "
+     "cA=TRUE and cRLSign when it has a key usage extension; several keys let a CA renewal keep "
+     "verifying). crl_urls are 1..8 objects {url, confirmed_address_classes}: http or https, a "
+     "host, no userinfo, no fragment, at most 2048 bytes, ASCII only (give an internationalised "
+     "host as punycode). The host is resolved at registration. Loopback, link-local, cloud "
+     "metadata, unspecified, multicast, reserved addresses and every address this server is "
+     "bound to are refused with no override. Any other class (public, private, "
+     "carrier-grade-nat, unique-local, non-global) must be named in confirmed_address_classes: "
+     "if you omit it the call is refused with invalid_params naming the classes the host "
+     "resolves to; read them and call again with that list. At most 64 sources; one source per "
+     "CA (a second registration of the same CA is a non-retryable invalid_params error naming the existing "
+     "id in its remediation: use update_revocation_source). Not idempotent. This release stores registrations only: "
+     "no CRL is fetched and no certificate is judged. Requires RevocationSource:Write AND a "
+     "durable Administrator role (not grantable), the supervised MCP tier (approval-gated: the "
+     "first call returns an approval ticket, re-call with the returned approval_id) and is "
+     "denied outright to a service-scoped token and to an MCP-tier-less caller. Resolves the "
+     "registered host, the only outbound reach any tool has. The refusals are exact: the NAT64 "
+     "forms (the well-known 64:ff9b::/96 and any prefix the operator declared with "
+     "--oidc-nat64-prefix) and 6to4 and IPv4-mapped forms are judged by the IPv4 address they "
+     "embed. Declared prefixes only at registration: no RFC 7050 discovery is done, so an address "
+     "behind an undeclared prefix the network advertises is judged as plain IPv6 here and "
+     "re-judged when the source is fetched. If this server's own addresses cannot be determined "
+     "or a name lookup times out, the call fails closed with a retryable error (retry_after_ms "
+     "5000) and registers nothing. Audited as "
+     "crypto.revocation_source.register: an attempted row is written first and if it cannot be "
+     "stored nothing is changed. Scope: facts only; the only built-in checks are D13's named rules and "
+     "windows, each shown with its criterion. Mirrors POST /api/v1/crypto/revocation-sources.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"A label for the source (free text, escaped on render)"},)j"
+     R"j("ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"1..8 PEM CERTIFICATE blocks of one CA"},)j"
+     R"j("crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048,"description":"An http or https CRL URL: a host, no userinfo, no fragment, ASCII only (an internationalised host as punycode)"},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]},"description":"The address classes the host resolves to, which you confirm the server may fetch from"}},"required":["url"],"additionalProperties":false},"description":"1..8 CRL URLs, each with the address classes you confirm"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["name","ca_certificates","crl_urls"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls"]})j"},
+
+    {"update_revocation_source",
+     "Replace a registered CRL source's name, CA certificates and CRL URLs (a full replace, the "
+     "same body as register_revocation_source plus the source id). This is how a renewed CA key "
+     "is added. The CA certificates must name the same subject as the registered source. "
+     "Dropping a URL deletes that URL's fetch status and every held CRL fetched from it; "
+     "dropping a key deletes every held CRL that verified only under it (destructive to that "
+     "held data; nothing is held in this release). The CA's anti-rollback marks are never "
+     "touched. expected_config_version is REQUIRED: pass the config_version you read with "
+     "get_revocation_source; if the source has changed since, the call is refused as a "
+     "non-retryable conflict (invalid_params, naming the current version) and nothing is "
+     "replaced, so an approved call cannot silently revert a newer configuration. Idempotent: a "
+     "body equal to the current configuration changes nothing and does "
+     "not bump config_version (changed false). The host of every URL is resolved again and the "
+     "same address rules and confirmations apply. Requires RevocationSource:Write AND a durable "
+     "Administrator role, the supervised MCP tier (approval-gated) and is denied outright to a "
+     "service-scoped token and to an MCP-tier-less caller. Resolves the registered hosts. "
+     "Audited as crypto.revocation_source.update (an attempted row first). Scope: facts only; the only "
+     "built-in checks are D13's named rules and windows, each shown with its criterion. Mirrors "
+     "PUT /api/v1/crypto/revocation-sources/{id}.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"integer","minimum":1,"description":"The source id"},)j"
+     R"j("expected_config_version":{"type":"integer","minimum":1,"description":"The source's config_version as you last read it (get_revocation_source). Refused with a conflict if the source has changed since, so an approved call cannot revert a newer configuration"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"A label for the source (free text, escaped on render)"},)j"
+     R"j("ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"1..8 PEM CERTIFICATE blocks of one CA, naming the same subject as the registered source"},)j"
+     R"j("crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048,"description":"An http or https CRL URL: a host, no userinfo, no fragment, ASCII only (an internationalised host as punycode)"},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]},"description":"The address classes the host resolves to, which you confirm the server may fetch from"}},"required":["url"],"additionalProperties":false},"description":"1..8 CRL URLs, each with the address classes you confirm"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["id","expected_config_version","name","ca_certificates","crl_urls"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}},"changed":{"type":"boolean","description":"False when the body equalled the stored source (config_version unchanged)"},"dropped_urls":{"type":"integer","minimum":0},"dropped_ca_certificates":{"type":"integer","minimum":0},"crls_deleted":{"type":"integer","minimum":0},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls","changed","dropped_urls","dropped_ca_certificates","crls_deleted"]})j"},
+
+    {"remove_revocation_source",
+     "Remove a registered CRL source with its URLs, held CRLs, entries and signature checks. "
+     "Certificates the source covered then read 'issuer not registered'. The CA's anti-rollback "
+     "marks SURVIVE, so removing and re-registering the CA cannot accept an older CRL. Removal "
+     "is a Write (there is no separate Delete). Idempotent: a repeat has no further effect and "
+     "answers a non-retryable invalid_params error (no such revocation source). Requires RevocationSource:Write AND a durable "
+     "Administrator role, the supervised MCP tier (approval-gated) and is denied outright to a "
+     "service-scoped token and to an MCP-tier-less caller. Audited as "
+     "crypto.revocation_source.remove (an attempted row first). Scope: facts only; the only built-in "
+     "checks are D13's named rules and windows, each shown with its criterion. Mirrors DELETE "
+     "/api/v1/crypto/revocation-sources/{id}.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer","description":"The removed source id"},"removed":{"type":"boolean","const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["id","removed"]})j"},
+
+    {"reset_revocation_source_high_water",
+     "Reset a registered CA's CRL anti-rollback marks and discard its held CRLs. Use it ONLY "
+     "after confirming the CA's clock or CRL numbering moved backwards on purpose: until the next "
+     "CRL is accepted the CA's certificates read 'revocation not checked', and the reset opens a "
+     "replay window, because a CRL that verifies and is dated at or after the reset is accepted "
+     "whatever its number. reset_at (RFC 3339 UTC, optional, no later than the server clock; "
+     "default now) sets the floor: a value below the CA's current thisUpdate widens that window "
+     "to everything since it. The response echoes the window opened. NOT idempotent: each call "
+     "sets a new reset_at and deletes the held CRLs again, so a repeat after a CRL was accepted "
+     "discards it. After a reset whose outcome is unknown, read get_revocation_source: "
+     "high_water.reset_at shows the floor in force. Optional pin_crl_sha256 (64 hex) names the "
+     "only first CRL to accept afterwards; the reset also clears each scope's CRL number and "
+     "thisUpdate and bumps config_version. Requires RevocationSource:Write AND a durable Administrator role, the "
+     "supervised MCP tier (approval-gated) and is denied outright to a service-scoped token and "
+     "to an MCP-tier-less caller. Audited as crypto.revocation_source.reset_high_water (an "
+     "attempted row first, carrying the reset_at you supplied). Scope: facts only; the only built-in "
+     "checks are D13's named rules and windows, each shown with its criterion. Mirrors POST "
+     "/api/v1/crypto/revocation-sources/{id}/reset-high-water.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},"reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
+     R"j("pin_crl_sha256":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$","description":"Optional SHA-256 of the one CRL to accept first afterwards"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned"]})j"},
 };
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
@@ -4562,6 +4705,9 @@ static const char* const kWriteToolsRaw[] = {
     // #2146 batch B - execution cancel/rerun records (Execution:Execute). Neither sends anything
     // to a device.
     "cancel_execution", "record_execution_rerun",
+    // ADR-0070 R1 (slice 2b-1a) — RevocationSource:Write (register, replace, remove, reset).
+    "register_revocation_source", "update_revocation_source", "remove_revocation_source",
+    "reset_revocation_source_high_water",
 };
 
 // The lookup set is DERIVED by catalogue() (merged with the registry records'
@@ -5097,6 +5243,20 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"create_software_deployment", {"SoftwareDeployment", "Execute"}},
     {"rollback_software_deployment", {"SoftwareDeployment", "Execute"}},
     {"cancel_software_deployment", {"SoftwareDeployment", "Execute"}},
+
+    // ADR-0070 R1: registered CRL sources. The pair drives the generic C8 tier / approval gate
+    // (`requires_approval` carries RevocationSource:Write, so a supervised token needs a
+    // ticket); the handler then requires the RevocationSource grant (perm_fn) AND the
+    // durable-administrator predicate, because the surface is admin-only in BOTH RBAC states
+    // and so not grantable, and a DENY on the grant must hold on MCP as it does on REST.
+    // No ServiceScopeClass: a service-scoped token is denied outright (the default) - the
+    // registry is fleet-wide with no per-service slice.
+    {"list_revocation_sources", {"RevocationSource", "Read"}},
+    {"get_revocation_source", {"RevocationSource", "Read"}},
+    {"register_revocation_source", {"RevocationSource", "Write"}},
+    {"update_revocation_source", {"RevocationSource", "Write"}},
+    {"remove_revocation_source", {"RevocationSource", "Write"}},
+    {"reset_revocation_source_high_water", {"RevocationSource", "Write"}},
 };
 
 // The lookup map is DERIVED by catalogue() (merged with the registry records);
@@ -5210,7 +5370,10 @@ constexpr std::string_view kRbacSecurables[] = {
     // REST-only (ADR-1005 twin-existence exception #2102). It is listed so
     // the seeded-catalogues binding test in test_rbac_store.cpp keeps the
     // two mirrors equal.
-    "Decommission"};
+    "Decommission",
+    // ADR-0070 R1: registered CRL sources; mirrors rbac_store.cpp's types[] addition. Seeded to
+    // Administrator only and ALSO behind the administrator predicate.
+    "RevocationSource"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -5442,7 +5605,8 @@ void validate_tool_security_registration(
 // approval-gated; assign_engine_role is approval-gated yet additive). Derive:
 //   readOnlyHint    = (effect == ReadOnly)
 //   destructiveHint = (effect == Destructive)   // meaningful only when !readOnly
-//   openWorldHint   = false                     // closed managed fleet, always
+//   openWorldHint   = ToolAnnotation::open_world // false (closed managed fleet) unless the entry says
+//                                                // it resolves an administrator-registered host
 // `idempotent` is ORTHOGONAL to effect (all four quadrants exist) and is a
 // hand-authored, safe-direction value (when in doubt, false — a false
 // idempotentHint:true invites an unsafe blind retry, a BLOCKING A5 defect).
@@ -5459,6 +5623,9 @@ struct ToolAnnotation {
     ToolEffect effect;
     bool idempotent;
     const char* title;
+    // True only for a tool that itself reaches outside Yuzu's own stores. The default stays
+    // false (closed managed fleet); the cross-check test allows exactly the tools it names.
+    bool open_world = false;
 };
 
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
@@ -5864,6 +6031,23 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"cancel_execution", {ToolEffect::Destructive, false, "Cancel execution record"}},
     {"record_execution_rerun",
      {ToolEffect::Destructive, false, "Record execution rerun (sends nothing to devices)"}},
+
+    // ADR-0070 R1 (slice 2b-1a). register: Additive, NOT idempotent (a second registration of the
+    // same CA is a 409). update: a full replace - Destructive (dropping a URL or key deletes its
+    // held CRLs) and idempotent (an equal body changes nothing). remove: Destructive, idempotent
+    // (a repeat is a 404 and changes nothing). reset: Destructive and NOT idempotent (each call
+    // sets a new reset_at and discards the held CRLs again). openWorldHint is true ONLY for
+    // register and update: they resolve the administrator-registered host, the only outbound
+    // reach any tool has (no tool fetches a CRL; the refresh job does).
+    {"list_revocation_sources", {ToolEffect::ReadOnly, true, "List registered CRL sources"}},
+    {"get_revocation_source", {ToolEffect::ReadOnly, true, "Show one registered CRL source"}},
+    {"register_revocation_source",
+     {ToolEffect::Additive, false, "Register a CA and its CRL URLs", /*open_world=*/true}},
+    {"update_revocation_source",
+     {ToolEffect::Destructive, true, "Replace a CRL source's keys and URLs", /*open_world=*/true}},
+    {"remove_revocation_source", {ToolEffect::Destructive, true, "Remove a CRL source"}},
+    {"reset_revocation_source_high_water",
+     {ToolEffect::Destructive, false, "Reset a CA's CRL anti-rollback marks"}},
 };
 
 // The registry header spells the PermFn signature out (it must not include the
@@ -6162,7 +6346,7 @@ std::string build_tool_annotations(const char* name) {
         .add("readOnlyHint", a.effect == ToolEffect::ReadOnly)
         .add("destructiveHint", a.effect == ToolEffect::Destructive)
         .add("idempotentHint", a.idempotent)
-        .add("openWorldHint", false)
+        .add("openWorldHint", a.open_world)
         .str();
 }
 
@@ -11048,6 +11232,399 @@ McpServer::HandlerFn McpServer::build_handler(
                 reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                    omit_newest, 0),
                       audit_ok);
+                return;
+            }
+
+            // ── Revocation sources (ADR-0070 R1, slice 2b-1a) ─────────────────────────────
+            // Twins of /api/v1/crypto/revocation-sources, calling the SAME
+            // RevocationSourceService as the REST routes so both transports accept and refuse
+            // the same bodies. Admin-only in BOTH RBAC states and not grantable: the generic
+            // C8 gate has already applied the tier / approval ({"RevocationSource","Write"} is
+            // in requires_approval's supervised list) and refused a service-scoped token, and
+            // rs_admit below is the authorization: the RevocationSource grant (perm_fn) AND the
+            // durable-administrator predicate, the same pair the REST routes require. (The
+            // assign_rbac_role family gates on the predicate INSTEAD OF perm_fn; this surface
+            // does not.) The shared helpers are declared once here; every tool branch below keeps its
+            // own block (the retry-hint gate scans each tool's block).
+            auto rs_fail = [&](const yuzu::server::revocation_source::ServiceError& e) {
+                using RsKind = yuzu::server::revocation_source::ServiceError::Kind;
+                switch (e.kind) {
+                case RsKind::kInvalidParams:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             e.param.empty() ? std::string{}
+                                                             : "fix the parameter " + e.param),
+                                    "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                case RsKind::kNotFound:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             "list the sources with list_revocation_sources"),
+                                    "application/json"); // retry-hint-exempt: unknown id, a retry fails identically
+                    return;
+                case RsKind::kVersionConflict:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             "read the source with get_revocation_source and resend "
+                                             "update_revocation_source with expected_config_version=" +
+                                                 std::to_string(e.existing_id)),
+                                    "application/json"); // retry-hint-exempt: stale version, resending it fails identically
+                    return;
+                case RsKind::kConflict:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             e.existing_id > 0
+                                                 ? "update the existing source with "
+                                                   "update_revocation_source id=" +
+                                                       std::to_string(e.existing_id)
+                                                 : std::string("remove a source first with "
+                                                               "remove_revocation_source")),
+                                    "application/json"); // retry-hint-exempt: conflict, a retry fails identically
+                    return;
+                case RsKind::kOutcomeUnknown:
+                    res.set_content(a4_error(kInternalError, e.message,
+                                             "read the source with get_revocation_source or "
+                                             "list_revocation_sources to see whether the change "
+                                             "was applied",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                case RsKind::kUnavailable:
+                    break;
+                }
+                res.set_content(a4_error(kInternalError, e.message, "retry the request",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+            };
+            // Gate: tier, wiring, the empty-tier refusal for a write (#4309 - such a caller has
+            // neither the REST twin's step-up nor an approval ticket), then the administrator
+            // decision. On refusal the answer is written and the denial audited.
+            auto rs_admit = [&](bool is_write, const std::string& verb,
+                                const std::string& target, bool check_grant = true) -> bool {
+                namespace rs = yuzu::server::revocation_source;
+                if (!tier_allows(tier, "RevocationSource", is_write ? "Write" : "Read")) {
+                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
+                                             kTierRemediation),
+                                    "application/json"); // retry-hint-exempt: tier denial
+                    return false;
+                }
+                if (!revocation_source_service_) {
+                    spdlog::error("{}: RevocationSourceService unwired - misconfigured call site; "
+                                  "failing closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json"); // retry-hint-exempt: unwired dependency, lasts until a restart
+                    return false;
+                }
+                if (is_write && session->mcp_tier.empty()) {
+                    (void)audit_fn(req, verb, "denied", rs::kAuditTargetType, target,
+                                   "empty mcp_tier, denied outright (auth_source=" +
+                                       session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 tool_name + " requires an MCP-tier bearer token - an MCP-tier-less "
+                                             "caller has neither the step-up nor an approval "
+                                             "ticket; use the REST twin from an authenticated "
+                                             "browser session",
+                                 "use the equivalent REST v1 route, or mint an MCP bearer token "
+                                 "with an appropriate tier"),
+                        "application/json"); // retry-hint-exempt: permission denial
+                    return false;
+                }
+                // The securable AND the predicate, exactly as the REST routes (a DENY on the
+                // Administrator role's RevocationSource grant is honoured on both transports).
+                // perm_fn writes its own 403 and denial row. Skipped on the post-validation
+                // re-check, which asks only whether the caller is STILL an administrator.
+                if (check_grant && !perm_fn(req, res, "RevocationSource", is_write ? "Write" : "Read"))
+                    return false;
+                const auto decision = rs::decide_admin(*session, auth_db, rbac_store,
+                                                       RbacAdminSurface::kMcp, is_write);
+                if (decision.outcome == rs::AdminDecision::Outcome::kAdmin)
+                    return true;
+                (void)audit_fn(req, verb, "denied", rs::kAuditTargetType, target,
+                               decision.audit_reason);
+                if (decision.outcome == rs::AdminDecision::Outcome::kUnavailable) {
+                    spdlog::warn("{}: {} (user={})", tool_name, decision.audit_reason,
+                                 session->username);
+                    res.set_content(a4_error(kInternalError, decision.message, "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                } else {
+                    res.set_content(a4_error(kPermissionDenied, decision.message),
+                                    "application/json"); // retry-hint-exempt: permission denial
+                }
+                return false;
+            };
+            // The `id` argument: an integer >= 1, removed from `body`. Leaves every other key for
+            // the caller (the service rejects an unknown one). nullopt = the answer is written.
+            auto rs_take_id = [&](nlohmann::json& body) -> std::optional<std::int64_t> {
+                body.erase("approval_id"); // the gate's ticket id, not an argument of the tool
+                const auto it = body.find("id");
+                if (it == body.end() || !it->is_number_integer() ||
+                    (it->is_number_unsigned() ? it->get<std::uint64_t>() > 999999999999999999ULL
+                                              : it->get<std::int64_t>() < 1) ||
+                    it->get<std::int64_t>() < 1) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id is required and must be an integer >= 1"),
+                                    "application/json"); // retry-hint-exempt: caller-input rejection
+                    return std::nullopt;
+                }
+                const std::int64_t v = it->get<std::int64_t>();
+                body.erase("id");
+                return v;
+            };
+
+            if (tool_name == "list_revocation_sources") {
+                namespace rs = yuzu::server::revocation_source;
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "list_revocation_sources takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string verb(rs::kAuditList);
+                if (!rs_admit(false, verb, "all"))
+                    return;
+                auto list = revocation_source_service_->list();
+                if (!list) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(list.error()), rs::kAuditTargetType, "all",
+                                   rs::audit_detail_error("", list.error()));
+                    mcp_audit(rs::audit_result_for(list.error()), list.error().message);
+                    rs_fail(list.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, "all",
+                                               rs::audit_detail_list("", list->sources.size()));
+                mcp_audit("success");
+                auto payload = rs::list_json(*list);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                if (!body.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_revocation_source takes only id"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string verb(rs::kAuditView);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(false, verb, target))
+                    return;
+                auto src = revocation_source_service_->get(*sid);
+                if (!src) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(src.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", src.error()));
+                    mcp_audit(rs::audit_result_for(src.error()), src.error().message);
+                    rs_fail(src.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               rs::audit_detail_view(""));
+                mcp_audit("success");
+                auto payload = rs::source_json(*src);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "register_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                const std::string verb(rs::kAuditRegister);
+                if (!rs_admit(true, verb, "new"))
+                    return;
+                // The approval ticket id is the gate's, not part of the registration body.
+                nlohmann::json reg_body = args;
+                reg_body.erase("approval_id");
+                // Judged before the attempted row: a refused body is never a mutation attempt.
+                auto valid = revocation_source_service_->validate_registration(reg_body);
+                if (!valid) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(valid.error()), rs::kAuditTargetType, "new",
+                                   rs::audit_detail_error("", valid.error()));
+                    mcp_audit(rs::audit_result_for(valid.error()), valid.error().message);
+                    rs_fail(valid.error());
+                    return;
+                }
+                // Validation resolved names (seconds): re-confirm the caller is STILL an
+                // administrator before anything is recorded or committed.
+                if (!rs_admit(true, verb, "new", /*check_grant=*/false))
+                    return;
+                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twin.
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, "new",
+                              rs::audit_detail_config("", *valid))) {
+                    mcp_audit("failure", "audit unavailable; source not registered");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto made = revocation_source_service_->register_validated(*valid, session->username);
+                if (!made) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(made.error()), rs::kAuditTargetType, "new",
+                                   rs::audit_detail_error("", made.error()));
+                    mcp_audit(rs::audit_result_for(made.error()), made.error().message);
+                    rs_fail(made.error());
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, verb, "success", rs::kAuditTargetType, std::to_string(made->id),
+                             rs::audit_detail_source("", *made));
+                mcp_audit("success");
+                auto payload = rs::source_json(*made);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "update_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                const std::string verb(rs::kAuditUpdate);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(true, verb, target))
+                    return;
+                auto valid = revocation_source_service_->validate_registration(
+                    body, rs::RevocationSourceService::BodyMode::kUpdate);
+                if (!valid) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(valid.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", valid.error()));
+                    mcp_audit(rs::audit_result_for(valid.error()), valid.error().message);
+                    rs_fail(valid.error());
+                    return;
+                }
+                if (!rs_admit(true, verb, target, /*check_grant=*/false))
+                    return;
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, target,
+                              rs::audit_detail_config("", *valid))) {
+                    mcp_audit("failure", "audit unavailable; source not changed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto done = revocation_source_service_->update_validated(*sid, *valid);
+                if (!done) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(done.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", done.error()));
+                    mcp_audit(rs::audit_result_for(done.error()), done.error().message);
+                    rs_fail(done.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               rs::audit_detail_update("", *done));
+                mcp_audit("success");
+                auto payload = rs::update_json(*done);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "remove_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                if (!body.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "remove_revocation_source takes only id"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string verb(rs::kAuditRemove);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(true, verb, target))
+                    return;
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, target, "cid=none")) {
+                    mcp_audit("failure", "audit unavailable; source not removed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto removed = revocation_source_service_->remove(*sid);
+                if (!removed) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(removed.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", removed.error()));
+                    mcp_audit(rs::audit_result_for(removed.error()), removed.error().message);
+                    rs_fail(removed.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               "cid=none removed=true");
+                mcp_audit("success");
+                nlohmann::json payload{{"id", *sid}, {"removed", true}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "reset_revocation_source_high_water") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                const std::string verb(rs::kAuditResetHighWater);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(true, verb, target))
+                    return;
+                // Judged before the attempted row, like register and update.
+                if (const auto bad = revocation_source_service_->validate_reset(body); !bad) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(bad.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", bad.error()));
+                    mcp_audit(rs::audit_result_for(bad.error()), bad.error().message);
+                    rs_fail(bad.error());
+                    return;
+                }
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, target,
+                              rs::audit_detail_reset("", body))) {
+                    mcp_audit("failure", "audit unavailable; marks not reset");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto done = revocation_source_service_->reset_high_water(*sid, body);
+                if (!done) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(done.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", done.error()));
+                    mcp_audit(rs::audit_result_for(done.error()), done.error().message);
+                    rs_fail(done.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               rs::audit_detail_reset_result("", *done));
+                mcp_audit("success");
+                auto payload = rs::reset_json(*done);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

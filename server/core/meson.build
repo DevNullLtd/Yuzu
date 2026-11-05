@@ -853,6 +853,8 @@ yuzu_server_core_lib = static_library(
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
     'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
     'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
+    'src/revocation_source_store.cpp',   # R1 (slice 2b-1a): registered CRL sources (born-on-PG)
+    'src/revocation_source_service.cpp', # R1: shared REST+MCP validation, egress check, JSON views
     'src/preflight_eval.cpp',
     'src/preflight_run_store.cpp',
     'src/preflight_runner.cpp',
@@ -1029,6 +1031,7 @@ yuzu_server_routes_lib = static_library(
     'src/sle_routes.cpp',
     'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
     'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/revocation_source_routes.cpp',  # R1: /api/v1/crypto/revocation-sources REST twins
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/verify_routes.cpp',
