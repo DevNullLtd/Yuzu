@@ -16,7 +16,8 @@
 //   apk      empty (same reason)                                 -> via:apk
 //   windows  Uninstall-hive Publisher, else empty               -> via:windows
 //   macos    signing leaf CN, else empty                        -> via:macos
-//   macos_pkgutil  empty always (a reverse-domain id is an identifier, not a vendor) -> via:macos_pkgutil
+//   macos_pkgutil  empty always (a reverse-domain id is an identifier, not a vendor)
+//                                                              -> via:macos_pkgutil
 
 #include <algorithm>
 #include <cctype>

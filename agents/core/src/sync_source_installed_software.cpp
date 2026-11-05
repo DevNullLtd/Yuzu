@@ -519,11 +519,11 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
     // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
     // The vendor rides in `publisher` (`-` = unknown) wherever the column is read as a vendor
-    // (Windows PythonCore; the Linux producer always emits `-`); on macOS it is a CFBundleIdentifier reverse-domain id, an
-    // identifier and not a vendor, so it is ignored there (`vendor_column_is_vendor` false) and
-    // the collector labels the row `via:python`, the same rule as macos_pkgutil. The flavour and
-    // path have no installed_software slot and are dropped. A constrained
-    // status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
+    // (Windows PythonCore; the Linux producer always emits `-`); on macOS it is a
+    // CFBundleIdentifier reverse-domain id, an identifier and not a vendor, so it is ignored
+    // there (`vendor_column_is_vendor` false) and the collector labels the row `via:python`,
+    // the same rule as macos_pkgutil. The flavour and path have no installed_software slot and
+    // are dropped. A constrained status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
     // strict (five logical fields); the version is dotted digits by construction on every leg, and
@@ -627,7 +627,8 @@ std::vector<std::pair<std::string_view, std::string_view>> installed_software_ac
 
 void vendor_or_origin(SwEntry& e) {
     if (e.publisher.empty())
-        e.publisher = std::string(kOriginLabelPrefix) + (e.ecosystem.empty() ? "unknown" : e.ecosystem);
+        e.publisher =
+            std::string(kOriginLabelPrefix) + (e.ecosystem.empty() ? "unknown" : e.ecosystem);
 }
 
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {

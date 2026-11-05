@@ -11,14 +11,17 @@
 ///   pkg_inventory.packages                  Homebrew formulae/casks (ecosystem `brew`)
 ///   pkg_inventory.managers                  one `homebrew` presence row (publisher `Homebrew`)
 ///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
-///   windows_optional_features.list          every DISM feature, state in `version` (publisher `Microsoft`)
+///   windows_optional_features.list          every DISM feature, state in `version`
+///                                           (publisher `Microsoft`)
 ///   msi_packages.list_inventory             machine-context MSI products (ecosystem `msi`)
-///   runtimes.python                         installed Python interpreters (ecosystem `python`; publisher = the vendor column)
+///   runtimes.python                         installed Python interpreters (ecosystem `python`;
+///                                           publisher = the vendor column)
 ///   middleware.ibm_mq                       installed IBM MQ (ecosystem `ibm_mq`; name and publisher from the product table)
 /// Every row carries `source` = "<plugin>.<action>" and a non-empty publisher: the declared vendor
-/// when the source has one, else the origin label `via:<ecosystem>` (pkg_inventory is zero-subprocess,
-/// so brew/snap/flatpak rows are `via:brew` etc.). NO per-user data (machine
-/// scope only — no PII).
+/// when the source has one, else the origin label `via:<ecosystem>` (pkg_inventory is
+/// zero-subprocess, so brew/snap/flatpak rows are `via:brew` etc.). NO per-user data (machine
+/// scope only) and no end-user PII; a package maintainer's name in a vendor or Maintainer field
+/// is third-party metadata (ADR-0016 "PII scope note").
 
 #include "sync_scheduler.hpp"
 
@@ -40,9 +43,10 @@ struct SwEntry {
     std::string name;
     std::string version; // upstream version, release/revision stripped; for ecosystem
                          // optional_feature, the DISM feature state (no real version)
-    std::string publisher; // declared vendor (rpm VENDOR>PACKAGER / deb Maintainer / Windows Publisher /
-                           // macOS signer / constant) or the origin label `via:<ecosystem>`;
-                           // NEVER empty once the collector has run (vendor_or_origin)
+    std::string publisher; // declared vendor (rpm VENDOR>PACKAGER / deb Maintainer / Windows
+                           // Publisher / macOS signer / constant) or the origin label
+                           // `via:<ecosystem>`; NEVER empty once the collector has run
+                           // (vendor_or_origin)
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
     std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq

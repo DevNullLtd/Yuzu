@@ -276,7 +276,8 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
         CHECK(r->signature_status == "unsigned");
     }
     SECTION("publisher is the declared VENDOR; PACKAGER (a person) only when VENDOR is unset") {
-        // Shape of a Rocky Linux 9 row (rpm 4.16): PACKAGER is the build system's address, VENDOR the org.
+        // Shape of a Rocky Linux 9 row (rpm 4.16): PACKAGER is the build system's address,
+        // VENDOR the org.
         const auto rocky = parse_rpm_inv_line(
             "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tRocky Linux Build System (Peridot) "
             "<releng@rockylinux.org>\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
