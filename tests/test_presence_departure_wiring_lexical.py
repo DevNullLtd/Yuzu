@@ -17,12 +17,16 @@ per file:
 
 Plus the endpoint_state retention prune's host (#5678): in server.cpp the one
 `offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow)` call must sit inside the
-preflight_runner_thread_ lambda, after its `tick % kOfflineEndpointPruneEveryNTicks == 1`
-condition. No unit test drives that thread, so deleting the call, dropping the cadence gate, or
-moving it onto another thread (health_recompute_thread_ shares the revocation sweep's budget)
-would leave every other test green. The software change ledger prune (SAM-14) is pinned the same
-way: one `software_inventory_store_->run_retention_prune_changes()` call, inside that lambda,
-behind its `tick % kSoftwareLedgerPruneEveryNTicks == 1` condition.
+preflight_runner_thread_ lambda, inside the block of an `if (... && tick %
+kOfflineEndpointPruneEveryNTicks == 1)`. No unit test drives that thread, so deleting the call,
+dropping or loosening the cadence gate, changing the cadence constant, or moving the call onto
+another thread (health_recompute_thread_ shares the revocation sweep's budget) would leave every
+other test green. The software change ledger prune (SAM-14) is pinned the same way: one
+`software_inventory_store_->run_retention_prune_changes()` call, inside that lambda, in the block
+of an `if (... && tick % kSoftwareLedgerPruneEveryNTicks == 1)`. Each cadence constant is pinned to
+`constexpr int <name> = 60;`, and the condition must end the `if` exactly (`== 10` and
+`== 1 || true` fail) in a head with no `||`, so a dead `(void)(cond);` ahead of an ungated call, or a
+call moved out of the block, fails too.
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The self-test applies in-memory mutations (dropped
@@ -69,39 +73,88 @@ def problems(name, gate, src):
     return out
 
 
-# (call, tick condition, label): each prune hosted on the preflight runner thread.
+# Cadence of both prunes: ticks of the preflight runner thread (~1 h at 60 s/tick).
+PRUNE_EVERY_N_TICKS = 60
+# (call, tick condition, label, cadence constant): each prune hosted on the preflight runner thread.
 PRUNES = (
     ("offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow)",
-     "tick % kOfflineEndpointPruneEveryNTicks == 1", "endpoint prune (#5678)"),
+     "tick % kOfflineEndpointPruneEveryNTicks == 1", "endpoint prune (#5678)",
+     "kOfflineEndpointPruneEveryNTicks"),
     ("software_inventory_store_->run_retention_prune_changes()",
-     "tick % kSoftwareLedgerPruneEveryNTicks == 1", "software change ledger prune (SAM-14)"),
+     "tick % kSoftwareLedgerPruneEveryNTicks == 1", "software change ledger prune (SAM-14)",
+     "kSoftwareLedgerPruneEveryNTicks"),
 )
 PRUNE_START = "preflight_runner_thread_ = std::thread("
 PRUNE_END = '"Pre-flight runner thread stopped"'
 
 
+def block_end(text, open_idx):
+    """Index of the `}` matching the `{` at open_idx, or -1."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        depth += (text[i] == "{") - (text[i] == "}")
+        if depth == 0:
+            return i
+    return -1
+
+
+def gate_problems(body, call, cond, label):
+    """The call sits in the block of an `if (<no ||> && cond)` whose condition ends at `cond`."""
+    gate = cond + "){"
+    if body.count(gate) != 1:
+        return [f"server.cpp: the {label} is not gated by an `if (... && {cond})` block"]
+    end = body.index(gate)
+    head = body[max(body.rfind(c, 0, end) for c in ";{}") + 1:end].lstrip()
+    if not head.startswith("if(") or "||" in head:
+        return [f"server.cpp: the {label} condition `{cond}` is not the tail of a plain `if (... && ...)`"]
+    opening = end + len(gate) - 1
+    if not opening < body.index(call) < block_end(body, opening):
+        return [f"server.cpp: the {label} is not inside the block gated by `{cond}`"]
+    return []
+
+
 def prune_problems(src):
-    """Each prune call appears once file-wide, inside the preflight thread lambda, behind its tick gate."""
+    """Each prune call appears once file-wide, inside the preflight thread lambda, in its gated block."""
     t = normalise(src)
     out = []
     lo, hi = t.find(normalise(PRUNE_START)), t.find(PRUNE_END)
     if lo < 0 or hi < lo:
         return ["server.cpp: preflight_runner_thread_ lambda not found (#5678)"]
     body = t[lo:hi]
-    for raw_call, raw_cond, label in PRUNES:
+    for raw_call, raw_cond, label, const in PRUNES:
         call, cond = normalise(raw_call), normalise(raw_cond)
+        decl = normalise(f"constexpr int {const} = {PRUNE_EVERY_N_TICKS};")
+        if t.count(decl) != 1:
+            out.append(f"server.cpp: expected exactly one `{decl}` (found {t.count(decl)}): {label}")
         if t.count(call) != 1:
             out.append(f"server.cpp: expected exactly one `{call}` (found {t.count(call)}): {label}")
         elif call not in body:
             out.append(f"server.cpp: the {label} is not inside the preflight_runner_thread_ lambda")
-        elif cond not in body or body.index(cond) > body.index(call):
-            out.append(f"server.cpp: the {label} is not gated by `{cond}`")
+        else:
+            out.extend(gate_problems(body, call, cond, label))
     return out
 
 
+def gated_if(cond):
+    """Regex for the `if (... && cond) {` head holding `cond` (captures what precedes `&& cond`)."""
+    return r"if \(([^{;]*?)\s*&&\s*" + re.escape(cond) + r"\)\s*\{"
+
+
 # (pattern, replacement) mutations of server.cpp; each must make prune_problems() non-empty.
-PRUNE_MUTATIONS = [m for call, cond, _ in PRUNES
-                   for m in ((re.escape(call), "(void)0"), (re.escape(cond), "true"))]
+PRUNE_MUTATIONS = []
+for _call, _cond, _, _const in PRUNES:
+    PRUNE_MUTATIONS += [
+        (re.escape(_call), "(void)0"),
+        (re.escape(_cond), "true"),
+        (re.escape(_cond), _cond[:-1] + "10"),              # == 10
+        (re.escape(_cond), _cond + " || true"),             # == 1 || true
+        (re.escape(f"constexpr int {_const} = {PRUNE_EVERY_N_TICKS};"),
+         f"constexpr int {_const} = 6;"),
+        # a dead `(void)(cond);` ahead of an ungated block
+        (gated_if(_cond), "(void)(" + _cond + ");\nif (\\1 && true) {"),
+        # the call leaves the gated block (the gated block is empty)
+        (re.escape(_cond) + r"\) \{", _cond + ") {}\n{"),
+    ]
 PRUNE_MUTATIONS.append((re.escape(PRUNE_START), "health_recompute_thread_ = std::thread("))
 
 # (file index into SITES, pattern, replacement, expected substring of the FIRST problem)
