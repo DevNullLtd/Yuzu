@@ -288,7 +288,9 @@ constexpr ToolRecord kToolRecords[] = {
     {"get_hardware_ci",
      "Get one device's full hardware record: identity, the synced CI blob (manufacturer, "
      "model, serial, system UUID, BIOS, CPU, RAM, disks, MACs, OS), installed software "
-     "(capped; software_truncated says so), tags and the live agent version. Use it after "
+     "(capped; software_truncated says so; each entry's publisher is the declared vendor or an "
+     "origin label via:<ecosystem>, which names where the row came from, not a vendor), tags and "
+     "the live agent version. Use it after "
      "list_hardware_ci once you have the agent_id; for software across many devices use "
      "query_installed_software instead. The CI blob and software are the last daily-sync "
      "snapshot; identity, online state and agent version are current. Read-only. "

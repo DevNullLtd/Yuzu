@@ -4348,7 +4348,11 @@ static const ToolDef kTools[] = {
     {"query_software_catalogue",
      "Fleet software title catalogue: one row per title rolled up across the whole fleet "
      "(installs = distinct devices, versions = distinct versions, ecosystems and kinds present, "
-     "newest_version), ordered by installs descending then name. totals{titles,installs} cover "
+     "newest_version), ordered by installs descending then name. A title's publisher is the "
+     "declared vendor when any row of the title has one, else the origin label via:<ecosystem> "
+     "(such as via:brew), which names where the row came from, not a vendor; kpis.publishers "
+     "counts distinct declared vendors and excludes labels; q matches the publisher text "
+     "literally, so q=via: lists the label-only titles. totals{titles,installs} cover "
      "EVERY row matching the filters, not just this page, so report 'N of M'. The first page also "
      "carries kpis (headline numbers from the hourly rollup refresh, plus coverage as counts: "
      "reporting devices, connected devices, devices not seen in 48 hours); continuation pages "
