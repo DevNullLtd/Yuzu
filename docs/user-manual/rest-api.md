@@ -4361,8 +4361,8 @@ below.
 | `title` | string | Yes | Human-readable campaign name, 1 to 256 bytes, no NUL byte |
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
-or `title` missing, empty, longer than 256 bytes or containing a NUL byte (an over-long title writes no
-audit row). `403` without `AccessReview:Attest` (or an
+or `title` missing, empty, longer than 256 bytes or containing a NUL byte (neither an over-long nor a
+NUL-bearing title writes an audit row). `403` without `AccessReview:Attest` (or an
 engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `415` — `Content-Type` is not
@@ -4663,8 +4663,10 @@ own copy of the check is defence in depth, which a cookie session does not reach
 refusal row does not set the header for a wrong Content-Type (open and attestation; close
 takes no body) or for a store refusal on open or close: those rows are attempted and a
 failure to save one is ignored. A refusal by the permission check writes its own row and
-sets no header, and a malformed request (a bad id, bad JSON, a field over its bound, a
-`justification` that is not a string) writes no row.
+sets no header, and a malformed request (a bad id, bad JSON, a grant field over its bound, a
+`justification` that is not a string, a `title` that is over-long or holds a NUL byte) writes no
+row. A `justification` over 4096 bytes or holding a NUL byte is refused by the store after the
+separation-of-duties gate and does write a `failure` row.
 
 Both machine contracts declare the signal: the OpenAPI success responses of the three
 write routes (201 for open, 200 for attest and close) document the `Sec-Audit-Failed` header, and
@@ -4730,9 +4732,9 @@ session cookie, so a cookie-authenticated request must carry an `Origin` (or
 `Referer`) naming this site, or it is refused with `403` before the body is
 read and a `csrf.denied` row is written by the server-wide same-site check
 (`target_type=Endpoint`, `target_id` is the method and path of the request, for example
-`POST /api/v1/access-reviews/<id>/attestations`, and `detail` ends with `reason=<token>`). The
-route's own copy of the check is defence in depth and is not reached by a cookie session. A request that authenticates with an API token is
-not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
+`POST /api/v1/access-reviews/<id>/attestations`, and `detail` ends with `reason=<token>`).
+The route's own copy of the check is defence in depth and is not reached by a cookie session.
+A request that authenticates with an API token is not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
 the dashboard origin to `--csrf-trusted-origin`.
 
 MCP twins (JSON only — the REST `?format=csv` export path has no MCP

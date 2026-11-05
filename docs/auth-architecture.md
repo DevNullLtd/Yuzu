@@ -3945,7 +3945,11 @@ full text of a superseded decision at all: only this database read does.
 **Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without a NUL byte (the
 longest ids the identity stores produce are about 520 bytes: `oidc:<iss>#<sub>` with each part capped at 255,
 and an IdP group `<source>:<external_id>` with an external id of up to 512) and
-`justification` is at most 4096 bytes. The REST and MCP handlers enforce the grant-field limit before the gate
+`justification` is at most 4096 bytes and, when present, a string (any other type is refused with `400` /
+invalid-params and no audit row, because an entry cannot be corrected once recorded; `null` counts as absent). A
+campaign `title` is at most 256 bytes without a NUL byte (a longer or NUL-bearing one is refused in the handler with
+`400` / invalid-params and no audit row, with the store checking again as a backstop). The REST and MCP handlers
+enforce the grant-field limit before the gate
 (a `400` / invalid-params with the message `principal_type, principal_id and role_name must be 1-1024 bytes
 without NUL`, no audit row, and the same for all three grant types because it is decided before any lookup),
 and the store checks it again as a backstop; the schema `maxLength` values are discovery metadata only. A grant
