@@ -11,8 +11,8 @@ handle / allocated C string / mapped library / temp path / subprocess / thread /
 context / stored pointer or reference**, and no `reinterpret_cast`, `const_cast`, `raw()` or
 `release()`. Every owned object is a value-type `std::string` (or a `constexpr` constant in
 static storage) under RAII. The one subprocess it touches (the rpm query in
-`get_inventory_linux`) already existed; only its compile-time argv literal gains a trailing
-`\t%{VENDOR}` column. The server SQL changes are statement text only: no new connection,
+`get_inventory_linux`) is the existing rpm query; its compile-time argv literal carries a
+trailing `\t%{VENDOR}` column. The server SQL changes are statement text only: no new connection,
 transaction, cursor or statement handle.
 
 ## Table 1 — new owned state (all RAII value types or static constants)
@@ -33,9 +33,9 @@ transaction, cursor or statement handle.
 
 | Resource | Owner | This diff's interaction |
 |---|---|---|
-| rpm `-qa` subprocess (`installed_apps/get_inventory_linux#2`) | `run_tool` → `yuzu::agent::run_bounded_subprocess` | The compile-time literal argv (`path`, `-qa`, `--queryformat`, format literal) gains `\t%{VENDOR}` as a tenth column; `docs/agent-spawn-sink-manifest.md` pins the same literal. Direct argv, no shell, bounded runner; no `popen`/`system` introduced. Output still lands in `res.output` and is parsed via `std::istringstream`. |
+| rpm `-qa` subprocess (`installed_apps/get_inventory_linux#2`) | `run_tool` → `yuzu::agent::run_bounded_subprocess` | The compile-time literal argv (`path`, `-qa`, `--queryformat`, format literal) carries `\t%{VENDOR}` as a tenth column; `docs/agent-spawn-sink-manifest.md` pins the same literal. Direct argv, no shell, bounded runner; no `popen`/`system` introduced. Output lands in `res.output` and is parsed via `std::istringstream`. |
 | catalogue-rollup transaction | `pool_.with_txn_for(kQueryAcquireTimeout, ...)` in `SoftwareInventoryStore::refresh_catalog_rollup` | Statement text only (representative publisher expression; KPI publisher count excludes `via:%`). The same single transaction rolls back on any failure, keeping the last good rollup. `pg::PgResult` values stay RAII. |
-| `SoftwareTitleDimension::reconcile_queue` | its own `with_txn_for` | Not edited. A change of the `normalize_vendor`/publisher inputs can make the existing prune `DELETE` remove a larger set of open queue rows in one statement; it runs under the transaction's `SET LOCAL statement_timeout` and the advisory lock, and a timeout rolls the whole reconcile back. No new acquisition. |
+| `SoftwareTitleDimension::reconcile_queue` | its own `with_txn_for` | Not edited. The prune `DELETE` removes every open queue row whose key matches no installed row, so a change of the `normalize_vendor`/publisher inputs bounds one statement by the open queue size; it runs under the transaction's `SET LOCAL statement_timeout` and the advisory lock, and a timeout rolls the whole reconcile back. No new acquisition. |
 | `SwEntry::publisher` collector loop | `make_installed_software_source` | One added call, `vendor_or_origin(e)`, per entry already owned by the loop. |
 
 ## Tests
