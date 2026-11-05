@@ -97,10 +97,11 @@ outage push yields one degrade per target.
 
 The dispatch-time write also advances `execution_tracker.dispatch_seq` (#3678), the sequence the WS-3
 command outbox measures its redelivery horizon on (`common/include/yuzu/command_replay_horizon.hpp`).
-A dispatch whose record is NOT written (a failed write, a latch skip, no tracker wired) is still sent and
-still takes an agent dedup-ring slot, so `AgentServiceImpl::record_command_dispatch` counts it into the
-process-local `ExecutionTracker::note_unrecorded_dispatch`, which `current_dispatch_seq()` adds to the
-shared value. Only the process that fails to write counts it: a write outage on a replica other than the
+A dispatch whose record is NOT written (a failed write, a latch skip) is still sent and still takes an
+agent dedup-ring slot, so `AgentServiceImpl::record_command_dispatch` counts it into the process-local
+`ExecutionTracker::note_unrecorded_dispatch`. `current_dispatch_position()` returns that count beside the
+shared value, never summed into it (they are on different scales). Only the process that fails to write
+counts it: a write outage on a replica other than the
 one running the outbox is not seen there, so while `YuzuDispatchRecordWriteFailing` fires on any replica
 the horizon protection should be read as weakened, not as in force.
 

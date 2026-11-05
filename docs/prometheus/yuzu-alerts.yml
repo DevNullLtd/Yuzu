@@ -979,6 +979,63 @@ groups:
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # #3678 -- the command outbox's REDELIVERY HORIZON. Two states, deliberately different rules.
+      #
+      # YuzuOutboxHeld: the delivery loop could not read the dispatch counters (or no reader is
+      # wired), so it HOLDS every pending occurrence and ends the tick -- nothing is sent, nothing
+      # fails, no audit row. All scheduled work stalls silently until the read recovers.
+      # `yuzu_server_command_outbox_pending` is the documented stall signal but nothing watched it.
+      # A hold repeats every ~5 s tick for as long as it lasts, so `increase()` stays positive
+      # throughout and `for: 15m` (longer than the 10m window's own transition) makes this a
+      # SUSTAINED-stall rule, not a blip. `stamp_not_committed` is excluded: it also occurs
+      # briefly at every leader handover and recovers on the next tick. The series are
+      # pre-seeded at 0 in CommandOutboxDelivery's constructor, so the first hold is a 0->1 step.
+      - alert: YuzuOutboxHeld
+        expr: |
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_hold_cause_total{cause=~"sequence_unwired|sequence_unreadable"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The command outbox is holding all scheduled work on {{ $labels.instance }}"
+          description: >-
+            For at least 15 minutes the command outbox delivery loop on {{ $labels.instance }} has
+            been unable to read the dispatch counters its redelivery limit needs
+            (cause sequence_unreadable) or has no reader wired (sequence_unwired), so it sends and
+            fails NOTHING: every pending scheduled occurrence is held and no audit row is written.
+            FIRST check PostgreSQL reachability and pool health on that instance (the counters live
+            in the execution_tracker schema, the same database as the outbox), then that the
+            execution_tracker.dispatch_seq sequence exists and the server role can read it.
+            Held occurrences are retried automatically once the read recovers; nothing is lost.
+            See docs/user-manual/instructions.md "Execution semantics" and docs/user-manual/metrics.md
+            (yuzu_server_command_outbox_deliver_hold_cause_total).
+
+      # #3678 -- YuzuOutboxDeadLettered: a scheduled occurrence was refused a retry because the
+      # dispatch count advanced by the redelivery horizon (or went backwards) since its first
+      # attempt, and was marked failed instead of being re-sent. That is the control working AND a
+      # lost scheduled run, so it is worth surfacing, but it is a WARNING, not a page: a single very
+      # large Guardian / asset-tag / sync push legitimately ends every waiting occurrence at once,
+      # and the count is only an estimate (docs/command-dedup.md). No `for:`: each dead-letter is
+      # one terminal row, and a lone one must be visible (the series is pre-seeded at 0).
+      - alert: YuzuOutboxDeadLettered
+        expr: |
+          increase(yuzu_server_command_outbox_deliver_horizon_exceeded_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A scheduled run was dead-lettered by the redelivery limit on {{ $labels.instance }}"
+          description: >-
+            At least one scheduled occurrence on {{ $labels.instance }} was marked failed in the
+            last hour because retrying it would have re-sent a command the agent may have already
+            forgotten (redelivery_horizon_exceeded), or because the shared dispatch sequence went
+            backwards (redelivery_sequence_regressed). The occurrence MAY OR MAY NOT have reached
+            any agent. Find it in the audit log (action command.outbox_delivered, result failure),
+            check the agents' responses for its command ID, and re-run it by hand if it did not
+            complete; an approval ticket it used is spent. A likely benign cause is a very large
+            fan-out push (Guardian, asset-tag, sync) that counted one dispatch per target; a
+            suspicious one is rows stuck for hours (see yuzu_server_command_outbox_deliver_retry_cause_total).
+            See docs/user-manual/instructions.md "Execution semantics".
+
       # HA WS-5 slice 2 (ADR-2002 §7f) — a presented gateway session_id that
       # matches MORE than one live directory row. No `for:` (same reasoning as
       # YuzuGatewayResponseAgentMismatch below): ambiguity means a duplicate

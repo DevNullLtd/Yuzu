@@ -7598,3 +7598,73 @@ tests:
       - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
         eval_time: 16m
         exp_samples: []
+
+  # ── YuzuOutboxHeld / YuzuOutboxDeadLettered (#3678, command outbox redelivery limit) ──────────
+  #
+  # Held: a systemic hold repeats every tick, so the counter climbs continuously; the rule needs
+  # the climb to persist for 15m. Dead-lettered: any increase over an hour.
+
+  # CASE — a sustained sequence_unreadable hold fires after the 15m `for:` and not before.
+  - interval: 1m
+    name: outbox held - a sustained sequence_unreadable hold fires after 15 minutes
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CASE — a lone, brief hold (a flapping read that recovered) does NOT fire.
+  - interval: 1m
+    name: outbox held - a brief hold that recovers does not fire
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0x3 1+1x4 6x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE — stamp_not_committed holds (leader handover noise) are excluded by the rule.
+  - interval: 1m
+    name: outbox held - stamp_not_committed alone does not fire
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="stamp_not_committed"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+
+  # CASE — a lone dead-letter (0 -> 1, then flat) fires, then clears when the hour window passes.
+  - interval: 1m
+    name: outbox dead-lettered - a lone dead-letter fires and then clears
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "0x5 1x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 3h
+        exp_samples: []
+
+  # CASE — a flat zero-seeded counter stays quiet.
+  - interval: 1m
+    name: outbox dead-lettered - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []

@@ -11,31 +11,45 @@
 /// RE-EXECUTE it. The command outbox (`server/core/src/command_outbox_delivery.cpp`) is the
 /// server-side redelivery source: it re-drives a `pending` row with its STABLE `command_id`.
 ///
-/// `kMaxOutboxRedeliveryHorizonCommands` is the most dispatch CALLS the outbox lets elapse
-/// between a row's first send attempt and a redrive. Every ring-consuming send passes the one
-/// dispatch chokepoint (`ServerImpl::build_classified_command`) and mints one command_id, so one
-/// dispatch call is at most one ring slot on any agent. The sequence the outbox reads
-/// (`ExecutionTracker::current_dispatch_seq`) is the shared `dispatch_seq`, advanced when a
-/// dispatch record is written, PLUS the reading process's count of dispatches whose record was
-/// not written (a failed, refused or latch-skipped write): those still consume ring slots.
+/// `kMaxOutboxRedeliveryHorizonCommands` is the most dispatches the outbox lets elapse between a
+/// row's first attempt and a redrive of it. Every ring-consuming send passes the one dispatch
+/// chokepoint (`ServerImpl::build_classified_command`) and mints one command_id, so one dispatch
+/// is at most one ring slot on any agent. The outbox measures elapsed dispatches from two counters
+/// (`ExecutionTracker::current_dispatch_position`, `dispatch_position.hpp`) that are deliberately
+/// kept SEPARATE, because they are on different scales:
+///  * `shared`     -- `dispatch_seq`, advanced when a dispatch RECORD is written; lives in the
+///                    database, so every replica reads the same number.
+///  * `unrecorded` -- the reading PROCESS's count of dispatches whose record was not written
+///                    (failed, refused, latch-skipped). They were still sent and may have taken a
+///                    ring slot. It restarts at zero in every process.
+/// A row is stamped with both and with the leader epoch of the stamping term. A redrive's
+/// estimate is `(shared_now - shared_stamp) + local`, where `local` is the exact difference of the
+/// two unrecorded counts when the same leadership term (hence the same process) reads it, and the
+/// reader's whole unrecorded count when any other term does. The two are never summed into one
+/// stored number: an earlier version did, and a value stamped by one process was then read on
+/// another process's scale, which could make a stale row look young.
 ///
 /// WHAT THIS BOUND IS, AND IS NOT. It is a conservative estimate, not a proof, and it errs in two
 /// directions that must not be confused:
 ///  * OVER-count (safe: a row is dead-lettered EARLY, a scheduled fire is lost, audited and
-///    counted). The sequence is fleet-wide, so every principal's dispatches advance it; a fan-out
-///    loop (the Guardian, asset-tag and sync pushes) records one call PER TARGET although each
-///    agent receives one command from it; `__guard__` consumes no dedup-ring slot yet counts; a
-///    re-record of the same id counts again. One push to `kMaxOutboxRedeliveryHorizonCommands`
-///    targets therefore dead-letters every stamped pending row at that moment.
-///  * UNDER-count (UNSAFE: a row could be redriven after the agent evicted it). The unrecorded
-///    count is per PROCESS. A record-write failure on a replica other than the one reading the
-///    sequence is not counted, so while the shared database is write-failing on another replica
-///    the horizon can trip late. A leader change resets the local term, which usually reads as a
-///    sequence that went BACKWARDS and dead-letters the row (safe), but is not guaranteed to. The
-///    2x margin is what absorbs what remains (the race between the horizon check and the agent's
-///    claim, and tick-length staleness); it is NOT sized to tolerate a sustained, uncounted
-///    write outage. A sound close of the under-count needs the agent to refuse an id older than
-///    its own ring (a wire change), tracked separately.
+///    counted). The shared sequence is fleet-wide, so every principal's dispatches advance it; a
+///    fan-out loop (the Guardian, asset-tag and sync pushes) records one call PER TARGET although
+///    each agent receives one command from it; `__guard__` consumes no dedup-ring slot yet counts;
+///    and every redrive that re-records its own id advances it again, so rows stuck in a long
+///    outage age each other (100 such rows add about 3 a second). One push to
+///    `kMaxOutboxRedeliveryHorizonCommands` targets dead-letters every stamped pending row at that
+///    moment. A different-term reader also charges its whole unrecorded history, which includes
+///    failures that predate the stamp.
+///  * UNDER-count (UNSAFE: a row could be redriven after the agent evicted it).
+///      - A record-write failure on a replica OTHER than the one reading the position is not
+///        counted: its unrecorded count lives in its own process. A sustained write outage on a
+///        non-leader replica therefore lets the horizon trip late.
+///      - A command dispatched before the stamp but queued (a gateway backlog, a slow agent
+///        stream) and claimed by the agent after the stamp takes a ring slot the count never saw.
+///      The 2x margin absorbs the race between the horizon check and the agent's claim and the
+///      staleness of one tick; it is NOT sized to tolerate a sustained, uncounted outage. A sound
+///      close of the under-count needs the agent to refuse an id older than its own ring (a wire
+///      change) and is not part of this change.
 ///
 /// The margin is the headroom the count does not otherwise account for. Do not tighten it to
 /// `<`/`<=` without re-deriving all of the above.

@@ -59,6 +59,7 @@ TAGS_HPP = ROOT / "server" / "core" / "src" / "dedup_fleet_tags.hpp"
 AGENT_REGISTRY_CPP = ROOT / "server" / "core" / "src" / "agent_registry.cpp"
 SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
 AGENT_SERVICE_CPP = ROOT / "server" / "core" / "src" / "agent_service_impl.cpp"
+OUTBOX_DELIVERY_CPP = ROOT / "server" / "core" / "src" / "command_outbox_delivery.cpp"
 METRICS_MD = ROOT / "docs" / "user-manual" / "metrics.md"
 ALERTS_YML = ROOT / "docs" / "prometheus" / "yuzu-alerts.yml"
 ALERTS_TEST = ROOT / "tests" / "prometheus" / "yuzu-alerts.test.yml"
@@ -262,9 +263,9 @@ def problems() -> list:
     window = srv[at:at + 6000] if at >= 0 else ""
     if at < 0:
         out.append("server.cpp no longer constructs CommandOutboxDelivery::Deps{...} (stale pattern)")
-    elif not re.search(r"\.dispatch_seq_fn\s*=", window) or "current_dispatch_seq()" not in window:
+    elif not re.search(r"\.dispatch_seq_fn\s*=", window) or "current_dispatch_position()" not in window:
         out.append("server.cpp's CommandOutboxDelivery::Deps no longer wires .dispatch_seq_fn to "
-                   "ExecutionTracker::current_dispatch_seq() (#3678): the outbox would hold every row")
+                   "ExecutionTracker::current_dispatch_position() (#3678): the outbox would hold every row")
     svc = strip_line_comments(read(AGENT_SERVICE_CPP))
     m = re.search(r"void AgentServiceImpl::record_command_dispatch\(.*?\n\}\n", svc, re.S)
     body = m.group(0) if m else ""
@@ -274,6 +275,15 @@ def problems() -> list:
         out.append("AgentServiceImpl::record_command_dispatch must call note_unrecorded_dispatch() at "
                    "BOTH its latch-skip and its failed-write sites (#3678): an uncounted unrecorded "
                    "dispatch freezes the outbox redelivery horizon while the agent ring fills")
+    # 10. #3678: the stamp is cleared ONLY when this call wrote it AND the attempt reached no agent.
+    # A clear on any weaker condition lets a stamp that guards a REAL earlier send be dropped, which
+    # restarts the horizon and is the unsafe direction. The store also guards by epoch, but this is
+    # the condition the caller is responsible for.
+    dlv = strip_line_comments(read(OUTBOX_DELIVERY_CPP))
+    if not re.search(r"clear_first_send_stamp\s*=\s*\*/\s*stamped_now\s*&&\s*outcome\.sent\s*==\s*0", dlv):
+        out.append("command_outbox_delivery.cpp must pass clear_first_send_stamp = stamped_now && "
+                   "outcome.sent == 0 to reschedule (#3678): any weaker condition can drop a stamp "
+                   "that guards a real earlier send")
     return out
 
 
@@ -351,6 +361,13 @@ class DedupFleetTagsLexical(unittest.TestCase):
         found = self._problems_with(
             AGENT_SERVICE_CPP, lambda s: s.replace("tracker->note_unrecorded_dispatch();", "", 1))
         self.assertTrue(any("note_unrecorded_dispatch()" in p for p in found), found)
+
+    def test_self_check_detects_a_weakened_stamp_clear_condition(self):
+        found = self._problems_with(
+            OUTBOX_DELIVERY_CPP,
+            lambda s: s.replace("/*clear_first_send_stamp=*/stamped_now && outcome.sent == 0",
+                                "/*clear_first_send_stamp=*/outcome.sent == 0", 1))
+        self.assertTrue(any("clear_first_send_stamp = stamped_now" in p for p in found), found)
 
     def test_self_check_detects_a_store_ring_bound_that_forks_the_shared_constant(self):
         found = self._problems_with(

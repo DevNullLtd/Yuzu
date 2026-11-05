@@ -123,14 +123,22 @@ CREATE INDEX outbox_approval_idx ON outbox (approval_id) WHERE approval_id <> ''
         // sequential scan must not run under the pool's 30 s statement timeout.
         {3, "SET LOCAL statement_timeout = 0;"
             "UPDATE outbox SET plugin = 'echo' WHERE plugin = 'tar';"},
-        // v4 (#3678): the dispatch sequence (`ExecutionTracker::current_dispatch_seq`) read just
-        // before the row's FIRST delivery attempt. A redrive compares the current sequence
-        // against it and dead-letters the row once the gap reaches the redelivery horizon
+        // v4 (#3678): where the dispatch counters stood just before the row's FIRST delivery
+        // attempt (`dispatch_position.hpp`). A redrive compares the counters now against these and
+        // dead-letters the row once the gap reaches the redelivery horizon
         // (`command_replay_horizon.hpp`), so a stable command_id is not re-sent after the agent
-        // dedup ring could have evicted it. Nullable, no default: a metadata-only ALTER (no table
-        // rewrite, so no statement_timeout lift is needed, unlike v2/v3). A `pending` row with
-        // NULL is stamped at its next delivery attempt.
-        {4, "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatch_seq_first_sent BIGINT;"},
+        // dedup ring could have evicted it.
+        //   dispatch_seq_first_sent        the SHARED sequence (comparable across processes)
+        //   dispatch_unrecorded_first_sent the stamping process's own unrecorded-dispatch count
+        //   dispatch_stamp_epoch           the leader epoch of the stamping term, which says whether
+        //                                  a later reader is the SAME process (so the local count
+        //                                  can be differenced) or another (so it cannot)
+        // All nullable, no default: a metadata-only ALTER (no table rewrite, so no
+        // statement_timeout lift is needed, unlike v2/v3). A `pending` row with NULL is stamped at
+        // its next delivery attempt. The three are written together by one UPDATE.
+        {4, "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatch_seq_first_sent BIGINT;"
+            "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatch_unrecorded_first_sent BIGINT;"
+            "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatch_stamp_epoch BIGINT;"},
     };
     return kMigrations;
 }
@@ -241,7 +249,7 @@ CommandOutboxStore::list_pending(int limit) const {
         lease.get(),
         "SELECT occurrence_id, command_id, source, plugin, action, scope_expr, agent_ids, "
         "       parameters, execution_id, principal, approval_id, attempts, "
-        "       dispatch_seq_first_sent "
+        "       dispatch_seq_first_sent, dispatch_unrecorded_first_sent, dispatch_stamp_epoch "
         "FROM command_outbox_store.outbox "
         "WHERE state = 'pending' AND next_attempt_at <= now() "
         "ORDER BY next_attempt_at ASC, created_at ASC "
@@ -273,16 +281,24 @@ CommandOutboxStore::list_pending(int limit) const {
         // avoids atoi/<cstdlib>); a malformed value leaves attempts=0, harmless.
         const char* av = PQgetvalue(res.get(), i, 11);
         std::from_chars(av, av + std::char_traits<char>::length(av), c.attempts);
-        // #3678: NULL = never stamped. A value that does not parse is treated as UNSTAMPED, not
-        // as 0: the delivery gate then re-stamps (fenced, NULL-only) or, when the column is
-        // somehow non-NULL but unparseable, refuses the stamp write and holds the row.
-        if (!PQgetisnull(res.get(), i, 12)) {
-            const char* sv = PQgetvalue(res.get(), i, 12);
-            std::int64_t seq = 0;
-            const auto r = std::from_chars(sv, sv + std::char_traits<char>::length(sv), seq);
-            if (r.ec == std::errc{} && seq >= 0)
-                c.dispatch_seq_first_sent = seq;
-        }
+        // #3678: NULL = never stamped. A value that does not parse (or is negative) is treated as
+        // ABSENT, not as 0: an unstamped row is re-stamped by the NULL-only write; a stamp column
+        // that is non-NULL but unparseable makes that write refuse, so the row is HELD. The two
+        // companion columns are optional on their own: a missing local count or epoch only makes
+        // the reader treat the stamp as written by ANOTHER term, which is the conservative case.
+        const auto read_i64 = [&](int col) -> std::optional<std::int64_t> {
+            if (PQgetisnull(res.get(), i, col))
+                return std::nullopt;
+            const char* v = PQgetvalue(res.get(), i, col);
+            std::int64_t n = 0;
+            const auto r = std::from_chars(v, v + std::char_traits<char>::length(v), n);
+            if (r.ec != std::errc{} || n < 0)
+                return std::nullopt;
+            return n;
+        };
+        c.dispatch_seq_first_sent = read_i64(12);
+        c.dispatch_unrecorded_first_sent = read_i64(13);
+        c.dispatch_stamp_epoch = read_i64(14);
         out.push_back(std::move(c));
     }
     return out;
@@ -458,20 +474,25 @@ CommandOutboxStore::mark_failed(const std::string& occurrence_id,
 std::expected<bool, CommandOutboxError>
 CommandOutboxStore::stamp_first_send(const std::string& occurrence_id,
                                      const std::string& leader_lock_name,
-                                     std::int64_t leader_epoch, std::int64_t dispatch_seq) {
-    if (dispatch_seq < 0)
+                                     std::int64_t leader_epoch, std::int64_t shared_seq,
+                                     std::int64_t unrecorded) {
+    if (shared_seq < 0 || unrecorded < 0)
         return std::unexpected(CommandOutboxError::db_error);
     const std::string fence = LeaderElector::epoch_fence_sql(leader_lock_name, leader_epoch);
-    // NULL-only: the FIRST stamp wins, so a later (or concurrent) stamp can never move the
-    // horizon's origin forward and quietly extend a row's redelivery window.
+    // NULL-only on the shared column: the FIRST stamp wins, so a later (or concurrent) stamp can
+    // never move the horizon's origin forward and quietly extend a row's redelivery window. All
+    // three columns are written together, and the epoch is the one this write is fenced on.
     const std::string sql =
         "UPDATE command_outbox_store.outbox SET dispatch_seq_first_sent=$2::bigint, "
+        "dispatch_unrecorded_first_sent=$3::bigint, dispatch_stamp_epoch=$4::bigint, "
         "updated_at=now() "
         "WHERE occurrence_id=$1 AND state='pending' AND dispatch_seq_first_sent IS NULL AND " +
         fence + " RETURNING occurrence_id";
-    return fenced_transition(sql.c_str(),
-                             std::vector<std::string>{occurrence_id, std::to_string(dispatch_seq)},
-                             "stamp_first_send");
+    return fenced_transition(
+        sql.c_str(),
+        std::vector<std::string>{occurrence_id, std::to_string(shared_seq),
+                                 std::to_string(unrecorded), std::to_string(leader_epoch)},
+        "stamp_first_send");
 }
 
 std::expected<bool, CommandOutboxError>
@@ -487,13 +508,22 @@ CommandOutboxStore::reschedule(const std::string& occurrence_id,
         "UPDATE command_outbox_store.outbox "
         "SET attempts = attempts + 1, updated_at = now(), "
         "    next_attempt_at = now() + ($2 || ' seconds')::interval, "
-        "    dispatch_seq_first_sent = CASE WHEN $3::boolean THEN NULL "
-        "                                   ELSE dispatch_seq_first_sent END "
+        "    dispatch_seq_first_sent = CASE WHEN $3::boolean AND dispatch_stamp_epoch = $4::bigint "
+        "                                   THEN NULL ELSE dispatch_seq_first_sent END, "
+        "    dispatch_unrecorded_first_sent = CASE WHEN $3::boolean AND "
+        "                                          dispatch_stamp_epoch = $4::bigint "
+        "                                          THEN NULL ELSE dispatch_unrecorded_first_sent END, "
+        "    dispatch_stamp_epoch = CASE WHEN $3::boolean AND dispatch_stamp_epoch = $4::bigint "
+        "                                THEN NULL ELSE dispatch_stamp_epoch END "
         "WHERE occurrence_id=$1 AND state='pending' AND " + fence + " RETURNING occurrence_id";
+    // The clear is double-guarded: the caller asks for it only when it wrote the stamp in this call
+    // and the attempt reached no agent, and the write itself clears only a stamp whose recorded
+    // epoch is THIS term's. A stamp from an earlier term is never cleared by a later one.
     return fenced_transition(
         sql.c_str(),
         std::vector<std::string>{occurrence_id, std::to_string(delay.count()),
-                                 clear_first_send_stamp ? "true" : "false"},
+                                 clear_first_send_stamp ? "true" : "false",
+                                 std::to_string(leader_epoch)},
         "reschedule");
 }
 

@@ -9,7 +9,8 @@
 // -- which the common header cannot see (it must not include an agent header: #2549 firewall).
 //
 // Honest limit: this proves the two constants are consistent, not that a real agent absorbs a
-// redrive at the production ring size (see the upper-bound argument in the common header).
+// redrive at the production ring size. The run-time bound is an estimate, not a proof; the common
+// header states how it errs in each direction.
 
 #include <yuzu/agent/command_dedup_store.hpp>
 #include <yuzu/command_replay_horizon.hpp>

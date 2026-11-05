@@ -18402,10 +18402,10 @@ private:
                 // #3678 (R4): the fleet-wide dispatch sequence the redelivery horizon is
                 // measured on. An unwired tracker reads as unreadable, which HOLDS every
                 // occurrence (fail closed) -- never as 0.
-                .dispatch_seq_fn = [this]() -> std::optional<std::int64_t> {
+                .dispatch_seq_fn = [this]() -> std::optional<DispatchPosition> {
                     if (!execution_tracker_)
                         return std::nullopt;
-                    return execution_tracker_->current_dispatch_seq();
+                    return execution_tracker_->current_dispatch_position();
                 },
             });
         schedule_tick_thread_ = std::thread([this]() {

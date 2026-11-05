@@ -42,27 +42,36 @@
 ///  R4 — REDELIVERY HORIZON (#3678). Effectively-once rests on the agent's dedup ring
 ///  (WS-0, `CommandDedupStore`), which forgets a terminal command after
 ///  `kAgentDedupRingRows` newer ones; a stable command_id re-sent AFTER that is a fresh claim
-///  and RE-EXECUTES. So a redrive is bounded by a COUNT of fleet-wide dispatch calls, not a
-///  clock: the sequence (`Deps::dispatch_seq_fn`, `ExecutionTracker::current_dispatch_seq`) is
-///  stamped on the row BEFORE its first send (`CommandOutboxStore::stamp_first_send`), and a
-///  redrive whose sequence has advanced by `redelivery_horizon_commands` (or gone backwards)
-///  is dead-lettered instead of sent (`redelivery_horizon_exceeded`, or
-///  `redelivery_sequence_regressed` for a sequence that went backwards). Every
-///  unreadable-sequence, unwired-reader or failed-stamp case HOLDS the row (no send) -- the
-///  direction that cannot re-execute; an unreadable or unwired sequence also ends the tick. A
-///  stamp written by an attempt that provably reached no agent (`sent == 0` on a retry outcome)
-///  is cleared in the same fenced reschedule, so a row blocked only by an unreadable gate is
-///  never aged toward a dead-letter without having been sent. The horizon is
+///  and RE-EXECUTES. So a redrive is bounded by a COUNT of dispatches, not a clock. The counters
+///  (`Deps::dispatch_seq_fn`, `ExecutionTracker::current_dispatch_position`) are stamped on the
+///  row BEFORE its first attempt (`CommandOutboxStore::stamp_first_send`): the SHARED sequence, the
+///  stamping process's own unrecorded-dispatch count, and the leader epoch of the stamping term.
+///  A redrive's elapsed estimate is
+///      (shared_now - shared_stamp)  +  local
+///  where `local` is `unrecorded_now - unrecorded_stamp` when the stamp's epoch equals THIS term's
+///  epoch (same process, so the two local counts are comparable) and the reader's WHOLE
+///  `unrecorded_now` otherwise (a different process; its history is unknowable, so count all of
+///  this one's). Elapsed `>= redelivery_horizon_commands` dead-letters the row
+///  (`redelivery_horizon_exceeded`); a shared sequence BELOW the stamp (a restore, a lost-WAL
+///  failover) dead-letters it as `redelivery_sequence_regressed`. The local count is never summed
+///  into the shared one: they are on different scales.
+///
+///  Every unreadable-position, unwired-reader or failed-stamp case HOLDS the row (no send) -- the
+///  direction that cannot re-execute; an unreadable or unwired position also ends the tick. A
+///  stamp written by an attempt that provably reached no agent (`sent == 0` on a retry outcome) is
+///  cleared in the same fenced reschedule, so a row blocked only by an unreadable gate is never
+///  aged toward a dead-letter without having been sent. The horizon is
 ///  `kMaxOutboxRedeliveryHorizonCommands` (`common/include/yuzu/command_replay_horizon.hpp`,
 ///  static_asserted below the ring) and the constructor clamps any larger `Deps` value down to
 ///  it. A dead-lettered row is NOT force-cancelled (`decline_or_cancel_exec` is not called): an
 ///  earlier attempt may have reached agents and their responses may still be arriving.
 ///
-///  The sequence is a count of dispatch CALLS plus this process's unrecorded dispatches
-///  (`ExecutionTracker::note_unrecorded_dispatch`). It is conservative in two ways that can
-///  dead-letter a row early (a fan-out push records one call per target; any principal's
-///  dispatches advance it) and has one residual that can dead-letter it LATE: record-write
-///  failures on a replica other than the one reading are not counted.
+///  The estimate is conservative in several ways that dead-letter a row EARLY (a fan-out push
+///  records one call per target; any principal's dispatches advance the shared term; every
+///  redrive that re-records its own id advances it) and has residuals that can let a row go LATE
+///  (record-write failures on a replica other than the reader are not counted; dispatches queued
+///  before the stamp but delivered after the agent's claim are not counted). It is an estimate,
+///  not a proof: see the header comment of `command_replay_horizon.hpp`.
 ///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
 /// historical discipline): a systemic transient gate/directory failure
@@ -82,6 +91,7 @@
 
 #include "dispatch_caller.hpp"          // DispatchCaller, ApprovalProvenance
 #include "dispatch_confined_arms.hpp"   // ConfinedDispatchOutcome
+#include "dispatch_position.hpp"         // DispatchPosition (#3678)
 
 #include <yuzu/command_replay_horizon.hpp> // kMaxOutboxRedeliveryHorizonCommands (#3678)
 
@@ -132,9 +142,9 @@ public:
                                              const std::string& plugin,
                                              const std::string& action)>;
 
-    /// #3678 (R4): the fleet-wide dispatch sequence, `nullopt` when it cannot be read.
-    /// server.cpp binds this to `ExecutionTracker::current_dispatch_seq`.
-    using DispatchSeqFn = std::function<std::optional<std::int64_t>()>;
+    /// #3678 (R4): the dispatch counters (`dispatch_position.hpp`), `nullopt` when they cannot be
+    /// read. server.cpp binds this to `ExecutionTracker::current_dispatch_position`.
+    using DispatchSeqFn = std::function<std::optional<DispatchPosition>()>;
 
     struct Deps {
         CommandOutboxStore* outbox{nullptr};          // required

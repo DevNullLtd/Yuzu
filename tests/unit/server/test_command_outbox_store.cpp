@@ -279,7 +279,7 @@ TEST_CASE("CommandOutboxStore[pg]: the v2 migration adds the approval index to a
     CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4"); // the ladder runs on through v4
 
     // v4 (#3678): the nullable stamp column is added without a rewrite, and a row that was
-    // already pending across the upgrade reads as UNSTAMPED (NULL), not as sequence 0.
+    // that existed before this migration reads as UNSTAMPED (NULL), not as sequence 0.
     yuzu::server::pg::PgResult stamp{PQexec(
         conn.get(), "SELECT count(*) FILTER (WHERE dispatch_seq_first_sent IS NULL), count(*) "
                     "FROM command_outbox_store.outbox")};

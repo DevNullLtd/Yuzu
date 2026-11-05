@@ -35,6 +35,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "dispatch_position.hpp"    // DispatchPosition (#3678)
 #include "response_provenance.hpp" // CommandRecord
 
 namespace yuzu::server::pg {
@@ -644,27 +645,25 @@ public:
         const std::string& command_id, const std::string& plugin, const std::string& execution_id,
         std::optional<std::chrono::milliseconds> lease_timeout = std::nullopt);
 
-    /// #3678: the EFFECTIVE dispatch sequence the WS-3 command outbox measures its redelivery
-    /// horizon on: the shared `dispatch_seq` (advanced once per recorded dispatch call, so it is
-    /// common to every replica) PLUS this process's own count of dispatches whose record was NOT
-    /// written (`note_unrecorded_dispatch`). The second term is what keeps the count honest when
-    /// record writes fail: an unrecorded dispatch still consumed an agent ring slot, and without
-    /// it the shared sequence would freeze exactly while the ring fills.
+    /// #3678: the two counters the WS-3 command outbox measures its redelivery horizon on
+    /// (`dispatch_position.hpp`): the SHARED `dispatch_seq` (advanced once per recorded dispatch
+    /// call; common to every replica) and this process's own count of dispatches whose record was
+    /// NOT written (`note_unrecorded_dispatch`). They are returned separately because they are on
+    /// different scales: only readings taken by the SAME process can be differenced on the local
+    /// term. The shared term can move BACKWARD on a restore or a lost-WAL failover, and the outbox
+    /// dead-letters on that.
     ///
-    /// Monotonic within one process. It is NOT monotonic across a restart or a leader change (the
-    /// local term resets, a restore can move the shared one back); the outbox treats a value
-    /// below a row's stamp as a dead-letter, which is the safe direction. Failures on a replica
-    /// OTHER than the one reading are not counted: that residual is documented in
-    /// `common/include/yuzu/command_replay_horizon.hpp`.
-    ///
-    /// Returns nullopt when the store is closed or the read degraded. NEVER treat nullopt as 0:
-    /// the outbox refuses to send on an unreadable sequence.
-    [[nodiscard]] std::optional<std::int64_t> current_dispatch_seq() const;
+    /// Returns nullopt when the store is closed or the read degraded. NEVER treat nullopt as zero:
+    /// the outbox refuses to send on an unreadable position. Failures on a replica other than the
+    /// one reading are not counted: see `common/include/yuzu/command_replay_horizon.hpp`.
+    [[nodiscard]] std::optional<DispatchPosition> current_dispatch_position() const;
 
     /// #3678: count one dispatch whose `record_command_dispatch` write did not happen -- failed,
-    /// refused, skipped by a tripped `DispatchRecordLatch`, or made with no tracker wired. The
-    /// command was still sent, so it may have consumed an agent dedup-ring slot. Lock-free;
-    /// called from the dispatch path. Over-counting is the safe direction.
+    /// refused, or skipped by a tripped `DispatchRecordLatch`. The command was still sent, so it
+    /// may have consumed an agent dedup-ring slot. (A dispatch made while NO tracker is wired is
+    /// not counted: there is nothing to count into, and the outbox's reader is then unreadable, so
+    /// the outbox holds.) Lock-free; called from the dispatch path. Over-counting is the safe
+    /// direction.
     void note_unrecorded_dispatch() noexcept {
         unrecorded_dispatches_.fetch_add(1, std::memory_order_relaxed);
     }

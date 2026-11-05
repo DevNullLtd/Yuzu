@@ -179,10 +179,14 @@ struct OutboxCommand {
     std::string principal;
     std::string approval_id; ///< see OutboxEnqueueRequest::approval_id
     int attempts{0};
-    /// #3678: the fleet-wide dispatch sequence (`ExecutionTracker::current_dispatch_seq`)
-    /// stamped on this row BEFORE its first send; nullopt = never stamped. A redrive compares it
-    /// with the current sequence to enforce the redelivery horizon.
+    /// #3678: where the dispatch counters stood before this row's FIRST delivery attempt
+    /// (`dispatch_position.hpp`); nullopt = never stamped. A redrive compares the counters now
+    /// against these to enforce the redelivery horizon. `dispatch_seq_first_sent` is the shared
+    /// sequence; the other two let a reader decide whether the stamping process's own unrecorded
+    /// count is comparable with its own (same leader epoch) or not.
     std::optional<std::int64_t> dispatch_seq_first_sent;
+    std::optional<std::int64_t> dispatch_unrecorded_first_sent;
+    std::optional<std::int64_t> dispatch_stamp_epoch;
 };
 
 class CommandOutboxStore {
@@ -319,24 +323,25 @@ public:
     mark_failed(const std::string& occurrence_id, const std::string& leader_lock_name,
                 std::int64_t leader_epoch, const std::string& reason);
 
-    /// #3678: epoch-fenced, NULL-only stamp of `dispatch_seq_first_sent` on a `pending` row,
-    /// committed BEFORE the row's first wire send. First stamp wins: returns `true` iff THIS
-    /// call wrote it, `false` if the row was already stamped, already terminal, or this replica
-    /// was fenced out (all "not ours" -- the caller must not send). A negative `dispatch_seq`
-    /// is refused as `db_error`.
+    /// #3678: epoch-fenced, NULL-only stamp of the dispatch counters on a `pending` row (shared
+    /// sequence, the stamping process's unrecorded count, and the leader epoch), committed BEFORE
+    /// the row's first wire send. First stamp wins: returns `true` iff THIS call wrote it, `false`
+    /// if the row was already stamped, already terminal, or this replica was fenced out (all "not
+    /// ours" -- the caller must not send). A negative argument is refused as `db_error`.
     [[nodiscard]] std::expected<bool, CommandOutboxError>
     stamp_first_send(const std::string& occurrence_id, const std::string& leader_lock_name,
-                     std::int64_t leader_epoch, std::int64_t dispatch_seq);
+                     std::int64_t leader_epoch, std::int64_t shared_seq, std::int64_t unrecorded);
 
     /// Epoch-fenced transient retry: keep the occurrence `pending`, bump
     /// `attempts`, and push `next_attempt_at` out by `delay` (so a transient
     /// delivery failure — a degraded dispatch chokepoint — backs off instead of
     /// hot-looping). Same return contract as `mark_sent`.
     ///
-    /// `clear_first_send_stamp` (#3678) also NULLs `dispatch_seq_first_sent` in the same fenced
-    /// write. Pass `true` ONLY when the attempt that wrote the stamp provably reached no agent
-    /// (it wrote the stamp in this very call and `sent == 0`): a stamp that predates the call may
-    /// guard an earlier attempt that really sent.
+    /// `clear_first_send_stamp` (#3678) also NULLs the three stamp columns in the same fenced
+    /// write, but ONLY if the stored stamp epoch equals `leader_epoch`. Pass `true` only when the
+    /// attempt that wrote the stamp provably reached no agent (it wrote the stamp in this very
+    /// call and `sent == 0`): a stamp that predates the call may guard an earlier attempt that
+    /// really sent, and the epoch guard additionally refuses to clear another term's stamp.
     [[nodiscard]] std::expected<bool, CommandOutboxError>
     reschedule(const std::string& occurrence_id, const std::string& leader_lock_name,
                std::int64_t leader_epoch, std::chrono::seconds delay,

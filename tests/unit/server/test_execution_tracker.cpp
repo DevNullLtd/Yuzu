@@ -1522,47 +1522,52 @@ TEST_CASE("ExecutionTracker: the dispatch record carries the plugin; the plugin 
         REQUIRE(first.has_value());
         CHECK(first->deleted == 0);
     }
-    SECTION("every dispatch record advances the fleet-wide dispatch sequence, monotonically "
-            "(#3678)") {
-        const auto s0 = tracker.current_dispatch_seq();
-        REQUIRE(s0.has_value());
-        CHECK(*s0 == 0); // nothing recorded yet on a fresh database: "none issued", not unreadable
+    SECTION("every dispatch record advances the SHARED dispatch sequence, monotonically (#3678)") {
+        const auto p0 = tracker.current_dispatch_position();
+        REQUIRE(p0.has_value());
+        CHECK(p0->shared == 0); // nothing recorded yet on a fresh database: "none issued", not unreadable
+        CHECK(p0->unrecorded == 0);
 
         REQUIRE(tracker.record_command_dispatch("seq-a", "echo", ""));
-        const auto s1 = tracker.current_dispatch_seq();
-        REQUIRE(s1.has_value());
-        CHECK(*s1 == *s0 + 1);
+        const auto p1 = tracker.current_dispatch_position();
+        REQUIRE(p1.has_value());
+        CHECK(p1->shared == p0->shared + 1);
 
         REQUIRE(tracker.record_command_dispatch("seq-b", "echo", ""));
-        const auto s2 = tracker.current_dispatch_seq();
-        REQUIRE(s2.has_value());
-        CHECK(*s2 > *s1);
+        const auto p2 = tracker.current_dispatch_position();
+        REQUIRE(p2.has_value());
+        CHECK(p2->shared > p1->shared);
 
         // A re-record of the SAME id also advances it: that only over-counts (the outbox horizon
         // trips earlier, never later), which is the safe direction.
         REQUIRE(tracker.record_command_dispatch("seq-a", "echo", ""));
-        const auto s3 = tracker.current_dispatch_seq();
-        REQUIRE(s3.has_value());
-        CHECK(*s3 > *s2);
+        const auto p3 = tracker.current_dispatch_position();
+        REQUIRE(p3.has_value());
+        CHECK(p3->shared > p2->shared);
 
         // A refused record (no plugin) must NOT consume a sequence value.
         CHECK_FALSE(tracker.record_command_dispatch("seq-c", "", ""));
-        const auto s4 = tracker.current_dispatch_seq();
-        REQUIRE(s4.has_value());
-        CHECK(*s4 == *s3);
-
-        // A dispatch whose record was NOT written still consumed an agent ring slot, so the
-        // process counts it into the EFFECTIVE sequence the outbox measures its horizon on.
+        const auto p4 = tracker.current_dispatch_position();
+        REQUIRE(p4.has_value());
+        CHECK(p4->shared == p3->shared);
+        CHECK(p4->unrecorded == 0); // the tracker does not count its own refusals; the caller does
+    }
+    SECTION("an unrecorded dispatch is counted in its OWN term and never summed into the shared "
+            "sequence (#3678)") {
+        const auto p0 = tracker.current_dispatch_position();
+        REQUIRE(p0.has_value());
         tracker.note_unrecorded_dispatch();
         tracker.note_unrecorded_dispatch();
-        const auto s5 = tracker.current_dispatch_seq();
-        REQUIRE(s5.has_value());
-        CHECK(*s5 == *s4 + 2);
-        // ...and a recorded dispatch still adds exactly one on top of it.
+        const auto p1 = tracker.current_dispatch_position();
+        REQUIRE(p1.has_value());
+        CHECK(p1->unrecorded == p0->unrecorded + 2);
+        CHECK(p1->shared == p0->shared); // the shared term is untouched: it lives in the database
+        // A recorded dispatch moves only the shared term.
         REQUIRE(tracker.record_command_dispatch("seq-d", "echo", ""));
-        const auto s6 = tracker.current_dispatch_seq();
-        REQUIRE(s6.has_value());
-        CHECK(*s6 == *s5 + 1);
+        const auto p2 = tracker.current_dispatch_position();
+        REQUIRE(p2.has_value());
+        CHECK(p2->shared == p1->shared + 1);
+        CHECK(p2->unrecorded == p1->unrecorded);
     }
     SECTION("a record without a plugin, or without a command id, is refused") {
         CHECK_FALSE(tracker.record_command_dispatch("cmd-3", "", "exec-1"));
@@ -1715,7 +1720,7 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades "
     // 0 would read as "no dispatches yet" and let a stale stamp look young. Counting an
     // unrecorded dispatch on a closed store must not make it readable either.
     closed.note_unrecorded_dispatch();
-    CHECK_FALSE(closed.current_dispatch_seq().has_value());
+    CHECK_FALSE(closed.current_dispatch_position().has_value());
 }
 
 TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "
