@@ -563,7 +563,8 @@ TEST_CASE("v3 drops a 17th token and a nameless row", "[server][inventory_blob_v
     CHECK(s2.sections[0].refusal == V3Refusal::kSourceMismatch);
 }
 
-TEST_CASE("v3 a 0x1E or 0x1F byte inside a field frames the record and never reaches a parsed field",
+TEST_CASE("v3 a 0x1E or 0x1F byte inside a field frames the record and never reaches a parsed "
+          "field",
           "[server][inventory_blob_v3]") {
     // The stored canonical records (row and component hashes, identity_key segments) rely on no
     // stored field holding a separator. The parser splits on both bytes, so a producer that
@@ -588,9 +589,9 @@ TEST_CASE("v3 a 0x1E or 0x1F byte inside a field frames the record and never rea
     CHECK(c.size == 0);
     CHECK(c.mtime == 10);
     CHECK(c.anchor_app == "20");
-    for (const auto f : {std::string_view(c.kind), std::string_view(c.name), std::string_view(c.version),
-                         std::string_view(c.version_source), std::string_view(c.path),
-                         std::string_view(c.anchor_app)})
+    for (const auto f : {std::string_view(c.kind), std::string_view(c.name),
+                         std::string_view(c.version), std::string_view(c.version_source),
+                         std::string_view(c.path), std::string_view(c.anchor_app)})
         CHECK(clean(f));
 
     // 0x1F in a name: the shift lands a version in version_source, refused.

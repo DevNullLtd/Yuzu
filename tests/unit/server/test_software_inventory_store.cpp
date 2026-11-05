@@ -5639,7 +5639,8 @@ SoftwareEntry rpm_row(const std::string& name, const std::string& version,
 }
 } // namespace
 
-TEST_CASE("v3: a release-only or epoch-only change is an upgrade carrying [epoch:]version[-release]",
+TEST_CASE("v3: a release-only or epoch-only change is an upgrade carrying "
+          "[epoch:]version[-release]",
           "[pg][software_inventory][v3][ledger]") {
     SWINV_SHARED(store, pool);
     struct Case {
@@ -5664,7 +5665,8 @@ TEST_CASE("v3: a release-only or epoch-only change is an upgrade carrying [epoch
     };
     for (const auto& c : cases) {
         CAPTURE(c.agent);
-        REQUIRE(store.apply_installed_software_v3(c.agent, v3_report({v3_full(kV3Pkgs, {c.from})}))[0]
+        REQUIRE(store.apply_installed_software_v3(c.agent,
+                                                  v3_report({v3_full(kV3Pkgs, {c.from})}))[0]
                     .outcome == V3SectionOutcome::kStored);
         // By a full section, then back again by a delta: both paths write one upgrade each.
         REQUIRE(store.apply_installed_software_v3(c.agent, v3_report({v3_full(kV3Pkgs, {c.to})}))[0]
@@ -5691,7 +5693,8 @@ TEST_CASE("v3: a release-only or epoch-only change is an upgrade carrying [epoch
                 .outcome == V3SectionOutcome::kStored);
     REQUIRE(store.apply_installed_software_v3("agent-same", v3_report({v3_full(kV3Pkgs, {p})}))[0]
                 .outcome == V3SectionOutcome::kStored);
-    REQUIRE(store.apply_installed_software_v3("agent-same", v3_report({v3_full(kV3Pkgs, {churned})}))[0]
+    REQUIRE(store.apply_installed_software_v3("agent-same",
+                                              v3_report({v3_full(kV3Pkgs, {churned})}))[0]
                 .outcome == V3SectionOutcome::kStored);
     CHECK(ledger_count(pool, "agent-same") == "0");
 }
@@ -5703,14 +5706,16 @@ TEST_CASE("v3: a held facet whose stored rows do not hash to its section hash is
     store.set_metrics(&metrics);
     const auto a1 = v3_entry("Alpha", kV3Apps);
     const auto b1 = v3_entry("Beta", kV3Apps);
-    REQUIRE(store.apply_installed_software_v3("agent-oob", v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
+    REQUIRE(store.apply_installed_software_v3("agent-oob",
+                                              v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
                 .outcome == V3SectionOutcome::kStored);
     // An out-of-band delete (no product path does this) leaves the facet_state hash behind.
     REQUIRE(sql_ok(pool, "DELETE FROM software_inventory_store.installed_software "
                          "WHERE agent_id = 'agent-oob' AND name = 'Beta'"));
     REQUIRE(facet_status(pool, "agent-oob", kV3Apps) == "full/" + section_hash_of({a1, b1}));
 
-    REQUIRE(store.apply_installed_software_v3("agent-oob", v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
+    REQUIRE(store.apply_installed_software_v3("agent-oob",
+                                              v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
                 .outcome == V3SectionOutcome::kStored);
     CHECK(ledger_count(pool, "agent-oob") == "0"); // no phantom install of Beta
     CHECK(metrics.counter("yuzu_software_changes_total", {{"kind", "install"}}).value() == 0.0);
@@ -5852,9 +5857,11 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
         const auto olds = std::vector<SoftwareEntry>{row("A", "1.5"), row("A", "1")};
         const auto news = std::vector<SoftwareEntry>{row("A", "4"), row("A", "3")};
         REQUIRE(row("A", "4").instance_key < row("A", "3").instance_key);
-        for (const auto& [o, n] : {std::pair{olds, news},
-                                   std::pair{std::vector<SoftwareEntry>(olds.rbegin(), olds.rend()),
-                                             std::vector<SoftwareEntry>(news.rbegin(), news.rend())}}) {
+        const auto reversed = [](const std::vector<SoftwareEntry>& v) {
+            return std::vector<SoftwareEntry>(v.rbegin(), v.rend());
+        };
+        for (const auto& [o, n] :
+             {std::pair{olds, news}, std::pair{reversed(olds), reversed(news)}}) {
             const auto ch = SoftwareInventoryStore::diff_changes(o, n);
             REQUIRE(ch.size() == 2);
             CHECK(ch[0].kind == Kind::kUpgrade);
@@ -5883,7 +5890,8 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
             e.epoch = ep;
             return keyed(std::move(e));
         };
-        auto ch = SoftwareInventoryStore::diff_changes({rel("1.0", "1", "")}, {rel("1.0", "2", "")});
+        auto ch =
+            SoftwareInventoryStore::diff_changes({rel("1.0", "1", "")}, {rel("1.0", "2", "")});
         REQUIRE(ch.size() == 1);
         CHECK(ch[0].from_version == "1.0-1");
         CHECK(ch[0].to_version == "1.0-2");

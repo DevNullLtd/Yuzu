@@ -1170,9 +1170,11 @@ SoftwareInventoryStore::diff_changes(const std::vector<SoftwareEntry>& old_rows,
                 came.push_back(g.added[a++]);
             }
         }
-        gone.insert(gone.end(), g.removed.begin() + static_cast<std::ptrdiff_t>(r), g.removed.end());
+        gone.insert(gone.end(), g.removed.begin() + static_cast<std::ptrdiff_t>(r),
+                    g.removed.end());
         came.insert(came.end(), g.added.begin() + static_cast<std::ptrdiff_t>(a), g.added.end());
-        // The rest pair k-th to k-th in tuple order (deterministic, independent of the row hashes).
+        // The rest pair k-th to k-th in tuple order; rows with an equal tuple are ordered by
+        // instance_key, so which of them pairs does not depend on the input order.
         const std::size_t paired = std::min(gone.size(), came.size());
         for (std::size_t i = 0; i < paired; ++i)
             out.push_back(make(SoftwareChangeKind::kUpgrade, *came[i], version_text(*gone[i]),
