@@ -972,7 +972,10 @@ TEST_CASE("win real ops: bounded file read and single-level directory listing on
     // First use of the new bounded-read primitive and of FindFirstFileExW listing, neither of which
     // the FakeOps cases reach: one small scratch tree (yuzu_test_ prefix: the Defender exclusion).
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_win_"};
-    const auto root = dir.path;
+    std::filesystem::create_directories(dir.path);
+    // The strict read compares the kernel's resolved path with the requested one, so the scratch
+    // root is spelled canonically (a runner's %TEMP% can carry an 8.3 short name).
+    const auto root = std::filesystem::canonical(dir.path);
     std::filesystem::create_directories(root / "alpha");
     std::filesystem::create_directories(root / "beta");
     {
@@ -998,6 +1001,43 @@ TEST_CASE("win real ops: bounded file read and single-level directory listing on
           pw::OpStatus::absent);
     CHECK(ops.read_file((root / "alpha").string(), 10).status == pw::OpStatus::error); // a directory
     CHECK(ops.read_file("", 10).status == pw::OpStatus::error);
+}
+
+TEST_CASE("win real ops: the nuspec read refuses a hard link and a redirected parent directory",
+          "[pkg_inventory][windows][realops]") {
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_win_strict_"};
+    std::filesystem::create_directories(dir.path);
+    const auto root = std::filesystem::canonical(dir.path);
+    std::filesystem::create_directories(root / "real");
+    const auto nuspec = root / "real" / "real.nuspec";
+    {
+        std::ofstream(nuspec, std::ios::binary)
+            << "<package><metadata><version>3.2.1</version></metadata></package>";
+    }
+    const pw::RealOps ops;
+    const auto plain = ops.read_file(nuspec.string(), 4096);
+    REQUIRE(plain.status == pw::OpStatus::ok); // the control: an ordinary file reads
+
+    // A second link to the same file: the read cannot tell whose content it is, so it refuses.
+    std::error_code ec;
+    std::filesystem::create_hard_link(nuspec, root / "real" / "linked.nuspec", ec);
+    REQUIRE_FALSE(ec);
+    CHECK(ops.read_file(nuspec.string(), 4096).status == pw::OpStatus::error);
+    CHECK(ops.read_file((root / "real" / "linked.nuspec").string(), 4096).status ==
+          pw::OpStatus::error);
+    std::filesystem::remove(root / "real" / "linked.nuspec", ec);
+    REQUIRE(ops.read_file(nuspec.string(), 4096).status == pw::OpStatus::ok); // single link again
+
+    // A parent directory that is a symlink (a junction behaves the same): the leaf probe alone
+    // would follow it, the resolved-path check refuses it. Creating one needs a privilege the
+    // runner may not grant, in which case this half is skipped, loudly.
+    std::filesystem::create_directory_symlink(root / "real", root / "redirect", ec);
+    if (ec) {
+        WARN("directory symlink not creatable here (" << ec.message() << "); redirect half skipped");
+        return;
+    }
+    CHECK(ops.read_file((root / "redirect" / "real.nuspec").string(), 4096).status ==
+          pw::OpStatus::error);
 }
 
 #endif // _WIN32

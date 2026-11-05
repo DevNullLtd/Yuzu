@@ -7,6 +7,11 @@
 //     (attributes carry FILE_ATTRIBUTE_REPARSE_POINT), never followed; parent
 //     directories are trusted (the callers read machine-wide, admin-writable
 //     trees such as C:\ProgramData);
+//   - with `strict` set, the read also refuses (as `error`) a file with more than one hard link
+//     and a file whose resolved path (GetFinalPathNameByHandleW) is not the requested path, so a
+//     junction or symlink in ANY parent directory, swapped in after a listing, is not followed.
+//     The default stays leaf-only: other callers read paths whose parents may legitimately be
+//     redirected, and a strict read can only turn an answer into an `error`, never into data;
 //   - a directory is refused as `error` (the leaf is opened with FILE_FLAG_BACKUP_SEMANTICS:
 //     without it CreateFileW answers ERROR_ACCESS_DENIED for a directory, which would be
 //     misreported as `denied`, an ACL refusal, when it is a wrong-kind path);
@@ -39,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace yuzu::win {
 
@@ -54,7 +60,26 @@ struct BoundedRead {
     bool truncated = false; ///< the file held more than `cap` bytes
 };
 
-[[nodiscard]] inline BoundedRead read_file_bounded(const std::wstring& path, std::size_t cap) {
+/// Whether the path the kernel resolved the open handle to is the path that was asked for. The
+/// final path of a DOS-volume handle carries a `\\?\` prefix; the comparison is ordinal and
+/// case-insensitive, the primitive NTFS itself is defined against. Any failure answers false.
+[[nodiscard]] inline bool handle_path_is(HANDLE h, const std::wstring& requested) {
+    std::vector<wchar_t> fin(MAX_PATH);
+    DWORD n = GetFinalPathNameByHandleW(h, fin.data(), static_cast<DWORD>(fin.size()),
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n >= fin.size()) {
+        fin.assign(static_cast<std::size_t>(n) + 1, L'\0');
+        n = GetFinalPathNameByHandleW(h, fin.data(), static_cast<DWORD>(fin.size()),
+                                      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    }
+    if (n == 0 || n >= fin.size()) return false;
+    const std::wstring expected = L"\\\\?\\" + requested;
+    return CompareStringOrdinal(expected.c_str(), static_cast<int>(expected.size()), fin.data(),
+                                static_cast<int>(n), TRUE) == CSTR_EQUAL;
+}
+
+[[nodiscard]] inline BoundedRead read_file_bounded(const std::wstring& path, std::size_t cap,
+                                                   bool strict = false) {
     BoundedRead out;
     if (path.empty()) return out; // an empty path would name the current directory's drive root
     const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
@@ -80,6 +105,8 @@ struct BoundedRead {
     if (!GetFileInformationByHandle(h, &info)) return out;
     if ((info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0)
         return out; // refused: status stays `error`
+    if (strict && (info.nNumberOfLinks > 1 || !handle_path_is(h, path)))
+        return out; // refused: a hard link, or a parent redirected by a junction or symlink
     const std::uint64_t size =
         (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
     const std::size_t limit = (std::min)(cap, kMaxBoundedReadBytes);
