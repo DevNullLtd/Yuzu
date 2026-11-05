@@ -4,11 +4,13 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 ## Behaviour change: installed-software `publisher` is never empty (`via:` origin labels)
 
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.
+
 - **What the agent sends:** every row has a non-empty publisher: the declared vendor, else the origin label `via:<ecosystem>`; the per-source table is in the installed-software inventory manual.
 - **Hash:** the publisher is part of the inventory hash, which the agent and the server of the same build compute identically. Bring up every server replica before the agents of the same build enroll.
 - **What the server does with a label:** it treats a `via:` publisher as no vendor. The catalogue's publisher total excludes labels, a title's representative publisher prefers a declared vendor, and title matching ignores the label. The match is exact and case-sensitive on the lower-case prefix the agent writes, so a real publisher that happens to start with `VIA:` is still a vendor.
 - **Title dimension:** the software title dimension and curation queue are keyed on the raw (name, publisher, ecosystem) triple, so a title with no declared vendor is recorded under its `via:` label, not under an empty publisher.
-- **Scripts that read `publisher`:** a script that tested for an empty publisher to mean "unknown vendor" must also treat a value starting with `via:` as unknown.
+- **Scripts that read `publisher`:** it is never empty; test for the `via:` prefix to find rows with no declared vendor.
 
 ## Behaviour change: installed-software schema v10 (the server accepts the sectioned report)
 
