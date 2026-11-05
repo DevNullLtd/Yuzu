@@ -1111,7 +1111,8 @@ US path US size US mtime US anchor_app RS`; a row hash is the SHA-256 of one rec
 `-` names); the section hash is the SHA-256 of the records sorted by those fields (size and mtime
 numerically) and de-duplicated. A full section deletes the agent's components then inserts
 (`first_seen` = the time the row was written); a delta deletes by
-`row_hash`, inserts, and verifies `expect`, and does not touch the rows it does not name. Freshness
+`row_hash`, inserts, and verifies `expect`, and does not touch the rows it does not name; every `-`
+must name a held row, else the section is a mismatch and rolls back. Freshness
 of a delta-maintained facet is `software_facet_state.last_confirmed_at`, not a per-row column.
 An honest-empty full
 deletes the rows. A repeated `(kind, path)` inside one section is a producer defect: `mismatch`.
