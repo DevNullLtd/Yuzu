@@ -1160,11 +1160,8 @@ std::string SoftwareInventoryStore::canonical_component_section_hash(std::vector
 //  - window 400 days in epoch SECONDS (observed_at); big_step_floor 1 day and implausibility_bound
 //    1 day (observed_at is server receipt time, never future, so a row more than a day ahead is
 //    skew and is excluded from the would-wipe denominator); min_plausible_reading year 2000;
-//  - cap_per_pass 50,000 at an hourly tick = 1.2M deletes/day. The fleet's MEAN ledger rows/day
-//    must stay under that daily cap or the table grows without bound; rows per device are bounded
-//    by 400 days x that device's change rate. The 2M-endpoint target at even one change per device
-//    per day exceeds the cap, so that scale needs a 5-minute cadence (the caller) or a higher
-//    cap (this constant): those are the two knobs, named here so the choice is not rediscovered.
+//  - cap_per_pass 50,000 at an hourly tick; the scale arithmetic and its two knobs (cadence, cap)
+//    are in the docs/clock-guarded-retention.md row for this store.
 int SoftwareInventoryStore::run_retention_prune_changes() {
     if (!open_)
         return -1;
