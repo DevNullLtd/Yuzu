@@ -140,7 +140,7 @@ inherits this same degrade-vs-outage ambiguity"; field reference:
 `docs/user-manual/rest-api.md` → `GET /api/v1/access-reviews/export`.
 
 **Addendum: access-review attestations now require the reviewer to differ from the subject of
-the grant, and every decision is kept (CC6.2, #4752, 2026-11-03).** Before this change a
+the grant, and every decision is kept (CC6.2, #4752, 2026-11-03, amended 2026-11-04).** Before this change a
 reviewer holding `AccessReview:Attest` could record a decision on a grant that named them, and a
 later decision on a grant replaced the earlier one, so the campaign record could not show who
 decided what, in what order. Now: (1) the reviewer must differ from the subject of the grant, on

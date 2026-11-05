@@ -3818,8 +3818,10 @@ allow-list) and the MCP tier check precedes the gate. Engine principal sessions 
 
 **The window (stated as a limit, not a guarantee).** The engine-owner and group-member rules are decided by a
 read BEFORE the store's write transaction, not inside it. ADR-0012 s2(c) forbids a store method from calling
-another store, or re-entering the pool, while it holds a lease, so the attest transaction cannot consult the
-engine or RBAC store. The window runs from that read to the commit: a pool acquire of up to the store's 4 s
+another store, or re-entering the pool, while it holds a lease, so the attest transaction does not consult the
+engine or RBAC store. ADR-0012 s2(c) itself sends cross-store work to s3, a dedicated query owner that takes one
+lease and issues schema-qualified SQL across the schemas; the project chose the pre-read with a documented window
+instead of building one. The window runs from that read to the commit: a pool acquire of up to the store's 4 s
 write budget, a row-lock wait of up to the pool's 10 s `lock_timeout`, and the statements themselves.
 It is normally milliseconds but is not a bound the code promises. An ownership transfer or a membership change
 that lands inside it is not seen, and there is no re-read after the commit. The user rule has no such window.
@@ -3998,7 +4000,7 @@ grants with 100 decisions each (about 453 MB against 323 MB for the 32 MB ASCII 
 the baseline is about 1.4 to 1.6 times the REST growth, the figure to scale by when sizing for concurrent requests). These were
 fresh processes on one host, three runs for each MCP figure and one run for each REST figure in the comparison, on the
 `VmHWM` divided by 1024 convention above; the three-run REST figures above agree with those single runs within about 3
-percent. The Access page's campaign fragment, measured the same way, peaks at about 195 MB for 1000 grants with 100
+percent at 1000 grants (about 7 percent at 200 grants, where the baseline is most of the peak). The Access page's campaign fragment, measured the same way, peaks at about 195 MB for 1000 grants with 100
 decisions each (about 255 MB with four-byte characters), and the page renders at most 1000 grants: it shows only the
 latest justification whole and 64 characters of each earlier one, so its body is 27 to 46 MB. The browser's own cost
 for a document of that size was not measured. No shipped deployment configuration (the `deploy/docker` compose files, the `deploy/systemd` unit, the HA compose file)

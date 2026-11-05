@@ -4358,10 +4358,11 @@ below.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `title` | string | Yes | Human-readable campaign name |
+| `title` | string | Yes | Human-readable campaign name, 1 to 256 bytes, no NUL byte |
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
-or `title` missing, empty or containing a NUL byte. `403` without `AccessReview:Attest` (or an
+or `title` missing, empty, longer than 256 bytes or containing a NUL byte (an over-long title writes no
+audit row). `403` without `AccessReview:Attest` (or an
 engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `415` — `Content-Type` is not
@@ -4376,8 +4377,8 @@ Audited as `access_review.campaign_opened` (`detail` carries
 Full evidentiary state of one review campaign: metadata plus every frozen
 attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
 (the review-completeness number). Each attestation row carries its current
-decision, `decision_seq` and `history[]`, the full list of decisions recorded for
-that grant.
+decision, `decision_seq` and `history[]`, the decisions recorded for that grant (the
+limits are below).
 
 **Permission:** `AccessReview:Read`.
 
@@ -4526,6 +4527,9 @@ decision. `400`, one cause each:
   audit rows and no known creation path produces a longer id, but a frozen grant whose `principal_id` or
   `role_name` exceeds 1024 bytes cannot be attested: it stays `pending` and is reported as an incomplete
   review when the campaign closes.
+- `justification` is present and not a string (a number, boolean, array or object; `null` counts as
+  absent). It is refused before the gate and writes no audit row: an entry cannot be corrected once
+  recorded, so a note is never read as empty and dropped.
 - `justification` is longer than 4096 bytes or contains a NUL byte. The store checks this after the
   separation-of-duties gate and writes a `failure` audit row.
 - The grant already holds the maximum of 100 recorded decisions. The message is
@@ -4652,12 +4656,15 @@ or close of a campaign likewise leaves the change in place and sets the header.
 For a refusal, the header depends on which refusal it is. A failed refusal row sets
 it for an engine-session refusal (all three write routes) and, on the attestation
 route, for the separation-of-duties refusals and the store failures and refusals; the
-refusal stands. A failed refusal row does not set it for a cross-site request (all
-three routes), for a wrong Content-Type (open and attestation; close takes no body)
-or for a store refusal on open or close: those rows are attempted and a failure to
-save one is ignored. A refusal by the permission check writes its own row and sets no
-header, and a malformed request (a bad id, bad JSON, a field over its bound) writes no
-row.
+refusal stands. A cross-site cookie request (all three routes) is refused earlier, by the
+server-wide same-site check, before the route runs; that check writes its own `csrf.denied`
+row and sets the header when the row cannot be saved (see the Audit Log guide). The route's
+own copy of the check is defence in depth, which a cookie session does not reach. A failed
+refusal row does not set the header for a wrong Content-Type (open and attestation; close
+takes no body) or for a store refusal on open or close: those rows are attempted and a
+failure to save one is ignored. A refusal by the permission check writes its own row and
+sets no header, and a malformed request (a bad id, bad JSON, a field over its bound, a
+`justification` that is not a string) writes no row.
 
 Both machine contracts declare the signal: the OpenAPI success responses of the three
 write routes (201 for open, 200 for attest and close) document the `Sec-Audit-Failed` header, and
@@ -4721,8 +4728,10 @@ The three mutating routes (`POST /api/v1/access-reviews`,
 `POST /api/v1/access-reviews/{id}/close`) are called by the dashboard with a
 session cookie, so a cookie-authenticated request must carry an `Origin` (or
 `Referer`) naming this site, or it is refused with `403` before the body is
-read and a `csrf.denied` row is written (`target_type=Endpoint`, `target_id` is
-the route as written above). A request that authenticates with an API token is
+read and a `csrf.denied` row is written by the server-wide same-site check
+(`target_type=Endpoint`, `target_id` is the method and path of the request, for example
+`POST /api/v1/access-reviews/<id>/attestations`, and `detail` ends with `reason=<token>`). The
+route's own copy of the check is defence in depth and is not reached by a cookie session. A request that authenticates with an API token is
 not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
 the dashboard origin to `--csrf-trusted-origin`.
 

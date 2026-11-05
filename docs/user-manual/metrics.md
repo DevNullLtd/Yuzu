@@ -1437,8 +1437,7 @@ Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
 access reviews") shipped with zero metrics; the hardening round added four
 bounded-label series wired at the REST handlers (`rest_api_v1.cpp`) only —
 the MCP twins are not double-counted. A fifth series,
-`yuzu_access_review_attestation_refused_total`, covers both surfaces (see the end of
-this section).
+`yuzu_access_review_attestation_refused_total`, covers both surfaces (see below).
 
 ```
 # HELP yuzu_access_review_export_total Access review evidence exports (GET /api/v1/access-reviews/export), by format
