@@ -812,7 +812,14 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   re-publishes when the latest CRL is missing or within 24h of `nextUpdate`. A CRL
   is valid for 48 hours from the moment it is built (`kCrlValidity`, #6016), so a
   fleet with no revocations gets a new CRL about once a day and a healthy leader
-  keeps it from expiring. The same check lets a failed startup pre-publish self-heal
+  keeps it from expiring. Headroom is exported on every replica's `/metrics` as
+  `yuzu_server_ca_crl_next_update_timestamp_seconds` (the CRL's `nextUpdate`; remaining
+  time is that value minus `time()`) with `YuzuCaCrlNearExpiry` (under 12 hours) and
+  `YuzuCaCrlExpired` (past `nextUpdate`), so a stalled republish is visible from any
+  scrape (#6527). That detects a stalled republish only: it does not detect a server that
+  is down (use `up`), a publisher clock that is wrong, or a consumer that fails to fetch,
+  and an installation with its own certificates has no internal CA and so no series. See
+  "CRL near expiry or expired" below. The same check lets a failed startup pre-publish self-heal
   on the next **successful leader** tick. That freshness
   re-publish is `FencedLeaderOnly` (WS-3, ADR-2002) — under a leadership pause (a
   lost coordination connection; look for `[HA] … FencedLeaderOnly background loops
@@ -889,6 +896,21 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   pg_terminate_backend(pid)` on that `pid` releases it immediately rather than waiting. Every other
   replica's retry loop (`kBootstrapLockAcquireTimeout`/`kBootstrapLockRetryInterval`,
   `default_certs.cpp`) picks the now-free lock up on its own next attempt — no restart required.
+
+### CRL near expiry or expired
+
+`YuzuCaCrlNearExpiry` (under 12 hours of `nextUpdate` left) or `YuzuCaCrlExpired` (past it) means the
+leader's freshness pass has stopped republishing; the server's own revocation check (`is_revoked`)
+reads the database and is unaffected, but anything that reads `GET /api/v1/ca/crl` (a reverse proxy's
+`ssl_crl`, a monitoring check) will start refusing this CA's certificates at `nextUpdate`.
+
+1. **Confirm** what is served: `curl -s --cacert <install CA> https://<server>/api/v1/ca/crl | openssl crl -inform DER -noout -lastupdate -nextupdate`. A 503 means no CRL is published at all.
+2. **Is there a leader?** `yuzu_server_leader_is_leader` and `YuzuLeaderNoLeader` (the zombie-lock steps are in `docs/user-manual/server-admin.md`, "Leader election: metrics and alerts"). A leader that reads `1` but is wedged is caught only by this alert.
+3. **Is publishing failing?** `yuzu_server_ca_crl_publish_failure_reason_total{reason}` and `YuzuCaCrlPublishFailing` name the cause (key load, lock timeout, no connection).
+4. **Is the leader's clock right?** The freshness pass compares `nextUpdate` with the leader's own clock, so a clock far from real time hides the problem from the leader while Prometheus still sees it.
+5. **Restart only the single wedged or leaderless replica**, one at a time. Do not restart every replica (that is the re-root procedure above, not this), and do not restart while Postgres is unreachable: the server fails closed at boot without it, so a restart turns a degraded state into an outage. A booting server publishes a CRL (the boot pre-publish is not leader-gated); success is the gauge moving to about 48 hours of headroom and no `PKI: initial CRL publish failed` warning in its log.
+
+What these alerts do **not** cover: a server process that is down or an unreachable `/metrics` (both silence the series; keep your own `up == 0` alert), a publisher clock stepped forward (a CRL dated in the future shows more than 48 hours of headroom and raises nothing), and consumers failing to fetch the CRL. Rolling back to a build without the gauges silences both alerts.
 
 ## Roadmap
 

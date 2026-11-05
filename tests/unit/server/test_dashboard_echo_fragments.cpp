@@ -1129,3 +1129,94 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): authority revoked while the att
     CHECK(h.calls[0].exec_visible->count("dev-A") == 1);
     CHECK(h.calls[0].exec_visible->count("dev-B") == 0); // the revocation reached the send
 }
+
+TEST_CASE("fragment purge/reenable audit (#3619 UP-5): the route permission revoked while the "
+          "attempted row is written dispatches nothing and records the outcome",
+          "[pg][server][echo][purge][reenable][fragment][audit][security][3619]") {
+    // The route gate (Infrastructure:Delete for purge, Execution:Execute for re-enable) ran
+    // before the wait. With RBAC off the dispatch seam admits every human principal, so a JIT
+    // elevation that lapses during the wait is caught only by deciding the permission again.
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            const std::string act = action;
+            h.audit_persists = [&h, act](const AuditRow& r) {
+                if (r.action == act && r.result == "attempted")
+                    h.perm_allow = false; // revoked mid-write
+                return true;
+            };
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 403);
+            CHECK(h.calls.empty());
+            // Admission, then the recheck after the attempted row -- of the ROUTE's own
+            // permission (Gate 3 QE-1: purge must not recheck the weaker Execution:Execute).
+            REQUIRE(h.perms.size() == 2);
+            const bool purge = act == "echo.source.purge";
+            CHECK(h.perms[1].securable_type == (purge ? "Infrastructure" : "Execution"));
+            CHECK(h.perms[1].op == (purge ? "Delete" : "Execute"));
+            CHECK(h.audits_for(action, "attempted") == 1);
+            REQUIRE(h.audits_for(action, "failure") == 1);
+            CHECK(h.audit_detail(action, "failure") == "permission_revoked device=dev-A source=process");
+            CHECK(h.audits_for(action, "success") == 0);
+            const std::string metric =
+                purge ? "yuzu_echo_source_purge_total" : "yuzu_echo_source_reenable_total";
+            CHECK(h.metric(metric, "denied") == 1.0);
+        }
+    }
+}
+
+TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while the attempted "
+          "row is written sends nothing and records the outcome",
+          "[pg][server][dashboard][execute][audit][security][3619]") {
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0; // a regression reaches dispatch, never the result-render path
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "command.dispatch" && r.result == "attempted")
+            h.perm_allow = false; // revoked mid-write
+        return true;
+    };
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-B");
+    CHECK(res->status == 403);
+    CHECK(h.calls.empty());
+    // The last gate call is the recheck after the attempted row, of the route's own permission
+    // (the route makes other gate calls before the row, so the count is not pinned here). This
+    // tells the recheck from admission only because the InstructionDefinition:Read lookup sits
+    // between them; calls.empty() and the failure detail below are the independent guards.
+    REQUIRE(h.perms.size() >= 2);
+    CHECK(h.perms.back().securable_type == "Execution");
+    CHECK(h.perms.back().op == "Execute");
+    CHECK(h.audits_for("command.dispatch", "attempted") == 1);
+    REQUIRE(h.audits_for("command.dispatch", "failure") == 1);
+    CHECK(h.audit_detail("command.dispatch", "failure") == "reason=permission_revoked os_info:version");
+    CHECK(h.audits_for("command.dispatch", "success") == 0);
+}
+
+TEST_CASE("fragment purge audit (#3619 UP-5, Gate 5 CH-1): a recheck refusal whose failure row is "
+          "not stored still purges nothing and flags the response",
+          "[pg][server][echo][purge][fragment][audit][security][3619]") {
+    // Compound fault: the attempted row is stored, the grant is withdrawn during that write, and
+    // every later row fails to persist. Only the attempted row survives; nothing is dispatched;
+    // the route's own (unstored) failure row marks the response.
+    FragmentHarness h;
+    bool attempted_seen = false;
+    h.audit_persists = [&h, &attempted_seen](const AuditRow& r) {
+        if (attempted_seen)
+            return false; // the audit store fails after the attempted row
+        if (r.action == "echo.source.purge" && r.result == "attempted") {
+            attempted_seen = true;
+            h.perm_allow = false; // revoked mid-write
+        }
+        return true;
+    };
+    auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(res->status == 403);
+    CHECK(h.calls.empty());
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.audits_for("echo.source.purge", "attempted") == 1);
+    CHECK(h.audit_detail("echo.source.purge", "failure") ==
+          "permission_revoked device=dev-A source=process"); // attempted, not stored
+    CHECK(h.audits_for("echo.source.purge", "failure") == 1);
+    CHECK(h.audits_for("echo.source.purge", "success") == 0);
+    CHECK(h.metric("yuzu_echo_source_purge_total", "denied") == 1.0);
+}
