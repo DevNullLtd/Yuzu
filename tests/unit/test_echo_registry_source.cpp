@@ -5059,10 +5059,11 @@ struct LiveRun {
             if (!seen) {
                 // #7135: on the shared CI box this wait timed out with nothing in the job log to
                 // say why. The session is system-wide, so name what it delivered since this write
-                // (all writers), whether our own buffer evicted any (evicted), whether any
-                // buffered event carries this process's pid (from_this_pid: the await predicate
-                // also needs the op and value name, so 1 here with the wait still timed out means
-                // the event arrived but did not match), and what the session says it lost. Events
+                // (all writers), whether our own buffer evicted any (evicted), whether an event
+                // carrying this process's pid arrived since this write (from_this_pid: the await
+                // predicate also needs the op and value name, so 1 here with the wait still timed
+                // out means an event arrived but did not match), and what the session says it
+                // lost. Events
                 // arriving while events_lost or rt_buffers_lost grow points at the session
                 // overflowing under load, which would have dropped this write's event; no events
                 // at all with etw_running=1 and zero loss points at a session that is not
@@ -5073,8 +5074,12 @@ struct LiveRun {
                 const SessionLoss loss = session_loss();
                 const auto evicted = src->buffer_for_test().drop_info().count;
                 // A deadline already in the past evaluates the predicate once, without waiting.
+                // seq is assigned together with pushed_ under the buffer lock, so
+                // seq > pushed_before means pushed since this write.
                 const bool from_this_pid = src->buffer_for_test().wait_for_event(
-                    [](const RegistryEtwEvent& e) { return e.pid == ::GetCurrentProcessId(); },
+                    [pushed_before](const RegistryEtwEvent& e) {
+                        return e.seq > pushed_before && e.pid == ::GetCurrentProcessId();
+                    },
                     std::chrono::steady_clock::now());
                 const std::string detail = std::format(
                     "no ETW event from this write within 15 s. session delivered {} events from "
@@ -5086,9 +5091,9 @@ struct LiveRun {
                     loss.rt_buffers_lost, loss.decode_failed, static_cast<int>(loss.query_ok),
                     static_cast<int>(etw_running()), static_cast<int>(from_this_pid));
                 // meson's job-log tail is the last 100 lines of the test's stdout then its
-                // stderr section, and this case sits ~700 lines before the end of the echo
-                // output, so a Catch2 message alone reaches only the uploaded meson-logs
-                // artifact. stderr is printed last: put the same text there too.
+                // stderr section, and hundreds of lines of per-case output follow this case,
+                // so a Catch2 message alone reaches only the uploaded meson-logs artifact.
+                // stderr is printed last: put the same text there too.
                 std::fprintf(stderr, "[#7135] %s\n", detail.c_str());
                 FAIL(detail);
             }
