@@ -12,6 +12,16 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **Sequencing in a fresh deployment:** bring up every server replica before the agents of the same build enroll. The agent in this release reads only the whole-source request, so the per-section request (`installed_software:<source>`) reads to it as a clean sync until the agent release that sends v3 handles it; no shipped agent sends v3 yet, so nothing changes today.
 - **Backups:** `software_facet_state` is an ordinary table, so a `pg_dump` backup of the database covers it.
 - **Metric:** `yuzu_inventory_section_ingest_total{facet,outcome}` counts the outcome of each section of a v3 report; see "Install type, scope and location, and the sectioned report" in the installed-software inventory manual.
+
+## Behaviour change: installed software syncs in a nightly window, and an overdue sync is spread
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a fleet forward.
+
+- **What changed:** the agent sends installed software once a day at a stable per-agent moment between 01:00 and 05:00 on the endpoint's own clock and time zone and a sync more than 15 minutes overdue is spread over the next 30 minutes by a stable per-agent offset; a send that keeps failing retries every 30 seconds for up to 15 minutes, then pauses for that offset before the next burst.
+- **Affected:** the server's `ReportInventory` load. A fleet in one time zone reports within four hours (about six times the per-second rate of an even spread, roughly 70 calls a second per million agents), and after a mass reboot or an outage every overdue agent reports within 30 minutes (roughly 550 a second per million). An endpoint with no time zone configured uses UTC.
+- **Sync now:** the agent's `__sync__.now` command accepts a comma-separated source list and an optional `delay_max_s`; the server sends neither yet, so an operator's Sync now is immediate.
+- **Not configurable yet:** the window is built into the agent; there is no setting and no settings push for it.
+
 ## ⚠️ Breaking: the Compose files that run Grafana require `YUZU_GRAFANA_ADMIN_PASSWORD`, and an existing Grafana keeps `admin`/`admin` (#4817)
 
 - **What changed:** `deploy/docker/docker-compose.yml`, `deploy/docker/docker-compose.uat.yml`, `deploy/docker/docker-compose.full-uat.yml` and the root `docker-compose.uat.yml` set `GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?...}` instead of `admin`. Compose refuses every command that reads one of these files, `up`, `down`, `ps`, `logs` and `exec` included, with `required variable YUZU_GRAFANA_ADMIN_PASSWORD is missing a value` until the variable is set to a non-empty value. The reference composes (`docker-compose.reference*.yml`) run no Grafana and are unchanged.

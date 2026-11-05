@@ -358,6 +358,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_sync_window.cpp', # SAM-19: sync_window.hpp placement + overdue catch-up, fake zone
     'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
                                           # from agent.cpp's __sync__.now reserved-command branch
@@ -4083,6 +4084,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('agent command-dedup wiring lexical gate (#3668)',
   _python3_test,
   args: [files('test_agent_command_dedup_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# __sync__.now parameter wiring: decide_sync_now is a pure function with its own unit tests; this
+# pins that agent.cpp's Subscribe loop still reads the `source` and `delay_max_s` keys and passes
+# both in (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
+# No build required.
+test('agent __sync__.now wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_sync_now_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
