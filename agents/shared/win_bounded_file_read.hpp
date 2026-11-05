@@ -4,14 +4,11 @@
 // agent) owns, where an unbounded or link-following read would be a hazard:
 //   - the leaf is opened with FILE_FLAG_OPEN_REPARSE_POINT, so a symlink or
 //     junction in the leaf position is opened as the LINK ITSELF and then refused
-//     (attributes carry FILE_ATTRIBUTE_REPARSE_POINT), never followed; parent
-//     directories are trusted (the callers read machine-wide, admin-writable
-//     trees such as C:\ProgramData);
-//   - with `strict` set, the read also refuses (as `error`) a file with more than one hard link
-//     and a file whose resolved path (GetFinalPathNameByHandleW) is not the requested path, so a
-//     junction or symlink in ANY parent directory, swapped in after a listing, is not followed.
-//     The default stays leaf-only: other callers read paths whose parents may legitimately be
-//     redirected, and a strict read can only turn an answer into an `error`, never into data;
+//     (attributes carry FILE_ATTRIBUTE_REPARSE_POINT), never followed;
+//   - the read also refuses (as `error`) a file with more than one hard link and a file whose
+//     resolved path (GetFinalPathNameByHandleW) is not the requested path, so a junction or
+//     symlink in ANY parent directory, swapped in after a listing, is not followed (a refusal
+//     only ever turns an answer into an `error`, never into data);
 //   - a directory is refused as `error` (the leaf is opened with FILE_FLAG_BACKUP_SEMANTICS:
 //     without it CreateFileW answers ERROR_ACCESS_DENIED for a directory, which would be
 //     misreported as `denied`, an ACL refusal, when it is a wrong-kind path);
@@ -78,8 +75,7 @@ struct BoundedRead {
                                 static_cast<int>(n), TRUE) == CSTR_EQUAL;
 }
 
-[[nodiscard]] inline BoundedRead read_file_bounded(const std::wstring& path, std::size_t cap,
-                                                   bool strict = false) {
+[[nodiscard]] inline BoundedRead read_file_bounded(const std::wstring& path, std::size_t cap) {
     BoundedRead out;
     if (path.empty()) return out; // an empty path would name the current directory's drive root
     const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
@@ -105,7 +101,7 @@ struct BoundedRead {
     if (!GetFileInformationByHandle(h, &info)) return out;
     if ((info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0)
         return out; // refused: status stays `error`
-    if (strict && (info.nNumberOfLinks > 1 || !handle_path_is(h, path)))
+    if (info.nNumberOfLinks > 1 || !handle_path_is(h, path))
         return out; // refused: a hard link, or a parent redirected by a junction or symlink
     const std::uint64_t size =
         (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;

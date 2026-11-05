@@ -682,7 +682,7 @@ public:
 
     [[nodiscard]] FileRead read_file(std::string_view path, std::size_t cap) const {
         FileRead out;
-        auto r = yuzu::win::read_file_bounded(yuzu::win::to_wide(path), cap, /*strict=*/true);
+        auto r = yuzu::win::read_file_bounded(yuzu::win::to_wide(path), cap);
         switch (r.status) {
         case yuzu::win::BoundedReadStatus::ok:
             out.bytes = std::move(r.bytes);
