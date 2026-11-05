@@ -3432,8 +3432,9 @@ tests:
   # source) > 0`, for: 5m, warning. Three sources share the counter:
   # "guardian_state" (DEX/observation reads, fail-soft), "guardian_rules"
   # (authoritative rule/status reads, fail-hard) and "guardian_census" (the
-  # census pending-evidence count read, #5690) - each must page on a
-  # sustained non-zero rate, keyed by both labels.
+  # census pending-evidence count read, #5690) - each pages on a
+  # sustained non-zero rate, keyed by both labels (the expr has no source filter; the cases
+  # below exercise guardian_state and guardian_rules).
 
   # CASE — a sustained degrade on the DEX/observation family (guardian_state)
   # pages, carrying both its reason and source labels.
@@ -3472,7 +3473,7 @@ tests:
           - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="store_not_open", source="guardian_rules", severity="warning"}'
             value: 1
 
-  # CASE — the boot-time pre-seed alone (both sources x all three reasons
+  # CASE — the boot-time pre-seed alone (the seeded sources x all three reasons
   # present at zero, never incremented) must stay quiet: present-at-zero is
   # the HEALTHY steady state, not a degrade.
   - interval: 1m

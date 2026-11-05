@@ -16968,7 +16968,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // missing rule and for a store fault (the audit row above tells them
                     // apart by that string's prefix), so the fault half cannot yet carry an
                     // honest retry_after_ms; mirrors REST, which answers 404 for both. The
-                    // error-class split that would close this is a tracked follow-up.
+                    // error-class split that would close this is tracked in #7148.
                     res.set_content(error_response(id, kInvalidParams, result.error()),
                                     "application/json");
                     return;
