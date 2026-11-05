@@ -184,9 +184,10 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
     # Elapsed vs limit on EVERY finished call, quiet or not (#7191): the margin
     # against the per-call limit was invisible, so a shard creeping toward it
     # looked identical to a healthy one until it finally timed out. One line,
-    # printed whole, so parallel shards do not interleave mid-line.
-    print(f"elapsed {time.monotonic() - started:.1f}s of {timeout}s limit "
-          f"(rc {proc.returncode}): {argv[-1]}", flush=True)
+    # written in ONE write() call, so parallel shards do not interleave mid-line.
+    sys.stdout.write(f"elapsed {time.monotonic() - started:.1f}s of {timeout}s limit "
+                     f"(rc {proc.returncode}): {argv[-1]}\n")
+    sys.stdout.flush()
     out = proc.stdout + proc.stderr
     if out and not quiet:
         print(out, end="" if out.endswith("\n") else "\n", flush=True)
@@ -200,7 +201,7 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
 # 30 s as 4 parallel processes over a round-robin split. In CI the unsplit call
 # took about 118 s and 120 s on two green docs-lint runs (40663221423,
 # 40688324438; measured between the log lines around the call) against the
-# 120 s per-call timeout below, and timed out on others. Capped at
+# 120 s per-call timeout it had then, and timed out on others. Capped at
 # min(4, os.cpu_count()): a public-repo ubuntu-24.04 runner has 4 vCPUs
 # (cflite-pr.yml). cpu_count ignores CPU affinity and cgroup quotas, which only
 # over-counts on a pinned or quota-limited box; the cap bounds that.
@@ -208,14 +209,15 @@ TEST_SHARDS = max(1, min(4, os.cpu_count() or 1))
 
 # Per-call limit for `promtool test rules` (each shard, and the canary's run).
 # 120 -> 240 for #7191. After sharding, one of four shards intermittently ran
-# past 120 s on shared CI runners while the other three passed (7 observed
-# failures on 2026-11-05, pull time ~3 s, so the time is in promtool itself) -
-# and the unsplit call measured 118 s / 120 s against this same limit before
-# sharding, so a 4-way split should have left ~4x headroom. That it did not
-# means a shard can be several times slower than the local 30 s on a busy
-# runner. 240 s is 2x the old limit, a wide margin over the cost of a single
-# shard; the per-shard `elapsed` line `run()` now prints is how to re-tune it
-# from real data rather than guess. `check rules` calls stay at 120 s: they are
+# past 120 s on CI while the other three passed (see #7191 for the failing
+# runs). The image pull is outside this limit (about 3 s in those jobs), so the
+# 120 s went on the `docker run` itself. The unsplit call measured 118 s / 120 s
+# against this same limit before sharding, so a 4-way split should have left
+# about 4x headroom; that it did not shows a shard can be several times slower
+# than the local 30 s, but WHY (a slow runner, an uneven split, or a stall) is
+# not established. 240 s is simply 2x the old limit. It is not derived from a
+# measured shard cost: the per-shard `elapsed` line `run()` now prints is how
+# to re-tune it from real data. A stalled call still fails, 120 s later. `check rules` calls stay at 120 s: they are
 # a parse, measured in seconds. THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT
 # ENCLOSE IT: a gate is now 120 + 240 + 240 + 120 = 720 s - see main()'s ladder
 # comment, meson's `timeout:` and docs-lint.yml's `timeout-minutes`.
@@ -991,7 +993,7 @@ def pull_with_retry() -> bool:
     # `timeout-minutes` on the `prometheus-rules` job covers this script's
     # docker-path ceiling (1665s) PLUS a second promtool-driven step
     # (`blind_band_sweep.py --check`) sharing the same job, sized in its own
-    # comment to ~915s - see `docs-lint.yml`'s comment on this job for the
+    # comment to ~945s - see `docs-lint.yml`'s comment on this job for the
     # combined arithmetic and current value. Sized to the WORST-CASE SUM of
     # both steps' own documented ceilings, not to either step's typical
     # measured runtime - sizing to typical runtime is exactly what let the
