@@ -392,8 +392,8 @@ struct SoftwareChange {
     std::string publisher;
     std::string identity_key;
     std::string instance_key;
-    std::string from_version; ///< remove/upgrade
-    std::string to_version;   ///< install/upgrade
+    std::string from_version; ///< remove/upgrade: `[epoch:]version[-release]`
+    std::string to_version;   ///< install/upgrade: `[epoch:]version[-release]`
 };
 
 struct V3SectionResult {
@@ -508,10 +508,12 @@ public:
 
     /// Ledger rows for a set of rows that left (`old_rows`) and a set that arrived (`new_rows`),
     /// both with derived keys. removed = old-not-new, added = new-not-old, keyed by instance_key.
-    /// One removed row is paired with one added row of the same identity stem (identity_key with
-    /// its version segment blanked), in sorted instance_key order: differing versions -> one
-    /// `upgrade(from, to)`; EQUAL versions (install_date, signature, publisher spelling or
-    /// location churn) -> NO row. Leftovers are `remove` / `install`. Pure.
+    /// A row's version is the (epoch, version, release) tuple, so a release-only or epoch-only
+    /// change is an update. Within one identity stem (identity_key with its version segment
+    /// blanked), both sides sorted by (tuple, instance_key): a removed and an added row with an
+    /// EQUAL tuple pair first and write NO row (install_date, signature, or a location spelling
+    /// that normalises equal); the rest pair k-th to k-th as `upgrade(from, to)`; leftovers are
+    /// `remove` / `install`. from/to are `[epoch:]version[-release]`, non-empty parts only. Pure.
     [[nodiscard]] static std::vector<SoftwareChange>
     diff_changes(const std::vector<SoftwareEntry>& old_rows,
                  const std::vector<SoftwareEntry>& new_rows);

@@ -5626,6 +5626,76 @@ TEST_CASE("v3: same title and version with a different instance_key writes no le
                          "WHERE agent_id = 'agent-ch'")[0][0] == "2026-06-01");
 }
 
+namespace {
+// A distro-package-shaped row: the version column is upstream, release/epoch their own columns.
+SoftwareEntry rpm_row(const std::string& name, const std::string& version,
+                      const std::string& release, const std::string& epoch = "") {
+    auto e = v3_entry(name, kV3Pkgs, version);
+    e.kind = "package";
+    e.ecosystem = "rpm";
+    e.release = release;
+    e.epoch = epoch;
+    return e;
+}
+} // namespace
+
+TEST_CASE("v3: a release-only or epoch-only change is an upgrade carrying [epoch:]version[-release]",
+          "[pg][software_inventory][v3][ledger]") {
+    SWINV_SHARED(store, pool);
+    struct Case {
+        const char* agent;
+        SoftwareEntry from;
+        SoftwareEntry to;
+        const char* from_text;
+        const char* to_text;
+    };
+    // flatpak: version '' and the commit in release.
+    auto flat1 = rpm_row("org.example.App", "", "3f2a9c1");
+    auto flat2 = rpm_row("org.example.App", "", "8be04d7");
+    flat1.ecosystem = flat2.ecosystem = "flatpak";
+    const Case cases[] = {
+        {"agent-rel", rpm_row("openssl", "3.0.7", "24.el9", "1"),
+         rpm_row("openssl", "3.0.7", "25.el9", "1"), "1:3.0.7-24.el9", "1:3.0.7-25.el9"},
+        {"agent-epo", rpm_row("openssl", "3.0.7", "24.el9", "1"),
+         rpm_row("openssl", "3.0.7", "24.el9", "2"), "1:3.0.7-24.el9", "2:3.0.7-24.el9"},
+        {"agent-flat", flat1, flat2, "3f2a9c1", "8be04d7"},
+        {"agent-vr", rpm_row("curl", "7.76.1", "26.el9"), rpm_row("curl", "8.5.0", "1.el9"),
+         "7.76.1-26.el9", "8.5.0-1.el9"},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.agent);
+        REQUIRE(store.apply_installed_software_v3(c.agent, v3_report({v3_full(kV3Pkgs, {c.from})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        // By a full section, then back again by a delta: both paths write one upgrade each.
+        REQUIRE(store.apply_installed_software_v3(c.agent, v3_report({v3_full(kV3Pkgs, {c.to})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        REQUIRE(store.apply_installed_software_v3(
+                    c.agent, v3_report({v3_delta(kV3Pkgs, section_hash_of({c.to}), {c.from},
+                                                 {c.to}, {c.from})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        const auto led = ledger(pool, c.agent);
+        REQUIRE(led.size() == 2);
+        CHECK(led[0][0] == "upgrade");
+        CHECK(led[0][2] == c.from_text);
+        CHECK(led[0][3] == c.to_text);
+        CHECK(led[1][0] == "upgrade");
+        CHECK(led[1][2] == c.to_text);
+        CHECK(led[1][3] == c.from_text);
+    }
+
+    // An unchanged re-report, and install_date churn at an equal tuple, write nothing.
+    const auto p = rpm_row("bash", "5.1.8", "9.el9", "0");
+    auto churned = p;
+    churned.install_date = "2026-07-07";
+    REQUIRE(store.apply_installed_software_v3("agent-same", v3_report({v3_full(kV3Pkgs, {p})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    REQUIRE(store.apply_installed_software_v3("agent-same", v3_report({v3_full(kV3Pkgs, {p})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    REQUIRE(store.apply_installed_software_v3("agent-same", v3_report({v3_full(kV3Pkgs, {churned})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(ledger_count(pool, "agent-same") == "0");
+}
+
 TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
           "[software_inventory][v3][ledger]") {
     const auto row = [](const std::string& name, const std::string& version,
@@ -5661,24 +5731,58 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
                                                    {row("A", "1", "", "d2")})
                   .empty());
     }
-    SECTION("two upgrades of one title pair in sorted instance_key order") {
-        // Same stem (name, publisher, arch, location); the install_date differs, so four distinct
-        // instance_keys. The k-th removed key (sorted) pairs the k-th added key (sorted).
-        auto olds = std::vector<SoftwareEntry>{row("A", "1", "", "x"), row("A", "1.5", "", "y")};
-        auto news = std::vector<SoftwareEntry>{row("A", "2", "", "x"), row("A", "3", "", "y")};
-        const auto ch = SoftwareInventoryStore::diff_changes(olds, news);
-        REQUIRE(ch.size() == 2);
-        const auto by_key = [](const SoftwareEntry& l, const SoftwareEntry& r) {
-            return l.instance_key < r.instance_key;
-        };
-        std::sort(olds.begin(), olds.end(), by_key);
-        std::sort(news.begin(), news.end(), by_key);
-        for (std::size_t k = 0; k < 2; ++k) {
-            CHECK(ch[k].kind == Kind::kUpgrade);
-            CHECK(ch[k].from_version == olds[k].version);
-            CHECK(ch[k].to_version == news[k].version);
-            CHECK(ch[k].instance_key == news[k].instance_key);
+    SECTION("two upgrades of one title pair in (epoch, version, release) order, whatever the input order") {
+        // Same stem (name, publisher, arch, location); four distinct instance_keys. The k-th
+        // removed row in tuple order pairs the k-th added row in tuple order.
+        const auto olds = std::vector<SoftwareEntry>{row("A", "1.5", "", "y"), row("A", "1", "", "x")};
+        const auto news = std::vector<SoftwareEntry>{row("A", "3", "", "x"), row("A", "2", "", "y")};
+        for (const auto& [o, n] : {std::pair{olds, news},
+                                   std::pair{std::vector<SoftwareEntry>(olds.rbegin(), olds.rend()),
+                                             std::vector<SoftwareEntry>(news.rbegin(), news.rend())}}) {
+            const auto ch = SoftwareInventoryStore::diff_changes(o, n);
+            REQUIRE(ch.size() == 2);
+            CHECK(ch[0].kind == Kind::kUpgrade);
+            CHECK(ch[0].from_version == "1");
+            CHECK(ch[0].to_version == "2");
+            CHECK(ch[1].kind == Kind::kUpgrade);
+            CHECK(ch[1].from_version == "1.5");
+            CHECK(ch[1].to_version == "3");
+            CHECK(ch[1].instance_key == row("A", "3", "", "x").instance_key);
         }
+    }
+    SECTION("an equal tuple pairs first: churn beside an upgrade is one upgrade, never two") {
+        // Removed {1 (churned date), 1.5}; added {1 (new date), 2}: 1 <-> 1 is churn, 1.5 -> 2.
+        const auto ch = SoftwareInventoryStore::diff_changes(
+            {row("A", "1", "", "d1"), row("A", "1.5", "", "d1")},
+            {row("A", "1", "", "d2"), row("A", "2", "", "d1")});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].kind == Kind::kUpgrade);
+        CHECK(ch[0].from_version == "1.5");
+        CHECK(ch[0].to_version == "2");
+    }
+    SECTION("release and epoch are part of the compared tuple and of the recorded text") {
+        const auto rel = [&](const std::string& v, const std::string& r, const std::string& ep) {
+            auto e = v3_entry("A", kV3Apps, v);
+            e.release = r;
+            e.epoch = ep;
+            return keyed(std::move(e));
+        };
+        auto ch = SoftwareInventoryStore::diff_changes({rel("1.0", "1", "")}, {rel("1.0", "2", "")});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].from_version == "1.0-1");
+        CHECK(ch[0].to_version == "1.0-2");
+        ch = SoftwareInventoryStore::diff_changes({rel("1.0", "", "3")}, {rel("1.0", "", "4")});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].from_version == "3:1.0");
+        CHECK(ch[0].to_version == "4:1.0");
+        ch = SoftwareInventoryStore::diff_changes({rel("", "abc", "")}, {rel("", "def", "")});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].from_version == "abc");
+        CHECK(ch[0].to_version == "def");
+        ch = SoftwareInventoryStore::diff_changes({rel("1.0", "1", "2")}, {});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].kind == Kind::kRemove);
+        CHECK(ch[0].from_version == "2:1.0-1");
     }
     SECTION("a version-only change beside an unrelated install and remove") {
         const auto ch = SoftwareInventoryStore::diff_changes({row("A", "1"), row("Gone", "1")},

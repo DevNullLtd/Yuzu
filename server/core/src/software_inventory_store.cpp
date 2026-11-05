@@ -1092,6 +1092,24 @@ std::string identity_stem(const std::string& identity_key) {
     return identity_key.substr(0, p1 + 1) + identity_key.substr(p2);
 }
 
+// The ledger's from/to text: `[epoch:]version[-release]`, non-empty parts only (`:` follows a
+// non-empty epoch, `-` joins a release to a non-empty version), so a flatpak row (version '',
+// the commit in release) reads as the commit alone.
+std::string version_text(const SoftwareEntry& e) {
+    std::string out;
+    if (!e.epoch.empty()) {
+        out += e.epoch;
+        out += ':';
+    }
+    out += e.version;
+    if (!e.release.empty()) {
+        if (!e.version.empty())
+            out += '-';
+        out += e.release;
+    }
+    return out;
+}
+
 } // namespace
 
 std::vector<SoftwareChange>
@@ -1118,8 +1136,14 @@ SoftwareInventoryStore::diff_changes(const std::vector<SoftwareEntry>& old_rows,
             groups[identity_stem(e.identity_key)].added.push_back(&e);
     }
 
-    const auto by_key = [](const SoftwareEntry* a, const SoftwareEntry* b) {
-        return a->instance_key < b->instance_key;
+    // A row's version is the (epoch, version, release) tuple: a release bump (a distro backport)
+    // or an epoch bump is a real update even when the upstream version text is unchanged.
+    const auto ver = [](const SoftwareEntry* e) {
+        return std::tie(e->epoch, e->version, e->release);
+    };
+    const auto by_ver = [&](const SoftwareEntry* a, const SoftwareEntry* b) {
+        return std::tuple_cat(ver(a), std::tie(a->instance_key)) <
+               std::tuple_cat(ver(b), std::tie(b->instance_key));
     };
     const auto make = [](SoftwareChangeKind kind, const SoftwareEntry& e, std::string from,
                          std::string to) {
@@ -1128,20 +1152,35 @@ SoftwareInventoryStore::diff_changes(const std::vector<SoftwareEntry>& old_rows,
     };
     std::vector<SoftwareChange> out;
     for (auto& [stem, g] : groups) {
-        std::sort(g.removed.begin(), g.removed.end(), by_key);
-        std::sort(g.added.begin(), g.added.end(), by_key);
-        const std::size_t paired = std::min(g.removed.size(), g.added.size());
-        for (std::size_t i = 0; i < paired; ++i) {
-            // Equal versions: the row churned (install_date, signature, publisher spelling,
-            // location) but the title is the same version, so there is no event to record.
-            if (g.removed[i]->version != g.added[i]->version)
-                out.push_back(make(SoftwareChangeKind::kUpgrade, *g.added[i], g.removed[i]->version,
-                                   g.added[i]->version));
+        std::sort(g.removed.begin(), g.removed.end(), by_ver);
+        std::sort(g.added.begin(), g.added.end(), by_ver);
+        // An equal tuple on both sides pairs first: the row churned (install_date, signature,
+        // publisher spelling, location spelling) at the same version, so there is no event.
+        std::vector<const SoftwareEntry*> gone;
+        std::vector<const SoftwareEntry*> came;
+        std::size_t r = 0;
+        std::size_t a = 0;
+        while (r < g.removed.size() && a < g.added.size()) {
+            if (ver(g.removed[r]) == ver(g.added[a])) {
+                ++r;
+                ++a;
+            } else if (ver(g.removed[r]) < ver(g.added[a])) {
+                gone.push_back(g.removed[r++]);
+            } else {
+                came.push_back(g.added[a++]);
+            }
         }
-        for (std::size_t i = paired; i < g.removed.size(); ++i)
-            out.push_back(make(SoftwareChangeKind::kRemove, *g.removed[i], g.removed[i]->version, {}));
-        for (std::size_t i = paired; i < g.added.size(); ++i)
-            out.push_back(make(SoftwareChangeKind::kInstall, *g.added[i], {}, g.added[i]->version));
+        gone.insert(gone.end(), g.removed.begin() + static_cast<std::ptrdiff_t>(r), g.removed.end());
+        came.insert(came.end(), g.added.begin() + static_cast<std::ptrdiff_t>(a), g.added.end());
+        // The rest pair k-th to k-th in tuple order (deterministic, independent of the row hashes).
+        const std::size_t paired = std::min(gone.size(), came.size());
+        for (std::size_t i = 0; i < paired; ++i)
+            out.push_back(make(SoftwareChangeKind::kUpgrade, *came[i], version_text(*gone[i]),
+                               version_text(*came[i])));
+        for (std::size_t i = paired; i < gone.size(); ++i)
+            out.push_back(make(SoftwareChangeKind::kRemove, *gone[i], version_text(*gone[i]), {}));
+        for (std::size_t i = paired; i < came.size(); ++i)
+            out.push_back(make(SoftwareChangeKind::kInstall, *came[i], {}, version_text(*came[i])));
     }
     return out;
 }
@@ -1638,7 +1677,8 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                         c,
                         "DELETE FROM software_inventory_store.installed_software "
                         "WHERE agent_id = $1 AND source = $2 AND instance_key = ANY($3::text[]) "
-                        "RETURNING name, publisher, version, identity_key, instance_key",
+                        "RETURNING name, publisher, epoch, version, release, identity_key, "
+                        "instance_key",
                         std::vector<std::string>{agent_id_s, sec.facet, pg::to_text_array(keys)});
                     if (del.status() != PGRES_TUPLES_OK)
                         return Step::kFail;
@@ -1648,9 +1688,11 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                         SoftwareEntry e;
                         e.name = PQgetvalue(del.get(), r, 0);
                         e.publisher = PQgetvalue(del.get(), r, 1);
-                        e.version = PQgetvalue(del.get(), r, 2);
-                        e.identity_key = PQgetvalue(del.get(), r, 3);
-                        e.instance_key = PQgetvalue(del.get(), r, 4);
+                        e.epoch = PQgetvalue(del.get(), r, 2);
+                        e.version = PQgetvalue(del.get(), r, 3);
+                        e.release = PQgetvalue(del.get(), r, 4);
+                        e.identity_key = PQgetvalue(del.get(), r, 5);
+                        e.instance_key = PQgetvalue(del.get(), r, 6);
                         old_rows.push_back(std::move(e));
                     }
                 }
