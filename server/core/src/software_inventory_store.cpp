@@ -745,7 +745,7 @@ std::string component_hash_of_normalised(const std::vector<V3Component>& rows) {
     return sha256_hex(canon);
 }
 
-// The component table's batched insert: parallel text[] arrays like insert_entries, 13 params.
+// The component table's batched insert: parallel text[] arrays like insert_entries, 12 params.
 bool insert_components(PGconn* c, const std::string& agent_id_s,
                        const std::vector<V3Component>& rows, std::int64_t ts,
                        std::string* sqlstate = nullptr) {

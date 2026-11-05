@@ -5786,7 +5786,7 @@ TEST_CASE("v3: a SQL fault in a later section rolls back an earlier section, its
     const auto a2 = v3_entry("Alpha", kV3Apps, "2.0");
     REQUIRE(store.apply_installed_software_v3("agent-lf", v3_report({v3_full(kV3Apps, {a1})}))[0]
                 .outcome == V3SectionOutcome::kStored);
-    const std::string before = stored_hash(pool, "agent-lf");
+    const std::string held_report = stored_hash(pool, "agent-lf");
 
     // Section 1 (the Alpha upgrade) applies and writes its ledger row inside the transaction;
     // section 2's DELETE then fails on the renamed table and the whole call rolls back.
@@ -5802,7 +5802,7 @@ TEST_CASE("v3: a SQL fault in a later section rolls back an earlier section, its
     CHECK(sql_rows(pool, "SELECT version FROM software_inventory_store.installed_software "
                          "WHERE agent_id = 'agent-lf' AND name = 'Alpha'")[0][0] == "1.0");
     CHECK(facet_status(pool, "agent-lf", kV3Apps) == "full/" + section_hash_of({a1}));
-    CHECK(stored_hash(pool, "agent-lf") == before);
+    CHECK(stored_hash(pool, "agent-lf") == held_report);
     for (const char* kind : {"install", "remove", "upgrade"})
         CHECK(metrics.counter("yuzu_software_changes_total", {{"kind", kind}}).value() == 0.0);
     store.set_metrics(nullptr);

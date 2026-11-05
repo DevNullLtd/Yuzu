@@ -22,7 +22,7 @@ condition. No unit test drives that thread, so deleting the call, dropping the c
 moving it onto another thread (health_recompute_thread_ shares the revocation sweep's budget)
 would leave every other test green. The software change ledger prune (SAM-14) is pinned the same
 way: one `software_inventory_store_->run_retention_prune_changes()` call, inside that lambda,
-after its `tick % kSoftwareLedgerPruneEveryNTicks == 1` condition.
+behind its `tick % kSoftwareLedgerPruneEveryNTicks == 1` condition.
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The self-test applies in-memory mutations (dropped
@@ -81,7 +81,7 @@ PRUNE_END = '"Pre-flight runner thread stopped"'
 
 
 def prune_problems(src):
-    """Each prune call appears once file-wide, inside the preflight thread lambda, after its tick gate."""
+    """Each prune call appears once file-wide, inside the preflight thread lambda, behind its tick gate."""
     t = normalise(src)
     out = []
     lo, hi = t.find(normalise(PRUNE_START)), t.find(PRUNE_END)

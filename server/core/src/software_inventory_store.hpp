@@ -491,10 +491,10 @@ public:
     ///    came in. A full section is a BASELINE (no ledger rows) when its facet holds no section
     ///    hash (first contact, which includes the first v3 call that applies a section; a facet
     ///    only ever reported status-only; a hash cleared by a status-only section over a
-    ///    'disabled' facet), was last 'disabled', or holds rows that do not hash to its held
-    ///    section hash (an out-of-band change to the table); otherwise it is diffed against the
-    ///    held rows, so a status-only section followed by a full one, or an honest-empty full
-    ///    followed by a populated one, still yields the right rows. There are
+    ///    'disabled' facet), has 'disabled' as its last status, or holds rows that do not hash to
+    ///    its held section hash (an out-of-band change to the table); otherwise it is diffed
+    ///    against the held rows, so a status-only section followed by a full one, or an
+    ///    honest-empty full followed by a populated one, yields the right rows. There are
     ///    NO tombstones on `installed_software`: a removal is a hard delete plus a `remove` row.
     ///  - `component_inventory`: full replaces the agent's `software_components` rows, delta
     ///    applies `-` row_hash / `comp` changes (same verification), in THIS store's schema and
