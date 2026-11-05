@@ -6057,12 +6057,13 @@ TEST_CASE("ingest_inventory_report v3: a refused section nacks only its facet; t
 }
 
 TEST_CASE("ingest_inventory_report v3: a full component_inventory section with no records is "
-          "nacked",
+          "stored, not nacked",
           "[pg][software_inventory][seam][v3]") {
     SWINV_SHARED(store, pool);
     yuzu::MetricsRegistry metrics;
 
     // A syntactically complete, honest-empty component section: header line only, no records.
+    // The device really has no components, so the report is complete and nothing is resent.
     const std::string blob = w_hdr() + w_sec(kV3Comp, "full");
     agentpb::InventoryReport rep;
     (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
@@ -6070,16 +6071,17 @@ TEST_CASE("ingest_inventory_report v3: a full component_inventory section with n
     agentpb::InventoryAck ack;
     yuzu::server::ingest_inventory_report(store, "agent-seam-cz", rep, ack, &metrics);
 
-    CHECK(std::vector<std::string>(ack.need_full().begin(), ack.need_full().end()) ==
-          std::vector<std::string>{"installed_software:component_inventory"});
+    CHECK(ack.need_full().empty());
     CHECK(metrics
               .counter("yuzu_inventory_section_ingest_total",
-                       {{"facet", kV3Comp}, {"outcome", "need_full"}})
+                       {{"facet", kV3Comp}, {"outcome", "stored"}})
               .value() == 1.0);
     CHECK(metrics
               .counter("yuzu_inventory_ingest_total",
-                       {{"source", "installed_software"}, {"outcome", "need_full"}})
+                       {{"source", "installed_software"}, {"outcome", "stored"}})
               .value() == 1.0);
+    CHECK(facet_status(pool, "agent-seam-cz", kV3Comp) ==
+          "full/" + SoftwareInventoryStore::canonical_component_section_hash({}));
 }
 
 TEST_CASE("ingest_inventory_report v3: a section holding a NUL byte is refused, nothing of it is "
