@@ -119,6 +119,28 @@ audit log cannot show such a read (a successful read wrote no row), and the
 `AccessReview:Read`, so an auditor testing that period should review the custom roles assigned to
 engine principals for `AccessReview:Read` rather than rely on the audit trail.
 
+**Addendum — access-review decisions were not final and could be self-attested until #4752
+(CC6.2).** Recorded here because this section cites "access review sign-offs" as CC6.2
+evidence. Before #4752, `record_attestation` (REST and MCP) overwrote any earlier decision on
+a grant and did not compare the reviewer with the grant's subject, so a holder of
+`AccessReview:Attest` (the non-admin `Reviewer` role has it) could sign off their own grant,
+and a subject could replace another reviewer's `flagged_revoke` with `attested` while the
+campaign was open. For any assessment period before #4752, closed campaigns may therefore
+contain self-attested grants and silently overwritten decisions. Since #4752 the server
+refuses both, inside the database write, and a recorded decision is final. To assess an earlier
+period, run the detection query in `docs/user-manual/upgrading.md` (self-attested `user` and
+`engine` grants) and look in the audit log for more than one `access_review.attested` or
+`access_review.flagged` `result=success` row for the same `target_id` (overwrites are not
+visible in the table), and note that audit rows are kept for 365 days by default while campaign
+rows are kept indefinitely, so for an older period the audit rows may already be pruned. An
+honest statement of the control today: once every server replica runs a build with #4752, the
+application refuses to let a reviewer decide a `user` grant held under their own username or an
+engine principal they owned when the campaign opened, and refuses to change a decision once it
+is recorded. That is enforced by the application, not by the database: a replica that has not
+been upgraded, or someone with write access to the database, can still change a row. It does
+not cover group grants, one person holding more than one account, or ownership changed after
+a campaign opened, and it needs at least two people able to attest.
+
 **Addendum — the access-review export now states whether RBAC was actually enforced
 (CC6.2, RBAC delivery plan A3).** #2376 above closed *who* can read the grant-population
 export; it did not address a separate gap this section's own evidence framing had:
