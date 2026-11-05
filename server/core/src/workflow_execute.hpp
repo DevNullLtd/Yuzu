@@ -154,7 +154,9 @@
 ///     `requested` row; it closes it `denied reason=idempotent_duplicate` (or
 ///     `idempotency_key_conflict` when the winner's fingerprint differs) and answers as a replay.
 ///   * THE REPLAY BODY is deliberately THIN (`workflow_idempotent_replay_json`): the run's id,
-///     workflow, status, `idempotent_replay:true` and `started_at`. The engine persists no
+///     workflow, status, `idempotent_replay:true`, `started_at` and `message`, plus `remediation`
+///     for every status but `completed` and `running` (each carries `kStepNotProvenUnsentText`;
+///     `running` carries `retry_after_ms` instead). The engine persists no
 ///     per-step outcome beyond each dispatch's return, so the original response cannot be rebuilt,
 ///     and a stored copy would be a second source of truth: the caller reads the run with
 ///     `get_workflow_execution`. `running` carries `retry_after_ms` 2000 and means POLL, never
@@ -316,8 +318,9 @@ inline constexpr std::array<std::string_view, 11> kWorkflowZeroReachStatuses{
 /// What a step's absence of a `command_id` does NOT prove. The command id is stored only in the
 /// step result written after the dispatch returns, and that write can be dropped (a lease timeout,
 /// a statement failure, a crash between the send and the write), so a step recorded `pending` or
-/// `skipped` may still have been sent. Every remediation that tells a worker how to decide whether
-/// to run again carries this, never "no command_id means never sent".
+/// `skipped` may still have been sent. Every remediation on a run that may have sent something (a
+/// thrown run's, and a replay's for every status but `completed` and `running`) carries this, never
+/// "no command_id means never sent".
 inline constexpr std::string_view kStepNotProvenUnsentText =
     "a step recorded pending or skipped may still have been sent; check the audit and response "
     "stores by plugin and time before re-running";

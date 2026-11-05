@@ -3461,10 +3461,16 @@ TEST_CASE("idempotency: a FAILED, cancelled, RUNNING, stale-running or unknown-s
                        : std::map<std::string, int>{{"replayed", 1}}));
             CHECK(fx.run_outcomes.empty()); // a replay never counts a run outcome
         }
-        if (std::string_view(row.expect) == "indeterminate") {
-            CHECK(j["remediation"].get<std::string>().find("get_workflow_execution") !=
-                  std::string::npos);
-            CHECK(j["remediation"].get<std::string>().find("new key") != std::string::npos);
+        if (std::string_view(row.expect) == "running") {
+            CHECK_FALSE(j.contains("remediation")); // a poll answer: retry_after_ms is its hint
+        } else {
+            REQUIRE(j.contains("remediation"));
+            const auto remediation = j["remediation"].get<std::string>();
+            CHECK(remediation.find("get_workflow_execution") != std::string::npos);
+            CHECK(remediation.find(std::string(kStepNotProvenUnsentText)) != std::string::npos);
+            CHECK(remediation.find("new ") != std::string::npos);
+            CHECK((remediation.find("may still be live") != std::string::npos) ==
+                  (std::string_view(row.expect) == "indeterminate"));
         }
     }
 }
@@ -4106,6 +4112,67 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: failed and 
     CHECK_FALSE(at_path(j, "/data").contains("retry_after_ms"));
     CHECK(stale->get_header_value("Retry-After").empty());
     CHECK(at_path(j, "/data/remediation").get<std::string>().find("new key") != std::string::npos);
+    CHECK(at_path(j, "/data/remediation").get<std::string>().find(std::string(kStepNotProvenUnsentText)) !=
+          std::string::npos);
+    CHECK(at_path(j, "/data/remediation").get<std::string>().find("may still be live") !=
+          std::string::npos);
+    // `failed` is not "nothing was sent": its wire body says the record cannot prove it.
+    CHECK(at_path(body_of(*failed), "/data/remediation")
+              .get<std::string>()
+              .find(std::string(kStepNotProvenUnsentText)) != std::string::npos);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a repeat of a partial, aborted or "
+          "interrupted run puts the may-still-have-been-sent caution on the wire body",
+          "[workflow][twin][rest][idempotency][parity]") {
+    const auto dispatched = [](const Rest& r) {
+        return std::count_if(r.fx.events.begin(), r.fx.events.end(),
+                             [](const auto& e) { return e.starts_with("dispatch:"); });
+    };
+    const auto replay_body = [&](Rest& r) {
+        const auto first = post_with_key(r, kKey);
+        REQUIRE(first);
+        const auto sent_before = dispatched(r);
+        const auto again = post_with_key(r, kKey);
+        REQUIRE(again);
+        CHECK(again->status == 202);
+        CHECK(dispatched(r) == sent_before); // a replay sends nothing
+        return body_of(*again);
+    };
+    const auto expect_caution = [](const json& j, const char* status) {
+        INFO(status);
+        CHECK(at_path(j, "/data/status") == status);
+        CHECK(at_path(j, "/data/retryable") == false);
+        const auto remediation = at_path(j, "/data/remediation").get<std::string>();
+        CHECK(remediation.find(std::string(kStepNotProvenUnsentText)) != std::string::npos);
+        CHECK(remediation.find("new idempotency key") != std::string::npos);
+    };
+    SECTION("partial: the engine ended failed although every attempted step reached") {
+        Rest r;
+        r.fx.engine_status = "failed";
+        expect_caution(replay_body(r), "partial");
+    }
+    SECTION("aborted: a step was refused at send time") {
+        Rest r;
+        r.fx.step_ids = {"i-ro", "i-ro2"};
+        r.fx.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        r.fx.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+        expect_caution(replay_body(r), "aborted");
+    }
+    SECTION("interrupted: the server stopped the run after step 1") {
+        Rest r;
+        r.fx.step_ids = {"i-ro", "i-ro2"};
+        r.fx.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        r.fx.engine_status = "failed";
+        r.fx.interrupt_before_step = 1;
+        expect_caution(replay_body(r), "interrupted");
+    }
+    SECTION("completed: no remediation") {
+        Rest r;
+        const auto j = replay_body(r);
+        CHECK(at_path(j, "/data/status") == "completed");
+        CHECK_FALSE(at_path(j, "/data").contains("remediation"));
+    }
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: a zero-reach 503 after the key is bound is not retryable "
@@ -4364,6 +4431,15 @@ void expect_parity(const ParityRun& p, std::string_view expected_class,
     if (want != "completed") {
         REQUIRE(j.contains("retryable"));
         CHECK(j.at("retryable") == false);
+        // The wire body of every non-completed class says a step the record shows unsent may have
+        // been sent, and that a re-run needs a new key.
+        REQUIRE(j.contains("remediation"));
+        const auto remediation = j.at("remediation").get<std::string>();
+        CHECK(remediation.find(std::string(kStepNotProvenUnsentText)) != std::string::npos);
+        CHECK(remediation.find("new idempotency key") != std::string::npos);
+        CHECK(remediation.find("get_workflow_execution") != std::string::npos);
+    } else {
+        CHECK_FALSE(j.contains("remediation"));
     }
 }
 

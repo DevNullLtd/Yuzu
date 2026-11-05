@@ -6776,17 +6776,19 @@ two outcomes cannot disagree: the same rule classifies both.
 | `data.status` | Meaning | Extra fields |
 |---|---|---|
 | `completed` | The run succeeded: the engine recorded it completed, no step was refused at send time, and every step's final attempt reached an agent. The ONLY status that means success. | none |
-| `partial` | Something was sent but the run did not succeed: some step's final attempt reached nobody (an `onFailure: continue` step), or the engine did not complete after a send. Final. | `retryable: false` |
-| `failed` | Nothing was sent, or the run threw. Final: the key stays bound; a deliberate re-run needs a NEW key. | `retryable: false` |
-| `aborted` | A step was refused at send time (its definition changed after approval or the preflight), or the run was stopped by its 60 second deadline or by the credential check. The replay does not say which of the stop causes (`data.reason` is absent). Final. | `retryable: false` |
-| `interrupted` | The stopping server ended the run. Final. | `retryable: false` |
+| `partial` | Something was sent but the run did not succeed: some step's final attempt reached nobody (an `onFailure: continue` step), or the engine did not complete after a send. Final. | `retryable: false`, `remediation` |
+| `failed` | No step is recorded as sent, or the run threw. A step the store did not record may still have been sent (the write that stores a step's command id can be dropped, and a thrown dispatch can follow a partial send), so read the run before deciding. Final: the key stays bound; a deliberate re-run needs a NEW key. | `retryable: false`, `remediation` |
+| `aborted` | A step was refused at send time (its definition changed after approval or the preflight, or its approval mode was raised), or the run was stopped by its 60 second deadline or by the credential check. A step after a refused `onFailure: continue` step may still have run; after a deadline or credential stop the rest did not. The replay does not say which of the stop causes (`data.reason` is absent). Final. | `retryable: false`, `remediation` |
+| `interrupted` | The stopping server ended the run. Final. | `retryable: false`, `remediation` |
 | `running` | The run is still in progress. **Poll `GET /api/v1/workflow-executions/{id}`; never re-send.** | `retry_after_ms: 2000`, `Retry-After: 2` |
-| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running. Treat a `running` answer older than 180 seconds the same way. | `retryable: false`, `remediation` |
+| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running. A run read on a replica whose clock is far ahead can still be live: if it may be, wait for it before re-running. Treat a `running` answer older than 180 seconds the same way. | `retryable: false`, `remediation` |
 
-What the stored rows can and cannot say: a run the engine recorded `failed` or `cancelled` whose rows cannot be read back replays `failed`. A step-result write the engine dropped under a database brownout costs precision (a run may replay `partial` or `failed` where the first answer said `interrupted` or `aborted`), never correctness: the replay is never `completed` for a run it cannot prove succeeded. A `foreach` step is judged by its last attempt (every item of that attempt must have reached an agent); the engine sends one item today.
+What the stored rows can and cannot say: a run the engine recorded `failed` or `cancelled` whose rows cannot be read back replays `failed`. A step-result write the engine dropped under a database brownout costs precision (a run may replay `partial` or `failed` where the first answer said `interrupted` or `aborted`), and a step whose write was dropped is recorded `pending` or `running` although it may have been sent, so a `failed` replay does not prove nothing was sent: every replay but `completed` and `running` carries a `remediation` that says so. The replay is never `completed` for a run it cannot prove succeeded. A `foreach` step is judged by its last attempt (every item of that attempt must have reached an agent); the engine sends one item today.
 
 Every replay body also carries `execution_id`, `workflow_id`, `idempotent_replay: true`, `started_at`
-(epoch seconds) and a `message`. It has NO `steps` and no `late_denied`: the engine does not keep a
+(epoch seconds) and a `message`; every status but `completed` and `running` adds `retryable: false` and a
+`remediation` (read the run, a step recorded `pending` or `skipped` may still have been sent, a deliberate
+re-run needs a NEW key). It has NO `steps` and no `late_denied`: the engine does not keep a
 per-step answer, so the original response cannot be rebuilt; read the run instead. A replay is a
 short read, so it is answered while the server is draining and when the run cap is full, takes no
 slot and writes no `requested` row. A call that raced the original (it passed the lookup before the
@@ -6895,7 +6897,7 @@ devices have not necessarily finished). A run that sent something and did not me
 `partial` (some step's final attempt reached nobody, or the engine did not complete after a send), `aborted` (a
 step was refused at send time because its definition changed, the run reached its 60 second
 deadline, or the credential check stopped it: `data.reason` `deadline_exceeded`,
-`credential_revoked` or `credential_indeterminate`; the rest did not run) or `interrupted` (the server began stopping: `data.reason`
+`credential_revoked` or `credential_indeterminate`; after a deadline or credential stop the rest did not run, but a step after a refused `onFailure: continue` step may still have run) or `interrupted` (the server began stopping: `data.reason`
 `server_shutdown`), with
 `data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
 with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step is judged

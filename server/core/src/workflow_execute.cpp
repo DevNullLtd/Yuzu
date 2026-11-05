@@ -330,8 +330,13 @@ WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
     o.replay_status = std::string(replay_status_for(ports, run, epoch_now(ports)));
     o.reason = "idempotent_replay";
     o.retryable = o.replay_status == kReplayRunning;
-    constexpr std::string_view kReadAndRerun =
-        "read get_workflow_execution for what ran; a deliberate re-run needs a new idempotency key";
+    // The stored steps cannot prove a send was absent (the command id is written after the
+    // dispatch returns, and that write can be dropped), so the one remediation for every terminal
+    // class says so; a step left running, or stored failed by a throw, is no better evidence.
+    const std::string read_and_rerun =
+        "read get_workflow_execution for what ran; " + std::string(kStepNotProvenUnsentText) +
+        "; a step left running, or recorded failed because its dispatch threw, may have been sent "
+        "too; a deliberate re-run needs a new idempotency key";
     if (o.replay_status == kReplayRunning) {
         o.message = "this idempotency key is bound to a run that is still in progress; nothing was "
                     "sent for this call";
@@ -343,25 +348,26 @@ WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
     } else if (o.replay_status == kReplayPartial) {
         o.message = "this idempotency key is bound to a run that sent some steps but did not "
                     "complete on every step; nothing was sent for this call";
-        o.remediation = std::string(kReadAndRerun);
+        o.remediation = read_and_rerun;
     } else if (o.replay_status == kReplayAborted) {
-        o.message = "this idempotency key is bound to a run that was stopped before it finished (a "
-                    "step was refused at dispatch, or the run reached its time budget or lost its "
-                    "credential); nothing was sent for this call";
-        o.remediation = std::string(kReadAndRerun);
+        o.message = "this idempotency key is bound to a run in which a step was refused at dispatch, "
+                    "or that reached its time budget or lost its credential; a step after a "
+                    "refused one may still have run; nothing was sent for this call";
+        o.remediation = read_and_rerun;
     } else if (o.replay_status == kReplayInterrupted) {
         o.message = "this idempotency key is bound to a run that the server's shutdown stopped; "
                     "nothing was sent for this call";
-        o.remediation = std::string(kReadAndRerun);
+        o.remediation = read_and_rerun;
     } else if (o.replay_status == kReplayFailed) {
         o.message = "this idempotency key is bound to a run that failed; nothing was sent for "
                     "this call";
-        o.remediation = std::string(kReadAndRerun);
+        o.remediation = read_and_rerun;
     } else {
         o.message = "this idempotency key is bound to a run whose outcome could not be confirmed; "
                     "nothing was sent for this call";
         o.remediation = "read get_workflow_execution; " + std::string(kStepNotProvenUnsentText) +
-                        "; a deliberate re-run needs a new key";
+                        "; if the run may still be live, wait for it before re-running; a "
+                        "deliberate re-run needs a new key";
     }
     return o;
 }
@@ -539,7 +545,7 @@ nlohmann::json workflow_idempotent_replay_json(const WorkflowExecuteOutcome& o,
         j["retry_after_ms"] = kIdempotentRunningRetryAfterMs;
     } else if (o.replay_status != kReplayCompleted) {
         j["retryable"] = false;
-        if (o.replay_status == kReplayIndeterminate)
+        if (!o.remediation.empty())
             j["remediation"] = o.remediation;
     }
     if (!o.audit_persisted)
@@ -1494,7 +1500,9 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                          "get_workflow_execution before starting another")
             : o.run_outcome == WorkflowRunOutcome::kAborted
                 ? "the workflow started and some steps were sent, but a step was refused at "
-                  "dispatch because its definition changed; the rest did not run"
+                  "dispatch (its approval mode was raised or its definition changed); a step after "
+                  "it may still have run when it was an onFailure: continue step, so read the "
+                  "steps with get_workflow_execution before starting another"
                 : "the workflow started and some steps were sent, but it did not complete on "
                   "every step; read the run with get_workflow_execution before starting another";
         if (o.deadline_exceeded)

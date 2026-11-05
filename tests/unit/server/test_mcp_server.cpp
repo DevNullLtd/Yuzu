@@ -49620,16 +49620,25 @@ TEST_CASE("MCP execute_workflow: replay answers for a running run (retry_after_m
     CHECK(running["idempotent_replay"] == true);
     CHECK(ts.audit_log.size() == audit_rows); // polling writes no row of any kind (workflow.execute or mcp)
 
+    CHECK_FALSE(running.contains("remediation")); // a poll answer: retry_after_ms is its hint
+
     const auto failed = call("key-failed-0001", 2);
     CHECK(failed["status"] == "failed");
     CHECK(failed["retryable"] == false);
     CHECK_FALSE(failed.contains("retry_after_ms"));
+    // `failed` is not "nothing was sent": the body says the record cannot prove it.
+    REQUIRE(failed.contains("remediation"));
+    CHECK(failed["remediation"].get<std::string>().find(
+              std::string(yuzu::server::kStepNotProvenUnsentText)) != std::string::npos);
 
     const auto stale = call("key-stale-00001", 3);
     CHECK(stale["status"] == "indeterminate");
     CHECK(stale["retryable"] == false);
     CHECK_FALSE(stale.contains("retry_after_ms"));
     CHECK(stale["remediation"].get<std::string>().find("get_workflow_execution") != std::string::npos);
+    CHECK(stale["remediation"].get<std::string>().find(
+              std::string(yuzu::server::kStepNotProvenUnsentText)) != std::string::npos);
+    CHECK(stale["remediation"].get<std::string>().find("may still be live") != std::string::npos);
 
     CHECK(fx.run_calls == 0);
     CHECK(fx.dispatches == 0);
@@ -49670,10 +49679,62 @@ TEST_CASE("MCP execute_workflow: a replay of a run the engine called completed b
     CHECK(payload.at("idempotent_replay") == true);
     CHECK(payload.at("retryable") == false);
     CHECK_FALSE(payload.contains("retry_after_ms"));
+    REQUIRE(payload.contains("remediation"));
+    CHECK(payload["remediation"].get<std::string>().find(
+              std::string(yuzu::server::kStepNotProvenUnsentText)) != std::string::npos);
     CHECK(wf_audit_has(ts, "success", "idempotent_replay=true run_status=partial"));
     CHECK(fx.run_calls == 0);
     CHECK(fx.dispatches == 0);
     CHECK(appr.pending_count() == 0);
+}
+
+TEST_CASE("MCP execute_workflow: a replay of an aborted or interrupted run carries the "
+          "may-still-have-been-sent caution in its tool_result body",
+          "[mcp][pg][workflow][twin][idempotency][outcome]") {
+    struct Row {
+        const char* expect;
+        const char* status;
+        const char* result;
+    };
+    const Row rows[] = {
+        {"aborted", "failed", R"j([{"error":"late_denied: approval mode raised"}])j"},
+        {"interrupted", "skipped", R"j({"reason":"server_shutdown"})j"},
+    };
+    for (const auto& row : rows) {
+        INFO(row.expect);
+        YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+        pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store(instr_pool);
+        REQUIRE(store.is_open());
+        yuzu::test::ApprovalManagerPg appr_bundle;
+        yuzu::server::ApprovalManager& appr = *appr_bundle;
+        WfMcpFx fx;
+        fx.seed(store);
+        yuzu::server::WorkflowStepResult ok;
+        ok.step_index = 0;
+        ok.instruction_id = fx.step_ids[0];
+        ok.status = "success";
+        ok.result_json = R"j({"status":"dispatched","command_id":"c","agents_reached":1})j";
+        yuzu::server::WorkflowStepResult stopped;
+        stopped.step_index = 1;
+        stopped.instruction_id = fx.step_ids[1];
+        stopped.status = row.status;
+        stopped.result_json = row.result;
+        fx.stored_rows_override = {ok, stopped};
+        fx.bound[{"alice", kWfKey}] = wf_bound_run("completed", 5, {"a1"});
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        auto res = ts.call(wf_exec_call(std::string(R"({"workflow_id":"wf-1","agent_ids":["a1"],"idempotency_key":")") + kWfKey + R"("})", 1));
+        REQUIRE(res);
+        const auto payload = wf_payload(*res);
+        CHECK(payload.at("status") == row.expect);
+        CHECK(payload.at("retryable") == false);
+        REQUIRE(payload.contains("remediation"));
+        CHECK(payload["remediation"].get<std::string>().find(
+                  std::string(yuzu::server::kStepNotProvenUnsentText)) != std::string::npos);
+        CHECK(fx.dispatches == 0);
+    }
 }
 
 TEST_CASE("MCP execute_workflow: the same key with a different request is -32602 "
