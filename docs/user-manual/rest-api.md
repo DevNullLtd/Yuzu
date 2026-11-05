@@ -4435,7 +4435,7 @@ flag ≠ revoke.
 
 **Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
 `principal_id`, or `role_name` missing, or `decision` is neither `attested`
-nor `flagged_revoke`. `403` without `AccessReview:Attest` (or an engine-classed
+nor `flagged_revoke`, or an identifier contains a NUL byte or is longer than 512 bytes. `403` without `AccessReview:Attest` (or an engine-classed
 caller), or for a browser (session-cookie) request that carries no
 `Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
 callers are exempt). Also `403` when the caller is the subject of the grant
@@ -4491,7 +4491,7 @@ Audited as `access_review.closed`.
 | `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv\|view> rows=<N> rbac_enforcement=<value>` (`view` is the dashboard's Current grants panel, `GET /fragments/access/reviews/grants`). `result=success`. |
 | `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews` or the dashboard fragment `GET /fragments/access/reviews/campaigns`. `target_type=AccessReview`. `result=success`. |
 | `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
-| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`, `denied`}. |
+| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>` on `success` and `denied` rows; a `failure` row carries `<campaign_id>` only. `result` ∈ {`success`, `failure`, `denied`}. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}` or the dashboard fragment `GET /fragments/access/reviews/campaign`. `target_id=<campaign_id>`. `result=success`. |
@@ -4510,7 +4510,9 @@ record `result=denied` when the store refuses the decision on purpose:
 `detail=self_attestation_blocked` for the `403` (the caller is the subject or
 owner) and `detail=already_decided` for the `409`. `target_id` is the full
 `<campaign_id>:<principal_type>:<principal_id>:<role_name>`. A denied row means
-nothing was recorded.
+nothing was recorded. If a denied row cannot be saved, the `403` or `409` still
+stands and the response carries `Sec-Audit-Failed: true`. The `409` message names the
+decision already recorded.
 
 The three mutating routes (`POST /api/v1/access-reviews`,
 `POST /api/v1/access-reviews/{id}/attestations` and

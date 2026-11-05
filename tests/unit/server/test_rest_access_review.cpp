@@ -1071,10 +1071,14 @@ nlohmann::json sod_body(const std::string& principal_id, const std::string& role
             {"decision", decision}};
 }
 
+/// True when an audit row with exactly this action/result/detail exists. A non-empty `target`
+/// must ALSO match, so a refusal row that stopped carrying the full campaign:type:id:role key
+/// (or started carrying caller bytes) is caught.
 bool audited(const AccessReviewHarness& h, const std::string& action, const std::string& result,
-             const std::string& detail) {
+             const std::string& detail, const std::string& target = {}) {
     for (const auto& a : h.audit_log)
-        if (a.action == action && a.result == result && a.detail == detail)
+        if (a.action == action && a.result == result && a.detail == detail &&
+            (target.empty() || a.target_id == target))
             return true;
     return false;
 }
@@ -1100,11 +1104,14 @@ TEST_CASE("access-reviews: REST refuses a Reviewer deciding their own grant (403
         REQUIRE(res);
         CHECK(res->status == 403);
     }
-    CHECK(audited(h, "access_review.attested", "denied", "self_attestation_blocked"));
-    CHECK(audited(h, "access_review.flagged", "denied", "self_attestation_blocked"));
-    // Nothing was recorded.
-    for (const auto& a : h.audit_log)
-        CHECK_FALSE((a.result == "success" && a.action.starts_with("access_review.at")));
+    const std::string self_key = cid + ":user:rita:Reviewer2";
+    CHECK(audited(h, "access_review.attested", "denied", "self_attestation_blocked", self_key));
+    CHECK(audited(h, "access_review.flagged", "denied", "self_attestation_blocked", self_key));
+    // Nothing was recorded: no success row under EITHER decision verb.
+    for (const auto& a : h.audit_log) {
+        CHECK_FALSE((a.result == "success" && a.action == "access_review.attested"));
+        CHECK_FALSE((a.result == "success" && a.action == "access_review.flagged"));
+    }
     auto view = h.access_review_store->get_campaign(cid);
     REQUIRE(view.has_value());
     CHECK(view->pending_count == static_cast<int>(view->attestations.size()));
@@ -1137,6 +1144,15 @@ TEST_CASE("access-reviews: REST decisions are final — a second reviewer gets 4
                                sod_body("fred", "FinalRole", "attested").dump());
     REQUIRE(subject);
     CHECK(subject->status == 403);
+    CHECK(audited(h, "access_review.attested", "denied", "self_attestation_blocked",
+                  cid + ":user:fred:FinalRole"));
+    CHECK(audited(h, "access_review.attested", "denied", "already_decided",
+                  cid + ":user:fred:FinalRole"));
+    // Refusals are not decisions: only carol's flag was counted, and no attest was.
+    CHECK(h.metrics.counter("yuzu_access_review_attestations_total", {{"decision", "flagged_revoke"}})
+              .value() == 1);
+    CHECK(h.metrics.counter("yuzu_access_review_attestations_total", {{"decision", "attested"}})
+              .value() == 0);
 
     auto view = h.access_review_store->get_campaign(cid);
     REQUIRE(view.has_value());
@@ -1184,6 +1200,7 @@ TEST_CASE("MCP: record_attestation refuses self-attestation and a second decisio
                                                       {"decision", "flagged_revoke"}});
     REQUIRE(ok);
     CHECK(ok->body.find("\"error\"") == std::string::npos);
+    CHECK(ok->body.find("recorded") != std::string::npos);
 
     auto again = h.mcp_call_tool("record_attestation", {{"campaign_id", cid},
                                                          {"principal_type", "user"},
@@ -1194,7 +1211,162 @@ TEST_CASE("MCP: record_attestation refuses self-attestation and a second decisio
     auto again_body = nlohmann::json::parse(again->body);
     REQUIRE(again_body.contains("error"));
     CHECK(again_body["error"]["code"].get<int>() == yuzu::server::mcp::kInvalidParams);
-    CHECK(audited(h, "access_review.attested", "denied", "already_decided"));
+    CHECK(audited(h, "access_review.attested", "denied", "already_decided",
+                  cid + ":user:nell:McpSodRole"));
+    // The recorded decision is named so an agent whose first response was lost can recover
+    // the state rather than flip it.
+    CHECK(again->body.find("flagged_revoke") != std::string::npos);
+}
+
+TEST_CASE("access-reviews: the engine-owner refusal works end to end over a real engine principal "
+          "(REST + MCP), tracking transfer_owner as a frozen limit",
+          "[pg][access_review][rest][mcp][sod]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && (op == "Read" || op == "Attest");
+    };
+    h.session_role = auth::Role::user;
+    for (const char* u : {"olivia", "bob", "carol"})
+        REQUIRE(h.auth_db->upsert_user(u, "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->create_role({.name = "EngSodRole", .description = "d"}).has_value());
+    auto eng = h.eps->create("SoD engine", "olivia", "test engine", "internal", "admin",
+                             "engine:sod4752");
+    REQUIRE(eng.has_value());
+    REQUIRE(h.rbac->assign_role({"engine", "engine:sod4752", "EngSodRole"}).has_value());
+
+    // This is the tripwire for the `owner_or_email` snapshot key: the campaign is opened through
+    // the REAL handler, which writes the snapshot the store's SQL later reads. Renaming that key
+    // in the handler turns the engine arm into a no-op and the next 403 becomes a 200.
+    const auto cid = h.open_campaign_rest("engine sod");
+    const nlohmann::json body = {{"principal_type", "engine"},
+                                 {"principal_id", "engine:sod4752"},
+                                 {"role_name", "EngSodRole"},
+                                 {"decision", "attested"}};
+    const std::string url = "/api/v1/access-reviews/" + cid + "/attestations";
+
+    h.session_user = "olivia";
+    auto owner = h.sink.Post(url, body.dump());
+    REQUIRE(owner);
+    CHECK(owner->status == 403);
+    CHECK(audited(h, "access_review.attested", "denied", "self_attestation_blocked",
+                  cid + ":engine:engine:sod4752:EngSodRole"));
+
+    // The owner is FROZEN at open: moving ownership afterwards does not unblock the old owner
+    // and does not block the new one (a documented limit — auth-architecture "Known limits").
+    REQUIRE(h.eps->transfer_owner("engine:sod4752", "bob").has_value());
+    auto still_owner = h.sink.Post(url, body.dump());
+    REQUIRE(still_owner);
+    CHECK(still_owner->status == 403);
+    h.session_user = "bob";
+    auto new_owner = h.sink.Post(url, body.dump());
+    REQUIRE(new_owner);
+    CHECK(new_owner->status == 200);
+
+    // MCP twin, on a second campaign over the (now bob-owned) engine.
+    h.session_user = "carol";
+    auto open2 = h.mcp_call_tool("open_access_review", {{"title", "engine sod mcp"}});
+    REQUIRE(open2);
+    const std::string cid2 = nlohmann::json::parse(open2->body)["result"]["structuredContent"]
+                                                    ["campaign_id"].get<std::string>();
+    h.session_user = "bob";
+    auto mcp_owner = h.mcp_call_tool("record_attestation", {{"campaign_id", cid2},
+                                                             {"principal_type", "engine"},
+                                                             {"principal_id", "engine:sod4752"},
+                                                             {"role_name", "EngSodRole"},
+                                                             {"decision", "flagged_revoke"}});
+    REQUIRE(mcp_owner);
+    auto mcp_body = nlohmann::json::parse(mcp_owner->body);
+    REQUIRE(mcp_body.contains("error"));
+    CHECK(mcp_body["error"]["code"].get<int>() == yuzu::server::mcp::kPermissionDenied);
+    CHECK(audited(h, "access_review.flagged", "denied", "self_attestation_blocked"));
+    h.session_user = "carol";
+    auto mcp_other = h.mcp_call_tool("record_attestation", {{"campaign_id", cid2},
+                                                             {"principal_type", "engine"},
+                                                             {"principal_id", "engine:sod4752"},
+                                                             {"role_name", "EngSodRole"},
+                                                             {"decision", "flagged_revoke"}});
+    REQUIRE(mcp_other);
+    CHECK(mcp_other->body.find("recorded") != std::string::npos);
+}
+
+TEST_CASE("access-reviews: a NUL-carrying or oversize identifier is a 400 / invalid-params and "
+          "never reaches the audit trail",
+          "[pg][access_review][rest][mcp][sod]") {
+    AccessReviewHarness h;
+    REQUIRE(h.rbac->create_role({.name = "NulRole", .description = "d"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("nina", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "nina", "NulRole"}).has_value());
+    const auto cid = h.open_campaign_rest("nul");
+    h.session_user = "carol";
+    const std::string url = "/api/v1/access-reviews/" + cid + "/attestations";
+
+    // "nina\0forged-suffix": Postgres would match nina's row while the full string went on
+    // into the audit target.
+    const std::string nul_id = std::string("nina") + '\0' + "forged-suffix";
+    auto rest_nul = h.sink.Post(url, nlohmann::json{{"principal_type", "user"},
+                                                    {"principal_id", nul_id},
+                                                    {"role_name", "NulRole"},
+                                                    {"decision", "attested"}}.dump());
+    REQUIRE(rest_nul);
+    CHECK(rest_nul->status == 400);
+    auto rest_big = h.sink.Post(url, nlohmann::json{{"principal_type", "user"},
+                                                    {"principal_id", "nina"},
+                                                    {"role_name", std::string(600, 'r')},
+                                                    {"decision", "attested"}}.dump());
+    REQUIRE(rest_big);
+    CHECK(rest_big->status == 400);
+
+    auto mcp_nul = h.mcp_call_tool("record_attestation", {{"campaign_id", cid},
+                                                           {"principal_type", "user"},
+                                                           {"principal_id", nul_id},
+                                                           {"role_name", "NulRole"},
+                                                           {"decision", "attested"}});
+    REQUIRE(mcp_nul);
+    auto mcp_body = nlohmann::json::parse(mcp_nul->body);
+    REQUIRE(mcp_body.contains("error"));
+    CHECK(mcp_body["error"]["code"].get<int>() == yuzu::server::mcp::kInvalidParams);
+
+    for (const auto& a : h.audit_log) {
+        INFO(a.action << " " << a.target_id);
+        CHECK(a.target_id.find("forged-suffix") == std::string::npos);
+        CHECK(a.detail.find("forged-suffix") == std::string::npos);
+        CHECK(a.target_id.size() < 400);
+    }
+    // The grant is untouched and still decidable by a legitimate reviewer.
+    auto ok = h.sink.Post(url, nlohmann::json{{"principal_type", "user"},
+                                              {"principal_id", "nina"},
+                                              {"role_name", "NulRole"},
+                                              {"decision", "attested"}}.dump());
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("access-reviews: a refusal whose audit row fails to persist says so on REST",
+          "[pg][access_review][rest][sod]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && (op == "Read" || op == "Attest");
+    };
+    h.session_user = "rita";
+    h.session_role = auth::Role::user;
+    REQUIRE(h.rbac->create_role({.name = "AuditFailRole", .description = "d"}).has_value());
+    REQUIRE(h.auth_db->upsert_user("rita", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "rita", "AuditFailRole"}).has_value());
+    const auto cid = h.open_campaign_rest("audit fail");
+
+    h.audit_fail_action = "access_review.attested";
+    auto res = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                           sod_body("rita", "AuditFailRole", "attested").dump());
+    REQUIRE(res);
+    CHECK(res->status == 403); // the refusal still stands
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // An audit that persisted carries no such header.
+    h.audit_fail_action.clear();
+    auto ok_audit = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                                sod_body("rita", "AuditFailRole", "attested").dump());
+    REQUIRE(ok_audit);
+    CHECK(ok_audit->status == 403);
+    CHECK(ok_audit->get_header_value("Sec-Audit-Failed").empty());
 }
 
 // ── GET /api/v1/access-reviews (list campaigns, H-2) ────────────────────────

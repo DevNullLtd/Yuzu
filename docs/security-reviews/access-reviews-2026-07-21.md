@@ -478,3 +478,8 @@ Refusals are audited `result=denied` (`self_attestation_blocked`,
 on MCP. Group grants have no owner and are not covered. This also closes #2326
 item 2. Full statement of the rule and its limits: `docs/auth-architecture.md`
 "Periodic access reviews".
+
+Decisions recorded before this change are not invalidated, and an overwritten decision cannot
+be reconstructed from the table (only from the audit log). The detection query and the
+rolling-upgrade ordering are in `docs/user-manual/upgrading.md`; the assessment-period
+statement is the #4752 addendum in `docs/enterprise-readiness-soc2-first-customer.md`.

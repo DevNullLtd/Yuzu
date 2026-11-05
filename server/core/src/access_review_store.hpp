@@ -179,10 +179,15 @@ public:
     ///                               campaign is not open (closed campaigns are
     ///                               immutable evidence — see `close_campaign`).
     ///                               REST 404.
-    ///   * `already_decided: ...`  — the grant already has a decision. REST 409.
+    ///   * `already_decided: ...`  — the grant already has a decision (the
+    ///                               message names it). REST 409.
     ///   * `self_attestation: ...` — reviewer is the subject / engine owner.
     ///                               REST 403. Outranks `already_decided:`.
-    /// Any other `unexpected(msg)` is a genuine write failure (503/retry).
+    ///   * `bad_request: ...`      — a NUL byte / over-long (> 512 bytes)
+    ///                               identifier, an empty reviewer, or an
+    ///                               invalid decision. REST 400.
+    /// Any other `unexpected(msg)` is a genuine write failure (503/retry); the
+    /// libpq text is LOGGED server-side and never returned.
     [[nodiscard]] std::expected<void, std::string>
     record_attestation(const std::string& campaign_id, const std::string& principal_type,
                        const std::string& principal_id, const std::string& role_name,
@@ -225,6 +230,17 @@ private:
     bool open_{false};
 };
 
+/// Machine-checkable error prefixes `record_attestation` produces. ONE
+/// definition each, used by BOTH the producer (access_review_store.cpp) and the
+/// classifiers below, so a typo is a compile error rather than a deliberate
+/// refusal silently degrading to a generic 503. (`not_found:` predates this and
+/// stays a literal at its existing sites.)
+inline constexpr std::string_view kSelfAttestationPrefix = "self_attestation:";
+inline constexpr std::string_view kAlreadyDecidedPrefix = "already_decided:";
+/// Client-caused input error the transport did not pre-validate (a NUL byte or
+/// over-long identifier, an empty reviewer). REST 400 / MCP invalid-params.
+inline constexpr std::string_view kBadRequestPrefix = "bad_request:";
+
 /// How `record_attestation` refused a decision on purpose (#4752), as opposed
 /// to a missing row (`not_found:`) or a store fault. The ONE place the store's
 /// error prefixes are turned into a transport-neutral verdict, so the REST and
@@ -232,11 +248,16 @@ private:
 enum class AttestationRefusal { None, SelfAttestation, AlreadyDecided };
 
 [[nodiscard]] inline AttestationRefusal classify_attestation_refusal(std::string_view err) noexcept {
-    if (err.starts_with("self_attestation:"))
+    if (err.starts_with(kSelfAttestationPrefix))
         return AttestationRefusal::SelfAttestation;
-    if (err.starts_with("already_decided:"))
+    if (err.starts_with(kAlreadyDecidedPrefix))
         return AttestationRefusal::AlreadyDecided;
     return AttestationRefusal::None;
+}
+
+/// True for a client-input error from any AccessReviewStore method.
+[[nodiscard]] inline bool is_bad_request_error(std::string_view err) noexcept {
+    return err.starts_with(kBadRequestPrefix);
 }
 
 /// Short, stable audit `detail` token for a refusal ("" for `None`). A token,

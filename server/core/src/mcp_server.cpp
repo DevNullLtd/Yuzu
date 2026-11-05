@@ -6335,17 +6335,18 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // fault, so it maps to kInvalidParams like the REST twin's 404. Any other
 // message is a genuine read/write failure → kInternalError (retryable).
 //
-// Contract pin: same binary posture as rest_api_v1.cpp's
-// access_review_error_status — every tool handler above pre-validates its
-// own required fields (title/decision/campaign_id/principal_type/
-// principal_id/role_name) BEFORE calling into AccessReviewStore, so the
-// store's own input-validation error strings never actually reach this
-// function today; they would otherwise land in the `else -> kInternalError`
-// arm, which is wrong (client error, not retryable). Callers MUST keep
-// pre-validating. If a future path reaches the store unvalidated, add a
-// `bad_request:` prefix to that store error and a kInvalidParams arm here
-// (and the matching 400 arm in rest_api_v1.cpp's access_review_error_status)
-// rather than letting it fall through to kInternalError.
+// Contract pin: same classes as rest_api_v1.cpp's access_review_error_status —
+// self_attestation: -> kPermissionDenied, already_decided: and bad_request: ->
+// kInvalidParams (#4752), not_found: -> kInvalidParams, else kInternalError.
+// Every tool handler above also pre-validates its own required fields
+// (title/decision/campaign_id/principal_type/principal_id/role_name) BEFORE
+// calling into AccessReviewStore, so the store's remaining bare validation
+// strings never actually reach this function today; they would otherwise land
+// in the `else -> kInternalError` arm, which is wrong (client error, not
+// retryable). Callers MUST keep pre-validating; a store error a handler cannot
+// pre-validate gets a `bad_request:` prefix (see
+// AccessReviewStore::record_attestation) and is mapped here and in the matching
+// 400 arm in rest_api_v1.cpp rather than falling through to kInternalError.
 int mcp_error_for_access_review_msg(const std::string& msg) {
     // #4752: a deliberate refusal of an attestation. self_attestation is a
     // permission problem (the reviewer may not decide their own grant);
@@ -6359,6 +6360,8 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
     case AttestationRefusal::None:
         break;
     }
+    if (is_bad_request_error(msg))
+        return kInvalidParams;
     return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
 }
 

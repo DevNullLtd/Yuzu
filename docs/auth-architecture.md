@@ -3747,7 +3747,9 @@ only to `Administrator` and the non-admin `Reviewer` role. The global gate is
 deliberate: a grant has no per-agent or management-group boundary to
 admit-then-filter against, and a confinement-filtered slice would be worthless
 as CC6.2 evidence, because an auditor needs the complete grant population every
-time. Do not move these routes onto `authorize_list_read`.
+time. That makes the global gate a stronger least-privilege posture (via the seeded `Reviewer`
+role) than a confinement-filtered slice would be, not a weaker one. Do not move these routes
+onto `authorize_list_read`.
 
 **#2225 round 2.** An earlier round gated the surface on `AuditLog:Read` /
 `AuditLog:Attest`. That over-disclosed the full fleet-wide grant population to
@@ -3806,9 +3808,21 @@ refuse it before the store is reached).
 anyone, is refused and the first decision, reviewer and justification stay
 untouched. This stops a subject from quietly replacing another reviewer's
 `flagged_revoke` with `attested`, which would leave the closed campaign showing
-only the self-signed result. If a decision was a mistake, open a new campaign.
+only the self-signed result. If a decision was a mistake, open a new campaign. This was ruled
+by the project owner on 2026-11-05 (#4752): a correction is a new campaign, never an edit, so a
+closed campaign shows what each reviewer actually decided.
 (This also closes #2326 item 2, the silent last-write-wins between two
 concurrent reviewers.)
+
+**A decision cannot land in a campaign that is closing.** The write takes a share lock on the
+campaign row, so a close waits for attestations already in flight and an attestation that
+arrives after the close is refused (`not_found`).
+
+The engine owner is read from the `owner_or_email` key of the row's frozen `grant_snapshot`.
+That key is a contract between the handlers that write the snapshot when a campaign opens and
+the store's SQL; the REST and MCP engine-owner tests (`[sod]`) are its tripwire, because
+renaming the key would silently stop the engine check. A snapshot that is empty, not valid JSON
+or has no owner has no readable owner, and its row stays attestable.
 
 When both rules apply to one attempt, `self_attestation` is reported, because a
 subject trying to overwrite a decision about their own grant is the signal that
@@ -3822,16 +3836,41 @@ helper, so they cannot disagree:
 |---|---|---|---|
 | `self_attestation:` | 403 | `kPermissionDenied` | `access_review.attested` or `access_review.flagged`, `result=denied`, detail `self_attestation_blocked` |
 | `already_decided:` | 409 | `kInvalidParams` | same verbs, `result=denied`, detail `already_decided` |
+| `bad_request:` | 400 | `kInvalidParams` | `result=failure`, no caller bytes in the row |
 | `not_found:` | 404 | `kInvalidParams` | `result=failure` (unchanged) |
 
-**Known limits, stated plainly.**
+A `bad_request:` means an identifier contained a NUL byte or was longer than 512 bytes (Postgres
+stops reading a parameter at the first NUL, so such a value would otherwise match a real row
+while its extra bytes reached the audit trail), or the reviewer was empty. The libpq text of a
+genuine database fault is logged on the server and never returned to the caller.
 
-- `group` grants have no owner, and group membership is a cross-store read, so a
-  member of a group is not blocked from deciding that group's grant.
-- An engine principal's `created_by` is not in the snapshot and is not checked.
-  Ownership moved by `transfer_owner` after a campaign opens is not reflected.
-- Nothing here stops two colluding reviewers deciding each other's grants.
-  Four-eyes on distinct human roots is a separate control.
+**Known limits, stated plainly.** The control compares usernames byte for byte, so it is exactly
+as strong as the rule "one person, one principal id". Read these before you describe it to an
+auditor.
+
+- **One person with more than one account.** A person who holds a local account and an SSO or
+  SCIM-provisioned identity (`oidc:<issuer>#<subject>`, `saml:`, `ad:`) is two principals to this
+  check, so they can decide the grant held under their other identity. The same goes for a
+  person's membership of a group (below).
+- **`group` grants have no owner**, and group membership is a cross-store read, so a member of a
+  group is not blocked from deciding that group's grant.
+- **Engine ownership is the owner recorded when the campaign opened.** Ownership moved by
+  `transfer_owner` afterwards is not reflected (the old owner stays blocked, the new owner is
+  not), an engine principal's `created_by` is not checked, and an engine deleted after the
+  campaign opened keeps a snapshot with no readable owner, which anyone may decide.
+- **It needs at least two people able to attest.** A sole Administrator (RBAC off, the default,
+  admits only administrators) cannot decide that administrator's own grants. They stay
+  `pending` until someone closes the campaign, and `close` has no separation of duties, so the
+  campaign closes with unreviewed rows. Assign `Reviewer` to a second person.
+- **It is not four-eyes.** Nothing stops two colluding reviewers deciding each other's grants.
+  Four-eyes on distinct human roots is a separate control (ADR-0033 section 7 reserves
+  human-root resolution for it); this rule compares usernames only, as ADR-1005's 2026-10-19
+  addendum already accepts.
+- **Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is
+  the subject of a grant can still open or close a campaign.
+- **Mixed-version replicas.** The rules live in the database write, so a replica still on the
+  old build keeps overwriting and accepting self-attestation until it is upgraded
+  (`docs/user-manual/upgrading.md`).
 - `record_attestation` stays `Destructive` on MCP because the write is now final
   and irreversible. Lowering the annotation would loosen tier gating and is a
   security decision of its own. It remains exempt from MFA step-up as evidence

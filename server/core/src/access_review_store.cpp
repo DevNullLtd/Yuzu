@@ -9,7 +9,9 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -38,14 +40,46 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 //   engine — the engine's owner, FROZEN into grant_snapshot at campaign open
 //            (`owner_or_email` holds `owner_username` for engine rows). Frozen,
 //            not live: the reviewed population is frozen at open and this needs
-//            no cross-store read. The `LIKE '{%'` guard keeps an empty or legacy
-//            snapshot from ever reaching the ::jsonb cast.
+//            no cross-store read. The key name is a CONTRACT with the handlers
+//            that write the snapshot (rest_api_v1.cpp / mcp_server.cpp open
+//            routes); renaming it there turns this arm into a silent no-op, so
+//            the REST and MCP engine-owner tests are its tripwire.
+//            `pg_input_is_valid(.., 'jsonb')` (PostgreSQL 16+, the project
+//            floor) makes the cast safe for ANY text — empty, legacy or
+//            malformed — and it sits INSIDE the CASE, whose branches Postgres
+//            evaluates in order, so the cast is never reached for a bad value
+//            or for a non-engine row. A snapshot that is valid JSON but not an
+//            object, or has no owner key, yields NULL -> '' (attestable).
 //   group  — not covered (no owner; membership is a cross-store read). Known,
 //            documented limit.
 constexpr const char* kSelfSubject =
     "(a.principal_type='user' AND a.principal_id=$5) OR "
-    "(a.principal_type='engine' AND COALESCE(CASE WHEN a.grant_snapshot LIKE '{%' "
+    "(a.principal_type='engine' AND COALESCE(CASE WHEN a.principal_type='engine' "
+    "AND pg_input_is_valid(a.grant_snapshot, 'jsonb') "
     "THEN (a.grant_snapshot::jsonb)->>'owner_or_email' END, '') = $5)";
+
+// Upper bound for every caller-supplied identifier on the attestation path.
+// Postgres stops reading a bound parameter at the first NUL, so an identifier
+// carrying one would MATCH the real row while the caller's full bytes went on
+// into the audit target; and the audit table has no column bound. Rejecting
+// both here (rather than in each transport) keeps ONE copy of the rule.
+constexpr std::size_t kMaxIdentifierBytes = 512;
+
+[[nodiscard]] bool bad_identifier(const std::string& s) {
+    return s.size() > kMaxIdentifierBytes || s.find('\0') != std::string::npos;
+}
+
+// Log-safe rendering of a campaign id: control characters become '?', truncated.
+[[nodiscard]] std::string log_safe(const std::string& s) {
+    std::string out;
+    out.reserve(std::min<std::size_t>(s.size(), 64));
+    for (unsigned char c : s) {
+        if (out.size() >= 64)
+            break;
+        out.push_back((c < 0x20 || c == 0x7f) ? '?' : static_cast<char>(c));
+    }
+    return out;
+}
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -247,16 +281,22 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
     if (!open_)
         return std::unexpected("database not open");
     if (decision != "attested" && decision != "flagged_revoke")
-        return std::unexpected("decision must be 'attested' or 'flagged_revoke'");
+        return std::unexpected(std::string(kBadRequestPrefix) +
+                               " decision must be 'attested' or 'flagged_revoke'");
     if (campaign_id.empty() || principal_type.empty() || principal_id.empty() ||
         role_name.empty())
-        return std::unexpected("campaign_id/principal_type/principal_id/role_name required");
+        return std::unexpected(std::string(kBadRequestPrefix) +
+                               " campaign_id/principal_type/principal_id/role_name required");
+    if (bad_identifier(campaign_id) || bad_identifier(principal_type) ||
+        bad_identifier(principal_id) || bad_identifier(role_name) || bad_identifier(reviewer))
+        return std::unexpected(std::string(kBadRequestPrefix) +
+                               " an identifier contains a NUL byte or exceeds 512 bytes");
 
     // Fail closed on an unidentified reviewer, the same way `is_self_target`
     // treats an empty username as "self": without an identity the
     // reviewer-vs-subject comparison below has nothing to compare.
     if (reviewer.empty())
-        return std::unexpected("reviewer required");
+        return std::unexpected(std::string(kBadRequestPrefix) + " reviewer required");
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
@@ -265,8 +305,14 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
     // The decision is written by ONE statement whose WHERE clause carries
     // every rule, so there is no check-then-write race and no caller can
     // skip a rule:
-    //   * `EXISTS (... status='open')` — a closed campaign's rows are
-    //     immutable evidence.
+    //   * `EXISTS (... status='open' FOR SHARE)` — a closed campaign's rows are
+    //     immutable evidence. FOR SHARE is load-bearing: without it the check is
+    //     a snapshot read, so an attestation already waiting on a row lock could
+    //     commit AFTER a concurrent close and land a final decision in a closed
+    //     campaign (verified). The share lock makes a close wait for in-flight
+    //     attests and makes a later attest re-check the new status; attests
+    //     share the lock with each other, and close_campaign touches only the
+    //     campaign row, so there is no lock-order cycle.
     //   * `decision='pending'` — a decision is FINAL (#4752; owner ruling
     //     2026-11-05). The first Attest/Flag sticks; a second reviewer, or
     //     the subject, can never replace it. Also closes #2326 item 2.
@@ -283,15 +329,22 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
                     "  AND a.role_name=$4 AND a.decision='pending' AND NOT (") +
         kSelfSubject +
         ") AND EXISTS (SELECT 1 FROM access_review_store.access_review_campaign c "
-        "              WHERE c.campaign_id=$1 AND c.status='open') "
+        "              WHERE c.campaign_id=$1 AND c.status='open' FOR SHARE) "
         "RETURNING a.campaign_id";
     pg::PgResult res = pg::exec_params(
         lease.get(), update_sql.c_str(),
         std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, reviewer,
                                  decision, std::to_string(now_ms()), justification});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("record_attestation write failed: ") +
-                               PQerrorMessage(lease.get()));
+    if (res.status() != PGRES_TUPLES_OK) {
+        // The libpq text can carry schema / constraint / JSON fragments, so it
+        // is logged here and never returned to the (REST / MCP) client.
+        const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        spdlog::error("AccessReviewStore::record_attestation: write failed "
+                      "(campaign={}, sqlstate={}): {}",
+                      log_safe(campaign_id), sqlstate ? sqlstate : "?",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(std::string("record_attestation write failed"));
+    }
     if (PQntuples(res.get()) != 0)
         return {};
 
@@ -308,9 +361,14 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
     pg::PgResult why = pg::exec_params(
         lease.get(), why_sql.c_str(),
         std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, reviewer});
-    if (why.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("record_attestation diagnosis failed: ") +
-                               PQerrorMessage(lease.get()));
+    if (why.status() != PGRES_TUPLES_OK) {
+        const char* sqlstate = PQresultErrorField(why.get(), PG_DIAG_SQLSTATE);
+        spdlog::error("AccessReviewStore::record_attestation: diagnosis failed "
+                      "(campaign={}, sqlstate={}): {}",
+                      log_safe(campaign_id), sqlstate ? sqlstate : "?",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(std::string("record_attestation diagnosis failed"));
+    }
     if (PQntuples(why.get()) == 0 || std::string_view(PQgetvalue(why.get(), 0, 0)) != "open")
         return std::unexpected(
             "not_found: no pending grant matches (campaign_id, principal_type, principal_id, "
@@ -320,11 +378,18 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
     // a decision about their own grant is the security-relevant signal.
     if (std::string_view(PQgetvalue(why.get(), 0, 2)) == "t")
         return std::unexpected(
-            "self_attestation: the acting reviewer is the subject of this grant (or the "
-            "owner of this engine principal) and may not decide it — another reviewer must");
+            std::string(kSelfAttestationPrefix) +
+            " the acting reviewer is the subject of this grant (or the owner of this engine "
+            "principal) and may not decide it — another reviewer must");
+    // The recorded decision comes from a CHECK-constrained column
+    // ('attested' | 'flagged_revoke'), so it is safe to echo, and it lets a
+    // caller whose first response was lost recover the state instead of
+    // guessing (and flipping) it.
     return std::unexpected(
-        "already_decided: this grant already has a recorded decision in this open campaign "
-        "and decisions are final — open a new campaign to re-review it");
+        std::string(kAlreadyDecidedPrefix) + " this grant already has a recorded decision ('" +
+        std::string(PQgetvalue(why.get(), 0, 1)) +
+        "') in this open campaign and decisions are final — open a new campaign to "
+        "re-review it");
 }
 
 std::expected<CampaignView, std::string>

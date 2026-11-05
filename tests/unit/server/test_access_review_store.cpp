@@ -42,9 +42,12 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::AccessReviewStore;
@@ -496,7 +499,279 @@ TEST_CASE("record_attestation requires an identified reviewer", "[access_review]
     REQUIRE(open_res.has_value());
     auto rec = store.record_attestation(*open_res, "user", "alice", "Admin", "attested", "", "");
     REQUIRE_FALSE(rec.has_value());
-    CHECK(rec.error() == "reviewer required");
+    // A client-input class (REST 400 / MCP invalid-params), not a retryable 503.
+    CHECK(yuzu::server::is_bad_request_error(rec.error()));
+    CHECK(rec.error().find("reviewer required") != std::string::npos);
+}
+
+// ── identifiers: NUL bytes and size (#4752 gate, UP-1) ──────────────────────
+
+TEST_CASE("record_attestation rejects NUL-carrying and oversize identifiers before any write",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("NUL", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // Postgres reads a bound parameter only up to the first NUL, so "alice\0junk"
+    // would MATCH alice's real row while the caller's full bytes flowed on into
+    // the audit target. It must be refused up front instead.
+    const std::string nul_id("alice\0junk", 10);
+    const std::string nul_role("Admin\0x", 7);
+    const std::string huge(513, 'x');
+    const std::string edge(512, 'x');
+
+    auto bad = [&](const char* what, auto&& rec) {
+        INFO(what);
+        REQUIRE_FALSE(rec.has_value());
+        CHECK(yuzu::server::is_bad_request_error(rec.error()));
+        CHECK(rec.error().find("junk") == std::string::npos); // never echo caller bytes
+    };
+    bad("nul principal_id",
+        store.record_attestation(cid, "user", nul_id, "Admin", "attested", "carol", ""));
+    bad("nul role_name",
+        store.record_attestation(cid, "user", "alice", nul_role, "attested", "carol", ""));
+    bad("nul campaign_id",
+        store.record_attestation(std::string("c\0x", 3), "user", "alice", "Admin", "attested",
+                                 "carol", ""));
+    bad("nul reviewer",
+        store.record_attestation(cid, "user", "alice", "Admin", "attested",
+                                 std::string("carol\0x", 7), ""));
+    bad("oversize role_name",
+        store.record_attestation(cid, "user", "alice", huge, "attested", "carol", ""));
+    bad("invalid decision",
+        store.record_attestation(cid, "user", "alice", "Admin", "maybe", "carol", ""));
+
+    // Nothing was written, and an identifier exactly at the bound is not
+    // refused for its size (it is simply not a frozen grant -> not_found).
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+    auto at_edge = store.record_attestation(cid, "user", "alice", edge, "attested", "carol", "");
+    REQUIRE_FALSE(at_edge.has_value());
+    CHECK(at_edge.error().starts_with("not_found:"));
+}
+
+// ── malformed grant_snapshot must never wedge a row (UP-8 / S-F3) ───────────
+
+TEST_CASE("record_attestation tolerates invalid or non-object snapshots on every statement",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::vector<GrantRef> grants{
+        GrantRef{"engine", "engine:badjson", "Writer", "{bad"},
+        GrantRef{"engine", "engine:scalar", "Writer", "7"},
+        GrantRef{"engine", "engine:array", "Writer", "[1,2]"},
+        GrantRef{"user", "uzer", "Admin", "{bad"},
+    };
+    auto open_res = store.open_campaign("Malformed", "admin", grants, "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // No owner can be read from a corrupt snapshot, so the row is attestable
+    // (the same treatment as an empty one) — and the statement does NOT error.
+    for (const char* id : {"engine:badjson", "engine:scalar", "engine:array"}) {
+        INFO(id);
+        auto rec = store.record_attestation(cid, "engine", id, "Writer", "attested", "carol", "");
+        CHECK(rec.has_value());
+        // The DIAGNOSING statement used to evaluate the cast unconditionally, so a
+        // second attempt on a DECIDED corrupt row returned a permanent 503 instead
+        // of 409 and an agent following the retry hint looped forever.
+        auto again = store.record_attestation(cid, "engine", id, "Writer", "flagged_revoke",
+                                              "dave", "");
+        REQUIRE_FALSE(again.has_value());
+        CHECK(again.error().starts_with("already_decided:"));
+    }
+    auto user_row = store.record_attestation(cid, "user", "uzer", "Admin", "attested", "carol", "");
+    CHECK(user_row.has_value());
+}
+
+// ── lease reuse, failure text, concurrency, close race (#4752 gate) ─────────
+
+TEST_CASE("record_attestation: a refusal on a pool of ONE connection reuses the lease",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Pool1", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    REQUIRE(store.record_attestation(*open_res, "user", "alice", "Admin", "attested", "carol", "")
+                .has_value());
+    // The diagnosing SELECT must run on the SAME lease. A second acquire on a
+    // one-connection pool would time out and report "database unavailable".
+    auto again =
+        store.record_attestation(*open_res, "user", "alice", "Admin", "flagged_revoke", "dave", "");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error().starts_with("already_decided:"));
+    // ... naming the recorded decision so a caller whose first response was lost can recover.
+    CHECK(again.error().find("'attested'") != std::string::npos);
+    // And the connection came back to the pool healthy.
+    CHECK(store.record_attestation(*open_res, "group", "eng", "Reader", "attested", "dave", "")
+              .has_value());
+}
+
+TEST_CASE("record_attestation: a failed write returns a fixed string, never libpq text",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Fail", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{PQexec(conn.get(), "DROP TABLE access_review_store.access_review_attestation")};
+        REQUIRE(d.ok());
+    }
+    auto rec = store.record_attestation(*open_res, "user", "alice", "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(rec.has_value());
+    CHECK(rec.error() == "record_attestation write failed");
+    // No refusal class, no 400/404 class: a genuine fault stays a 503.
+    CHECK(yuzu::server::classify_attestation_refusal(rec.error()) ==
+          yuzu::server::AttestationRefusal::None);
+    CHECK_FALSE(yuzu::server::is_bad_request_error(rec.error()));
+    CHECK_FALSE(rec.error().starts_with("not_found:"));
+    CHECK(rec.error().find("relation") == std::string::npos);
+    // The connection that just saw an ERROR was recycled: a later call on the
+    // same (tiny) pool fails the same honest way instead of hanging.
+    auto again = store.record_attestation(*open_res, "user", "alice", "Admin", "attested", "dave", "");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == "record_attestation write failed");
+}
+
+TEST_CASE("record_attestation: concurrent deciders produce exactly one winner",
+          "[access_review][store][pg][sod][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Race", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    constexpr int kThreads = 6;
+    std::atomic<bool> go{false};
+    std::vector<std::expected<void, std::string>> results(kThreads);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            while (!go.load())
+                std::this_thread::yield();
+            results[i] = store.record_attestation(cid, "user", "alice", "Admin",
+                                                  i % 2 == 0 ? "attested" : "flagged_revoke",
+                                                  "reviewer" + std::to_string(i), "");
+        });
+    }
+    go = true;
+    for (auto& t : threads)
+        t.join();
+
+    int winner = -1, wins = 0;
+    for (int i = 0; i < kThreads; ++i) {
+        if (results[i].has_value()) {
+            ++wins;
+            winner = i;
+        } else {
+            INFO("loser " << i << ": " << results[i].error());
+            CHECK(results[i].error().starts_with("already_decided:"));
+        }
+    }
+    REQUIRE(wins == 1);
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    for (const auto& a : view->attestations)
+        if (a.principal_id == "alice") {
+            CHECK(a.reviewer == "reviewer" + std::to_string(winner));
+            CHECK(a.decision == (winner % 2 == 0 ? "attested" : "flagged_revoke"));
+        }
+}
+
+TEST_CASE("record_attestation: an attest waiting on a closing campaign does not land after the close",
+          "[access_review][store][pg][sod][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("CloseRace", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // Session A closes the campaign but has NOT committed yet (holds its row lock).
+    PgConn closer{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(closer.get()) == CONNECTION_OK);
+    {
+        PgResult b{PQexec(closer.get(), "BEGIN")};
+        REQUIRE(b.ok());
+        const std::string upd =
+            "UPDATE access_review_store.access_review_campaign SET status='closed' "
+            "WHERE campaign_id='" + cid + "'";
+        PgResult u{PQexec(closer.get(), upd.c_str())};
+        REQUIRE(u.ok());
+    }
+    std::expected<void, std::string> result;
+    std::thread attester([&] {
+        result = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    });
+
+    // Wait until the attest is genuinely blocked on a lock (not merely slow).
+    PgConn probe{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(probe.get()) == CONNECTION_OK);
+    bool blocked = false;
+    for (int i = 0; i < 200 && !blocked; ++i) {
+        PgResult r{PQexec(probe.get(),
+                          "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' "
+                          "AND datname=current_database()")};
+        if (r.ok() && PQntuples(r.get()) == 1 && std::string(PQgetvalue(r.get(), 0, 0)) != "0")
+            blocked = true;
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    {
+        PgResult c{PQexec(closer.get(), "COMMIT")};
+        REQUIRE(c.ok());
+    }
+    attester.join();
+    REQUIRE(blocked); // without FOR SHARE the attest never blocks and lands in the closed campaign
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().starts_with("not_found:"));
+
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "closed");
+    CHECK(view->pending_count == 3); // nothing was decided after the close
+}
+
+TEST_CASE("attestation refusal classifiers map exactly the documented prefixes",
+          "[access_review][store][sod]") {
+    using yuzu::server::AttestationRefusal;
+    using yuzu::server::classify_attestation_refusal;
+    using yuzu::server::is_bad_request_error;
+    CHECK(classify_attestation_refusal("self_attestation: x") == AttestationRefusal::SelfAttestation);
+    CHECK(classify_attestation_refusal("already_decided: x") == AttestationRefusal::AlreadyDecided);
+    for (const char* none : {"not_found: x", "bad_request: x", "record_attestation write failed",
+                             "self_attestation", "already_decided", "", " self_attestation: x"})
+        CHECK(classify_attestation_refusal(none) == AttestationRefusal::None);
+    CHECK(is_bad_request_error("bad_request: x"));
+    for (const char* no : {"not_found: x", "self_attestation: x", "bad_request", ""})
+        CHECK_FALSE(is_bad_request_error(no));
+    CHECK(std::string(yuzu::server::attestation_refusal_token(AttestationRefusal::SelfAttestation)) ==
+          "self_attestation_blocked");
+    CHECK(std::string(yuzu::server::attestation_refusal_token(AttestationRefusal::AlreadyDecided)) ==
+          "already_decided");
+    CHECK(std::string(yuzu::server::attestation_refusal_token(AttestationRefusal::None)).empty());
 }
 
 TEST_CASE("record_attestation rejects a decision outside {attested,flagged_revoke}",

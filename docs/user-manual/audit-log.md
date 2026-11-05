@@ -693,7 +693,13 @@ cannot be written the panel says so.
 different permission from the audit log: holding `AuditLog:Read` does not grant it. A caller who
 also holds `AccessReview:Attest` can open a review, attest or flag a grant (with an optional
 justification) and close a campaign; each is a call to the existing `/api/v1/access-reviews`
-routes. **Flag for revocation records evidence only; it never revokes the grant.** Closing is
+routes. **Flag for revocation records evidence only; it never revokes the grant.** A decision is
+final: a grant that already has one shows no buttons, and a reviewer cannot decide their own
+grant (or an engine principal they own), so the page shows the refusal and another reviewer must
+decide it. If another reviewer decided the grant first, the page reloads to show their decision.
+Separation of duties needs at least two people able to attest: with a single Administrator and
+RBAC off, that person's own grants stay pending and show as unreviewed when the campaign is
+closed (assign `Reviewer` to a second person). Closing is
 one-way and may leave grants undecided. `/access/audit?campaign=<id>` opens a campaign directly.
 Viewing writes the same rows as the REST reads: `access_review.list` for the list,
 `access_review.get` for a campaign and `access_review.exported` (`format=view`) for the current
