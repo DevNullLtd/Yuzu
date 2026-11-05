@@ -421,12 +421,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "  PRIMARY KEY (agent_id, facet));"},
         {11,
          // SAM-14: delta apply, the change ledger and the component store (ADR-0016 Update
-         // 2026-11-04). Four new EMPTY objects and one sequence, no existing table touched: online.
+         // 2026-11-04). Three new EMPTY tables, no existing table touched: online.
          // software_changes: one row per install | remove | upgrade an applied section produced.
          // A removal is a hard delete from installed_software plus a `remove` row here carrying
          // name/publisher/version: there are NO tombstones on installed_software. observed_at is
-         // the SERVER receipt time in seconds (the retention column), report_seq groups the rows of
-         // one apply call. install_id is the inserted row's id (0 for a remove). Indexes serve the
+         // the SERVER receipt time in seconds (the retention column) and, with agent_id, groups
+         // the rows of one apply call (calls are serialised per agent). install_id is the
+         // inserted row's id (0 for a remove). Indexes serve the
          // per-device history read ((agent_id, observed_at, change_id)) and the retention probe
          // ((observed_at)).
          // software_components: the current component set per device, hard-deleted when a
@@ -437,7 +438,6 @@ const std::vector<pg::PgMigration>& migrations() {
          // equality is byte-exact (long Windows paths, case-insensitive volumes) and the btree key
          // stays small; `path` rides beside it. row_hash is what a delta `-` names.
          // retention_meta: the durable anchor/dedup state of the clock-guarded ledger prune.
-         "CREATE SEQUENCE IF NOT EXISTS software_report_seq;"
          "CREATE TABLE IF NOT EXISTS software_changes ("
          "  change_id    BIGSERIAL PRIMARY KEY,"
          "  agent_id     TEXT   NOT NULL,"
@@ -450,8 +450,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "  install_id   BIGINT NOT NULL DEFAULT 0,"
          "  from_version TEXT   NOT NULL DEFAULT '',"
          "  to_version   TEXT   NOT NULL DEFAULT '',"
-         "  observed_at  BIGINT NOT NULL,"
-         "  report_seq   BIGINT NOT NULL);"
+         "  observed_at  BIGINT NOT NULL);"
          "CREATE INDEX IF NOT EXISTS software_changes_agent_idx "
          "ON software_changes (agent_id, observed_at, change_id);"
          "CREATE INDEX IF NOT EXISTS software_changes_observed_idx "
@@ -1239,7 +1238,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
          "bytes_read, updated_at"},
         {"software_changes",
          "change_id, agent_id, facet, kind, name, publisher, identity_key, instance_key, "
-         "install_id, from_version, to_version, observed_at, report_seq"},
+         "install_id, from_version, to_version, observed_at"},
         {"software_components",
          "agent_id, kind, path_hash, path, name, version, version_source, size, mtime, "
          "anchor_app, row_hash, first_seen, last_seen"},
@@ -1553,9 +1552,6 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                                                     PQgetvalue(hr.get(), r, 2)};
         }
 
-        // One report_seq per apply call, minted on the first ledger write.
-        std::optional<std::int64_t> report_seq;
-
         // facet_state for a section whose rows were applied (full or delta).
         const auto put_applied_state = [&](const V3Section& sec, const std::string& section_hash) {
             pg::PgResult up = pg::exec_params(
@@ -1585,14 +1581,6 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                                       const std::vector<SoftwareChange>& changes) {
             if (changes.empty())
                 return true;
-            if (!report_seq) {
-                pg::PgResult sq = pg::exec_params(
-                    c, "SELECT nextval('software_inventory_store.software_report_seq')",
-                    std::vector<std::string>{});
-                if (sq.status() != PGRES_TUPLES_OK || PQntuples(sq.get()) != 1)
-                    return false;
-                report_seq = std::strtoll(PQgetvalue(sq.get(), 0, 0), nullptr, 10);
-            }
             std::vector<std::string_view> cols[7];
             for (const auto& ch : changes) {
                 cols[0].emplace_back(software_change_kind_name(ch.kind));
@@ -1603,18 +1591,18 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 cols[5].emplace_back(ch.from_version);
                 cols[6].emplace_back(ch.to_version);
             }
-            std::vector<std::string> params{agent_id_s, facet, ts_s, std::to_string(*report_seq)};
+            std::vector<std::string> params{agent_id_s, facet, ts_s};
             for (const auto& col : cols)
                 params.push_back(pg::to_text_array(col));
             pg::PgResult ins = pg::exec_params(
                 c,
                 "INSERT INTO software_inventory_store.software_changes "
                 "(agent_id, facet, kind, name, publisher, identity_key, instance_key, install_id, "
-                " from_version, to_version, observed_at, report_seq) "
+                " from_version, to_version, observed_at) "
                 "SELECT $1, $2, t.kind, t.name, t.publisher, t.ik, t.ink, "
-                "       COALESCE(s.install_id, 0), t.fv, t.tv, $3::bigint, $4::bigint "
-                "FROM unnest($5::text[], $6::text[], $7::text[], $8::text[], $9::text[], "
-                "            $10::text[], $11::text[]) AS t(kind, name, publisher, ik, ink, fv, tv) "
+                "       COALESCE(s.install_id, 0), t.fv, t.tv, $3::bigint "
+                "FROM unnest($4::text[], $5::text[], $6::text[], $7::text[], $8::text[], "
+                "            $9::text[], $10::text[]) AS t(kind, name, publisher, ik, ink, fv, tv) "
                 "LEFT JOIN software_inventory_store.installed_software s "
                 "  ON s.agent_id = $1 AND s.instance_key = t.ink AND t.kind <> 'remove'",
                 params);

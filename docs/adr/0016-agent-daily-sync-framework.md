@@ -1043,8 +1043,8 @@ only; `find_by_purl` is a store method with no caller).
 ### 2026-11-04 — `installed_software` blob v3: delta apply, change ledger, component store, retention (schema v11)
 
 The server applies a verified delta section, records what every applied section changed, stores
-the component section, and prunes the ledger, so an agent can be delta-only. Schema v11 adds four
-empty objects and one sequence; nothing existing is rewritten.
+the component section, and prunes the ledger, so an agent can be delta-only. Schema v11 adds three
+empty tables; nothing existing is rewritten.
 
 **The `expect` field (a contract revision).** The `S` record has a seventh field after
 `bytes_read`: `expect`, the section hash the agent holds AFTER applying the section (64 lowercase
@@ -1077,9 +1077,9 @@ not verify is rolled back alone and the others of the call still apply.
   recomputed.
 
 **Change ledger (`software_changes`).** Every applied section writes one row per install, remove
-or upgrade, in the same transaction (one `unnest()` statement per section; one
-`nextval('software_report_seq')` per call groups the rows). `observed_at` is the server receipt
-time in seconds. `install_id` is the inserted row's id, 0 for a remove. The rows come from a pure
+or upgrade, in the same transaction (one `unnest()` statement per section). `observed_at` is the
+server receipt time in seconds and, with `agent_id`, groups the rows of one apply call: calls for
+an agent are serialised by its advisory lock. `install_id` is the inserted row's id, 0 for a remove. The rows come from a pure
 diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`; one removed row pairs
 with one added row of the same identity stem (`identity_key` with its version segment blanked), in
 sorted `instance_key` order. A pair whose versions differ is one `upgrade(from, to)`; a pair whose

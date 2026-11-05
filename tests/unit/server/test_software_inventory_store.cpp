@@ -5174,11 +5174,11 @@ V3Section v3_delta(const std::string& facet, const std::string& base,
     return s;
 }
 
-// Ledger rows of one agent, oldest first: kind, name, from, to, install_id, report_seq.
+// Ledger rows of one agent, oldest first: kind, name, from, to, install_id, observed_at.
 SqlTable ledger(PgPool& pool, const std::string& agent) {
     return sql_rows(pool,
                     "SELECT kind, name, from_version, to_version, install_id::text, "
-                    "report_seq::text FROM software_inventory_store.software_changes "
+                    "observed_at::text FROM software_inventory_store.software_changes "
                     "WHERE agent_id = $1 ORDER BY change_id",
                     {agent});
 }
@@ -5265,8 +5265,6 @@ TEST_CASE("v3: a first full section is a baseline: rows written, no ledger rows"
     CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.software_components")[0][0] ==
           "0");
     CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.retention_meta")[0][0] == "0");
-    CHECK(sql_rows(pool, "SELECT last_value::text FROM software_inventory_store.software_report_seq")
-              .size() == 1);
 }
 
 TEST_CASE("v3: a delta upgrade applies as -old +new, writes one upgrade row and verifies its hash",
@@ -5445,7 +5443,7 @@ TEST_CASE("v3: a full section on a held facet writes remove/install/upgrade rows
     CHECK(by_name["Beta"][2] == "1.0");
     CHECK(by_name["Gamma"][0] == "install");
     CHECK(by_name["Gamma"][3] == "1.0");
-    // One apply call = one report_seq.
+    // One apply call = one observed_at (with the agent, the group key of its rows).
     CHECK(by_name["Alpha"][5] == by_name["Beta"][5]);
     CHECK(by_name["Beta"][5] == by_name["Gamma"][5]);
 
@@ -5744,8 +5742,8 @@ TEST_CASE("run_retention_prune_changes: 400-day window under the clock guard, ca
     const std::string now_s = "(EXTRACT(EPOCH FROM now()))::bigint";
     const auto insert_at = [&](const std::string& agent, long days_ago) {
         REQUIRE(sql_ok(pool, "INSERT INTO software_inventory_store.software_changes "
-                             "(agent_id, facet, kind, name, observed_at, report_seq) "
-                             "VALUES ($1, 'f', 'install', 'n', " + now_s + " - $2::bigint * 86400, 1)",
+                             "(agent_id, facet, kind, name, observed_at) "
+                             "VALUES ($1, 'f', 'install', 'n', " + now_s + " - $2::bigint * 86400)",
                        {agent, std::to_string(days_ago)}));
     };
     const auto remaining = [&] { return std::stoll(sql_rows(pool, "SELECT count(*) FROM "
@@ -5769,9 +5767,9 @@ TEST_CASE("run_retention_prune_changes: 400-day window under the clock guard, ca
 
     // The cap: at most kChangesPruneCapPerPass rows go in one pass.
     REQUIRE(sql_ok(pool, "INSERT INTO software_inventory_store.software_changes "
-                         "(agent_id, facet, kind, name, observed_at, report_seq) "
+                         "(agent_id, facet, kind, name, observed_at) "
                          "SELECT 'bulk', 'f', 'install', 'n', " + now_s +
-                         " - 500 * 86400, 1 FROM generate_series(1, $1::int)",
+                         " - 500 * 86400 FROM generate_series(1, $1::int)",
                    {std::to_string(SoftwareInventoryStore::kChangesPruneCapPerPass + 7)}));
     CHECK(store.run_retention_prune_changes() == SoftwareInventoryStore::kChangesPruneCapPerPass);
     CHECK(remaining() == 2 + 7);
