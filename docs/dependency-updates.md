@@ -244,11 +244,10 @@ archives and images is a separate follow-up. Drogon's other bundled libraries we
 A future cpp-httplib bump should follow the BUMP CHECKLIST comment in
 `server/core/src/body_cap_httplib.hpp`.
 
-**Resolver use-after-free, closed on glibc only.** The cpp-httplib 0.59.0
+**Resolver fix in the glibc branch of cpp-httplib 0.59.0.** The 0.59.0
 header carries the fix for upstream issue 2431 (a use-after-free around
-`getaddrinfo_a` cancellation), in its glibc branch only; the 0.43.2 header
-already carries the same fix. No CVE id is cited: none appears in the vcpkg
-tree. The Windows `GetAddrInfoEx` and macOS `CFHost` resolver paths are unchanged by this bump.
+`getaddrinfo_a` cancellation); the 0.43.2 header already carries the same fix.
+No CVE id is cited: none appears in the vcpkg tree.
 
 **New behaviour.** On glibc builds a lookup against an unresponsive resolver now waits for the
 resolver itself (about 30 seconds with default resolver settings; cpp-httplib's header says the

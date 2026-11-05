@@ -22,6 +22,7 @@
 //   - no percent-decoding of the path (httplib routes on
 //     `decode_path_component`), so `%2E`-encoded paths behave differently;
 //   - no multipart and no chunked transfer-encoding;
+//   - no 256-byte path limit for regex routes (httplib 0.59 answers 404 for a longer path);
 //   - `extra_headers` is a map, so it cannot carry DUPLICATE headers (the classic
 //     `Origin:`-twice CSRF desync probe); `repeated_headers` can, and
 //     `Request::set_header` SILENTLY DROPS any value failing `is_field_value`

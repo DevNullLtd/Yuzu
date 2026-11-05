@@ -4443,7 +4443,8 @@ flag ≠ revoke.
 
 **Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
 `principal_id`, or `role_name` missing, or `decision` is neither `attested`
-nor `flagged_revoke`, or an identifier contains a NUL byte or is longer than 512 bytes, or the
+nor `flagged_revoke`, or an identifier contains a NUL byte or is longer than 512 bytes (a `campaign_id` in the URL path
+that makes the whole path longer than 256 bytes answers `404` with the connection closed instead), or the
 `justification` contains a NUL byte or is longer than 8192 bytes. `403` without `AccessReview:Attest` (or an engine-classed
 caller), or for a browser (session-cookie) request that carries no
 `Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
