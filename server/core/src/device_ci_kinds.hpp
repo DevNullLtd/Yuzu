@@ -80,7 +80,8 @@ struct DeviceCiSectionDef {
 };
 
 // The last column is row_floor: the width measured from a captured sample for cpu, dimm (once
-// manufacturer, part and serial are filled), disk and volume. partition and topology are ASSUMED
+// manufacturer, part and serial are filled), disk and volume. partition is measured on Windows
+// only (76 to 85 wire bytes, 2026-11-04) and ASSUMED for Linux and macOS; topology is ASSUMED
 // (no captures yet); swap has no capture either (its legs are planned only), so its floor is its
 // shortest possible row. Re-measure those three as their legs land.
 inline constexpr DeviceCiSectionDef kDeviceCiSections[] = {
