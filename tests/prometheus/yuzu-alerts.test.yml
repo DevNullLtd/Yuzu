@@ -5152,6 +5152,165 @@ tests:
           - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g1", job="yuzu-gateway", reason="identity_mismatch", severity="critical"}'
             value: 1
 
+  # CASE D3c -- the three CRL refusals (#6016 PR 4b) page the same way as the
+  # identity refusals when the gateway admitted nothing: crl_revoked (the CA's
+  # CRL lists the server's certificate), revocation_unknown (a CRL source but no
+  # usable CRL) and revocation_stale (past nextUpdate plus grace). Each is a
+  # total command outage for that gateway.
+  - interval: 1m
+    name: gateway mgmt identity outage - CRL reasons with no admissions page
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="crl_revoked"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g2",reason="revocation_unknown"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g3",reason="revocation_stale"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g2",method="identity"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g3",method="identity"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g1", job="yuzu-gateway", reason="crl_revoked", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g2", job="yuzu-gateway", reason="revocation_unknown", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g3", job="yuzu-gateway", reason="revocation_stale", severity="critical"}'
+            value: 1
+      # the warning rule fires for the same causes
+      - expr: 'count(ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing"})'
+        eval_time: 8m
+        exp_samples:
+          - labels: '{}'
+            value: 3
+
+  # CASE D3d -- a CRL refusal amid admissions (a stray stale replica among
+  # several that still admit) does not page.
+  - interval: 1m
+    name: gateway mgmt identity outage - CRL reason amid admissions does not page
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="crl_revoked"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE CRL1 -- YuzuGatewayMgmtCrlNotLoaded (#6016 PR 4b): a CRL source is
+  # configured (enforced = 1) and no CRL has verified (loaded = 0) for ten
+  # minutes pages: a server that needs a few minutes to come up is a cold start,
+  # not an outage, so the boundary is pinned on both sides (nothing at 9 m,
+  # firing at 11 m). A gateway with no source (enforced = 0) and one that has
+  # loaded a CRL never fire. When the CRL loads the alert clears.
+  - interval: 1m
+    name: gateway mgmt crl not loaded - enforced without a CRL pages after ten minutes, clears on load
+    input_series:
+      - series: 'yuzu_gw_mgmt_crl_enforced{job="yuzu-gateway",instance="g1"}'
+        values: "1x40"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g1"}'
+        values: "0x25 1x15"
+      - series: 'yuzu_gw_mgmt_crl_enforced{job="yuzu-gateway",instance="g2"}'
+        values: "1x40"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g2"}'
+        values: "1x40"
+      - series: 'yuzu_gw_mgmt_crl_enforced{job="yuzu-gateway",instance="g3"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g3"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlNotLoaded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlNotLoaded", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlNotLoaded", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtCrlNotLoaded", alertstate="firing", instance="g1", job="yuzu-gateway", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlNotLoaded", alertstate="firing"}'
+        eval_time: 27m
+        exp_samples: []
+
+  # CASE CRL2 -- YuzuGatewayMgmtCrlStale: the loaded CRL is past its nextUpdate
+  # (here 600 s) for five minutes warns. A CRL not yet stale, and a gateway with
+  # none loaded (nextUpdate 0), never fire this rule (the second is
+  # YuzuGatewayMgmtCrlNotLoaded's case).
+  - interval: 1m
+    name: gateway mgmt crl stale - past nextUpdate warns, others do not
+    input_series:
+      - series: 'yuzu_gw_mgmt_crl_next_update_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "600x30"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g1"}'
+        values: "1x30"
+      - series: 'yuzu_gw_mgmt_crl_next_update_timestamp_seconds{job="yuzu-gateway",instance="g2"}'
+        values: "100000x30"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g2"}'
+        values: "1x30"
+      - series: 'yuzu_gw_mgmt_crl_next_update_timestamp_seconds{job="yuzu-gateway",instance="g3"}'
+        values: "0x30"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g3"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlStale", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlStale", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtCrlStale", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE CRL3 -- YuzuGatewayMgmtCrlRefreshStalled (#6016 PR 4b): a CRL is held
+  # but the source has not been read successfully for 30 minutes (and the
+  # condition has held for 10): the watcher is wedged or every fetch fails
+  # behind a still-valid CRL. A watcher whose last success keeps advancing, and
+  # a gateway with no CRL loaded (that is NotLoaded's case), never fire.
+  - interval: 1m
+    name: gateway mgmt crl refresh stalled - last success older than 30 minutes warns
+    input_series:
+      - series: 'yuzu_gw_mgmt_crl_last_success_timestamp_seconds{job="yuzu-gateway",instance="g1"}'
+        values: "100x70"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g1"}'
+        values: "1x70"
+      - series: 'yuzu_gw_mgmt_crl_last_success_timestamp_seconds{job="yuzu-gateway",instance="g2"}'
+        values: "100+60x70"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g2"}'
+        values: "1x70"
+      - series: 'yuzu_gw_mgmt_crl_last_success_timestamp_seconds{job="yuzu-gateway",instance="g3"}'
+        values: "100x70"
+      - series: 'yuzu_gw_mgmt_crl_loaded{job="yuzu-gateway",instance="g3"}'
+        values: "0x70"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlRefreshStalled", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlRefreshStalled", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlRefreshStalled", alertstate="firing"}'
+        eval_time: 41m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtCrlRefreshStalled", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtCrlRefreshStalled", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
   # CASE D4 -- the same rejections while the gateway keeps ADMITTING (the server
   # works for most commands; a probe or the gateway's own leaf is refused): no
   # page. The warning rule still fires. Checked across the window.

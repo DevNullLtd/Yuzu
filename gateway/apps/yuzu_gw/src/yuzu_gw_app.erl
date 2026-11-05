@@ -32,7 +32,7 @@
          legacy_grpcbox_in_files/2, check_grpc_listeners/0,
          check_upstream_client_config/0,
          check_mgmt_listener_posture/0, check_memory_shedding/0,
-         check_mgmt_pin_refresh/0, check_mgmt_auth_config/0,
+         check_mgmt_pin_refresh/0, check_mgmt_auth_config/0, check_mgmt_crl_source/0,
          startup_guards/0]).                                               %% for testing
 -export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
 -export([apply_env_overrides/1]).                                          %% for testing
@@ -104,6 +104,7 @@ startup_guards() ->
      fun ?MODULE:check_upstream_tls_posture/0,
      fun ?MODULE:check_upstream_tls_files/0,
      fun ?MODULE:check_mgmt_auth_config/0,
+     fun ?MODULE:check_mgmt_crl_source/0,
      fun ?MODULE:check_mgmt_listener_posture/0,
      fun ?MODULE:check_mgmt_pin_refresh/0,
      fun ?MODULE:check_memory_shedding/0].
@@ -321,6 +322,7 @@ stop(_State) ->
     %% The management peer authorization published at boot describes the listeners
     %% that just went down; a later start resolves and publishes its own.
     ok = yuzu_gw_mgmt_identity:reset(),
+    ok = yuzu_gw_mgmt_crl_source:reset(),
     logger:info("Gateway shutdown complete"),
     ok.
 
@@ -1332,6 +1334,76 @@ check_mgmt_auth_config() ->
               "(identity_over_ca_bundle). See docs/user-manual/gateway.md.", [Defects]),
             {error, bad_mgmt_peer_auth}
     end.
+
+%% @doc Fail-closed guard (#6016 PR 4b): resolve the CA revocation list source
+%% (`mgmt_crl_source', `mgmt_crl_grace_s', `mgmt_crl_refresh_ms') and publish it for
+%% yuzu_gw_authz and yuzu_gw_mgmt_crl_source. A malformed source, an `http://' URL, a
+%% missing `cacertfile' override, a url source with no CA to trust and a value out of
+%% range each refuse the boot: none falls back silently. An ABSENT source is not
+%% refused: the gateway then checks no CRL, and in a mode that admits by identity says
+%% so, because a certificate the CA has revoked is otherwise still admitted for as long
+%% as it carries the identity. Runs after check_mgmt_auth_config/0, whose mode it reads.
+-spec check_mgmt_crl_source() -> ok | {error, bad_mgmt_crl_source}.
+check_mgmt_crl_source() ->
+    case yuzu_gw_mgmt_crl_source:resolve() of
+        {ok, none} ->
+            ok = yuzu_gw_mgmt_crl_source:publish_policy(none),
+            #{mode := Mode} = yuzu_gw_mgmt_identity:current(),
+            case guarded_mgmt_listener() andalso Mode =/= pin of
+                true ->
+                    logger:warning(
+                      "{yuzu_gw, mgmt_crl_source} is not set: this gateway does not read the "
+                      "install CA's revocation list, so a server certificate the CA has "
+                      "revoked is still admitted for as long as it carries the server "
+                      "identity. Set it, for example {url, \"https://<server>:8443/api/v1/ca/"
+                      "crl\"}; the shipped reference configuration does. A later release will "
+                      "refuse to start without it in mode ~p. See docs/user-manual/gateway.md.",
+                      [Mode]);
+                false ->
+                    ok
+            end,
+            ok;
+        {ok, #{source := Source, grace_s := Grace, refresh_ms := Refresh} = Policy} ->
+            ok = yuzu_gw_mgmt_crl_source:publish_policy(Policy),
+            #{mode := Mode} = yuzu_gw_mgmt_identity:current(),
+            case Mode of
+                pin ->
+                    logger:warning(
+                      "{yuzu_gw, mgmt_crl_source} is set while mgmt_peer_auth_mode is pin: "
+                      "the revocation check applies to the pinned server certificate too, so "
+                      "it must be issued by the CA that signs the CRL, or every management "
+                      "stream is refused (revocation_unknown). See docs/user-manual/gateway.md.");
+                _ ->
+                    ok
+            end,
+            logger:info("Management CRL source: ~s; grace ~bs; refresh ~bms",
+                        [describe_crl_source(Source), Grace, Refresh]),
+            ok;
+        {error, Defects} ->
+            logger:critical(
+              "Refusing to start: invalid management CRL configuration: ~p. "
+              "mgmt_crl_source must be {url, \"https://host[:port]/path\"}, "
+              "{url, Url, #{cacertfile => Path}} or {file, Path} (https only; no userinfo; "
+              "the cacertfile must exist, and a url source needs one, or a management "
+              "listener cacertfile to default to); mgmt_crl_grace_s an integer from 0 to "
+              "604800; mgmt_crl_refresh_ms an integer from 1000 to 3600000. See "
+              "docs/user-manual/gateway.md.", [Defects]),
+            {error, bad_mgmt_crl_source}
+    end.
+
+guarded_mgmt_listener() ->
+    lists:any(fun(S) -> maps:get(auth_fun, S, undefined) =/= undefined end,
+              mgmt_listener_entries()).
+
+%% What the boot line names: the host the CRL is fetched from and the CA that must have issued
+%% the certificate presented there (the operator-visible half of the deployment contract).
+describe_crl_source({file, Path}) ->
+    io_lib:format("file ~ts", [Path]);
+describe_crl_source({url, #{host := Host, port := Port, path := PathAndQuery, cacertfile := Ca}}) ->
+    %% The query string, if any, is not logged: it is as likely to carry a token as a path is not.
+    [Path | _] = string:split(PathAndQuery, "?"),
+    io_lib:format("url https://~ts:~b~ts, trusting ~ts to have issued the certificate presented "
+                  "there", [Host, Port, Path, Ca]).
 
 %% An explicit mgmt_peer_identity that is not the identity the management
 %% listener's own cacertfile derives is almost always a typo, a lower-case copy
