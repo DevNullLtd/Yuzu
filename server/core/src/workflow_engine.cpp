@@ -123,19 +123,24 @@ const std::vector<pg::PgMigration>& migrations() {
         // v3 (#2146, idempotent execute): a client key claimed on the run's own row. NULL on every
         // keyless run (the legacy route and any call that sent no key), so the partial UNIQUE index
         // holds only keyed rows and a keyless INSERT never touches it. The CHECK makes a key
-        // without its principal or fingerprint unstorable: a NULL principal never conflicts under
-        // a unique index, so such a row would silently stop being idempotent. Plain (transactional)
+        // without its principal or fingerprint unstorable (a NULL principal never conflicts under
+        // a unique index, so such a row would silently stop being idempotent) and an empty
+        // principal unstorable (it would be one shared key namespace). Plain (transactional)
         // index build on a table the fresh-database hard cutover guarantees is empty
         // (docs/postgres-store-playbook.md "Recorded exception"). No backfill: an existing run
-        // has no key.
+        // has no key. Every statement is re-run safe (a rewound version stamp, or an index built
+        // by hand ahead of the migration): the CHECK is dropped before it is added.
         {3,
          "ALTER TABLE workflow_executions "
-         "  ADD COLUMN principal           TEXT,"
-         "  ADD COLUMN idempotency_key     TEXT,"
-         "  ADD COLUMN request_fingerprint TEXT;"
+         "  ADD COLUMN IF NOT EXISTS principal           TEXT,"
+         "  ADD COLUMN IF NOT EXISTS idempotency_key     TEXT,"
+         "  ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;"
+         "ALTER TABLE workflow_executions DROP CONSTRAINT IF EXISTS wf_exec_idem_complete;"
          "ALTER TABLE workflow_executions ADD CONSTRAINT wf_exec_idem_complete CHECK ("
-         "  idempotency_key IS NULL OR (principal IS NOT NULL AND request_fingerprint IS NOT NULL));"
-         "CREATE UNIQUE INDEX idx_wf_exec_idem ON workflow_executions(principal, idempotency_key) "
+         "  idempotency_key IS NULL OR "
+         "  (principal IS NOT NULL AND principal <> '' AND request_fingerprint IS NOT NULL));"
+         "CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_exec_idem "
+         "  ON workflow_executions(principal, idempotency_key) "
          "  WHERE idempotency_key IS NOT NULL;"},
     };
     return kMigrations;

@@ -86,9 +86,9 @@ void roll_back(const std::string& dsn, const char* store, int to_version) {
                       " WHERE store = '" + store + "'");
 }
 
-// Roll workflow_engine back to v1. Its v3 adds columns, a CHECK and an index, and the migrations
-// are plain DDL, so undoing only the recorded version would make v3 fail on re-apply; take the v3
-// artifacts out the way test_workflow_engine.cpp's v2->v3 case does.
+// Roll workflow_engine back to v1. Its v3 adds columns, a CHECK and an index (re-run safe, but a
+// rolled-back store should look like the one an earlier build left); take the v3 artifacts out the
+// way test_workflow_engine.cpp's v2->v3 case does.
 void roll_back_workflow_engine_to_v1(const std::string& dsn) {
     exec_sql(dsn, "DROP INDEX workflow_engine.idx_wf_exec_idem");
     exec_sql(dsn, "ALTER TABLE workflow_engine.workflow_executions "

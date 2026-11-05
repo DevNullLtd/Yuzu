@@ -2665,6 +2665,9 @@ TEST_CASE("WorkflowEngine idempotency: a key with no principal or no fingerprint
     CHECK(insert("e5", "alice", "key-complete-01", "fp").status() == PGRES_COMMAND_OK);
     CHECK(insert("e6", "alice", "key-complete-01", "fp").status() == PGRES_FATAL_ERROR); // unique
     CHECK(insert("e7", "bob", "key-complete-01", "fp").status() == PGRES_COMMAND_OK);
+    // An empty principal would be one shared key namespace: unstorable on a keyed row.
+    CHECK(insert("e8", "", "key-empty-principal", "fp").status() == PGRES_FATAL_ERROR);
+    CHECK(insert("e9", "", nullptr, nullptr).status() == PGRES_COMMAND_OK); // keyless: no claim
 }
 
 TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK and the partial unique "
@@ -2678,40 +2681,91 @@ TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK 
         REQUIRE(fresh.is_open());
     }
     const auto query_count = [&](const std::string& sql) { return count_rows(db.dsn(), sql); };
+    // columns, CHECK, CHECK that rejects an empty principal, partial unique index, recorded version
     const auto v3_artifacts = [&] {
-        return std::array<std::int64_t, 4>{
+        return std::array<std::int64_t, 5>{
             query_count("SELECT count(*) FROM information_schema.columns WHERE table_schema = "
                         "'workflow_engine' AND table_name = 'workflow_executions' AND column_name IN "
                         "('principal', 'idempotency_key', 'request_fingerprint')"),
             query_count("SELECT count(*) FROM pg_constraint WHERE conname = 'wf_exec_idem_complete'"),
+            query_count("SELECT count(*) FROM pg_constraint WHERE conname = 'wf_exec_idem_complete' "
+                        "AND pg_get_constraintdef(oid) LIKE '%principal <> ''''::text%'"),
             // a UNIQUE index with a predicate (partial) on (principal, idempotency_key)
             query_count("SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
                         "WHERE c.relname = 'idx_wf_exec_idem' AND i.indisunique AND i.indpred IS NOT NULL"),
             query_count("SELECT version FROM public.schema_meta WHERE store = 'workflow_engine'")};
     };
-    CHECK(v3_artifacts() == std::array<std::int64_t, 4>{3, 1, 1, 3});
-
-    // Put the store back at v2 exactly as an earlier build left it, then open it again.
-    {
+    using Shape = std::array<std::int64_t, 5>;
+    constexpr Shape kV3{3, 1, 1, 1, 3};
+    const auto run_ddl = [&](std::initializer_list<const char*> statements) {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        for (const char* ddl :
-             {"DROP INDEX workflow_engine.idx_wf_exec_idem",
-              "ALTER TABLE workflow_engine.workflow_executions DROP CONSTRAINT wf_exec_idem_complete",
-              "ALTER TABLE workflow_engine.workflow_executions DROP COLUMN principal, "
-              "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint",
-              "UPDATE public.schema_meta SET version = 2 WHERE store = 'workflow_engine'"}) {
+        for (const char* ddl : statements) {
+            INFO(ddl);
             PgResult r{PQexec(conn.get(), ddl)};
             REQUIRE(r.ok());
         }
+    };
+    constexpr const char* kRewind = "UPDATE public.schema_meta SET version = 2 "
+                                    "WHERE store = 'workflow_engine'";
+    constexpr const char* kDropIndex = "DROP INDEX workflow_engine.idx_wf_exec_idem";
+    constexpr const char* kDropCheck =
+        "ALTER TABLE workflow_engine.workflow_executions DROP CONSTRAINT wf_exec_idem_complete";
+    // The shape an earlier draft of v3 would have left: the CHECK without the principal clause.
+    constexpr const char* kAddOldCheck =
+        "ALTER TABLE workflow_engine.workflow_executions ADD CONSTRAINT wf_exec_idem_complete CHECK ("
+        "idempotency_key IS NULL OR (principal IS NOT NULL AND request_fingerprint IS NOT NULL))";
+    CHECK(v3_artifacts() == kV3);
+
+    // Put the store back at v2 exactly as an earlier build left it, then open it again.
+    run_ddl({kDropIndex, kDropCheck,
+             "ALTER TABLE workflow_engine.workflow_executions DROP COLUMN principal, "
+             "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint",
+             kRewind});
+    CHECK(v3_artifacts() == Shape{0, 0, 0, 0, 2});
+    {
+        WorkflowEngine upgraded{pool};
+        REQUIRE(upgraded.is_open());
+        CHECK(v3_artifacts() == kV3);
+        // And the upgraded store claims keys.
+        const auto wf_id = *upgraded.create_workflow(kOneStepYaml);
+        CHECK(execute_keyed(upgraded, wf_id, claim_of("alice", "key-after-upgrade")).result.has_value());
     }
-    CHECK(v3_artifacts() == std::array<std::int64_t, 4>{0, 0, 0, 2});
-    WorkflowEngine upgraded{pool};
-    REQUIRE(upgraded.is_open());
-    CHECK(v3_artifacts() == std::array<std::int64_t, 4>{3, 1, 1, 3});
-    // And the upgraded store claims keys.
-    const auto wf_id = *upgraded.create_workflow(kOneStepYaml);
-    CHECK(execute_keyed(upgraded, wf_id, claim_of("alice", "key-after-upgrade")).result.has_value());
+
+    // v3 applied a third time over a complete v3 (a rewound version stamp) is a no-op.
+    run_ddl({kRewind});
+    CHECK(v3_artifacts() == Shape{3, 1, 1, 1, 2});
+    {
+        WorkflowEngine again{pool};
+        REQUIRE(again.is_open());
+    }
+    CHECK(v3_artifacts() == kV3);
+
+    // Re-run over a partially applied v3: each state ends in the same shape.
+    {
+        // columns only (no CHECK, no index)
+        run_ddl({kDropIndex, kDropCheck, kRewind});
+        CHECK(v3_artifacts() == Shape{3, 0, 0, 0, 2});
+        WorkflowEngine a{pool};
+        REQUIRE(a.is_open());
+        CHECK(v3_artifacts() == kV3);
+    }
+    {
+        // columns and the index, no CHECK (the index built by hand ahead of the migration)
+        run_ddl({kDropCheck, kRewind});
+        CHECK(v3_artifacts() == Shape{3, 0, 0, 1, 2});
+        WorkflowEngine b{pool};
+        REQUIRE(b.is_open());
+        CHECK(v3_artifacts() == kV3);
+    }
+    {
+        // columns, index and the CHECK without the empty-principal clause: replaced, not kept
+        run_ddl({kDropCheck, kAddOldCheck, kRewind});
+        CHECK(v3_artifacts() == Shape{3, 1, 0, 1, 2});
+        WorkflowEngine c{pool};
+        REQUIRE(c.is_open());
+        CHECK(v3_artifacts() == kV3);
+    }
 }
 
 TEST_CASE("WorkflowEngine idempotency: a run killed after the claim leaves a `running` row that the "
