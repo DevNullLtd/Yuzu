@@ -22,9 +22,6 @@ namespace {
 // Must match the server seam's caps (inventory_ingestion.cpp) so the server's
 // parse does not truncate/drop differently from what this source hashed.
 constexpr std::size_t kMaxEntries = 20000;
-// Origin-label prefix of a publisher the source does not declare (`via:<ecosystem>`). MUST equal
-// the server's kOriginLabelPrefix (product_normalize.hpp), which treats it as "no vendor".
-constexpr std::string_view kOriginLabelPrefix = "via:";
 constexpr std::size_t kMaxFieldLen = 1024;
 // Total canonical-blob ceiling — MUST equal the server seam's kMaxBlobBytes
 // (inventory_ingestion.cpp); the two are comment-coordinated. Deliberately set
@@ -630,7 +627,7 @@ std::vector<std::pair<std::string_view, std::string_view>> installed_software_ac
 
 void vendor_or_origin(SwEntry& e) {
     if (e.publisher.empty())
-        e.publisher = std::string(kOriginLabelPrefix) + e.ecosystem;
+        e.publisher = std::string(kOriginLabelPrefix) + (e.ecosystem.empty() ? "unknown" : e.ecosystem);
 }
 
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {

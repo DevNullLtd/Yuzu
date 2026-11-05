@@ -3655,6 +3655,10 @@ TEST_CASE("vendor_or_origin: a declared vendor stays, an empty one becomes via:<
     vendor_or_origin(declared);
     CHECK(declared.publisher == "Acme");
 
+    // The prefix is the wire form the server recognises (product_normalize.hpp kOriginLabelPrefix,
+    // pinned to the same literal in test_product_normalize.cpp).
+    CHECK(yuzu::agent::kOriginLabelPrefix == "via:");
+
     for (const char* eco : {"deb", "pacman", "apk", "rpm", "windows", "macos", "macos_pkgutil",
                             "brew", "snap", "flatpak", "optional_feature", "msi", "python"}) {
         INFO(eco);
@@ -3663,6 +3667,11 @@ TEST_CASE("vendor_or_origin: a declared vendor stays, an empty one becomes via:<
         vendor_or_origin(e);
         CHECK(e.publisher == std::string("via:") + eco);
     }
+
+    // An empty ecosystem is labelled `via:unknown`, never the bare `via:`.
+    SwEntry no_eco;
+    vendor_or_origin(no_eco);
+    CHECK(no_eco.publisher == "via:unknown");
 
     // The fallback lives in the collector, not in the blob builder: a fixture entry with an empty
     // publisher still hashes with an empty slot 3, which is what keeps the cross-pins above fixed.

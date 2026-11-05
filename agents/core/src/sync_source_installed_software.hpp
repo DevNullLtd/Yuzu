@@ -194,8 +194,14 @@ YUZU_EXPORT AdaptedRows parse_middleware_output(const std::string& out, std::str
 /// for the descriptor pin test (tests/unit/test_inventory_sync_action_table.cpp).
 YUZU_EXPORT std::vector<std::pair<std::string_view, std::string_view>> installed_software_actions();
 
+/// Origin-label prefix of a publisher the source does not declare (`via:<ecosystem>`). MUST equal
+/// the server's kOriginLabelPrefix (product_normalize.hpp), which treats it as "no vendor"; the
+/// test_inventory_sync and test_product_normalize cases pin both to "via:".
+inline constexpr std::string_view kOriginLabelPrefix = "via:";
+
 /// The collector's single fallback site: an entry with no declared publisher gets the origin
-/// label `via:<ecosystem>`. A declared vendor is left alone. The server's normalize_vendor treats
+/// label `via:<ecosystem>` (`via:unknown` when the entry's ecosystem is empty, never the bare
+/// `via:`). A declared vendor is left alone. The server's normalize_vendor treats
 /// a raw `via:` prefix (case-sensitive, exact) as "no vendor". Applied after every adapter, not
 /// inside installed_software_canonical_blob, so fixture-built blobs hash unchanged.
 YUZU_EXPORT void vendor_or_origin(SwEntry& e);
