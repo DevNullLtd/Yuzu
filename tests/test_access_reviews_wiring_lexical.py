@@ -273,9 +273,7 @@ class SettingsErrorMessage(unittest.TestCase):
         self.assertTrue(settings_error_problems(
             text.replace("var e = data && data.error;", "var e = data && data.error; var m = data.error || 1;")))
         # Reading the campaign id from the unwrapped body is caught.
-        self.assertTrue(settings_error_problems(text.replace("data && data.data", "data")
-                                                .replace("var d = data;", "var d = data;")
-                                                .replace("data.data", "data.x")))
+        self.assertTrue(settings_error_problems(text.replace("data && data.data", "data")))
         self.assertTrue(settings_error_problems(text.replace("var e = data && data.error;",
                                                              "var e = data.error || data.message;")
                                                 .replace("e.message", "x")))

@@ -2428,6 +2428,7 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
         CHECK(row.decision_seq == 0);
         CHECK(row.history.empty());
         CHECK(audit_rows(h, "access_review.attested").empty());
+        CHECK(h.audit_log.empty()); // no domain row and no mcp.* wrapper row
 
         auto with_null = sod_args(cid, "user", "bob", "Operator");
         with_null["justification"] = nullptr;
@@ -2437,6 +2438,16 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
         REQUIRE_FALSE(okbody.is_discarded());
         CHECK_FALSE(okbody.contains("error"));
         CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+
+        // A numeric string is a string: accepted and kept as the note.
+        auto numeric = sod_args(cid, "user", "bob", "Operator");
+        numeric["justification"] = "123";
+        auto second = h.mcp_call_tool("record_attestation", numeric);
+        REQUIRE(second);
+        CHECK_FALSE(nlohmann::json::parse(second->body, nullptr, false).contains("error"));
+        const auto row2 = grant_row(h, cid, "user", "bob", "Operator");
+        REQUIRE(row2.history.size() == 2);
+        CHECK(row2.history.back().justification == "123");
     }
 }
 
@@ -2475,6 +2486,8 @@ TEST_CASE("open campaign: a title over 256 bytes is refused with 400 / invalid p
             h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", two_byte_over}}.dump());
         REQUIRE(wide_over);
         CHECK(wide_over->status == 400);
+        CHECK(wide_over->body.find(msg) != std::string::npos);
+        CHECK(h.audit_log.empty());
         auto wide_fit =
             h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", two_byte_fit}}.dump());
         REQUIRE(wide_fit);
@@ -2491,15 +2504,21 @@ TEST_CASE("open campaign: a title over 256 bytes is refused with 400 / invalid p
         CHECK(err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
         CHECK(err.value("message", std::string{}) == msg);
         CHECK(audit_rows(h, "access_review.campaign_opened").empty());
+        CHECK(h.audit_log.empty()); // no domain row and no mcp.* wrapper row
 
         auto nul = h.mcp_call_tool("open_access_review", {{"title", with_nul}});
         const auto nul_err = mcp_error_of(nul);
         CHECK(nul_err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
         CHECK(nul_err.value("message", std::string{}) == nul_msg);
         CHECK(audit_rows(h, "access_review.campaign_opened").empty());
+        CHECK(h.audit_log.empty());
 
         auto wide_over = h.mcp_call_tool("open_access_review", {{"title", two_byte_over}});
-        CHECK(mcp_error_of(wide_over).value("code", 0) == yuzu::server::mcp::kInvalidParams);
+        const auto wide_err = mcp_error_of(wide_over);
+        CHECK(wide_err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
+        CHECK(wide_err.value("message", std::string{}) ==
+              msg); // the handler's text, not the store's
+        CHECK(h.audit_log.empty());
         auto wide_fit = h.mcp_call_tool("open_access_review", {{"title", two_byte_fit}});
         REQUIRE(wide_fit);
         CHECK_FALSE(nlohmann::json::parse(wide_fit->body, nullptr, false).contains("error"));
@@ -3806,13 +3825,19 @@ TEST_CASE("attestation limits: the MCP input schema and description and the Open
     CHECK(found);
 
     // The campaign title cap is spelled in the open tool's schema and the open route's OpenAPI.
+    // Read through json pointers: a missing key is a failed check, never an abort.
+    const auto at = [](const nlohmann::json& j, const char* pointer) {
+        const nlohmann::json::json_pointer p{pointer};
+        return j.contains(p) ? j.at(p) : nlohmann::json{};
+    };
     const std::string title_max = std::to_string(yuzu::server::kCampaignTitleMaxLen);
     bool found_open = false;
-    for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
-        if (t["name"] != "open_access_review")
+    const auto tools_json = nlohmann::json::parse(tools->body);
+    for (const auto& t : at(tools_json, "/result/tools")) {
+        if (t.value("name", std::string{}) != "open_access_review")
             continue;
         found_open = true;
-        CHECK(t["inputSchema"]["properties"]["title"]["maxLength"] ==
+        CHECK(at(t, "/inputSchema/properties/title/maxLength") ==
               yuzu::server::kCampaignTitleMaxLen);
     }
     CHECK(found_open);
@@ -3820,11 +3845,11 @@ TEST_CASE("attestation limits: the MCP input schema and description and the Open
           std::string::npos);
 
     const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
-    const auto& open_post = spec["paths"]["/access-reviews"]["post"];
-    CHECK(open_post["requestBody"]["content"]["application/json"]["schema"]["properties"]["title"]
-                   ["maxLength"] == yuzu::server::kCampaignTitleMaxLen);
-    CHECK(open_post["responses"]["400"]["description"].get<std::string>().find(title_max) !=
-          std::string::npos);
+    CHECK(at(spec, "/paths/~1access-reviews/post/requestBody/content/application~1json/schema/"
+                   "properties/title/maxLength") == yuzu::server::kCampaignTitleMaxLen);
+    const auto open_400 = at(spec, "/paths/~1access-reviews/post/responses/400/description");
+    CHECK(open_400.is_string());
+    CHECK(open_400.get<std::string>().find(title_max) != std::string::npos);
     const auto& post = spec["paths"]["/access-reviews/{id}/attestations"]["post"];
     const auto& body = post["requestBody"]["content"]["application/json"]["schema"]["properties"];
     CHECK(body["principal_id"]["maxLength"] == yuzu::server::kPrincipalIdMaxLen);
