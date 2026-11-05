@@ -25,7 +25,13 @@
 %%%   mgmt_crl_grace_s     0..604800, default 86400: how long past nextUpdate a loaded CRL is still
 %%%                        believed (yuzu_gw_mgmt_crl:check/4).
 %%%   mgmt_crl_refresh_ms  1000..3600000, default 5000. Separate from mgmt_pin_refresh_ms: a url
-%%%                        source is a request to another host, not a stat of a local file.
+%%%                        source is a request to another host, not a stat of a local file. Each
+%%%                        wait is jittered DOWN by up to 10% (never up: the withdrawal latency
+%%%                        bound of ADR 2004 A6(a) is this interval).
+%%%   mgmt_crl_max_validity_s  3600..31536000, default UNSET (no bound): the widest `nextUpdate -
+%%%                        thisUpdate' a CRL may carry; wider is refused `validity_too_long'. Never
+%%%                        measured against the gateway's clock. The shipped reference configs set
+%%%                        691200 (8 days: above the 7 days an older server publishes).
 %%%
 %%% Every defect in these is a boot defect (yuzu_gw_app:check_mgmt_crl_source/0): a malformed value,
 %%% an `http://' URL, userinfo in the URL, a missing `cacertfile' override, a url source with no
@@ -53,6 +59,19 @@
 %%% bound (yuzu_gw_mgmt_crl:max_bytes/0) and aborted mid-stream past it. An `ETag' the server sends
 %%% is returned as `If-None-Match' on the next attempt, and a 304 is "unchanged". A parse is skipped
 %%% when neither the CRL's bytes nor the verification certificates changed.
+%%%
+%%% Rejected bytes. A rejection whose cause is the bytes (and the verification certificates) alone
+%%% (`malformed', `unsupported', `too_large', `unverified', `issuer_mismatch', `validity_too_long')
+%%% is remembered by the key (hash of the bytes, hash of the certificates, the `max_validity_s' in
+%%% force) until one of them changes, so the same bad file is not decoded and verified again on every
+%%% tick. The memory lasts memo_ttl_s() (one hour): then the same bytes are parsed, counted and logged
+%%% again, which bounds a refusal pinned by a transient fault and reminds of a persistent one. `future_dated' (it clears when
+%%% the clock catches up), `replay' (it depends on the CRL held and on its staleness: remembering it
+%%% would turn the bounded blind window of ADR 2004 A8 into a `revocation_stale' outage) and every
+%%% fetch failure are never remembered. A remembered refusal is REPORTED exactly like a fresh one
+%%% (the gauges say the latest attempt obtained nothing good, so `last_success' does not advance and
+%%% the alerts keyed on it still fire); the only difference is that the rejection COUNTER moves once
+%%% per distinct rejection rather than once per tick.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_mgmt_crl_source).
@@ -60,8 +79,9 @@
 
 -export([start_link/0]).
 -export([policy/0, publish_policy/1, current/0, reset/0, grace_s/0]).
--export([resolve/0, resolve/4, refresh_ms/0, reject_reasons/0]).
+-export([resolve/0, resolve/4, resolve/5, refresh_ms/0, reject_reasons/0]).
 -export([load/4, fetch/3, parse_url/1, tls_options/3, tls_options_ders/3, replace_rule/4]).
+-export([jittered_ms/2, max_jitter_fraction/0, memoisable/1, size_warn_interval_s/0, memo_ttl_s/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([policy/0, source/0, tick_state/0]).
@@ -77,6 +97,21 @@
 -define(TICK_FETCH_MS, 3000).
 -define(BOOT_FETCH_MS, 5000).
 -define(CA_READ_MS, 2000).
+%% The widest nextUpdate - thisUpdate an operator may set as the bound: from one hour (below that
+%% no CA publishes and the setting is a typo) to a year.
+-define(MIN_MAX_VALIDITY_S, 3600).
+-define(MAX_MAX_VALIDITY_S, 31536000).
+%% The refresh wait is shortened by a random fraction of up to this much, never lengthened.
+-define(JITTER_FRACTION, 0.1).
+%% The near-the-size-bound warning is logged at most once per this many seconds.
+-define(SIZE_WARN_INTERVAL_S, 3600).
+%% A remembered refusal is honoured for this many seconds, then the same bytes are parsed, counted
+%% and logged again: it bounds a refusal pinned by a transient fault and reminds of a persistent one.
+-define(MEMO_TTL_S, 3600).
+%% What a remembered rejection can be: refusals decided by the bytes and the verification
+%% certificates ALONE (see the module doc).
+-define(MEMOISABLE, [malformed, unsupported, too_large, unverified, issuer_mismatch,
+                     validity_too_long]).
 
 -type source() :: {url, #{host := string(), port := 1..65535, path := string(),
                           cacertfile := string()}}
@@ -84,12 +119,23 @@
 -type policy() :: #{source := source(),
                     grace_s := 0..604800,
                     refresh_ms := 1000..3600000,
+                    %% absent: no bound
+                    max_validity_s => 3600..31536000,
                     verify_cacertfiles := [string()]}.
+%% `rejected': the key, reason and time (seconds since the epoch) of the last memoisable rejection,
+%% since the last accepted CRL. The key is the hash of the bytes, the hash of the verification
+%% certificates and the `max_validity_s' in force; it is honoured for `memo_ttl_s()' seconds.
+%% `size_warned_at': seconds since the epoch of the last near-the-bound warning.
+%% Both optional so a state built before they existed still works.
 -type tick_state() :: #{crl := yuzu_gw_mgmt_crl:crl() | none,
                         crl_hash := binary() | undefined,
                         ca_hash := binary() | undefined,
                         etag := binary() | undefined,
-                        last_reject := atom() | undefined}.
+                        last_reject := atom() | undefined,
+                        rejected => none | {binary(), binary(), pos_integer() | undefined, atom(), integer()},
+                        size_warned_at => integer() | undefined,
+                        %% the bound of the load in progress, for the log line of a refusal
+                        max_validity_s => pos_integer() | undefined}.
 
 %%--------------------------------------------------------------------
 %% Published state (persistent_term reads; no process call)
@@ -133,8 +179,34 @@ grace_s() ->
 %% (yuzu_gw_mgmt_crl) or not obtained (the fetch).
 -spec reject_reasons() -> [atom()].
 reject_reasons() ->
-    [malformed, too_large, unverified, issuer_mismatch, future_dated, replay,
+    [malformed, unsupported, too_large, unverified, issuer_mismatch, validity_too_long,
+     future_dated, replay,
      fetch_timeout, fetch_connect, fetch_tls, fetch_status, fetch_error, file_unreadable].
+
+%% @doc The reasons a rejection is remembered for (by bytes and verification certificates).
+-spec memoisable(atom()) -> boolean().
+memoisable(Reason) ->
+    lists:member(Reason, ?MEMOISABLE).
+
+%% @doc The largest share of the refresh interval a wait is shortened by.
+-spec max_jitter_fraction() -> float().
+max_jitter_fraction() -> ?JITTER_FRACTION.
+
+%% @doc The wait before the next refresh: the interval shortened by `R' (a number in [0, 1)) times
+%% the largest jitter share, so always in (0.9 * Interval, Interval]. DOWN only: a longer wait would
+%% stretch ADR 2004 A6(a)'s "up to mgmt_crl_refresh_ms after the server publishes". `R' is a
+%% parameter so the bounds are test-pinned without randomness.
+-spec jittered_ms(pos_integer(), float()) -> pos_integer().
+jittered_ms(Interval, R) when is_integer(Interval), Interval > 0, is_number(R), R >= 0, R < 1 ->
+    max(1, Interval - trunc(Interval * ?JITTER_FRACTION * R)).
+
+%% @doc Seconds a remembered refusal is honoured before the same bytes are parsed again.
+-spec memo_ttl_s() -> pos_integer().
+memo_ttl_s() -> ?MEMO_TTL_S.
+
+%% @doc Seconds between two near-the-size-bound warnings.
+-spec size_warn_interval_s() -> pos_integer().
+size_warn_interval_s() -> ?SIZE_WARN_INTERVAL_S.
 
 %%--------------------------------------------------------------------
 %% Configuration
@@ -146,30 +218,42 @@ resolve() ->
     resolve(application:get_env(yuzu_gw, mgmt_crl_source, undefined),
             application:get_env(yuzu_gw, mgmt_crl_grace_s, undefined),
             application:get_env(yuzu_gw, mgmt_crl_refresh_ms, undefined),
-            application:get_env(yuzu_gw, grpc_listeners, [])).
+            application:get_env(yuzu_gw, grpc_listeners, []),
+            application:get_env(yuzu_gw, mgmt_crl_max_validity_s, undefined)).
 
 %% @doc Pure core (the file-existence check of a `cacertfile' override aside) -- exported for
 %% testing. Every defect is returned together so one boot attempt names them all.
 -spec resolve(term(), term(), term(), term()) -> {ok, policy() | none} | {error, [term()]}.
-resolve(undefined, Grace, Refresh, _Listeners) ->
-    %% No source: the other two keys are then meaningless, and a malformed one is still a typo.
-    case [E || {error, E} <- [grace(Grace), refresh(Refresh)]] of
+resolve(Source, Grace, Refresh, Listeners) ->
+    resolve(Source, Grace, Refresh, Listeners, undefined).
+
+%% @doc resolve/4 with `mgmt_crl_max_validity_s'.
+-spec resolve(term(), term(), term(), term(), term()) -> {ok, policy() | none} | {error, [term()]}.
+resolve(undefined, Grace, Refresh, _Listeners, MaxValidity) ->
+    %% No source: the other keys are then meaningless, and a malformed one is still a typo.
+    case [E || {error, E} <- [grace(Grace), refresh(Refresh), max_validity(MaxValidity)]] of
         [] -> {ok, none};
         Errors -> {error, Errors}
     end;
-resolve(Source0, Grace0, Refresh0, Listeners) ->
+resolve(Source0, Grace0, Refresh0, Listeners, MaxValidity0) ->
     VerifyFiles = mgmt_cacertfiles(Listeners),
     Source = source(Source0, VerifyFiles),
     Grace = grace(Grace0),
     Refresh = refresh(Refresh0),
+    MaxValidity = max_validity(MaxValidity0),
     case lists:flatmap(fun({error, E}) when is_list(E) -> E; ({error, E}) -> [E]; (_) -> [] end,
-                       [Source, Grace, Refresh]) of
+                       [Source, Grace, Refresh, MaxValidity]) of
         [] ->
             {ok, S} = Source,
             {ok, G} = Grace,
             {ok, R} = Refresh,
-            {ok, #{source => S, grace_s => G, refresh_ms => R,
-                   verify_cacertfiles => VerifyFiles}};
+            {ok, M} = MaxValidity,
+            Policy = #{source => S, grace_s => G, refresh_ms => R,
+                       verify_cacertfiles => VerifyFiles},
+            {ok, case M of
+                     undefined -> Policy;
+                     _ -> Policy#{max_validity_s => M}
+                 end};
         Errors ->
             {error, Errors}
     end.
@@ -177,6 +261,13 @@ resolve(Source0, Grace0, Refresh0, Listeners) ->
 grace(undefined) -> {ok, ?DEFAULT_GRACE_S};
 grace(G) when is_integer(G), G >= 0, G =< ?MAX_GRACE_S -> {ok, G};
 grace(G) -> {error, {bad_mgmt_crl_grace_s, G, {expected_integer_seconds_between, 0, ?MAX_GRACE_S}}}.
+
+%% Unset is no bound (the code default; the shipped reference configs set one).
+max_validity(undefined) -> {ok, undefined};
+max_validity(V) when is_integer(V), V >= ?MIN_MAX_VALIDITY_S, V =< ?MAX_MAX_VALIDITY_S -> {ok, V};
+max_validity(V) ->
+    {error, {bad_mgmt_crl_max_validity_s, V,
+             {expected_integer_seconds_between, ?MIN_MAX_VALIDITY_S, ?MAX_MAX_VALIDITY_S}}}.
 
 refresh(undefined) -> {ok, ?DEFAULT_REFRESH_MS};
 refresh(R) when is_integer(R), R >= ?MIN_REFRESH_MS, R =< ?MAX_REFRESH_MS -> {ok, R};
@@ -346,13 +437,13 @@ handle_info(_Msg, State) ->
     {noreply, State}.
 
 schedule(Interval) ->
-    erlang:send_after(Interval, self(), refresh),
+    erlang:send_after(jittered_ms(Interval, rand:uniform()), self(), refresh),
     ok.
 
 -spec new_state() -> tick_state().
 new_state() ->
     #{crl => none, crl_hash => undefined, ca_hash => undefined, etag => undefined,
-      last_reject => undefined}.
+      last_reject => undefined, rejected => none, size_warned_at => undefined}.
 
 -spec seeded_state() -> tick_state().
 seeded_state() ->
@@ -394,11 +485,12 @@ failure_kind(_) -> other.
                                            {ok, binary(), binary() | undefined}
                                          | not_modified
                                          | {error, atom()}), integer()) -> tick_state().
-load(#{verify_cacertfiles := Files} = Policy, State, Fetch, Now) ->
+load(#{verify_cacertfiles := Files} = Policy, State0, Fetch, Now) ->
+    State = State0#{max_validity_s => maps:get(max_validity_s, Policy, undefined)},
     case Fetch(Policy, State) of
         {ok, Bin, Etag} ->
             case verification_set(Files) of
-                {ok, CaDers} -> applied(Bin, CaDers, Etag, State, Now, maps:get(grace_s, Policy));
+                {ok, CaDers} -> applied(Bin, CaDers, Etag, State, Now, Policy);
                 {error, Reason} -> rejected(Reason, State)
             end;
         not_modified ->
@@ -408,8 +500,10 @@ load(#{verify_cacertfiles := Files} = Policy, State, Fetch, Now) ->
             rejected(Reason, State)
     end.
 
-applied(Bin, CaDers, Etag, #{crl := Loaded, crl_hash := OldHash, ca_hash := OldCaHash} = State,
-        Now, Grace) ->
+applied(Bin, CaDers, Etag, State0, Now, Policy) ->
+    #{crl := Loaded, crl_hash := OldHash, ca_hash := OldCaHash} = State =
+        warn_size(Bin, State0, Now),
+    Grace = maps:get(grace_s, Policy),
     Hash = crypto:hash(sha256, Bin),
     CaHash = crypto:hash(sha256, CaDers),
     case Loaded =/= none andalso Hash =:= OldHash andalso CaHash =:= OldCaHash of
@@ -418,15 +512,79 @@ applied(Bin, CaDers, Etag, #{crl := Loaded, crl_hash := OldHash, ca_hash := OldC
             report_state(Loaded, true),
             State#{etag := Etag, last_reject := undefined};
         false ->
-            case yuzu_gw_mgmt_crl:parse(Bin, CaDers, Now) of
-                {ok, New} ->
-                    install(New, Hash, CaHash, Etag, State, Now, Grace);
-                {error, Reason} ->
-                    rejected(Reason, State)
+            MaxValidity = maps:get(max_validity_s, Policy, undefined),
+            case memo_state(maps:get(rejected, State, none), Hash, CaHash, MaxValidity, Now) of
+                {hit, Reason} ->
+                    %% Bytes already refused under these certificates and this bound, for a reason
+                    %% only they decide: not parsed or verified again, and not counted again, but
+                    %% reported exactly as a refusal is (the gauges, the log on a change of
+                    %% reason). The ETag is NOT advanced, as on any refusal, so the next request is
+                    %% not a 304 that would read as success.
+                    rejected_again(Reason, State);
+                Other ->
+                    %% `expired': the memory is an hour old, so the refusal is decided, counted and
+                    %% logged again (last_reject is cleared so the log line is not suppressed).
+                    State1 = case Other of
+                                 expired -> State#{rejected => none, last_reject := undefined};
+                                 none    -> State
+                             end,
+                    Opts = case Policy of
+                               #{max_validity_s := Max} -> #{max_validity_s => Max};
+                               _ -> #{}
+                           end,
+                    Parsed = yuzu_gw_mgmt_crl:parse(Bin, CaDers, Now, Opts),
+                    %% The parse of a CRL near the bound leaves hundreds of MiB of garbage on this
+                    %% long-lived process's heap; collect it now rather than at some later GC.
+                    _ = erlang:garbage_collect(),
+                    case Parsed of
+                        {ok, New} ->
+                            install(New, Hash, CaHash, Etag, State1, Now, Grace);
+                        {error, Reason} ->
+                            remember(Reason, {Hash, CaHash, MaxValidity, Now},
+                                     rejected(Reason, State1))
+                    end
             end
     end.
 
-install(New, Hash, CaHash, Etag, #{crl := Loaded} = State, Now, Grace) ->
+%% Is there a live memory of exactly these bytes, certificates and bound? `expired' once it is
+%% `memo_ttl_s()' old, or when the clock has been stepped back past it (it cannot be trusted to age).
+memo_state({Hash, CaHash, MaxValidity, Reason, At}, Hash, CaHash, MaxValidity, Now) ->
+    case Now < At orelse Now - At >= ?MEMO_TTL_S of
+        true  -> expired;
+        false -> {hit, Reason}
+    end;
+memo_state(_Other, _Hash, _CaHash, _MaxValidity, _Now) ->
+    none.
+
+%% Remember a refusal only when the bytes, the certificates and the bound alone decided it.
+remember(Reason, {Hash, CaHash, MaxValidity, Now}, State) ->
+    case memoisable(Reason) of
+        true  -> State#{rejected => {Hash, CaHash, MaxValidity, Reason, Now}};
+        false -> State
+    end.
+
+%% Near the size bound: a CRL only grows (revoked rows are append-only), and past the bound every
+%% fetch is `too_large'. Said when the body has passed three quarters of it, at most once an hour.
+warn_size(Bin, State, Now) ->
+    Size = byte_size(Bin),
+    Last = maps:get(size_warned_at, State, undefined),
+    case Size > yuzu_gw_mgmt_crl:warn_bytes()
+         andalso (Last =:= undefined orelse Now < Last orelse Now - Last >= ?SIZE_WARN_INTERVAL_S) of
+        true ->
+            Max = yuzu_gw_mgmt_crl:max_bytes(),
+            logger:warning(
+              "mgmt_crl_source: the CA's CRL is ~b bytes, ~.1f% of the ~b byte bound; past it "
+              "every fetch is refused (too_large) and the CRL held stops being refreshed. The "
+              "CRL only grows: plan the gateway upgrade (docs/user-manual/gateway.md, Limits)",
+              [Size, Size * 100 / Max, Max]),
+            State#{size_warned_at => Now};
+        false ->
+            State
+    end.
+
+install(New, Hash, CaHash, Etag, #{crl := Loaded} = State0, Now, Grace) ->
+    %% An accepted (or identical) CRL ends the memory of a refusal.
+    State = State0#{rejected => none},
     case replace_rule(Loaded, New, Now, Grace) of
         {replace, Crl} ->
             ok = persistent_term:put(?CRL, #{crl => Crl, loaded_at => Now}),
@@ -454,7 +612,10 @@ install(New, Hash, CaHash, Etag, #{crl := Loaded} = State, Now, Grace) ->
                        maps:get(number, Loaded), maps:get(this_update, Loaded),
                        maps:get(next_update, Loaded)])
             end,
-            rejected(replay, State)
+            %% Never remembered: the verdict depends on the CRL held and on how stale it is, so it
+            %% is decided again every tick (A8's bounded blind window is not an outage). It is not
+            %% an acceptance either, so the memory of an EARLIER refusal (State0) stands.
+            rejected(replay, State0)
     end.
 
 %% The replace rule of yuzu_gw_mgmt_crl:replace/2, plus one more refusal: a CRL that is already
@@ -473,21 +634,35 @@ stale(#{next_update := Next}, Now, Grace) -> Now > Next + Grace.
 
 %% Count a refusal by reason; log it when the reason CHANGES (a bad file is one line, not one per
 %% tick). The loaded CRL, if any, is untouched.
-rejected(Reason, #{crl := Loaded, last_reject := Last} = State) ->
+rejected(Reason, State) ->
     telemetry:execute([yuzu, gw, mgmt_crl, rejected], #{count => 1}, #{reason => Reason}),
+    rejected_again(Reason, State).
+
+%% A refusal of bytes already counted: everything of rejected/2 except the count. The state it
+%% reports is the same as a fresh refusal's (the latest attempt obtained nothing good), which is
+%% what the alerts read.
+rejected_again(Reason, #{crl := Loaded, last_reject := Last} = State) ->
     case Reason =:= Last of
         true -> ok;
         false ->
-            logger:warning("mgmt_crl_source: the CRL was not loaded (~p); ~s",
+            logger:warning("mgmt_crl_source: the CRL was not loaded (~p); ~s~s",
                            [Reason, case Loaded of
                                         none -> "no CRL is loaded, so every management stream is "
                                                 "refused (revocation_unknown) until one is";
                                         _ -> "the CRL loaded earlier stays in force until "
                                              "nextUpdate plus the grace"
-                                    end])
+                                    end, hint(Reason, maps:get(max_validity_s, State, undefined))])
     end,
     report_state(Loaded, false),
     State#{last_reject := Reason}.
+
+%% What the operator can do about a refusal whose cause is a setting of theirs, appended to the log line.
+hint(validity_too_long, Bound) ->
+    io_lib:format(". A CRL wider than the configured mgmt_crl_max_validity_s (~s) was refused: "
+                  "raise the key or leave it unset (docs/user-manual/gateway.md)",
+                  [case Bound of undefined -> "unset"; _ -> integer_to_list(Bound) ++ " s" end]);
+hint(_Reason, _Bound) ->
+    "".
 
 %% The certificates the CRL may be verified against: every certificate of every management
 %% listener's cacertfile, read now (a re-rooted CA is picked up without a restart).

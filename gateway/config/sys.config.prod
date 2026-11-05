@@ -201,7 +201,18 @@
         %% in `identity' or `identity_or_pin' mode without a source). Read at boot: a change applies
         %% only when the gateway is restarted, which disconnects the node's agents
         %% (see docs/user-manual/gateway.md "Withdrawing a server certificate").
+        %% mgmt_crl_max_validity_s (unset in code: no bound; 3600..31536000) refuses a validly
+        %% signed CRL whose nextUpdate is more than that many seconds after its thisUpdate
+        %% (`validity_too_long'): without it a CRL with a far-future nextUpdate keeps being
+        %% believed and keeps the staleness alerts quiet. The width is read from the CRL's own two
+        %% dates, never from this host's clock. 691200 (8 days) must stay above 7 days plus 300 s,
+        %% the validity a server that predates #6919 publishes, or a gateway upgraded before its
+        %% server refuses every CRL mid-rollout. The Yuzu server publishes 48 hours.
+        %% The example below is commented out because this file ships no mgmt_crl_source (a key with no
+        %% source is inert); deploy/docker/reference-gateway-sys.config sets both, so a deployment that
+        %% enables the source here should set this key with it.
         %% Example: {mgmt_crl_source, {url, "https://yuzu-server.example.com:8443/api/v1/ca/crl"}},
+        %% Example: {mgmt_crl_max_validity_s, 691200},
 
         %% HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b),
         %% distinct from `cluster_id` above: this is what to RESOLVE to find
