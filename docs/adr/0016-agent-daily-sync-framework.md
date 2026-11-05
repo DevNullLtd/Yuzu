@@ -80,7 +80,10 @@ A small, source-agnostic seam:
 - **Startup policy:** first-run or overdue (gone past one interval while
   offline) → one catch-up sync after a *short random startup delay* (so a
   mass-deploy or a site's Monday-morning power-on does not herd); otherwise wait
-  for the next phase fire.
+  for the next phase fire. *(Amended by the Update of 2026-11-04 below: "overdue"
+  means a `next_fire` more than 15 minutes late, not a full interval, and the
+  catch-up is spread over 30 minutes; the 10 minute startup delay stays for a first
+  run.)*
 
 > **Update (2026-10-04, #5327):** a source whose collect yields nothing records
 > `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
@@ -1049,5 +1052,74 @@ all its v2 rows first, so it should carry `full` for every facet it holds.
 **Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
 writer; any read surface returning the new columns (the existing reads select the old columns
 only; `find_by_purl` is a store method with no caller).
+
+### 2026-11-04 — sync-now parameters, the installed-software window, and overdue catch-up
+
+This amends the trigger text of section 3 and the `__sync__.now` reserved-command contract. No
+proto field is added: both new inputs are entries in the command's existing string `parameters`
+map, and the wire, the KV keys and the heartbeat tags are unchanged.
+
+- **`__sync__.now` parameters.** `source` accepts `all`, one name, or a comma-separated list. The
+  list is all-or-nothing: any unknown name fails the command (exit 2, naming the valid set) and
+  arms nothing. `delay_max_s` is an integer from 0 to 86400; absent or 0 is the immediate path.
+  When it is above 0 the agent still forces a full report, but fires it at a stable per-agent
+  offset in `[0, delay_max_s)` from the request instead of at once; a source already armed to
+  fire sooner keeps the sooner time, so a repeated request never delays it. A malformed or
+  out-of-range value fails the command (exit 2); a present but empty value is malformed. The
+  existing `stagger_seconds` field stays ignored for `__sync__`. The server sends neither
+  `delay_max_s` nor a source list yet, so an operator's sync-now is immediate today.
+- **The sender's audit row.** The change that adds the server-side sender records `delay_max_s`
+  and the target source list in the dispatch's audit row. The sender and the agent are the same
+  build, so it needs no version or capability gate.
+- **Installed-software window.** `installed_software` is scheduled inside a nightly window of
+  01:00 to 05:00 in the machine's local time, at a stable per-agent moment
+  (`fnv1a(agent:window:source)` over the window length, to the second); a source without a window
+  fires at a phase offset of its interval. The skip backoff of #5327 is capped at that moment rather than at
+  the next phase slot. It governs the regular daily sync only: the first sync after enrolment,
+  skip-ladder and `need_full` retries, catch-up and an operator's sync-now can fall outside it.
+  The window is a compile-time default carried by the source; there is no channel to change it
+  per fleet yet, and a settings push is deferred. "Local" is the machine's own clock and time
+  zone: an agent with no zone configured (a container, a VDI image, a service with `TZ` unset)
+  runs on UTC and gets 01:00 to 05:00 UTC, which can be working hours where its users are. A
+  local time that does not exist (a spring-forward gap) resolves forward, an ambiguous one
+  (fall-back) resolves to whichever instant the C library chooses. A machine that is off or
+  asleep through its window syncs at its next wake (see catch-up) and then returns to the next
+  window. A source's full resend floor (7 days) is checked at its fire time, so across a
+  spring-forward change the seventh day's fire is an hour short of it and the full send lands on
+  the eighth: the floor is 7 to 8 days. Sources without a window keep the interval and phase-slot cadence.
+- **Capacity.** A window concentrates the day's reports. A fleet in one time zone reports
+  within four hours rather than across twenty-four: about 70 `ReportInventory` calls a second per
+  million agents at the peak, against about 12 for the uniform spread (six times), and zones
+  overlap less than a uniform spread would. Hash-skip is unchanged, so most of those calls carry
+  a hash only; the blob goes out for a changed source, at the 7 to 8 day floor and for an
+  operator-forced sync. The handler takes a per-agent lock and no fleet-wide one, and nothing
+  rate-limits it; these figures are arithmetic from the window length, not measurements, and
+  pool sizing against them has not been measured.
+- **Catch-up.** A persisted `next_fire` more than `kMaxTickSeconds` (15 minutes) in the past,
+  which a live agent never has, or more than two days ahead (a clock stepped back, a restored
+  VM, a corrupt value: no interval plus window reaches two days), is re-armed to now plus a
+  stable offset in `[0, 30 min)`. It is checked on every batch pass, so it covers both a restart
+  and a tick that runs long after the previous one (sleep and resume). It changes the schedule
+  only: `last_hash` and `force_full` are untouched, so a catch-up sync is hash-only unless the
+  source changed. An overdue source is spread rather than fired at once, which is the startup policy section 3
+  describes. First-run jitter (10 minutes) is unchanged. After a mass reboot or
+  a server outage every overdue agent reports within 30 minutes: about 550 calls a second per
+  million agents (eight times the in-window peak). The 30 minute spread is a constant and does
+  not scale with the fleet.
+- **Forced syncs and outages.** An operator-forced sync is outside catch-up only while its pass
+  is current. If the forced pass finds nothing to send or its send fails, `next_fire` stays at
+  the request time and the batch pass retries every 30 seconds, but only for 15
+  minutes; catch-up then re-arms it to a stable offset in `[0, 30 min)` and the 30 second retries
+  resume from there, with `force_full` kept so the sync is still full. The same applies to any
+  source whose send keeps failing: during a long outage an agent retries in 15 minute bursts
+  separated by a pause of up to 30 minutes.
+  A server that comes back is reached within about 30 seconds if the agent is mid-burst and
+  otherwise within 30 minutes; a sync-now that failed on first send can arrive up to about
+  45 minutes after it was requested (15 minutes to notice, up to 30 of spread).
+- **Staleness.** A windowed source's consecutive daily syncs are 24 hours apart, 23 or 25 across
+  a clock change, because the moment is fixed in local time; a machine that missed its window
+  reports at its next wake. With the 45 minutes above, both stay inside the 48 hour "two missed
+  daily cycles" staleness threshold of `docs/user-manual/inventory.md`, and the freshness gauge
+  keys on server receipt time, so no freshness expectation is weakened.
 
 > **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
