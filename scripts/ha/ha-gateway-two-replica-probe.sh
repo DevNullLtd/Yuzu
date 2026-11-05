@@ -26,7 +26,7 @@
 # joins the node's network namespace (no host root needed) and are classified by a packet capture
 # taken IN the victim gateway's namespace.
 #
-# Platform: Linux with Docker only (bash 5, GNU date, flock-free, network namespaces, cpusets).
+# Platform: Linux with Docker only (bash 5, GNU date, network namespaces, cpusets).
 # Credentials are per-rig, random and throwaway; they appear in this host's process list while the rig
 # runs, which is acceptable for a local measurement rig and for nothing shared or long-lived.
 # State (secrets, enrolment token, raw results) lives under $TWOREP_STATE_ROOT
@@ -309,7 +309,7 @@ settle_fleet() {
     done
     local s; s=$(date +%s)
     until [ "$(connected_count)" = "$n" ]; do
-        [ $(( $(date +%s) - s )) -ge 300 ] && { fail "settle: only $(connected_count)/$n registered after 300s"; break; }
+        [ $(( $(date +%s) - s )) -ge 300 ] && { fail "settle: only $(connected_count)/$n registered after 300s"; return 1; }
         sleep 2
     done
     sleep 20
@@ -319,8 +319,11 @@ settle_fleet() {
 }
 
 RUN_ACTIVE=""
+RUN_FINISHED=0
 scenario_cleanup() {
     [ -n "$RUN_ACTIVE" ] && sampler_stop "$RUN_ACTIVE"
+    # an interrupted run is marked, so that no later export summarises it as if it had completed
+    [ -n "$RUN_ACTIVE" ] && [ "$RUN_FINISHED" -ne 1 ] && [ ! -e "$RUN_ACTIVE/INVALID" ] && echo "interrupted before the run completed" > "$RUN_ACTIVE/INVALID"
     docker rm -f "spike-2r-cap-$$" >/dev/null 2>&1
     # never leave a fault behind
     [ -n "${STATE:-}" ] && flush_faults >/dev/null 2>&1
@@ -341,11 +344,18 @@ cmd_scenario() {
         --recovery) recovery="$2"; shift 2;; --victim) victim_c="$2"; shift 2;;
         *) die "scenario: unknown arg $1";; esac; done
     case "$id" in NOFAULT|F3-2r) ;; *) die "usage: scenario NOFAULT|F3-2r [--victim gateway-N] [--sample K] [--window S] [--recovery S]";; esac
+    for v in "$window" "$sample" "$recovery"; do
+        case "$v" in ''|*[!0-9]*) die "scenario: --window, --sample and --recovery must be non-negative integers (got '$v')";; esac
+    done
+    [ "$window" -ge 60 ] && [ "$sample" -ge 1 ] || die "scenario: --window must be at least 60 and --sample at least 1"
+    if [ -n "$victim_c" ]; then
+        case " ${GATEWAYS[*]} " in *" $victim_c "*) ;; *) die "scenario: --victim must be one of: ${GATEWAYS[*]}";; esac
+    fi
     trap 'scenario_cleanup' EXIT
     trap 'scenario_cleanup; exit 130' INT TERM
     load_state; need_rest
     login "$URL1" "$STATE/cookies1" && login "$URL2" "$STATE/cookies2" || die "login failed"
-    settle_fleet
+    settle_fleet || die "settle failed: the fleet is not fully registered, so the run would not start from the shape it states; refusing to measure"
     login "$URL1" "$STATE/cookies1" && login "$URL2" "$STATE/cookies2" || die "login failed after settle"
 
     local run="$STATE/run-$id-$(date +%H%M%S)"; mkdir -p "$run"; RUN_ACTIVE="$run"
@@ -371,7 +381,7 @@ cmd_scenario() {
     # the sample: agents attached to the victim (agent_id and hostname, one per line)
     python3 -I "$CLIENT" sample --run "$run" --victim-node "$victim_node" --k "$sample" --stale 2
     [ -s "$run/sample.txt" ] || { fail "no agents are attached to $victim_node"; return 1; }
-    echo "id=$id victim=$vc victim_node=$victim_node total=$total window=$window sample=$(wc -l < "$run/sample.txt") tag=$SPIKE_TAG script_sha=$(git -C "$REPO_ROOT" hash-object "${BASH_SOURCE[0]}" 2>/dev/null | cut -c1-12) load=$(cut -d' ' -f1-3 /proc/loadavg) upstream=$(upstream_sessions)" > "$run/meta.txt"
+    echo "id=$id victim=$vc victim_node=$victim_node total=$total window=$window sample=$(wc -l < "$run/sample.txt") tag=$SPIKE_TAG script_sha=$(git -C "$REPO_ROOT" hash-object "${BASH_SOURCE[0]}" 2>/dev/null | cut -c1-12) client_sha=$(git -C "$REPO_ROOT" hash-object "$CLIENT" 2>/dev/null | cut -c1-12) overlay_sha=$(git -C "$REPO_ROOT" hash-object "$COMPOSE_OVERLAY" 2>/dev/null | cut -c1-12) load=$(cut -d' ' -f1-3 /proc/loadavg) upstream=$(upstream_sessions)" > "$run/meta.txt"
 
     sampler_start "$run"
     # capture IN the victim gateway's namespace on the upstream VIP port: an agent sees nothing of this fault
@@ -422,10 +432,21 @@ cmd_scenario() {
     docker logs --since "$since" "$(cname server)"   > "$run/serverlog-1.txt" 2>&1
     docker logs --since "$since" "$(cname server-2)" > "$run/serverlog-2.txt" 2>&1
     python3 -I "$CLIENT" analyse --run "$run"
+    RUN_FINISHED=1
+}
+
+# One command at a time per rig: a second scenario, a `down` or a `scale` against a rig that is mid-run would
+# invalidate it without a trace. The lock is held on fd 9 for the life of the command; the sampler and the other
+# background children close it (`exec 9>&-`) so an orphan can never block the next command.
+take_lock() {
+    mkdir -p "$STATE_ROOT" && chmod 700 "$STATE_ROOT"
+    exec 9>"$STATE_ROOT/.rig.lock" || die "cannot open $STATE_ROOT/.rig.lock"
+    flock -n 9 || die "another command already holds the rig lock ($STATE_ROOT/.rig.lock)"
 }
 
 main() {
     local sub="${1:-}"; shift || true
+    case "$sub" in up|scenario|scale|restore|down|holders) take_lock;; esac
     case "$sub" in
         up) cmd_up "$@";;
         scenario) cmd_scenario "$@";;
@@ -434,7 +455,7 @@ main() {
         holders) load_state; need_rest; login "$URL1" "$STATE/cookies1"; login "$URL2" "$STATE/cookies2"; mkdir -p "$STATE/holders-$$"; holders "$STATE/holders-$$"; cat "$STATE/holders-$$/holders.csv";;
         restore) cmd_restore;;
         down) cmd_down;;
-        *) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 2;;
+        *) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2;;
     esac
     [ "$FAILS" -eq 0 ] || { echo "$FAILS failure(s)" >&2; exit 1; }
 }

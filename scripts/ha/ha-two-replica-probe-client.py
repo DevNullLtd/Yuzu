@@ -11,14 +11,15 @@ Subcommands (all take --run RUNDIR, where the runner keeps the raw data):
   probe      one probe round: every sampled agent through BOTH replicas, both REST surfaces, plus one
              scope-arm probe per replica; scored against a polled deadline
   recovered  exit 0 when the latest probe round delivered every id-arm probe on both replicas
-  resolve    re-read the response store for every send of the run (a server-synthesised terminal can
-             arrive up to the 300 s SendCommand deadline after the send)
+  resolve    re-read the response store for every send that was "accepted, no result" at its deadline (a
+             server-synthesised terminal can arrive up to the 300 s SendCommand deadline after the send)
   analyse    classify and tabulate: probes.csv, summary.md
   export     (--state DIR --out DIR) summarise every run under a state dir for the committed record
 
 Outcome classes of ONE probe (the first match wins):
   probe_invalid      HTTP 400 "could not be parsed": the probe itself was malformed; never counted as a dispatch result
-  refused            the dispatch REFUSED it: HTTP >= 400, or 202/200 with agents_reached == 0. The body
+  rig_error          anything else that is not a 2xx (no connection, 401, 403, 429, 500...): never a dispatch result
+  refused            the dispatch REFUSED it: HTTP 503, or 202/200 with agents_reached == 0. The body
                      is kept, because the refusals differ: "no agent connected" (before the arm walk)
                      versus a not-sent (`no_agents_reached`); neither writes a response row.
   server_synthesised a response row whose error text carries a `[gateway_...]` prefix (built by the
@@ -32,6 +33,7 @@ Outcome classes of ONE probe (the first match wins):
 import argparse
 import csv
 import glob
+import hashlib
 import http.cookiejar
 import json
 import os
@@ -62,6 +64,52 @@ def _tls_context():
 
 CTX = _tls_context() if os.environ.get("TWOREP_CA") else None
 STATUS = {0: "RUNNING", 1: "SUCCESS", 2: "FAILURE", 3: "TIMEOUT", 4: "REJECTED"}  # agent.proto CommandResponse.Status
+
+
+def load_rows(path):
+    """Read a JSON-lines file, skipping (and counting) a line that does not parse: an interrupted writer must
+    not take the whole analysis down, and the count is printed so a loss is never silent."""
+    rows, bad = [], 0
+    if os.path.exists(path):
+        for line in open(path, errors="replace"):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                bad += 1
+    if bad:
+        print("WARNING: %d unparseable line(s) skipped in %s" % (bad, path), file=sys.stderr)
+    return rows
+
+
+def write_atomic(path, text):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def classify_cohorts(rows):
+    """Tag every row with `cohort_eff`: its sampled cohort, except that an agent of the clean cohort whose
+    CONTROL did not deliver through both replicas on both surfaces (id arm) is `inconclusive` for the whole
+    run, never a pass and never a refusal; a row with no cohort tag is `unknown`, never `clean`. Returns the
+    sorted list of inconclusive agent ids."""
+    bad = set()
+    for r in rows:
+        if r.get("label") == "control" and r.get("arm") == "ids" and r.get("cohort") == "clean" \
+                and r.get("final_outcome", r.get("outcome")) != "delivered":
+            bad.add(r["agent_id"])
+    for r in rows:
+        c = r.get("cohort") or "unknown"
+        r["cohort_eff"] = "inconclusive" if (c == "clean" and r["agent_id"] in bad) else c
+    return sorted(bad)
+
+
+def median(values):
+    v = sorted(values)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
 
 
 def now_ms():
@@ -144,6 +192,9 @@ def cmd_holders(a):
                             host[aid] = rec["hostname"]
         listed[n] = ids
         print("replica %d GET /api/agents -> http %d, %d agents listed" % (n, st, len(ids)))
+        if st != 200 or not ids:
+            sys.exit("holders: replica %d's agent listing failed (http %d, %d ids): refusing to attribute holders "
+                     "from an empty set, which would count every agent as clean" % (n, st, len(ids)))
     log = {1: open(a.log1, errors="replace").read(), 2: open(a.log2, errors="replace").read()}
     rows = []
     for line in open(a.routes):
@@ -203,7 +254,7 @@ def read_sample(run, path):
     out = []
     for l in read_lines(path):
         f = (l.split(",") + ["", ""])[:3]
-        out.append((f[0], f[1] or "clean", f[2]))
+        out.append((f[0], f[1] or "unknown", f[2]))
     return out
 
 
@@ -252,11 +303,14 @@ def responses_for(sess, cmd):
 def score(rec, rows):
     """Outcome class of one probe from what dispatch said and what the response store holds."""
     if rec["http"] == 0:
-        return "refused", "client-error"
+        return "rig_error", "client-error"
     if rec["http"] == 400 and "could not be parsed" in rec.get("body", ""):
         return "probe_invalid", "scope expression rejected (a caller error in the probe, not a dispatch result)"
-    if rec["http"] >= 400:
-        return "refused", "http %d" % rec["http"]
+    if rec["http"] == 503:
+        return "refused", "http 503"
+    if rec["http"] >= 300:
+        # 401/403/429/500/...: the rig or the session is wrong, not a dispatch decision. Never scored as a refusal.
+        return "rig_error", "http %d" % rec["http"]
     reached = rec["agents_reached"]
     if reached == 0 and reached != "":
         return "refused", "agents_reached=0"
@@ -340,7 +394,7 @@ def cmd_probe(a):
 
 def latest_round(run):
     p = os.path.join(run, "probes.jsonl")
-    rows = [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+    rows = load_rows(p)
     if not rows:
         return []
     lab = rows[-1]["label"]
@@ -348,7 +402,7 @@ def latest_round(run):
 
 
 def cmd_recovered(a):
-    rows = [r for r in latest_round(a.run) if r["arm"] == "ids" and r.get("cohort", "clean") == "clean"]
+    rows = [r for r in latest_round(a.run) if r["arm"] == "ids" and r.get("cohort") == "clean"]
     sys.exit(0 if rows and all(r["outcome"] == "delivered" for r in rows) else 1)
 
 
@@ -356,7 +410,7 @@ def cmd_recovered(a):
 def cmd_resolve(a):
     sess = {1: Session(a.url1, a.cookies1), 2: Session(a.url2, a.cookies2)}
     p = os.path.join(a.run, "probes.jsonl")
-    rows = [json.loads(l) for l in open(p)]
+    rows = load_rows(p)
     changed = 0
     for r in rows:
         if r["outcome"] != "accepted_no_result" or not r["command_id"]:
@@ -366,9 +420,7 @@ def cmd_resolve(a):
         if cls != "accepted_no_result":
             r["final_outcome"], r["why"] = cls, why + " (late)"
             changed += 1
-    with open(p, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
+    write_atomic(p, "".join(json.dumps(r) + "\n" for r in rows))
     print("resolve: %d accepted-no-result probes became terminal after the deadline" % changed)
 
 
@@ -429,12 +481,13 @@ def route_timeline(run, agents):
 
 def cmd_analyse(a):
     p = os.path.join(a.run, "probes.jsonl")
-    rows = [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+    rows = load_rows(p)
+    inconclusive = classify_cohorts(rows)
     for r in rows:
         r["in_agent_log"] = agent_logs_with(a.run, r["command_id"]) if r["command_id"] else 0
-        r.setdefault("cohort", "clean"); r.setdefault("role", "unknown"); r.setdefault("reason", "")
+        r.setdefault("role", "unknown"); r.setdefault("reason", "")
     with open(os.path.join(a.run, "probes.csv"), "w", newline="") as f:
-        cols = ["label", "rel_s", "replica", "role", "cohort", "surface", "arm", "agent_id", "http", "command_id",
+        cols = ["label", "rel_s", "replica", "role", "cohort", "cohort_eff", "surface", "arm", "agent_id", "http", "command_id",
                 "agents_reached", "outcome", "final_outcome", "reason", "why", "in_agent_log", "body"]
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
         w.writeheader()
@@ -449,17 +502,20 @@ def cmd_analyse(a):
     if os.path.exists(inv):
         lines += ["**INVALID RUN: %s**" % open(inv).read().strip(), ""]
     # control validity per clean agent: delivered through BOTH replicas, id arm, before the fault
-    ctl = [r for r in rows if r["label"] == "control" and r["arm"] == "ids"]
-    bad = sorted({r["agent_id"][:8] + "/r%d" % r["replica"] for r in ctl if r["cohort"] == "clean" and r["final_outcome"] != "delivered"})
     lines += ["control (clean cohort, id arm, both replicas, both surfaces): %s" % (
-        "ALL DELIVERED" if not bad else "FAILED for %s: those agents are INCONCLUSIVE, not a pass" % ", ".join(bad)), ""]
-    for cohort in ("clean", "stale_other"):
-        sub = [r for r in rows if r["cohort"] == cohort]
+        "ALL DELIVERED" if not inconclusive else
+        "FAILED for %d agent(s) (%s): they are INCONCLUSIVE for the whole run (own table below), never a pass and never a refusal" % (
+            len(inconclusive), ", ".join(x[:8] for x in inconclusive))), ""]
+    if any(r["cohort_eff"] == "unknown" for r in rows):
+        lines += ["**%d probe rows carry no cohort tag (an early run): reported as cohort `unknown`, never as clean.**" % sum(
+            1 for r in rows if r["cohort_eff"] == "unknown"), ""]
+    for cohort in ("clean", "stale_other", "inconclusive", "unknown"):
+        sub = [r for r in rows if r["cohort_eff"] == cohort]
         if not sub:
             continue
         lines += ["## cohort: %s" % cohort, "",
-                  "| round | probed replica | role | arm | delivered | refused | server-synth | no result | timeout | invalid | total | refusal reasons |",
-                  "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+                  "| round | probed replica | role | arm | delivered | refused | server-synth | no result | timeout | invalid | rig error | total | refusal reasons |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for lab in labels:
             for rep in (1, 2):
                 for arm in ("ids", "scope"):
@@ -472,17 +528,17 @@ def cmd_analyse(a):
                         if r["final_outcome"] == "refused":
                             k = r["reason"] or ("legacy bare 503" if r["surface"] == "legacy" else "http %s" % r["http"])
                             reasons[k] = reasons.get(k, 0) + 1
-                    lines.append("| %s | %d | %s | %s | %d | %d | %d | %d | %d | %d | %d | %s |" % (
+                    lines.append("| %s | %d | %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %s |" % (
                         lab, rep, sel[0]["role"], arm, c("delivered"), c("refused"), c("server_synthesised"),
-                        c("accepted_no_result"), c("timeout"), c("probe_invalid"), len(sel),
+                        c("accepted_no_result"), c("timeout"), c("probe_invalid"), c("rig_error"), len(sel),
                         ", ".join("%s x%d" % kv for kv in sorted(reasons.items())) or "-"))
         lines.append("")
-    agents = {r["agent_id"] for r in rows if r["cohort"] == "clean"}
+    agents = {r["agent_id"] for r in rows if r["cohort_eff"] == "clean"}
     tl = route_timeline(a.run, agents)
     if tl:
         def stat(d):
             v = sorted(d.values())
-            return "n=%d min=%.0f s median=%.0f s max=%.0f s" % (len(v), v[0], v[len(v) // 2], v[-1]) if v else "none observed"
+            return "n=%d min=%.0f s median=%.1f s max=%.0f s" % (len(v), v[0], median(v), v[-1]) if v else "none observed"
         lines += ["## route directory timeline (clean cohort, seconds)", "",
                   "- first non-routable (lease expired or session cleared) after the fault: " + stat(tl["first_nonroutable_s"]),
                   "- first sample with the session cleared (row unarmed/tombstoned) after the fault: " + stat(tl["first_unarmed_s"]),
@@ -501,29 +557,36 @@ def cmd_export(a):
     secrets are NOT exported."""
     os.makedirs(a.out, exist_ok=True)
     runs = sorted(glob.glob(os.path.join(a.state, "run-*", "probes.jsonl")))
+    if a.runs:
+        want = set(x for x in a.runs.split(",") if x)
+        missing = want - {os.path.basename(os.path.dirname(x)) for x in runs}
+        if missing:
+            sys.exit("export: no such run(s): %s" % ", ".join(sorted(missing)))
+        runs = [x for x in runs if os.path.basename(os.path.dirname(x)) in want]
     with open(os.path.join(a.out, "probe-summary.csv"), "w", newline="") as f, \
             open(os.path.join(a.out, "run-timeline.csv"), "w", newline="") as g:
         w = csv.writer(f, lineterminator="\n")
         w.writerow(["run", "scenario", "victim", "holder_replica", "round", "cohort", "probed_replica", "role", "arm",
-                    "delivered", "refused", "server_synthesised", "accepted_no_result", "timeout", "invalid", "total",
-                    "refusal_reasons"])
+                    "delivered", "refused", "server_synthesised", "accepted_no_result", "timeout", "invalid", "rig_error",
+                    "total", "refusal_reasons"])
         t = csv.writer(g, lineterminator="\n")
         t.writerow(["run", "scenario", "victim", "holder_replica", "agents_total", "clean_sampled", "stale_sampled",
                     "nonroutable_n", "nonroutable_min_s", "nonroutable_median_s", "nonroutable_max_s",
                     "unarmed_n", "unarmed_min_s", "unarmed_median_s", "unarmed_max_s",
                     "routable_after_undo_n", "routable_after_undo_min_s", "routable_after_undo_median_s",
-                    "routable_after_undo_max_s", "invalid"])
+                    "routable_after_undo_max_s", "inconclusive_agents", "valid", "invalid_reason", "probes_sha256"])
         for pj in runs:
             rd = os.path.dirname(pj)
             run = os.path.basename(rd)
             meta = open(os.path.join(rd, "meta.txt")).read() if os.path.exists(os.path.join(rd, "meta.txt")) else ""
             m = dict(x.split("=", 1) for x in meta.split() if "=" in x)
-            rows = [json.loads(l) for l in open(pj)]
+            rows = load_rows(pj)
             if any("cohort" not in r for r in rows):
                 # an early shake-out run taken before probes carried a cohort and holder: its stale-session agents
                 # cannot be told from clean ones, so it is not summarised (its raw data stays in the state dir)
                 print("skipping %s: probes carry no cohort tag" % run)
                 continue
+            inconclusive = classify_cohorts(rows)
             for r in rows:
                 r.setdefault("reason", "")
             holders = sorted({r.get("holder", "") for r in rows if r.get("holder")})
@@ -532,10 +595,10 @@ def cmd_export(a):
                 if r["label"] not in labels:
                     labels.append(r["label"])
             for lab in labels:
-                for cohort in ("clean", "stale_other"):
+                for cohort in ("clean", "stale_other", "inconclusive"):
                     for rep in (1, 2):
                         for arm in ("ids", "scope"):
-                            sel = [r for r in rows if r["label"] == lab and r["cohort"] == cohort and r["replica"] == rep and r["arm"] == arm]
+                            sel = [r for r in rows if r["label"] == lab and r["cohort_eff"] == cohort and r["replica"] == rep and r["arm"] == arm]
                             if not sel:
                                 continue
                             c = lambda k: sum(1 for r in sel if r["final_outcome"] == k)
@@ -546,18 +609,21 @@ def cmd_export(a):
                                     reasons[k] = reasons.get(k, 0) + 1
                             w.writerow([run, m.get("id", ""), m.get("victim", ""), "/".join(holders), lab, cohort, rep, sel[0]["role"], arm,
                                         c("delivered"), c("refused"), c("server_synthesised"), c("accepted_no_result"), c("timeout"),
-                                        c("probe_invalid"), len(sel), "; ".join("%s x%d" % kv for kv in sorted(reasons.items()))])
-            clean = {r["agent_id"] for r in rows if r["cohort"] == "clean"}
+                                        c("probe_invalid"), c("rig_error"), len(sel), "; ".join("%s x%d" % kv for kv in sorted(reasons.items()))])
+            clean = {r["agent_id"] for r in rows if r["cohort_eff"] == "clean"}
             tl = route_timeline(rd, clean)
             def st(d):
                 v = sorted(d.values()) if d else []
-                return [len(v), "%.0f" % v[0], "%.0f" % v[len(v) // 2], "%.0f" % v[-1]] if v else [0, "", "", ""]
+                return [len(v), "%.0f" % v[0], "%.1f" % median(v), "%.0f" % v[-1]] if v else [0, "", "", ""]
             samp = read_sample(rd, os.path.join(rd, "sample.txt")) if os.path.exists(os.path.join(rd, "sample.txt")) else []
             t.writerow([run, m.get("id", ""), m.get("victim", ""), "/".join(holders), m.get("total", ""),
                         sum(1 for x in samp if x[1] == "clean"), sum(1 for x in samp if x[1] != "clean"),
                         *st(tl.get("first_nonroutable_s")), *st(tl.get("first_unarmed_s")),
                         *st(tl.get("first_routable_after_undo_s")),
-                        open(os.path.join(rd, "INVALID")).read().strip() if os.path.exists(os.path.join(rd, "INVALID")) else ""])
+                        len(inconclusive),
+                        "no" if os.path.exists(os.path.join(rd, "INVALID")) else "yes",
+                        open(os.path.join(rd, "INVALID")).read().strip() if os.path.exists(os.path.join(rd, "INVALID")) else "",
+                        hashlib.sha256(open(pj, "rb").read()).hexdigest()])
     print("exported %d runs to %s" % (len(runs), a.out))
 
 
@@ -566,6 +632,7 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True)
     pe = sp.add_parser("export")
     pe.add_argument("--state", required=True); pe.add_argument("--out", required=True)
+    pe.add_argument("--runs", default="", help="comma list of run directory names to summarise (default: every tagged run)")
     for name in ("holders", "sample", "probe", "recovered", "resolve", "analyse"):
         p = sp.add_parser(name)
         p.add_argument("--run", required=True)

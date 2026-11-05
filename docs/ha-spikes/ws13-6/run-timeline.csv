@@ -1,5 +1,5 @@
-run,scenario,victim,holder_replica,agents_total,clean_sampled,stale_sampled,nonroutable_n,nonroutable_min_s,nonroutable_median_s,nonroutable_max_s,unarmed_n,unarmed_min_s,unarmed_median_s,unarmed_max_s,routable_after_undo_n,routable_after_undo_min_s,routable_after_undo_median_s,routable_after_undo_max_s,invalid
-run-F3-2r-162443,F3-2r,gateway-1,1,60,10,2,10,63,83,87,0,,,,10,3,3,3,
-run-F3-2r-164225,F3-2r,gateway-2,2,60,10,2,10,63,76,87,10,331,331,331,10,4,4,4,
-run-F3-2r-170006,F3-2r,gateway-3,2,60,10,2,10,63,83,85,10,471,471,471,10,1,1,1,
-run-NOFAULT-160202,NOFAULT,gateway-3,2,60,10,2,0,,,,0,,,,0,,,,
+run,scenario,victim,holder_replica,agents_total,clean_sampled,stale_sampled,nonroutable_n,nonroutable_min_s,nonroutable_median_s,nonroutable_max_s,unarmed_n,unarmed_min_s,unarmed_median_s,unarmed_max_s,routable_after_undo_n,routable_after_undo_min_s,routable_after_undo_median_s,routable_after_undo_max_s,inconclusive_agents,valid,invalid_reason,probes_sha256
+run-F3-2r-162443,F3-2r,gateway-1,1,60,10,2,10,63,81.1,87,0,,,,10,3,2.9,3,0,yes,,92af785929fc34f1cd8c933279dc52abaa973bd071aa26fa93b1ef5d0d4faf77
+run-F3-2r-164225,F3-2r,gateway-2,2,60,10,2,10,63,75.3,87,10,331,331.2,331,10,4,3.6,4,0,yes,,3476e617baa3ce3b20d11e8edca74b36dd08665b4864ddebc4336e48179b5cce
+run-F3-2r-170006,F3-2r,gateway-3,2,60,10,2,10,63,79.0,85,10,471,470.9,471,10,1,1.3,1,0,yes,,460fd1d1a8e2fb6f9849cc4852266603003728a4e5a6e39412b2a95bc9bb23e8
+run-NOFAULT-160202,NOFAULT,gateway-3,2,60,10,2,0,,,,0,,,,0,,,,0,yes,,6d83419cd9962e845a46ce96589924cb331937da381ac26fa3b70f24b19abbb7

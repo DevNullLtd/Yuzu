@@ -7,7 +7,8 @@
 ## servers can still be dispatched to through either replica. Do not copy it into a deployment, and
 ## do not read a pass as evidence that two replicas are safe.
 ##
-## Use it ONLY through scripts/ha/ha-gateway-two-replica-probe.sh, which layers it on the spike rig:
+## It is MUTUALLY EXCLUSIVE with the 13.0 spike rig (same fixed addresses, 10.77.12.0/22): the runner refuses
+## to start while either rig's resources exist. Use it ONLY through scripts/ha/ha-gateway-two-replica-probe.sh, which layers it on the spike rig:
 ##   docker compose -f docker-compose.ha-gateway-failover.yml -f docker-compose.ha-gateway-two-replica.yml
 ## and sets the environment this file needs (SPIKE_GW_SYSCONFIG, SPIKE_HAPROXY_CFG, ...).
 ##
@@ -62,7 +63,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       server: { condition: service_healthy }
-    ports:
+    ports: !override
       - "127.0.0.1:${SPIKE_REST_PORT_2:-0}:8443"
     volumes:
       - ${SPIKE_SERVER_CFG:?set by the script}:/etc/yuzu/yuzu-server.cfg:ro
@@ -87,6 +88,9 @@ services:
       server-2: { condition: service_healthy }
 
   haproxy:
+    # the overlay needs the config that carries the upstream VIP frontend: refuse the spike's own haproxy.cfg
+    volumes:
+      - ./ha-gateway-failover/${SPIKE_HAPROXY_CFG:?set by the script (haproxy-two-replica.cfg)}:/usr/local/etc/haproxy/haproxy.cfg:ro
     # the server and the gateways resolve names through Docker's DNS, so the upstream VIP name is an alias
     networks:
       spike:
