@@ -44975,6 +44975,7 @@ TEST_CASE("MCP Guardian: the twins carry the flags order_uncertain and projectio
     CHECK(required("get_guardian_agent_status").find("uncertain_rules") != std::string::npos);
     CHECK(required("get_guardian_rule_status").find("projection_pending") != std::string::npos);
     CHECK(required("get_guardian_device_guards").find("order_uncertain") != std::string::npos);
+}
 
 // ── cancel_execution / record_execution_rerun (#2146 batch B) ───────────────────────────────
 // REST twins: POST /api/v1/executions/{id}/cancel and .../rerun (test_execution_cancel_rerun_twins.cpp).
