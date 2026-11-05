@@ -348,7 +348,10 @@ private:
     /// expired (at most one thread per expiry). Flips `rebind_guard_ok_` false,
     /// stickily, on a definite failure; an inconclusive check latches nothing but flags the
     /// reads that follow `guard_unverified` (and retries on the next find) until a check succeeds.
-    void revalidate_rebind_guard_if_due(PGconn* conn) const;
+    /// Returns true iff THIS call ran the check and it was inconclusive, so the caller can flag its
+    /// own read without sampling the shared flag afterwards: a concurrent successful check clears
+    /// that flag between this call's verdict and the caller's load (#6079 K3).
+    [[nodiscard]] bool revalidate_rebind_guard_if_due(PGconn* conn) const;
 
     pg::PgPool& pool_;
     bool open_{false};

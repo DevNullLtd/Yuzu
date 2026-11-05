@@ -193,11 +193,12 @@ enum class GuardCheck { kOk, kFailed, kInconclusive };
 
 // Is the rebind guard in force for every writer? Reads the catalog: the trigger exists,
 // is ENABLE ALWAYS ('A'), is a ROW BEFORE UPDATE trigger and nothing else (tgtype & 127 = 19: no
-// INSERT, DELETE, TRUNCATE or INSTEAD bit, as AuthDB's check) with no WHEN clause, lists all five
-// guarded columns, and calls the pinned function body. A missing
-// sessions table (a rename fault, a drop) is INCONCLUSIVE rather than a failure: it is
-// not evidence about the trigger and every session query fails on it anyway. When `cause` is
-// given, an inconclusive result describes why (SQLSTATE and server message, or the row count).
+// INSERT, DELETE, TRUNCATE or INSTEAD bit, as AuthDB's check) with no WHEN clause, lists EXACTLY
+// the five guarded columns (attnum equality of the sorted lists, not containment), and calls the
+// pinned function body. A missing sessions table (a rename fault, a drop) is INCONCLUSIVE rather
+// than a failure: it is not evidence about the trigger and every session query fails on it anyway.
+// When `cause` is given, an inconclusive result describes why (SQLSTATE and server message, or the
+// row count).
 GuardCheck check_rebind_guard(PGconn* conn, std::string* cause = nullptr) {
     PgResult r = exec_params(
         conn,
@@ -207,10 +208,11 @@ GuardCheck check_rebind_guard(PGconn* conn, std::string* cause = nullptr) {
         "AND NOT a.attisdropped "
         "         AND a.attname IN ('mfa_verified_ms','mfa_factor_gen','username','auth_source',"
         "'principal_kind')) = 5 "
-        "  AND t.tgattr::int2[] @> ARRAY(SELECT a.attnum FROM pg_attribute a "
+        "  AND ARRAY(SELECT x FROM unnest(t.tgattr::int2[]) AS x ORDER BY x) = "
+        "      ARRAY(SELECT a.attnum FROM pg_attribute a "
         "         WHERE a.attrelid = c.oid AND NOT a.attisdropped "
         "           AND a.attname IN ('mfa_verified_ms','mfa_factor_gen','username','auth_source',"
-        "'principal_kind')) "
+        "'principal_kind') ORDER BY a.attnum) "
         "  AND p.proname = 'sessions_mfa_rebind_guard' AND p.pronamespace = c.relnamespace "
         "  AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') "
         "  AND p.prosrc = $1::text, false) "
@@ -677,7 +679,7 @@ SessionStore::find(const std::string& token_hash) const {
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(Error{"database unavailable"});
-    revalidate_rebind_guard_if_due(lease.get());
+    const bool own_check_inconclusive = revalidate_rebind_guard_if_due(lease.get());
     // db_now_ms is the LAST column, read in the SAME atomic SELECT as the row, so
     // adjudication is against the DB clock at read time — never the replica's
     // local clock, and never a separate query that could skew (design-review N1).
@@ -696,21 +698,24 @@ SessionStore::find(const std::string& token_hash) const {
     FoundSession fs;
     fs.row = row_from(r.get(), 0);
     fs.db_now_ms = to_i64(PQgetvalue(r.get(), 0, kSessionRowColumns)); // db_now after the row cols
-    fs.guard_unverified = last_validation_inconclusive_.load(std::memory_order_acquire);
+    // This call's own inconclusive verdict is carried in a local, not re-read from the shared flag:
+    // a concurrent successful check may clear the flag between that verdict and this load.
+    fs.guard_unverified =
+        own_check_inconclusive || last_validation_inconclusive_.load(std::memory_order_acquire);
     return std::optional<FoundSession>{std::move(fs)};
 }
 
-void SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
+bool SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
     if (!rebind_guard_ok_.load(std::memory_order_acquire))
-        return; // sticky: a failure observed once stays until restart
+        return false; // sticky: a failure observed once stays until restart
     const std::int64_t now = steady_now_ms();
     std::int64_t due = next_validation_steady_ms_.load(std::memory_order_relaxed);
     if (now < due)
-        return;
+        return false;
     // Exactly one thread per expiry runs the catalog query; the rest proceed.
     if (!next_validation_steady_ms_.compare_exchange_strong(
             due, now + validation_memo_ms_.load(std::memory_order_relaxed)))
-        return;
+        return false;
     std::string cause;
     GuardCheck verdict;
     if (force_inconclusive_for_test_.load(std::memory_order_relaxed)) {
@@ -722,12 +727,12 @@ void SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
     switch (verdict) {
     case GuardCheck::kOk:
         last_validation_inconclusive_.store(false, std::memory_order_release);
-        return;
+        return false;
     case GuardCheck::kFailed:
         rebind_guard_ok_.store(false, std::memory_order_release);
         spdlog::error("SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, or "
                       "altered; local MFA binding decisions now fail closed until restart");
-        return;
+        return false;
     case GuardCheck::kInconclusive:
         // Not evidence about the trigger (query error, table unreachable): retry on the
         // next find rather than waiting out the memo and do not latch. The row is still served,
@@ -740,8 +745,9 @@ void SessionStore::revalidate_rebind_guard_if_due(PGconn* conn) const {
                          "session validation is unaffected",
                          cause);
         next_validation_steady_ms_.store(0, std::memory_order_release);
-        return;
+        return true;
     }
+    return false;
 }
 
 std::expected<std::uint64_t, SessionStore::Error> SessionStore::read_generation() const {

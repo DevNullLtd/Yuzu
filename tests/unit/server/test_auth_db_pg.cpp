@@ -3791,6 +3791,13 @@ TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
              std::string(kRestoreTriggerSql),
          "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
              kRestoreTriggerSql + "; DROP SCHEMA yuzu_test_shadow CASCADE"},
+        {"covers a wider column list (a superset of the two)",
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER users_mfa_factor_gen "
+         "BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen, mfa_last_counter ON auth.users FOR "
+         "EACH ROW EXECUTE FUNCTION auth.users_mfa_factor_gen(); " +
+             std::string(kRestoreTriggerSql),
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
+             kRestoreTriggerSql},
         {"no longer covers the instant column",
          "DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER users_mfa_factor_gen "
          "BEFORE "

@@ -675,8 +675,8 @@ decrypt_mfa_secret(pg::SecretCodec& codec, const LoadedMfaRow& row) {
 // #6079: is the factor-generation trigger EFFECTIVELY in force? Reads the catalog, not the
 // migration history: the trigger must exist, be ENABLE ALWAYS (tgenabled = 'A', so it also fires
 // under `session_replication_role = replica`), be a BEFORE UPDATE row trigger whose column list
-// contains both columns (a superset passes: the `@>` test; it still fires on every change to
-// either), with the INSERT/DELETE/TRUNCATE bits clear and no WHEN clause, and call the plpgsql
+// is EXACTLY those two columns (attnum equality of the sorted lists; a superset is refused too,
+// so a catalog edit that widened the list reads as altered), with the INSERT/DELETE/TRUNCATE bits clear and no WHEN clause, and call the plpgsql
 // function of that name, in the table's schema, whose body is byte-identical to the pinned
 // constant and whose `proconfig` is exactly `{"search_path=pg_catalog, pg_temp"}` (one element;
 // pg_temp last so the session's temporary schema cannot shadow a type name first): the pin keeps
@@ -697,9 +697,10 @@ enum class BindingCheck : std::uint8_t {
         "SELECT t.tgenabled = 'A' "
         "AND (t.tgtype & 127) = 19 "
         "AND t.tgqual IS NULL "
-        "AND t.tgattr::int2[] @> ARRAY(SELECT attnum FROM pg_attribute "
-        "                              WHERE attrelid = t.tgrelid "
-        "                                AND attname IN ('mfa_enrolled_at','mfa_factor_gen')) "
+        "AND ARRAY(SELECT x FROM unnest(t.tgattr::int2[]) AS x ORDER BY x) = "
+        "    ARRAY(SELECT attnum FROM pg_attribute "
+        "           WHERE attrelid = t.tgrelid "
+        "             AND attname IN ('mfa_enrolled_at','mfa_factor_gen') ORDER BY attnum) "
         "AND p.proname = 'users_mfa_factor_gen' "
         "AND p.pronamespace = (SELECT relnamespace FROM pg_class WHERE oid = t.tgrelid) "
         "AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') "

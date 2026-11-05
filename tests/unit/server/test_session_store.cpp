@@ -1045,6 +1045,13 @@ TEST_CASE("SessionStore v3: the store refuses to open when the guard is not prov
           "session_store.sessions FOR EACH ROW EXECUTE FUNCTION "
           "session_store.sessions_mfa_rebind_guard()",
           "ALTER TABLE session_store.sessions ENABLE ALWAYS TRIGGER sessions_mfa_rebind_guard"}},
+        {"trigger recreated with a WIDER column list (a superset of the five)",
+         {"DROP TRIGGER sessions_mfa_rebind_guard ON session_store.sessions",
+          "CREATE TRIGGER sessions_mfa_rebind_guard BEFORE UPDATE OF mfa_verified_ms, "
+          "mfa_factor_gen, username, auth_source, principal_kind, mfa_bind_seq ON "
+          "session_store.sessions FOR EACH ROW EXECUTE FUNCTION "
+          "session_store.sessions_mfa_rebind_guard()",
+          "ALTER TABLE session_store.sessions ENABLE ALWAYS TRIGGER sessions_mfa_rebind_guard"}},
         {"trigger recreated with a WHEN clause that never holds",
          {"DROP TRIGGER sessions_mfa_rebind_guard ON session_store.sessions",
           "CREATE TRIGGER sessions_mfa_rebind_guard BEFORE UPDATE OF mfa_verified_ms, "
