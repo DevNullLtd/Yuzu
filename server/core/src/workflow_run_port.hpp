@@ -102,7 +102,7 @@ inline constexpr char kWorkflowIdempotentReplayError[] = "idempotent replay";
 /// from here only: `WorkflowEngine::execute` has no separate parameter for it.
 ///
 /// Consumed today: `on_admitted`, `on_attempt`, `before_attempt`, `deadline`, `should_stop`,
-/// `on_interrupted`, `idempotency` and `on_replay`.
+/// `on_interrupted`, `idempotency`, `on_replay`, `principal` and `correlation_id`.
 struct WorkflowRunControl {
     /// Called once with the new run's execution id after the engine has admitted the run and
     /// before the first step is dispatched.
@@ -146,6 +146,14 @@ struct WorkflowRunControl {
     /// Called once with the run the key is bound to, when the claim found one. Required to be set
     /// with `idempotency` (the caller has no other way to tell a replay from an error).
     std::function<void(const WorkflowRunReplay&)> on_replay;
+    /// Who started the run and under which call, stored on the run's own row whether or not the
+    /// call is keyed, so an unkeyed run still names its actor and an audit row that carries only
+    /// the call's `correlation_id=` (the `requested` row, which is written before any execution id
+    /// exists) joins to the run. Empty stores NULL (the legacy route and any caller that sets
+    /// neither). For a KEYED run the stored principal is `idempotency->principal` (the key's
+    /// namespace), which the sequence sets to the same value. Never consulted for admission.
+    std::string principal;
+    std::string correlation_id;
 };
 
 using WorkflowRunFn = std::function<std::expected<std::string, std::string>(

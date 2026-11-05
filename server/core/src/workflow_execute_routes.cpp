@@ -9,9 +9,13 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <mutex>
+
 namespace yuzu::server {
 
 namespace {
+
+constexpr std::string_view kRestAuditContext = "surface=rest";
 
 struct HttpShape {
     int code;
@@ -105,19 +109,65 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
         [d = std::move(deps)](const httplib::Request& req, httplib::Response& res) {
             if (!d.perm_fn || !d.perm_fn(req, res, "Workflow", "Execute"))
                 return;
+            // An unwired audit sink fails CLOSED: this route is audit-first (the `requested` row is
+            // written before any effect), so a deployment with no sink cannot be treated as
+            // "audit off". Behind the gate (an unauthorised caller learns nothing about the
+            // configuration) and before any body work, lease, store read or dispatch. No retry
+            // hint: an unwired sink is a server defect, not a transient fault. The instruction
+            // twin answers the same way.
+            if (!d.persist_audit_fn && !d.audit_fn) {
+                static std::once_flag logged; // once per process, not per request
+                std::call_once(logged, [] {
+                    spdlog::error("POST /api/v1/workflows/{{id}}/execute: no audit sink is wired; "
+                                  "refusing every request with 503 (server configuration defect)");
+                });
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                nlohmann::json j = nlohmann::json::parse(detail::error_json_a4(
+                    503, "audit subsystem not configured; nothing was sent",
+                    detail::ensure_correlation_id(res),
+                    detail::A4ErrorOpts{
+                        .remediation = "the server has no audit sink wired; this is a server "
+                                       "configuration defect and retrying will not help"}));
+                j["error"]["reason"] = "audit_unavailable";
+                res.set_content(j.dump(), "application/json");
+                return;
+            }
+
+            // The call's ONE correlation id: the response header, the error body, the run's own
+            // row and the `correlation_id=` token of every `workflow.execute` row this call writes.
             const std::string cid = detail::ensure_correlation_id(res);
             const std::string workflow_id = req.matches[1].str();
+            const WorkflowAuditFn audit = [&](const std::string& action, const std::string& result,
+                                              const std::string& target_id,
+                                              const std::string& detail_text) {
+                if (d.persist_audit_fn)
+                    return d.persist_audit_fn(req, action, result, "workflow", target_id,
+                                              detail_text);
+                d.audit_fn(req, action, result, "workflow", target_id, detail_text);
+                return true; // the plain sink reports no persist failure
+            };
+            // A refusal before the sequence runs still leaves a `denied` row (the instruction
+            // twin's `audit_pre_core_denial`); a lost row sets Sec-Audit-Failed and the 400 itself
+            // stands. The id is cleaned in the row (`workflow_audit_target`), never raw, and the
+            // body never echoes it.
+            const auto refuse_pre_core = [&](std::string_view message, const std::string& reason) {
+                if (!audit_workflow_pre_core_denial(audit, kRestAuditContext, cid, reason,
+                                                    workflow_id))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 400;
+                nlohmann::json j = nlohmann::json::parse(
+                    detail::error_json_a4(400, message, cid, detail::A4ErrorOpts{}));
+                j["error"]["reason"] = reason;
+                res.set_content(j.dump(), "application/json");
+            };
 
             // A malformed id (control byte, NUL included, invalid UTF-8, over-length) is refused
             // before the key, the body, the lease or any read, and never retryable: the store would
             // cut a NUL at the bind and run a DIFFERENT workflow, or raise 22021 and read as a 503.
-            // The message never echoes the id, and no audit row embeds it.
+            // The message never echoes the id, and the audit row carries it bounded and cleaned.
             if (const auto bad_id = check_workflow_id(workflow_id)) {
-                res.status = 400;
-                nlohmann::json j = nlohmann::json::parse(
-                    detail::error_json_a4(400, bad_id->message, cid, detail::A4ErrorOpts{}));
-                j["error"]["reason"] = bad_id->reason;
-                res.set_content(j.dump(), "application/json");
+                refuse_pre_core(bad_id->message, bad_id->reason);
                 return;
             }
 
@@ -132,11 +182,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                               "idempotency_key_invalid", "send the Idempotency-Key header once"}}
                         : check_workflow_idempotency_key(req.get_header_value("Idempotency-Key"));
                 if (bad) {
-                    res.status = 400;
-                    nlohmann::json j = nlohmann::json::parse(
-                        detail::error_json_a4(400, bad->message, cid, detail::A4ErrorOpts{}));
-                    j["error"]["reason"] = bad->reason;
-                    res.set_content(j.dump(), "application/json");
+                    refuse_pre_core(bad->message, bad->reason);
                     return;
                 }
                 idempotency_key = req.get_header_value("Idempotency-Key");
@@ -144,15 +190,12 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
 
             // #2437-class guard: raw-text depth check BEFORE the parse.
             if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "request body nests too deeply"),
-                                "application/json");
+                refuse_pre_core("request body nests too deeply", "body_depth");
                 return;
             }
             const auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                refuse_pre_core("invalid JSON", "invalid_json");
                 return;
             }
             auto agent_ids = parse_workflow_execute_body(body);
@@ -166,11 +209,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                     } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
                     }
                 }
-                res.status = 400;
-                nlohmann::json j = nlohmann::json::parse(detail::error_json_a4(
-                    400, agent_ids.error().message, cid, detail::A4ErrorOpts{}));
-                j["error"]["reason"] = agent_ids.error().reason;
-                res.set_content(j.dump(), "application/json");
+                refuse_pre_core(agent_ids.error().message, agent_ids.error().reason);
                 return;
             }
 
@@ -206,15 +245,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                                                        /*execution_id=*/"", c);
                 };
             }
-            ports.audit = [&](const std::string& action, const std::string& result,
-                              const std::string& target_id, const std::string& detail_text) {
-                if (d.persist_audit_fn)
-                    return d.persist_audit_fn(req, action, result, "workflow", target_id,
-                                              detail_text);
-                if (d.audit_fn)
-                    d.audit_fn(req, action, result, "workflow", target_id, detail_text);
-                return true; // audit off: not a persist failure
-            };
+            ports.audit = audit;
             ports.count_target_rejected = [&](std::string_view reason) {
                 if (!d.metrics)
                     return;
@@ -264,7 +295,8 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             wreq.workflow_id = workflow_id;
             wreq.agent_ids = std::move(*agent_ids);
             wreq.caller = caller;
-            wreq.audit_context = "surface=rest";
+            wreq.audit_context = std::string(kRestAuditContext);
+            wreq.correlation_id = cid;
             wreq.deadline = deadline;
             wreq.idempotency_key = idempotency_key;
             // The run is synchronous on this handler thread, so `req` outlives every use of the

@@ -94,7 +94,8 @@ void roll_back_workflow_engine_to_v1(const std::string& dsn) {
     exec_sql(dsn, "ALTER TABLE workflow_engine.workflow_executions "
                   "DROP CONSTRAINT wf_exec_idem_complete");
     exec_sql(dsn, "ALTER TABLE workflow_engine.workflow_executions DROP COLUMN principal, "
-                  "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint");
+                  "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint, "
+                  "DROP COLUMN correlation_id");
     roll_back(dsn, "workflow_engine", 1);
 }
 

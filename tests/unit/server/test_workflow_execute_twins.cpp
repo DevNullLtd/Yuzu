@@ -187,6 +187,9 @@ struct Fx {
     bool get_exec_fault{false};
     std::int64_t fixed_now{1'000'000};
     std::optional<WorkflowIdempotencyClaim> seen_claim;
+    /// What the sequence handed the run port beside the claim, keyed or not.
+    std::string seen_control_principal;
+    std::string seen_control_cid;
     std::map<std::string, int> idem_counts;
     /// Called by the stand-in engine right before it claims: lets a test bind a competing run
     /// AFTER the pre-check said "none" (the lost race).
@@ -323,6 +326,8 @@ struct Fx {
             // The engine's atomic claim: a key already bound is a replay (nothing admitted);
             // otherwise the claim binds it to the run being admitted.
             seen_claim = control.idempotency;
+            seen_control_principal = control.principal;
+            seen_control_cid = control.correlation_id;
             if (control.idempotency) {
                 const auto& c = *control.idempotency;
                 if (before_claim)
@@ -1852,6 +1857,8 @@ struct Rest {
     std::optional<ConfinedDispatchOutcome> dispatch_result;
     int gate_calls{0};
     int persist_calls{0};
+    /// The action, result and target_id of every row the route's sink received, in order.
+    std::vector<std::string> audit_actions, audit_results, audit_targets;
     DispatchCaller caller{.principal = "alice",
                           .principal_role = "user",
                           .exec_visible = std::nullopt,
@@ -1869,7 +1876,7 @@ struct Rest {
     std::vector<std::string> reauth_tokens;
     yuzu::server::test::TestRouteSink sink;
 
-    Rest() {
+    explicit Rest(bool wire_audit = true) {
         api = fx.api();
         WorkflowExecuteRouteDeps d;
         d.perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string& t,
@@ -1883,17 +1890,21 @@ struct Rest {
             }
             return gate_admits;
         };
-        d.persist_audit_fn = [this](const httplib::Request&, const std::string&,
-                                    const std::string& result, const std::string&,
-                                    const std::string&, const std::string& detail) {
-            ++persist_calls;
-            const size_t idx = fx.audit_details.size();
-            fx.events.push_back("audit:" + result);
-            fx.audit_details.push_back(detail);
-            if (fx.audit_fails_on_call && *fx.audit_fails_on_call == idx)
-                return false;
-            return fx.audit_ok;
-        };
+        if (wire_audit)
+            d.persist_audit_fn = [this](const httplib::Request&, const std::string& action,
+                                        const std::string& result, const std::string&,
+                                        const std::string& target, const std::string& detail) {
+                ++persist_calls;
+                const size_t idx = fx.audit_details.size();
+                fx.events.push_back("audit:" + result);
+                fx.audit_details.push_back(detail);
+                audit_actions.push_back(action);
+                audit_results.push_back(result);
+                audit_targets.push_back(target);
+                if (fx.audit_fails_on_call && *fx.audit_fails_on_call == idx)
+                    return false;
+                return fx.audit_ok;
+            };
         d.workflow_api = api;
         d.workflow_run = fx.run_fn();
         d.workflow_idempotency_lookup = fx.idempotency_lookup_fn();
@@ -2185,7 +2196,8 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: body refusals are 400 with a rea
         CHECK(res->status == 400);
         CHECK(body_of(*res)["error"]["reason"] == reason);
         CHECK_FALSE(r.fx.dispatched_anything());
-        CHECK(r.persist_calls == 0);
+        // The refusal leaves exactly one `denied` row (the pre-core audit) and no `requested` row.
+        CHECK(r.audit_results == std::vector<std::string>{"denied"});
     }
     {
         Rest r;
@@ -2580,19 +2592,39 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a malformed workflow id is a non
             CHECK(res->get_header_value("Retry-After").empty());
             CHECK(res->body.find("foo") == std::string::npos);
             CHECK(res->body.find(id) == std::string::npos);
-            // Nothing read, leased, run, audited or sent.
+            // Nothing read, leased, run or sent. The refusal itself IS audited (a `denied` row,
+            // the instruction twin's pre-core refusal), carrying the id only bounded and cleaned.
             CHECK(r.fx.get_workflow_calls == 0);
             CHECK(r.fx.lookup_count.empty());
             CHECK(r.fx.find_calls == 0);
             CHECK_FALSE(r.fx.engine_called);
             CHECK(r.fx.bound.empty());
-            CHECK(r.fx.events.empty());
-            CHECK(r.fx.audit_details.empty());
-            CHECK(r.persist_calls == 0);
+            CHECK(r.fx.events == std::vector<std::string>{"audit:denied"});
+            REQUIRE(r.persist_calls == 1);
+            CHECK(r.audit_actions.front() == "workflow.execute");
+            CHECK(r.audit_results.front() == "denied");
+            CHECK(r.fx.audit_details.front().starts_with("surface=rest correlation_id="));
+            CHECK(r.fx.audit_details.front().find("reason=invalid_workflow_id") != std::string::npos);
+            CHECK(r.fx.audit_details.front().find(res->get_header_value("X-Correlation-Id")) !=
+                  std::string::npos);
             CHECK_FALSE(r.fx.dispatched_anything());
             CHECK(r.budget.active() == 0);
             CHECK(r.refused("draining") == 0);
             CHECK(r.refused("per_principal_stream_cap") == 0);
+            // The row is bounded and holds no raw control byte, whatever the id held: neither the
+            // target column nor the detail may carry the malformed id as sent.
+            for (const std::string& cell : {r.audit_targets.front(), r.fx.audit_details.front()}) {
+                CHECK(cell.size() <= 600);
+                for (const char ch : cell) {
+                    CHECK(static_cast<unsigned char>(ch) >= 0x20);
+                    CHECK(static_cast<unsigned char>(ch) != 0x7F);
+                }
+            }
+            if (id.size() > 200) { // an over-length id never reaches the row whole
+                CHECK(r.audit_targets.front().size() < id.size());
+                CHECK(r.fx.audit_details.front().find(id) == std::string::npos);
+            }
+            CHECK(r.audit_targets.front().find(id) == std::string::npos);
         }
     }
 }
@@ -3921,7 +3953,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a malformed
     CHECK_FALSE(r.fx.engine_called);
     CHECK(r.fx.find_calls == 0);
     CHECK(r.budget.active() == 0);
-    CHECK(r.fx.events.empty());
+    // Six refusals, six `denied` rows (the pre-core audit) and nothing else.
+    CHECK(r.fx.events == std::vector<std::string>(6, "audit:denied"));
+    CHECK(r.fx.audit_details.front().find("reason=idempotency_key_invalid") != std::string::npos);
     const auto keyless = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
     REQUIRE(keyless);
     CHECK(keyless->status == 202);
@@ -4363,4 +4397,244 @@ TEST_CASE("replay parity: rows that cannot prove an outcome are never `completed
         g.stored_rows["exec-bound"] = {settled(0, "success", ack)};
         CHECK(g.run(keyed(g)).replay_status == "failed");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// The audit join (#2146 comp2-1 / ca2-2 / ca2-3): every `workflow.execute` row carries the call's
+// correlation id, the run's own row names the actor and the call even when it is unkeyed, a REST
+// refusal before the sequence still leaves a `denied` row, and an unwired sink fails closed.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// Every audit row `r` received carries the response's correlation id, right after the surface.
+void check_rows_carry_cid(const Rest& r, const httplib::Response& res, std::size_t expected_rows) {
+    const std::string cid = res.get_header_value("X-Correlation-Id");
+    REQUIRE_FALSE(cid.empty());
+    REQUIRE(r.fx.audit_details.size() == expected_rows);
+    for (const auto& d : r.fx.audit_details) {
+        INFO(d);
+        CHECK(d.starts_with("surface=rest correlation_id=" + cid));
+    }
+    for (const auto& a : r.audit_actions)
+        CHECK(a == "workflow.execute");
+}
+
+} // namespace
+
+TEST_CASE("workflow.execute audit join: REST success, partial and aborted runs stamp the correlation id "
+          "on every row",
+          "[workflow][twin][rest][audit][correlation]") {
+    SECTION("success: requested then success") {
+        Rest r;
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        check_rows_carry_cid(r, *res, 2);
+        CHECK(r.audit_results == std::vector<std::string>{"requested", "success"});
+    }
+    SECTION("aborted by a send-time refusal: requested, denied (late), failure") {
+        Rest r;
+        r.fx.step_ids = {"i-ro", "i-ro2"};
+        r.fx.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        r.fx.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        check_rows_carry_cid(r, *res, 3);
+        CHECK(r.audit_results == std::vector<std::string>{"requested", "denied", "failure"});
+    }
+    SECTION("a run that throws: requested then the failure row") {
+        Rest r;
+        r.dispatch_throws = true;
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        check_rows_carry_cid(r, *res, 2);
+        CHECK(r.audit_results == std::vector<std::string>{"requested", "failure"});
+    }
+    SECTION("a refusal inside the sequence (the caller may not run a step): the denied row") {
+        Rest r;
+        r.fx.defs["i-ro"] = def("i-ro", "os_info", "os_version", "always");
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        REQUIRE_FALSE(r.fx.audit_details.empty());
+        check_rows_carry_cid(r, *res, r.fx.audit_details.size());
+    }
+}
+
+TEST_CASE("workflow.execute audit join: REST idempotent replay and conflict rows carry the correlation id "
+          "of the REPEAT, not of the run they answer with",
+          "[workflow][twin][rest][audit][correlation][idempotency]") {
+    Rest r;
+    r.fx.fixed_now = real_epoch_now();
+    const auto first = post_with_key(r, kKey);
+    REQUIRE(first);
+    const std::string first_cid = first->get_header_value("X-Correlation-Id");
+    const std::size_t after_first = r.fx.audit_details.size();
+    const auto second = post_with_key(r, kKey);
+    REQUIRE(second);
+    CHECK(body_of(*second)["data"]["idempotent_replay"] == true);
+    const std::string second_cid = second->get_header_value("X-Correlation-Id");
+    REQUIRE_FALSE(second_cid.empty());
+    CHECK(second_cid != first_cid);
+    REQUIRE(r.fx.audit_details.size() == after_first + 1);
+    CHECK(r.fx.audit_details.back().starts_with("surface=rest correlation_id=" + second_cid));
+    CHECK(r.fx.audit_details.back().find("idempotent_replay=true") != std::string::npos);
+
+    const auto conflict = post_with_key(r, kKey, R"({"agent_ids":["a1","a2"]})");
+    REQUIRE(conflict);
+    CHECK(conflict->status == 422);
+    CHECK(r.audit_results.back() == "denied");
+    CHECK(r.fx.audit_details.back().starts_with(
+        "surface=rest correlation_id=" + conflict->get_header_value("X-Correlation-Id")));
+    CHECK(r.fx.audit_details.back().find("reason=idempotency_key_conflict") != std::string::npos);
+}
+
+TEST_CASE("workflow.execute audit join: a REST refusal BEFORE the sequence leaves a denied row with the "
+          "correlation id, the reason and no read, lease or send",
+          "[workflow][twin][rest][audit][correlation][security]") {
+    struct Case {
+        const char* name;
+        std::string body;
+        std::unordered_map<std::string, std::string> headers;
+        std::string reason;
+    };
+    const std::string deep = std::string(200, '[') + std::string(200, ']');
+    const std::vector<Case> cases = {
+        {"a bad Idempotency-Key", R"({"agent_ids":["a1"]})", {{"Idempotency-Key", "short"}},
+         "idempotency_key_invalid"},
+        {"a body that nests too deeply", deep, {}, "body_depth"},
+        {"a body that is not JSON", "{not json", {}, "invalid_json"},
+        {"a body of the wrong shape", R"({})", {}, "agent_ids_required"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        Rest r;
+        const auto res = r.sink.dispatch("POST", "/api/v1/workflows/wf-1/execute", c.body,
+                                         "application/json", c.headers);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(body_of(*res)["error"]["reason"] == c.reason);
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        check_rows_carry_cid(r, *res, 1);
+        CHECK(r.audit_results.front() == "denied");
+        CHECK(r.fx.audit_details.front().find("reason=" + c.reason) != std::string::npos);
+        CHECK(r.audit_targets.front() == "wf-1");
+        CHECK(r.fx.get_workflow_calls == 0);
+        CHECK_FALSE(r.fx.engine_called);
+        CHECK_FALSE(r.fx.dispatched_anything());
+        CHECK(r.budget.active() == 0);
+    }
+    SECTION("a lost pre-core row adds Sec-Audit-Failed and the 400 stands") {
+        Rest r;
+        r.fx.audit_ok = false;
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", "{not json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+}
+
+TEST_CASE("workflow.execute audit join: an UNWIRED audit sink is a 503 audit_unavailable with nothing "
+          "read, leased, dispatched or run",
+          "[workflow][twin][rest][audit][failclosed][security]") {
+    Rest r(/*wire_audit=*/false);
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto j = body_of(*res);
+    CHECK(at_path(j, "/error/reason") == "audit_unavailable");
+    CHECK(at_path(j, "/error/retry_after_ms").is_null());
+    CHECK(at_path(j, "/error/correlation_id") == res->get_header_value("X-Correlation-Id"));
+    CHECK(r.gate_calls == 1); // behind the surface gate
+    CHECK(r.fx.get_workflow_calls == 0);
+    CHECK(r.fx.find_calls == 0);
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK_FALSE(r.fx.dispatched_anything());
+    CHECK(r.budget.active() == 0);
+    CHECK(r.fx.events.empty());
+    SECTION("an unauthorised caller learns nothing about the configuration") {
+        Rest denied(/*wire_audit=*/false);
+        denied.gate_admits = false;
+        const auto d = denied.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(d);
+        CHECK(d->status == 403);
+    }
+    SECTION("a malformed id is still the audit defect first, never a silent 400 with no row") {
+        Rest bad(/*wire_audit=*/false);
+        const auto b = bad.sink.Post("/api/v1/workflows/" + std::string(200, 'x') + "/execute",
+                                     R"({"agent_ids":["a1"]})");
+        REQUIRE(b);
+        CHECK(b->status == 503);
+    }
+}
+
+TEST_CASE("workflow.execute audit join: the run port is handed the actor and the call id on an UNKEYED "
+          "run as well as a keyed one",
+          "[workflow][twin][rest][audit][correlation]") {
+    SECTION("REST, unkeyed") {
+        Rest r;
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK_FALSE(r.fx.seen_claim.has_value());
+        CHECK(r.fx.seen_control_principal == "alice");
+        CHECK(r.fx.seen_control_cid == res->get_header_value("X-Correlation-Id"));
+        CHECK_FALSE(r.fx.seen_control_cid.empty());
+    }
+    SECTION("REST, keyed") {
+        Rest r;
+        const auto res = post_with_key(r, kKey);
+        REQUIRE(res);
+        REQUIRE(r.fx.seen_claim.has_value());
+        CHECK(r.fx.seen_claim->principal == "alice");
+        CHECK(r.fx.seen_control_principal == "alice");
+        CHECK(r.fx.seen_control_cid == res->get_header_value("X-Correlation-Id"));
+    }
+    SECTION("the sequence, with a correlation id and approval id on the request") {
+        Fx f;
+        auto req = f.request();
+        req.correlation_id = "cid-123";
+        req.approval_id = "appr-9";
+        const auto out = f.run(req);
+        CHECK(out.status == WorkflowExecuteStatus::kOk);
+        CHECK(f.seen_control_cid == "cid-123");
+        REQUIRE_FALSE(f.audit_details.empty());
+        for (const auto& d : f.audit_details) {
+            INFO(d);
+            CHECK(d.starts_with("surface=test correlation_id=cid-123 approval_id=appr-9"));
+        }
+    }
+    SECTION("a hostile approval id is cleaned and bounded in every row") {
+        Fx f;
+        auto req = f.request();
+        req.correlation_id = "cid-1";
+        req.approval_id = "a b=c\nforged=1" + std::string(500, 'z');
+        (void)f.run(req);
+        for (const auto& d : f.audit_details) {
+            CHECK(d.find('\n') == std::string::npos);
+            CHECK(d.find("forged=1") == std::string::npos);
+            CHECK(d.size() < 400);
+        }
+    }
+}
+
+TEST_CASE("workflow.execute audit join: workflow_audit_target keeps a normal id byte-identical and "
+          "never emits a raw malformed one",
+          "[workflow][twin][audit][security]") {
+    CHECK(workflow_audit_target("wf-1") == "wf-1");
+    CHECK(workflow_audit_target("caf\xc3\xa9") == "caf\xc3\xa9");
+    const auto cleaned = workflow_audit_target(std::string("a\0b\nc\x1b[0m\x7f\xff", 11));
+    for (const char ch : cleaned) {
+        CHECK(static_cast<unsigned char>(ch) >= 0x20);
+        CHECK(static_cast<unsigned char>(ch) != 0x7F);
+    }
+    CHECK(workflow_audit_target(std::string(4096, 'x')).size() <= 131);
+    CHECK_FALSE(audit_workflow_pre_core_denial({}, "surface=rest", "cid", "r", "wf-1"));
+    CHECK_FALSE(audit_workflow_pre_core_denial(
+        [](const std::string&, const std::string&, const std::string&, const std::string&) -> bool {
+            throw std::runtime_error("sink exploded");
+        },
+        "surface=rest", "cid", "r", "wf-1"));
 }

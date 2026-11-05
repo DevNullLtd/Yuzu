@@ -8486,6 +8486,31 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string workflow_id;
                 WorkflowExecuteRequest wreq;
             };
+            // The call's ONE correlation id: the response header, every error body this tool
+            // answers, the run's own row and the `correlation_id=` token of every row this call
+            // writes (the `workflow.execute` rows through the request, the `mcp.execute_workflow`
+            // rows through `mcp_workflow_audit`). `ensure_correlation_id` reuses the header, so the
+            // probe and the handler agree.
+            const auto wf_cid = [&]() { return yuzu::server::detail::ensure_correlation_id(res); };
+            // The approval ticket the call presented, bounded and cleaned for a row; empty when it
+            // presented none. On a recall it is the id the `approved ... consumed approval_id=`
+            // row names, which is how an audit reader joins the run to the human approval.
+            const auto wf_approval_id = [&]() -> std::string {
+                if (const auto it = args.find("approval_id");
+                    it != args.end() && it->is_string())
+                    return it->get<std::string>();
+                return {};
+            };
+            const auto mcp_workflow_audit = [&](const std::string& result_status,
+                                                const std::string& detail_text) {
+                std::string d = detail_text;
+                if (!d.empty())
+                    d += ' ';
+                d += "correlation_id=" + ::yuzu::log_token(wf_cid());
+                if (const auto ap = wf_approval_id(); !ap.empty())
+                    d += " approval_id=" + audit_caller_id(ap);
+                return mcp_audit(result_status, d);
+            };
             // Writes the refusal into `res` and returns nullopt.
             const auto parse_workflow_call = [&]() -> std::optional<WorkflowMcpCall> {
                 // Strict arguments: the C8 schema check only runs for approval-gated callers.
@@ -8493,19 +8518,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (it.key() != "workflow_id" && it.key() != "agent_ids" &&
                         it.key() != "idempotency_key" && it.key() != "approval_id") {
                         res.set_content(
-                            error_response(id, kInvalidParams,
-                                           "unknown argument '" + it.key().substr(0, 64) +
-                                               "'; execute_workflow takes workflow_id, agent_ids, "
-                                               "idempotency_key and approval_id"),
+                            a4_error(kInvalidParams,
+                                     "unknown argument '" + it.key().substr(0, 64) +
+                                         "'; execute_workflow takes workflow_id, agent_ids, "
+                                         "idempotency_key and approval_id",
+                                     {}, -1, wf_cid()),
                             "application/json");
                         return std::nullopt;
                     }
                 }
                 const auto wf_id = param_string_strict(args, "workflow_id");
                 if (!wf_id || wf_id->empty()) {
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "workflow_id must be a non-empty string of at "
-                                                   "most 128 bytes"),
+                    res.set_content(a4_error(kInvalidParams,
+                                             "workflow_id must be a non-empty string of at "
+                                             "most 128 bytes",
+                                             {}, -1, wf_cid()),
                                     "application/json");
                     return std::nullopt;
                 }
@@ -8513,13 +8540,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // parse, the key, the replay lookup, the lease or any ticket. The audit detail
                 // carries the id only bounded and cleaned, never raw.
                 if (const auto bad_id = check_workflow_id(*wf_id)) {
-                    mcp_audit("denied", "reason=" + bad_id->reason + " workflow=" +
-                                            ::yuzu::log_token(
-                                                instruction_execute::bounded_definition_id(*wf_id)));
+                    const bool audit_ok = mcp_workflow_audit(
+                        "denied", "reason=" + bad_id->reason + " workflow=" +
+                                      ::yuzu::log_token(
+                                          instruction_execute::bounded_definition_id(*wf_id)));
                     res.set_content(a4_error(kInvalidParams, bad_id->message,
                                              "fix the workflow id; this input can never succeed "
                                              "as sent",
-                                             -1, {}, true, bad_id->reason),
+                                             -1, wf_cid(), audit_ok, bad_id->reason),
                                     "application/json");
                     return std::nullopt;
                 }
@@ -8535,8 +8563,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
                         }
                     }
-                    mcp_audit("denied", "reason=" + agent_ids.error().reason);
-                    res.set_content(error_response(id, kInvalidParams, agent_ids.error().message), // retry-hint-exempt: input-parse failure, not a store fault
+                    const bool audit_ok =
+                        mcp_workflow_audit("denied", "reason=" + agent_ids.error().reason);
+                    res.set_content(a4_error(kInvalidParams, agent_ids.error().message, {}, -1, // retry-hint-exempt: input-parse failure, not a store fault
+                                             wf_cid(), audit_ok),
                                     "application/json");
                     return std::nullopt;
                 }
@@ -8553,8 +8583,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                "again"}}
                          : check_workflow_idempotency_key(*key);
                 if (key_error) {
-                    mcp_audit("denied", "reason=" + key_error->reason);
-                    res.set_content(error_response(id, kInvalidParams, key_error->message), // retry-hint-exempt: input-parse failure, not a store fault
+                    const bool audit_ok =
+                        mcp_workflow_audit("denied", "reason=" + key_error->reason);
+                    res.set_content(a4_error(kInvalidParams, key_error->message, {}, -1, // retry-hint-exempt: input-parse failure, not a store fault
+                                             wf_cid(), audit_ok),
                                     "application/json");
                     return std::nullopt;
                 }
@@ -8570,6 +8602,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     caller_fn ? caller_fn(*session)
                               : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
                 call.wreq.audit_context = "surface=mcp";
+                call.wreq.correlation_id = wf_cid();
+                call.wreq.approval_id = wf_approval_id();
                 // The run's clock starts when the call is taken, so prepare counts against it.
                 call.wreq.deadline = std::chrono::steady_clock::now() + kWorkflowSyncBudget;
                 return call;
@@ -8654,7 +8688,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // by the sequence itself as kRunFailed (no retry hint, see render_workflow_refusal).
             const auto respond_workflow_threw = [&](const char* what) {
                 spdlog::error("MCP execute_workflow: threw: {}", what);
-                mcp_audit("failure", "exception");
+                const bool audit_ok = mcp_workflow_audit("failure", "exception");
                 res.set_content(
                     a4_error(kInternalError, "workflow execution failed",
                              approval_ticket_just_consumed
@@ -8662,7 +8696,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                    "new approval for the same call and re-call with the same "
                                    "idempotency_key"
                                  : std::string{},
-                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, wf_cid(), audit_ok),
                     "application/json");
             };
             // An execute_workflow run refused at ADMISSION (cap or draining): the same HTTP 429 /
@@ -8677,8 +8711,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                std::to_string((kWorkflowRunCapRetryAfterMs + 999) / 1000));
                 res.set_content(a4_error(draining ? kMcpShuttingDown : kMcpStreamCap, out.message,
                                          out.remediation,
-                                         static_cast<long>(kWorkflowRunCapRetryAfterMs), {}, true,
-                                         out.reason),
+                                         static_cast<long>(kWorkflowRunCapRetryAfterMs), wf_cid(),
+                                         true, out.reason),
                                 "application/json");
             };
             // Leases the run's slot from the ONE shared budget, or answers the refusal. True ==
@@ -8698,20 +8732,21 @@ McpServer::HandlerFn McpServer::build_handler(
             // kNoAgentsReached, which are success envelopes).
             const auto render_workflow_refusal = [&](const WorkflowExecuteOutcome& out) {
                 using WES = WorkflowExecuteStatus;
-                mcp_audit(out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
-                                  out.status == WES::kUnavailable ||
-                                  out.status == WES::kEffectDigestFailed ||
-                                  out.status == WES::kRunFailed
-                              ? "error"
-                              : "denied",
-                          "reason=" + out.reason);
+                const bool audit_ok = mcp_workflow_audit(
+                    out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
+                            out.status == WES::kUnavailable ||
+                            out.status == WES::kEffectDigestFailed || out.status == WES::kRunFailed
+                        ? "error"
+                        : "denied",
+                    "reason=" + out.reason);
+                const std::string cid = wf_cid();
                 switch (out.status) {
                 case WES::kRunFailed: {
                     // The run THREW after steps may have been sent: -32603 with NO retry hint
                     // (retry_after_ms null on purpose; a blind re-send could dispatch twice) and
                     // the typed handles a worker reads the run with, as execute_instruction_definition's
                     // dispatch_exception carries them.
-                    nlohmann::json data{{"correlation_id", yuzu::server::detail::make_correlation_id()},
+                    nlohmann::json data{{"correlation_id", cid},
                                         {"retry_after_ms", nullptr},
                                         {"remediation", out.remediation},
                                         {"reason", out.reason},
@@ -8737,13 +8772,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                        "request a new approval for the same call and re-call "
                                        "with the same idempotency_key"
                                      : std::string{},
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, cid, audit_ok),
                         "application/json");
                     return;
                 case WES::kUnavailable:
                 case WES::kNoPrincipal:
                 case WES::kEffectDigestFailed:
-                    res.set_content(error_response(id, kInternalError, out.message),
+                    res.set_content(a4_error(kInternalError, out.message, {}, -1, cid, audit_ok), // retry-hint-exempt: a missing dependency or an unusable request, not a transient fault
                                     "application/json");
                     return;
                 case WES::kDefinitionChanged:
@@ -8752,7 +8787,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(a4_error(kInvalidParams, out.message,
                                              "the approval ticket is spent; re-request approval "
                                              "for the workflow as it is now and re-call",
-                                             -1, {}, true, out.reason),
+                                             -1, cid, audit_ok, out.reason),
                                     "application/json");
                     return;
                 case WES::kApprovalRequired:
@@ -8760,14 +8795,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kPermissionDenied, out.message,
                                  "run each instruction through its own approval; a workflow only "
                                  "runs steps this caller may run without one. An approval ticket "
-                                 "for this call does not lift a step's own approval mode"),
+                                 "for this call does not lift a step's own approval mode",
+                                 -1, cid, audit_ok),
                         "application/json");
                     return;
                 case WES::kDispatchDenied:
                     // Permanent for this caller: retry_after_ms stays null, and `reason` is the
                     // stable token a worker branches on.
                     res.set_content(a4_error(kPermissionDenied, out.message, out.remediation, -1,
-                                             {}, true, out.reason),
+                                             cid, audit_ok, out.reason),
                                     "application/json");
                     return;
                 case WES::kRunCapReached:
@@ -8776,14 +8812,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 case WES::kExceedsSyncBudget:
                     // A property of the stored workflow, permanent until it is replaced: no hint.
-                    res.set_content(a4_error(kInvalidParams, out.message, out.remediation, -1, {},
-                                             true, out.reason),
+                    res.set_content(a4_error(kInvalidParams, out.message, out.remediation, -1, cid,
+                                             audit_ok, out.reason),
                                     "application/json");
                     return;
                 case WES::kIdempotencyConflict: {
                     // The key is bound to a DIFFERENT request: terminal, no retry hint. The run it
                     // is bound to is the caller's own, so its id is handed back.
-                    nlohmann::json data{{"correlation_id", yuzu::server::detail::make_correlation_id()},
+                    nlohmann::json data{{"correlation_id", cid},
                                         {"retry_after_ms", nullptr},
                                         {"remediation", out.remediation},
                                         {"reason", out.reason},
@@ -8805,7 +8841,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 case WES::kExecuteFailed:
                     break;
                 }
-                res.set_content(error_response(id, kInvalidParams, out.message),
+                res.set_content(a4_error(kInvalidParams, out.message, {}, -1, cid, audit_ok), // retry-hint-exempt: a permanent refusal of this input, not a store fault
                                 "application/json");
             };
 
@@ -8820,9 +8856,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (out.replay_status != kReplayRunning)
-                    mcp_audit("success", "execution_id=" + audit_caller_id(out.execution_id) +
-                                             " idempotent_replay=true run_status=" +
-                                             out.replay_status);
+                    mcp_workflow_audit("success", "execution_id=" + audit_caller_id(out.execution_id) +
+                                                      " idempotent_replay=true run_status=" +
+                                                      out.replay_status);
                 res.set_content(
                     success_response(id, tool_result(workflow_idempotent_replay_json(out, workflow_id)
                                                          .dump(),
@@ -22589,12 +22625,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         if (!out.remediation.empty())
                             payload["remediation"] = out.remediation;
                     }
-                    mcp_audit(out.status == WES::kOk ? "success" : "failure",
-                              "execution_id=" + audit_caller_id(out.execution_id) +
-                                  (out.status == WES::kOk
-                                       ? std::string{}
-                                       : " run_outcome=" +
-                                             std::string(workflow_run_outcome_token(out.run_outcome))));
+                    mcp_workflow_audit(
+                        out.status == WES::kOk ? "success" : "failure",
+                        "execution_id=" + audit_caller_id(out.execution_id) +
+                            (out.status == WES::kOk
+                                 ? std::string{}
+                                 : " run_outcome=" +
+                                       std::string(workflow_run_outcome_token(out.run_outcome))));
                     res.set_content(
                         success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                         "application/json");

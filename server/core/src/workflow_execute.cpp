@@ -369,6 +369,38 @@ std::optional<WorkflowExecuteBodyError> check_workflow_id(std::string_view id) {
     return std::nullopt;
 }
 
+std::string workflow_audit_prefix(const WorkflowExecuteRequest& req) {
+    std::string out = req.audit_context;
+    if (!req.correlation_id.empty())
+        out += " correlation_id=" + ::yuzu::log_token(req.correlation_id);
+    if (!req.approval_id.empty())
+        out += " approval_id=" + clip_token(req.approval_id);
+    return out;
+}
+
+std::string workflow_audit_target(std::string_view workflow_id) {
+    std::string target = instruction_execute::bounded_definition_id(workflow_id);
+    if (instruction_execute::definition_id_needs_audit_fold(workflow_id))
+        target = ::yuzu::log_token(target);
+    return target;
+}
+
+bool audit_workflow_pre_core_denial(const WorkflowAuditFn& audit, std::string_view audit_context,
+                                    std::string_view correlation_id, std::string_view reason,
+                                    std::string_view workflow_id) {
+    try {
+        if (!audit)
+            return false;
+        return audit(std::string(kActionExecute), "denied", workflow_audit_target(workflow_id),
+                     std::string(audit_context) +
+                         " correlation_id=" + ::yuzu::log_token(std::string(correlation_id)) +
+                         " reason=" + ::yuzu::log_token(std::string(reason)) + " workflow=" +
+                         ::yuzu::log_token(instruction_execute::bounded_definition_id(workflow_id)));
+    } catch (...) {
+        return false;
+    }
+}
+
 std::optional<WorkflowExecuteBodyError> check_workflow_idempotency_key(std::string_view key) {
     if (key.size() < kIdempotencyKeyMinLen || key.size() > kIdempotencyKeyMaxLen ||
         !std::all_of(key.begin(), key.end(), idempotency_key_char_ok))
@@ -432,7 +464,7 @@ std::optional<WorkflowExecuteOutcome> check_workflow_idempotency(const WorkflowE
     const auto fingerprint = workflow_request_fingerprint(ports, req.workflow_id, req.agent_ids);
     if (!fingerprint) {
         (void)ports.audit(std::string(kActionExecute), "failure", target_id,
-                          req.audit_context + " reason=request_fingerprint_unavailable" +
+                          workflow_audit_prefix(req) + " reason=request_fingerprint_unavailable" +
                               key_detail);
         return refuse(WorkflowExecuteStatus::kEffectDigestFailed,
                       "the request could not be fingerprinted for its idempotency key",
@@ -454,7 +486,7 @@ std::optional<WorkflowExecuteOutcome> check_workflow_idempotency(const WorkflowE
 
     if (run.request_fingerprint != *fingerprint) {
         (void)ports.audit(std::string(kActionExecute), "denied", target_id,
-                          req.audit_context + " reason=idempotency_key_conflict execution_id=" +
+                          workflow_audit_prefix(req) + " reason=idempotency_key_conflict execution_id=" +
                               clip_token(run.execution_id) + key_detail);
         count_idempotent(ports, "conflict");
         return conflict_outcome(run.execution_id);
@@ -468,7 +500,7 @@ std::optional<WorkflowExecuteOutcome> check_workflow_idempotency(const WorkflowE
     }
     o.audit_persisted = ports.audit(
         std::string(kActionExecute), "success", target_id,
-        req.audit_context + " execution_id=" + clip_token(run.execution_id) +
+        workflow_audit_prefix(req) + " execution_id=" + clip_token(run.execution_id) +
             " idempotent_replay=true run_status=" + o.replay_status + key_detail);
     count_idempotent(ports, "replayed");
     return o;
@@ -833,7 +865,7 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
         // Set-and-proceed: nothing has been dispatched on a refusal, so a lost denial row does
         // not change what the caller is told; the persist outcome is deliberately not consulted.
         (void)ports.audit(std::string(kActionExecute), "denied", target_id,
-                          req.audit_context + " reason=" + std::string(reason) + extra);
+                          workflow_audit_prefix(req) + " reason=" + std::string(reason) + extra);
     };
     auto count_rejected = [&](std::string_view reason) {
         if (ports.count_target_rejected)
@@ -1074,7 +1106,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     const std::string target_id = clip_token(req.workflow_id);
     auto deny_audit = [&](std::string_view reason, const std::string& extra) {
         (void)ports.audit(std::string(kActionExecute), "denied", target_id,
-                          req.audit_context + " reason=" + std::string(reason) + extra);
+                          workflow_audit_prefix(req) + " reason=" + std::string(reason) + extra);
     };
     auto count_rejected = [&](std::string_view reason) {
         if (ports.count_target_rejected)
@@ -1212,6 +1244,8 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     const auto deadline = req.deadline.value_or(std::chrono::steady_clock::now() +
                                                 kWorkflowSyncBudget);
     control.deadline = deadline;
+    control.principal = req.caller.principal;
+    control.correlation_id = clip_token(req.correlation_id);
     control.on_interrupted = [&progress] { progress.interrupted = true; };
     control.on_attempt = [&progress](int step_index, int attempt) {
         progress.current_step = step_index;
@@ -1242,7 +1276,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         const WorkflowRunReplay& won = *progress.replay;
         const bool differs = !claim || won.fingerprint != claim->fingerprint;
         (void)ports.audit(std::string(kActionExecute), "denied", target_id,
-                          req.audit_context + " reason=" +
+                          workflow_audit_prefix(req) + " reason=" +
                               (differs ? "idempotency_key_conflict" : "idempotent_duplicate") +
                               " execution_id=" + clip_token(won.execution_id) +
                               " idempotency_key=" + clip_token(req.idempotency_key));
@@ -1265,7 +1299,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         const std::string msg = db ? "workflow store unavailable"
                                    : gone ? "workflow not found" : run.error();
         (void)ports.audit(std::string(kActionExecute), "failure", target_id,
-                          req.audit_context + " reason=" +
+                          workflow_audit_prefix(req) + " reason=" +
                               (db ? "store_unavailable" : gone ? "workflow_not_found" : "rejected") +
                               (db ? "" : " detail=" + clip_token(run.error())));
         WorkflowExecuteOutcome o = refuse(status, msg, db ? "store_unavailable" : "rejected",
@@ -1392,7 +1426,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         reached_total += static_cast<std::size_t>(n.agents_reached);
     o.audit_persisted = ports.audit(
         std::string(kActionExecute), succeeded ? "success" : "failure", target_id,
-        req.audit_context + " execution_id=" + clip_token(o.execution_id) +
+        workflow_audit_prefix(req) + " execution_id=" + clip_token(o.execution_id) +
             " run_status=" + clip_token(o.run_status) +
             " dispatches=" + std::to_string(o.steps.size()) +
             " agents_reached=" + std::to_string(reached_total) +
@@ -1429,7 +1463,7 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
         auto fingerprint = workflow_request_fingerprint(ports, req.workflow_id, req.agent_ids);
         if (!fingerprint) {
             (void)ports.audit(std::string(kActionExecute), "failure", target_id,
-                              req.audit_context + " reason=request_fingerprint_unavailable" +
+                              workflow_audit_prefix(req) + " reason=request_fingerprint_unavailable" +
                                   " idempotency_key=" + clip_token(req.idempotency_key));
             return refuse(WorkflowExecuteStatus::kEffectDigestFailed,
                           "the request could not be fingerprinted for its idempotency key",
@@ -1441,7 +1475,7 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
 
     // ── 5. the requested row, BEFORE anything is dispatched ──────────────
     if (!ports.audit(std::string(kActionExecute), "requested", target_id,
-                     req.audit_context + " agents=" + std::to_string(req.agent_ids.size()) +
+                     workflow_audit_prefix(req) + " agents=" + std::to_string(req.agent_ids.size()) +
                          " steps=" + std::to_string(plan.step_count) +
                          (req.idempotency_key.empty()
                               ? ""
@@ -1455,7 +1489,7 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
     // run (instruction_execute.cpp's throw arm): a second allocation failure in the arm must not
     // lose the closing row.
     std::string threw_detail =
-        req.audit_context + " run_outcome=" +
+        workflow_audit_prefix(req) + " run_outcome=" +
         std::string(workflow_run_outcome_token(WorkflowRunOutcome::kFailed)) +
         " reason=dispatch_exception";
     WorkflowExecuteOutcome threw = refuse(

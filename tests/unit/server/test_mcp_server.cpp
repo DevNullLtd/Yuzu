@@ -48155,6 +48155,8 @@ struct WfMcpFx {
     std::function<void(int)> on_authorize; // called with the 0-based authorizer call index
     std::function<void()> on_run;          // called inside the run port once the run is admitted
     std::optional<std::chrono::steady_clock::time_point> seen_deadline; // the run's control.deadline
+    std::string seen_control_principal; // the run's control.principal (stored on the run row)
+    std::string seen_control_cid;       // the run's control.correlation_id
     /// When set, the rows a read of a completed run returns (instead of one `success` per step).
     std::vector<yuzu::server::WorkflowStepResult> stored_rows_override;
     std::shared_ptr<yuzu::server::test::FnWorkflowApi> api;
@@ -48273,6 +48275,8 @@ struct WfMcpFx {
             -> std::expected<std::string, std::string> {
             ++run_calls;
             seen_deadline = control.deadline;
+            seen_control_principal = control.principal;
+            seen_control_cid = control.correlation_id;
             // The engine's atomic claim: a key already bound is a replay, nothing admitted;
             // otherwise it is bound to the run being admitted.
             if (control.idempotency) {
@@ -49948,4 +49952,159 @@ TEST_CASE("MCP execute_workflow: the served tool leads with the key, requires it
     REQUIRE(bogus);
     const auto bj = nlohmann::json::parse(bogus->body);
     CHECK(bj["error"]["message"].get<std::string>().find("idempotency_key") != std::string::npos);
+}
+
+
+// ── the audit join (#2146 comp2-1 / ca2-2): the correlation id on every row and error, the
+// approval id on the rows of a call that presented a ticket ────────────────────────────────────
+
+namespace {
+
+/// The detail of every row of `action|result` kind written since `from`, in order.
+std::vector<std::string> wf_rows_since(const McpTestServer& ts, std::size_t from,
+                                       std::string_view action_result) {
+    std::vector<std::string> out;
+    for (std::size_t i = from; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i)
+        if (ts.audit_log[i] == action_result)
+            out.push_back(ts.audit_details[i]);
+    return out;
+}
+
+/// Every row since `from` whose action is `workflow.execute` or `mcp.execute_workflow`.
+std::vector<std::string> wf_call_rows_since(const McpTestServer& ts, std::size_t from) {
+    std::vector<std::string> out;
+    for (std::size_t i = from; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i)
+        if (ts.audit_log[i].starts_with("workflow.execute|") ||
+            ts.audit_log[i].starts_with("mcp.execute_workflow|"))
+            out.push_back(ts.audit_details[i]);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("MCP execute_workflow: a refusal while parsing the call carries the SAME correlation id in the "
+          "audit row, the error data and the response header",
+          "[mcp][workflow][twin][audit][correlation]") {
+    McpTestServer ts;
+    WfExecDispatchProbe probe;
+    ts.start_with_dispatch(probe.fn());
+    struct Row {
+        const char* what;
+        std::string args;
+        std::string reason; // the audit `reason=` token ("" == no audit row is written)
+    };
+    const std::vector<Row> rows = {
+        {"a malformed workflow id",
+         nlohmann::json({{"workflow_id", std::string("foo\x01")},
+                         {"agent_ids", {"a1"}},
+                         {"idempotency_key", kWfDefaultKey}})
+             .dump(),
+         "invalid_workflow_id"},
+        {"a body of the wrong shape",
+         nlohmann::json({{"workflow_id", "wf-1"}, {"idempotency_key", kWfDefaultKey}}).dump(),
+         "agent_ids_required"},
+        {"a missing idempotency key",
+         nlohmann::json({{"workflow_id", "wf-1"}, {"agent_ids", {"a1"}}}).dump(),
+         "idempotency_key_invalid"},
+        {"an unknown argument",
+         nlohmann::json({{"workflow_id", "wf-1"}, {"agent_ids", {"a1"}}, {"surprise", 1}}).dump(),
+         ""},
+    };
+    int rpc = 1;
+    for (const auto& row : rows) {
+        INFO(row.what);
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(wf_exec_call_raw(row.args, rpc++));
+        REQUIRE(res);
+        const std::string cid = res->get_header_value("X-Correlation-Id");
+        REQUIRE_FALSE(cid.empty());
+        const auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("error"));
+        REQUIRE(j["error"].contains("data"));
+        CHECK(j["error"]["data"]["correlation_id"] == cid);
+        if (row.reason.empty())
+            continue;
+        const auto rows_written = wf_call_rows_since(ts, before);
+        REQUIRE(rows_written.size() == 1);
+        INFO(rows_written.front());
+        CHECK(rows_written.front().find("reason=" + row.reason) != std::string::npos);
+        CHECK(rows_written.front().find("correlation_id=" + cid) != std::string::npos);
+        CHECK_FALSE(probe.dispatched);
+    }
+}
+
+TEST_CASE("MCP execute_workflow: every row of a ticketed call carries the correlation id and the "
+          "approval id, and the run row is handed the actor and the call",
+          "[mcp][pg][workflow][twin][security][tier][approval][audit][correlation]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+
+    const std::string approval_id = wf_mint_and_approve(ts, appr);
+
+    SECTION("a refusal after the probe: the denied rows carry both ids") {
+        WfMcpFx::repoint(store, fx.ro_id, "os_info", "os_name");
+        const auto before = ts.audit_log.size();
+        auto moved = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+        REQUIRE(moved);
+        const std::string cid = moved->get_header_value("X-Correlation-Id");
+        REQUIRE_FALSE(cid.empty());
+        const auto mj = nlohmann::json::parse(moved->body);
+        REQUIRE(mj.contains("error"));
+        CHECK(mj["error"]["data"]["correlation_id"] == cid);
+        const auto rows = wf_call_rows_since(ts, before);
+        REQUIRE_FALSE(rows.empty());
+        for (const auto& d : rows) {
+            INFO(d);
+            CHECK(d.find("correlation_id=" + cid) != std::string::npos);
+            CHECK(d.find("approval_id=" + approval_id) != std::string::npos);
+        }
+        CHECK(wf_audit_has(ts, "denied", "reason=definition_changed"));
+    }
+
+    SECTION("a success: requested and closing workflow.execute rows plus the tool row") {
+        const auto before = ts.audit_log.size();
+        auto ok = ts.call(wf_exec_call(wf_recall_args(approval_id), 3));
+        REQUIRE(ok);
+        REQUIRE(nlohmann::json::parse(ok->body).contains("result"));
+        const std::string cid = ok->get_header_value("X-Correlation-Id");
+        REQUIRE_FALSE(cid.empty());
+        const auto requested = wf_rows_since(ts, before, "workflow.execute|requested");
+        const auto closing = wf_rows_since(ts, before, "workflow.execute|success");
+        const auto tool_row = wf_rows_since(ts, before, "mcp.execute_workflow|success");
+        REQUIRE(requested.size() == 1);
+        REQUIRE(closing.size() == 1);
+        REQUIRE(tool_row.size() == 1);
+        for (const auto& d : {requested.front(), closing.front(), tool_row.front()}) {
+            INFO(d);
+            CHECK(d.find("correlation_id=" + cid) != std::string::npos);
+            CHECK(d.find("approval_id=" + approval_id) != std::string::npos);
+        }
+        CHECK(requested.front().starts_with("surface=mcp correlation_id=" + cid));
+        // The run row's actor and call are handed to the engine.
+        CHECK(fx.seen_control_principal == "alice");
+        CHECK(fx.seen_control_cid == cid);
+
+        // A repeat of the key without a ticket is a replay whose row names the REPEAT's call and
+        // presents no approval.
+        const auto before_replay = ts.audit_log.size();
+        auto again = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 4));
+        REQUIRE(again);
+        REQUIRE(nlohmann::json::parse(again->body).contains("result"));
+        const std::string cid2 = again->get_header_value("X-Correlation-Id");
+        CHECK(cid2 != cid);
+        const auto replay = wf_rows_since(ts, before_replay, "workflow.execute|success");
+        REQUIRE(replay.size() == 1);
+        CHECK(replay.front().find("correlation_id=" + cid2) != std::string::npos);
+        CHECK(replay.front().find("idempotent_replay=true") != std::string::npos);
+        CHECK(replay.front().find("approval_id=") == std::string::npos);
+    }
 }

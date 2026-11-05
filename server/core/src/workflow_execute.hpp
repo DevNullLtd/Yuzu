@@ -431,6 +431,17 @@ struct WorkflowExecuteRequest {
     std::vector<std::string> agent_ids; ///< from `parse_workflow_execute_body`: non-empty, bounded
     DispatchCaller caller;
     std::string audit_context; ///< "surface=rest" / "surface=mcp": a literal, never caller text
+    /// The call's ONE correlation id (the response header, the error body and, through
+    /// `workflow_audit_prefix`, the `correlation_id=` token of every `workflow.execute` row this
+    /// call writes). It is also stored on the run's own row, so a row that carries no
+    /// `execution_id` (the `requested` row, a pre-admission refusal) joins to the run by it. Set
+    /// by the transport from its response; empty only in a unit harness, which then stamps nothing.
+    std::string correlation_id;
+    /// MCP only: the approval ticket the caller presented (the one `consume_ticket` spent when the
+    /// call reached the handler), written as `approval_id=` on every row so an audit reader can
+    /// join the run to the human approval without the idempotency key. Empty on REST (no ticket
+    /// flow) and on a call that carried none.
+    std::string approval_id;
     /// MCP supervised tier only: the step effects the consumed ticket was bound to (the probe's
     /// snapshot, whose digest the ticket match proved equal to the approved one). Unset on REST,
     /// which has no ticket, and on any call that carried none: nothing then holds the lookup.
@@ -751,6 +762,31 @@ prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecut
 /// would read as a retryable 503 for an input that can never succeed. The message never echoes
 /// the id. `nullopt` == fine.
 [[nodiscard]] std::optional<WorkflowExecuteBodyError> check_workflow_id(std::string_view id);
+
+/// The leading detail of EVERY `workflow.execute` row of a call: `audit_context`, then
+/// `correlation_id=<id>` and, when a ticket was presented, `approval_id=<id>`, each value cleaned
+/// and bounded. The single place the join tokens are spelled, so a row written by a new code path
+/// cannot forget them. Ends without a trailing space; callers append ` key=value` tokens.
+[[nodiscard]] std::string workflow_audit_prefix(const WorkflowExecuteRequest& req);
+
+/// The `target_id` column for a `workflow.execute` row written BEFORE the sequence runs (and so for
+/// an id that may be malformed): the id bounded, and folded through `log_token` when it holds a
+/// control byte, invalid UTF-8 or a code point `log_token` folds. A normal id is returned
+/// byte-identical (bounded). Never the raw malformed id: `sanitize_pg_text` repairs only invalid
+/// UTF-8 and NUL, so any other control byte would otherwise reach the column verbatim.
+[[nodiscard]] std::string workflow_audit_target(std::string_view workflow_id);
+
+/// The `denied` row for a REST refusal that happens BEFORE the sequence runs (a malformed id, a bad
+/// `Idempotency-Key`, a body that nests too deeply, does not parse or fails the shape check), the
+/// twin of `instruction_execute::audit_pre_core_denial`. Detail is `surface=rest
+/// correlation_id=<id> reason=<reason> workflow=<id>`, every value cleaned and bounded. Returns
+/// whether the row persisted (a sink that throws reads as not persisted); the caller sets
+/// `Sec-Audit-Failed` on a lost row and the 400 itself stands.
+[[nodiscard]] bool audit_workflow_pre_core_denial(const WorkflowAuditFn& audit,
+                                                  std::string_view audit_context,
+                                                  std::string_view correlation_id,
+                                                  std::string_view reason,
+                                                  std::string_view workflow_id);
 
 /// Bound-checks a client idempotency key: 8 to 128 bytes of `[A-Za-z0-9._:-]`. `nullopt` == fine.
 /// The transport calls it before any ticket, lease or read, so a bad key spends nothing. The

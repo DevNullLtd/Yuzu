@@ -2672,6 +2672,51 @@ TEST_CASE("WorkflowEngine idempotency: a key with no principal or no fingerprint
     CHECK(insert("e9", "", nullptr, nullptr).status() == PGRES_COMMAND_OK); // keyless: no claim
 }
 
+TEST_CASE("WorkflowEngine audit join: the run row stores the actor and the call id whether or not the "
+          "call is keyed, and NULL when the caller supplied none",
+          "[workflow_engine][pg][execute][audit][correlation]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kOneStepYaml);
+    const auto run = [&](const std::string& principal, const std::string& cid,
+                         std::optional<WorkflowIdempotencyClaim> claim) {
+        WorkflowRunControl control;
+        control.principal = principal;
+        control.correlation_id = cid;
+        control.idempotency = std::move(claim);
+        StepDispatchFn fn = [](const std::string&, const std::string&, const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            return std::string(R"({"status":"ok"})");
+        };
+        auto r = engine.execute(wf_id, {"agent-1"}, fn, nullptr, control);
+        REQUIRE(r.has_value());
+        return *r;
+    };
+    const std::string base = "SELECT count(*) FROM workflow_engine.workflow_executions WHERE id = '";
+
+    const auto unkeyed = run("alice", "req-aaa-1", std::nullopt);
+    CHECK(count_rows(wf_db_fx_.dsn(), base + unkeyed + "' AND principal = 'alice' AND "
+                                      "correlation_id = 'req-aaa-1' AND idempotency_key IS NULL AND "
+                                      "request_fingerprint IS NULL") == 1);
+
+    const auto keyed = run("bob", "req-bbb-2", claim_of("bob", "key-0123456789", "fp-A"));
+    CHECK(count_rows(wf_db_fx_.dsn(), base + keyed + "' AND principal = 'bob' AND "
+                                      "correlation_id = 'req-bbb-2' AND idempotency_key = "
+                                      "'key-0123456789'") == 1);
+
+    // No principal or call id (the legacy route, a system caller): NULL, never an empty string.
+    const auto bare = run("", "", std::nullopt);
+    CHECK(count_rows(wf_db_fx_.dsn(), base + bare + "' AND principal IS NULL AND "
+                                      "correlation_id IS NULL") == 1);
+
+    // The audit join works on the call id: one run per id.
+    CHECK(count_rows(wf_db_fx_.dsn(),
+                     "SELECT count(*) FROM workflow_engine.workflow_executions WHERE "
+                     "correlation_id = 'req-aaa-1'") == 1);
+
+    // Unkeyed rows never touch the idempotency unique index: the same actor may run again.
+    CHECK(run("alice", "req-aaa-3", std::nullopt) != unkeyed);
+}
+
 TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK and the partial unique "
           "index to a v2 store, and a fresh store gets the same",
           "[workflow_engine][pg][schema][idempotency][migration]") {
@@ -2688,7 +2733,7 @@ TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK 
         return std::array<std::int64_t, 5>{
             query_count("SELECT count(*) FROM information_schema.columns WHERE table_schema = "
                         "'workflow_engine' AND table_name = 'workflow_executions' AND column_name IN "
-                        "('principal', 'idempotency_key', 'request_fingerprint')"),
+                        "('principal', 'idempotency_key', 'request_fingerprint', 'correlation_id')"),
             query_count("SELECT count(*) FROM pg_constraint WHERE conname = 'wf_exec_idem_complete'"),
             query_count("SELECT count(*) FROM pg_constraint WHERE conname = 'wf_exec_idem_complete' "
                         "AND pg_get_constraintdef(oid) LIKE '%principal <> ''''::text%'"),
@@ -2698,7 +2743,7 @@ TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK 
             query_count("SELECT version FROM public.schema_meta WHERE store = 'workflow_engine'")};
     };
     using Shape = std::array<std::int64_t, 5>;
-    constexpr Shape kV3{3, 1, 1, 1, 3};
+    constexpr Shape kV3{4, 1, 1, 1, 3};
     const auto run_ddl = [&](std::initializer_list<const char*> statements) {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -2722,7 +2767,8 @@ TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK 
     // Put the store back at v2 exactly as an earlier build left it, then open it again.
     run_ddl({kDropIndex, kDropCheck,
              "ALTER TABLE workflow_engine.workflow_executions DROP COLUMN principal, "
-             "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint",
+             "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint, "
+             "DROP COLUMN correlation_id",
              kRewind});
     CHECK(v3_artifacts() == Shape{0, 0, 0, 0, 2});
     {
@@ -2736,7 +2782,7 @@ TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK 
 
     // v3 applied a third time over a complete v3 (a rewound version stamp) is a no-op.
     run_ddl({kRewind});
-    CHECK(v3_artifacts() == Shape{3, 1, 1, 1, 2});
+    CHECK(v3_artifacts() == Shape{4, 1, 1, 1, 2});
     {
         WorkflowEngine again{pool};
         REQUIRE(again.is_open());
@@ -2747,15 +2793,24 @@ TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK 
     {
         // columns only (no CHECK, no index)
         run_ddl({kDropIndex, kDropCheck, kRewind});
-        CHECK(v3_artifacts() == Shape{3, 0, 0, 0, 2});
+        CHECK(v3_artifacts() == Shape{4, 0, 0, 0, 2});
         WorkflowEngine a{pool};
         REQUIRE(a.is_open());
         CHECK(v3_artifacts() == kV3);
     }
     {
+        // the v3 of an earlier draft (three columns, no correlation_id), index and CHECK present:
+        // the missing column is added in place, the rest is kept
+        run_ddl({"ALTER TABLE workflow_engine.workflow_executions DROP COLUMN correlation_id", kRewind});
+        CHECK(v3_artifacts() == Shape{3, 1, 1, 1, 2});
+        WorkflowEngine d{pool};
+        REQUIRE(d.is_open());
+        CHECK(v3_artifacts() == kV3);
+    }
+    {
         // columns and the index, no CHECK (the index built by hand ahead of the migration)
         run_ddl({kDropCheck, kRewind});
-        CHECK(v3_artifacts() == Shape{3, 0, 0, 1, 2});
+        CHECK(v3_artifacts() == Shape{4, 0, 0, 1, 2});
         WorkflowEngine b{pool};
         REQUIRE(b.is_open());
         CHECK(v3_artifacts() == kV3);
@@ -2763,7 +2818,7 @@ TEST_CASE("WorkflowEngine idempotency: migration v3 adds the columns, the CHECK 
     {
         // columns, index and the CHECK without the empty-principal clause: replaced, not kept
         run_ddl({kDropCheck, kAddOldCheck, kRewind});
-        CHECK(v3_artifacts() == Shape{3, 1, 0, 1, 2});
+        CHECK(v3_artifacts() == Shape{4, 1, 0, 1, 2});
         WorkflowEngine c{pool};
         REQUIRE(c.is_open());
         CHECK(v3_artifacts() == kV3);

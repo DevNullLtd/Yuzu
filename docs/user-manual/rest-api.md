@@ -6708,9 +6708,10 @@ nothing is sent.
 
 | Status | `error.reason` | Meaning |
 |---|---|---|
-| `400` | `body_type`, `agent_ids_required`, `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `agent_id_len`, `agent_ids_count`, `scope_unsupported` | The body failed the targeting shape check. |
-| `400` | `invalid_workflow_id` | The workflow id in the path is empty, longer than 128 bytes, holds a control byte (below `0x20` or `0x7F`, NUL included) or is not valid UTF-8 (for example a percent-encoded `%00` or `%FF`). Never retryable: it can never succeed as sent. Checked first, before the key, the body, admission or any read, so nothing is leased, read, written or sent; the message does not echo the id. |
-| `400` | `idempotency_key_invalid` | The `Idempotency-Key` header is not 8 to 128 characters from `A-Z a-z 0-9 . _ : -`, or was sent more than once. Checked before anything is read or leased. |
+| `400` | `body_type`, `agent_ids_required`, `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `agent_id_len`, `agent_ids_count`, `scope_unsupported` | The body failed the targeting shape check. A `denied` audit row is written. |
+| `400` | `body_depth`, `invalid_json` | The body nests too deeply or is not JSON. A `denied` audit row is written. |
+| `400` | `invalid_workflow_id` | The workflow id in the path is empty, longer than 128 bytes, holds a control byte (below `0x20` or `0x7F`, NUL included) or is not valid UTF-8 (for example a percent-encoded `%00` or `%FF`). Never retryable: it can never succeed as sent. Checked first, before the key, the body, admission or any read, so nothing is leased, read or sent; the message does not echo the id. One `denied` audit row is written, carrying the id cut to 128 bytes and neutralised. |
+| `400` | `idempotency_key_invalid` | The `Idempotency-Key` header is not 8 to 128 characters from `A-Z a-z 0-9 . _ : -`, or was sent more than once. Checked before anything is read or leased. A `denied` audit row is written. |
 | `400` | `workflow_no_steps` | The workflow exists but has no steps. |
 | `400` | `unknown_instruction` | A step names an instruction that does not exist. |
 | `400` | `step_unclassified` | A step's `plugin.action` is not in the capability catalogue. |
@@ -6726,13 +6727,14 @@ nothing is sent.
 | `500` | `no_principal` | The session has no principal. |
 | `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
 | `503` | `draining` | Admission: the server is shutting down and starts no new run. `Retry-After: 5` and `retry_after_ms: 5000`; nothing was read, sent or audited. Retry against another replica or after the restart. |
+| `503` | `audit_unavailable` | The server has no audit sink wired (a configuration defect, `retry_after_ms: null`, `Sec-Audit-Failed: true`), or the `requested` row could not be saved. Nothing was read, leased, run or sent. |
 | `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
 | `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). Also the answer to an unexpected fault BEFORE the `requested` row (the preflight half): nothing was sent, so retrying is safe. A failed idempotency lookup is this too: it is never treated as "no run is bound to the key", so nothing is written and nothing is sent. |
 | `500` | `request_fingerprint_unavailable` | A keyed call whose request fingerprint (a SHA-256) could not be computed. Audited (`failure`); nothing was sent. |
 | `503` | `audit_unavailable` | The `requested` row could not be saved (`Sec-Audit-Failed: true`); nothing was sent. |
 | `503` | a zero-reach cause | The run started and no step reached any agent (below). |
 
-**Audit.** A keyed call carries `idempotency_key=<key>` in its `requested` and closing rows. A terminal
+**Audit.** Every `workflow.execute` row of a call starts `surface=rest correlation_id=<id>`, the value of the response's `X-Correlation-Id` header and of the error body's `correlation_id`; the run's own row stores the same `correlation_id` and the caller's `principal`, keyed or not, so a `requested` row (written before any execution id exists) and an orphaned run join by it. A keyed call carries `idempotency_key=<key>` in its `requested` and closing rows. A refusal before the sequence runs (`invalid_workflow_id`, `idempotency_key_invalid`, `body_depth`, `invalid_json`, the body-shape reasons above) writes ONE `denied` row (`reason=<reason> workflow=<id cut to 128 bytes and neutralised>`; `target_id` is the same cleaned id, never the raw malformed one) and nothing else; a lost row adds `Sec-Audit-Failed: true` and the `400` stands. A server with no audit sink wired answers every call `503` `audit_unavailable` with `Sec-Audit-Failed: true` and `retry_after_ms: null` (a configuration defect) right after the permission check, before anything is read, leased or sent. A terminal
 replay (every status but `running`) writes one `success` row (`idempotent_replay=true
 run_status=<the replay's status>`, the first-answer class in the table below, not the engine's
 word); a `running` replay writes none (counted on

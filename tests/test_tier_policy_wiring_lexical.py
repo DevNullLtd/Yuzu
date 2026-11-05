@@ -77,7 +77,8 @@ call site would pass every existing test. This gate closes that:
      admission refuse a new run once shutdown begins); the run adapter's
      `return engine->execute(..., control);` (the whole control reaches the
      engine, never `{}`; `on_admitted` travels inside it, the engine has no positional parameter); `wf_deps.audit_fn` and `wf_deps.persist_audit_fn` (the REST route's audit
-     sinks; an unwired sink passes vacuously as "audit off"); and `workflow_engine_->set_should_stop`
+     sinks; an unwired sink is a 503 audit_unavailable for every caller, so a dropped line
+     refuses every workflow run in production); and `workflow_engine_->set_should_stop`
      with its body (stop wins over draining); and the idempotency pre-check beside the run port
      (`WorkflowIdempotencyLookupFn`, workflow_run_port.hpp, NOT a `WorkflowApi` method):
      `return engine->find_execution_by_key(caller.principal, idempotency_key);` (the principal is the
@@ -184,7 +185,7 @@ WORKFLOW_PIN_ADVICE = {
     "set_workflow_idempotency_lookup_fn": "'mcp_server_->set_workflow_idempotency_lookup_fn("
                                           "workflow_idempotency_lookup_fn);' -- unwired, every MCP execute_workflow "
                                           "call (all keyed) is refused as 'engine not available'",
-    "wf_deps.audit_fn": "'wf_deps.audit_fn = audit_fn;' -- an unwired sink is 'audit off' to the workflow route",
+    "wf_deps.audit_fn": "'wf_deps.audit_fn = audit_fn;' -- an unwired sink makes the workflow route answer 503 audit_unavailable",
     "wf_deps.persist_audit_fn": "'wf_deps.persist_audit_fn = audit_fn;' -- the persisted sink the route prefers; "
                                 "unwired it falls back to the best-effort one",
     "set_should_stop": "'workflow_engine_->set_should_stop([this] {...});' with stop_requested_ -> kStop checked "
@@ -406,7 +407,7 @@ class TierPolicyWiringLexical(unittest.TestCase):
                          RUN_ADAPTER_TAIL.replace("condition_fn), control", "condition_fn), "
                                                   "yuzu::server::WorkflowRunControl{}"), 1),
              ["engine->execute"]),
-            ("T33 the workflow route audit sink dropped (compiles: unwired is audit off)",
+            ("T33 the workflow route audit sink dropped (compiles: the route then refuses every run 503)",
              src.replace(AUDIT_FN_LINE, AUDIT_FN_LINE.replace("wf_deps.audit_fn", "wf_deps.unrelated"), 1),
              ["wf_deps.audit_fn"]),
             ("T34 the workflow route persisted audit sink dropped",

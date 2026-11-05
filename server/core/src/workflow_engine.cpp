@@ -120,21 +120,26 @@ const std::vector<pg::PgMigration>& migrations() {
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE instruction_id LIKE 'crossplatform.tar.%';"
          "UPDATE workflows SET yaml_source = replace(yaml_source, "
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE yaml_source LIKE '%crossplatform.tar.%';"},
-        // v3 (#2146, idempotent execute): a client key claimed on the run's own row. NULL on every
-        // keyless run (the legacy route and any call that sent no key), so the partial UNIQUE index
-        // holds only keyed rows and a keyless INSERT never touches it. The CHECK makes a key
-        // without its principal or fingerprint unstorable (a NULL principal never conflicts under
-        // a unique index, so such a row would silently stop being idempotent) and an empty
-        // principal unstorable (it would be one shared key namespace). Plain (transactional)
-        // index build on a table the fresh-database hard cutover guarantees is empty
-        // (docs/postgres-store-playbook.md "Recorded exception"). No backfill: an existing run
-        // has no key. Every statement is re-run safe (a rewound version stamp, or an index built
-        // by hand ahead of the migration): the CHECK is dropped before it is added.
+        // v3 (#2146, idempotent execute): a client key claimed on the run's own row, plus the
+        // run's actor and call. `idempotency_key` and `request_fingerprint` are NULL on every
+        // keyless run (the legacy route and any call that sent no key), so the partial UNIQUE
+        // index holds only keyed rows and a keyless INSERT never touches it. `principal` and
+        // `correlation_id` are stored on EVERY run the execute twins start, keyed or not (NULL
+        // for the legacy route), so an unkeyed run still names its actor and the audit rows that
+        // carry the same `correlation_id=` join to it. The CHECK makes a key without its principal
+        // or fingerprint unstorable (a NULL principal never conflicts under a unique index, so
+        // such a row would silently stop being idempotent) and an empty principal unstorable (it
+        // would be one shared key namespace); it says nothing about the unkeyed row's columns.
+        // Plain (transactional) index build on a table the fresh-database hard cutover guarantees
+        // is empty (docs/postgres-store-playbook.md "Recorded exception"). No backfill: an
+        // existing run has no key. Every statement is re-run safe (a rewound version stamp, or an
+        // index built by hand ahead of the migration): the CHECK is dropped before it is added.
         {3,
          "ALTER TABLE workflow_executions "
          "  ADD COLUMN IF NOT EXISTS principal           TEXT,"
          "  ADD COLUMN IF NOT EXISTS idempotency_key     TEXT,"
-         "  ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;"
+         "  ADD COLUMN IF NOT EXISTS request_fingerprint TEXT,"
+         "  ADD COLUMN IF NOT EXISTS correlation_id      TEXT;"
          "ALTER TABLE workflow_executions DROP CONSTRAINT IF EXISTS wf_exec_idem_complete;"
          "ALTER TABLE workflow_executions ADD CONSTRAINT wf_exec_idem_complete CHECK ("
          "  idempotency_key IS NULL OR "
@@ -765,26 +770,31 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     WorkflowRunReplay replay;
     const auto& claim = control.idempotency;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // `principal` and `correlation_id` are stored on every row the twins admit (NULL when the
+        // caller supplied none); a KEYED row's principal is the claim's, the key's namespace.
         pg::PgResult ires = claim
             ? pg::exec_params(
                   conn,
                   "INSERT INTO workflow_engine.workflow_executions "
                   "(id, workflow_id, status, agent_ids_json, started_at, current_step, "
-                  " principal, idempotency_key, request_fingerprint) "
-                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0, $5, $6, $7 "
+                  " principal, idempotency_key, request_fingerprint, correlation_id) "
+                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0, $5, $6, $7, NULLIF($8, '') "
                   "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
                   "ON CONFLICT (principal, idempotency_key) WHERE idempotency_key IS NOT NULL "
                   "DO NOTHING RETURNING id",
                   std::vector<std::string>{exec_id, workflow_id, agent_str, now, claim->principal,
-                                           claim->key, claim->fingerprint})
+                                           claim->key, claim->fingerprint,
+                                           control.correlation_id})
             : pg::exec_params(
                   conn,
                   "INSERT INTO workflow_engine.workflow_executions "
-                  "(id, workflow_id, status, agent_ids_json, started_at, current_step) "
-                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0 "
+                  "(id, workflow_id, status, agent_ids_json, started_at, current_step, "
+                  " principal, correlation_id) "
+                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0, NULLIF($5, ''), NULLIF($6, '') "
                   "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
                   "RETURNING id",
-                  std::vector<std::string>{exec_id, workflow_id, agent_str, now});
+                  std::vector<std::string>{exec_id, workflow_id, agent_str, now,
+                                           control.principal, control.correlation_id});
         if (ires.status() != PGRES_TUPLES_OK) {
             spdlog::error("WorkflowEngine::execute: execution insert failed: {}",
                           PQresultErrorMessage(ires.get()));
