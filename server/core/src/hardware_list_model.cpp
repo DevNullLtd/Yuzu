@@ -222,11 +222,11 @@ std::vector<std::string_view> ci_columns(const DeviceCiSectionDef& def) {
 }
 
 /// `ci.sections`: one entry per section the device reported, in registry order. `complete` is true
-/// only for level `ok` after the row-count and content-digest checks (`verify_section_content`). Rows are served
-/// only for `ok` and `constrained` (a constrained section is
-/// a bounded or partial projection, so its `complete:false` is the whole point); every other level
-/// - `unavailable`, `permission_denied`, or a level this server does not know - renders its reason
-/// and no rows, even if rows were somehow stored.
+/// only for level `ok` after the row-count and content-digest checks (`verify_section_content`).
+/// Rows are served only for `ok` and `constrained` (a constrained section is a bounded or partial
+/// projection, so its `complete:false` is the whole point); every other level - `unavailable`,
+/// `permission_denied`, or a level this server does not know - renders its reason and no rows,
+/// even if rows were somehow stored.
 nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
                                 const std::vector<DeviceCiSection>& sections) {
     nlohmann::json out = nlohmann::json::array();
@@ -999,6 +999,8 @@ SectionVerdict verify_section_content(const DeviceCiSection& section) {
         return v; // the count already reports the loss; a lost row always changes the digest too
     if (!section.content_digest.has_value())
         return v; // not verifiable: served as the count rule left it
+    if (!section_digest_is_current(*section.content_digest))
+        return v; // a layout version this build cannot recompute: unverified, never a mismatch
     if (section.level != "ok" && section.level != "constrained")
         return v; // no rows by contract: nothing to hash
     const auto idx = device_ci_section_index(section.kind);

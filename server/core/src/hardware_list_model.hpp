@@ -225,7 +225,8 @@ inline constexpr std::string_view kSectionRowCountMismatchReason = "server:row_c
 /// number of child rows actually read (up-2: a child table emptied out of band, e.g. a partial
 /// single-table restore or a manual DELETE, must never read as a complete section).
 ///
-/// The one decision, pure (no store, no PG). Rules:
+/// The count half of the served decision (`verify_section_content` below is the function every
+/// serving path calls and composes this with the content digest). Pure (no store, no PG). Rules:
 ///  - `row_count == nullopt` (a status-only kind, or a row written before migration v3): the
 ///    section is served exactly as stored - never verified, never downgraded.
 ///  - `rows.size() == *row_count`: exactly as stored.
@@ -254,8 +255,10 @@ inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:
 /// anything that serves raw `get_device_ci_sections` levels must call it.
 ///
 /// Pure. Rules, on top of the row-count rules above:
-///  - `content_digest == nullopt` (a status-only kind, or a row written before the digest
-///    existed): not verifiable, served as the row-count rule left it.
+///  - `content_digest == nullopt` (a status-only kind, or a row written before migration v3):
+///    not verifiable, served as the row-count rule left it. So is a stored value that does not
+///    start with the layout prefix this build writes (`section_digest_is_current`, `v1:`): a
+///    layout this build cannot recompute is UNVERIFIED, never a mismatch.
 ///  - `unavailable`, `permission_denied`, an unknown or blank level: never touched (no rows by
 ///    contract).
 ///  - If the row count already disagrees, that verdict is returned alone: the count token is the

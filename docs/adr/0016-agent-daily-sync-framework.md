@@ -812,8 +812,12 @@ rows that were read are still served.
 
 The status row also records `content_digest` (the same migration v3, additive and nullable): the
 SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
-count, row count, then each row's position and cells), computed by the server from the rows it
-inserts in the same transaction, never taken from the agent. One pure function
+count, row count, then each row's position and cells, with any NUL byte in a cell skipped because the
+store cannot keep one), computed by the server from the rows it inserts in the same transaction,
+never taken from the agent. It is stored as `v1:<64 hex>`: the prefix names the preimage layout, and a
+stored value in a layout this server does not know is treated as unverified, never as a mismatch, so a
+later layout change or a registry column change (see the warning in `device_ci_kinds.hpp`) cannot
+raise a false integrity alarm on every stored row. One pure function
 (`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
 read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
 row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
@@ -827,10 +831,15 @@ level or reason. It closes the same-count content drift that the count alone cou
 store NULL for both, are not verified, and read exactly as before.
 Only a full replace records the count and repairs a mismatched section: a device whose hash is
 unchanged sends only a hash, which leaves the rows alone, so this happens on a hardware change, an
-operator Sync now, or the weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
+operator Sync now of the device record (`POST /api/v1/hardware/{id}/sync`; the fleet-wide route and the
+MCP `sync_hardware_software` tool re-send installed software only and do not repair a section), or the
+weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
 for up to a week after upgrade. The wire format and the agent are unchanged. Migration 3 is a single
-additive `ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL, ADD COLUMN content_digest
-TEXT NULL` (the digest column is folded into v3 because v3 had not shipped). The rollback note above
+additive `ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, ADD COLUMN IF
+NOT EXISTS content_digest TEXT NULL` (the digest column is folded into v3 because v3 had not shipped;
+the runner is gated on the recorded version only, so a development database that already recorded the
+earlier row-count-only v3 must have its `schema_meta` version for this store set back to 2 or be
+recreated). The rollback note above
 holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
 there, so the sections it writes are unverified until a v3 server next does a full replace for that
 device.

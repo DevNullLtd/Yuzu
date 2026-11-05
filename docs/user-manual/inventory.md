@@ -1219,22 +1219,28 @@ sync, defeating the hash-skip protocol.
   `server:row_count_mismatch` means the rows stored for the section no longer match the count
   recorded when the device last synced in full (rows were lost outside the product, for example
   a partial database restore), so the section is served `constrained` and incomplete with the
-  rows that remain. Only a full sync repairs it (a device whose hardware has not changed sends
-  only a hash on its daily sync, which leaves the rows alone): run **Sync now** on the device,
-  or wait for its next hardware change or the weekly full report (at most 7 days). A section
-  stored before this check existed has no recorded count and is not checked until that
-  device's next full sync, so a freshly upgraded server verifies a device only after that
-  sync. `server:content_digest_mismatch` means the number of rows still matches but the rows
-  no longer hash to the digest the server recorded beside the section's status when the device
-  last synced in full (a row was edited, or the rows were swapped for another sync's out of
-  band): the section is served `constrained` and incomplete, with the rows that were read, but
+  rows that remain. `server:content_digest_mismatch` means the number of rows still matches but
+  the rows no longer hash to the digest the server recorded beside the section's status when the
+  device last synced in full (a row was edited, or the rows were swapped for another sync's out
+  of band): the section is served `constrained` and incomplete, with the rows that were read, but
   those rows are **not** the values the agent reported, so do not rely on them. A lost row
-  reports `server:row_count_mismatch` alone. Both are repaired only by a full sync (see above),
-  and a section stored before the digest existed has none and is checked by its row count
-  alone until that sync. The digest is computed by the server from the rows it stored (never
-  taken from the agent) and is an integrity check against accident and non-malicious drift,
-  not tamper resistance: someone who can write the table can rewrite the digest. It covers the
-  rows only, not the section's `status` or `reason`.
+  reports `server:row_count_mismatch` alone. Neither token is stored: both are worked out each
+  time the record is read, so they never appear in the `device_ci_section` query further down.
+  Reading the record again does not clear either token. **Only a full device-record sync
+  repairs it** (a device whose hardware has not changed sends only a hash on its daily sync,
+  which leaves the rows alone): use **Sync now** on the device's Hardware page, or
+  `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
+  `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed
+  software only and do not repair a section. Otherwise it clears on the device's next hardware
+  change or its weekly full report (at most 7 days). A section stored before these checks existed
+  (before migration 3) has neither a recorded count nor a digest and is not verified until that
+  device's next full sync, so a freshly upgraded server verifies a device only after that sync.
+  The digest is computed by the server from the rows it was about to insert (the same projection
+  that is stored; never taken from the agent) and is an integrity check against accident and
+  non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
+  digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
+  layout version prefix (`v1:` then the SHA-256); a stored digest in a layout this server does
+  not know is treated as unverified, never as a mismatch.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.

@@ -27,15 +27,16 @@ struct DeviceCiSection {
     /// inserts): the child-row count persisted with the section's status row, so an out-of-band
     /// loss of child rows is detectable. nullopt = a status-only kind, or a row written before
     /// migration v3 - not verifiable, and read exactly as before. See `verify_section_row_count`
-    /// (hardware_list_model.hpp) for the one decision that consumes it.
+    /// (hardware_list_model.hpp), the count half of the decision `verify_section_content` serves.
     std::optional<int> row_count;
     /// READ SIDE ONLY (the writer derives it from the rows it inserts, never from the agent): the
-    /// SHA-256 of the canonical serialization of the section's child rows
+    /// `v1:` + SHA-256 of the canonical serialization of the section's child rows
     /// (`section_content_digest`, device_ci_section_digest.hpp), persisted with the status row so an
     /// out-of-band edit, restore or swap of child rows - including one that keeps the row count -
-    /// is detectable. nullopt = a status-only kind, or a row written before the digest existed:
-    /// not verifiable, read exactly as before. An integrity check against accident, NOT tamper
-    /// resistance. See `verify_section_content` (hardware_list_model.hpp).
+    /// is detectable. nullopt = a status-only kind, or a row written before migration v3: not
+    /// verifiable, read exactly as before; so is a value in a layout this build does not know. An
+    /// integrity check against accident and non-malicious drift, NOT tamper resistance. See
+    /// `verify_section_content` (hardware_list_model.hpp).
     std::optional<std::string> content_digest;
 };
 

@@ -29,7 +29,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -1546,10 +1548,10 @@ TEST_CASE("section_content_digest: row order is part of the content and the kind
     const Rows rev{{"d1", "2", "s"}, {"d0", "1", "s"}};
     const auto& swap = def_of("swap");
     CHECK(section_content_digest(swap, fwd) != section_content_digest(swap, rev));
-    // Stable: the same rows always give the same 64-hex digest.
+    // Stable: the same rows always give the same v1 digest (prefix plus 64 hex).
     const auto d = section_content_digest(swap, fwd);
     REQUIRE(d.has_value());
-    CHECK(d->size() == 64);
+    CHECK(d->size() == 3 + 64);
     CHECK(d == section_content_digest(swap, fwd));
     // Same bytes under another kind of the same width never collide.
     const auto& other = def_of("swap");
@@ -1559,8 +1561,9 @@ TEST_CASE("section_content_digest: row order is part of the content and the kind
 }
 
 // Pins the serialization itself: a silent change would make every stored digest read as drift.
+// Two rows, so a position that does not advance (every row at ord 0) is caught.
 TEST_CASE("section_content_preimage layout is pinned", "[hardware][model][sections][digest]") {
-    const std::string pre = section_content_preimage("swap", 3, Rows{{"a", "", "c"}});
+    const std::string pre = section_content_preimage("swap", 3, Rows{{"a", "", "c"}, {"d", "e", "f"}});
     std::string want = "yuzu.device_ci.section.v1";
     auto u64 = [&](std::uint64_t v) {
         for (int sh = 56; sh >= 0; sh -= 8)
@@ -1572,12 +1575,59 @@ TEST_CASE("section_content_preimage layout is pinned", "[hardware][model][sectio
     };
     str("swap");
     u64(3); // ncol
-    u64(1); // nrows
-    u64(0); // ord
+    u64(2); // nrows
+    u64(0); // ord of the first row
     str("a");
     str("");
     str("c");
+    u64(1); // ord of the second row
+    str("d");
+    str("e");
+    str("f");
     CHECK(pre == want);
+}
+
+// A hard-coded vector, computed outside the code under test (python hashlib over the layout above):
+// the digest function itself, prefix included, cannot drift without this failing.
+TEST_CASE("section_content_digest: a fixed input has a fixed v1 digest", "[hardware][model][sections][digest]") {
+    const auto d = section_content_digest(def_of("swap"), Rows{{"a", "", "c"}, {"d", "e", "f"}});
+    REQUIRE(d.has_value());
+    CHECK(*d == "v1:3e77875b5c562ab906284410143716a347521d08e6b9a6e3dc44fd5a3c94c2c4");
+}
+
+TEST_CASE("section_content_digest: the stored form is the v1 prefix then 64 lowercase hex",
+          "[hardware][model][sections][digest]") {
+    const auto d = section_content_digest(def_of("cpu"), cpu_rows(2));
+    REQUIRE(d.has_value());
+    CHECK(d->size() == 3 + 64);
+    CHECK(d->substr(0, 3) == "v1:");
+    CHECK(section_digest_is_current(*d));
+    for (const char c : d->substr(3))
+        CHECK(((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')));
+    CHECK_FALSE(section_digest_is_current(d->substr(3))); // the bare-hex form of an intermediate build
+    CHECK_FALSE(section_digest_is_current("v2:" + d->substr(3)));
+    CHECK_FALSE(section_digest_is_current("V1:" + d->substr(3)));
+    CHECK_FALSE(section_digest_is_current(""));
+    CHECK_FALSE(section_digest_is_current("v1"));
+}
+
+// Kills: a digest over the cell WITH its NULs. pg::to_text_array drops 0x00 on store, so the cell
+// reads back without it and the stored digest must be of that projection.
+TEST_CASE("section_content_digest: a NUL byte in a cell is skipped to match what the store keeps",
+          "[hardware][model][sections][digest]") {
+    const auto& disk = def_of("disk");
+    const std::string nul("m\0x", 3);
+    REQUIRE(nul.size() == 3);
+    CHECK(section_content_digest(disk, Rows{{"0", nul, "1", "ssd", "sata"}}) ==
+          section_content_digest(disk, Rows{{"0", "mx", "1", "ssd", "sata"}}));
+    // A cell of only NULs is the blank cell; a NUL does not hide a following cell boundary.
+    CHECK(section_content_digest(disk, Rows{{"0", std::string(2, '\0'), "1", "ssd", "sata"}}) ==
+          section_content_digest(disk, Rows{{"0", "", "1", "ssd", "sata"}}));
+    CHECK(section_content_digest(disk, Rows{{"0", "m", "x", "ssd", "sata"}}) !=
+          section_content_digest(disk, Rows{{"0", nul, "1", "ssd", "sata"}}));
+    // A section hand-built with a NUL cell verifies, not a permanent mismatch.
+    auto s = digested_section("disk", "ok", "", Rows{{"0", nul, "1", "ssd", "sata"}});
+    CHECK(verify_section_content(s).level == "ok");
 }
 
 TEST_CASE("verify_section_content: an intact section is served exactly as stored",
@@ -1659,6 +1709,66 @@ TEST_CASE("verify_section_content: a NULL digest leaves the section as the count
     CHECK(verify_section_content(s).reason == "server:row_count_mismatch");
 }
 
+// Kills: a verifier that early-returns on a stored digest of the wrong length, or compares only a
+// prefix of it (fail-open on a corrupt column). A value that carries the v1 prefix is a digest this
+// build can recompute, so any difference from it is a mismatch.
+TEST_CASE("verify_section_content: a wrong or damaged v1 digest is a mismatch",
+          "[hardware][model][sections][digest]") {
+    const auto good = section_content_digest(def_of("cpu"), cpu_rows(2));
+    REQUIRE(good.has_value());
+    const std::string hex = good->substr(3);
+    std::string upper = hex;
+    for (auto& c : upper)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    const std::string bad_values[] = {
+        "v1:deadbeef",                               // garbage, short
+        "v1:",                                       // prefix only
+        "v1:" + hex.substr(0, 8),                    // truncated to 8
+        "v1:" + hex.substr(0, 63),                   // one short
+        "v1:" + hex + "0",                           // one long
+        "v1:" + hex.substr(0, 8) + std::string(56, '0'), // right head, wrong tail
+        "v1:" + upper,                               // case changed
+    };
+    for (const auto& bad : bad_values) {
+        INFO(bad);
+        auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+        s.content_digest = bad;
+        const auto v = verify_section_content(s);
+        CHECK(v.level == "constrained");
+        CHECK(v.reason == "server:content_digest_mismatch");
+    }
+}
+
+// Kills: treating a layout this build cannot recompute as drift (a false alarm on every row after a
+// future layout bump), and the reverse, treating it as verified.
+TEST_CASE("verify_section_content: a stored digest with an unknown prefix is unverified and not a mismatch",
+          "[hardware][model][sections][digest]") {
+    const auto good = section_content_digest(def_of("cpu"), cpu_rows(2));
+    REQUIRE(good.has_value());
+    const std::string hex = good->substr(3);
+    for (const std::string& stored : {hex, "v2:" + hex, "V1:" + hex, std::string("sha256:") + hex, std::string("x")}) {
+        INFO(stored);
+        auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+        s.content_digest = stored;
+        s.rows[0][1] = "Edited"; // would be a mismatch if the digest were understood
+        const auto v = verify_section_content(s);
+        CHECK(v.level == "ok");
+        CHECK(v.reason.empty());
+    }
+}
+
+// Kills: skipping the digest when no rows remain. With the count unknown (NULL) a section whose
+// rows have all gone is visible only to the digest.
+TEST_CASE("verify_section_content: a digest-only loss of every row is a mismatch",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+    s.row_count.reset();
+    s.rows.clear();
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:content_digest_mismatch");
+}
+
 TEST_CASE("verify_section_content: levels with no rows by contract are never touched",
           "[hardware][model][sections][digest]") {
     for (const char* level : {"unavailable", "permission_denied", "novel", ""}) {
@@ -1696,4 +1806,21 @@ TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and
     CHECK(c["reason"] == "server:content_digest_mismatch");
     CHECK(c["rows"].size() == 2); // served, but NOT the reported generation: see the verdict doc
     CHECK(section_of(j, "disk")["complete"] == true);
+}
+
+// The digest binds n_fields; the INSERT and SELECT use the parsed column list. They must agree for
+// every kind (also a build-time static_assert in device_ci_kinds.hpp; this reports which kind).
+TEST_CASE("registry: n_fields equals the column count of every table-backed kind",
+          "[hardware][model][sections][digest]") {
+    for (const auto& d : kDeviceCiSections) {
+        INFO(d.section);
+        const std::string_view cols{d.columns};
+        if (d.table == nullptr) {
+            CHECK(cols.empty());
+            CHECK(d.n_fields == 0);
+            continue;
+        }
+        const auto n = 1 + std::count(cols.begin(), cols.end(), ',');
+        CHECK(n == d.n_fields);
+    }
 }

@@ -2194,10 +2194,33 @@ TEST_CASE("a v2 database upgrades to v3 in place and existing sections have no c
     // The next full replace (hardware change, Sync now or the weekly floor) arms the check.
     REQUIRE(put_record(store, "agent-up", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
     CHECK(persisted_row_counts(pool, "agent-up").at("dimm") == "2");
-    CHECK(persisted_digests(pool, "agent-up").at("dimm").size() == 64);
+    CHECK(persisted_digests(pool, "agent-up").at("dimm").size() == 3 + 64);
+    CHECK(persisted_digests(pool, "agent-up").at("dimm").substr(0, 3) == "v1:");
     CHECK(served_section(store, "agent-up", "dimm")["complete"] == true);
     exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-up'");
     CHECK(served_section(store, "agent-up", "dimm")["reason"] == "server:row_count_mismatch");
+}
+
+// Kills: migration 3 without IF NOT EXISTS. The runner is gated on the recorded version number
+// only, so a database that already has the columns but is rewound to version 2 (the fix for a
+// database that ran an earlier build of v3) must run migration 3 again without failing.
+TEST_CASE("migration 3 is re-runnable over a database that already has its columns",
+          "[pg][device_ci][migration][v3][digest]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_record(seed, "agent-rr", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
+    }
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store'");
+    DeviceInventoryStore store{pool}; // runs migration 3 over the existing columns
+    REQUIRE(store.is_open());
+    // Data written before the re-run is untouched and the columns still work.
+    CHECK(persisted_row_counts(pool, "agent-rr").at("dimm") == "2");
+    CHECK(served_section(store, "agent-rr", "dimm")["complete"] == true);
+    REQUIRE(put_record(store, "agent-rr", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
 }
 
 // ── The persisted per-section content digest (migration v3, up2r-up-3) ─────────────────────────
@@ -2240,7 +2263,8 @@ TEST_CASE("v2 ingest persists a server-computed content digest per table-backed 
         CHECK(digests.at(sec.kind) == yuzu::server::section_content_digest(def, sec.rows).value());
     }
     // An empty table-backed section still carries a digest (a verified empty).
-    CHECK(digests.at("swap").size() == 64);
+    CHECK(digests.at("swap").size() == 3 + 64);
+    CHECK(digests.at("swap").substr(0, 3) == "v1:");
     // An untouched device serves exactly as before.
     CHECK(served_section(store, "agent-dg", "dimm")["complete"] == true);
     CHECK(served_section(store, "agent-dg", "cpu")["complete"] == true);
@@ -2367,4 +2391,141 @@ TEST_CASE("a full replace rewrites the content digest (never stale)", "[pg][devi
     // The same content again gives the same digest (deterministic).
     REQUIRE(put_record(store, "agent-rw", blob_with_dimm_size(2, 2, "16384")) == InventoryIngestOutcome::kStored);
     CHECK(persisted_digests(pool, "agent-rw").at("dimm") == d2);
+}
+
+// Kills: a verifier that early-returns on a stored digest that is not 64 characters (a truncated or
+// garbage column reading as verified), or one that compares only the head of it. A stored value
+// WITH the v1 prefix is a digest this build recomputes, so any difference from it is a mismatch.
+TEST_CASE("a corrupt v1 content digest is served constrained with the digest reason",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::pair<const char*, const char*> corruptions[] = {
+        {"garbage", "'v1:deadbeef'"},
+        {"prefix only", "'v1:'"},
+        {"truncated to 8 hex", "left(content_digest, 11)"},
+        {"one char short", "left(content_digest, 66)"},
+        {"right head wrong tail", "left(content_digest, 11) || repeat('0', 56)"},
+        {"upper-cased hex", "'v1:' || upper(substr(content_digest, 4))"},
+    };
+    for (const auto& [what, expr] : corruptions) {
+        INFO(what);
+        REQUIRE(put_record(store, "agent-cd", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+        const auto stored = persisted_digests(pool, "agent-cd").at("dimm");
+        // The upper-casing case is only a change if the hex has a letter in it: pin that.
+        REQUIRE(stored.find_first_of("abcdef", 3) != std::string::npos);
+        REQUIRE(served_section(store, "agent-cd", "dimm")["complete"] == true);
+        exec_stmt(pool, std::string("UPDATE device_inventory_store.device_ci_section SET content_digest = ") +
+                            expr + " WHERE agent_id = 'agent-cd' AND kind = 'dimm'");
+        const auto dimm = served_section(store, "agent-cd", "dimm");
+        CHECK(dimm["status"] == "constrained");
+        CHECK(dimm["complete"] == false);
+        CHECK(dimm["reason"] == "server:content_digest_mismatch");
+        CHECK(dimm["rows"].size() == 2);
+        // Siblings keep their own digest.
+        CHECK(served_section(store, "agent-cd", "cpu")["complete"] == true);
+    }
+}
+
+// Kills: reading a layout this build does not know as drift. The bare-hex form is what an
+// intermediate build of this branch stored; a future prefix is the case the version exists for.
+TEST_CASE("a content digest with an unknown prefix is unverified and the section reads as before",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(put_record(store, "agent-up2", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+    const char* forms[] = {"substr(content_digest, 4)", "'v2:' || substr(content_digest, 4)"};
+    for (const char* expr : forms) {
+        INFO(expr);
+        exec_stmt(pool, std::string("UPDATE device_inventory_store.device_ci_section SET content_digest = ") +
+                            expr + " WHERE agent_id = 'agent-up2' AND kind = 'dimm'");
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci_dimm SET part_number = 'EDITED' "
+                        "WHERE agent_id = 'agent-up2'");
+        const auto dimm = served_section(store, "agent-up2", "dimm");
+        CHECK(dimm["status"] == "ok");
+        CHECK(dimm["complete"] == true);
+        CHECK(dimm["reason"].is_null());
+    }
+    // The row count keeps guarding on its own.
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-up2' AND ord = 1");
+    CHECK(served_section(store, "agent-up2", "dimm")["reason"] == "server:row_count_mismatch");
+}
+
+// Kills: a digest taken over the cell with its NUL while the table keeps it without (permanent
+// false mismatch for a hand-built record, which the ingest seam never produces).
+TEST_CASE("a cell with a NUL byte is stored without it and still verifies",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto rec = blob_with_rows(1, 2);
+    bool patched = false;
+    for (auto& sec : rec.sections)
+        if (sec.kind == "dimm") {
+            REQUIRE_FALSE(sec.rows.empty());
+            sec.rows[0][4] = std::string("Sam\0sung", 8); // manufacturer
+            REQUIRE(sec.rows[0][4].size() == 8);
+            patched = true;
+        }
+    REQUIRE(patched);
+    REQUIRE(put_record(store, "agent-nul", rec) == InventoryIngestOutcome::kStored);
+    const auto dimm = served_section(store, "agent-nul", "dimm");
+    REQUIRE(dimm["rows"].size() == 2);
+    CHECK(dimm["rows"][0]["manufacturer"] == "Samsung"); // the NUL is not stored
+    CHECK(dimm["status"] == "ok");
+    CHECK(dimm["complete"] == true);
+    CHECK(dimm["reason"].is_null());
+}
+
+// Every registered kind goes through the same write path. Iterates the WHOLE registry, so a kind
+// added later (or one whose digest write is skipped) fails here instead of reading unverified
+// forever. Status-only kinds persist NULL for both columns.
+TEST_CASE("every registered kind persists its row count and a v1 digest and status-only kinds persist neither",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::vector<std::vector<std::string>> recs;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        recs.push_back({"status", d.section, "ok", ""});
+        if (d.table == nullptr)
+            continue;
+        std::vector<std::string> row{d.section};
+        for (int k = 0; k < d.n_fields; ++k)
+            row.push_back("v" + std::to_string(k));
+        recs.push_back(std::move(row));
+    }
+    const auto rec = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+    REQUIRE(put_record(store, "agent-all", rec) == InventoryIngestOutcome::kStored);
+
+    const auto counts = persisted_row_counts(pool, "agent-all");
+    const auto digests = persisted_digests(pool, "agent-all");
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        INFO(d.section);
+        REQUIRE(counts.count(d.section) == 1);
+        REQUIRE(digests.count(d.section) == 1);
+        if (d.table == nullptr) {
+            CHECK(counts.at(d.section) == "NULL");
+            CHECK(digests.at(d.section) == "NULL");
+            continue;
+        }
+        CHECK(counts.at(d.section) == "1");
+        const auto& dg = digests.at(d.section);
+        REQUIRE(dg.size() == 3 + 64);
+        CHECK(dg.substr(0, 3) == "v1:");
+        CHECK(dg.find_first_not_of("0123456789abcdef", 3) == std::string::npos);
+        CHECK(served_section(store, "agent-all", d.section)["complete"] == true);
+    }
 }

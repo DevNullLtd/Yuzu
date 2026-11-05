@@ -79,6 +79,18 @@ struct DeviceCiSectionDef {
                          ///< lowering a budget to dodge the 80% assert fails the build.
 };
 
+// WARNING - stored integrity data depends on this table. For every table-backed kind the store
+// persists `device_ci_section.row_count` and `content_digest`, and the digest preimage binds the
+// kind's `section` name, `n_fields` and column order (device_ci_section_digest.hpp). Changing
+// `section`, `n_fields` or the column list/order of a kind that is already stored makes every
+// stored digest of that kind recompute differently, so the section would read as
+// `server:content_digest_mismatch` (a false integrity alarm) until each device's next full sync,
+// up to the weekly floor. A hash-only daily report does NOT rewrite rows. Do one of: (a) bump the
+// digest layout prefix (`kSectionDigestPrefix`) so old values read as unverified, or (b) ship a
+// migration that sets `row_count` and `content_digest` to NULL for that kind. Adding a new
+// table-backed kind is safe (it gets a digest automatically); the whole-registry test in
+// test_device_inventory_store.cpp fails if a kind persists none.
+//
 // The last column is row_floor: the width measured from a captured sample for cpu, dimm (once
 // manufacturer, part and serial are filled), disk and volume. partition is measured on Windows
 // only (76 to 85 wire bytes, 2026-11-04) and ASSUMED for Linux and macOS; topology is ASSUMED
@@ -149,6 +161,34 @@ inline constexpr std::size_t kDeviceCiSectionCount = std::size(kDeviceCiSections
     return sum;
 }
 
+/// The digest preimage binds `n_fields`, while the INSERT and the read-side SELECT use the parsed
+/// `columns` list: the two must describe the same width or every stored digest of the kind reads
+/// as drift. A table-backed kind's `n_fields` equals its comma-separated column count; a
+/// status-only kind has no columns.
+[[nodiscard]] constexpr bool device_ci_columns_match_n_fields() {
+    for (const auto& d : kDeviceCiSections) {
+        const std::string_view cols{d.columns};
+        if (d.table == nullptr) {
+            if (!cols.empty() || d.n_fields != 0)
+                return false;
+            continue;
+        }
+        if (cols.empty())
+            return false;
+        int n = 1;
+        for (const char c : cols)
+            if (c == ',')
+                ++n;
+        if (n != d.n_fields)
+            return false;
+    }
+    return true;
+}
+
+static_assert(device_ci_columns_match_n_fields(),
+              "device_ci_kinds.hpp: a table-backed section's n_fields differs from its column count "
+              "(or a status-only section declares columns); the content digest binds n_fields and the "
+              "store uses the column list, so they must agree");
 static_assert(device_ci_row_budgets_sane(),
               "device_ci_kinds.hpp: a row budget is outside [row_floor, clamp-bound row], a "
               "row_floor is below the shortest possible row, or a status-only section declares "

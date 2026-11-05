@@ -161,11 +161,16 @@ std::string migration_v2_sql() {
 // both written in the same transaction as the rows. NULL = status-only kind (no child rows) or a
 // row written before v3 (unknown) - both read exactly as before (never verified). Nullable with
 // no default and no CHECK: the ALTERs are metadata-only and cannot fail on existing rows.
-// v3 is unreleased, so the digest column is folded into it rather than adding a v4.
+// v3 is unreleased, so the digest column is folded into it rather than adding a v4. The ADDs are
+// IF NOT EXISTS so a re-run is harmless, BUT the runner is gated on the recorded version number
+// only (no checksum): a database that already recorded the earlier row_count-only v3 will NOT run
+// this again and lacks content_digest (every full ingest then fails at section_insert and the
+// sections read is a 503). Reset such a dev/UAT database before use - set its schema_meta version
+// for this store back to 2 and restart, or recreate the store schema.
 // Unqualified DDL - the runner sets search_path to the store schema.
 constexpr const char* kMigrationV3Sql =
-    "ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL, "
-    "ADD COLUMN content_digest TEXT NULL;";
+    "ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, "
+    "ADD COLUMN IF NOT EXISTS content_digest TEXT NULL;";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -493,8 +498,11 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             // Computed from exactly what is about to be stored (short rows pad, long rows
             // truncate to the registry's columns - the same rule the INSERT applies below).
             const auto digest = section_content_digest(def, sec.rows);
-            if (!digest)
-                return fail("digest");
+            if (!digest) {
+                const bool failed = fail("digest");
+                fail_err = "digest_provider_failed"; // no libpq statement failed: name the cause
+                return failed;
+            }
             digests.push_back(*digest);
             if (sec.rows.empty()) {
                 row_counts.emplace_back("0"); // table-backed, nothing inserted
