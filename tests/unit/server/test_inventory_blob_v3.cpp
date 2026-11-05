@@ -563,6 +563,54 @@ TEST_CASE("v3 drops a 17th token and a nameless row", "[server][inventory_blob_v
     CHECK(s2.sections[0].refusal == V3Refusal::kSourceMismatch);
 }
 
+TEST_CASE("v3 a 0x1E or 0x1F byte inside a field frames the record and never reaches a parsed field",
+          "[server][inventory_blob_v3]") {
+    // The stored canonical records (row and component hashes, identity_key segments) rely on no
+    // stored field holding a separator. The parser splits on both bytes, so a producer that
+    // leaves one inside a name or path shifts or cuts its record; it can never store one.
+    const auto clean = [](std::string_view f) { return f.find_first_of("\x1e\x1f") == f.npos; };
+    const auto comp_rec = [](std::string_view name, std::string_view path) {
+        return rec({"comp", "jar", name, "1.0", "pom", path, "10", "20", "App"});
+    };
+    const auto comp_sec = [&](const std::string& record) {
+        const V3Report r = parse_ok(header() + sec("component_inventory", "full") + record);
+        REQUIRE(r.sections.size() == 1);
+        return r.sections[0];
+    };
+
+    // 0x1F in a path: the fields shift (size reads the tail of the path as 0); nothing kept
+    // carries the byte.
+    const auto shifted = comp_sec(comp_rec("core", std::string("/opt/a") + kFs + "b.jar"));
+    CHECK(shifted.refusal == V3Refusal::kNone);
+    REQUIRE(shifted.components.size() == 1);
+    const auto& c = shifted.components[0];
+    CHECK(c.path == "/opt/a");
+    CHECK(c.size == 0);
+    CHECK(c.mtime == 10);
+    CHECK(c.anchor_app == "20");
+    for (const auto f : {std::string_view(c.kind), std::string_view(c.name), std::string_view(c.version),
+                         std::string_view(c.version_source), std::string_view(c.path),
+                         std::string_view(c.anchor_app)})
+        CHECK(clean(f));
+
+    // 0x1F in a name: the shift lands a version in version_source, refused.
+    const auto by_name = comp_sec(comp_rec(std::string("log4j") + kFs + "core", "/opt/a.jar"));
+    CHECK(by_name.refusal == V3Refusal::kBadVersionSource);
+    CHECK(by_name.components.empty());
+
+    // 0x1E in a path: the record ends there and its tail is an unknown record, refused.
+    const auto cut = comp_sec(comp_rec("core", std::string("/opt/a") + kRs + "b.jar"));
+    CHECK(cut.refusal == V3Refusal::kUnknownRecord);
+    CHECK(cut.components.empty());
+
+    // 0x1F in a `+` row name shifts the source slot: refused as a source mismatch.
+    const V3Report row = parse_ok(header() + sec(kApps, "full") +
+                                  plus(std::string("Al") + kFs + "pha", kApps));
+    REQUIRE(row.sections.size() == 1);
+    CHECK(row.sections[0].refusal == V3Refusal::kSourceMismatch);
+    CHECK(row.sections[0].rows.empty());
+}
+
 TEST_CASE("v3 empty records are skipped", "[server][inventory_blob_v3]") {
     std::string blob = header() + sec(kApps, "full");
     blob += kRs; // an empty record
