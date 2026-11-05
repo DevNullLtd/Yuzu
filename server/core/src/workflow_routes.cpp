@@ -2403,7 +2403,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                     workflow_engine, instruction_store,
                                                     cmd_dispatch, cmd_dispatch_concurrency,
                                                     caller_fn, approval_manager,
-                                                    capability_registry, metrics](  // BR2-001/BR3-001
+                                                    capability_registry, metrics,
+                                                    stream_budget = deps.stream_budget,
+                                                    draining = deps.draining,
+                                                    run_budget = deps.workflow_run_budget](  // BR2-001/BR3-001
                                                         const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -2447,6 +2450,32 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             caller_fn ? caller_fn(req)
                       : yuzu::server::DispatchCaller{
                             .exec_visible = yuzu::server::authz::deny_all()};
+
+        // The run's clock starts here (everything below, the reads included, counts against it).
+        const auto run_deadline = std::chrono::steady_clock::now() +
+            run_budget.value_or(std::chrono::milliseconds{yuzu::server::kWorkflowSyncBudget});
+
+        // ADMISSION (#2146 op-3): this handler holds a worker for the whole synchronous run, so it
+        // takes the SAME lease through the SAME admit_workflow_run() as POST /api/v1/workflows/
+        // {id}/execute and MCP execute_workflow, keyed by the same principal: walking to this route
+        // must not escape the per-principal or global cap, or a draining server's refusal. Placed
+        // before the workflow and instruction reads below. A stack local, so every return and a
+        // throw release it. A refusal wrote and read nothing: no audit row (the counter is its
+        // record), nothing dispatched.
+        auto admission = yuzu::server::admit_workflow_run(stream_budget, draining,
+                                                          caller.principal, metrics);
+        if (admission.refusal) {
+            const auto& refused = *admission.refusal;
+            res.status = refused.status == yuzu::server::WorkflowExecuteStatus::kDraining ? 503 : 429;
+            res.set_header(
+                "Retry-After",
+                std::to_string((yuzu::server::kWorkflowRunCapRetryAfterMs + 999) / 1000));
+            detail::A4ErrorOpts opts;
+            opts.retry_after_ms = yuzu::server::kWorkflowRunCapRetryAfterMs;
+            opts.remediation = refused.remediation;
+            res.set_content(detail::a4_error(res, refused.message, opts), "application/json");
+            return;
+        }
 
         // --- Pre-validate approval gates on all workflow steps ---------------
         // If any instruction in the workflow requires approval, reject the
@@ -2802,7 +2831,22 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return evaluate_compliance_bool(expression, fields);
         };
 
-        auto result = workflow_engine->execute(workflow_id, agent_ids, dispatch_fn, condition_fn);
+        // Bounded like the v1 twin: no dispatch attempt starts at or after the deadline and no
+        // retry delay runs past it; the engine then closes the execution `failed` (remaining steps
+        // skipped). Nothing else of the v1 sequence applies here (no prepare split, no
+        // reauthorize, no sleep precheck); the hook only records that the bound was what stopped
+        // the run, so the audit row can say so.
+        bool deadline_hit = false;
+        yuzu::server::WorkflowRunControl control;
+        control.deadline = run_deadline;
+        control.before_attempt = [&deadline_hit, run_deadline] {
+            if (std::chrono::steady_clock::now() < run_deadline)
+                return true;
+            deadline_hit = true;
+            return false;
+        };
+        auto result = workflow_engine->execute(workflow_id, agent_ids, dispatch_fn, condition_fn,
+                                               nullptr, control);
 
         if (!result) {
             if (yuzu::server::is_generic_db_error(result.error())) {
@@ -2848,7 +2892,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      "reason=" + late_targeting_reason + " (late; execution_id=" + *result + ")");
         } else {
             audit_fn(req, "workflow.execute", "success", "workflow", workflow_id,
-                     "execution_id=" + *result);
+                     "execution_id=" + *result +
+                         (deadline_hit ? " (run stopped: deadline_exceeded)" : ""));
         }
         emit_fn("workflow.executed", req);
         res.set_header(

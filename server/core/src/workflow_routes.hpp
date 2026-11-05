@@ -28,6 +28,7 @@
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -166,6 +167,9 @@ public:
         /// True while the server is draining; the synchronous workflow-run routes refuse new runs
         /// then (the budget itself does not consult its closing flag). Unset = never draining.
         std::function<bool()> draining;
+        /// Test seam: the wall-clock bound of one run on the LEGACY `POST /api/workflows/{id}/execute`
+        /// route. Unset = `kWorkflowSyncBudget` (60 s), the production value; nothing wires it.
+        std::optional<std::chrono::milliseconds> workflow_run_budget;
         AuthFn auth_fn;
         PermFn perm_fn;
         /// Side-effect-free permission probe for RENDERING decisions only (never a gate):

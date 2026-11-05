@@ -6580,6 +6580,22 @@ A step refused at send time by the targeting gate is recorded failed at once, wi
 retry sleep. If a step throws, the engine closes the execution `failed` (never left `running`),
 marks its remaining steps `skipped`, and the request fails with the server's generic `500`.
 
+**Admission and run bound (#2146).** This route holds one HTTP worker for the whole run, so it
+takes the same held-open slot as [`POST /api/v1/workflows/{id}/execute`](#post-apiv1workflowsidexecute)
+and MCP `execute_workflow`, through the same admission step and keyed by the same principal: a
+slot held by a run on any of the three counts against all of them. It is taken after the
+permission check and the body check and before the workflow or any instruction is read. A
+principal that already has 2 runs in progress, or a full server-wide held-open budget, is refused
+`429`, and a draining server `503`, each with `Retry-After: 5`, `retry_after_ms: 5000` in the
+error body and nothing read, sent or audited (the refusal is counted on
+`yuzu_server_workflow_run_refused_total{reason}`). The slot is released when the response is
+written, whatever the outcome. The run is bounded to 60 seconds from the moment the request is
+taken: no dispatch attempt starts after that, a retry delay is cut to the time left, the remaining
+steps are skipped and the execution is closed `failed`. The answer is unchanged (`202`, `status: running`) and the `workflow.execute` audit detail gains ` (run stopped: deadline_exceeded)`, so
+read the run with `GET /api/workflow-executions/{id}`. Unlike the v1 twin, this route does not
+refuse up front a workflow whose retry sleeps could exceed 60 seconds, and does not re-check the
+caller's credential between steps.
+
 **Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). Such a token runs a workflow through the MCP tool `execute_workflow`, which takes an approval ticket (`-32006` with an `approval_id`, approval, recall), or from a session or a non-MCP API token. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
 
 #### `GET /api/workflow-executions/{id}`
@@ -13081,7 +13097,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 
 This stream holds an HTTP worker thread for as long as the drawer stays open, so it leases
 from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, MCP streamed POST,
-`GET /api/v1/events`, and the legacy `/events` stream (ADR-0034). That means enough open
+`GET /api/v1/events`, the legacy `/events` stream and synchronous workflow runs (ADR-0034). That means enough open
 drawers — or enough traffic on any of the other surfaces — can cause a *new* drawer to be
 refused with `429`. A live stream is never evicted to make room.
 
@@ -13187,7 +13203,7 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 
 This endpoint holds an HTTP worker thread open for the life of the subscription, so it
 leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
-executions drawer, MCP streamed POST, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+executions drawer, MCP streamed POST, the legacy `/events` stream and synchronous workflow runs (ADR-0034). A cap hit rejects the
 *new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:
