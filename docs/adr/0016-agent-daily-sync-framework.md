@@ -160,8 +160,11 @@ Therefore we **coexist, not replace**:
   sources that need fleet-wide queries. `installed_software` is the first;
   future high-query sources get their own typed table in this store. Built per
   the `OfflineEndpointStore` template + ADR-0012 + the postgres-store-playbook:
-  - **Current-state only** (replace on change). No history in central PG —
-    change-history stays an edge/Echo concern (ADR-0004 boundary).
+  - **Current-state only** (replace on change) for the inventory rows. One
+    exception, recorded in the 2026-11-04 Update (schema v11): a per-device
+    install history (`software_changes`, 400 days, clock-guarded prune) is kept
+    in central PG; any wider change-history is an edge/Echo concern (ADR-0004
+    boundary).
   - **Normalized relational rows**, **no JSONB/GIN** — honors the
     "migrate off Postgres easily" constraint. Generic parent
     `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` +
@@ -920,6 +923,12 @@ directory, so it is classified like the `list` column above. It is erased on dec
 or log line carries it). The server stores it as sent after the field step, without minimisation,
 so **the agent writer must not send per-user paths**: that precondition is owned by the change
 that starts sending slot 13, which must also test that no profile path is emitted.
+The change ledger (the 2026-11-04 Update, schema v11) keeps a copy for its retention window:
+`software_changes.identity_key` carries the lower-cased location as its last segment for 400
+days, past the hard delete of the `installed_software` row (`delete_agent` removes the ledger
+rows with the device). That is accepted because the producer sends no per-user paths (the
+precondition above), so the copy names machine-scope roots only, and nothing reads the ledger
+back.
 
 **`install_type` and `install_scope`.** Both are derived by the server at insert time and are
 never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
@@ -1076,19 +1085,25 @@ not verify is rolled back alone and the others of the call still apply.
 - On success the facet state is `delta` with `expect` as its section hash and the report hash is
   recomputed.
 
-**Change ledger (`software_changes`).** Every applied section writes one row per install, remove
+**Change ledger (`software_changes`).** Every applied installed-software section (a component
+section writes none) writes one row per install, remove
 or upgrade, in the same transaction (one `unnest()` statement per section). `observed_at` is the
 replica's own server clock in whole seconds (not the database clock) and, with `agent_id`, groups
 the rows of one apply call: calls for an agent are serialised by its advisory lock, but two calls
 inside the same second share an `observed_at`, so rows are ordered by `change_id` within a group.
 A row's identity is its `instance_key`, stored on the ledger row. The rows come from a pure
-diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`; one removed row pairs
-with one added row of the same identity stem (`identity_key` with its version segment blanked), in
-sorted `instance_key` order. A pair whose versions differ is one `upgrade(from, to)`; a pair whose
-versions are EQUAL (install_date, signature, publisher spelling or location churn) writes no row;
-leftovers are `remove` and `install`. **There are no tombstones on `installed_software`**: a
-removal is a hard delete plus a `remove` row carrying name, publisher and version, so no read
-needs a `removed_at` filter.
+diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`. A row's version is
+the (`epoch`, `version`, `release`) tuple, so a release-only or epoch-only change (a distribution
+backport, a Flatpak commit) is an update. Within one identity stem (`identity_key` with its
+version segment blanked) both sides are sorted by (tuple, `instance_key`): a removed and an added
+row with an EQUAL tuple pair first and write no row (install_date, signature, or a location
+spelling that normalises equal); the rest pair k-th to k-th in tuple order as one
+`upgrade(from, to)` each; leftovers are `remove` and `install`. `from_version` and `to_version`
+hold `[epoch:]version[-release]`, non-empty parts only (the `:` follows a non-empty epoch, the
+`-` joins a release to a non-empty version, so a Flatpak row reads as its commit), in the
+existing text columns. **There are no tombstones on `installed_software`**: a removal is a hard
+delete plus a `remove` row carrying name, publisher and that version text, so no read needs a
+`removed_at` filter.
 
 **Baseline rule.** A `full` section is a BASELINE (rows written, no ledger rows) unless the
 server holds the facet's rows: a facet state with a non-empty section hash whose status is not
@@ -1101,6 +1116,9 @@ never recorded, by design. In every other case the held rows are still in the ta
 status-only section leaves them in place, so the full section is diffed against them: a timeout
 followed by a full carrying an upgrade writes one `upgrade`, and an honest-empty full followed by
 a populated one writes the installs.
+Held also means the stored rows hash to the held section hash. A facet whose rows do not (an
+out-of-band delete or a partial-table restore; no product path produces one) is a baseline with
+a warning, so a missing row is never recorded as a phantom `install`.
 
 **Components (`software_components`).** The component table lives in this store's schema, owned
 by `SoftwareInventoryStore`, because a component section is applied in the same transaction as
@@ -1116,6 +1134,9 @@ must name a held row, else the section is a mismatch and rolls back. Freshness
 of a delta-maintained facet is `software_facet_state.last_confirmed_at`, not a per-row column.
 An honest-empty full
 deletes the rows. A repeated `(kind, path)` inside one section is a producer defect: `mismatch`.
+That includes two components of one kind with an empty path, and it holds for a `full` section
+too: the resend repeats the pair, so the facet is answered `mismatch` on every cycle and none of
+it is stored until the writer sends each path once. It does not repair itself.
 The facet now carries a real section hash and enters the report hash. A row a delta removes is
 hard-deleted with no history row: component change history is out of scope. Components are
 current-state, bounded to the per-call cap per device by the post-apply check above, and die with
@@ -1135,7 +1156,8 @@ the section counter's series. `YuzuInventorySectionDeltaMismatch` (warning, `for
 never holds for an hour; the rule reads `increase(...[1d])` and needs both at least 5 `mismatch`
 sections for a facet and more than 5% of that facet's sections. An isolated mismatch (an agent
 restored from a snapshot, a report racing a decommission) is expected and does not fire it; the
-agent resends the facet in full and the fleet self-heals.
+agent resends the facet in full, which repairs a delta that went out of step; a component section
+that repeats a `(kind, path)` does not repair itself (above).
 
 **Not in this change.** The agent writer (it must emit `expect` and mirror the component hashes);
 any read surface for the ledger or the components.

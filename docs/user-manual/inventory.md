@@ -344,16 +344,21 @@ first v3 call from a device that applies a section removes the rows its earlier 
 shows the same software from two report formats.
 
 A `delta` section lists only what changed (rows removed by hash, rows added) and carries the hash
-the device holds after applying it. The server applies it to the rows it already holds and checks
+the device holds once it has applied it. The server applies it to the rows it holds and checks
 its own result against that hash. If the device's starting point is not the one the server holds,
-or a removal names a row the server does not have, or the result does not match, the section is
-undone on its own (the other sections of the report still apply) and asked for again in full, so
-nothing is lost. The `component_inventory` section is stored the same way, per device, as the
-current list of components found (`full` replaces the list, `delta` changes it, an empty `full`
-clears it).
+a removal names a row the server does not have, the result does not match, or the facet would
+hold more than the per-call record cap (20,000), the section is undone on its own (the other
+sections of the report apply) and asked for again in full, so nothing is lost. The
+`component_inventory` section is stored the same way, per device, as the current list of
+components found (`full` replaces the list, `delta` changes it, an empty `full` clears it). A
+component section that names one kind and path twice (two components of one kind with an empty
+path, for example) is answered the same way and does not repair itself: the resend repeats the
+pair, so none of that section is stored until the agent's component writer sends each path once.
 
 The server also keeps a change history for installed software: one entry for every install,
-removal or upgrade a stored section produced, with the version before and after. The first full
+removal or upgrade a stored installed-software section produced, with the from and to versions
+written as `[epoch:]version[-release]` (non-empty parts only), so a release-only or epoch-only
+update (a distribution backport, a Flatpak commit) is an upgrade too. The first full
 section the server receives for a collector, and the first one after that collector was switched
 off and on again, set the starting point and produce no history. Removed software is simply deleted from the device's list; the
 history entry is the record that it was there. History older than 400 days is pruned. Nothing in
@@ -1214,8 +1219,9 @@ at least once in the last day, so a single refusal is enough; the refusal is a g
 that never self-heals, so fix the agent, except `facet="unknown"`, a version-skew incident fixed by reprovisioning matching builds),
 `YuzuInventorySectionDeltaMismatch` (warning, held 1h: at least 5 `outcome="mismatch"` sections in
 the last day for one facet and more than 5% of that facet's sections; a delta or component section
-did not verify and was rolled back, the agent resends it in full, and a few a day are expected, so
-only a sustained share means the agent's delta writer and the server disagree about the row set), and
+did not verify and is rolled back, the agent resends it in full, and a few a day are expected; a
+sustained share means the agent's section writer and the server disagree about the row set, and a
+component section that names one kind and path twice fails on every resend), and
 `YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
 
 A **recording rule**, `yuzu:inventory_ingest_duration_seconds:p99{source,phase}`,
