@@ -16,8 +16,8 @@
  *                   \{Applications, InboxApplications, Deprovisioned}: one subkey
  *                   per PackageFullName (Name_Version_Arch_ResourceId_PublisherId).
  *                   Per-user SID subkeys are never enumerated (machine scope).
- *                   A missing key (Deprovisioned was absent on the capture host) is
- *                   normal; a denied key is a constraint. The WindowsApps folder is
+ *                   A missing key is normal (an empty roster); a denied key is a
+ *                   constraint. The WindowsApps folder is
  *                   deliberately NOT listed (its ACL denies the agent's service
  *                   account the listing) and AppxManifest.xml is never read, so
  *                   there is no publisher column.
