@@ -3976,7 +3976,12 @@ builders and the serialised body at once, and there is no per-campaign budget, n
 no concurrency limit on the route itself, so each request in flight holds its own copies. The grant's top-level
 `justification` repeats its latest history entry, so the latest entry's text is in the response twice. The MCP twin
 puts its payload in the tool result twice (the `content` text and `structuredContent`), so its response is larger than
-the REST body (about 2.2 times by code reading, not measured). The Access page's own memory use was not measured. No
+the REST body: measured at 2.04 to 2.16 times its bytes, and at about 1.3 to 1.5 times its peak memory
+(463 MB against 331 MB for the 32 MB ASCII case, 1.14 GB against 0.79 GB for the 105 MB control-character case; one
+fresh process per measurement, three runs each, on one host). The Access page's campaign fragment, measured the same
+way, peaks at about 200 MB for 1000 grants with 100 decisions each (260 MB with four-byte characters): it shows only
+the latest justification whole and 64 characters of each earlier one, so its body is 27 to 46 MB. The browser's own
+cost for a document of that size was not measured. No
 shipped deployment configuration (the `deploy/docker` compose files, the `deploy/systemd` unit, the HA compose file)
 sets a memory limit, and the only shipped server-restart alert is `YuzuServerRestartLoop` (more than 3 resets of
 `yuzu_server_uptime_seconds` in 3 hours, sustained for 15 minutes, `docs/prometheus/yuzu-alerts.yml`). One out-of-memory
