@@ -76,7 +76,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "C:\\ProgramData\\chocolatey\\lib directory listing (presence + directory count); winget "
          "presence and version from the HKLM Appx roster "
          "(AppxAllUserStore\\Applications\\Microsoft.DesktopAppInstaller_* key name)",
-         "measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; chocolatey is "
+         "measured as a virtual service account (NT SERVICE\\<name>, non-admin) and as the interactive admin user, NT SERVICE\\YuzuAgent itself not used; chocolatey is "
          "found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); its own "
          "version is not read (the bootstrap package has no loose nuspec and bin\\choco.exe is a "
          "shim), so its version column is `-`"},
@@ -94,7 +94,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "chocolatey lib\\<id>\\<id>.nuspec, one bounded read per package, <version> by a bounded "
          "tag scan (no libxml2)",
-         "measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; chocolatey is "
+         "measured as a virtual service account (NT SERVICE\\<name>, non-admin) and as the interactive admin user, NT SERVICE\\YuzuAgent itself not used; chocolatey is "
          "found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); a "
          "directory without a loose nuspec (the chocolatey bootstrap package) is not listed; an "
          "unreadable nuspec gives a row with an empty version"},
@@ -113,7 +113,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "HKLM Appx\\AppxAllUserStore {Applications, InboxApplications, Deprovisioned} subkey names "
          "(one per PackageFullName); the WindowsApps folder is not listed and no manifest is read",
-         "measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; per-user "
+         "measured as a virtual service account (NT SERVICE\\<name>, non-admin) and as the interactive admin user, NT SERVICE\\YuzuAgent itself not used; per-user "
          "packages are not enumerated and Deprovisioned rows are not collected as software"},
     },
 };
