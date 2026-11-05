@@ -868,7 +868,7 @@ template <typename Req>
 /// `oversize = !unmeasurable && content_length > cap`, so the BROAD rule
 /// suppressed the size check: `Transfer-Encoding: identity` plus a
 /// `Content-Length` of 8 MiB was admitted on every class whose
-/// `requires_measurable` is false, 28 of 32 classes, including the
+/// `requires_measurable` is false, including the
 /// health probes — because httplib honours an exact `chunked` and NOTHING
 /// else, falling through to `Content-Length` and reading every byte. The gate
 /// discarded a length httplib was about to act on. Verified on a raw socket

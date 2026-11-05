@@ -16197,7 +16197,7 @@ private:
         // class's cap can be checked against before anything is read off the
         // socket). It has a structural limit, recorded in body_cap_policy.hpp's
         // KNOWN LIMITATION paragraph: on any class with `requires_measurable ==
-        // false` (28 of 32 classes) a genuine chunked — or otherwise unmeasurable
+        // false` a genuine chunked — or otherwise unmeasurable
         // — body is NOT size-checked there at all; it falls through to
         // httplib's own 100 MiB backstop (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`) and
         // is handed to the route handler uncapped by this table. This second

@@ -80,10 +80,10 @@
 /// KNOWN LIMITATION, recorded deliberately, not implied away: because of the
 /// default above, a chunked or Content-Length-less body is NOT refused BEFORE
 /// BEING READ on any class that keeps `requires_measurable` off (all but the
-/// four listed above); this table's pre-routing chokepoint
+/// five listed above); this table's pre-routing chokepoint
 /// admits it, up to httplib's own 100 MiB backstop, without checking this
 /// table's cap at all. A comment or doc that says chunked bodies are
-/// "refused" without naming all four classes that require a measurable body is wrong.
+/// "refused" without naming all five classes that require a measurable body is wrong.
 /// This is a recorded adjudication, not an oversight — see the paragraph
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
