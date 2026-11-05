@@ -1714,7 +1714,8 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                     return Step::kMismatch;
             } else {
                 // BASELINE (rows written, no ledger rows) unless the server holds this facet's
-                // rows: a facet_state row with a section hash, not switched off. A status-only
+                // rows: a facet_state row with a section hash, not switched off, whose rows hash
+                // to it (checked below). A status-only
                 // section can create a facet_state row for a facet that never held rows (empty
                 // hash), and one arriving over a `disabled` facet clears the hash (below), so
                 // neither makes the next full a diff. A status-only section over a held facet
@@ -1732,6 +1733,20 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                             ledger = false;
                             break;
                         }
+                    }
+                }
+                // The held rows must be the rows the held hash describes. No product path parts
+                // them (every writer is transactional under the agent lock), but an out-of-band
+                // DELETE or a partial-table restore would, and diffing against what is left would
+                // write a phantom `install` for every missing row: baseline instead.
+                if (ledger) {
+                    normalize(old_rows); // a no-op on the set: stored rows are unique per instance
+                    if (section_hash_of_normalised(old_rows) != prior->section_hash) {
+                        spdlog::warn("SoftwareInventoryStore: agent={} facet={} stored rows do not "
+                                     "hash to the held section hash; this section is applied "
+                                     "without ledger rows",
+                                     agent_id, sec.facet);
+                        ledger = false;
                     }
                 }
                 pg::PgResult del = pg::exec_params(

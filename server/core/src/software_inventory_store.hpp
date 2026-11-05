@@ -488,10 +488,13 @@ public:
     ///    its section hash.
     ///  - LEDGER: every applied section writes `software_changes` rows (install | remove |
     ///    upgrade) in the same transaction, from `diff_changes` over the rows that went out and
-    ///    came in. A full section is a BASELINE (no ledger rows) when its facet is not held at all
-    ///    (first contact, which includes the first v3 call that applies a section) or was last 'disabled'; otherwise it is
-    ///    diffed against the held rows, so a status-only section followed by a full one, or an
-    ///    honest-empty full followed by a populated one, still yields the right rows. There are
+    ///    came in. A full section is a BASELINE (no ledger rows) when its facet holds no section
+    ///    hash (first contact, which includes the first v3 call that applies a section; a facet
+    ///    only ever reported status-only; a hash cleared by a status-only section over a
+    ///    'disabled' facet), was last 'disabled', or holds rows that do not hash to its held
+    ///    section hash (an out-of-band change to the table); otherwise it is diffed against the
+    ///    held rows, so a status-only section followed by a full one, or an honest-empty full
+    ///    followed by a populated one, still yields the right rows. There are
     ///    NO tombstones on `installed_software`: a removal is a hard delete plus a `remove` row.
     ///  - `component_inventory`: full replaces the agent's `software_components` rows, delta
     ///    applies `-` row_hash / `comp` changes (same verification), in THIS store's schema and

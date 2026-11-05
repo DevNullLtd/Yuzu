@@ -5696,6 +5696,34 @@ TEST_CASE("v3: a release-only or epoch-only change is an upgrade carrying [epoch
     CHECK(ledger_count(pool, "agent-same") == "0");
 }
 
+TEST_CASE("v3: a held facet whose stored rows do not hash to its section hash is a baseline",
+          "[pg][software_inventory][v3][ledger]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    const auto b1 = v3_entry("Beta", kV3Apps);
+    REQUIRE(store.apply_installed_software_v3("agent-oob", v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    // An out-of-band delete (no product path does this) leaves the facet_state hash behind.
+    REQUIRE(sql_ok(pool, "DELETE FROM software_inventory_store.installed_software "
+                         "WHERE agent_id = 'agent-oob' AND name = 'Beta'"));
+    REQUIRE(facet_status(pool, "agent-oob", kV3Apps) == "full/" + section_hash_of({a1, b1}));
+
+    REQUIRE(store.apply_installed_software_v3("agent-oob", v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(ledger_count(pool, "agent-oob") == "0"); // no phantom install of Beta
+    CHECK(metrics.counter("yuzu_software_changes_total", {{"kind", "install"}}).value() == 0.0);
+    CHECK(names_of(pool, "agent-oob", kV3Apps) == (std::vector<std::string>{"Alpha", "Beta"}));
+    CHECK(facet_status(pool, "agent-oob", kV3Apps) == "full/" + section_hash_of({a1, b1}));
+
+    // The rows agree with the hash again, so the next full diffs as usual.
+    REQUIRE(store.apply_installed_software_v3("agent-oob", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(ledger_count(pool, "agent-oob") == "1");
+    store.set_metrics(nullptr);
+}
+
 TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
           "[software_inventory][v3][ledger]") {
     const auto row = [](const std::string& name, const std::string& version,
