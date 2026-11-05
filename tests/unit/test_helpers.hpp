@@ -1435,8 +1435,12 @@ inline std::int64_t iso8601_to_ns(const std::string& ts) {
     if (!ymd.ok())
         return 0;
     const sys_days date{ymd};
-    const seconds secs = date.time_since_epoch() + hours{hour_v} + minutes{minute_v} +
-                         seconds{second_v};
+    // 64-bit arithmetic throughout: MSVC's std::chrono::hours and minutes use a 32-bit int, so
+    // summing them as durations wraps for a far-future year (found on Windows CI, PR #7151).
+    const seconds secs{static_cast<std::int64_t>(date.time_since_epoch().count()) * 86400LL +
+                       static_cast<std::int64_t>(hour_v) * 3600LL +
+                       static_cast<std::int64_t>(minute_v) * 60LL +
+                       static_cast<std::int64_t>(second_v)};
     // Past 2262-04-11 the nanosecond count no longer fits in int64: report it as unparsed rather
     // than overflow (the same bound guardian_ingest.cpp applies to an agent stamp).
     if (secs.count() > INT64_MAX / 1'000'000'000LL)
