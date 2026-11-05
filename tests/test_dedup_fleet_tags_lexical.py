@@ -53,6 +53,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 AGENT_CPP = ROOT / "agents" / "core" / "src" / "agent.cpp"
 STORE_HPP = ROOT / "agents" / "core" / "include" / "yuzu" / "agent" / "command_dedup_store.hpp"
+# #3678: the ring size is single-sourced here; the store's kMaxDedupRows is bound to it.
+HORIZON_HPP = ROOT / "common" / "include" / "yuzu" / "command_replay_horizon.hpp"
 TAGS_HPP = ROOT / "server" / "core" / "src" / "dedup_fleet_tags.hpp"
 AGENT_REGISTRY_CPP = ROOT / "server" / "core" / "src" / "agent_registry.cpp"
 SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
@@ -120,8 +122,15 @@ def other_gauges() -> list:
 
 
 def kmax_dedup_rows() -> int:
-    m = re.search(r"kMaxDedupRows\s*=\s*(\d+)\s*;", strip_line_comments(read(STORE_HPP)))
+    """The agent's ring bound: kAgentDedupRingRows (command_replay_horizon.hpp), which
+    command_dedup_store.hpp must bind kMaxDedupRows to (checked in problems(), check 5)."""
+    m = re.search(r"kAgentDedupRingRows\s*=\s*(\d+)\s*;", strip_line_comments(read(HORIZON_HPP)))
     return int(m.group(1)) if m else -1
+
+
+def store_binds_to_shared_ring_constant() -> bool:
+    return bool(re.search(r"kMaxDedupRows\s*=\s*(?:::)?(?:yuzu::)?kAgentDedupRingRows\s*;",
+                          strip_line_comments(read(STORE_HPP))))
 
 
 def problems() -> list:
@@ -182,7 +191,10 @@ def problems() -> list:
     # 5. the capacity HELP's ring bound is the agent's constant
     kmax = kmax_dedup_rows()
     if kmax < 0:
-        out.append("could not parse kMaxDedupRows from command_dedup_store.hpp (stale pattern)")
+        out.append("could not parse kAgentDedupRingRows from command_replay_horizon.hpp (stale pattern)")
+    elif not store_binds_to_shared_ring_constant():
+        out.append("command_dedup_store.hpp kMaxDedupRows is not bound to yuzu::kAgentDedupRingRows "
+                   "(#3678): the ring size must be single-sourced in command_replay_horizon.hpp")
     else:
         m = re.search(r'kDedupRowsMaxHelp\s*=(.*?)";', strip_line_comments(read(TAGS_HPP)), re.S)
         help_text = "".join(re.findall(r'"([^"]*)"', m.group(1) + '"')) if m else ""
@@ -303,8 +315,13 @@ class DedupFleetTagsLexical(unittest.TestCase):
         self.assertTrue(any("names no issue number" in p for p in found), found)
 
     def test_self_check_detects_a_stale_ring_bound_in_the_help(self):
-        found = self._problems_with(STORE_HPP, lambda s: re.sub(r"(kMaxDedupRows\s*=\s*)20000", r"\g<1>30000", s))
+        found = self._problems_with(HORIZON_HPP, lambda s: re.sub(r"(kAgentDedupRingRows\s*=\s*)20000", r"\g<1>30000", s))
         self.assertTrue(any("kMaxDedupRows" in p for p in found), found)
+
+    def test_self_check_detects_a_store_ring_bound_that_forks_the_shared_constant(self):
+        found = self._problems_with(
+            STORE_HPP, lambda s: re.sub(r"(kMaxDedupRows\s*=\s*)::yuzu::kAgentDedupRingRows", r"\g<1>20000", s))
+        self.assertTrue(any("not bound to yuzu::kAgentDedupRingRows" in p for p in found), found)
 
 
 if __name__ == "__main__":

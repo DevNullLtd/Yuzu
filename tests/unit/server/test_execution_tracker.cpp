@@ -1522,6 +1522,35 @@ TEST_CASE("ExecutionTracker: the dispatch record carries the plugin; the plugin 
         REQUIRE(first.has_value());
         CHECK(first->deleted == 0);
     }
+    SECTION("every dispatch record advances the fleet-wide dispatch sequence, monotonically "
+            "(#3678)") {
+        const auto s0 = tracker.current_dispatch_seq();
+        REQUIRE(s0.has_value());
+        CHECK(*s0 == 0); // nothing recorded yet on a fresh database: "none issued", not unreadable
+
+        REQUIRE(tracker.record_command_dispatch("seq-a", "echo", ""));
+        const auto s1 = tracker.current_dispatch_seq();
+        REQUIRE(s1.has_value());
+        CHECK(*s1 == *s0 + 1);
+
+        REQUIRE(tracker.record_command_dispatch("seq-b", "echo", ""));
+        const auto s2 = tracker.current_dispatch_seq();
+        REQUIRE(s2.has_value());
+        CHECK(*s2 > *s1);
+
+        // A re-record of the SAME id also advances it: that only over-counts (the outbox horizon
+        // trips earlier, never later), which is the safe direction.
+        REQUIRE(tracker.record_command_dispatch("seq-a", "echo", ""));
+        const auto s3 = tracker.current_dispatch_seq();
+        REQUIRE(s3.has_value());
+        CHECK(*s3 > *s2);
+
+        // A refused record (no plugin) must NOT consume a sequence value.
+        CHECK_FALSE(tracker.record_command_dispatch("seq-c", "", ""));
+        const auto s4 = tracker.current_dispatch_seq();
+        REQUIRE(s4.has_value());
+        CHECK(*s4 == *s3);
+    }
     SECTION("a record without a plugin, or without a command id, is refused") {
         CHECK_FALSE(tracker.record_command_dispatch("cmd-3", "", "exec-1"));
         CHECK_FALSE(tracker.record_command_dispatch("", "echo", "exec-1"));

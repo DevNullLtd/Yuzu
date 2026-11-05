@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <system_error>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -122,6 +123,16 @@ CREATE INDEX outbox_approval_idx ON outbox (approval_id) WHERE approval_id <> ''
         // sequential scan must not run under the pool's 30 s statement timeout.
         {3, "SET LOCAL statement_timeout = 0;"
             "UPDATE outbox SET plugin = 'echo' WHERE plugin = 'tar';"},
+        // v4 (#3678): the fleet-wide dispatch sequence (`ExecutionTracker::current_dispatch_seq`)
+        // read just before the row's FIRST send. A redrive compares the current sequence against
+        // it and dead-letters the row once the gap reaches the redelivery horizon
+        // (`command_replay_horizon.hpp`), so a stable command_id is never re-sent after the agent
+        // dedup ring could have evicted it. Nullable, no default: a metadata-only ALTER (no table
+        // rewrite, so no statement_timeout lift is needed, unlike v2/v3). A row still `pending`
+        // across the upgrade has NULL and is stamped at its next delivery attempt; if its first
+        // send happened before the upgrade, the horizon is measured from that later stamp (a
+        // one-time, documented window).
+        {4, "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatch_seq_first_sent BIGINT;"},
     };
     return kMigrations;
 }
@@ -231,7 +242,8 @@ CommandOutboxStore::list_pending(int limit) const {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT occurrence_id, command_id, source, plugin, action, scope_expr, agent_ids, "
-        "       parameters, execution_id, principal, approval_id, attempts "
+        "       parameters, execution_id, principal, approval_id, attempts, "
+        "       dispatch_seq_first_sent "
         "FROM command_outbox_store.outbox "
         "WHERE state = 'pending' AND next_attempt_at <= now() "
         "ORDER BY next_attempt_at ASC, created_at ASC "
@@ -263,6 +275,16 @@ CommandOutboxStore::list_pending(int limit) const {
         // avoids atoi/<cstdlib>); a malformed value leaves attempts=0, harmless.
         const char* av = PQgetvalue(res.get(), i, 11);
         std::from_chars(av, av + std::char_traits<char>::length(av), c.attempts);
+        // #3678: NULL = never stamped. A value that does not parse is treated as UNSTAMPED, not
+        // as 0: the delivery gate then re-stamps (fenced, NULL-only) or, when the column is
+        // somehow non-NULL but unparseable, refuses the stamp write and holds the row.
+        if (!PQgetisnull(res.get(), i, 12)) {
+            const char* sv = PQgetvalue(res.get(), i, 12);
+            std::int64_t seq = 0;
+            const auto r = std::from_chars(sv, sv + std::char_traits<char>::length(sv), seq);
+            if (r.ec == std::errc{} && seq >= 0)
+                c.dispatch_seq_first_sent = seq;
+        }
         out.push_back(std::move(c));
     }
     return out;
@@ -433,6 +455,25 @@ CommandOutboxStore::mark_failed(const std::string& occurrence_id,
         "WHERE occurrence_id=$1 AND state='pending' AND " + fence + " RETURNING occurrence_id";
     return fenced_transition(sql.c_str(), std::vector<std::string>{occurrence_id, reason},
                              "mark_failed");
+}
+
+std::expected<bool, CommandOutboxError>
+CommandOutboxStore::stamp_first_send(const std::string& occurrence_id,
+                                     const std::string& leader_lock_name,
+                                     std::int64_t leader_epoch, std::int64_t dispatch_seq) {
+    if (dispatch_seq < 0)
+        return std::unexpected(CommandOutboxError::db_error);
+    const std::string fence = LeaderElector::epoch_fence_sql(leader_lock_name, leader_epoch);
+    // NULL-only: the FIRST stamp wins, so a later (or concurrent) stamp can never move the
+    // horizon's origin forward and quietly extend a row's redelivery window.
+    const std::string sql =
+        "UPDATE command_outbox_store.outbox SET dispatch_seq_first_sent=$2::bigint, "
+        "updated_at=now() "
+        "WHERE occurrence_id=$1 AND state='pending' AND dispatch_seq_first_sent IS NULL AND " +
+        fence + " RETURNING occurrence_id";
+    return fenced_transition(sql.c_str(),
+                             std::vector<std::string>{occurrence_id, std::to_string(dispatch_seq)},
+                             "stamp_first_send");
 }
 
 std::expected<bool, CommandOutboxError>

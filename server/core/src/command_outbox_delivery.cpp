@@ -11,8 +11,10 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
+#include <string>
 
 namespace yuzu::server {
 
@@ -61,6 +63,12 @@ bool decode_payload(const OutboxCommand& c, std::vector<std::string>& agent_ids,
 } // namespace
 
 CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
+    // R4 (#3678): the horizon can never exceed the constant that is static_asserted below the
+    // agent dedup ring, and a non-positive value would dead-letter every redrive.
+    d_.redelivery_horizon_commands =
+        std::clamp<std::int64_t>(d_.redelivery_horizon_commands, 1,
+                                 yuzu::kMaxOutboxRedeliveryHorizonCommands);
+
     // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
     // pre-seed both `cause` values `yuzu_server_command_outbox_deliver_retry_cause_total` can
     // actually emit (see the increment call site below). Lazy-created-on-first-increment means a
@@ -85,6 +93,16 @@ CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
                             {{"cause", "route_unreadable"}});
         d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                             {{"cause", "os_gate_unreadable"}});
+        // #3678: pre-seed so the first dead-letter is a visible step from 0, not a series that
+        // appears already at 1 (the lone-incident reason above).
+        d_.metrics->describe(
+            "yuzu_server_command_outbox_deliver_horizon_exceeded_total",
+            "Outbox occurrences dead-lettered (`redelivery_horizon_exceeded`) because a redrive "
+            "would have re-sent a stable command_id after the fleet-wide dispatch sequence had "
+            "advanced by the redelivery horizon (#3678): the agent's dedup ring may have evicted "
+            "it, so the send would re-execute. The command may have executed once already.",
+            "counter");
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_horizon_exceeded_total");
         // json-dump-depth-guard fix: the bare
         // yuzu_server_command_outbox_deliver_decode_failed_total counter stays
         // unchanged (dashboards/alerts-in-waiting keep working), but it now
@@ -282,6 +300,63 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             audit(c, "failure", "payload_decode_failed");
         }
         return;
+    }
+
+    // 2b. R4 (#3678) REDELIVERY HORIZON. Runs after authorization and decode (a denied or
+    //     malformed row never reaches it) and BEFORE any send. Every branch that cannot prove
+    //     the row is inside the horizon HOLDS it (return, no send, no reschedule): the next tick
+    //     retries, and a held row can only be re-sent later, never sooner.
+    if (!d_.dispatch_seq_fn) {
+        count("yuzu_server_command_outbox_deliver_degrade_total");
+        spdlog::error("command_outbox_delivery: occurrence '{}' held: no dispatch-sequence reader "
+                      "wired (redelivery horizon cannot be enforced)",
+                      c.occurrence_id);
+        return;
+    }
+    const auto cur_seq = d_.dispatch_seq_fn();
+    if (!cur_seq) {
+        count("yuzu_server_command_outbox_deliver_degrade_total");
+        spdlog::warn("command_outbox_delivery: occurrence '{}' held: dispatch sequence unreadable",
+                     c.occurrence_id);
+        return;
+    }
+    if (!c.dispatch_seq_first_sent) {
+        // First attempt: the stamp MUST commit before the send. Fenced out, already stamped by
+        // another writer, or a store error all mean "not ours / unknown": hold, do not send.
+        auto stamped = d_.outbox->stamp_first_send(c.occurrence_id, lock_name, epoch, *cur_seq);
+        if (!stamped.has_value() || !*stamped) {
+            count("yuzu_server_command_outbox_deliver_degrade_total");
+            spdlog::warn("command_outbox_delivery: occurrence '{}' held: first-send stamp did not "
+                         "commit ({})",
+                         c.occurrence_id, stamped.has_value() ? "fenced or already stamped"
+                                                              : "store degraded");
+            return;
+        }
+    } else {
+        const std::int64_t first_seq = *c.dispatch_seq_first_sent;
+        // `cur < first` is an anomaly (restore from backup, lost-WAL promotion): the elapsed
+        // count is unknowable, so it dead-letters exactly like an exceeded horizon.
+        if (*cur_seq < first_seq || *cur_seq - first_seq >= d_.redelivery_horizon_commands) {
+            auto marked = d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch,
+                                                 "redelivery_horizon_exceeded");
+            if (marked.has_value() && *marked) {
+                count("yuzu_server_command_outbox_deliver_horizon_exceeded_total");
+                spdlog::error("command_outbox_delivery: occurrence '{}' (command_id={}) "
+                              "dead-lettered: redelivery horizon exceeded (first_seq={} "
+                              "current_seq={} horizon={})",
+                              c.occurrence_id, c.command_id, first_seq, *cur_seq,
+                              d_.redelivery_horizon_commands);
+                // NOT decline_or_cancel_exec: the first attempt may have reached agents and
+                // their responses may still be arriving (see R4 in the header).
+                audit(c, "failure",
+                      "redelivery_horizon_exceeded first_seq=" + std::to_string(first_seq) +
+                          " current_seq=" + std::to_string(*cur_seq) + " horizon=" +
+                          std::to_string(d_.redelivery_horizon_commands) +
+                          " (an earlier attempt may have executed; redelivery refused to stay "
+                          "inside the agent dedup window)");
+            }
+            return;
+        }
     }
 
     // 3. Re-resolve the caller from the stored principal (never a serialized

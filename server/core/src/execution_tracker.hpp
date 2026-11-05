@@ -643,6 +643,13 @@ public:
         const std::string& command_id, const std::string& plugin, const std::string& execution_id,
         std::optional<std::chrono::milliseconds> lease_timeout = std::nullopt);
 
+    /// #3678: the fleet-wide dispatch sequence `record_command_dispatch` advances once per call.
+    /// Returns the number of dispatch records written so far (monotonic across replicas and
+    /// restarts; a crash can skip values forward, never backward), or nullopt when the store is
+    /// closed or the read degraded. NEVER treat nullopt as 0: the WS-3 command outbox refuses to
+    /// send on an unreadable sequence. See `common/include/yuzu/command_replay_horizon.hpp`.
+    [[nodiscard]] std::optional<std::int64_t> current_dispatch_seq() const;
+
     /// Resolves a previously recorded dispatch. Returns nullopt for an unknown command id (a
     /// forged or never-issued id, a failed record write, a reaped record) AND for a degraded read;
     /// `degrade_reason`, when non-null, is set to "pool_exhausted" or "query_failed" iff the

@@ -862,6 +862,22 @@ delivery, once the real outcome is known. A systemic delivery-gate failure
 (for example, containment status unreadable) is treated as transient: the
 same occurrence is retried with back-off rather than failed outright.
 
+A retry re-sends the occurrence's original command ID, so that an agent which
+already ran it can recognise and absorb the repeat. An agent only remembers the
+most recent 20,000 completed commands, so the server bounds how long an
+occurrence may keep being retried: it records the fleet-wide dispatch count
+just before the first send attempt and, once that count has advanced by 10,000
+(half the agent's memory) before a retry, it stops. That occurrence is marked
+failed with the note `redelivery_horizon_exceeded` and a `failure`
+`command.outbox_delivered` audit event, and it is never sent again — an earlier
+attempt may already have run, so the run is not cancelled and its execution row
+is left as it was. If the dispatch count cannot be read at all, the occurrence
+is held (neither sent nor failed) and tried again on the next cycle; the
+`yuzu_server_command_outbox_deliver_degrade_total` counter rises while that
+lasts. The cap counts commands, not time, so an occurrence stuck on a quiet
+fleet is not ended by it. The count half is delivered under #3678; a
+time-based cap and a retry-count cap remain open under #4167.
+
 Approval-gated runs (the schedule's `requires_approval` flag, or a definition
 whose `approvalMode` is not `auto` — there is no operator session on the
 scheduled path, so `role-gated` also requires a ticket) submit one approval

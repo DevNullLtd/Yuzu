@@ -111,8 +111,15 @@ claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
 ## Two further contracts
 
 - `record_terminal` is **FIRST-WRITE-WINS** (in-flight → terminal only).
-- **The dedup window (`kMaxDedupRows`) MUST exceed the server's max retry/outbox horizon** (WS-1 /
-  WS-3).
+- **The dedup window (`kMaxDedupRows`) MUST exceed the server's outbox redelivery horizon** (#3678).
+  This is a compile-time check, not prose: `kMaxDedupRows` is `yuzu::kAgentDedupRingRows` and
+  `kMaxOutboxRedeliveryHorizonCommands` is `static_assert`ed to at most half of it, both in
+  `common/include/yuzu/command_replay_horizon.hpp`. The WS-3 command outbox
+  (`command_outbox_delivery.cpp`) enforces the horizon by stamping the fleet-wide dispatch sequence
+  (`ExecutionTracker::current_dispatch_seq`) on a row before its first send and dead-lettering any
+  redrive once the sequence has advanced by the horizon (`redelivery_horizon_exceeded`). The bound is
+  an upper bound by construction (every ring-consuming send is one dispatch call), not something a
+  test observes on a real agent at the production ring size.
 
 ## Related
 

@@ -39,6 +39,21 @@
 ///  stays `pending` for the true leader (the duplicate send it may already
 ///  have made is absorbed by command_id dedup).
 ///
+///  R4 — REDELIVERY HORIZON (#3678). Effectively-once rests on the agent's dedup ring
+///  (WS-0, `CommandDedupStore`), which forgets a terminal command after
+///  `kAgentDedupRingRows` newer ones; a stable command_id re-sent AFTER that is a fresh claim
+///  and RE-EXECUTES. So a redrive is bounded by a COUNT of fleet-wide dispatch calls, not a
+///  clock: the sequence (`Deps::dispatch_seq_fn`, `ExecutionTracker::current_dispatch_seq`) is
+///  stamped on the row BEFORE its first send (`CommandOutboxStore::stamp_first_send`), and a
+///  redrive whose sequence has advanced by `redelivery_horizon_commands` (or gone backwards)
+///  is dead-lettered `redelivery_horizon_exceeded` instead of sent. Every unreadable-sequence,
+///  unwired-reader or failed-stamp case HOLDS the row (no send) -- the direction that cannot
+///  re-execute. The horizon is `kMaxOutboxRedeliveryHorizonCommands`
+///  (`common/include/yuzu/command_replay_horizon.hpp`, static_asserted below the ring) and the
+///  constructor clamps any larger `Deps` value down to it. A dead-lettered row is NOT
+///  force-cancelled (`decline_or_cancel_exec` is not called): the first attempt may have
+///  reached agents and their responses may still be arriving.
+///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
 /// historical discipline): a systemic transient gate/directory failure
 /// (`containment_unreadable` OR, WS-4 4.2b Task D, `route_unreadable` — a
@@ -58,9 +73,12 @@
 #include "dispatch_caller.hpp"          // DispatchCaller, ApprovalProvenance
 #include "dispatch_confined_arms.hpp"   // ConfinedDispatchOutcome
 
+#include <yuzu/command_replay_horizon.hpp> // kMaxOutboxRedeliveryHorizonCommands (#3678)
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -104,6 +122,10 @@ public:
                                              const std::string& plugin,
                                              const std::string& action)>;
 
+    /// #3678 (R4): the fleet-wide dispatch sequence, `nullopt` when it cannot be read.
+    /// server.cpp binds this to `ExecutionTracker::current_dispatch_seq`.
+    using DispatchSeqFn = std::function<std::optional<std::int64_t>()>;
+
     struct Deps {
         CommandOutboxStore* outbox{nullptr};          // required
         LeaderElector* leader{nullptr};               // required — supplies the fenced epoch
@@ -119,6 +141,13 @@ public:
         std::function<bool()> should_stop;
         int max_per_tick{100};
         std::chrono::seconds retry_backoff{std::chrono::seconds(30)};
+        /// R4 (#3678): REQUIRED and fail-closed -- an unset reader holds every occurrence
+        /// (never sends), exactly like an unset `arming_check` denies.
+        DispatchSeqFn dispatch_seq_fn;
+        /// R4: dispatch calls that may elapse between an occurrence's first send and a redrive.
+        /// The constructor clamps this into [1, kMaxOutboxRedeliveryHorizonCommands]; tests lower
+        /// it, nothing can raise it past the agent-ring-derived constant.
+        std::int64_t redelivery_horizon_commands{yuzu::kMaxOutboxRedeliveryHorizonCommands};
     };
 
     explicit CommandOutboxDelivery(Deps deps);
@@ -128,6 +157,11 @@ public:
     /// leadership (the FencedLeaderOnly loop gate in server.cpp guarantees this);
     /// a defensive `epoch().has_value()` check bails if leadership is not held.
     void tick();
+
+    /// TEST-ONLY: the horizon in force after the constructor's clamp (#3678).
+    [[nodiscard]] std::int64_t redelivery_horizon_for_test() const noexcept {
+        return d_.redelivery_horizon_commands;
+    }
 
 private:
     void deliver(const OutboxCommand& c, const std::string& lock_name, std::int64_t epoch);

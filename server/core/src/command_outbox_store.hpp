@@ -74,6 +74,16 @@
 /// `unexpected(db_error)`, never a silently-empty vector that reads as "nothing
 /// owed" (which would silently drop every scheduled fire).
 ///
+/// REDELIVERY HORIZON (#3678). A re-drive re-sends the STABLE `command_id`, and the agent's dedup
+/// ring forgets a terminal command after `kAgentDedupRingRows` newer ones, so a re-drive that old
+/// would RE-EXECUTE. `dispatch_seq_first_sent` records the fleet-wide dispatch sequence before a
+/// row's first send (`stamp_first_send`, epoch-fenced, NULL-only: the first stamp wins and the
+/// origin never moves forward); the delivery loop dead-letters (`mark_failed`,
+/// `redelivery_horizon_exceeded`) a re-drive once the sequence has advanced by
+/// `kMaxOutboxRedeliveryHorizonCommands`. This store does not decide that -- it only carries the
+/// stamp; the rule is `CommandOutboxDelivery` rule R4. The count half of #4167 (the age and
+/// attempts caps are still open there).
+///
 /// SPENT-TICKET LEDGER (#6096). `ScheduleRunner` reads each row's `approval_id` back
 /// (`occurrences_for_approval`) to decide that an approved scheduled ticket was already used.
 /// Any FUTURE outbox reaper must therefore retain rows at least as long as the 7-day ticket
@@ -169,6 +179,10 @@ struct OutboxCommand {
     std::string principal;
     std::string approval_id; ///< see OutboxEnqueueRequest::approval_id
     int attempts{0};
+    /// #3678: the fleet-wide dispatch sequence (`ExecutionTracker::current_dispatch_seq`)
+    /// stamped on this row BEFORE its first send; nullopt = never stamped. A redrive compares it
+    /// with the current sequence to enforce the redelivery horizon.
+    std::optional<std::int64_t> dispatch_seq_first_sent;
 };
 
 class CommandOutboxStore {
@@ -305,6 +319,15 @@ public:
     mark_failed(const std::string& occurrence_id, const std::string& leader_lock_name,
                 std::int64_t leader_epoch, const std::string& reason);
 
+    /// #3678: epoch-fenced, NULL-only stamp of `dispatch_seq_first_sent` on a `pending` row,
+    /// committed BEFORE the row's first wire send. First stamp wins: returns `true` iff THIS
+    /// call wrote it, `false` if the row was already stamped, already terminal, or this replica
+    /// was fenced out (all "not ours" -- the caller must not send). A negative `dispatch_seq`
+    /// is refused as `db_error`.
+    [[nodiscard]] std::expected<bool, CommandOutboxError>
+    stamp_first_send(const std::string& occurrence_id, const std::string& leader_lock_name,
+                     std::int64_t leader_epoch, std::int64_t dispatch_seq);
+
     /// Epoch-fenced transient retry: keep the occurrence `pending`, bump
     /// `attempts`, and push `next_attempt_at` out by `delay` (so a transient
     /// delivery failure — a degraded dispatch chokepoint — backs off instead of
@@ -333,7 +356,7 @@ public:
     [[nodiscard]] std::expected<bool, std::string>
     occurrence_exists(const std::string& occurrence_id) const;
 
-    /// The schema migrations for this store (versions 1 and 2). Exposed for tests and
+    /// The schema migrations for this store (versions 1 through 4). Exposed for tests and
     /// the migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
 

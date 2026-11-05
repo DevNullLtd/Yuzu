@@ -9,8 +9,8 @@
  * agent restart AND remembers each command's TERMINAL outcome so a duplicate
  * replays the ORIGINAL result rather than a bare REJECTED.
  *
- * Why replay matters: the server's at-least-once delivery (and, later, the WS-1
- * transactional outbox) can redeliver a command whose first terminal ack was
+ * Why replay matters: the server's at-least-once delivery (and the WS-3 command
+ * outbox, which re-sends a stable command_id) can redeliver a command whose first terminal ack was
  * lost. Without outcome replay the honest guarantee is only "effect-once,
  * result-maybe-lost": the side effect ran once, but the operator sees REJECTED
  * and the real SUCCESS/output is gone. This store closes that. It is
@@ -66,6 +66,7 @@
  * durability, it never propagates into the command hot path.
  */
 
+#include <yuzu/command_replay_horizon.hpp>
 #include <yuzu/plugin.h>
 
 #include <atomic>
@@ -183,7 +184,8 @@ public:
      * terminal. It is NOT a measure of the eviction-driven double-execute: an
      * outcome aged out of the ring produces a fresh Claimed on redelivery, not a
      * Miss, so that path is not separately detectable here (it is bounded by
-     * kMaxDedupRows exceeding the server's retry horizon, not observed). Best-
+     * kMaxDedupRows exceeding the server's outbox redelivery horizon, #3678, not
+     * observed). Best-
      * effort + noexcept: a failure only degrades durability. Miss on an empty id /
      * closed store returns Miss / Error respectively.
      */
@@ -245,10 +247,15 @@ public:
      * terminal rows are evicted by rowid (insert order), never by clock, never
      * touching in-flight rows. Exceeding this between a command's execution and a
      * possible redelivery is what would let a duplicate re-execute, so it MUST
-     * stay well above the server's max retry/outbox horizon (WS-1/WS-3).
-     * Substrate-tuned; do not copy the number elsewhere.
+     * stay above the server's outbox redelivery horizon. That relationship is a
+     * compile-time check, not prose (#3678): the value is
+     * `yuzu::kAgentDedupRingRows` and `kMaxOutboxRedeliveryHorizonCommands` is
+     * static_asserted to at most half of it in
+     * `common/include/yuzu/command_replay_horizon.hpp`, which the WS-3 command
+     * outbox (`command_outbox_delivery`) enforces by dead-lettering a redrive past
+     * it. Substrate-tuned; do not copy the number elsewhere.
      */
-    static constexpr std::int64_t kMaxDedupRows = 20000;
+    static constexpr std::int64_t kMaxDedupRows = ::yuzu::kAgentDedupRingRows;
 
     /**
      * Prune cadence: prune after this many claims, so eviction is O(rows)

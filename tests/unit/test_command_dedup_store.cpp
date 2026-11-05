@@ -268,6 +268,46 @@ TEST_CASE("CommandDedupStore: retention evicts oldest TERMINAL rows",
     CHECK(t.store.claim("cmd-oldest").status == ClaimStatus::Claimed);
 }
 
+// #3678: the boundary the server's redelivery horizon is sized against. A terminal command stays
+// replayable while FEWER than `max` newer terminal commands exist, so a redelivery that arrives
+// within `max - 1` newer commands is absorbed (replayed, not re-executed). Past `max` newer ones
+// (and a prune) it is a fresh claim -- the re-execution the horizon exists to prevent. Reduced
+// ring (the idiom above): this proves the SHAPE of the boundary, not the 20000 production figure.
+TEST_CASE("CommandDedupStore: a terminal command is still replayed after max-1 newer terminals "
+          "and re-claimable only once max newer ones have pushed it out (#3678)",
+          "[command_dedup][retention][3678]") {
+    static_assert(CommandDedupStore::kMaxDedupRows == ::yuzu::kAgentDedupRingRows,
+                  "the ring bound is single-sourced in command_replay_horizon.hpp");
+    constexpr std::int64_t kRing = 600; // > kPruneInterval (512): at least one prune runs
+    static_assert(kRing > static_cast<std::int64_t>(CommandDedupStore::kPruneInterval));
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(kRing);
+
+    REQUIRE(t.store.claim("cmd-x").status == ClaimStatus::Claimed);
+    REQUIRE(t.store.record_terminal("cmd-x", "SUCCESS-X") == RecordOutcome::Recorded);
+
+    // kRing - 1 newer terminal commands: cmd-x is the oldest of exactly kRing retained rows.
+    for (std::int64_t i = 0; i < kRing - 1; ++i) {
+        auto id = "newer-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+    auto inside = t.store.claim("cmd-x");
+    CHECK(inside.status == ClaimStatus::Duplicate);
+    CHECK(inside.state == DedupState::Terminal);
+    CHECK(inside.response == "SUCCESS-X"); // replayed with its ORIGINAL outcome
+
+    // Push kRing + one prune interval more newer terminals past it: cmd-x is evicted and a
+    // redelivery would now be a fresh claim (a re-execution).
+    for (std::int64_t i = 0; i < kRing + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval);
+         ++i) {
+        auto id = "pushout-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+    CHECK(t.store.claim("cmd-x").status == ClaimStatus::Claimed);
+}
+
 TEST_CASE("CommandDedupStore: a live in-flight row is NEVER evicted by retention (UP-1)",
           "[command_dedup][retention][effectively-once]") {
     auto t = make_store();

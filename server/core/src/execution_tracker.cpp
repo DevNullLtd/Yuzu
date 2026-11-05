@@ -607,6 +607,11 @@ const std::vector<pg::PgMigration>& migrations() {
          "UPDATE concurrency_claims SET definition_id = replace(definition_id, "
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
          "UPDATE command_execution SET plugin = 'echo' WHERE plugin = 'tar';"},
+        // v9 (#3678): the fleet-wide dispatch sequence. `record_command_dispatch` advances it once
+        // per dispatch call (one command_id = at most one agent dedup-ring slot), and the WS-3
+        // command outbox compares it against the value stamped on a row at first send to bound a
+        // redrive (see command_replay_horizon.hpp). DDL only, no table rewrite, instant.
+        {9, "CREATE SEQUENCE IF NOT EXISTS dispatch_seq;"},
     };
     return kMigrations;
 }
@@ -2754,11 +2759,17 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
     // session_store's DB-clock-authority precedent (#3715).
     //
     // ON CONFLICT: the PLUGIN is deliberately NOT updated (first writer wins; see the declaration).
+    //
+    // #3678: the same statement advances `dispatch_seq` (no extra round trip on this synchronous
+    // pre-RPC path). It is consumed on a conflicting re-record too, which only over-counts: a
+    // larger sequence makes the outbox redelivery horizon trip earlier, never later. The explicit
+    // `WHERE true` is the documented disambiguation of INSERT ... SELECT ... FROM ... ON CONFLICT.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO execution_tracker.command_execution "
         "(command_id, plugin, execution_id, created_at) "
-        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "SELECT $1::text, $2::text, $3::text, extract(epoch FROM now())::bigint "
+        "FROM (SELECT nextval('execution_tracker.dispatch_seq')) AS seq WHERE true "
         "ON CONFLICT (command_id) DO UPDATE SET "
         "execution_id = CASE WHEN EXCLUDED.execution_id = '' "
         "THEN execution_tracker.command_execution.execution_id ELSE EXCLUDED.execution_id END, "
@@ -2776,6 +2787,27 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
         return false;
     }
     return true;
+}
+
+std::optional<std::int64_t> ExecutionTracker::current_dispatch_seq() const {
+    if (!open_)
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    // last_value is the most recently issued value; before the first nextval() it reads 1 with
+    // is_called = false, which is "none issued" = 0.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END "
+        "FROM execution_tracker.dispatch_seq",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    const auto parsed = parse_reap_i64(col_str(res.get(), 0, 0));
+    if (!parsed || *parsed < 0)
+        return std::nullopt;
+    return *parsed;
 }
 
 std::optional<CommandRecord>

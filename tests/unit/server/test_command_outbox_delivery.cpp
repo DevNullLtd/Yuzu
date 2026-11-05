@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -59,6 +60,7 @@ struct DispatchProbe {
     std::string last_action;
     ApprovalProvenance last_provenance{ApprovalProvenance::None};
     ConfinedDispatchOutcome next{}; // returned each call; test sets .sent etc.
+    std::function<void()> on_call;  // #3678: runs INSIDE dispatch_fn, to observe state at send time
 };
 
 class DeliveryPg {
@@ -94,13 +96,55 @@ public:
     std::int64_t epoch() const { return epoch_; }
     static std::string lock() { return kServerBackgroundLeaderLock; }
 
+    // #3678 (R4): the fleet-wide dispatch sequence the delivery loop reads. `seq` is what the
+    // tests advance; nullopt models an unreadable sequence; `seq_wired=false` models a server
+    // that never wired the reader (the loop must HOLD, not send).
+    std::optional<std::int64_t> seq{1000};
+    bool seq_wired{true};
+    CommandOutboxDelivery::DispatchSeqFn seq_fn() {
+        if (!seq_wired)
+            return {};
+        return [this]() { return seq; };
+    }
+
+    // Make a backed-off pending row due again (reschedule pushes next_attempt_at out by 30 s).
+    void make_due(const std::string& occ) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db_->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    conn.get(),
+                    "UPDATE command_outbox_store.outbox SET next_attempt_at = now() "
+                    "WHERE occurrence_id=$1",
+                    std::vector<std::string>{occ})
+                    .status() == PGRES_COMMAND_OK);
+    }
+
+    // Raw read of one text/bigint column; "<null>" for SQL NULL, "<absent>" for no such row.
+    std::string raw_col(const std::string& occ, const char* column) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db_->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql = std::string("SELECT ") + column +
+                                " FROM command_outbox_store.outbox WHERE occurrence_id=$1";
+        yuzu::server::pg::PgResult r =
+            yuzu::server::pg::exec_params(conn.get(), sql.c_str(), std::vector<std::string>{occ});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        if (PQntuples(r.get()) != 1)
+            return "<absent>";
+        return PQgetisnull(r.get(), 0, 0) ? std::string("<null>")
+                                           : std::string(PQgetvalue(r.get(), 0, 0));
+    }
+
     // Build a delivery loop whose dispatch/arming seams the test controls.
     // `metrics` is optional (defaulted) - most tests here assert on the
     // OutboxCommand state machine, not on observability, and don't need it.
     CommandOutboxDelivery make_delivery(DispatchProbe& probe, bool arming_allow,
-                                        yuzu::MetricsRegistry* metrics = nullptr) {
+                                        yuzu::MetricsRegistry* metrics = nullptr,
+                                        std::int64_t horizon =
+                                            yuzu::kMaxOutboxRedeliveryHorizonCommands) {
         CommandOutboxDelivery::Deps d;
         d.outbox = store_.get();
+        d.dispatch_seq_fn = seq_fn(); // #3678 R4: required, fail-closed
+        d.redelivery_horizon_commands = horizon;
         d.leader = elector_.get();
         d.metrics = metrics;
         d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
@@ -113,6 +157,8 @@ public:
             probe.last_plugin = plugin;
             probe.last_action = action;
             probe.last_provenance = caller.approval_provenance;
+            if (probe.on_call)
+                probe.on_call();
             auto out = probe.next;
             out.command_id = command_id;
             return out;
@@ -490,6 +536,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: mark_cancelled failing after an "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -568,6 +615,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: an already-terminal execution reaching "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -671,6 +719,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) com
 
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
@@ -800,6 +849,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine dispatch whose target-count writ
 
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
@@ -891,6 +941,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a redrive to sent==0 does NOT cancel an "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -979,6 +1030,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: authority denied at redelivery does NOT "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -1014,4 +1066,239 @@ TEST_CASE("CommandOutboxDelivery[pg]: authority denied at redelivery does NOT "
     // The occurrence itself is still durably marked failed — the denial is
     // permanent at the outbox level regardless of the exec-cancel decision.
     CHECK(fx.raw_state("occ-denied-with-response") == "failed");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// #3678 (R4): the redelivery horizon. A stable command_id re-sent after the agent's dedup ring
+// could have evicted it re-executes, so a redrive is bounded by a COUNT of fleet-wide dispatch
+// calls (the sequence ExecutionTracker advances), stamped on the row before its first send.
+// What these prove: the gate's decisions against a FAKE sequence and fake dispatch. What they
+// do NOT prove: that a real agent absorbs a redrive at the production ring size -- that is the
+// upper-bound argument in command_replay_horizon.hpp, not something a unit test can observe.
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("CommandOutboxDelivery[pg]: the first send stamps the dispatch sequence BEFORE dispatch "
+          "(#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-stamp", "cmd-stamp"), fx.lock(),
+                                         fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
+    CHECK(fx.raw_col("occ-stamp", "dispatch_seq_first_sent") == "<null>");
+
+    DispatchProbe probe;
+    std::string stamp_seen_at_send;
+    probe.on_call = [&] { stamp_seen_at_send = fx.raw_col("occ-stamp", "dispatch_seq_first_sent"); };
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+
+    CHECK(probe.calls == 1);
+    CHECK(stamp_seen_at_send == "1000"); // committed before the wire send, not after
+    CHECK(fx.raw_state("occ-stamp") == "sent");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a redrive inside the horizon is still sent; AT the horizon "
+          "it is dead-lettered and never sent (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    constexpr std::int64_t kHorizon = 10;
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-h", "cmd-h"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.containment_unreadable = true; // first attempt: reschedule, row stays pending
+    yuzu::MetricsRegistry metrics;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics, kHorizon);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    REQUIRE(fx.raw_state("occ-h") == "pending");
+    REQUIRE(fx.raw_col("occ-h", "dispatch_seq_first_sent") == "1000");
+
+    // One short of the horizon: still redriven (and the stamp is NOT moved).
+    fx.seq = 1000 + kHorizon - 1;
+    fx.make_due("occ-h");
+    loop.tick();
+    CHECK(probe.calls == 2);
+    CHECK(fx.raw_state("occ-h") == "pending");
+    CHECK(fx.raw_col("occ-h", "dispatch_seq_first_sent") == "1000");
+
+    // At the horizon: dead-lettered, dispatch_fn NOT called again.
+    fx.seq = 1000 + kHorizon;
+    fx.make_due("occ-h");
+    loop.tick();
+    CHECK(probe.calls == 2);
+    CHECK(fx.raw_state("occ-h") == "failed");
+    CHECK(fx.raw_col("occ-h", "note") == "redelivery_horizon_exceeded");
+    CHECK(metrics.counter("yuzu_server_command_outbox_deliver_horizon_exceeded_total").value() ==
+          1);
+
+    // Terminal: a further tick never re-drives it.
+    fx.make_due("occ-h");
+    loop.tick();
+    CHECK(probe.calls == 2);
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a sequence that went BACKWARDS dead-letters the redrive "
+          "(#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-back", "cmd-back"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    probe.next.containment_unreadable = true;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+
+    fx.seq = 5; // e.g. a restore from backup: the elapsed count is unknowable
+    fx.make_due("occ-back");
+    loop.tick();
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-back") == "failed");
+    CHECK(fx.raw_col("occ-back", "note") == "redelivery_horizon_exceeded");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: an unreadable or unwired dispatch sequence HOLDS the row -- "
+          "no send, no stamp, no reschedule (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-hold", "cmd-hold"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    yuzu::MetricsRegistry metrics;
+
+    SECTION("sequence unreadable") {
+        fx.seq = std::nullopt;
+        auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics);
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-hold") == "pending");
+        CHECK(fx.raw_col("occ-hold", "dispatch_seq_first_sent") == "<null>");
+        CHECK(fx.raw_col("occ-hold", "attempts") == "0");
+        CHECK(metrics.counter("yuzu_server_command_outbox_deliver_degrade_total").value() == 1);
+
+        // Held, not lost: once the sequence is readable again the SAME tick path delivers it.
+        fx.seq = 1000;
+        loop.tick();
+        CHECK(probe.calls == 1);
+        CHECK(fx.raw_state("occ-hold") == "sent");
+    }
+    SECTION("reader never wired (fail closed like an unset arming_check)") {
+        fx.seq_wired = false;
+        auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics);
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-hold") == "pending");
+        CHECK(fx.raw_col("occ-hold", "dispatch_seq_first_sent") == "<null>");
+    }
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a stamp that cannot commit (fenced-out epoch) sends nothing "
+          "(#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-fence", "cmd-fence"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // A stale ex-leader presents an older epoch: the fenced stamp matches no row.
+    auto stale = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch() - 1, 1000);
+    REQUIRE(stale.has_value());
+    CHECK_FALSE(*stale);
+    CHECK(fx.raw_col("occ-fence", "dispatch_seq_first_sent") == "<null>");
+
+    // The true leader stamps; a second stamp (any epoch) cannot move the origin.
+    auto first = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch(), 1000);
+    REQUIRE(first.has_value());
+    CHECK(*first);
+    auto again = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch(), 9999);
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again);
+    CHECK(fx.raw_col("occ-fence", "dispatch_seq_first_sent") == "1000");
+
+    // A negative sequence is refused, never written.
+    auto neg = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch(), -1);
+    CHECK_FALSE(neg.has_value());
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a horizon dead-letter keeps the approval ticket spent and "
+          "leaves the execution row alone (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+
+    yuzu::server::pg::PgPool tracker_pool{{.conninfo = fx.dsn(), .size = 2}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    auto req = fx.req("occ-ticket", "cmd-ticket", /*approval=*/"appr-1");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.containment_unreadable = true;
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.dispatch_seq_fn = fx.seq_fn();
+    d.redelivery_horizon_commands = 5;
+    d.dispatch_fn = [&probe](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&, const DispatchCaller&, const std::string& cid) {
+        probe.calls++;
+        auto out = probe.next;
+        out.command_id = cid;
+        return out;
+    };
+    d.resolve_caller = [](const std::string& p) {
+        DispatchCaller c;
+        c.principal = p;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    fx.seq = 1000 + 5;
+    fx.make_due("occ-ticket");
+    loop.tick();
+
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-ticket") == "failed");
+    // `failed` is NOT a state filter on the spent-ticket ledger: the first attempt happened.
+    auto spent = fx.store().occurrences_for_approval("appr-1");
+    REQUIRE(spent.has_value());
+    CHECK(*spent == std::vector<std::string>{"occ-ticket"});
+    // The command may have reached agents: the execution row is NOT force-cancelled.
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "running");
+}
+
+TEST_CASE("CommandOutboxDelivery: the constructor clamps a Deps horizon into [1, the ring-derived "
+          "constant] (#3678)",
+          "[command_outbox][delivery][3678]") {
+    // No database needed: the clamp is constructor-local. (tick() never runs.)
+    auto horizon_after = [](std::int64_t requested) {
+        CommandOutboxDelivery::Deps d;
+        d.redelivery_horizon_commands = requested;
+        CommandOutboxDelivery loop{std::move(d)};
+        return loop.redelivery_horizon_for_test();
+    };
+    CHECK(horizon_after(yuzu::kMaxOutboxRedeliveryHorizonCommands * 100) ==
+          yuzu::kMaxOutboxRedeliveryHorizonCommands);
+    CHECK(horizon_after(0) == 1);
+    CHECK(horizon_after(-7) == 1);
+    CHECK(horizon_after(42) == 42);
 }
