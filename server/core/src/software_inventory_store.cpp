@@ -73,12 +73,12 @@ constexpr int kFleetQueryRowCap = 100000;
 // survive (the "as of" stamp ages, and yuzu_inventory_catalog_rollup_total{outcome="error"}
 // increments). The first refresh after migration v8 has no last-good (v8 drops the rollup
 // tables), so a failing first refresh leaves the catalogue "building".
-// Scale ceiling (measured on PG 18.6 without the representative-publisher aggregate): the
-// GROUPING SETS statement costs about 12.8x the former catalogue GROUP BY (37 s vs 2.9 s at
-// 1.8M rows) and reaches this flat 60 s cap at about 2.7M installed rows (about 6,000
-// endpoints at about 450 titles each). The representative-publisher aggregate adds a second
-// max() to each of the 8 grouping sets, so the cap is reached somewhat sooner (estimated
-// about 2.5M rows, unmeasured, tracked in #5545); beyond it the catalogue stays "building"
+// Scale ceiling (measured on PG 18.6 for the grouping sets alone): the GROUPING SETS
+// statement costs about 12.8x the former catalogue GROUP BY (37 s vs 2.9 s at 1.8M rows) and
+// reaches this flat 60 s cap at about 2.7M installed rows (about 6,000 endpoints at about 450
+// titles each). The representative-publisher aggregate adds a second max() to each of the 8
+// grouping sets; with it the cap is estimated at about 2.5M rows (unmeasured, tracked in
+// #5545). Beyond the cap the catalogue stays "building"
 // until the rollup is made incremental. The page READS hit
 // the small precomputed tables, no bound.
 constexpr const char* kRollupStatementTimeout = "60s";
@@ -724,8 +724,9 @@ std::string is_origin_label(std::string_view col) {
 
 // The representative publisher of a group: a declared vendor over an origin label
 // (`via:<ecosystem>`, product_normalize.hpp kOriginLabelPrefix), falling back to the plain max
-// (a label, or '') when no row of the group has a vendor. Plain max() would pick `via:` over
-// any capitalised vendor, since lowercase sorts after uppercase. The display column AND the
+// (a label, or '') when no row of the group has a vendor. The CASE excludes labels explicitly,
+// so the result does not depend on the database collation (a plain max() could pick a label
+// over a vendor wherever the label sorts last). The display column AND the
 // catalogue `q` publisher arm both use this expression, so a search finds what is shown.
 std::string representative_publisher(std::string_view col) {
     const std::string c(col);

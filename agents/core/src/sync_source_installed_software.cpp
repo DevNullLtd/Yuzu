@@ -523,7 +523,8 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // CFBundleIdentifier reverse-domain id, an identifier and not a vendor, so it is ignored
     // there (`vendor_column_is_vendor` false) and the collector labels the row `via:python`,
     // the same rule as macos_pkgutil. The flavour and path have no installed_software slot and
-    // are dropped. A constrained status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
+    // are dropped. A constrained status withholds these rows only: see the table row's
+    // ConstrainedPolicy::drop_source.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
     // strict (five logical fields); the version is dotted digits by construction on every leg, and
