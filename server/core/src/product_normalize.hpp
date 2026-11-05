@@ -65,7 +65,7 @@ NormalizedTitle normalize_title(std::string_view raw);
 
 /// The origin-label prefix the agent writes into `publisher` when a source declares no vendor
 /// (`via:<ecosystem>`, ADR-0016 update 2026-11-04). It names where a row came from, never who
-/// made it. MUST equal the agent's kOriginLabelPrefix (sync_source_installed_software.cpp).
+/// made it. MUST equal the agent's kOriginLabelPrefix (sync_source_installed_software.hpp).
 inline constexpr std::string_view kOriginLabelPrefix = "via:";
 
 /// Normalise a raw vendor/publisher name deterministically: ASCII lowercase,

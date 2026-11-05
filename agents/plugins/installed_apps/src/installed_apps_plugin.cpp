@@ -462,8 +462,8 @@ InvCollection get_inventory_linux() {
         // matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the two
         // collectors agree on this field for the same rpm. Never a live
         // `rpm -K` verification. The publisher is the declared VENDOR, falling
-        // back to PACKAGER (a person) when VENDOR is unset; both ride in
-        // the row, and the `list` action reports its own columns.
+        // back to PACKAGER (a person) when VENDOR is unset; the publisher slot
+        // carries the one chosen, and the `list` action reports its own columns.
         collect({path, "-qa", "--queryformat",
                 "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{PACKAGER}\t"
                 "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\t%{VENDOR}\n"},

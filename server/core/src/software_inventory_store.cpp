@@ -73,10 +73,13 @@ constexpr int kFleetQueryRowCap = 100000;
 // survive (the "as of" stamp ages, and yuzu_inventory_catalog_rollup_total{outcome="error"}
 // increments). The first refresh after migration v8 has no last-good (v8 drops the rollup
 // tables), so a failing first refresh leaves the catalogue "building".
-// Scale ceiling (measured on PG 18.6): the GROUPING SETS statement costs about 12.8x the
-// former catalogue GROUP BY (37 s vs 2.9 s at 1.8M rows) and reaches this flat 60 s cap at
-// about 2.7M installed rows (about 6,000 endpoints at about 450 titles each); beyond that
-// the catalogue stays "building" until the rollup is made incremental. The page READS hit
+// Scale ceiling (measured on PG 18.6 without the representative-publisher aggregate): the
+// GROUPING SETS statement costs about 12.8x the former catalogue GROUP BY (37 s vs 2.9 s at
+// 1.8M rows) and reaches this flat 60 s cap at about 2.7M installed rows (about 6,000
+// endpoints at about 450 titles each). The representative-publisher aggregate adds a second
+// max() to each of the 8 grouping sets, so the cap is reached somewhat sooner (estimated
+// about 2.5M rows, unmeasured, tracked in #5545); beyond it the catalogue stays "building"
+// until the rollup is made incremental. The page READS hit
 // the small precomputed tables, no bound.
 constexpr const char* kRollupStatementTimeout = "60s";
 
