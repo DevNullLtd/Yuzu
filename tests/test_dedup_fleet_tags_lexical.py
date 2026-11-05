@@ -271,10 +271,21 @@ def problems() -> list:
     body = m.group(0) if m else ""
     if not body:
         out.append("could not find AgentServiceImpl::record_command_dispatch in agent_service_impl.cpp")
-    elif body.count("note_unrecorded_dispatch()") < 2:
-        out.append("AgentServiceImpl::record_command_dispatch must call note_unrecorded_dispatch() at "
-                   "BOTH its latch-skip and its failed-write sites (#3678): an uncounted unrecorded "
-                   "dispatch freezes the outbox redelivery horizon while the agent ring fills")
+    else:
+        # Bind each call to ITS branch (comments already stripped, whitespace removed): a bare
+        # count of the token is satisfied by two calls in one branch, or by one after a `return`.
+        flat = re.sub(r"\s+", "", body)
+        degrade = r'metrics_\.counter\("yuzu_exec_correlation_write_degrade_total"\)\.increment\(\);'
+        note = r"if\(tracker\)tracker->note_unrecorded_dispatch\(\);"
+        if not re.search(r"if\(latch&&latch->tripped\(\)\)\{latch->note_skipped\(\);" + degrade + note + r"return;\}", flat):
+            out.append("AgentServiceImpl::record_command_dispatch must call note_unrecorded_dispatch() in "
+                       "its LATCH-SKIP branch, after the degrade count and before the return (#3678): an "
+                       "uncounted skipped dispatch freezes the outbox redelivery horizon while the agent "
+                       "ring fills")
+        if not re.search(r"if\(!recorded\)\{if\(latch\)latch->trip\(\);" + degrade + note + r"\}", flat):
+            out.append("AgentServiceImpl::record_command_dispatch must call note_unrecorded_dispatch() in "
+                       "its FAILED-WRITE branch (#3678): an uncounted failed write freezes the outbox "
+                       "redelivery horizon while the agent ring fills")
     # 10. #3678: the stamp is cleared ONLY when this call wrote it AND the attempt reached no agent.
     # A clear on any weaker condition lets a stamp that guards a REAL earlier send be dropped, which
     # restarts the horizon and is the unsafe direction. The store also guards by epoch, but this is
@@ -358,9 +369,27 @@ class DedupFleetTagsLexical(unittest.TestCase):
         self.assertTrue(any("no longer wires .dispatch_seq_fn" in p for p in found), found)
 
     def test_self_check_detects_an_uncounted_unrecorded_dispatch_site(self):
+        # The skip branch's call (the first occurrence in the file) ...
         found = self._problems_with(
             AGENT_SERVICE_CPP, lambda s: s.replace("tracker->note_unrecorded_dispatch();", "", 1))
-        self.assertTrue(any("note_unrecorded_dispatch()" in p for p in found), found)
+        self.assertTrue(any("LATCH-SKIP branch" in p for p in found), found)
+
+        # ... and the failed-write branch's call (the LAST occurrence) are each pinned to THEIR branch.
+        def drop_last(s):
+            i = s.rindex("tracker->note_unrecorded_dispatch();")
+            return s[:i] + s[i + len("tracker->note_unrecorded_dispatch();"):]
+        found = self._problems_with(AGENT_SERVICE_CPP, drop_last)
+        self.assertTrue(any("FAILED-WRITE branch" in p for p in found), found)
+
+    def test_self_check_rejects_two_calls_in_one_branch(self):
+        # A bare token count would accept this: both calls in the failed-write branch, none in the skip.
+        def move_both(s):
+            call = "if (tracker)\n            tracker->note_unrecorded_dispatch();"
+            s = s.replace(call, "", 1)
+            return s.replace("metrics_.counter(\"yuzu_exec_correlation_write_degrade_total\").increment();\n        // #3678: see the skipped branch above.",
+                             "metrics_.counter(\"yuzu_exec_correlation_write_degrade_total\").increment();\n        if (tracker) tracker->note_unrecorded_dispatch();\n        // #3678: see the skipped branch above.", 1)
+        found = self._problems_with(AGENT_SERVICE_CPP, move_both)
+        self.assertTrue(any("LATCH-SKIP branch" in p for p in found), found)
 
     def test_self_check_detects_a_weakened_stamp_clear_condition(self):
         found = self._problems_with(

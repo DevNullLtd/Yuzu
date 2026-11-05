@@ -486,14 +486,15 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
          "the registry audit decides by the resolved plugin"),
         ("prov-live-output-by-resolved-plugin", r"publish_output_rows\(agent_id,plugin,resp\.output\(\)\)", 2,
          "the live output stream decides by the resolved plugin"),
-        # #3678: the skip block may carry ONE extra statement between the degrade count and the
+        # #3678: the skip block carries exactly ONE extra statement between the degrade count and the
         # return -- `if (tracker) tracker->note_unrecorded_dispatch();` -- because a skipped record
-        # is a dispatch the outbox redelivery horizon must still count. Nothing else is allowed
-        # there: the degrade count, the `note_skipped()` and the `return` stay pinned.
+        # is a dispatch the outbox redelivery horizon must still count. It is REQUIRED (deleting it
+        # fails this pin), and nothing else is allowed there: the degrade count, the
+        # `note_skipped()` and the `return` stay pinned.
         ("prov-latch-skip-after-trip",
          r"if\(latch&&latch->tripped\(\)\)\{latch->note_skipped\(\);"
          r"metrics_\.counter\(\"yuzu_exec_correlation_write_degrade_total\"\)\.increment\(\);"
-         r"(?:if\(tracker\)tracker->note_unrecorded_dispatch\(\);)?return;\}", 1,
+         r"if\(tracker\)tracker->note_unrecorded_dispatch\(\);return;\}", 1,
          "a write after the loop's first failure is skipped AND counted as a degrade"),
         ("prov-latch-short-budget",
          r"latch\?tracker->record_command_dispatch\(command_id,plugin,execution_id,latch->lease_timeout\(\)\)"

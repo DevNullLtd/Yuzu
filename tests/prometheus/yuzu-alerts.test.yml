@@ -7627,8 +7627,34 @@ tests:
       - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
         values: "0x3 1+1x4 6x120"
     promql_expr_test:
+      # Evaluated DURING and just after the window (the expression is true for the 5-minute hold
+      # plus the 10m window = about 14 minutes, one short of `for: 15m`): a case that evaluates
+      # only at 60m can never fail, which is how `for: 1m` and a wider window used to pass it.
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
         eval_time: 60m
+        exp_samples: []
+
+  # CASE — a hold of about 7 minutes DOES fire, after it has already recovered, and clears about
+  # 10 minutes later: the rule is "stalled for several minutes", not "stalled for 15 minutes".
+  - interval: 1m
+    name: outbox held - a 7 minute hold fires late and clears
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0x3 1+1x7 8x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 19m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 40m
         exp_samples: []
 
   # CASE — stamp_not_committed holds (leader handover noise) are excluded by the rule.
@@ -7667,4 +7693,61 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
         eval_time: 90m
+        exp_samples: []
+
+  # CASE — a series born already non-zero (a dead-letter on the first leader tick after a restart,
+  # inside one scrape interval) still fires; `increase()` alone would ignore its first sample.
+  - interval: 1m
+    name: outbox dead-lettered - a series born non-zero fires and later clears
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "_x9 3x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 150m
+        exp_samples: []
+
+  # ── YuzuOutboxStampFailing (#3678) ─────────────────────────────────────────────────────────
+
+  # CASE — a PERSISTENT stamp failure fires after the 1h `for:`, and not before.
+  - interval: 1m
+    name: outbox stamp failing - a persistent stamp_not_committed fires after an hour
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="stamp_not_committed"}'
+        values: "0+1x200"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CASE — leader-handover noise (a few failed stamps, then recovery) does not fire.
+  - interval: 1m
+    name: outbox stamp failing - handover noise does not fire
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="stamp_not_committed"}'
+        values: "0x3 1+1x2 3x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE — a systemic hold cause does not fire the stamp rule (each cause has its own alert).
+  - interval: 1m
+    name: outbox stamp failing - sequence_unreadable alone does not fire it
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0+1x200"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 120m
         exp_samples: []

@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -1147,8 +1148,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: a redrive is sent while inside the horizon
     DeliveryPg fx;
     yuzu::server::AuditStore audit{fx.pool()};
     REQUIRE(audit.is_open());
-    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-h", "cmd-h"), fx.lock(), fx.epoch()) ==
-            OutboxEnqueueOutcome::Enqueued);
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-h", "cmd-h", "abcdef0123456789"), fx.lock(),
+                                         fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
 
     DispatchProbe probe;
     make_partial_send(probe); // first attempt: reaches some agents, retried -- the stamp stays
@@ -1189,8 +1190,10 @@ TEST_CASE("CommandOutboxDelivery[pg]: a redrive is sent while inside the horizon
     REQUIRE(rows->size() == 1); // the partial-send retries wrote none: only the dead-letter did
     CHECK((*rows)[0].result == "failure");
     CHECK((*rows)[0].detail.find("redelivery_horizon_exceeded first_seq=1000 current_seq=1010 "
-                                 "local_delta=0 horizon=10 execution_id=exec-1 approval_id=") !=
-          std::string::npos);
+                                 "local_delta=0 horizon=10 execution_id=exec-1 "
+                                 "approval_id=abcdef01 (") != std::string::npos);
+    // An approval id is a bearer capability: only an 8-character prefix is recorded.
+    CHECK((*rows)[0].detail.find("abcdef0123456789") == std::string::npos);
 
     // Terminal: a further tick never re-drives it, and writes no second row.
     fx.make_due("occ-h");
@@ -1497,14 +1500,62 @@ TEST_CASE("CommandOutboxDelivery[pg]: a stamp from ANOTHER leadership term is co
     make_partial_send(probe);
     auto loop = fx.make_delivery(probe, /*arming_allow=*/true, nullptr, kHorizon);
 
-    SECTION("a previous process had a HUGE local count: the new one is not misled into 'young'") {
-        // The old leader stamped when ITS count was 12,000. A summed encoding would now read this
-        // process's 3 as 11,997 BELOW the stamp. The separate encoding reads 0 shared + 3 local.
+    SECTION("KNOWN RESIDUAL (characterisation, not a guarantee): a previous process's post-stamp "
+            "unrecorded dispatches are FORGOTTEN, so the row reads young and is SENT") {
+        // The old leader stamped when ITS count was 12,000, and may have gone on to make any number
+        // of unrecorded dispatches before it restarted. This process starts near zero and has no
+        // way to know. A summed encoding would instead have read 3 as 11,997 BELOW the stamp (the
+        // scale-mixing defect the redesign removed); the separate encoding reads 0 shared + 3
+        // local, which is SAFE FROM THAT DEFECT but is an UNDER-count for the forgotten failures.
+        // The sound close is agent-side (refuse ids older than the ring): see
+        // command_replay_horizon.hpp, "an earlier process lifetime". This test pins today's
+        // behaviour so it cannot change silently in either direction.
         fx.set_stamp("occ-x", 1000, 12000, fx.epoch() - 1);
         fx.unrecorded = 3;
         loop.tick();
         CHECK(probe.calls == 1); // elapsed = 0 + 3 < 10: sent
         CHECK(fx.raw_state("occ-x") == "pending");
+    }
+    SECTION("the DISCRIMINATOR: the same numbers dead-letter in another term and are sent in the "
+            "same term") {
+        // stamp unrecorded = 5, reader unrecorded = 10, horizon 10.
+        //   another term  -> the reader charges its WHOLE count: 10 >= 10 -> dead-letter
+        //   the same term -> differenced: 10 - 5 = 5 < 10 -> sent
+        // If the epoch comparison were deleted (every stamp treated as same-term) the first half
+        // would be sent, which is exactly the scale-mixing defect: every other section in this
+        // test happens to give the same verdict either way.
+        fx.set_stamp("occ-x", 1000, 5, fx.epoch() - 1);
+        fx.unrecorded = 10;
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
+        CHECK(fx.raw_col("occ-x", "note") == "redelivery_horizon_exceeded");
+    }
+    SECTION("the same numbers inside ONE term are differenced and the row is sent") {
+        fx.set_stamp("occ-x", 1000, 5, fx.epoch());
+        fx.unrecorded = 10;
+        loop.tick();
+        CHECK(probe.calls == 1);
+        CHECK(fx.raw_state("occ-x") == "pending");
+    }
+    SECTION("a huge local count with the shared sequence advanced dead-letters instead of "
+            "wrapping negative") {
+        fx.set_stamp("occ-x", 1000, 0, fx.epoch() - 1);
+        fx.seq = 1005;
+        fx.unrecorded = std::numeric_limits<std::int64_t>::max();
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
+        CHECK(fx.raw_col("occ-x", "note") == "redelivery_horizon_exceeded");
+    }
+    SECTION("a local count that went DOWN inside one epoch is charged whole, not clamped to zero") {
+        // Cannot happen unless an epoch were reused (the elector documents that as not covered),
+        // but clamping the difference to zero would then silently under-count.
+        fx.set_stamp("occ-x", 1000, 500, fx.epoch());
+        fx.unrecorded = 10;
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
     }
     SECTION("this process's whole local count is charged, which can only over-count") {
         fx.set_stamp("occ-x", 1000, 0, fx.epoch() - 1);
@@ -1536,6 +1587,71 @@ TEST_CASE("CommandOutboxDelivery[pg]: a stamp from ANOTHER leadership term is co
         CHECK(probe.calls == 0);
         CHECK(fx.raw_col("occ-x", "note") == "redelivery_sequence_regressed");
     }
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a REAL leadership change (resign then re-acquire) is "
+          "another term -- the reader charges its whole unrecorded count (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    constexpr std::int64_t kHorizon = 10;
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-flap", "cmd-flap"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe); // keeps the stamp
+    fx.unrecorded = 500;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, nullptr, kHorizon);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    REQUIRE(fx.raw_col("occ-flap", "dispatch_stamp_epoch") == std::to_string(fx.epoch()));
+
+    // The same process loses and regains leadership: a genuinely NEW epoch from the real elector.
+    const std::int64_t old_epoch = fx.epoch();
+    fx.elector().resign();
+    REQUIRE(fx.elector().try_acquire());
+    REQUIRE(fx.elector().epoch().has_value());
+    REQUIRE(*fx.elector().epoch() != old_epoch);
+
+    // 9 unrecorded dispatches since the stamp would be 509 - 500 = 9 < 10 if differenced (same
+    // term). Across a term change the reader charges its whole count, 509 >= 10, and refuses --
+    // a safe-direction early dead-letter, which is the documented cost of using the epoch as the
+    // "same process" discriminator (a boot nonce would avoid it; a follow-up).
+    fx.unrecorded = 509;
+    fx.make_due("occ-flap");
+    loop.tick();
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-flap") == "failed");
+    CHECK(fx.raw_col("occ-flap", "note") == "redelivery_horizon_exceeded");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: KNOWN RESIDUAL (characterisation, not a guarantee): a stale "
+          "leader acting on an old snapshot still sends a row a peer has just dead-lettered (#3678)",
+          "[command_outbox][pg][delivery][3678][residual]") {
+    // The send happens BEFORE any fenced write for the sent path (see the "ORDERING" comment in
+    // deliver()), so a replica that read the row as stamped-and-inside-the-horizon can send it even
+    // though a peer dead-lettered it in between. Only the bookkeeping is fenced out. That is the
+    // pre-existing ADR-2002 section 6 gap, absorbed by the agent's dedup UNLESS the id has been
+    // evicted -- which is exactly the case the horizon exists for, so this is worth pinning.
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-stale", "cmd-stale"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe);
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick(); // attempt 1: stamps, partial send, rescheduled
+    REQUIRE(probe.calls == 1);
+    fx.make_due("occ-stale");
+
+    // A peer dead-letters the row between this replica's list_pending snapshot and its decision.
+    fx.before_seq_read = [&] {
+        auto peer = fx.store().mark_failed("occ-stale", fx.lock(), fx.epoch(),
+                                           "redelivery_horizon_exceeded");
+        REQUIRE(peer.has_value());
+        REQUIRE(*peer);
+    };
+    loop.tick();
+
+    CHECK(fx.raw_state("occ-stale") == "failed"); // the peer's verdict stands in the store...
+    CHECK(probe.calls == 2);                      // ...but this replica still sent on its snapshot
 }
 
 TEST_CASE("CommandOutboxStore[pg]: the stamp-clear only touches a stamp written in THIS term "

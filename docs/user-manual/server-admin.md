@@ -1195,7 +1195,7 @@ no-backfill, since this store never existed before 3.3).
   assurance built on "one audit event per scheduled fire" must be updated**
   to expect the pair, or to key off `command.outbox_delivered` for the
   delivery outcome. A `failure` row is not always "reached nobody": since
-  #3678 it also records a redelivery dead-letter (detail begins
+  #3678 it also records a redelivery dead-letter (detail contains
   `redelivery_horizon_exceeded` or `redelivery_sequence_regressed`) for an
   occurrence that may or may not have reached any agent.
 - **A scheduled run's retry is now bounded (#3678).** Previously a run whose
@@ -1208,7 +1208,7 @@ no-backfill, since this store never existed before 3.3).
   ticket it used stays spent. The count is an estimate and can err in both
   directions; see "Execution semantics" in `docs/user-manual/instructions.md`
   for the limits and the steps to take after a dead-letter. Alerts:
-  `YuzuOutboxDeadLettered` and `YuzuOutboxHeld`.
+  `YuzuOutboxHeld`, `YuzuOutboxStampFailing` and `YuzuOutboxDeadLettered`.
 - **New metrics.** Eight counters and a backlog gauge —
   `yuzu_server_command_outbox_*` — cover enqueue-side degrade and the
   delivery loop's outcomes (delivered / no-agents / denied / retry / errors /

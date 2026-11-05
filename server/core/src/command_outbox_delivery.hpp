@@ -49,9 +49,10 @@
 ///  A redrive's elapsed estimate is
 ///      (shared_now - shared_stamp)  +  local
 ///  where `local` is `unrecorded_now - unrecorded_stamp` when the stamp's epoch equals THIS term's
-///  epoch (same process, so the two local counts are comparable) and the reader's WHOLE
-///  `unrecorded_now` otherwise (a different process; its history is unknowable, so count all of
-///  this one's). Elapsed `>= redelivery_horizon_commands` dead-letters the row
+///  epoch (same process, so the two local counts are comparable and the count can only have
+///  grown) and the reader's WHOLE `unrecorded_now` otherwise (a different process: the reader
+///  charges its whole unrecorded count, which includes failures that predate the stamp). Elapsed
+///  `>= redelivery_horizon_commands` dead-letters the row
 ///  (`redelivery_horizon_exceeded`); a shared sequence BELOW the stamp (a restore, a lost-WAL
 ///  failover) dead-letters it as `redelivery_sequence_regressed`. The local count is never summed
 ///  into the shared one: they are on different scales.
@@ -68,10 +69,13 @@
 ///
 ///  The estimate is conservative in several ways that dead-letter a row EARLY (a fan-out push
 ///  records one call per target; any principal's dispatches advance the shared term; every
-///  redrive that re-records its own id advances it) and has residuals that can let a row go LATE
-///  (record-write failures on a replica other than the reader are not counted; dispatches queued
-///  before the stamp but delivered after the agent's claim are not counted). It is an estimate,
-///  not a proof: see the header comment of `command_replay_horizon.hpp`.
+///  redrive that re-records its own id advances it; a reader in another term charges its whole
+///  unrecorded count, which never decays inside a process) and has residuals that can let a row go
+///  LATE (unrecorded dispatches made by a replica OTHER than the reader, or by an EARLIER
+///  PROCESS LIFETIME of the same replica -- a restart or a leader change -- are not in the
+///  reader's count; commands dispatched before the stamp but claimed by the agent after it are
+///  not counted). It is an estimate, not a proof: see the header comment of
+///  `command_replay_horizon.hpp`.
 ///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
 /// historical discipline): a systemic transient gate/directory failure

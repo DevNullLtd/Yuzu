@@ -128,11 +128,19 @@ claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
   **It errs both ways.** It OVER-counts (safe: a row is dead-lettered early and a scheduled fire is
   lost, audited): the sequence is fleet-wide; a per-target push (Guardian, asset-tag, sync) counts
   once per target although each agent receives one command; `__guard__` counts although it takes no
-  ring slot; and every redrive that re-records its own id advances it, so rows stuck in a long
-  gateway-directory outage age each other. It can UNDER-count (unsafe: a redrive after the agent
-  evicted the id): a record-write failure on a replica other than the one reading the position is
-  not counted, and a command dispatched before the stamp but delivered to the agent after it takes a
-  ring slot the count never saw. The 2x margin absorbs the race between the check and the agent's
+  ring slot; every redrive that re-records its own id advances it, so rows stuck in a long
+  gateway-directory outage age each other; and a reader in another leadership term charges its whole
+  unrecorded count, which never decays inside a process (after about 10,000 such dispatches every
+  later leadership change dead-letters every waiting row until a restart). It can UNDER-count
+  (unsafe: a redrive after the agent evicted the id): a record-write failure on a replica other than
+  the one reading the position is not counted, and neither are the failures an EARLIER PROCESS
+  LIFETIME of the same replica made after the stamp (a restart or a leadership change; a restart
+  resets the count to zero and cannot make the shared sequence go backwards, so it is NOT a safe
+  `redelivery_sequence_regressed` refusal); a shared sequence restored to a value still above a
+  row's stamp reads as small progress; a replica acting on a stale snapshot can still send a row a
+  peer has just dead-lettered, because the send precedes the fenced bookkeeping write; and a command
+  dispatched before the stamp but delivered to the agent after it takes a ring slot the count never
+  saw. The 2x margin absorbs the race between the check and the agent's
   claim; it is not sized for a sustained uncounted outage. The sound close, which makes the agent
   refuse an id older than its own ring, needs a wire change and is not part of this change. No test
   observes a real agent at the production ring size.

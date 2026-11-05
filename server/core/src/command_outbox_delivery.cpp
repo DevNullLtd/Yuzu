@@ -353,11 +353,20 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         // operator can tell the two apart. Only the shared term is judged here: the local count
         // legitimately restarts at zero in a new process.
         const bool regressed = pos->shared < first_shared;
-        // Same leadership term => same process => the two local counts are comparable. Any other
-        // case (a different term, or a stamp row missing its companions) counts the reader's whole
-        // local history, which can only over-count.
+        // Same leadership term => same process => the two local counts are comparable, and the
+        // reader's count can only have grown since the stamp. Any other case counts the reader's
+        // WHOLE local count: a different term, a stamp row missing its companions, or a count that
+        // went DOWN inside one epoch (impossible unless an epoch were ever reused, which the
+        // elector documents as not covered; clamping that to zero would under-count).
+        //
+        // Charging the whole count is an OVER-count relative to the reader's own history (it
+        // includes failures that predate the stamp), but it is NOT a bound on what was missed: a
+        // previous process's unrecorded dispatches after the stamp are not in this process's count
+        // at all, and a freshly started reader holds about zero. That is the under-count residual
+        // documented in command_replay_horizon.hpp ("an earlier process lifetime").
         const bool same_term = c.dispatch_stamp_epoch && *c.dispatch_stamp_epoch == epoch &&
-                               c.dispatch_unrecorded_first_sent;
+                               c.dispatch_unrecorded_first_sent &&
+                               pos->unrecorded >= *c.dispatch_unrecorded_first_sent;
         const std::int64_t local =
             same_term ? std::max<std::int64_t>(0, pos->unrecorded - *c.dispatch_unrecorded_first_sent)
                       : pos->unrecorded;
@@ -374,7 +383,7 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             if (marked.has_value() && *marked) {
                 count("yuzu_server_command_outbox_deliver_horizon_exceeded_total");
                 spdlog::error("command_outbox_delivery: occurrence '{}' (command_id={}) "
-                              "dead-lettered: {} (stamp_shared={} now_shared={} local_delta={} "
+                              "dead-lettered: {} (first_seq={} current_seq={} local_delta={} "
                               "same_term={} horizon={})",
                               c.occurrence_id, c.command_id, reason, first_shared, pos->shared,
                               local, same_term, d_.redelivery_horizon_commands);
@@ -385,7 +394,11 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                           " current_seq=" + std::to_string(pos->shared) +
                           " local_delta=" + std::to_string(local) +
                           " horizon=" + std::to_string(d_.redelivery_horizon_commands) +
-                          " execution_id=" + c.execution_id + " approval_id=" + c.approval_id +
+                          " execution_id=" + c.execution_id +
+                          // An approval id is a bearer capability (approval_manager.cpp redacts it
+                          // to 8 characters in its logs), so only that prefix is recorded here;
+                          // the full id is on the approval's own audit rows.
+                          " approval_id=" + c.approval_id.substr(0, 8) +
                           " (an earlier attempt may or may not have reached any agent; "
                           "redelivery refused to stay inside the agent dedup window)");
             }

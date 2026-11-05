@@ -76,13 +76,17 @@
 ///
 /// REDELIVERY HORIZON (#3678). A re-drive re-sends the STABLE `command_id`, and the agent's dedup
 /// ring forgets a terminal command after `kAgentDedupRingRows` newer ones, so a re-drive that old
-/// would RE-EXECUTE. `dispatch_seq_first_sent` records the fleet-wide dispatch sequence before a
-/// row's first send (`stamp_first_send`, epoch-fenced, NULL-only: the first stamp wins and the
-/// origin never moves forward); the delivery loop dead-letters (`mark_failed`,
-/// `redelivery_horizon_exceeded`) a re-drive once the sequence has advanced by
-/// `kMaxOutboxRedeliveryHorizonCommands`. This store does not decide that -- it only carries the
-/// stamp; the rule is `CommandOutboxDelivery` rule R4. It is the count half of #4167; the age and
-/// attempts caps are still open there.
+/// would RE-EXECUTE. Three nullable columns record where the dispatch counters stood before a
+/// row's FIRST delivery attempt (`dispatch_position.hpp`): `dispatch_seq_first_sent` (the shared
+/// sequence), `dispatch_unrecorded_first_sent` (the stamping process's own unrecorded-dispatch
+/// count) and `dispatch_stamp_epoch` (the leader epoch of the stamping term, which says whether a
+/// later reader is the SAME process, so the local counts can be differenced, or another). They
+/// are written together by `stamp_first_send` (epoch-fenced, NULL-only: the first stamp wins and
+/// the origin never moves forward). The delivery loop dead-letters (`mark_failed`,
+/// `redelivery_horizon_exceeded` or `redelivery_sequence_regressed`) a re-drive whose estimate
+/// reaches `kMaxOutboxRedeliveryHorizonCommands`. This store does not decide that -- it only
+/// carries the stamp; the rule is `CommandOutboxDelivery` rule R4. It is the dispatch-count cap
+/// of #4167; the time cap and the attempts cap are still open there.
 ///
 /// SPENT-TICKET LEDGER (#6096). `ScheduleRunner` reads each row's `approval_id` back
 /// (`occurrences_for_approval`) to decide that an approved scheduled ticket was already used.

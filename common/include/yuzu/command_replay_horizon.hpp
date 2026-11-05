@@ -39,11 +39,25 @@
 ///    outage age each other (100 such rows add about 3 a second). One push to
 ///    `kMaxOutboxRedeliveryHorizonCommands` targets dead-letters every stamped pending row at that
 ///    moment. A different-term reader also charges its whole unrecorded history, which includes
-///    failures that predate the stamp.
+///    failures that predate the stamp and which never decays inside a process: once a process has
+///    accumulated about `kMaxOutboxRedeliveryHorizonCommands` unrecorded dispatches (one large
+///    push during a tripped record latch is enough), EVERY later change of leadership on it
+///    dead-letters every stamped pending row until it restarts.
 ///  * UNDER-count (UNSAFE: a row could be redriven after the agent evicted it).
 ///      - A record-write failure on a replica OTHER than the one reading the position is not
 ///        counted: its unrecorded count lives in its own process. A sustained write outage on a
 ///        non-leader replica therefore lets the horizon trip late.
+///      - The same hole exists for an EARLIER PROCESS LIFETIME of the SAME replica. A restart or a
+///        change of leadership gives the reader a new epoch and, after a restart, a count of
+///        zero, so the unrecorded dispatches the previous process made AFTER the stamp are
+///        forgotten and the row reads younger than it is. A restart is therefore not a safe
+///        refusal; it is an under-count. (A restart cannot make the SHARED sequence go
+///        backwards, so it never produces `redelivery_sequence_regressed`.)
+///      - The shared sequence restored to a value still ABOVE a row's stamp reads as small
+///        progress, which under-counts the dispatches the restore rewound.
+///      - A replica that acts on a stale snapshot of a row can still send it after a peer
+///        dead-lettered it, because the send precedes the fenced bookkeeping write (the ADR-2002
+///        section 6 gap); the agent's dedup absorbs that unless the id has been evicted.
 ///      - A command dispatched before the stamp but queued (a gateway backlog, a slow agent
 ///        stream) and claimed by the agent after the stamp takes a ring slot the count never saw.
 ///      The 2x margin absorbs the race between the horizon check and the agent's claim and the
