@@ -8,9 +8,12 @@ its `always()`. This reads .github/workflows/ci.yml's `windows:` job and checks:
   1. the self-test step, the pre-test cleanup and `Test (non-pg suites)` appear in that order, once each;
   2. the post-test cleanup comes after `Test (non-pg suites)` and carries `if: always()` (a cancelled job still
      runs it; an `if:` with no status function would be skipped on failure);
-  3. every call is `shell: pwsh` and goes through the one script, with -SelfTest only on the self-test step;
-  4. the script is ASCII only (Windows PowerShell 5.1 misreads BOM-less UTF-8), and has no `exit 1`/`throw` outside
-     the -SelfTest block's own expectation helper, so housekeeping can never turn the test phase red.
+  3. every call is `shell: pwsh` with a `timeout-minutes` cap and goes through the one script, with -SelfTest only on
+     the self-test step; the self-test and pre-test steps carry no `if:` and no `continue-on-error` (a skipped or
+     ignored step would leave the guard silently off);
+  4. the script is ASCII only (Windows PowerShell 5.1 misreads BOM-less UTF-8); real mode (everything after the
+     -SelfTest block) wraps the cleanup in a catch-all `try`/`catch`, has no `exit 1`/`throw`, and ends `exit 0`, so
+     housekeeping can never turn the test phase red.
 """
 import pathlib
 import re
@@ -53,10 +56,15 @@ def main():
             body = steps[name]
             if "shell: pwsh" not in body:
                 errors.append(f"{name!r} must be `shell: pwsh`")
+            if not re.search(r"^        timeout-minutes: \d+\s*$", body, re.M):
+                errors.append(f"{name!r} must carry a `timeout-minutes` cap (a wedged logman must not hold the runner)")
             if "./scripts/ci/stop-dead-etw-sessions.ps1" not in body:
                 errors.append(f"{name!r} must run ./scripts/ci/stop-dead-etw-sessions.ps1")
         if "-SelfTest" not in steps[SELFTEST]:
             errors.append("the self-test step must pass -SelfTest")
+        for name in (SELFTEST, PRE):
+            if re.search(r"^        (if|continue-on-error):", steps[name], re.M):
+                errors.append(f"{name!r} must not carry `if:` or `continue-on-error` (the guard would be silently off)")
         for name in (PRE, POST):
             if "-SelfTest" in steps[name]:
                 errors.append(f"{name!r} must not pass -SelfTest")
@@ -67,11 +75,21 @@ def main():
     if any(ord(c) > 127 for c in ps1):
         errors.append("stop-dead-etw-sessions.ps1 must be ASCII only")
     outside = ps1.split("if ($SelfTest) {", 1)
-    real_mode = outside[1].split("\nexit 0\n}", 1)[-1] if len(outside) == 2 else ""
-    if len(outside) != 2 or "exit 1" in real_mode or re.search(r"^\s*throw\b", real_mode, re.M):
-        errors.append("real mode must end `exit 0` and never `exit 1`/`throw` (housekeeping must not fail the job)")
-    if not real_mode.rstrip().endswith("exit 0"):
-        errors.append("the script's last statement must be `exit 0`")
+    # the self-test block ends at the first top-level `exit 0` + `}`; everything after it is real mode
+    real_mode = outside[1].split("\n    exit 0\n}", 1)[-1] if len(outside) == 2 and "\n    exit 0\n}" in outside[1] else ""
+    if not real_mode:
+        errors.append("could not find the end of the -SelfTest block (expected `    exit 0` then `}`)")
+    else:
+        if "exit 1" in real_mode or re.search(r"^\s*throw\b", real_mode, re.M):
+            errors.append("real mode must never `exit 1`/`throw` (housekeeping must not fail the job)")
+        code_lines = [l.strip() for l in real_mode.splitlines() if l.strip() and not l.strip().startswith("#")]
+        # the FIRST statement of real mode opens the catch-all, and the last-but-one closes it with a catch
+        if not code_lines or code_lines[0] != "try {":
+            errors.append("real mode must open with a catch-all `try {` before anything that can throw")
+        elif not any(l.startswith("} catch {") for l in code_lines[-4:]):
+            errors.append("real mode's catch-all `} catch {` must close the block right before the final `exit 0`")
+        if not real_mode.rstrip().endswith("exit 0"):
+            errors.append("the script's last statement must be `exit 0`")
 
     if errors:
         for e in errors:

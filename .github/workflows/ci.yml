@@ -2161,13 +2161,17 @@ jobs:
       # for a dead pid was on this box while `echo unit tests` failed on every run (#7173, #7135). This step logs the
       # session count (the system limit is 64) and stops sessions named Yuzu*Etw-<pid> whose pid is NOT running, by
       # exact name, so a live job on another runner slot keeps its session. It never fails the job (a listing or stop
-      # error is a ::warning); the self-test before it proves the decisions without touching a real session. See
+      # error is a ::warning; a successful stop is annotated too, on purpose, so a leak shows on the job); each step is
+      # capped at 5 minutes so a wedged logman cannot hold the runner; the self-test before them proves the decisions
+      # without touching a real session. See
       # scripts/ci/stop-dead-etw-sessions.ps1 and "Leaked ETW sessions" in docs/ci-architecture.md.
       - name: Self-test the ETW leaked-session cleanup
+        timeout-minutes: 5
         shell: pwsh
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -SelfTest
 
       - name: Stop ETW sessions leaked by dead Yuzu test processes (pre-test)
+        timeout-minutes: 5
         shell: pwsh
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase pre-test
 
@@ -2263,6 +2267,7 @@ jobs:
       # Dead-pid sessions only, so a concurrent job's live session is untouched; never fails the job.
       - name: Stop ETW sessions leaked by dead Yuzu test processes (post-test)
         if: always()
+        timeout-minutes: 5
         shell: pwsh
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase post-test
 

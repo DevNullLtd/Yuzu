@@ -15,14 +15,15 @@
   What it does, in order:
     1. Lists the sessions with `logman query -ets` and logs the total (the system limit is 64) and the Yuzu count, so a
        slow build-up shows in the job log. At -WarnAt or more sessions it also emits a ::warning.
-    2. For each session named Yuzu<anything>Etw-<digits> whose pid is not a running process, re-checks the pid and stops
+    2. For each session named Yuzu<letters>Etw-<digits> whose pid is not a running process, re-checks the pid and stops
        the session by EXACT name with `logman stop <name> -ets`. A session whose pid is alive is never touched, so a job
        running on one of the other runner slots keeps its session. A pid that was reused by an unrelated live process
        leaves its session in place (the safe direction; it is stopped once that process exits).
     3. Never fails the job: a listing or stop error is a ::warning and the script exits 0. It cannot make the test
        phase red; only -SelfTest can exit non-zero.
 
-  Only names matching ^Yuzu\w*Etw-\d+$ are candidates. System, Defender and every other session are never matched.
+  Only names matching ^Yuzu[A-Za-z]*Etw-[0-9]+$ (case-sensitive, ASCII) are candidates. System, Defender and every
+  other session are never matched.
 
   Run by .github/workflows/ci.yml in the Windows job: once before the test phase, once after it under always() (a
   killed or cancelled test process leaves its session behind at once), and in -SelfTest mode before either, which
@@ -30,8 +31,8 @@
   Keep this file ASCII only (Windows PowerShell 5.1 misreads BOM-less UTF-8).
 
 .PARAMETER SelfTest
-  Run the decision logic against canned `logman` output with injected liveness and stop functions. Exits 1 on a
-  failed expectation, else 0. Starts no session and stops none.
+  Run the decision logic against canned `logman` output with injected liveness and stop functions. Throws (a
+  non-zero exit under the CI shell) on a failed expectation, else exits 0. Starts no session and stops none.
 
 .PARAMETER WarnAt
   Total session count at or above which a ::warning is emitted (default 48 of the 64-session system limit).
@@ -65,7 +66,7 @@ function Read-EtwSessionList {
         if (-not ($line -match '^(?<name>\S.*?)\s{2,}Trace\s+\S+\s*$')) { continue }
         $total++
         $name = $Matches['name'].Trim()
-        if ($name -match '^Yuzu\w*Etw-(?<pid>\d+)$') {
+        if ($name -cmatch '^Yuzu[A-Za-z]*Etw-(?<pid>[0-9]+)$') {
             $parsed = 0
             if ([int]::TryParse($Matches['pid'], [ref]$parsed)) {
                 $yuzu += [pscustomobject]@{ Name = $name; ProcessId = $parsed }
@@ -76,6 +77,13 @@ function Read-EtwSessionList {
         }
     }
     [pscustomobject]@{ Total = $total; Yuzu = $yuzu }
+}
+
+# A liveness probe that throws counts as ALIVE: the one wrong answer that can hurt is a false "dead", so every doubt
+# resolves to leaving the session alone.
+function Test-AliveSafe {
+    param([scriptblock]$Probe, [int]$ProcessId)
+    try { [bool](& $Probe $ProcessId) } catch { $true }
 }
 
 # The whole flow with its three outside-world functions injected, so -SelfTest drives it without touching the box.
@@ -90,7 +98,7 @@ function Invoke-EtwSessionCleanup {
         [int]$WarnAt,
         [string]$Phase
     )
-    $result = [pscustomobject]@{ Listed = $false; Total = 0; YuzuCount = 0; Stopped = @(); Skipped = @(); Failed = @() }
+    $result = [pscustomobject]@{ Listed = $false; Total = 0; YuzuCount = 0; Warned = $false; Stopped = @(); Skipped = @(); Failed = @() }
     try {
         $lines = @(& $Query)
     } catch {
@@ -108,17 +116,20 @@ function Invoke-EtwSessionCleanup {
         return $result
     }
     if ($list.Total -ge $WarnAt) {
+        $result.Warned = $true
         Write-Host "${script:WarnPrefix}ETW session count $($list.Total) is at or above $WarnAt of the $SessionLimit-session system limit"
     }
     foreach ($s in $list.Yuzu) {
-        if ($s.ProcessId -lt 0 -or (& $IsAlive $s.ProcessId)) {
+        if ($s.ProcessId -lt 0 -or (Test-AliveSafe -Probe $IsAlive -ProcessId $s.ProcessId)) {
             $result.Skipped += $s.Name
             Write-Host "  keep $($s.Name): pid $($s.ProcessId) is running or not provably dead"
             continue
         }
         # re-check at the last moment: the pid is only worth acting on while it is still dead
-        if (& $IsAlive $s.ProcessId) { $result.Skipped += $s.Name; continue }
-        if (& $Stop $s.Name) {
+        if (Test-AliveSafe -Probe $IsAlive -ProcessId $s.ProcessId) { $result.Skipped += $s.Name; continue }
+        $stopped = $false
+        try { $stopped = [bool](& $Stop $s.Name) } catch { $stopped = $false }
+        if ($stopped) {
             $result.Stopped += $s.Name
             Write-Host "${script:WarnPrefix}stopped leaked ETW session $($s.Name): pid $($s.ProcessId) is not running ($Phase)"
         } else {
@@ -144,6 +155,7 @@ if ($SelfTest) {
         'YuzuEchoRegistryEtw-222                 Trace                         Running',
         'YuzuTarFileEtw-333                      Trace                         Running',
         'NotYuzuEchoRegistryEtw-444              Trace                         Running',
+        'yuzuEchoRegistryEtw-555                 Trace                         Running',
         'YuzuEchoRegistryEtw-abc                 Trace                         Running',
         'YuzuEchoRegistryEtw-99999999999999      Trace                         Running',
         'Microsoft Defender ETW Session          Trace                         Running',
@@ -158,13 +170,14 @@ if ($SelfTest) {
     # arm 1: dead sessions of the Yuzu shape are stopped by exact name; live, look-alike and foreign ones are not
     $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopOk -WarnAt 48 -Phase 'selftest'
     Test-Expect ($r.Listed) 'arm 1 did not list'
-    Test-Expect ($r.Total -eq 8) "arm 1 total sessions: expected 8, got $($r.Total)"
+    Test-Expect ($r.Total -eq 9) "arm 1 total sessions: expected 9, got $($r.Total)"
     Test-Expect ($r.YuzuCount -eq 4) "arm 1 Yuzu sessions: expected 4, got $($r.YuzuCount)"
     Test-Expect (($r.Stopped -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuTarFileEtw-333') "arm 1 stopped: $($r.Stopped -join ',')"
     Test-Expect (($script:stopCalls -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuTarFileEtw-333') "arm 1 stop calls: $($script:stopCalls -join ',')"
     Test-Expect ($r.Skipped -contains 'YuzuEchoRegistryEtw-222') 'arm 1 stopped a session whose pid is alive'
     Test-Expect ($r.Skipped -contains 'YuzuEchoRegistryEtw-99999999999999') 'arm 1 stopped a session whose pid is not parseable'
     Test-Expect ($script:stopCalls -notcontains 'NotYuzuEchoRegistryEtw-444') 'arm 1 matched a look-alike name'
+    Test-Expect ($script:stopCalls -notcontains 'yuzuEchoRegistryEtw-555') 'arm 1 matched a differently-cased name'
 
     # arm 2: a stop that fails is reported, never thrown, and the next session is still tried
     $script:stopCalls = @()
@@ -186,8 +199,26 @@ if ($SelfTest) {
     Test-Expect (-not $r.Listed -and $script:stopCalls.Count -eq 0) 'arm 4 acted on a failed listing'
 
     # arm 5: output that parses to zero rows stops nothing
-    $r = Invoke-EtwSessionCleanup -Query { @('Error: Access is denied.') } -IsAlive $isAlive -Stop $stopOk -WarnAt 48 -Phase 'selftest'
+    # (the input holds a Yuzu name in a shape the parser must not accept: one space before 'Trace')
+    $r = Invoke-EtwSessionCleanup -Query { @('Error: Access is denied.', 'YuzuEchoRegistryEtw-111 Trace Running') } -IsAlive $isAlive -Stop $stopOk -WarnAt 48 -Phase 'selftest'
     Test-Expect ($r.Total -eq 0 -and $script:stopCalls.Count -eq 0) 'arm 5 acted on unparseable output'
+
+    # arm 6: a Stop that throws is a failure for THAT session only; the next session is still tried
+    $script:stopCalls = @()
+    $stopThrowsFirst = { param([string]$Name) $script:stopCalls += $Name; if ($Name -eq 'YuzuEchoRegistryEtw-111') { throw 'access denied' }; $true }
+    $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopThrowsFirst -WarnAt 48 -Phase 'selftest'
+    Test-Expect (($r.Failed -join ',') -eq 'YuzuEchoRegistryEtw-111' -and ($r.Stopped -join ',') -eq 'YuzuTarFileEtw-333') "arm 6 throwing stop: failed=$($r.Failed -join ',') stopped=$($r.Stopped -join ',')"
+
+    # arm 7: a liveness probe that throws counts as alive, so nothing is stopped
+    $script:stopCalls = @()
+    $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive { param([int]$ProcessId) throw 'probe failed' } -Stop $stopOk -WarnAt 48 -Phase 'selftest'
+    Test-Expect ($script:stopCalls.Count -eq 0 -and $r.Skipped.Count -eq 4) "arm 7 stopped a session whose liveness could not be decided: $($script:stopCalls -join ',')"
+
+    # arm 8: the session-count warning fires at -WarnAt and not below it
+    $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopOk -WarnAt 9 -Phase 'selftest'
+    Test-Expect ($r.Warned) 'arm 8 did not warn at exactly -WarnAt'
+    $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopOk -WarnAt 10 -Phase 'selftest'
+    Test-Expect (-not $r.Warned) 'arm 8 warned below -WarnAt'
 
     Write-Host 'ETW session cleanup self-test: all arms hold'
     exit 0
@@ -200,7 +231,13 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "logman query -ets exited $LASTEXITCODE" }
         $out | ForEach-Object { "$_" }
     }
-    $isAliveReal = { param([int]$ProcessId) [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) }
+    # Only Get-Process's own "no process with this id" error means dead; any other failure means alive (leave it).
+    $isAliveReal = {
+        param([int]$ProcessId)
+        try { $null = Get-Process -Id $ProcessId -ErrorAction Stop; $true }
+        catch [Microsoft.PowerShell.Commands.ProcessCommandException] { $false }
+        catch { $true }
+    }
     $stopReal = {
         param([string]$Name)
         & logman stop $Name -ets *> $null
