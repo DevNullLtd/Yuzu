@@ -1039,7 +1039,9 @@ endif
 # case in no shard, in two shards, or outside the reference set
 # `~[.]~[tsan-heavy]~[flaky-4086]`. It prints per-shard case counts as an
 # informational notice only: count is not time, so there is no ratio gate. The
-# drift signal is flake-retry.py's 80%-of-budget table (#2092/#2093).
+# drift signal is flake-retry.py's 80%-of-budget table (#2092/#2093); while the
+# #7135 stopgap stands, shard C's mark is 384s, not 192s, so it is a late warning
+# until #7177 rebalances C.
 #
 # MEASURED BALANCE (2026-10-01, case-sum predictions from per-case durations
 # joined to tags, not CI measurements): Linux ~[30.6, 29.4, 29.9]s, Windows
@@ -1142,24 +1144,34 @@ agent_shard_specs = {
   'C': _agent_a_excl + _agent_b_excl + agent_shard_suffix,
 }
 agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin]
+# Per-shard meson timeouts. Only shard C is raised (#7135); A and B keep the old single
+# entry's 240s, because only C was measured to need more.
+#
+# SHARD C's 480s IS A DELIBERATE, TEMPORARY EXCEPTION to docs/testing/unit-test-conventions.md
+# ("an entry past 50% of its timeout is ported, split or host-gated, never given more time"),
+# in the same shape as the #3582 shard bump (docs/ci-architecture.md): the split is tracked as
+# #7177 and this value comes back down when it lands. Measured on the Windows MSVC debug leg:
+# shard C ran 184.87s (run 41919798385 attempt 5; its echo entry passed in 51.04s), 211.54s,
+# 210.55s and 206.28s (runs 42040619981, 42049202343, 42056811785: all three are jobs that
+# FAILED, on the echo ETW case, so those are shard C passing inside a failed job), and it hit
+# the 240s limit at 240.09s in the same job where echo hit its 90s limit (run 41919798385
+# attempt 4, job 126911227871); both passed on the rerun with no code change, so the box was
+# loaded, not hung. #7135 records ~222s for C alone on a 16-thread host. The worst case is at
+# least 240s (a timeout is a floor, not a measurement) and the limit is 2x that. Shards A
+# (98-102s) and B (70s) are well under. Do not shorten tests to fit; split the shard instead
+# (#7177). Side effect to know about: flake-retry.py's 80%-of-timeout warning mark for C moves
+# from 192s to 384s, so C can grow ~80% before it warns; #7177 restores an early warning. The
+# one other measured contention figure is for SERVER `~[pg]` (c0 289s -> c4 603s, ~2.1x,
+# across jobs, on the pre-#3443 combined step; docs/ci-architecture.md "Windows test-phase
+# concurrency gate"). A real hang is also bounded by the job-level timeouts.
+agent_shard_timeouts = {'A': 240, 'B': 240, 'C': 480}
 foreach shard, spec : agent_shard_specs
   test(
     'agent unit tests shard ' + shard,
     agent_test_exe,
     args: [spec, '--allow-running-no-tests', '--durations=yes'],
     suite: ['agent', 'agent-shard'],
-    # 480s per shard (#7135; was 240s, the old single entry's figure). Measured on the
-    # Windows MSVC debug leg: shard C ran 185s (run 41919798385 attempt 5) and 212s (run
-    # 42040619981, job 127290311756) on passing attempts and hit the 240s limit once under load
-    # with no code change on a rerun (run 41919798385 attempt 4); #7135 records ~222s for it
-    # alone on a 16-thread host. The worst case is therefore at least 240s (a timeout is a floor, not a
-    # measurement) and the limit is 2x that. Shards A (98-102s) and B (70s) are well under, so
-    # this is sized off C. Do not shorten tests to fit; split the shard instead if C outgrows
-    # this. The one other measured contention
-    # figure is for SERVER `~[pg]` (c0 289s -> c4 603s, ~2.1x, across jobs, on the
-    # pre-#3443 combined step; docs/ci-architecture.md "Windows test-phase concurrency
-    # gate"). A real hang is also bounded by the job-level timeouts.
-    timeout: 480,
+    timeout: agent_shard_timeouts[shard],
     depends: agent_shard_deps,
   )
 endforeach
@@ -1420,10 +1432,15 @@ echo_test_exe = executable(
 )
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
-# 180s (#7135; was 90s). The suite took 51s on a Windows CI runner when it passed (run
-# 41919798385 attempt 5) and 82s on a standalone Windows host (#7135 comment), and it timed out
-# at 90s on a loaded runner (attempt 4), so the worst case is at least 90s (a timeout is a floor,
-# not a measurement) and the limit is 2x that. A failed live-registry case adds its own 15s waits on top.
+# 180s (#7135; was 90s), the same DELIBERATE, TEMPORARY exception shape as the agent shards above
+# (docs/testing/unit-test-conventions.md; docs/ci-architecture.md): the suite is not being split,
+# so this one is justified by the budget rule instead. It took 51.04s on a Windows CI runner when
+# it passed (run 41919798385 attempt 5, 28% of 180s) and 82s on a standalone Windows host (#7135
+# comment, 46%), and it timed out at 90.09s on a loaded runner (attempt 4, job 126911227871) in
+# the same job where agent shard C also timed out; both passed on the rerun, so that was load,
+# not a hang. A timeout is a floor, not a measurement: the limit is 2x that floor, and the
+# deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
+# live-registry case adds its own 15s waits on top. Revisit once #7173/#7135 settle.
 test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 

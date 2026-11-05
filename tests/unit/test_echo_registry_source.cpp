@@ -5069,7 +5069,11 @@ struct LiveRun {
                 // delivering; etw_running=0 means the session died during the wait. The counters
                 // are cumulative for the session, and zero loss does not prove nothing was dropped
                 // (provider-side drops are not counted). If loss_query_ok is 0 the counters are
-                // not evidence.
+                // not evidence, and the loss counters print n/a. "Passed the reader's filter" counts only
+                // events the reader accepted (provider, the set/delete ids, status 0, decodable), so 0
+                // cannot tell an idle session from one whose events are all being rejected.
+                // from_this_pid is read after the 15 s wait and the loss query, so an event that landed
+                // in that gap reads as "arrived but did not match".
                 const SessionLoss loss = session_loss();
                 const auto evicted = src->buffer_for_test().drop_info().count;
                 // A deadline already in the past evaluates the predicate once, without waiting.
@@ -5080,20 +5084,24 @@ struct LiveRun {
                         return e.seq > pushed_before && e.pid == ::GetCurrentProcessId();
                     },
                     std::chrono::steady_clock::now());
+                const auto counter = [&loss](std::uint64_t v) {
+                    return loss.query_ok ? std::to_string(v) : std::string("n/a");
+                };
                 const std::string detail = std::format(
-                    "no ETW event from this write within 15 s. session delivered {} events from "
-                    "all writers since this write ({} buffered, {} evicted since the session "
-                    "started); events_lost={} rt_buffers_lost={} decode_failed={} "
-                    "loss_query_ok={} etw_running={} from_this_pid={}",
+                    "no ETW event from this write within 15 s. session passed {} events from "
+                    "all writers through the reader's filter since this write ({} buffered, {} "
+                    "evicted since the session started); events_lost={} rt_buffers_lost={} "
+                    "decode_failed={} loss_query_ok={} etw_running={} from_this_pid={}",
                     src->buffer_for_test().pushed() - pushed_before,
-                    src->buffer_for_test().size(), evicted, loss.events_lost,
-                    loss.rt_buffers_lost, loss.decode_failed, static_cast<int>(loss.query_ok),
-                    static_cast<int>(etw_running()), static_cast<int>(from_this_pid));
+                    src->buffer_for_test().size(), evicted, counter(loss.events_lost),
+                    counter(loss.rt_buffers_lost), loss.decode_failed,
+                    static_cast<int>(loss.query_ok), static_cast<int>(etw_running()),
+                    static_cast<int>(from_this_pid));
                 // meson's job-log tail is the last 100 lines of the test's stdout then its
                 // stderr section, and hundreds of lines of per-case output follow this case,
                 // so a Catch2 message alone reaches only the uploaded meson-logs artifact.
                 // stderr is printed last: put the same text there too.
-                std::fprintf(stderr, "[#7135] %s\n", detail.c_str());
+                std::fputs(std::format("[#7135] {}\n", detail).c_str(), stderr);
                 FAIL(detail);
             }
         }
