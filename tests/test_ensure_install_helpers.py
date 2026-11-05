@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_DIR = Path(os.environ.get("YUZU_ENSURE_SCRIPT_DIR", ROOT / "scripts" / "test"))
-FARM_TOOLS = ("bash sh dirname basename sed head grep readlink sha256sum cut cat ls mkdir rm ln mv "
+FARM_TOOLS = ("bash sh dirname basename sed head grep readlink sha256sum shasum cut cat ls mkdir rm ln mv "
               "uname touch chmod tr mktemp tail wc od").split()
 
 # A sequence stub: STUB_<VAR> is a space-separated list of outcomes ("ok"/"fail"), one per call; the
@@ -538,12 +538,25 @@ class EnsurePuppeteer(SandboxCase):
         return self.sb.run(self.SCRIPT, **{"STUB_EXE": str(self.exe),
                                            "PUPPETEER_CACHE_DIR": str(self.cache), **env})
 
-    def install_modules(self, lock_mtime, modules_mtime):
+    def lock_sha(self):
+        return hashlib.sha256((self.pp / "package-lock.json").read_bytes()).hexdigest()
+
+    def stamp_path(self):
+        return self.pp / "node_modules" / ".yuzu-package-lock.sha256"
+
+    def install_modules(self, stamp="current", lock_mtime=None, modules_mtime=None):
+        """A node_modules that npm ci left behind. `stamp` is what the script recorded in it: "current"
+        (the hash of package-lock.json as it is now), None (no stamp: another tool or an older script
+        installed it), or any other string (the hash of some other lock)."""
         (self.pp / "node_modules" / "puppeteer").mkdir(parents=True)
         mod_lock = self.pp / "node_modules" / ".package-lock.json"
         mod_lock.touch()
-        os.utime(self.pp / "package-lock.json", (lock_mtime, lock_mtime))
-        os.utime(mod_lock, (modules_mtime, modules_mtime))
+        if stamp is not None:
+            self.stamp_path().write_text((self.lock_sha() if stamp == "current" else stamp) + "\n")
+        if lock_mtime is not None:
+            os.utime(self.pp / "package-lock.json", (lock_mtime, lock_mtime))
+        if modules_mtime is not None:
+            os.utime(mod_lock, (modules_mtime, modules_mtime))
 
     def npx_calls(self):
         return [c for c in self.sb.calls() if c.startswith("npx ")]
@@ -586,14 +599,61 @@ class EnsurePuppeteer(SandboxCase):
         self.assertEqual(list(self.sb.neutral.iterdir()), [], "nothing may land in the caller's directory")
 
     def test_up_to_date_modules_skip_npm(self):
-        self.install_modules(1_000_000, 1_000_100)
+        self.install_modules()
         self.expect(self.run_script(), 0, "already match")
         self.assertEqual(self.sb.calls(), [])
 
-    def test_lockfile_newer_than_modules_reinstalls(self):
-        self.install_modules(1_000_100, 1_000_000)
+    def test_a_fresh_install_records_the_hash_of_the_lockfile_it_installed_from(self):
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.stamp_path().read_text(), self.lock_sha() + "\n")
+        # and the next run trusts it
+        self.sb.reset_logs()
+        self.expect(self.run_script(), 0, "already match")
+        self.assertEqual(self.sb.calls(), [])
+
+    def test_a_changed_lockfile_reinstalls_even_when_it_looks_older_than_the_modules(self):
+        # the mtime rule trusted this: node_modules from another branch, its own newer mtime, a lock that
+        # then changed under an OLDER mtime (a checkout that preserved times, cp -p, rsync)
+        self.install_modules(stamp="0" * 64, lock_mtime=1_000_000, modules_mtime=1_000_100)
         self.expect(self.run_script(), 0, "ready")
         self.assertEqual(self.sb.calls(), [self.NPM_CI])
+        self.assertEqual(self.stamp_path().read_text(), self.lock_sha() + "\n")
+
+    def test_the_same_lockfile_with_a_newer_mtime_is_not_reinstalled(self):
+        # touch, or a git checkout that rewrote the identical file: same content, newer time
+        self.install_modules(lock_mtime=1_000_100, modules_mtime=1_000_000)
+        self.expect(self.run_script(), 0, "already match")
+        self.assertEqual(self.sb.calls(), [])
+
+    def test_modules_without_a_stamp_are_reinstalled_once(self):
+        self.install_modules(stamp=None)
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.sb.calls(), [self.NPM_CI])
+        self.sb.reset_logs()
+        self.expect(self.run_script(), 0, "already match")
+        self.assertEqual(self.sb.calls(), [])
+
+    def test_modules_with_a_stamp_but_no_npm_lock_file_are_reinstalled(self):
+        self.install_modules()
+        (self.pp / "node_modules" / ".package-lock.json").unlink()
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.sb.calls(), [self.NPM_CI])
+
+    def test_a_failed_install_leaves_no_stamp_behind(self):
+        self.install_modules(stamp="0" * 64)
+        r = self.run_script(STUB_NPM_RC="1")
+        self.expect(r, 1, "npm ci failed")
+        self.assertFalse(self.stamp_path().exists(), "a stale stamp survived a failed npm ci")
+        # so the next run does not take the half-installed tree for a good one
+        self.sb.reset_logs()
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(self.sb.calls(), [self.NPM_CI])
+
+    def test_no_hashing_tool_is_not_ready(self):
+        for tool in ("sha256sum", "shasum"):
+            (self.sb.farm / tool).unlink(missing_ok=True)
+        self.expect(self.run_script(), 1, "cannot hash")
+        self.assertEqual(self.sb.calls(), [])
 
     def test_failed_npm_ci(self):
         self.expect(self.run_script(STUB_NPM_RC="1"), 1, "npm ci failed")
@@ -632,7 +692,7 @@ class EnsurePuppeteer(SandboxCase):
 
     def test_a_timed_out_probe_says_so_on_stderr_and_is_never_taken_for_a_path(self):
         # The notice must not travel down stdout: exe_path's output is captured as the browser path.
-        self.install_modules(1_000_000, 1_000_100)
+        self.install_modules()
         self.sb.stub("timeout", timeout_stub())
         r = self.run_script(STUB_TIMEOUT_RC="124", STUB_TIMEOUT_ONLY="executablePath")
         self.expect(r, 1, "node could not load puppeteer")
@@ -865,7 +925,7 @@ class EnsurePuppeteer(SandboxCase):
 
     def test_every_probe_and_install_step_has_its_own_timeout(self):
         # a broken browser through the whole recovery path, with distinct launch and default timeouts
-        self.install_modules(1_000_000, 1_000_100)
+        self.install_modules()
         self.make_browser(runs=False)
         self.sb.stub("ldd", LDD_ALL_FOUND)
         self.sb.stub("timeout", timeout_stub())

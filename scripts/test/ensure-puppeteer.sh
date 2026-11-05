@@ -9,14 +9,16 @@
 #
 # What "ready" means, each step checked rather than assumed:
 #   1. node >= 22.12 and npm on PATH (the pinned puppeteer's floor).
-#   2. tests/puppeteer/node_modules matches package-lock.json (`npm ci` otherwise).
+#   2. tests/puppeteer/node_modules was installed by this script from the CURRENT package-lock.json
+#      (`npm ci` otherwise; see the stamp below).
 #   3. A Chrome for Testing binary exists (`puppeteer browsers install chrome` otherwise).
 #      PUPPETEER_EXECUTABLE_PATH, when set, is honoured and nothing is downloaded.
 #   4. That browser actually LAUNCHES headless. A binary that is present but cannot start
 #      (a missing shared library on a minimal Linux image is the usual cause) would otherwise
 #      surface as a confusing failure deep inside the crawl.
 #
-# What it changes: tests/puppeteer/node_modules, the puppeteer browser cache (PUPPETEER_CACHE_DIR,
+# What it changes: tests/puppeteer/node_modules (including one stamp file inside it,
+# .yuzu-package-lock.sha256), the puppeteer browser cache (PUPPETEER_CACHE_DIR,
 # default ~/.cache/puppeteer), npm's own cache (~/.npm) and one lock file,
 # ${XDG_CACHE_HOME:-~/.cache}/yuzu-ensure-puppeteer.lock. It reads no credentials and prints none of
 # its own; the output of npm and the browser installer is passed through as they print it.
@@ -125,21 +127,42 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # --- 2. dependencies ----------------------------------------------------------------------
-# npm ci writes node_modules/.package-lock.json; a lockfile newer than it means the install
-# predates the pinned versions (a rebase moved the lock), so reinstall rather than trust it. This is
-# an mtime heuristic: a lock whose mtime was preserved by cp -p or rsync can be trusted wrongly.
+# After a successful `npm ci` this script records the SHA-256 of package-lock.json in
+# node_modules/.yuzu-package-lock.sha256. The stamp lives INSIDE node_modules, so a deleted or replaced
+# node_modules takes it along. node_modules is trusted only when its stamp equals the hash of the
+# lockfile as it is NOW: a node_modules copied from another branch, restored from a cache, or built by
+# something else carries another lock's stamp or none, and is reinstalled whatever the file mtimes say
+# (an mtime comparison ran a newer-but-different node_modules unverified). The stamp says "npm ci ran
+# here against exactly this lock"; it does not re-verify the installed files afterwards. A node_modules
+# from before this stamp existed has none, so the first run after upgrading reinstalls once.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        return 1
+    fi
+}
+lock_sha="$(sha256_of "$PP/package-lock.json")" || die "cannot hash $PP/package-lock.json (neither sha256sum nor shasum is on PATH)"
+[[ -n "$lock_sha" ]] || die "cannot hash $PP/package-lock.json"
+STAMP="$PP/node_modules/.yuzu-package-lock.sha256"
 stale=0
-if [[ ! -d "$PP/node_modules/puppeteer" ]]; then
+if [[ ! -d "$PP/node_modules/puppeteer" || ! -f "$PP/node_modules/.package-lock.json" ]]; then
     stale=1
-elif [[ "$PP/package-lock.json" -nt "$PP/node_modules/.package-lock.json" ]]; then
+elif [[ "$(cat "$STAMP" 2>/dev/null || true)" != "$lock_sha" ]]; then
     stale=1
 fi
 if (( stale )); then
     say "installing dependencies (npm ci) in tests/puppeteer"
+    # No stamp may outlive a failed or interrupted install (npm ci replaces node_modules wholesale; this
+    # covers a failure before it gets that far).
+    rm -f "$STAMP"
     # Defer the browser download to step 3 so a failure there names itself. A caller who set
     # PUPPETEER_EXECUTABLE_PATH wants no download at all, which this also satisfies.
     ( cd "$PP" && PUPPETEER_SKIP_DOWNLOAD=1 tmo "$NPM_CI_TIMEOUT" npm ci --ignore-scripts --no-audit --no-fund ) \
         || die "npm ci failed in tests/puppeteer; check network access to the npm registry"
+    printf '%s\n' "$lock_sha" > "$STAMP" || die "cannot write $STAMP"
 else
     say "dependencies already match package-lock.json"
 fi
