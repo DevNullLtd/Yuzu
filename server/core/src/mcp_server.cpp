@@ -1382,9 +1382,16 @@ static const ToolDef kTools[] = {
      "present when known) and retry_after_ms null: steps may already have been sent, so do NOT "
      "re-send; read get_workflow_execution. A throw before that row is retryable "
      "(retry_after_ms 5000) because nothing was sent. "
-     "RESULT: a success envelope with execution_id, workflow_id, status (the engine's recorded "
-     "dispatch-level status, completed or failed; it means sent, not finished) and steps (one "
-     "entry per send attempt: instruction_id, command_id, agents_reached; when 0, a reason). If "
+     "RESULT: a success envelope with execution_id, workflow_id, status and steps (one entry per "
+     "send attempt: instruction_id, command_id, agents_reached; when 0, a reason). status is "
+     "\"completed\" ONLY if the engine recorded the run completed, no step was refused at send "
+     "time and every send attempt reached at least one agent (it means sent, not finished). "
+     "Otherwise, when something was sent, status is \"partial\" (some attempt reached nobody, or "
+     "the engine did not complete after a send) or \"aborted\" (a step was refused at send time "
+     "because its definition changed; the rest did not run), with run_status (the engine's own "
+     "status), message, retryable false and retry_after_ms null: the run is NOT a success and "
+     "must not be re-sent; read get_workflow_execution and each step's reason. The closing "
+     "audit row is result failure with run_outcome=failed|partial|aborted. If "
      "NO step reached any agent the envelope instead carries status set to the cause with "
      "agents_reached 0 on every step: \"quarantined\", "
      "\"plugin_not_found\", \"kill_switched_os\", \"late_denied\" and \"definition_changed\" are PERMANENT "
@@ -8538,7 +8545,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                          /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                 "application/json");
             };
-            // Renders any status the sequence refuses with (everything but kOk/kNoAgentsReached).
+            // Renders any status the sequence refuses with (everything but kOk, kRunIncomplete and
+            // kNoAgentsReached, which are success envelopes).
             const auto render_workflow_refusal = [&](const WorkflowExecuteOutcome& out) {
                 using WES = WorkflowExecuteStatus;
                 mcp_audit(out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
@@ -8604,6 +8612,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 case WES::kOk:
+                case WES::kRunIncomplete:
                 case WES::kNoAgentsReached:
                 case WES::kInvalidWorkflow:
                 case WES::kWorkflowNotFound:
@@ -22327,8 +22336,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 using WES = WorkflowExecuteStatus;
-                if (out.status == WES::kOk || out.status == WES::kNoAgentsReached) {
+                if (out.status == WES::kOk || out.status == WES::kRunIncomplete ||
+                    out.status == WES::kNoAgentsReached) {
                     auto payload = workflow_execute_result_json(out, call->workflow_id);
+                    if (out.status == WES::kRunIncomplete) {
+                        // Same typed status as REST's 202 (`partial` / `aborted`): a success
+                        // envelope that says the run did not succeed, never a retry hint.
+                        payload["retry_after_ms"] = nullptr;
+                    }
                     if (out.status == WES::kNoAgentsReached) {
                         // Same envelope shape as execute_instruction's zero-agents branch: a
                         // success result carrying the cause, never a bare "reached 0".
@@ -22339,7 +22354,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                           : nlohmann::json(nullptr);
                     }
                     mcp_audit(out.status == WES::kOk ? "success" : "failure",
-                              "execution_id=" + audit_caller_id(out.execution_id));
+                              "execution_id=" + audit_caller_id(out.execution_id) +
+                                  (out.status == WES::kOk
+                                       ? std::string{}
+                                       : " run_outcome=" +
+                                             std::string(workflow_run_outcome_token(out.run_outcome))));
                     res.set_content(
                         success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                         "application/json");

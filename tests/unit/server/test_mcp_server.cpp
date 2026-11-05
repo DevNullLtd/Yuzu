@@ -48107,6 +48107,8 @@ struct WfMcpFx {
     // 1-based index of the dispatch whose send fan-out throws on its 3rd send (two sends were
     // accepted first); unset == never throws.
     std::optional<int> throw_on_dispatch;
+    // 1-based index of the dispatch that reaches nobody (sent 0); unset == every dispatch reaches one.
+    std::optional<int> zero_on_dispatch;
     std::vector<yuzu::server::StepDispatchError> step_errors; // failed step callbacks, in order
     std::function<void(int)> on_authorize; // called with the 0-based authorizer call index
     std::shared_ptr<yuzu::server::test::FnWorkflowApi> api;
@@ -48232,11 +48234,17 @@ struct WfMcpFx {
             ++dispatches;
             if (throw_on_dispatch && dispatches == *throw_on_dispatch)
                 return yuzu::test::dispatch_throwing_on_nth_send({"x1", "x2", "x3"}, 3);
+            if (zero_on_dispatch && dispatches == *zero_on_dispatch)
+                return {.sent = 0, .command_id = "cmd-" + std::to_string(dispatches)};
             return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatches)};
         };
     }
 };
 
+} // namespace
+
+namespace {
+bool wf_audit_has(const McpTestServer& ts, std::string_view result, std::string_view needle);
 } // namespace
 
 TEST_CASE("MCP execute_workflow: at the supervised tier the first call mints a ticket and dispatches "
@@ -48281,6 +48289,10 @@ TEST_CASE("MCP execute_workflow: at the supervised tier the first call mints a t
     const auto payload = nlohmann::json::parse(rj["result"]["content"][0]["text"].get<std::string>());
     CHECK(payload["execution_id"] == "exec-1");
     CHECK(payload["steps"].size() == 2);
+    // Completed and every step reached: the one case the label is `completed` / `success`.
+    CHECK(payload["status"] == "completed");
+    CHECK_FALSE(payload.contains("run_status"));
+    CHECK(wf_audit_has(ts, "success", "execution_id=exec-1"));
 }
 
 TEST_CASE("MCP execute_workflow: a caller-level denial of any step's pair is refused BEFORE a ticket is "
@@ -48582,6 +48594,47 @@ TEST_CASE("MCP execute_workflow: a step repointed mid-run is not sent, is audite
     CHECK(payload["steps"][1]["retryable"] == false);
     CHECK(wf_audit_has(ts, "denied", "reason=definition_changed"));
     CHECK(wf_audit_has(ts, "denied", "(late)"));
+    // Step 1 was sent, so the call is a typed non-success, not `completed`.
+    CHECK(payload["status"] == "aborted");
+    CHECK(payload["run_status"] == "completed");
+    CHECK(payload["retryable"] == false);
+    CHECK(payload["retry_after_ms"].is_null());
+    CHECK(wf_audit_has(ts, "failure", "run_outcome=aborted"));
+    CHECK_FALSE(wf_audit_has(ts, "success", "execution_id=exec-1"));
+}
+
+TEST_CASE("MCP execute_workflow: a run where step 1 reached an agent and step 2 reached nobody is "
+          "`partial`, not a success",
+          "[mcp][pg][workflow][twin][security][tier][approval][outcome]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    fx.zero_on_dispatch = 2;
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    const std::string approval_id = wf_mint_and_approve(ts, appr);
+    auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+    REQUIRE(recall);
+    INFO(recall->body);
+    const auto j = nlohmann::json::parse(recall->body);
+    REQUIRE(j.contains("result"));
+    const auto payload = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fx.dispatches == 2);
+    CHECK(payload["status"] == "partial");
+    CHECK(payload["run_status"] == "completed");
+    CHECK(payload["retryable"] == false);
+    CHECK(payload["retry_after_ms"].is_null());
+    CHECK(payload["execution_id"] == "exec-1");
+    REQUIRE(payload["steps"].size() == 2);
+    CHECK(payload["steps"][1]["agents_reached"] == 0);
+    CHECK(wf_audit_has(ts, "failure", "run_outcome=partial"));
+    CHECK_FALSE(wf_audit_has(ts, "success", "execution_id=exec-1"));
 }
 
 TEST_CASE("MCP execute_workflow: a run that throws after the requested row is -32603 dispatch_exception "

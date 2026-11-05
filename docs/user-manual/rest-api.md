@@ -6707,8 +6707,10 @@ nothing is sent.
 **Audit.** A `workflow.execute` row with `result=requested` is written before anything is sent; if
 it cannot be saved the answer is `503` with `Sec-Audit-Failed: true` and nothing was sent. A step
 refused at send time because its definition changed after the preflight is audited as `denied` at
-that moment (detail ends `(late)`). A closing row (`success`, `failure` or `denied`) records the
-outcome; if that one is lost the `202` carries `data.audit_persisted: false` and
+that moment (detail ends `(late)`). A closing row records the outcome: `success` ONLY for a run
+whose `data.status` is `completed`, otherwise `failure` with `run_outcome=failed|partial|aborted`
+in the detail (the same tokens as the `partial`/`aborted` status, and `failed` for the `503` where
+nothing reached; `interrupted` is reserved for a server shutdown and is not produced yet); if that one is lost the `202` carries `data.audit_persisted: false` and
 `Sec-Audit-Failed: true`. A refusal by the per-step checks (`approval_required`, `dispatch_denied`,
 `step_unclassified`, the targeting refusals) is audited as `denied` with the `reason`, and writes no
 `requested` row. A wiring failure, an unknown or empty workflow, an unknown instruction and a store
@@ -6727,15 +6729,25 @@ caller's approval or targeting checks) is a permanent failure, recorded at once 
 sleep, and the step's `on_failure` policy applies. A fault that throws out of the run closes the
 execution `failed` (never left `running`) and answers `500 dispatch_exception` as above.
 
-**Success `202`:** `data.execution_id`, `data.workflow_id`, `data.status` (the engine's recorded
-dispatch-level status, `completed` or `failed`: commands were sent, devices have not necessarily
-finished), `data.late_denied` and `data.steps`, one entry per send attempt (retries and `foreach`
-add entries): `instruction_id`, `command_id`, `agents_reached`, and, when `agents_reached` is `0`,
-`reason`, `retryable` and the withheld counts `agents_quarantined`, `agents_unknown_plugin`,
-`agents_kill_switched_os`.
+**Success `202`:** `data.execution_id`, `data.workflow_id`, `data.status`, `data.late_denied` and
+`data.steps`, one entry per send attempt (retries and `foreach` add entries): `instruction_id`,
+`command_id`, `agents_reached`, and, when `agents_reached` is `0`, `reason`, `retryable` and the
+withheld counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`.
+`data.status` is `completed` ONLY when the engine recorded the run `completed`, no step was refused
+at send time and every send attempt reached at least one agent (commands were sent; devices have not
+necessarily finished). A run that sent something and did not meet all three is still a `202` (a
+`5xx` would invite a blind re-send of steps already sent) but is NOT a success: `data.status` is
+`partial` (some attempt reached nobody, or the engine did not complete after a send) or `aborted` (a
+step was refused at send time because its definition changed, and the rest did not run), with
+`data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
+with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step retried
+to success still counts its earlier zero-reach attempt, so the run reads `partial`: the label errs
+toward failure.
 
 **Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
-with `error.reason` and `error.execution_id` (the run exists and is readable). `quarantined`,
+with `error.reason` and `error.execution_id` (the run exists and is readable). `run_failed` (the
+engine ended the run without a single dispatch attempt, or its final state could not be read;
+`retry_after_ms: null`), `quarantined`,
 `plugin_not_found`, `kill_switched_os` and `late_denied` are permanent (`retry_after_ms: null`);
 `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached` (offline
 devices, or a per-device concurrency claim) are retryable (`retry_after_ms: 5000`).

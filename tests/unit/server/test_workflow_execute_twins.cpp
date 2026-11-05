@@ -658,6 +658,9 @@ TEST_CASE("workflow execute: a step edited after the preflight is refused AT SEN
     CHECK(o.status == WorkflowExecuteStatus::kNoAgentsReached);
     CHECK(o.reason == "late_denied");
     CHECK_FALSE(o.retryable); // permanent: the same request will be refused again
+    CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+    CHECK(f.events.back() == "audit:failure");
+    CHECK(f.audit_details.back().find("run_outcome=aborted") != std::string::npos);
     // The denied row exists, with the (late) marker, and was written BEFORE the engine returned.
     const auto denied = f.position("audit:denied");
     REQUIRE(denied < f.events.size());
@@ -721,9 +724,9 @@ TEST_CASE("workflow execute: every zero-reach cause is named per step with an ho
     }
 }
 
-TEST_CASE("workflow execute: a run where SOME step reached an agent is a success with the zero step "
-          "named, not a failure",
-          "[workflow][twin][zeroreach]") {
+TEST_CASE("workflow execute: a run where SOME step reached an agent but another reached nobody is "
+          "PARTIAL: a failure row and a typed non-success, never `success`",
+          "[workflow][twin][zeroreach][outcome]") {
     Fx f;
     f.step_ids = {"i-ro", "i-ro2"};
     f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
@@ -731,10 +734,161 @@ TEST_CASE("workflow execute: a run where SOME step reached an agent is a success
     zero.denied_quarantined_count = 1;
     f.outcomes["i-ro2"] = zero;
     const auto o = f.run();
-    CHECK(o.status == WorkflowExecuteStatus::kOk);
+    CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+    CHECK(o.run_outcome == WorkflowRunOutcome::kPartial);
+    CHECK(o.reason == "partial");
+    CHECK_FALSE(o.retryable);
+    CHECK(o.run_status == "completed"); // the engine's own word, kept apart from the label
     REQUIRE(o.steps.size() == 2);
     CHECK(o.steps[0].agents_reached == 1);
     CHECK(o.steps[1].reason == "quarantined");
+    CHECK(f.events.back() == "audit:failure");
+    CHECK(f.position("audit:success") == f.events.size());
+    CHECK(f.audit_details.back().find("run_outcome=partial") != std::string::npos);
+    CHECK(f.audit_details.back().find("run_status=completed") != std::string::npos);
+    const auto j = workflow_execute_result_json(o, "wf-1");
+    CHECK(j["status"] == "partial");
+    CHECK(j["run_status"] == "completed");
+    CHECK(j["retryable"] == false);
+    CHECK(j["steps"].size() == 2);
+}
+
+TEST_CASE("workflow execute: only a completed run whose every attempt reached an agent is `success`",
+          "[workflow][twin][outcome]") {
+    SECTION("completed and fully reached") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        const auto o = f.run();
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kSucceeded);
+        CHECK(f.events.back() == "audit:success");
+        CHECK(f.audit_details.back().find("run_outcome") == std::string::npos);
+        const auto j = workflow_execute_result_json(o, "wf-1");
+        CHECK(j["status"] == "completed");
+        CHECK_FALSE(j.contains("run_status"));
+        CHECK_FALSE(j.contains("retryable"));
+    }
+    SECTION("the engine ended FAILED after every step reached an agent") {
+        Fx f;
+        f.engine_status = "failed";
+        const auto o = f.run();
+        CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kPartial);
+        CHECK(o.run_status == "failed");
+        CHECK(f.events.back() == "audit:failure");
+        CHECK(f.audit_details.back().find("run_outcome=partial") != std::string::npos);
+        CHECK(f.audit_details.back().find("run_status=failed") != std::string::npos);
+        CHECK(workflow_execute_result_json(o, "wf-1")["run_status"] == "failed");
+    }
+    SECTION("a finalize that did not land (still running) is not success either") {
+        Fx f;
+        f.engine_status = "running";
+        CHECK(f.run().status == WorkflowExecuteStatus::kRunIncomplete);
+    }
+    SECTION("an engine status that cannot be read back is never success") {
+        Fx f;
+        auto a = f.api();
+        auto unreadable = std::make_shared<test::FnWorkflowApi>(
+            test::FnWorkflowApi::ListFn{},
+            [&](const std::string& id) { return a->get_workflow(id); },
+            [](const std::string&) -> std::expected<std::optional<WorkflowExecution>, std::string> {
+                return std::unexpected(std::string{"db: gone"});
+            });
+        const auto o = apply_workflow_execute(f.ports(unreadable), f.request());
+        CHECK(o.run_status == "unknown");
+        CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kPartial);
+        CHECK(f.events.back() == "audit:failure");
+    }
+}
+
+TEST_CASE("workflow execute: a run that ended with nothing sent and no dispatch attempt is FAILED with "
+          "reason run_failed",
+          "[workflow][twin][outcome]") {
+    Fx f;
+    f.engine_status = "failed";
+    auto a = f.api();
+    auto p = f.ports(a);
+    // The engine admits the run and fails it before any step reaches the dispatch callback (a
+    // step's own lookup failed, say): no note, nothing sent.
+    p.run = [&](const std::string&, const std::vector<std::string>&, StepDispatchFn,
+                ConditionEvalFn, const WorkflowRunControl& control)
+        -> std::expected<std::string, std::string> {
+        if (control.on_admitted)
+            control.on_admitted("exec-1");
+        return std::string{"exec-1"};
+    };
+    const auto o = apply_workflow_execute(p, f.request());
+    CHECK(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+    CHECK(o.run_outcome == WorkflowRunOutcome::kFailed);
+    CHECK(o.reason == "run_failed");
+    CHECK_FALSE(o.retryable);
+    CHECK(o.execution_id == "exec-1");
+    CHECK(f.events.back() == "audit:failure");
+    CHECK(f.audit_details.back().find("run_outcome=failed") != std::string::npos);
+    CHECK(f.audit_details.back().find("reason=run_failed") != std::string::npos);
+}
+
+TEST_CASE("workflow execute: a zero-reach run closes `failure` with run_outcome=failed and its cause",
+          "[workflow][twin][outcome]") {
+    Fx f;
+    ConfinedDispatchOutcome out;
+    out.sent = 0;
+    out.denied_quarantined_count = 2;
+    f.outcomes["i-ro"] = out;
+    const auto o = f.run();
+    REQUIRE(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+    CHECK(o.run_outcome == WorkflowRunOutcome::kFailed);
+    CHECK(f.events.back() == "audit:failure");
+    CHECK(f.audit_details.back().find("run_outcome=failed") != std::string::npos);
+    CHECK(f.audit_details.back().find("reason=quarantined") != std::string::npos);
+}
+
+TEST_CASE("workflow execute: a step refused at send time AFTER an earlier step was sent is ABORTED, a "
+          "typed non-success; the late denial keeps its own `denied` row",
+          "[workflow][twin][outcome][late]") {
+    Fx f;
+    f.step_ids = {"i-ro", "i-ro2"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+    const auto o = f.run();
+    CHECK(o.late_denied);
+    CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+    CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+    CHECK(o.reason == "aborted");
+    // requested, the (late) denial at the moment of refusal, then the closing FAILURE row.
+    CHECK(f.events.back() == "audit:failure");
+    CHECK(f.position("audit:denied") < f.position("engine_returned"));
+    CHECK(f.audit_details.back().find("run_outcome=aborted") != std::string::npos);
+    CHECK(f.audit_details.back().find("late_denied=true") != std::string::npos);
+    CHECK(workflow_execute_result_json(o, "wf-1")["status"] == "aborted");
+}
+
+TEST_CASE("workflow execute: the run outcome is judged by ONE function and its tokens are closed",
+          "[workflow][twin][outcome]") {
+    const auto reached = [](int n) {
+        WorkflowStepDispatchNote note;
+        note.agents_reached = n;
+        return note;
+    };
+    using O = WorkflowRunOutcome;
+    CHECK(classify_workflow_run("completed", false, {reached(1), reached(2)}) == O::kSucceeded);
+    CHECK(classify_workflow_run("completed", false, {}) == O::kSucceeded); // every step condition-skipped
+    CHECK(classify_workflow_run("completed", false, {reached(1), reached(0)}) == O::kPartial);
+    CHECK(classify_workflow_run("failed", false, {reached(1)}) == O::kPartial);
+    CHECK(classify_workflow_run("completed", false, {reached(0)}) == O::kFailed);
+    CHECK(classify_workflow_run("failed", false, {}) == O::kFailed);
+    CHECK(classify_workflow_run("unknown", false, {}) == O::kFailed);
+    CHECK(classify_workflow_run("cancelled", false, {reached(1)}) == O::kPartial);
+    CHECK(classify_workflow_run("completed", true, {reached(1), reached(0)}) == O::kAborted);
+    CHECK(classify_workflow_run("completed", true, {reached(0)}) == O::kAborted);
+    CHECK(workflow_run_outcome_token(O::kSucceeded) == "succeeded");
+    CHECK(workflow_run_outcome_token(O::kFailed) == "failed");
+    CHECK(workflow_run_outcome_token(O::kPartial) == "partial");
+    CHECK(workflow_run_outcome_token(O::kAborted) == "aborted");
+    // Reserved for the shutdown path: no run produces it yet, but the vocabulary is pinned.
+    CHECK(workflow_run_outcome_token(O::kInterrupted) == "interrupted");
 }
 
 TEST_CASE("workflow execute: a protective action never reports the three gate-withhold causes",
@@ -1453,6 +1607,57 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: success is 202 with the run and 
     REQUIRE(r.saw_caller);
     CHECK(r.seen_caller.principal == "alice");
     CHECK(r.seen_caller.approval_provenance == ApprovalProvenance::None);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a run the engine ended FAILED after a send is a 202 "
+          "with status partial and no retry hint, never `completed`",
+          "[workflow][twin][rest][outcome]") {
+    Rest r;
+    r.fx.engine_status = "failed";
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto j = body_of(*res);
+    CHECK(j["data"]["status"] == "partial");
+    CHECK(j["data"]["run_status"] == "failed");
+    CHECK(j["data"]["retryable"] == false);
+    CHECK_FALSE(j["data"]["message"].get<std::string>().empty());
+    CHECK(j["data"]["execution_id"] == "exec-1");
+    REQUIRE(j["data"]["steps"].size() == 1);
+    CHECK(j["data"]["steps"][0]["agents_reached"] == 1);
+    CHECK(r.fx.events.back() == "audit:failure");
+    CHECK(r.fx.audit_details.back().find("run_outcome=partial") != std::string::npos);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a step refused at send time after step 1 was sent is a "
+          "202 with status aborted",
+          "[workflow][twin][rest][outcome][late]") {
+    Rest r;
+    r.fx.step_ids = {"i-ro", "i-ro2"};
+    r.fx.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    r.fx.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto j = body_of(*res);
+    CHECK(j["data"]["status"] == "aborted");
+    CHECK(j["data"]["late_denied"] == true);
+    CHECK(j["data"]["retryable"] == false);
+    CHECK(r.fx.events.back() == "audit:failure");
+    CHECK(r.fx.audit_details.back().find("run_outcome=aborted") != std::string::npos);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a lost closing row on a partial run still adds "
+          "Sec-Audit-Failed",
+          "[workflow][twin][rest][outcome][audit]") {
+    Rest r;
+    r.fx.engine_status = "failed";
+    r.fx.audit_fails_on_call = 1; // 0 = requested, 1 = the closing row
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(body_of(*res)["data"]["audit_persisted"] == false);
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: there is no ticket, so a repointed step runs as edited "

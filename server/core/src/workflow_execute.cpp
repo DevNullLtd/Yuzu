@@ -169,11 +169,18 @@ nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,
         }
         steps.push_back(std::move(e));
     }
+    const bool incomplete = o.status == WorkflowExecuteStatus::kRunIncomplete;
     nlohmann::json j = {{"execution_id", o.execution_id},
                         {"workflow_id", workflow_id},
-                        {"status", o.run_status},
+                        {"status", incomplete ? std::string(workflow_run_outcome_token(o.run_outcome))
+                                              : o.run_status},
                         {"late_denied", o.late_denied},
                         {"steps", std::move(steps)}};
+    if (incomplete) {
+        j["run_status"] = o.run_status;
+        j["retryable"] = false;
+        j["message"] = o.message;
+    }
     if (!o.audit_persisted)
         j["audit_persisted"] = false;
     return j;
@@ -191,6 +198,39 @@ WorkflowInstructionLookupFn make_instruction_lookup(InstructionStore* store) {
             return std::optional<WorkflowStepInstruction>{};
         return std::optional<WorkflowStepInstruction>{to_step_instruction(**r)};
     };
+}
+
+// ── how a run ended ───────────────────────────────────────────────────────
+
+std::string_view workflow_run_outcome_token(WorkflowRunOutcome outcome) {
+    switch (outcome) {
+    case WorkflowRunOutcome::kSucceeded:
+        return "succeeded";
+    case WorkflowRunOutcome::kFailed:
+        return "failed";
+    case WorkflowRunOutcome::kPartial:
+        return "partial";
+    case WorkflowRunOutcome::kInterrupted:
+        return "interrupted";
+    case WorkflowRunOutcome::kAborted:
+        return "aborted";
+    }
+    return "failed";
+}
+
+WorkflowRunOutcome classify_workflow_run(std::string_view run_status, bool late_denied,
+                                         const std::vector<WorkflowStepDispatchNote>& steps) {
+    if (late_denied)
+        return WorkflowRunOutcome::kAborted;
+    const bool any_reached = std::any_of(steps.begin(), steps.end(),
+                                         [](const auto& n) { return n.agents_reached > 0; });
+    const bool all_reached = std::all_of(steps.begin(), steps.end(),
+                                         [](const auto& n) { return n.agents_reached > 0; });
+    // Only the engine's own "completed" counts: "unknown" (unreadable), "running" (a finalize
+    // that did not land), "failed" and "cancelled" are all not success.
+    if (run_status == "completed" && all_reached)
+        return WorkflowRunOutcome::kSucceeded;
+    return any_reached ? WorkflowRunOutcome::kPartial : WorkflowRunOutcome::kFailed;
 }
 
 // ── step-effect binding ───────────────────────────────────────────────────
@@ -595,43 +635,65 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     if (const auto ex = ports.api->get_workflow_execution(*run); ex && *ex)
         o.run_status = (*ex)->status;
 
+    o.run_outcome = classify_workflow_run(o.run_status, late_denied, o.steps);
     const bool any_reached = std::any_of(o.steps.begin(), o.steps.end(),
                                          [](const auto& n) { return n.agents_reached > 0; });
-    const WorkflowStepDispatchNote* first_zero = nullptr;
-    for (const auto& n : o.steps) {
-        if (n.agents_reached == 0) { // a zero-reach cause, or "late_denied" (permanent)
-            first_zero = &n;
-            break;
+    if (o.run_outcome == WorkflowRunOutcome::kSucceeded) {
+        o.status = WorkflowExecuteStatus::kOk;
+    } else if (any_reached) {
+        // Something was sent, so the run is readable and its steps matter: a typed 2xx, never a
+        // blind-retry invitation.
+        o.status = WorkflowExecuteStatus::kRunIncomplete;
+        o.reason = std::string(workflow_run_outcome_token(o.run_outcome));
+        o.retryable = false;
+        o.message =
+            o.run_outcome == WorkflowRunOutcome::kAborted
+                ? "the workflow started and some steps were sent, but a step was refused at "
+                  "dispatch because its definition changed; the rest did not run"
+                : "the workflow started and some steps were sent, but it did not complete on "
+                  "every step; read the run with get_workflow_execution before starting another";
+    } else {
+        o.status = WorkflowExecuteStatus::kNoAgentsReached;
+        const WorkflowStepDispatchNote* first_zero = nullptr;
+        for (const auto& n : o.steps) {
+            if (n.agents_reached == 0) { // a zero-reach cause, or "late_denied" (permanent)
+                first_zero = &n;
+                break;
+            }
+        }
+        if (first_zero) {
+            o.reason = first_zero->reason;
+            o.retryable = first_zero->retryable;
+            o.message = first_zero->reason == "definition_changed"
+                            ? "the workflow started but a step was refused at dispatch because its "
+                              "definition changed after the approval ticket was checked"
+                        : first_zero->reason == "late_denied"
+                            ? "the workflow started but a step was refused at dispatch because its "
+                              "definition changed after the preflight"
+                            : "the workflow started but no step reached any agent (" +
+                                  first_zero->reason + ")";
+        } else {
+            // The engine ended the run without a single dispatch attempt (a step failed before
+            // it could be sent, or the row is not readable): nothing reached anyone.
+            o.reason = "run_failed";
+            o.retryable = false;
+            o.message = "the workflow started but did not complete and no step reached any agent";
         }
     }
-    if (!any_reached && first_zero) {
-        o.status = WorkflowExecuteStatus::kNoAgentsReached;
-        o.reason = first_zero->reason;
-        o.retryable = first_zero->retryable;
-        o.message = first_zero->reason == "definition_changed"
-                        ? "the workflow started but a step was refused at dispatch because its "
-                          "definition changed after the approval ticket was checked"
-                    : first_zero->reason == "late_denied"
-                        ? "the workflow started but a step was refused at dispatch because its "
-                          "definition changed after the preflight"
-                        : "the workflow started but no step reached any agent (" +
-                              first_zero->reason + ")";
-    } else {
-        o.status = WorkflowExecuteStatus::kOk;
-    }
 
-    const std::string result = late_denied ? "denied"
-                               : o.status == WorkflowExecuteStatus::kOk ? "success" : "failure";
+    const bool succeeded = o.status == WorkflowExecuteStatus::kOk;
     std::size_t reached_total = 0;
     for (const auto& n : o.steps)
         reached_total += static_cast<std::size_t>(n.agents_reached);
     o.audit_persisted = ports.audit(
-        std::string(kActionExecute), result, target_id,
+        std::string(kActionExecute), succeeded ? "success" : "failure", target_id,
         req.audit_context + " execution_id=" + clip_token(o.execution_id) +
             " run_status=" + clip_token(o.run_status) +
             " dispatches=" + std::to_string(o.steps.size()) +
             " agents_reached=" + std::to_string(reached_total) +
             (late_denied ? " late_denied=true" : "") +
+            (succeeded ? ""
+                       : " run_outcome=" + std::string(workflow_run_outcome_token(o.run_outcome))) +
             (o.status == WorkflowExecuteStatus::kNoAgentsReached ? " reason=" + o.reason : ""));
     return o;
 }

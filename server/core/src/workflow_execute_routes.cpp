@@ -23,6 +23,8 @@ struct HttpShape {
     switch (o.status) {
     case S::kOk:
         return {202, false};
+    case S::kRunIncomplete: // sent something, did not fully succeed: typed status, never a retry hint
+        return {202, false};
     case S::kUnavailable:
         return {503, false}; // a missing dependency is not a transient fault
     case S::kNoPrincipal:
@@ -218,7 +220,11 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                 out.retryable = true;
             }
 
-            if (out.status == WorkflowExecuteStatus::kOk) {
+            // A run that sent something is a 202 whose `status` says how it ended: `completed`
+            // for a full success, `partial` or `aborted` (retryable:false) otherwise (D7: a 5xx
+            // would invite a blind re-send of steps that were already sent).
+            if (out.status == WorkflowExecuteStatus::kOk ||
+                out.status == WorkflowExecuteStatus::kRunIncomplete) {
                 if (!out.audit_persisted)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = 202;

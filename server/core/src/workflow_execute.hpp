@@ -60,6 +60,17 @@
 /// prepare half, the `requested` row itself) escapes, and a transport maps that one retryable:
 /// nothing had been sent.
 ///
+/// THE CLOSING LABEL. The closing `workflow.execute` row is `success` only for
+/// `WorkflowRunOutcome::kSucceeded` (see `classify_workflow_run`): the engine's recorded status is
+/// `completed`, no step was refused at send time and every dispatch attempt reached an agent.
+/// Anything else is `failure` with `run_outcome=failed|partial|interrupted|aborted` in the detail.
+/// The engine's final state is read back through the existing `WorkflowApi::get_workflow_execution`
+/// after the run: the run is synchronous and the engine finalizes its row before `run` returns, so
+/// the read cannot see an earlier state, and an unreadable row ("unknown") is never success. The
+/// transports map the outcome identically: kOk -> 202 `status:"completed"`; a run that sent
+/// something but did not succeed (kRunIncomplete) -> 202 with `status:"partial"|"aborted"` and
+/// `retryable:false`; a run that reached nobody (kNoAgentsReached) -> the zero-reach error.
+///
 /// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
 /// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches
 /// is decided later, per step, at the dispatch chokepoint (visibility, containment, plugin
@@ -215,7 +226,7 @@ struct WorkflowExecuteBodyError {
 parse_workflow_execute_body(const nlohmann::json& body);
 
 enum class WorkflowExecuteStatus {
-    kOk,                         ///< run started; see `execution_id` and `steps`
+    kOk,                         ///< the run COMPLETED and every dispatch attempt reached an agent (202)
     kUnavailable,                ///< a port is unwired / the instruction store is closed (503, nothing done)
     kNoPrincipal,                ///< the caller has no resolvable principal (500)
     kStoreFailed,                ///< a store read failed (503, retryable)
@@ -228,12 +239,45 @@ enum class WorkflowExecuteStatus {
     kDestructiveUntargeted,      ///< a Destructive/Forensics step is not explicitly targeted (400)
     kDestructiveNoVisibleTarget, ///< ... or every named agent is outside the caller's view (404)
     kAuditFailed,                ///< the `requested` row did not persist; nothing was dispatched (503)
-    kNoAgentsReached,            ///< the run started but no step reached any agent (503/reason)
+    kNoAgentsReached,            ///< the run started and ended with no step having reached any agent (503/reason; outcome failed or aborted)
     kExecuteFailed,              ///< the engine refused the run (400), message in `message`
     kDefinitionChanged,          ///< a step's instruction moved from the ticket-bound effect (400, nothing sent for it)
     kEffectDigestFailed,         ///< the step-effect digest could not be computed (500, no ticket minted)
     kRunFailed,                  ///< the run THREW after the `requested` row: steps may have been sent (500, NOT retryable)
+    kRunIncomplete,              ///< the run ran and sent something but did not fully succeed: `partial` or `aborted` (2xx, typed status, NOT retryable)
 };
+
+/// How a run that reached the engine ended, judged from what the engine recorded and what the
+/// steps did. `kSucceeded` is the ONLY value that labels the closing `workflow.execute` row
+/// `success`; every other value labels it `failure` and rides in the row's detail as
+/// `run_outcome=<token>` (`workflow_run_outcome_token`). A run is `kSucceeded` only if ALL of:
+/// the engine's recorded status is `completed`, no step was refused at send time
+/// (`late_denied`), and every dispatch attempt reached at least one agent. The others, tested
+/// in this order:
+///   * `kAborted`     a step was refused at send time (`late_denied`): its definition moved off the
+///                    preflight or off the ticket-bound effect, or it no longer passed admission.
+///                    Takes precedence: the run was cut short by a refusal, whatever else it did.
+///   * `kInterrupted` RESERVED for the shutdown path (commit 7): the run was stopped by the server
+///                    draining before it finished. Produced by nothing yet.
+///   * `kFailed`      no dispatch attempt reached any agent: the engine ended `failed` (or in any
+///                    status other than `completed`, or unreadable) with nothing sent, or every
+///                    attempt reached nobody and the failed step's policy (abort, skip_remaining)
+///                    ended the run.
+///   * `kPartial`     at least one attempt reached an agent but the run is not `kSucceeded`: some
+///                    attempt reached nobody, or the engine ended in a status other than
+///                    `completed` after a send. A step retried to success still counts its failed
+///                    attempt, so such a run reads `partial`: the label errs toward failure.
+enum class WorkflowRunOutcome {
+    kSucceeded,
+    kFailed,
+    kPartial,
+    kInterrupted,
+    kAborted,
+};
+
+/// The closed token for `outcome` (`succeeded`, `failed`, `partial`, `interrupted`, `aborted`):
+/// the `run_outcome=` audit detail and, for `partial` and `aborted`, the 2xx body's `status`.
+[[nodiscard]] std::string_view workflow_run_outcome_token(WorkflowRunOutcome outcome);
 
 /// One dispatch attempt as recorded while the engine drove the steps. Retries and `foreach`
 /// expansion produce more than one entry for a step.
@@ -263,7 +307,7 @@ struct WorkflowExecuteOutcome {
     /// wording, the ExecuteGate case rewritten because no ticket lifts a workflow step's gate).
     std::string remediation;
     bool retryable{false};
-    /// Set for kOk and kNoAgentsReached (the run exists in both), and for kRunFailed when the
+    /// Set for kOk, kRunIncomplete and kNoAgentsReached (the run exists in all), and for kRunFailed when the
     /// engine had admitted the run before the throw ("" otherwise).
     std::string execution_id;
     /// kRunFailed only: a lower bound on the agents the send path had accepted a send to when the
@@ -278,9 +322,18 @@ struct WorkflowExecuteOutcome {
     /// note reason is `late_denied`, or `definition_changed` when it moved off the ticket-bound
     /// effect.
     bool late_denied{false};
+    /// Set for every outcome of a run that finished the step loop (kOk, kNoAgentsReached,
+    /// kRunIncomplete); `kSucceeded` for anything else.
+    WorkflowRunOutcome run_outcome{WorkflowRunOutcome::kSucceeded};
     /// False only when the closing outcome row failed to persist after the run had started.
     bool audit_persisted{true};
 };
+
+/// The ONE judgement of how a finished run ended. `run_status` is the engine's recorded status
+/// after the step loop ("unknown" when it could not be read back, which is never success).
+[[nodiscard]] WorkflowRunOutcome
+classify_workflow_run(std::string_view run_status, bool late_denied,
+                      const std::vector<WorkflowStepDispatchNote>& steps);
 
 /// What `prepare_workflow_execute` hands to `run_workflow_execute`. The run needs only
 /// `step_count`: the workflow and its instructions are re-read by the run itself (per step,
@@ -354,12 +407,15 @@ struct StepAdmissionDecision {
                                                const std::vector<std::string>& agent_ids,
                                                const DispatchCaller& caller);
 
-/// The success body both transports return for a started run (kOk or kNoAgentsReached):
-/// `execution_id`, `workflow_id`, `status` (the engine's recorded dispatch-level status) and
-/// `steps` (one entry per dispatch attempt: `instruction_id`, `command_id`, `agents_reached`,
-/// plus `reason`/`retryable` and the withheld counts when nothing was reached), `late_denied`,
-/// and `audit_persisted:false` only when the closing audit row failed. One builder so REST and
-/// MCP cannot drift on field set.
+/// The success body both transports return for a started run (kOk, kRunIncomplete or
+/// kNoAgentsReached): `execution_id`, `workflow_id`, `status` and `steps` (one entry per dispatch
+/// attempt: `instruction_id`, `command_id`, `agents_reached`, plus `reason`/`retryable` and the
+/// withheld counts when nothing was reached), `late_denied`, and `audit_persisted:false` only when
+/// the closing audit row failed. `status` is the engine's recorded dispatch-level status
+/// (`completed` for a full success). For kRunIncomplete it is the run's outcome token instead
+/// (`partial` or `aborted`), the engine's own status moves to `run_status`, and `message` and
+/// `retryable:false` are added: a client that reads only `status` can never mistake an
+/// incomplete run for a completed one. One builder so REST and MCP cannot drift on field set.
 [[nodiscard]] nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,
                                                           const std::string& workflow_id);
 
