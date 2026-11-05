@@ -10,8 +10,8 @@
  * single-level directory listing (FindFirstFileExW) and one bounded file read.
  * Nothing spawns a process: no choco.exe, no winget.exe.
  *
- * WHAT IS READ (every mechanism below was captured on a real host, 2026-11-04;
- * the captures are summarised in docs/samples/windows.txt and the README):
+ * WHAT IS READ (every mechanism below was captured on a real Windows host;
+ * docs/samples/windows.txt is a plugin-capture of the three actions, see the README):
  *   store_packages  HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore
  *                   \{Applications, InboxApplications, Deprovisioned}: one subkey
  *                   per PackageFullName (Name_Version_Arch_ResourceId_PublisherId).

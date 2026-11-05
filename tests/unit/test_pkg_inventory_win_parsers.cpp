@@ -9,7 +9,8 @@
  *
  * PROVENANCE OF THE DATA. REAL = copied from the 2026-11-04 capture of the Windows
  * 11 (10.0.26200) build host kingsley, run as the interactive admin user (not the
- * agent's service account, which is unverified): the 18 chocolatey lib directories
+ * agent's service account; a plugin-capture as a virtual service account is the
+ * committed sample): the 18 chocolatey lib directories
  * and their versions (`choco list --local-only -r`), the loose-nuspec presence per
  * directory (including `chocolatey` having none), the jq nuspec verbatim, the first
  * lines of the 7zip nuspec, the first six `Applications` and `InboxApplications`
@@ -1058,8 +1059,7 @@ TEST_CASE("win real ops: the nuspec read refuses a hard link and a redirected pa
     // runner may not grant, in which case this half is skipped, loudly.
     std::filesystem::create_directory_symlink(root / "real", root / "redirect", ec);
     if (ec) {
-        WARN("directory symlink not creatable here (" << ec.message() << "); redirect half skipped");
-        return;
+        SKIP("directory symlink not creatable here (" << ec.message() << "); redirect half skipped");
     }
     CHECK(ops.read_file((root / "redirect" / "real.nuspec").string(), 4096).status ==
           pw::OpStatus::error);

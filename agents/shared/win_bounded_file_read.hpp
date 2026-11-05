@@ -60,6 +60,9 @@ struct BoundedRead {
 /// Whether the path the kernel resolved the open handle to is the path that was asked for. The
 /// final path of a DOS-volume handle carries a `\\?\` prefix; the comparison is ordinal and
 /// case-insensitive, the primitive NTFS itself is defined against. Any failure answers false.
+/// `requested` must be a canonical absolute drive-letter path (backslashes, no `\\?\` prefix, no
+/// `.` or `..` segments, no 8.3 names, not UNC); anything else reads as a redirected parent and is
+/// refused, which turns the answer into an `error`, never into data.
 [[nodiscard]] inline bool handle_path_is(HANDLE h, const std::wstring& requested) {
     std::vector<wchar_t> fin(MAX_PATH);
     DWORD n = GetFinalPathNameByHandleW(h, fin.data(), static_cast<DWORD>(fin.size()),
