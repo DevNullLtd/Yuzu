@@ -3725,6 +3725,162 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
+## Periodic access reviews (SOC 2 CC6.2)
+
+A reviewer periodically confirms that every role grant in the fleet is still
+appropriate, and the confirmation is kept as evidence. The surface is six
+operations on two transports: `GET /api/v1/access-reviews/export`,
+`GET /api/v1/access-reviews`, `POST /api/v1/access-reviews` (open),
+`GET /api/v1/access-reviews/{id}`, `POST /api/v1/access-reviews/{id}/attestations`
+and `POST /api/v1/access-reviews/{id}/close`, with the MCP twins
+`export_access_review`, `list_access_reviews`, `open_access_review`,
+`get_access_review`, `record_attestation` and `close_access_review`.
+Opening a campaign freezes one `pending` row per (principal, role) grant in
+`AccessReviewStore` (Postgres schema `access_review_store`); a reviewer then
+records `attested` or `flagged_revoke` against each row; closing stamps who and
+when. Design notes and the audit shape: `docs/security-reviews/access-reviews-2026-07-21.md`.
+
+### The gate is global, and dedicated (#2225)
+
+Reads need `AccessReview:Read`, writes `AccessReview:Attest`. Both are seeded
+only to `Administrator` and the non-admin `Reviewer` role. The global gate is
+deliberate: a grant has no per-agent or management-group boundary to
+admit-then-filter against, and a confinement-filtered slice would be worthless
+as CC6.2 evidence, because an auditor needs the complete grant population every
+time. That makes the global gate a stronger least-privilege posture (via the seeded `Reviewer`
+role) than a confinement-filtered slice would be, not a weaker one. Do not move these routes
+onto `authorize_list_read`.
+
+**#2225 round 2.** An earlier round gated the surface on `AuditLog:Read` /
+`AuditLog:Attest`. That over-disclosed the full fleet-wide grant population to
+the `Operator` and `PlatformEngineer` roles, which hold `AuditLog:Read` for
+unrelated reasons but neither holds `UserManagement:Read` or
+`EnginePrincipal:Read`, the permissions that gate the equivalent-sensitivity
+`/rbac/roles` and `/engine-principals/{id}/roles` routes (the latter moved off
+`Security:Read` in #2376). `AccessReview` was cut away from `AuditLog:*` and
+must not be put back.
+
+### Flag is not revoke
+
+`decision: "flagged_revoke"` records evidence only. It never calls
+`unassign_role` or revokes an engine principal. Acting on a flag is a separate,
+explicitly gated operator action.
+
+### The population is read from the grant table
+
+`build_access_review` reads the grant table directly
+(`RbacStore::list_all_principal_roles_checked()`), so a grant whose principal is
+in no roster (a deleted user, a stale IdP row, an orphan OIDC/SSO principal) is
+surfaced as `source="orphan"` instead of being omitted. A roster walk would hide
+exactly the grants an auditor most needs to see.
+
+### Campaigns are never pruned
+
+A closed campaign is the compliance evidence and is kept indefinitely. Do not
+copy the `/auto` Pre-flight 14-day prune. Any retention policy is a separate,
+explicitly reviewed decision.
+
+### Separation of duties and final decisions (#4752)
+
+Two rules, both enforced inside the single `UPDATE` in
+`AccessReviewStore::record_attestation`, so the MCP tool, the REST route and any
+future caller inherit them and no handler can forget either.
+
+**A reviewer may not decide their own grant.** The write is refused when the
+acting reviewer is:
+
+- the subject of a `user` grant (`principal_id` equals the reviewer's username,
+  compared byte for byte with no case folding or normalisation, so an alias is a
+  different principal), or
+- the owner of an `engine` principal, as frozen into the row's `grant_snapshot`
+  (`owner_or_email`) when the campaign was opened. The owner is frozen, not
+  looked up live: the reviewed population is frozen at open, and the check needs
+  no cross-store read. An empty or legacy snapshot has no owner and is not
+  blocked.
+
+The reviewer is always the session's username. An API-token or MCP-token session
+acts as the token's owner, so attesting through your own token is caught the
+same way. An engine-classed session can never be a reviewer (both transports
+refuse it before the store is reached).
+
+**A decision is final.** A grant moves from `pending` to `attested` or
+`flagged_revoke` exactly once while its campaign is open. A second call, by
+anyone, is refused and the first decision, reviewer and justification stay
+untouched. This stops a subject from quietly replacing another reviewer's
+`flagged_revoke` with `attested`, which would leave the closed campaign showing
+only the self-signed result. If a decision was a mistake, open a new campaign. This was ruled
+by the project owner on 2026-11-05 (#4752): a correction is a new campaign, never an edit, so a
+closed campaign shows what each reviewer actually decided.
+(This also closes #2326 item 2, the silent last-write-wins between two
+concurrent reviewers.)
+
+**A decision cannot land in a campaign that is closing.** The write takes a share lock on the
+campaign row, so a close waits for attestations already in flight and an attestation that
+arrives after the close is refused (`not_found`).
+
+The engine owner is read from the `owner_or_email` key of the row's frozen `grant_snapshot`.
+That key is a contract between the handlers that write the snapshot when a campaign opens and
+the store's SQL; the REST and MCP engine-owner tests (`[sod]`) are its tripwire, because
+renaming the key would silently stop the engine check. A snapshot that is empty, not valid JSON
+or has no owner has no readable owner, and its row stays attestable.
+
+When both rules apply to one attempt, `self_attestation` is reported, because a
+subject trying to overwrite a decision about their own grant is the signal that
+matters.
+
+**How a refusal reaches the caller.** The store returns a prefixed error and the
+two transports translate it with the shared `classify_attestation_refusal`
+helper, so they cannot disagree:
+
+| Store prefix | REST | MCP | Audit row |
+|---|---|---|---|
+| `self_attestation:` | 403 | `kPermissionDenied` | `access_review.attested` or `access_review.flagged`, `result=denied`, detail `self_attestation_blocked` |
+| `already_decided:` | 409 | `kInvalidParams` | same verbs, `result=denied`, detail `already_decided` |
+| `bad_request:` | 400 | `kInvalidParams` | `result=failure`, empty `target_id`, fixed `detail` (no caller bytes in the row) |
+| `not_found:` | 404 | `kInvalidParams` | `result=failure` (unchanged) |
+
+A `bad_request:` means an identifier contained a NUL byte or was longer than 512 bytes (Postgres
+stops reading a parameter at the first NUL, so such a value would otherwise match a real row
+while its extra bytes reached the audit trail), the justification contained a NUL byte or was
+longer than 8192 bytes (it would be silently cut at the NUL), or the reviewer was empty. The
+512-byte bound is far above anything the account-provisioning path accepts (prefixed external
+ids are capped at 255 bytes and local usernames at 64), so an ordinary grant is never refused;
+a grant created by another path with a longer id would be refused here. The libpq text of a genuine database fault in `record_attestation` or
+`close_campaign` is logged on the server and never returned to the caller.
+
+**Known limits, stated plainly.** The control compares usernames byte for byte, so it is exactly
+as strong as the rule "one person, one principal id". Read these before you describe it to an
+auditor.
+
+- **One person with more than one account.** A person who holds a local account and an SSO or
+  SCIM-provisioned identity (`oidc:<issuer>#<subject>`, `saml:`, `ad:`) is two principals to this
+  check, so they can decide the grant held under their other identity. The same goes for a
+  person's membership of a group (below).
+- **`group` grants have no owner**, and group membership is a cross-store read, so a member of a
+  group is not blocked from deciding that group's grant.
+- **Engine ownership is the owner recorded when the campaign opened.** Ownership moved by
+  `transfer_owner` afterwards is not reflected (the old owner stays blocked, the new owner is
+  not), an engine principal's `created_by` is not checked, and an engine deleted after the
+  campaign opened keeps a snapshot with no readable owner, which anyone may decide.
+- **It needs at least two people able to attest.** A sole Administrator (RBAC off, the default,
+  admits only administrators) cannot decide that administrator's own grants. They stay
+  `pending` until someone closes the campaign, and `close` has no separation of duties, so the
+  campaign closes with unreviewed rows. Assign `Reviewer` to a second person.
+- **It is not four-eyes.** Nothing stops two colluding reviewers deciding each other's grants.
+  Four-eyes on distinct human roots is a separate control (ADR-0033 section 7 reserves
+  human-root resolution for it); this rule compares usernames only, the same limit ADR-1005's
+  2026-10-19 addendum records for approvals. No separate acceptance of that limit is recorded for
+  access reviews.
+- **Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is
+  the subject of a grant can still open or close a campaign.
+- **Mixed-version replicas.** The rules live in the database write, so a replica still on the
+  old build keeps overwriting and accepting self-attestation until it is upgraded
+  (`docs/user-manual/upgrading.md`).
+- `record_attestation` stays `Destructive` on MCP because the write is now final
+  and irreversible. Lowering the annotation would loosen tier gating and is a
+  security decision of its own. It remains exempt from MFA step-up as evidence
+  capture under its own securable (`step_up_detail::kEvidenceCapture`).
+
 ## Render-time permission probes (capability hints)
 
 Six `AuthRoutes` methods answer a permission question without writing a denial row for an
