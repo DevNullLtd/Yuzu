@@ -411,14 +411,15 @@ Motivation: the server-authoritative vulnerability-matching direction (ADR-0018)
 needs full EVR (`epoch:version-release`) + `arch` + the host's distro release for
 Lane-1 OVAL matching, and an honest `kind=app` discriminator for the Lane-3
 OS-native tail. The population contract is **honest-empty**: a field the
-ecosystem does not store is `''`, never synthesised (rpm = full NEVRA + PACKAGER
-+ stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
+ecosystem does not store is `''`, never synthesised, except `publisher`, which carries a
+vendor or a `via:` label (see the 2026-11-04 section) (rpm = full NEVRA + VENDOR, else
+PACKAGER, + stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
 held; apk = name/version/pkgrel; pacman = name/EVR; Windows/macOS = `kind=app`
 with name/version/publisher only; `distro_id`/`distro_version` from
 `/etc/os-release` stamped on every Linux row; `homebrew` is a reserved
-ecosystem value, not collected). `version` is now the upstream version with the
-release/revision split into its own field, and rpm `publisher` switches
-VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
+ecosystem value, not collected). `version` is the upstream version with the
+release/revision split into its own field, and rpm `publisher` is the `VENDOR` tag,
+else the `PACKAGER` tag.
 
 > **Update (2026-10-04, #5328):** `homebrew` was never emitted as an ecosystem
 > value and is retired. Homebrew (ecosystem `brew`; kind `pkg` for formulae, `app`
@@ -1054,7 +1055,7 @@ only; `find_by_purl` is a store method with no caller).
 
 Every row of every `installed_software` source carries a non-empty `publisher`, so slot 3 of the
 row (hashed on both the v2 and the v3 path) is always populated. The wire layout has no extra
-slot and the parser refuses nothing: the server parses and hashes slot 3 on both paths, so the
+slot and the parser gains no rule for it: the server parses and hashes slot 3 on both paths, so the
 mechanism is a value rule on the agent, one recognition rule in the server normaliser, and golden
 vectors on both sides.
 
@@ -1110,8 +1111,10 @@ its `via:` label, not under an empty publisher, and a triple keyed `''` and the 
   an open row whose triple is absent from `title_triples`;
 - its REJECTED `curation_queue` row stays, because a rejection outlives the title's absence.
 
-The `via:<ecosystem>` triple is a new key: it gets a new `title_dimension` row (`unnormalized`,
-since a label normalises to no vendor) and is queued as a new open item. A rejection recorded
+The `via:<ecosystem>` triple is a new key: it gets a new `title_dimension` row. A label normalises to no vendor, so a pack or curated alias
+with an empty raw publisher covers it (the shipped aliases all have one, and such a title
+resolves `pack` and is not queued); a title no alias covers is `unnormalized` and queued as a
+new open item. A rejection recorded
 against the `''` triple is not carried over to it, so a curator rejects the labelled title again
 if it is still unwanted.
 
