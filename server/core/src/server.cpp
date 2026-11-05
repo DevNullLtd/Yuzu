@@ -3285,6 +3285,20 @@ public:
                           "(gap-matrix #10). Labelled purpose (agent|code-signing) and via "
                           "(direct|gateway_proxy|rest|mcp)",
                           "counter");
+        // #6527: CRL freshness, set at scrape time by the /metrics handler (health_routes.cpp)
+        // from the latest ca_crl_versions row. Deliberately NOT pre-seeded: 0 would read as a
+        // CRL that expired in 1970. The series is absent while no CRL exists or the CA store is
+        // closed, and alerts on it must treat absence as "no CRL", not as healthy.
+        metrics_.describe("yuzu_server_ca_crl_next_update_timestamp_seconds",
+                          "Unix time at which the latest published internal-CA CRL expires "
+                          "(its nextUpdate). Alert on this minus time(); absent while no CRL has "
+                          "been published (#6527)",
+                          "gauge");
+        metrics_.describe("yuzu_server_ca_crl_published_timestamp_seconds",
+                          "Unix time at which the latest internal-CA CRL was published; time() "
+                          "minus this is the CRL age. Absent while no CRL has been published "
+                          "(#6527)",
+                          "gauge");
         // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
         // the public CRL is stale relative to ca_store. Alert on >0 since a revocation,
         // since server-side enforcement is live but external consumers are not
