@@ -1178,3 +1178,46 @@ earlier row-count-only v3 must be reset with `UPDATE public.schema_meta SET vers
 holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
 there, so the sections it writes are unverified until a v3 server next does a full replace for that
 device.
+
+### 2026-11-05 — per-management-group collection settings (server side)
+
+The server stores a collection settings document per management group
+(`SoftwareCollectionSettingsStore`, schema `software_collection_settings_store`, tables `settings` and
+`settings_history`) and resolves the document that applies to a device. The agent behaviour is a hard
+requirement on the settings push, below. Wire reference: `docs/user-manual/rest-api.md`, "Software
+collection settings".
+
+- **Document.** `interval_s` 3600 to 604800, an optional window in minutes past local midnight, a zone
+  (empty = the machine's own, else an IANA name checked against `pg_timezone_names` in the write
+  transaction), a boolean per collector (`installed_apps`, `middleware`, `msi_packages`,
+  `pkg_inventory`, `runtimes`, `windows_optional_features`) and a priority 0 to 1000. A window needs a
+  whole-day interval: the agent fires a window once per local day, so a 25 hour interval with a window
+  has no meaning. `installed_apps` cannot be turned off by a document. The roadmap's `evidence`
+  collector has no plugin in the tree, so it has no key.
+- **Resolution** (pure, `collection_settings_resolve.hpp`). The root group's document is the fleet
+  default layer and never a competing candidate: every device is a member of the root group and groups
+  created without a parent sit beside it at depth 0, so a competing root document would win every
+  creation-time tie against a top-level group. For each group the device belongs to, the nearest group
+  (itself, then its ancestors, excluding root) with a document is a candidate. A candidate whose
+  group is an ancestor of another candidate's group is dropped, so priority decides only between
+  unrelated branches. The winner is chosen by priority (higher wins), depth (deeper wins), group
+  creation time (older wins), group id (smaller wins). The kill-switch snapshot is applied last and
+  always wins; the host route reads the all-OS layer only, and a degraded kill-switch read is a `503`,
+  never a document with collectors off. The per-OS withheld set belongs to the settings push, which
+  knows the target OS.
+- **Versions.** `document_version` is the SHA-256 of a fixed-order canonical text including priority
+  (so `expected_version` catches a concurrent priority-only edit); `effective_version` hashes the
+  resolved fields only (interval, window, zone, sorted switches with the overlay applied), with no priority,
+  source group or timestamps. Golden vectors are pinned in `test_collection_settings_resolve.cpp`.
+- **Read rule.** A stored row whose `plugins_json` does not parse, holds a non-boolean or an unknown key,
+  or whose scalar fields fail the validator is `Corrupt` (a `503`), never a default document. A
+  missing known collector key reads as that collector's fleet default (on), and the stored `version`
+  is returned as written.
+- **Writes.** Create is `INSERT ... ON CONFLICT DO NOTHING RETURNING`; replace is `SELECT ... FOR
+  UPDATE`, a version compare, then `UPDATE ... WHERE version = $n RETURNING`. A stale version is a
+  conflict (`409`), never last-writer-wins. History keeps the newest 200 rows per group, trimmed by
+  count in the write transaction.
+- **Hard requirement on the settings push.** The agent must honour an interval of 1 hour to 7 days, run
+  a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
+  the per-collector switch, and reject any setting it cannot honour, then report the effective version
+  it applied. Until the push lands the settings have no effect on any agent.

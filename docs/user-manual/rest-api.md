@@ -375,6 +375,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/commands` | 4 MiB | `commands` | The fifth `requires_measurable=true` class. The REST v1 twin of MCP `execute_instruction` (`POST /api/v1/commands`). The same 4 MiB as the `/mcp/` class, because the same worst case rides it: 10000 agent ids, 32 parameters of 64 KiB and an 8 KiB scope come to about 3.3 MiB. `requires_measurable=true`, like `/mcp/`: a chunked (unmeasurable) body is refused here rather than read unbounded. Any method, so a sibling under the prefix is capped too. |
 | any | `/api/v1/inventory/software/normalization/` | 64 KiB | `software_curation` | The software-title curation subtree. The body-bearing routes are `POST .../aliases` (one JSON object of at most eight strings, each at most 256 bytes) and `POST .../queue/{key}/reject` (bodyless); the status and queue GETs are bodyless siblings sharing the prefix, so any method. |
 | any | `/api/v1/inventory/software/normalization/pack` | 1 MiB | `software_alias_pack` | The alias-pack CSV upload. The raw body is the CSV, which `parse_normalization_pack` refuses over 1 MiB, so the cap mirrors that bound exactly. A longer prefix than the row above, so it wins for this path. |
+| any | `/api/v1/inventory/software/collection-settings` | 16 KiB | `software_collection_settings` | The per-group collection settings routes. The only body-bearing route is `PUT .../{group_id}`: one small JSON object (an interval, a window, a zone name, six boolean switches, a priority and a version). The GET siblings share the prefix. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
@@ -8121,6 +8122,56 @@ Marks one open queue entry `rejected` (`200 {"data": {"rejected": true}}`). `key
 #### `POST /api/v1/inventory/software/normalization/pack`
 
 Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row (and at least 50-row) and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400` (a NUL byte or invalid UTF-8 included). A body over 1 MiB never reaches the parser: the pre-auth body cap answers `413`. A replace keeps products a curator owns (`origin` curated) at their category, and at their `cpe_product` once it is non-empty. A replace also leaves curated aliases active. An alias curated with the category omitted still marks its product curated, which freezes that product's category against later packs. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
+
+#### Software collection settings
+
+Per-management-group settings for the daily installed-software collection: how often it runs, in which local-time window, in which time zone, and which collectors run (see [Collection settings](inventory.md#collection-settings)). The server stores one document per group and resolves the single document that applies to a device. REST only: there is no MCP tool or page for these routes yet. Settings take effect on agents only when the settings push lands; storing or changing a document never starts a collection and never contacts an agent.
+
+**A document** is the group's whole setting, replaced as a unit:
+
+| Field | Type | Rule |
+|---|---|---|
+| `interval_s` | integer | 3600 to 604800 (1 hour to 7 days) |
+| `window` | object or `null` | `{"start_min": 60, "end_min": 300}`, minutes past local midnight, `0 <= start_min < end_min <= 1440`; allowed only with a whole-day interval (86400, 172800, ...) |
+| `timezone` | string | Empty for the machine's own zone, else an IANA zone name known to the database (`Europe/London`); at most 64 bytes |
+| `plugins` | object | Every collector as a boolean: `installed_apps`, `middleware`, `msi_packages`, `pkg_inventory`, `runtimes`, `windows_optional_features`. `installed_apps` cannot be `false`. An unknown or missing key is a `400` |
+| `priority` | integer | 0 to 1000; decides only between unrelated branches (below). The root group's document takes no priority |
+| `expected_version` | string | Write only: the `version` last read, or `none` (also the default) to create only |
+
+Any other top-level key is a `400`. `version` is the SHA-256 of the stored document including its priority, so a concurrent priority-only edit is caught by `expected_version`.
+
+**Authority.** Reads and writes need the global `ManagementGroup:Read` / `ManagementGroup:Write` grant, or an `ITServiceOwner` assignment on the group or any ancestor group (a parent's owner reaches its children, never a sibling branch). The fleet list needs the global read. The root group and any change to `priority` need the global write grant. A service-scoped API token, an MCP-tier token and an engine principal are never admitted through the group assignment. An authority read that cannot be completed (the RBAC store, the group hierarchy or the role assignments) is a `503` with `retry_after_ms`, never a `403` and never an admit.
+
+#### `GET /api/v1/inventory/software/collection-settings`
+
+Every stored document and the built-in fleet default (24 hours, 01:00 to 05:00, machine-local zone, every collector on), each with its `version`. Global `ManagementGroup:Read` only. A document whose group has since been deleted is listed and ignored by the resolver. More than 20,000 documents, or a stored row that fails the read rule, is a `503`, never a truncated list.
+
+#### `GET /api/v1/inventory/software/collection-settings/{group_id}`
+
+The group's own stored document (`group_id`, `interval_s`, `window`, `timezone`, `plugins`, `priority`, `version`, `updated_at`, `updated_by`), not the resolved result for any device. `404` when the group does not exist or has no document.
+
+#### `PUT /api/v1/inventory/software/collection-settings/{group_id}`
+
+Replaces the group's document and answers `200` with the stored document and `previous_version` (`null` on create). A stale or absent `expected_version` answers `409` with the stored document in `error.current` (`null` when none exists), including when a concurrent create won. A zone the database does not know is a `400`. The request is audited as `software_estate.collection_settings.update` with a `requested` row stored ahead of the write and an outcome row (see [audit-log.md](audit-log.md)). A `503` reading `outcome unknown` means the commit did not confirm and the write may be live: `GET` the document to verify. The route is classified as operational configuration for MFA step-up (no proof required).
+
+#### `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`
+
+The settings that apply to one device, resolved across every management group it belongs to:
+
+```json
+{"data": {"agent_id": "agent-1",
+          "effective": {"interval_s": 7200, "window": null, "timezone": "", "plugins": {"installed_apps": true, "middleware": true, "msi_packages": true, "pkg_inventory": true, "runtimes": false, "windows_optional_features": true}},
+          "source_group_id": "a1b2c3d4e5f6", "version": "<64 hex>", "kill_switched": ["runtimes"]},
+ "meta": {"api_version": "v1"}}
+```
+
+- In each group the device belongs to, the nearest group (itself, then its ancestors) with a document is a candidate. A candidate whose group is an ancestor of another candidate's group is dropped, so priority decides only between unrelated branches. The winner is chosen by priority (higher wins), then depth (deeper wins), then group creation time (older wins), then group id.
+- The root group's document is the fleet default layer: it applies to a device with no other candidate and never competes with a group's document.
+- The plugin kill switches always win: a killed collector is `false` in `effective.plugins` and listed in `kill_switched`. Registered apps collection (`installed_apps`) is on unless it is itself kill-switched. Only the all-OS kill-switch layer is read.
+- `version` is the SHA-256 of the effective fields only (interval, window, zone, sorted switches): no priority, source group or timestamps.
+- `source_group_id` is the winning group, the root group id (`000000000000`) when the root document applies, or empty for the built-in default. It is an opaque id and can name a group outside a scoped caller's branch when the device is also a member there.
+- A device in no group, or one the server has no record of, answers `200` with the fleet default and an empty `source_group_id`; no device lookup is made.
+- Requires `Inventory:Read` on the device. A membership, settings or kill-switch read that cannot be completed is a `503`, never a document with collectors off.
 
 ---
 
