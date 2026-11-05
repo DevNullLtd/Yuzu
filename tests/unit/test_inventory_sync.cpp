@@ -3788,8 +3788,9 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
             out += row + '\n';
         g_fake[3].out["list_inventory"] = out;
     }
-    // runtimes.python: the vendor column is read where it holds a vendor (Windows, Linux) and
-    // ignored on macOS, where it is a bundle identifier; `-` is no vendor on any OS.
+    // runtimes.python: the vendor column is read as a vendor on Windows and Linux (the Linux
+    // producer always emits `-`) and ignored on macOS, where it is a bundle identifier; `-` is
+    // no vendor on any OS.
     g_fake[4].out["python"] = nl({supported_status("python"),
                                   "python|cpython|3.14.6|C:/Python314/|PythonCore",
                                   "python|unmodelled|3.11|/usr/bin/python3.11|-"});

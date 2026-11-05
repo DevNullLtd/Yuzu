@@ -518,8 +518,8 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
     // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
     // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
-    // The vendor rides in `publisher` (`-` = unknown) wherever the column holds a vendor
-    // (Windows PythonCore, Linux); on macOS it is a CFBundleIdentifier reverse-domain id, an
+    // The vendor rides in `publisher` (`-` = unknown) wherever the column is read as a vendor
+    // (Windows PythonCore; the Linux producer always emits `-`); on macOS it is a CFBundleIdentifier reverse-domain id, an
     // identifier and not a vendor, so it is ignored there (`vendor_column_is_vendor` false) and
     // the collector labels the row `via:python`, the same rule as macos_pkgutil. The flavour and
     // path have no installed_software slot and are dropped. A constrained

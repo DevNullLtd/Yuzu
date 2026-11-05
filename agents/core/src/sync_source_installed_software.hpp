@@ -152,8 +152,9 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::str
 YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
                                                                  ConstrainedPolicy policy);
 
-/// Whether the `runtimes` `python` vendor column holds a vendor on this host's OS: true on
-/// Windows (PythonCore tag) and Linux, false on macOS where it is a CFBundleIdentifier id.
+/// Whether the `runtimes` `python` vendor column is read as a vendor on this host's OS: true on
+/// Windows (the PythonCore tag) and on Linux (whose producer always emits `-`, so a Linux row is
+/// labelled `via:python`), false on macOS where it is a CFBundleIdentifier id.
 #if defined(__APPLE__)
 inline constexpr bool kPythonVendorColumnIsVendor = false;
 #else

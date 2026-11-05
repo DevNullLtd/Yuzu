@@ -1079,7 +1079,8 @@ the fallback.
 | `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
 | `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
 | `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
-| `runtimes.python`, Windows and Linux | the row's vendor column, unescaped | `via:python` when the column is `-` |
+| `runtimes.python`, Windows | the row's vendor column (the `PythonCore` registry tag), unescaped | `via:python` when the column is `-` |
+| `runtimes.python`, Linux | none: the Linux producer always emits `-` in the vendor column | `via:python` |
 | `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
 | `middleware.ibm_mq` | `IBM`, from the product table | n/a |
 
