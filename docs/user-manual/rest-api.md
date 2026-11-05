@@ -7159,8 +7159,9 @@ flag, parameters and creator are in no read that carries another user's schedule
 are not rendered for one. The page view also carries `data-can-write`, `data-can-enable` and
 `data-can-delete` on its list root (render hints probed once per render from `Schedule:Write`,
 `Execution:Execute` and `Schedule:Delete`, never a gate; each probe refused writes one
-`auth.permission_required` audit row) and per-row Enable/Disable and Delete buttons, disabled for
-a row the caller did not create. The default view is unchanged.
+`auth.permission_required` audit row; a supervised-tier MCP token's approval-gated pairs are not
+probed and write none, so those two hints are `0` for it) and per-row Enable/Disable and Delete
+buttons, disabled for a row the caller did not create. The default view is unchanged.
 
 #### `GET /fragments/workflows`
 
@@ -7175,7 +7176,10 @@ up and shown only when the caller also holds `InstructionDefinition:Read` (a sep
 `data-can-delete` (`0` or `1`): render hints probed once per render from `Workflow:Execute`,
 `Workflow:Write` and `Workflow:Delete`, deciding which controls the page offers. They are not an
 authorization decision; the run, create and delete routes check their own grant. Each refused probe
-writes one `auth.permission_required` audit row. Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+writes one `auth.permission_required` audit row, except for a supervised-tier MCP token: its
+approval-gated pairs (`Workflow:Execute`, `Workflow:Delete`) are not probed, so a render writes no
+`auth.approval_required` row, the list root carries `data-run-gate="approval"` and Run now is
+disabled with the reason that the token must use the MCP `execute_workflow` ticket flow. Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
 
 #### `GET /fragments/workflow-runs`
 

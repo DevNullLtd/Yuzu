@@ -1204,7 +1204,10 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
     // failed run and never as a retryable fault. The strings and the outcome are built BEFORE the
     // run (instruction_execute.cpp's throw arm): a second allocation failure in the arm must not
     // lose the closing row.
-    std::string threw_detail = req.audit_context + " reason=dispatch_exception";
+    std::string threw_detail =
+        req.audit_context + " run_outcome=" +
+        std::string(workflow_run_outcome_token(WorkflowRunOutcome::kFailed)) +
+        " reason=dispatch_exception";
     WorkflowExecuteOutcome threw = refuse(
         WorkflowExecuteStatus::kRunFailed, "workflow run failed part-way",
         "dispatch_exception");

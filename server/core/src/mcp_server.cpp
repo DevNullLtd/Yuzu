@@ -1365,16 +1365,16 @@ static const ToolDef kTools[] = {
      "AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Before anything is sent every step is "
      "checked against YOU: its instruction must exist and have approval_mode auto (a role-gated "
      "step runs only for an administrator; an always-approval step, or an unknown mode, refuses "
-     "the whole call with 403 and a message naming the step - run that instruction through its "
+     "the whole call with a permission error (-32003) and a message naming the step - run that instruction through its "
      "own approval instead), and you must be allowed to dispatch its plugin.action (RBAC, the "
      "action's admin-or-approval gate, the action's kill switch): if not, the whole call is "
-     "refused with 403 reason dispatch_denied naming the step, permanently for you (retrying "
+     "refused with a permission error (-32003), reason dispatch_denied, naming the step, permanently for you (retrying "
      "will not help) and nothing is sent. An approval ticket for this call does NOT lift either "
      "check. A Destructive-classified step needs the explicit agent_ids (always true here) and "
      "at least one of them visible to you, else the call is refused; a Forensics step needs "
      "exactly one agent id. A step whose plugin.action is not in the capability catalogue "
      "refuses the call. If the instruction store, the approval gate or the dispatcher is not "
-     "available the call is refused with a 503 and NOTHING is sent. Which DEVICES a step reaches "
+     "available the call is refused with an internal error (-32603) and NOTHING is sent. Which DEVICES a step reaches "
      "is decided per step at send time and is NOT checked up front: an earlier step may already "
      "have been sent when a later one reaches nobody. "
      "TIER AND TICKET: the operator tier is denied. At the supervised tier the first call returns "
@@ -1407,7 +1407,7 @@ static const ToolDef kTools[] = {
      "sent. A role grant removed mid-run is caught per step at the dispatch chokepoint; an "
      "administrator elevation that expires, or a device-group narrowing, during the run is only "
      "bounded by the 60 second deadline. "
-     "AUDIT: an 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
+     "AUDIT: a 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
      "it cannot be saved the call fails with a retryable error and nothing was sent. A step "
      "refused at send time because its definition changed is audited at that moment and is not "
      "retried. A closing row records the outcome (audit_persisted:false if that one was lost). "
@@ -8488,7 +8488,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!wf_id || wf_id->empty() || wf_id->size() > mcp::kExecInstrIdentMaxLen) {
                     res.set_content(error_response(id, kInvalidParams,
                                                    "workflow_id must be a non-empty string of at "
-                                                   "most 128 characters"),
+                                                   "most 128 bytes"),
                                     "application/json");
                     return std::nullopt;
                 }
@@ -22458,25 +22458,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            // ── execute_bundle (ADR-0011) ─────────────────────────────────
-            // Async fan-out of one instruction into several plugin actions on ONE
-            // device. Thin wrapper over the shared BundleOrchestrator — the SAME
-            // transport-agnostic core as POST /api/v1/bundles. Tier + approval are
-            // already enforced by the C8 generic block (execute_bundle ∈
-            // catalogue().security).
-            //
-            // governance C4/sec-4: a bundle targets ONE device, so authorization is
-            // the per-target confinement below (caller_fn + in_scope) — NOT
-            // ALSO a targetless global Execution:Execute perm_fn gate. Keeping both
-            // (as this handler previously did) is STRICTER than REST's
-            // /api/v1/bundles twin (scoped_perm_fn only, no global gate), so a
-            // management-group-scoped operator with no GLOBAL Execution:Execute
-            // grant was admitted by REST and 403'd here — the twins must agree.
-            // Dropping the global gate matches REST's per-target-only posture; a
-            // caller with neither a global grant NOR a scoped one for this agent
-            // still gets denied below by `in_scope` (compose_exec_visible resolves
-            // to a present-empty set when the caller holds no Execution:Execute
-            // grant at all, scoped or global — see authz_model.hpp).
             // ── execute_workflow (#2146 batch B) ──────────────────────────
             // REST v1 twin: POST /api/v1/workflows/{id}/execute (workflow_execute_routes.cpp).
             // Both run workflow_execute.hpp's apply_workflow_execute, so the precheck, the
@@ -22572,6 +22553,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── execute_bundle (ADR-0011) ─────────────────────────────────
+            // Async fan-out of one instruction into several plugin actions on ONE
+            // device. Thin wrapper over the shared BundleOrchestrator — the SAME
+            // transport-agnostic core as POST /api/v1/bundles. Tier + approval are
+            // already enforced by the C8 generic block (execute_bundle ∈
+            // catalogue().security).
+            //
+            // governance C4/sec-4: a bundle targets ONE device, so authorization is
+            // the per-target confinement below (caller_fn + in_scope) — NOT
+            // ALSO a targetless global Execution:Execute perm_fn gate. Keeping both
+            // (as this handler previously did) is STRICTER than REST's
+            // /api/v1/bundles twin (scoped_perm_fn only, no global gate), so a
+            // management-group-scoped operator with no GLOBAL Execution:Execute
+            // grant was admitted by REST and 403'd here — the twins must agree.
+            // Dropping the global gate matches REST's per-target-only posture; a
+            // caller with neither a global grant NOR a scoped one for this agent
+            // still gets denied below by `in_scope` (compose_exec_visible resolves
+            // to a present-empty set when the caller holds no Execution:Execute
+            // grant at all, scoped or global — see authz_model.hpp).
             if (tool_name == "execute_bundle") {
                 if (!bundle_orch) {
                     res.set_content(

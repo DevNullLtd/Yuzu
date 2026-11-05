@@ -1688,8 +1688,9 @@ public:
         // #2146: the v1 instruction-definition execute twin (instruction_execute.cpp) confines a
         // Destructive / Forensics pair's named targets to the operator's visible agents exactly
         // as `/api/command` does, so it emits the same reason; the MCP twin shares the `mcp`
-        // route label and is seeded with it.
-        for (const char* route : {"instruction_execute", "mcp"})
+        // route label and is seeded with it. The v1 workflow run twins (REST and MCP
+        // `execute_workflow`) confine each step the same way and count under `workflow`.
+        for (const char* route : {"instruction_execute", "mcp", "workflow"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});

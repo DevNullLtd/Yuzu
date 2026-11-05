@@ -1050,8 +1050,12 @@
         var watched = !!polling[row.getAttribute('data-workflow-id')];
         // Disabled while its run is watched: the server accepts duplicate executes, and the
         // earlier one may still be running although the request timed out.
+        var list = $('.ops-list', wfHost);
+        var gated = !!list && list.getAttribute('data-run-gate') === 'approval';
         setReason(b, can('run') && !watched, watched
-          ? 'A run of this workflow may still be in progress.' : 'Requires Workflow:Execute');
+          ? 'A run of this workflow may still be in progress.'
+          : gated ? 'Approval-gated for this MCP token tier: use the MCP execute_workflow tool and its approval ticket'
+                  : 'Requires Workflow:Execute');
       });
     }
 

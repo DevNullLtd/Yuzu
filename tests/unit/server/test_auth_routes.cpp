@@ -849,9 +849,9 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
 
 // Workflow:Execute joined the supervised-tier requires_approval() list (owner ruling 2026-10-30).
 // The legacy POST /api/workflows/{id}/execute route gates on require_permission, which mirrors
-// that rule on every non-MCP transport, so a supervised token is refused pending a ticket. No MCP
-// tool maps to Workflow:Execute in this change, so the refusal has no ticket path yet; the gap
-// this closes is a supervised token running a workflow with no human in the loop.
+// that rule on every non-MCP transport, so a supervised token is refused pending a ticket. The ticket
+// path is the MCP execute_workflow tool, which the 403 remediation names; the gap this closes is a
+// supervised token running a workflow with no human in the loop.
 TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from approval-gated "
           "Workflow:Execute on the legacy REST route",
           "[pg][auth_routes][scope][mcp]") {
@@ -872,6 +872,11 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
     auto j = nlohmann::json::parse(res.body);
     CHECK(j["error"]["code"].get<int>() == 403);
     CHECK(j["error"]["permission"].get<std::string>() == "Workflow:Execute");
+    // The remediation names the real entry point and what it needs; the generic text does not.
+    const auto remediation = j["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("execute_workflow") != std::string::npos);
+    CHECK(remediation.find("idempotency_key") != std::string::npos);
+    CHECK(remediation.find("approval_id") != std::string::npos);
 }
 
 // The "unaffected" side of the rule above: the approval gate is the supervised branch only. An
@@ -1230,6 +1235,9 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from 
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("approval") != std::string::npos);
+    // A pair with no named MCP tool keeps the generic remediation.
+    CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+    CHECK(res.body.find("execute_workflow") == std::string::npos);
 }
 
 // Complement of the above: on the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate

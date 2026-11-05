@@ -179,9 +179,9 @@ inline bool requires_approval(std::string_view mcp_tier,
         // needs an approval ticket for it, like every other fleet execution at this tier.
         // Before this line a supervised token passed Workflow:Execute with NO ticket. Because
         // AuthRoutes::require_permission mirrors this rule on every non-MCP transport, a
-        // supervised-tier token is now also refused (403, ticket-then-recall) on both REST
-        // execute routes (#520). The operator tier stays DENIED by tier_allows() above, which
-        // admits only Execution:Execute among execute operations.
+        // supervised-tier token is now also refused (403; use the MCP ticket flow, i.e. the
+        // execute_workflow tool) on both REST execute routes (#520). The operator tier stays DENIED by tier_allows()
+        // above, which admits only Execution:Execute among execute operations.
         if (securable_type == "Workflow" && operation == "Execute") return true;
 
         // ApiToken:Write (create_api_token / POST /api/v1/tokens) gates here too

@@ -16,6 +16,7 @@
 #include "instruction_param_schema.hpp" // ParamValidatorCache: stored parameter_schema enforcement
 #include "name_lookup_memo.hpp"  // Operate O1: one render's definition-name lookups
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "mcp_policy.hpp"  // mcp::requires_approval (approval_gated_hint)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
@@ -61,6 +62,17 @@ void fragment_note(httplib::Response& res, const char* attr, std::string_view te
     res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
                         html_escape(std::string(text)) + "</div>",
                     "text/html; charset=utf-8");
+}
+
+// A render hint must not become a denial. A supervised-tier MCP token holds the grant yet is
+// approval-gated on every non-MCP transport (mcp::requires_approval, the predicate
+// AuthRoutes::require_tier_policy applies), so probing it through the gate would write one
+// auth.approval_required row per probe per render. This answers from the session alone: no gate
+// call, no row. A hint only; the action routes keep their own gate.
+[[nodiscard]] bool approval_gated_hint(const std::optional<auth::Session>& session,
+                                       std::string_view securable_type, std::string_view operation) {
+    return session && !session->mcp_tier.empty() &&
+           mcp::requires_approval(session->mcp_tier, securable_type, operation);
 }
 
 // Operate Executions page (`detail?view=page`): the collapsed responses list of the devices
@@ -1779,9 +1791,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             operate_pages::ScheduleListView view;
             view.truncated = result->truncated;
             // Render hints, probed once per render and never a gate (an unwired probe offers
-            // no control). Each refused grant writes one auth.permission_required audit row.
+            // no control). Each refused grant writes one auth.permission_required audit row,
+            // except a supervised-tier token's approval-gated pairs, which are decided from the
+            // session without probing (approval_gated_hint) and so write none.
             auto probe = [&](const char* type, const char* op) {
-                return probe_perm_fn && probe_perm_fn(req, type, op);
+                return !approval_gated_hint(session, type, op) && probe_perm_fn &&
+                       probe_perm_fn(req, type, op);
             };
             view.can_write = probe("Schedule", "Write");
             view.can_enable = probe("Execution", "Execute");
@@ -1869,7 +1884,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // does not imply. Reads one past the 100 shown so truncation is known, not guessed.
     // list_workflows loads every row's yaml_source and steps (one query per row under one
     // lease), so the page limit stays at 101 and the YAML is never rendered.
-    sink.Get("/fragments/workflows", [perm_fn, probe_perm_fn, instruction_store, workflow_api](
+    sink.Get("/fragments/workflows", [auth_fn, perm_fn, probe_perm_fn, instruction_store, workflow_api](
                                          const httplib::Request& req, httplib::Response& res) {
         // htmx drops 4xx/5xx bodies: every refusal and degrade is a 200 note, and nothing from
         // the gate's own body (reason, role or permission names) reaches the fragment.
@@ -1900,10 +1915,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         view.truncated = result->size() > shown;
         // Render hints, probed once per render and never a gate (every write route keeps its
         // own perm_fn). An unwired probe cannot decide, so no control is offered. The probe
-        // writes one auth.permission_required audit row per refused grant (disclosed).
+        // writes one auth.permission_required audit row per refused grant (disclosed), except a
+        // supervised-tier token's approval-gated pairs (Execute, Delete): those are decided from
+        // the session without probing (approval_gated_hint) and write no auth.approval_required
+        // row per render. Run then says why it is off: the token needs the MCP ticket flow.
+        std::optional<auth::Session> session;
+        if (auth_fn) {
+            httplib::Response scratch; // perm_fn already authenticated; nothing here is sent
+            session = auth_fn(req, scratch);
+        }
         auto probe = [&](const char* type, const char* op) {
-            return probe_perm_fn && probe_perm_fn(req, type, op);
+            return !approval_gated_hint(session, type, op) && probe_perm_fn &&
+                   probe_perm_fn(req, type, op);
         };
+        view.run_approval_gated = approval_gated_hint(session, "Workflow", "Execute");
         view.can_run = probe("Workflow", "Execute");
         view.can_write = probe("Workflow", "Write");
         view.can_delete = probe("Workflow", "Delete");

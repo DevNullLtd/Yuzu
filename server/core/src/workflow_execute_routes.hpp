@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file workflow_execute_routes.hpp
-/// `POST /api/v1/workflows/{id}/execute` — the REST v1 twin of the legacy
+/// `POST /api/v1/workflows/{id}/execute`: the REST v1 twin of the legacy
 /// `POST /api/workflows/{id}/execute` and of MCP `execute_workflow` (#2146 batch B, ledger row
 /// `post.api-workflows-param-execute`). A thin transport over `workflow_execute.hpp`'s shared
 /// sequence: this file owns the surface gate (`Workflow:Execute`), body parsing, the principal

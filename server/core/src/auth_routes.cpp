@@ -190,6 +190,20 @@ struct AuditProbeScope {
     AuditProbeScope& operator=(const AuditProbeScope&) = delete;
 };
 
+// The remediation for a supervised-tier token refused on a non-MCP transport. The generic text
+// names the flow; a pair with a named MCP tool also names the tool and what it needs, because
+// the contract (a required idempotency_key, the approval_id on the repeat call) cannot be
+// guessed from "ticket-then-recall". EXTEND this function when a pair gains a tool, never fork.
+std::string approval_gated_remediation(std::string_view securable_type, std::string_view operation) {
+    if (securable_type == "Workflow" && operation == "Execute")
+        return "this operation is approval-gated for the supervised MCP tier; call the MCP "
+               "execute_workflow tool (POST /mcp/v1/) with an idempotency_key: the first call "
+               "returns an approval_id, and once an administrator approves it, repeat the same "
+               "call with that approval_id. A person can also run it from the dashboard";
+    return "this operation is approval-gated for the supervised MCP tier; use the MCP "
+           "ticket-then-recall flow (POST /mcp/v1/) or the dashboard";
+}
+
 } // namespace
 
 namespace detail {
@@ -1167,13 +1181,12 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
         // false), keep `.remediation` unconditionally (it correctly steers to
         // the ticket-then-recall flow regardless of whether an RBAC grant
         // would separately admit the caller).
+        // Named local: the A4 options hold views, so the text must outlive the a4_denial call.
+        const std::string remediation = approval_gated_remediation(securable_type, operation);
         res.set_content(
             detail::a4_denial(
                 res, 403, "operation requires approval for this MCP tier on this transport",
-                detail::A4ErrorOpts{.remediation = "this operation is approval-gated "
-                                             "for the supervised MCP tier; use the MCP "
-                                             "ticket-then-recall flow (POST /mcp/v1/) or "
-                                             "the dashboard",
+                detail::A4ErrorOpts{.remediation = remediation,
                             .permission = actionable_permission ? std::string_view(perm)
                                                                 : std::string_view{}}),
             "application/json");
@@ -1300,14 +1313,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
                           securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
+            const std::string remediation = approval_gated_remediation(securable_type, operation);
             res.set_content(
                 detail::a4_denial(
                     res, 403,
                     "operation requires approval for this MCP tier on this transport",
-                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
-                                               "supervised MCP tier; use the MCP ticket-then-recall "
-                                               "flow (POST /mcp/v1/) or the dashboard",
-                                .permission = perm}),
+                    detail::A4ErrorOpts{.remediation = remediation, .permission = perm}),
                 "application/json");
             return false;
         }

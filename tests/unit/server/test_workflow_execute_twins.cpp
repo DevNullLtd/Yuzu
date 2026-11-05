@@ -757,7 +757,8 @@ TEST_CASE("workflow execute: a run that THROWS after the requested row is a fail
     CHECK(f.events.front() == "audit:requested");
     CHECK(f.events.back() == "audit:failure");
     CHECK(f.position("audit:success") == f.events.size());
-    CHECK(f.audit_details[1].find("reason=dispatch_exception") != std::string::npos);
+    CHECK(f.audit_details[1].find("run_outcome=failed reason=dispatch_exception") !=
+          std::string::npos);
     CHECK(f.audit_details[1].find("execution_id=exec-1") != std::string::npos);
     CHECK(f.audit_details[1].find("agents_sent=3") != std::string::npos);
     CHECK(f.audit_details[1].find("surface=test") != std::string::npos);
@@ -778,6 +779,8 @@ TEST_CASE("workflow execute: a throw before the engine admitted the run is still
     CHECK(o.agents_sent == 0);
     CHECK_FALSE(f.dispatched_anything());
     CHECK(f.events.back() == "audit:failure");
+    REQUIRE_FALSE(f.audit_details.empty());
+    CHECK(f.audit_details.back().find("run_outcome=failed") != std::string::npos);
 }
 
 TEST_CASE("workflow execute: a lost closing row on a thrown run is reported, not hidden",

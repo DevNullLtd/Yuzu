@@ -1224,6 +1224,23 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      tools marked Confined in `docs/user-manual/mcp.md` are. Removing the pins drops
      the 2027-01-31 revisit date from the ledger, and that date now lives on #4041.
 
+   - **2026-11-05 - the `Workflow:Execute` residual of the 2026-10-30 entry is
+     closed.** That entry accepted that no MCP tool mapped to the pair, so a
+     supervised token had no ticket path to run a workflow. The MCP tool
+     `execute_workflow` and its REST twin `POST /api/v1/workflows/{id}/execute` now
+     exist, sharing one sequence in `server/core/src/workflow_execute.{hpp,cpp}`. A
+     supervised token calls the tool, receives an approval ticket (`-32006`), and
+     repeats the same call with the `approval_id` after an administrator approves;
+     the ticket binds the workflow id, the agent ids and the ordered step effects.
+     The tool requires an `idempotency_key` (the REST twin accepts an optional
+     `Idempotency-Key` header), because the call is synchronous and a lost response
+     must not become a second full send. The operator tier stays denied by
+     `tier_allows()`, and the legacy `POST /api/workflows/{id}/execute` still refuses
+     a supervised token with `403`. A run holds one HTTP worker, so it leases the
+     shared held-open budget (`StreamBudget`, at most 2 per principal) and has a 60
+     second deadline. The 2026-10-30 entry is left as written; this entry supersedes
+     its residual sentence only.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
