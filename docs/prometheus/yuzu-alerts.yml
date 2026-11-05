@@ -5271,8 +5271,9 @@ groups:
             back and asked for a full one. The agent self-heals by resending the facet in
             full, so nothing is lost, but a persistent share means the agent and server
             disagree about the row set: grep the warn-level "did not verify" server line
-            for the agent_id and compare the agent's writer against the server's canonical
-            section hash.
+            for the agent_id (that line is sampled, about 1 in 100, so the search can
+            come back empty even while mismatches are happening) and compare the agent's
+            writer against the server's canonical section hash.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
         # outcome=dropped = a blob over the 3 MiB cap, or a blob-v3 blob that cannot be
