@@ -462,14 +462,14 @@ TEST_CASE_METHOD(MfaFixture,
         return r;
     }();
     REQUIRE_FALSE(failed.has_value());
-    REQUIRE(failed.error() == AuthDBError::WriteFailed);
+    REQUIRE(failed.error() == AuthDBError::EntropyUnavailable); // #6995: not a store fault
     auto s = db->mfa_status("alice");
     REQUIRE(s.has_value());
     REQUIRE(s->recovery_codes_remaining == 10);
     REQUIRE(s->factor_gen == gen);
 
     // A stale generation is refused BEFORE any mint: the armed failure is not consumed, and
-    // the error is FactorChanged, not WriteFailed.
+    // the error is FactorChanged, not EntropyUnavailable.
     {
         ForcedCsprngFailure forced;
         auto stale = db->mfa_regenerate_recovery_codes("alice", gen - 1);
