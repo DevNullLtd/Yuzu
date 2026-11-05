@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <format>
@@ -5075,15 +5076,21 @@ struct LiveRun {
                 const bool from_this_pid = src->buffer_for_test().wait_for_event(
                     [](const RegistryEtwEvent& e) { return e.pid == ::GetCurrentProcessId(); },
                     std::chrono::steady_clock::now());
-                FAIL("no ETW event from this write within 15 s. session delivered "
-                     << (src->buffer_for_test().pushed() - pushed_before)
-                     << " events from all writers since this write ("
-                     << src->buffer_for_test().size() << " buffered, " << evicted
-                     << " evicted since the session started); events_lost=" << loss.events_lost
-                     << " rt_buffers_lost=" << loss.rt_buffers_lost
-                     << " decode_failed=" << loss.decode_failed
-                     << " loss_query_ok=" << loss.query_ok << " etw_running=" << etw_running()
-                     << " from_this_pid=" << from_this_pid);
+                const std::string detail = std::format(
+                    "no ETW event from this write within 15 s. session delivered {} events from "
+                    "all writers since this write ({} buffered, {} evicted since the session "
+                    "started); events_lost={} rt_buffers_lost={} decode_failed={} "
+                    "loss_query_ok={} etw_running={} from_this_pid={}",
+                    src->buffer_for_test().pushed() - pushed_before,
+                    src->buffer_for_test().size(), evicted, loss.events_lost,
+                    loss.rt_buffers_lost, loss.decode_failed, static_cast<int>(loss.query_ok),
+                    static_cast<int>(etw_running()), static_cast<int>(from_this_pid));
+                // meson's job-log tail is the last 100 lines of the test's stdout then its
+                // stderr section, and this case sits ~700 lines before the end of the echo
+                // output, so a Catch2 message alone reaches only the uploaded meson-logs
+                // artifact. stderr is printed last: put the same text there too.
+                std::fprintf(stderr, "[#7135] %s\n", detail.c_str());
+                FAIL(detail);
             }
         }
         tick(t.db, *src);

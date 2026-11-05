@@ -1480,10 +1480,12 @@ acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
 `timeout-minutes: 120`. Since #7135 a hung agent shard holds the step for up to
 480 s (was 240 s) and a hung echo entry up to 180 s (was 90 s), and `flake-retry.py`
-re-runs a failed suite once to enumerate its failures, so a hung entry costs its limit
-twice before the job fails (nothing is masked). That is about 16 minutes for one
-agent shard; several hung entries compound it and the 120-minute `timeout-minutes`
-is the backstop. At np=2 the Linux slot-wait case was the one that
+re-runs a failed suite once to enumerate its failures, so an entry that hangs again on
+the re-run costs its limit twice before the job fails (nothing is masked): about 16
+minutes for one agent shard on Windows, and up to about 24 on the macOS and sanitizer
+legs, whose first run uses `--timeout-multiplier 2`. The 95 minutes above leaves only
+a few minutes inside `timeout-minutes: 120` before checkout and build are counted, so
+several hung entries are bounded by that job timeout, not by this arithmetic. At np=2 the Linux slot-wait case was the one that
 needed attention: the "revisit the 700s per-shard budget or the Linux
 `--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
 above) had a less severe trigger than at 16 shards (the all-at-cap ceiling alone
