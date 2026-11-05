@@ -5724,6 +5724,90 @@ TEST_CASE("v3: a held facet whose stored rows do not hash to its section hash is
     store.set_metrics(nullptr);
 }
 
+TEST_CASE("v3: a delta's - set reaches only the calling agent's rows of the section's facet",
+          "[pg][software_inventory][v3][ledger]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    const auto p1 = v3_entry("libfoo", kV3Pkgs);
+    const auto victim = v3_entry("Victim", kV3Apps);
+    const auto vc = comp("victim-core", "/opt/victim/core.jar");
+    REQUIRE(store.apply_installed_software_v3(
+                    "agent-a", v3_report({v3_full(kV3Apps, {a1}), v3_full(kV3Pkgs, {p1}),
+                                          comp_full({comp("own", "/opt/own.jar")})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    REQUIRE(store.apply_installed_software_v3(
+                    "agent-b", v3_report({v3_full(kV3Apps, {victim}), comp_full({vc})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    const std::string a_apps = section_hash_of({a1});
+    const std::string b_state = facet_status(pool, "agent-b", kV3Apps);
+    const std::string b_comp = facet_status(pool, "agent-b", kV3Comp);
+    const std::string a_pkgs = facet_status(pool, "agent-a", kV3Pkgs);
+
+    SECTION("agent A names agent B's row") {
+        const auto res = store.apply_installed_software_v3(
+            "agent-a", v3_report({v3_delta(kV3Apps, a_apps, {a1}, {victim}, {})}));
+        CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
+    }
+    SECTION("an apps section names the same agent's pkgs row") {
+        const auto res = store.apply_installed_software_v3(
+            "agent-a", v3_report({v3_delta(kV3Apps, a_apps, {a1}, {p1}, {})}));
+        CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
+    }
+    SECTION("agent A's component delta names agent B's component") {
+        const auto own = comp("own", "/opt/own.jar");
+        const auto res = store.apply_installed_software_v3(
+            "agent-a", v3_report({comp_delta(comp_hash_of({own}), {own}, {vc}, {})}));
+        CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
+    }
+    CHECK(names_of(pool, "agent-b", kV3Apps) == std::vector<std::string>{"Victim"});
+    CHECK(comp_rows(pool, "agent-b").size() == 1);
+    CHECK(names_of(pool, "agent-a", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+    CHECK(names_of(pool, "agent-a", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(facet_status(pool, "agent-b", kV3Apps) == b_state);
+    CHECK(facet_status(pool, "agent-b", kV3Comp) == b_comp);
+    CHECK(facet_status(pool, "agent-a", kV3Pkgs) == a_pkgs);
+    CHECK(facet_status(pool, "agent-a", kV3Apps) == "full/" + a_apps);
+    CHECK(ledger_count(pool, "agent-a") == "0");
+    CHECK(ledger_count(pool, "agent-b") == "0");
+}
+
+TEST_CASE("v3: a SQL fault in a later section rolls back an earlier section, its ledger rows and "
+          "the counter",
+          "[pg][software_inventory][v3][ledger]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    const auto a1 = v3_entry("Alpha", kV3Apps, "1.0");
+    const auto a2 = v3_entry("Alpha", kV3Apps, "2.0");
+    REQUIRE(store.apply_installed_software_v3("agent-lf", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    const std::string before = stored_hash(pool, "agent-lf");
+
+    // Section 1 (the Alpha upgrade) applies and writes its ledger row inside the transaction;
+    // section 2's DELETE then fails on the renamed table and the whole call rolls back.
+    REQUIRE(sql_ok(pool, "ALTER TABLE software_inventory_store.software_components "
+                         "RENAME TO software_components_gone"));
+    const auto res = store.apply_installed_software_v3(
+        "agent-lf", v3_report({v3_delta(kV3Apps, section_hash_of({a1}), {a2}, {a1}, {a2}),
+                               comp_full({comp("x", "/opt/x.jar")})}));
+    REQUIRE(res.size() == 2);
+    CHECK(res[0].outcome == V3SectionOutcome::kError);
+    CHECK(res[1].outcome == V3SectionOutcome::kError);
+    CHECK(ledger_count(pool, "agent-lf") == "0");
+    CHECK(sql_rows(pool, "SELECT version FROM software_inventory_store.installed_software "
+                         "WHERE agent_id = 'agent-lf' AND name = 'Alpha'")[0][0] == "1.0");
+    CHECK(facet_status(pool, "agent-lf", kV3Apps) == "full/" + section_hash_of({a1}));
+    CHECK(stored_hash(pool, "agent-lf") == before);
+    for (const char* kind : {"install", "remove", "upgrade"})
+        CHECK(metrics.counter("yuzu_software_changes_total", {{"kind", kind}}).value() == 0.0);
+    store.set_metrics(nullptr);
+}
+
 TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
           "[software_inventory][v3][ledger]") {
     const auto row = [](const std::string& name, const std::string& version,
