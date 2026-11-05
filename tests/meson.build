@@ -4467,6 +4467,15 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# The Windows package-sources upgrade note states the fresh-deployment contract (routed
+# Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
+test('upgrade notes contract',
+  _python3_test,
+  args: [files('test_upgrade_notes_contract.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
 # Code-to-docs drift gate (docs/docs-drift-gate.md): REST routes, MCP tools
 # and CLI flags named in the user manual, ratcheted by name; the
 # self-test drives every failure branch and also runs the gate on the tree.

@@ -885,6 +885,21 @@ TEST_CASE("win sample: docs/samples/windows.txt is a captured run with well-form
           "[pkg_inventory][windows][sample]") {
     // The sample is a real plugin-capture of the three actions on a Windows host, so it cannot be
     // compared with fixture output; what stays checkable on every OS is its shape.
+    // The stamp and the three outcomes pin that this is a captured, fully answered run, and what
+    // account class it was taken as.
+    {
+        std::ifstream in(std::filesystem::path(YUZU_PLUGIN_SRC_DIR) / "pkg_inventory" / "docs" /
+                         "samples" / "windows.txt");
+        std::string header;
+        std::getline(in, header);
+        CHECK(header.rfind("captured: windows ", 0) == 0);
+        CHECK(header.find("virtual service account") != std::string::npos);
+        CHECK(header.find("YuzuAgent itself not used") != std::string::npos);
+        std::size_t full = 0;
+        for (std::string line; std::getline(in, line);)
+            if (line.rfind("[result_status] OK / FULL", 0) == 0) ++full;
+        CHECK(full == 3);
+    }
     const auto managers = sample_section("managers");
     REQUIRE_FALSE(managers.empty());
     CHECK(std::any_of(managers.begin(), managers.end(), [](const std::string& r) {
