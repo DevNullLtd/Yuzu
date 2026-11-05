@@ -238,6 +238,9 @@ public:
         /// gets. Unset ⇒ that route answers "workflow engine not available". The legacy
         /// `POST /api/workflows/{id}/execute` keeps its own `workflow_engine` call.
         WorkflowRunFn workflow_run;
+        /// The idempotency pre-check beside `workflow_run` (server.cpp wires both from
+        /// `workflow_engine_`); the same function MCP `execute_workflow` gets.
+        WorkflowIdempotencyLookupFn workflow_idempotency_lookup;
         /// The shared dispatch-chokepoint dry run (server.cpp's `authorize_dispatch`) that the v1
         /// execute route asks per distinct step pair before anything is sent. Unset ⇒ that
         /// route answers 503 "workflow dispatch not available" (fail closed, never "no gate").

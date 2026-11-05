@@ -179,7 +179,7 @@ struct Fx {
 
     // ── idempotency (#2146) ──
     // The runs the stand-in engine has bound a key to, by (principal, key). The pre-check reads
-    // it through find_execution_by_key; the stand-in engine's atomic claim reads and writes it.
+    // it through the idempotency lookup port; the stand-in engine's atomic claim reads and writes it.
     std::map<std::pair<std::string, std::string>, WorkflowIdempotentRun> bound;
     int find_calls{0};
     bool find_fault{false};
@@ -290,17 +290,20 @@ struct Fx {
                 e.step_results = rows_implied_by(e.status);
             return std::optional<WorkflowExecution>{e};
         };
-        auto find = [this](const std::string& principal, const std::string& key)
-            -> std::expected<std::optional<WorkflowIdempotentRun>, std::string> {
+        return std::make_shared<test::FnWorkflowApi>(test::FnWorkflowApi::ListFn{}, get, get_exec);
+    }
+
+    /// The idempotency pre-check port over `bound`, keyed by the CALLER's principal.
+    WorkflowIdempotencyLookupFn idempotency_lookup_fn() {
+        return [this](const DispatchCaller& caller, const std::string& key)
+                   -> std::expected<std::optional<WorkflowIdempotentRun>, std::string> {
             ++find_calls;
             if (find_fault)
                 return std::unexpected(std::string{"db: boom"});
-            if (auto it = bound.find({principal, key}); it != bound.end())
+            if (auto it = bound.find({caller.principal, key}); it != bound.end())
                 return std::optional<WorkflowIdempotentRun>{it->second};
             return std::optional<WorkflowIdempotentRun>{};
         };
-        return std::make_shared<test::FnWorkflowApi>(test::FnWorkflowApi::ListFn{}, get, get_exec,
-                                                      test::FnWorkflowApi::ListExecutionsFn{}, find);
     }
 
     /// The stand-in for the engine behind the run port: it drives the steps in order,
@@ -430,6 +433,7 @@ struct Fx {
         WorkflowExecutePorts p;
         p.api = wire_api ? a.get() : nullptr;
         p.run = wire_run ? run_fn() : WorkflowRunFn{};
+        p.idempotency_lookup = idempotency_lookup_fn();
         p.instruction_store_open = store_open;
         p.approval_gate_available = approval_gate;
         p.lookup = [this](const std::string& id)
@@ -1892,6 +1896,7 @@ struct Rest {
         };
         d.workflow_api = api;
         d.workflow_run = fx.run_fn();
+        d.workflow_idempotency_lookup = fx.idempotency_lookup_fn();
         d.instruction_store_open = [this] { return fx.store_open; };
         d.approval_gate_available = [this] { return fx.approval_gate; };
         auto ports = fx.ports(api);
@@ -2133,6 +2138,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a throw BEFORE the requested row
     };
     d.workflow_api = r.api;
     d.workflow_run = r.fx.run_fn();
+    d.workflow_idempotency_lookup = r.fx.idempotency_lookup_fn();
     d.instruction_store_open = [] { return true; };
     d.approval_gate_available = [] { return true; };
     auto ports = r.fx.ports(r.api);
@@ -2268,6 +2274,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: no step reaching any agent is a 
     };
     d.workflow_api = r.api;
     d.workflow_run = r.fx.run_fn();
+    d.workflow_idempotency_lookup = r.fx.idempotency_lookup_fn();
     d.instruction_store_open = [] { return true; };
     d.approval_gate_available = [] { return true; };
     auto ports = r.fx.ports(r.api);
@@ -2311,6 +2318,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: an unwired caller derivation is 
     };
     d.workflow_api = r.api;
     d.workflow_run = r.fx.run_fn();
+    d.workflow_idempotency_lookup = r.fx.idempotency_lookup_fn();
     d.instruction_store_open = [] { return true; };
     d.approval_gate_available = [] { return true; };
     auto ports = r.fx.ports(r.api);

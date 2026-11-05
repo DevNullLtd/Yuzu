@@ -414,6 +414,11 @@ std::optional<WorkflowExecuteOutcome> check_workflow_idempotency(const WorkflowE
     // does not answer from a key either.
     if (auto refusal = workflow_wiring_refusal(ports, req))
         return refusal;
+    // The lookup is wired with the run port in server.cpp; a build without it cannot honour a key,
+    // and answering "no run bound" would dispatch a repeat. Fail closed.
+    if (!ports.idempotency_lookup)
+        return refuse(WorkflowExecuteStatus::kUnavailable, "workflow engine not available",
+                      "workflow_engine_unavailable");
     // A key belongs to a principal. An empty one is refused whoever the caller is, `system`
     // included: under the store's unique index a NULL principal never conflicts, so the key
     // would silently stop being idempotent.
@@ -434,7 +439,7 @@ std::optional<WorkflowExecuteOutcome> check_workflow_idempotency(const WorkflowE
                       "request_fingerprint_unavailable");
     }
 
-    const auto bound = ports.api->find_execution_by_key(req.caller.principal, req.idempotency_key);
+    const auto bound = ports.idempotency_lookup(req.caller, req.idempotency_key);
     if (!bound) {
         // A fault is NOT "no run bound": proceeding would dispatch, and the whole point of the
         // key is that a call whose first answer was lost cannot be sent twice. Nothing is written.

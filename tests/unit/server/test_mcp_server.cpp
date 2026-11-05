@@ -1083,6 +1083,10 @@ struct McpTestServer {
     /// production). Empty (the default) leaves the tool answering "workflow engine not available".
     yuzu::server::WorkflowRunFn workflow_run_for_test;
 
+    /// #2146: the idempotency pre-check beside the run port (core-internal, not a WorkflowApi
+    /// method). Empty (the default) leaves a keyed call answering "workflow engine not available".
+    yuzu::server::WorkflowIdempotencyLookupFn workflow_idempotency_lookup_for_test;
+
     /// #2146 D3: the server's draining flag as the MCP server reads it. Empty (the default) is
     /// never draining.
     std::function<bool()> draining_for_test;
@@ -1925,6 +1929,8 @@ private:
         // the raw engine (see workflow_api_for_test's own doc comment).
         if (workflow_run_for_test)
             mcp.set_workflow_run_fn(workflow_run_for_test);
+        if (workflow_idempotency_lookup_for_test)
+            mcp.set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_for_test);
         if (draining_for_test)
             mcp.set_draining_fn(draining_for_test);
         if (workflow_digest_for_test)
@@ -48226,24 +48232,24 @@ struct WfMcpFx {
                     e.step_results = stored_rows_override;
                 return std::optional<yuzu::server::WorkflowExecution>{e};
             },
-            yuzu::server::test::FnWorkflowApi::ListExecutionsFn{}, find_fn());
+            yuzu::server::test::FnWorkflowApi::ListExecutionsFn{});
     }
 
-    // The idempotency lookup over `bound`. Installed by wire() on whichever double the case
-    // ended up with, so a case that swaps in its own FnWorkflowApi still has it.
-    yuzu::server::test::FnWorkflowApi::FindByKeyFn find_fn() {
-        return [this](const std::string& principal, const std::string& key)
+    // The idempotency lookup port over `bound`, keyed by the caller's principal. Installed by
+    // wire() on the harness, independently of whichever FnWorkflowApi the case uses.
+    yuzu::server::WorkflowIdempotencyLookupFn find_fn() {
+        return [this](const yuzu::server::DispatchCaller& caller, const std::string& key)
                    -> std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string> {
             ++find_calls;
             if (find_fault)
                 return std::unexpected(std::string{"db: boom"});
-            if (auto it = bound.find({principal, key}); it != bound.end())
+            if (auto it = bound.find({caller.principal, key}); it != bound.end())
                 return std::optional<yuzu::server::WorkflowIdempotentRun>{it->second};
             return std::optional<yuzu::server::WorkflowIdempotentRun>{};
         };
     }
 
-    // The runs an idempotency key is bound to, by (principal, key): what the read seam answers.
+    // The runs an idempotency key is bound to, by (principal, key): what the lookup port answers.
     std::map<std::pair<std::string, std::string>, yuzu::server::WorkflowIdempotentRun> bound;
     int find_calls{0};
     bool find_fault{false};
@@ -48252,7 +48258,7 @@ struct WfMcpFx {
               yuzu::server::ApprovalManager& appr) {
         ts.instruction_store_for_test = &store;
         ts.approval_manager_for_test = &appr;
-        api->set_find_by_key(find_fn());
+        ts.workflow_idempotency_lookup_for_test = find_fn();
         ts.workflow_api_for_test = api;
         ts.caller_fn_for_test = [](const auth::Session&) {
             return yuzu::server::DispatchCaller{.principal = "alice",
@@ -48766,7 +48772,7 @@ TEST_CASE("MCP execute_workflow: a run the engine stopped for a server stop is `
             e.status = "failed";
             return std::optional<yuzu::server::WorkflowExecution>{e};
         });
-    fx.api->set_find_by_key(fx.find_fn());
+    ts.workflow_idempotency_lookup_for_test = fx.find_fn();
     ts.workflow_api_for_test = fx.api;
     ts.workflow_run_for_test = [&](const std::string&, const std::vector<std::string>&,
                                    yuzu::server::StepDispatchFn fn, yuzu::server::ConditionEvalFn,
@@ -48827,7 +48833,7 @@ TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; 
                 e.status = "failed";
                 return std::optional<yuzu::server::WorkflowExecution>{e};
             });
-        fx.api->set_find_by_key(fx.find_fn());
+        ts.workflow_idempotency_lookup_for_test = fx.find_fn();
         ts.workflow_api_for_test = fx.api;
         // The engine stand-in asks the hook before every step and stops when it says no, as the
         // real engine does before every dispatch attempt.
@@ -48930,7 +48936,7 @@ TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; 
                 e.status = "completed";
                 return std::optional<yuzu::server::WorkflowExecution>{e};
             });
-        fx.api->set_find_by_key(fx.find_fn());
+        ts.workflow_idempotency_lookup_for_test = fx.find_fn();
         ts.workflow_api_for_test = fx.api;
         ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
         const std::string approval_id = wf_mint_and_approve(ts, appr);
@@ -49095,11 +49101,7 @@ TEST_CASE("MCP execute_workflow: a workflow whose retry sleeps exceed the 60 s b
             -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
             return std::optional<yuzu::server::WorkflowExecution>{};
         },
-        yuzu::server::test::FnWorkflowApi::ListExecutionsFn{},
-        [](const std::string&, const std::string&)
-            -> std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string> {
-            return std::optional<yuzu::server::WorkflowIdempotentRun>{};
-        });
+        yuzu::server::test::FnWorkflowApi::ListExecutionsFn{});
     McpTestServer ts;
     fx.wire(ts, store, appr);
     ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
@@ -49343,12 +49345,12 @@ TEST_CASE("MCP execute_workflow: a malformed workflow_id is -32602 invalid_workf
         },
         yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
     ts.workflow_api_for_test = bad_id_api;
-    bad_id_api->set_find_by_key(
-        [&find_calls](const std::string&, const std::string&)
+    ts.workflow_idempotency_lookup_for_test =
+        [&find_calls](const yuzu::server::DispatchCaller&, const std::string&)
             -> std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, std::string> {
             ++find_calls;
             return std::optional<yuzu::server::WorkflowIdempotentRun>{};
-        });
+        };
     bool run_called = false;
     ts.workflow_run_for_test = [&run_called](const std::string&, const std::vector<std::string>&,
                                              yuzu::server::StepDispatchFn,

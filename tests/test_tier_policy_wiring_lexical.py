@@ -66,7 +66,7 @@ call site would pass every existing test. This gate closes that:
      dropping either compiles cleanly, passes every unit test, and leaves a revoked credential able
      to finish a workflow run it started; only production wiring can be pinned, here.
 
-  8. (#2146 sec-3/I1/I6, workflow run cap, shutdown drain and audit) Six seams of the workflow-execute
+  8. (#2146 sec-3/I1/I6, workflow run cap, shutdown drain and audit) The seams of the workflow-execute
      twins are OPTIONAL by construction (a null `StreamBudget` is "unmetered", an empty `draining`
      is "never draining", an empty audit sink is "audit off", a `{}` control disables the deadline,
      the idempotency claim, the stop level and the safety hooks), so dropping or rewriting any of
@@ -75,10 +75,17 @@ call site would pass every existing test. This gate closes that:
      ADR-0034 budget the held-open cap leases from); `wf_deps.draining` and
      `mcp_server_->set_draining_fn` with the body `draining_ || stop_requested_` (REST and MCP
      admission refuse a new run once shutdown begins); the run adapter's
-     `return engine->execute(..., control.on_admitted, control);` (the whole control reaches the
-     engine, never `{}`); `wf_deps.audit_fn` and `wf_deps.persist_audit_fn` (the REST route's audit
+     `return engine->execute(..., control);` (the whole control reaches the
+     engine, never `{}`; `on_admitted` travels inside it, the engine has no positional parameter); `wf_deps.audit_fn` and `wf_deps.persist_audit_fn` (the REST route's audit
      sinks; an unwired sink passes vacuously as "audit off"); and `workflow_engine_->set_should_stop`
-     with its body (stop wins over draining). The drain loop's own feed is pinned in
+     with its body (stop wins over draining); and the idempotency pre-check beside the run port
+     (`WorkflowIdempotencyLookupFn`, workflow_run_port.hpp, NOT a `WorkflowApi` method):
+     `return engine->find_execution_by_key(caller.principal, idempotency_key);` (the principal is the
+     authenticated caller's own, never a parameter), `wf_deps.workflow_idempotency_lookup = ...;`
+     and `mcp_server_->set_workflow_idempotency_lookup_fn(...);` with the SAME function the run
+     port's neighbours get (unwired, a keyed call is refused as "engine not available", so a
+     dropped line fails every execute rather than losing replay protection, but only production
+     wiring can show it). The drain loop's own feed is pinned in
      tests/unit/server/test_shutdown_join_order.cpp.
 
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
@@ -124,7 +131,14 @@ WF_STREAM_BUDGET = r"^[ \t]*wf_deps\.stream_budget = stream_budget_\.get\(\);.*$
 WF_DRAINING = r"^[ \t]*wf_deps\.draining = \[this\] " + _STOP_OR_DRAIN + r";"
 MCP_DRAINING = r"^[ \t]*mcp_server_->set_draining_fn\(\[this\] " + _STOP_OR_DRAIN + r"\);"
 RUN_ADAPTER = (r"^[ \t]*return engine->execute\(workflow_id, agent_ids, std::move\(dispatch_fn\),\s*"
-               r"std::move\(condition_fn\), control\.on_admitted, control\);")
+               r"std::move\(condition_fn\), control\);")
+IDEMP_LOOKUP = (r"^[ \t]*workflow_idempotency_lookup_fn = \[engine = workflow_engine_\.get\(\)\]\(\s*"
+                r"const yuzu::server::DispatchCaller& caller,\s*"
+                r"const std::string& idempotency_key\) \{\s*"
+                r"return engine->find_execution_by_key\(caller\.principal, idempotency_key\);")
+WF_IDEMP = r"^[ \t]*wf_deps\.workflow_idempotency_lookup = workflow_idempotency_lookup_fn;.*$"
+MCP_IDEMP = (r"^[ \t]*mcp_server_->set_workflow_idempotency_lookup_fn\("
+             r"workflow_idempotency_lookup_fn\);")
 WF_AUDIT_FN = r"^[ \t]*wf_deps\.audit_fn = audit_fn;.*$"
 WF_PERSIST_AUDIT_FN = r"^[ \t]*wf_deps\.persist_audit_fn = audit_fn;.*$"
 SHOULD_STOP = (r"^[ \t]*workflow_engine_->set_should_stop\(\[this\] \{\s*"
@@ -144,6 +158,9 @@ WORKFLOW_PINS = (
     ("wf_deps.draining", WF_DRAINING),
     ("mcp_server_->set_draining_fn", MCP_DRAINING),
     ("engine->execute", RUN_ADAPTER),
+    ("workflow_idempotency_lookup_fn", IDEMP_LOOKUP),
+    ("wf_deps.workflow_idempotency_lookup", WF_IDEMP),
+    ("set_workflow_idempotency_lookup_fn", MCP_IDEMP),
     ("wf_deps.audit_fn", WF_AUDIT_FN),
     ("wf_deps.persist_audit_fn", WF_PERSIST_AUDIT_FN),
     ("set_should_stop", SHOULD_STOP),
@@ -156,8 +173,17 @@ WORKFLOW_PIN_ADVICE = {
     "mcp_server_->set_draining_fn": "'mcp_server_->set_draining_fn([this] { return draining_ || stop_requested_; });' "
                                     "-- an unset one is 'never draining', so MCP admits runs during shutdown",
     "engine->execute": "the run adapter's 'return engine->execute(workflow_id, agent_ids, std::move(dispatch_fn), "
-                       "std::move(condition_fn), control.on_admitted, control);' -- a '{}' control disables the "
+                       "std::move(condition_fn), control);' -- a '{}' control disables the "
                        "deadline, the idempotency claim, the stop level and the safety hooks",
+    "workflow_idempotency_lookup_fn": "the idempotency lookup 'return engine->find_execution_by_key(caller.principal, "
+                                      "idempotency_key);' -- the principal must be the authenticated caller's own, "
+                                      "never a supplied parameter",
+    "wf_deps.workflow_idempotency_lookup": "'wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn;' -- "
+                                           "unwired, the REST execute route refuses every keyed call as 'engine not "
+                                           "available'",
+    "set_workflow_idempotency_lookup_fn": "'mcp_server_->set_workflow_idempotency_lookup_fn("
+                                          "workflow_idempotency_lookup_fn);' -- unwired, every MCP execute_workflow "
+                                          "call (all keyed) is refused as 'engine not available'",
     "wf_deps.audit_fn": "'wf_deps.audit_fn = audit_fn;' -- an unwired sink is 'audit off' to the workflow route",
     "wf_deps.persist_audit_fn": "'wf_deps.persist_audit_fn = audit_fn;' -- the persisted sink the route prefers; "
                                 "unwired it falls back to the best-effort one",
@@ -249,7 +275,11 @@ LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 STREAM_BUDGET_LINE = "        wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface\n"
 WF_DRAINING_HEAD = "        wf_deps.draining = [this] {\n"
 MCP_DRAINING_HEAD = "            mcp_server_->set_draining_fn([this] {\n"
-RUN_ADAPTER_TAIL = "                                       std::move(condition_fn), control.on_admitted, control);\n"
+RUN_ADAPTER_TAIL = "                                       std::move(condition_fn), control);\n"
+IDEMP_LOOKUP_BODY = "                return engine->find_execution_by_key(caller.principal, idempotency_key);\n"
+WF_IDEMP_LINE = ("        wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn; "
+                 "// and the same lookup\n")
+MCP_IDEMP_LINE = "            mcp_server_->set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_fn);\n"
 AUDIT_FN_LINE = "        wf_deps.audit_fn = audit_fn;\n"
 PERSIST_AUDIT_FN_LINE = "        wf_deps.persist_audit_fn = audit_fn; // #4990: the drawer's response.forensics.read row\n"
 SHOULD_STOP_HEAD = "                workflow_engine_->set_should_stop([this] {\n"
@@ -366,14 +396,14 @@ class TierPolicyWiringLexical(unittest.TestCase):
              src.replace(MCP_DRAINING_HEAD, MCP_DRAINING_HEAD + "                return false;\n", 1),
              ["set_draining_fn"]),
             ("T30 the run adapter passes an empty control instead of `control`",
-             src.replace(RUN_ADAPTER_TAIL, RUN_ADAPTER_TAIL.replace("control.on_admitted, control", "{}, {}"), 1),
+             src.replace(RUN_ADAPTER_TAIL, RUN_ADAPTER_TAIL.replace("condition_fn), control", "condition_fn), {}"), 1),
              ["engine->execute"]),
             ("T31 the run adapter drops the control argument",
              src.replace(RUN_ADAPTER_TAIL, RUN_ADAPTER_TAIL.replace(", control);", ");"), 1),
              ["engine->execute"]),
             ("T32 the run adapter passes a default-constructed control",
              src.replace(RUN_ADAPTER_TAIL,
-                         RUN_ADAPTER_TAIL.replace("control.on_admitted, control", "control.on_admitted, "
+                         RUN_ADAPTER_TAIL.replace("condition_fn), control", "condition_fn), "
                                                   "yuzu::server::WorkflowRunControl{}"), 1),
              ["engine->execute"]),
             ("T33 the workflow route audit sink dropped (compiles: unwired is audit off)",
@@ -401,6 +431,26 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T40 set_should_stop maps stop_requested_ to kDraining",
              src.replace(SHOULD_STOP_STOP, SHOULD_STOP_STOP.replace("kStop", "kDraining"), 1),
              ["set_should_stop"]),
+            ("T41 the idempotency lookup answers a supplied principal instead of the caller's",
+             src.replace(IDEMP_LOOKUP_BODY, IDEMP_LOOKUP_BODY.replace("caller.principal", "idempotency_key"), 1),
+             ["find_execution_by_key"]),
+            ("T42 the idempotency lookup always answers no run bound (a repeat would dispatch again)",
+             src.replace(IDEMP_LOOKUP_BODY,
+                         "                return std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, "
+                         "std::string>{std::nullopt};\n", 1),
+             ["find_execution_by_key"]),
+            ("T43 wf_deps.workflow_idempotency_lookup dropped (compiles: unwired is engine not available)",
+             src.replace(WF_IDEMP_LINE, WF_IDEMP_LINE.replace("wf_deps.workflow_idempotency_lookup", "wf_deps.unrelated"), 1),
+             ["wf_deps.workflow_idempotency_lookup"]),
+            ("T44 wf_deps.workflow_idempotency_lookup commented out (anchoring proof)",
+             src.replace(WF_IDEMP_LINE, "// " + WF_IDEMP_LINE, 1),
+             ["wf_deps.workflow_idempotency_lookup"]),
+            ("T45 mcp set_workflow_idempotency_lookup_fn dropped",
+             src.replace(MCP_IDEMP_LINE, MCP_IDEMP_LINE.replace("set_workflow_idempotency_lookup_fn", "set_unrelated_fn"), 1),
+             ["set_workflow_idempotency_lookup_fn"]),
+            ("T46 mcp set_workflow_idempotency_lookup_fn wired to an empty function",
+             src.replace(MCP_IDEMP_LINE, MCP_IDEMP_LINE.replace("(workflow_idempotency_lookup_fn)", "({})"), 1),
+             ["set_workflow_idempotency_lookup_fn"]),
             ("T11 the writer wired after register_routes (count stays one)",
              src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1) + AUDIT_SESSION_LINE,
              ["BEFORE"]),

@@ -383,6 +383,10 @@ struct WorkflowExecutePorts {
     const WorkflowApi* api{nullptr};
     /// Starts the run; the engine adapter built in server.cpp. Unset == engine not available.
     WorkflowRunFn run;
+    /// The idempotency pre-check, asked with the transport's `DispatchCaller` (never a bare
+    /// principal). Core-internal like `run`, and not a `WorkflowApi` method. Unset == engine not
+    /// available: a keyed call is refused, never answered as "no run bound".
+    WorkflowIdempotencyLookupFn idempotency_lookup;
     /// `InstructionStore* != nullptr && is_open()`, computed by the transport at call time.
     bool instruction_store_open{false};
     /// `ApprovalManager* != nullptr`. The manager is not consulted for a decision (per-step

@@ -19655,7 +19655,17 @@ private:
                                   yuzu::server::ConditionEvalFn condition_fn,
                                   const yuzu::server::WorkflowRunControl& control) {
                 return engine->execute(workflow_id, agent_ids, std::move(dispatch_fn),
-                                       std::move(condition_fn), control.on_admitted, control);
+                                       std::move(condition_fn), control);
+            };
+        // The idempotency pre-check beside the run port (workflow_run_port.hpp): core-internal, NOT
+        // a WorkflowApi method. The principal is the authenticated caller's own, never a parameter
+        // a presentation or MCP client can supply.
+        yuzu::server::WorkflowIdempotencyLookupFn workflow_idempotency_lookup_fn;
+        if (workflow_engine_)
+            workflow_idempotency_lookup_fn = [engine = workflow_engine_.get()](
+                                                 const yuzu::server::DispatchCaller& caller,
+                                                 const std::string& idempotency_key) {
+                return engine->find_execution_by_key(caller.principal, idempotency_key);
             };
         // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam — ONE
         // instance backing 8 of the 9 GET /api/v1/guaranteed-state/* resources
@@ -21069,6 +21079,7 @@ private:
         // constructed above (shared with mcp_server_->set_workflow_api below).
         wf_deps.workflow_api = workflow_api;
         wf_deps.workflow_run = workflow_run_fn; // same closure MCP execute_workflow gets
+        wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn; // and the same lookup
         wf_deps.authorize_dispatch = authorize_dispatch; // the step-pair dry run (sec-4)
         // The per-step credential liveness check of the v1 execute run: the SAME seam MCP's
         // held-open streams re-validate through (tri-state; an engine principal's Active check
@@ -23023,6 +23034,7 @@ private:
             mcp_server_->set_workflow_api(workflow_api);
             mcp_server_->set_workflow_concurrency_dispatch_fn(command_dispatch_concurrency_fn);
             mcp_server_->set_workflow_run_fn(workflow_run_fn);
+            mcp_server_->set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_fn);
             mcp_server_->set_draining_fn([this] {
                 return draining_.load(std::memory_order_acquire) ||
                        stop_requested_.load(std::memory_order_acquire);

@@ -186,6 +186,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             WorkflowExecutePorts ports;
             ports.api = d.workflow_api.get();
             ports.run = d.workflow_run;
+            ports.idempotency_lookup = d.workflow_idempotency_lookup;
             ports.instruction_store_open = d.instruction_store_open && d.instruction_store_open();
             ports.approval_gate_available = d.approval_gate_available && d.approval_gate_available();
             ports.lookup = d.lookup;

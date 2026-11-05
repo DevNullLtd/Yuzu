@@ -120,7 +120,7 @@ struct WorkflowExecution {
     std::vector<WorkflowStepResult> step_results;
 };
 
-/// The run a client's idempotency key is bound to (`WorkflowApi::find_execution_by_key`): just
+/// The run a client's idempotency key is bound to (`WorkflowIdempotencyLookupFn`, workflow_run_port.hpp): just
 /// enough to answer a repeat of the call without reading the run's steps. `request_fingerprint`
 /// is the opaque value the claim stored (workflow_execute.hpp computes it).
 struct WorkflowIdempotentRun {

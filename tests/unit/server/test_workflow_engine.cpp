@@ -662,11 +662,12 @@ TEST_CASE("WorkflowEngine: on_admitted gets the new execution id before the firs
             return std::string(R"({"status":"ok"})");
         };
         std::string admitted_id;
-        auto r = engine.execute(wf_id, {"agent-1"}, fn, nullptr,
-                                [&](const std::string& id) {
-                                    events.push_back("admitted");
-                                    admitted_id = id;
-                                });
+        WorkflowRunControl control;
+        control.on_admitted = [&](const std::string& id) {
+            events.push_back("admitted");
+            admitted_id = id;
+        };
+        auto r = engine.execute(wf_id, {"agent-1"}, fn, nullptr, control);
         REQUIRE(r.has_value());
         CHECK(admitted_id == *r);
         REQUIRE(events.size() == 3);
@@ -679,10 +680,11 @@ TEST_CASE("WorkflowEngine: on_admitted gets the new execution id before the firs
             ++dispatches;
             return std::string(R"({"status":"ok"})");
         };
-        CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, fn, nullptr,
-                                       [](const std::string&) {
-                                           throw std::runtime_error("hook exploded");
-                                       }),
+        WorkflowRunControl control;
+        control.on_admitted = [](const std::string&) {
+            throw std::runtime_error("hook exploded");
+        };
+        CHECK_THROWS_AS(engine.execute(wf_id, {"agent-1"}, fn, nullptr, control),
                         std::runtime_error);
         CHECK(dispatches == 0);
         const auto exec = only_execution(engine, wf_id);
@@ -727,7 +729,7 @@ TEST_CASE("WorkflowEngine: a run past its deadline stops before the next attempt
             return std::unexpected(StepDispatchError{"agent unreachable", false});
         };
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = engine.execute(wf_id, {"agent-1"}, arm_then_fail, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, arm_then_fail, nullptr, control);
         const auto elapsed = std::chrono::steady_clock::now() - t0;
         REQUIRE(r.has_value());
         // One attempt, then the 30 s delay was cut to the ~250 ms left. Uncapped, the run would
@@ -746,7 +748,7 @@ TEST_CASE("WorkflowEngine: a run past its deadline stops before the next attempt
     SECTION("a deadline that has already passed dispatches nothing") {
         WorkflowRunControl control;
         control.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, control);
         REQUIRE(r.has_value());
         CHECK(dispatched.empty());
         const auto exec = only_execution(engine, wf_id);
@@ -770,7 +772,7 @@ TEST_CASE("WorkflowEngine: a run past its deadline stops before the next attempt
                                   "      retryCount: 2\n"
                                   "      retryDelay: 0\n";
         auto quick_id = *engine.create_workflow(quick);
-        auto r = engine.execute(quick_id, {"agent-1"}, flaky, nullptr, nullptr, control);
+        auto r = engine.execute(quick_id, {"agent-1"}, flaky, nullptr, control);
         REQUIRE(r.has_value());
         CHECK(attempts == 2);
         CHECK(only_execution(engine, quick_id).status == "completed");
@@ -794,7 +796,7 @@ TEST_CASE("WorkflowEngine: before_attempt alone decides when installed; false st
     // stop decision (the hook owns it), so step 1 runs.
     control.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     control.before_attempt = [&asked] { return ++asked == 1; };
-    auto r = engine.execute(wf_id, {"agent-1"}, ok, nullptr, nullptr, control);
+    auto r = engine.execute(wf_id, {"agent-1"}, ok, nullptr, control);
     REQUIRE(r.has_value());
     CHECK(dispatches == 1);
     CHECK(asked == 2);
@@ -833,7 +835,7 @@ TEST_CASE("WorkflowEngine: before_attempt is asked once per dispatch attempt, af
         asked_at.push_back(std::chrono::steady_clock::now());
         return true;
     };
-    auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, nullptr, control);
+    auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
     REQUIRE(r.has_value());
     // Once before step 1's first attempt, once on waking from its retry sleep, once before step 2:
     // three asks for three attempts, each ahead of its own dispatch.
@@ -924,7 +926,7 @@ TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one
         control.should_stop = [&flip] { return flip.get(); };
         control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, control);
         const auto elapsed = std::chrono::steady_clock::now() - t0;
         REQUIRE(r.has_value());
         check_stopped(elapsed);
@@ -935,7 +937,7 @@ TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one
         WorkflowRunControl control; // as the legacy route: none
         control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, control);
         const auto elapsed = std::chrono::steady_clock::now() - t0;
         REQUIRE(r.has_value());
         check_stopped(elapsed);
@@ -944,7 +946,7 @@ TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one
         engine.set_should_stop([] { return WorkflowStopLevel::kStop; });
         WorkflowRunControl control;
         control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
-        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, control);
         REQUIRE(r.has_value());
         CHECK(dispatched.empty());
         CHECK(interrupted_calls == 1);
@@ -969,7 +971,7 @@ TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one
         WorkflowRunControl control;
         control.should_stop = [&level] { return static_cast<WorkflowStopLevel>(level.load()); };
         control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
-        auto r = engine.execute(wf_id, {"agent-1"}, ok_then_stop, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, ok_then_stop, nullptr, control);
         REQUIRE(r.has_value());
         CHECK(seen == std::vector<std::string>{"inst-1"});
         CHECK(interrupted_calls == 1);
@@ -1025,7 +1027,7 @@ TEST_CASE("WorkflowEngine: a DRAINING server abandons a retry sleep but keeps di
         flip.arm(std::chrono::milliseconds(100), WorkflowStopLevel::kDraining);
         engine.set_should_stop([&flip] { return flip.get(); });
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = engine.execute(wf_id, {"agent-1"}, fail_first, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, fail_first, nullptr, control);
         const auto elapsed = std::chrono::steady_clock::now() - t0;
         REQUIRE(r.has_value());
         check_continued(elapsed);
@@ -1033,14 +1035,14 @@ TEST_CASE("WorkflowEngine: a DRAINING server abandons a retry sleep but keeps di
     SECTION("draining already set: the failed attempt is not retried and no delay is slept") {
         engine.set_should_stop([] { return WorkflowStopLevel::kDraining; });
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = engine.execute(wf_id, {"agent-1"}, fail_first, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, fail_first, nullptr, control);
         const auto elapsed = std::chrono::steady_clock::now() - t0;
         REQUIRE(r.has_value());
         check_continued(elapsed);
     }
     SECTION("draining does not touch a run that never needs a retry") {
         engine.set_should_stop([] { return WorkflowStopLevel::kDraining; });
-        auto r = engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), nullptr, control);
         REQUIRE(r.has_value());
         const auto exec = only_execution(engine, wf_id);
         CHECK(exec.status == "completed");
@@ -2436,7 +2438,7 @@ ClaimResult execute_keyed(WorkflowEngine& engine, const std::string& wf_id,
         ++out.dispatches;
         return std::string(R"({"status":"ok"})");
     };
-    out.result = engine.execute(wf_id, agents, fn, nullptr, control.on_admitted, control);
+    out.result = engine.execute(wf_id, agents, fn, nullptr, control);
     return out;
 }
 
@@ -2800,6 +2802,9 @@ TEST_CASE("WorkflowEngine idempotency: a run killed after the claim leaves a `ru
                    const WorkflowRunControl&) -> std::expected<std::string, std::string> {
         return std::unexpected(std::string{"must not run"});
     };
+    ports.idempotency_lookup = [&engine](const DispatchCaller& caller, const std::string& key) {
+        return engine.find_execution_by_key(caller.principal, key);
+    };
     ports.instruction_store_open = true;
     ports.approval_gate_available = true;
     ports.lookup = [](const std::string&)
@@ -2925,7 +2930,10 @@ ParityOutcome parity_run(WorkflowEngine& engine, ParityEnv& env, const std::stri
                           StepDispatchFn dispatch_fn, ConditionEvalFn condition_fn,
                           const WorkflowRunControl& control) {
         return engine.execute(workflow_id, agent_ids, std::move(dispatch_fn),
-                              std::move(condition_fn), control.on_admitted, control);
+                              std::move(condition_fn), control);
+    };
+    ports.idempotency_lookup = [&engine](const DispatchCaller& caller, const std::string& key) {
+        return engine.find_execution_by_key(caller.principal, key);
     };
     ports.instruction_store_open = true;
     ports.approval_gate_available = true;
@@ -3221,7 +3229,7 @@ TEST_CASE("WorkflowEngine: the engine announces every attempt (step index and at
         events.push_back("ask");
         return ++asked < 4; // the fourth ask (none: three attempts) never says no
     };
-    auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, nullptr, control);
+    auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
     REQUIRE(r.has_value());
     CHECK(events == std::vector<std::string>{"attempt:0/1", "ask", "dispatch:inst-a", "attempt:0/2",
                                              "ask", "dispatch:inst-a", "attempt:1/1", "ask",
@@ -3235,10 +3243,131 @@ TEST_CASE("WorkflowEngine: the engine announces every attempt (step index and at
         events.push_back("ask");
         return ++asked < 2; // yes for attempt 1, no for the retry
     };
-    auto stopped = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, nullptr, control);
+    auto stopped = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
     REQUIRE(stopped.has_value());
     CHECK(events == std::vector<std::string>{"attempt:0/1", "ask", "dispatch:inst-a", "attempt:0/2",
                                              "ask"});
+}
+
+// The port's unset-member rule ("a member the engine does not consume is ignored") is a silent
+// fail-open for the safety hooks, so each consumed member is proved on its own: the run sets
+// ONLY that member and the effect is observed. Deleting the engine's read of one member fails
+// exactly its section. `on_interrupted` has no trigger of its own, so its section stops the run
+// through the engine-level default (`set_should_stop`, which is not a control member).
+TEST_CASE("WorkflowEngine: every run-control hook is consumed by the engine, each proved alone",
+          "[workflow_engine][pg][execute][hooks]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kTwoStepYaml);
+    std::vector<std::string> dispatched;
+    StepDispatchFn dispatch = [&dispatched](const std::string& id, const std::string&,
+                                            const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        dispatched.push_back(id);
+        return std::string(R"({"status":"ok"})");
+    };
+    // A run the engine ended before dispatching anything: failed, both steps settled unsent.
+    const auto check_stopped_before_any_dispatch = [&](const std::string& reason_fragment) {
+        CHECK(dispatched.empty());
+        const auto exec = only_execution(engine, wf_id);
+        CHECK(exec.status == "failed");
+        REQUIRE(exec.step_results.size() == 2);
+        for (const auto& sr : exec.step_results) {
+            CHECK(sr.status != "success");
+            CHECK(sr.result_json.find(reason_fragment) != std::string::npos);
+        }
+    };
+
+    SECTION("on_admitted: called once with the id execute() returns, before any dispatch") {
+        std::vector<std::string> events;
+        std::string admitted_id;
+        StepDispatchFn recording = [&events](const std::string& id, const std::string&,
+                                             const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            events.push_back("dispatch:" + id);
+            return std::string(R"({"status":"ok"})");
+        };
+        WorkflowRunControl control;
+        control.on_admitted = [&](const std::string& id) {
+            events.push_back("admitted");
+            admitted_id = id;
+        };
+        const auto r = engine.execute(wf_id, {"agent-1"}, recording, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(admitted_id == *r);
+        CHECK(events == std::vector<std::string>{"admitted", "dispatch:inst-1", "dispatch:inst-2"});
+    }
+    SECTION("on_attempt: announced for every attempt with the step index and attempt number") {
+        std::vector<std::pair<int, int>> seen;
+        WorkflowRunControl control;
+        control.on_attempt = [&seen](int step, int attempt) { seen.emplace_back(step, attempt); };
+        const auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(seen == std::vector<std::pair<int, int>>{{0, 1}, {1, 1}});
+        CHECK(dispatched.size() == 2);
+    }
+    SECTION("before_attempt: a false answer stops the run before the attempt is made") {
+        int asked = 0;
+        WorkflowRunControl control;
+        control.before_attempt = [&asked] {
+            ++asked;
+            return false;
+        };
+        const auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(asked == 1);
+        check_stopped_before_any_dispatch("run stopped");
+    }
+    SECTION("deadline: a deadline already passed stops the run before the first attempt") {
+        WorkflowRunControl control;
+        control.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        const auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
+        REQUIRE(r.has_value());
+        check_stopped_before_any_dispatch("run stopped");
+    }
+    SECTION("should_stop: kStop ends the run before the first step, skipped as server_shutdown") {
+        int asked = 0;
+        WorkflowRunControl control;
+        control.should_stop = [&asked] {
+            ++asked;
+            return WorkflowStopLevel::kStop;
+        };
+        const auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(asked >= 1);
+        check_stopped_before_any_dispatch("server_shutdown");
+    }
+    SECTION("should_stop: kDraining abandons a retry the step had not yet made") {
+        const auto retry_wf = *engine.create_workflow(
+            "kind: Workflow\nmetadata:\n  name: drain-wf\nspec:\n  steps:\n"
+            "    - instruction: inst-r\n"
+            "      retryCount: 3\n"
+            "      retryDelay: 30\n"
+            "      onFailure: continue\n");
+        int attempts = 0;
+        StepDispatchFn failing = [&attempts](const std::string&, const std::string&,
+                                             const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            ++attempts;
+            return std::unexpected(StepDispatchError{"agent unreachable", false});
+        };
+        WorkflowRunControl control;
+        control.should_stop = [] { return WorkflowStopLevel::kDraining; };
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r = engine.execute(retry_wf, {"agent-1"}, failing, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(attempts == 1); // uncapped: four attempts and 90 s of delay
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+    }
+    SECTION("on_interrupted: called once when the engine ends the run on a stop") {
+        engine.set_should_stop([] { return WorkflowStopLevel::kStop; });
+        int interrupted = 0;
+        WorkflowRunControl control;
+        control.on_interrupted = [&interrupted] { ++interrupted; };
+        const auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(interrupted == 1);
+        check_stopped_before_any_dispatch("server_shutdown");
+    }
 }
 
 TEST_CASE("WorkflowEngine: a stopped or failed step's stored result carries the structured `reason` "
@@ -3267,7 +3396,7 @@ TEST_CASE("WorkflowEngine: a stopped or failed step's stored result carries the 
     SECTION("a run bound (deadline / credential) stop: the step in flight and the skipped rest") {
         WorkflowRunControl control;
         control.before_attempt = [] { return false; };
-        REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), nullptr, nullptr, control)
+        REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), nullptr, control)
                     .has_value());
         const auto exec = only_execution(engine, wf_id);
         REQUIRE(exec.step_results.size() == 2);
@@ -3289,7 +3418,7 @@ TEST_CASE("WorkflowEngine: a stopped or failed step's stored result carries the 
             level = static_cast<int>(WorkflowStopLevel::kStop);
             return std::unexpected(StepDispatchError{"transient", false});
         };
-        REQUIRE(engine.execute(retry_id, {"agent-1"}, fail_then_stop, nullptr, nullptr, control)
+        REQUIRE(engine.execute(retry_id, {"agent-1"}, fail_then_stop, nullptr, control)
                     .has_value());
         const auto exec = only_execution(engine, retry_id);
         REQUIRE(exec.step_results.size() == 1);

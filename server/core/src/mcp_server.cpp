@@ -8578,6 +8578,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 WorkflowExecutePorts ports;
                 ports.api = workflow_api_.get();
                 ports.run = workflow_run_fn_;
+                ports.idempotency_lookup = workflow_idempotency_lookup_fn_;
                 ports.digest = workflow_digest_fn_;
                 ports.instruction_store_open = instruction_store && instruction_store->is_open();
                 ports.approval_gate_available = approval_manager != nullptr;

@@ -872,6 +872,13 @@ public:
     /// `execute_workflow` answers "workflow engine not available" and dispatches nothing.
     void set_workflow_run_fn(WorkflowRunFn fn) { workflow_run_fn_ = std::move(fn); }
 
+    /// The idempotency pre-check `execute_workflow` asks beside the run port; server.cpp wires the
+    /// identical function the REST route gets. Unset means a keyed call (every MCP call is keyed)
+    /// answers "workflow engine not available".
+    void set_workflow_idempotency_lookup_fn(WorkflowIdempotencyLookupFn fn) {
+        workflow_idempotency_lookup_fn_ = std::move(fn);
+    }
+
     /// True while the server is draining. `execute_workflow` refuses a new run then
     /// (`StreamBudget::try_acquire` does not consult its own closing flag). Unset (the default)
     /// is never draining: a harness that does not wire it. server.cpp wires `draining_`.
@@ -1433,6 +1440,7 @@ private:
     std::shared_ptr<const WorkflowApi> workflow_api_;
     ConcurrencyDispatchFn workflow_concurrency_dispatch_fn_; // see set_workflow_concurrency_dispatch_fn
     WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
+    WorkflowIdempotencyLookupFn workflow_idempotency_lookup_fn_; // see set_workflow_idempotency_lookup_fn
     std::function<bool()> draining_fn_;                      // see set_draining_fn
     std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
     std::optional<std::chrono::milliseconds> workflow_reauthorize_retry_delay_; // see set_workflow_reauthorize_retry_delay

@@ -14,8 +14,7 @@
 /// Postgres-backed store, `workflow_engine.hpp`) along.
 ///
 /// The four methods == the four public REST v1 resources above (plus their
-/// MCP twins; the fifth, `find_execution_by_key`, is the read behind the idempotent replay of
-/// the public execute operation, not a resource of its own), so a presentation/MCP caller consumes only what the public,
+/// MCP twins), so a presentation/MCP caller consumes only what the public,
 /// versioned core API serves (ADR-0031 B3, INV-31-4 "no private core API") —
 /// a local in-process implementation today (`LocalWorkflowApi`,
 /// `workflow_api.cpp`), a core HTTP client after the WS-B2 cutover. Adding a
@@ -99,17 +98,6 @@ public:
     [[nodiscard]] virtual std::expected<WorkflowExecutionPage, std::string>
     list_workflow_executions(const WorkflowExecutionListQuery& q,
                              const authz::VisibleSet& scope) const = 0;
-
-    /// The run a client's idempotency key (`Idempotency-Key` header / MCP `idempotency_key`) is
-    /// bound to for `principal`, or `nullopt` when none is: the lookup behind a repeat of
-    /// `POST /api/v1/workflows/{id}/execute` / `execute_workflow`, which answers with that run
-    /// instead of starting another. It reads only the caller's OWN key (the principal is part of
-    /// the question) and returns run metadata, no steps and no agent ids. `std::unexpected` is a
-    /// genuine read failure and is never "no run bound": the caller refuses the call (retryable)
-    /// rather than risk a second dispatch. Same `genericize_db_error` rule as the reads above.
-    [[nodiscard]] virtual std::expected<std::optional<WorkflowIdempotentRun>, std::string>
-    find_execution_by_key(const std::string& principal,
-                          const std::string& idempotency_key) const = 0;
 };
 
 } // namespace yuzu::server

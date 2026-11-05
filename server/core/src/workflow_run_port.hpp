@@ -12,12 +12,22 @@
 /// thread (retry sleeps included), and returns the execution id once the step loop has finished.
 /// A failed step is recorded in the execution, not returned. `std::unexpected` carries the
 /// engine's own text: a `kDbErrorPrefix` store failure (genericize before display) or
-/// "workflow not found: ..." / "workflow has no steps".
+/// "workflow not found: ..." / "workflow has no steps". A THROW out of `dispatch_fn`,
+/// `condition_fn` or `control.on_admitted` is not returned either: the engine first closes the
+/// run `failed` (the unstarted steps skipped) and then RETHROWS, so the port propagates the
+/// exception to its caller after the finalize and never answers it as a value. Once
+/// `control.on_admitted` has fired the port never returns `std::unexpected` at all: it returns the
+/// execution id or rethrows, so every `std::unexpected` (a store failure, "not found", an
+/// idempotent replay) means NOTHING was admitted or dispatched.
+///
+/// The idempotency pre-check (`WorkflowIdempotencyLookupFn`, below) is the second core-internal
+/// port of the execute sequence and lives here for the same reason: it is not a public resource.
 ///
 /// The port has NO authorization, confinement, approval-mode or audit logic of its own: the
 /// caller decides all of that before the call and supplies a `dispatch_fn` that confines each step
 /// to the caller. Calling it directly would dispatch to the named agents unconfined.
 
+#include "dispatch_caller.hpp" // DispatchCaller: the lookup is asked on behalf of a caller
 #include "workflow_types.hpp"
 
 #include <chrono>
@@ -85,8 +95,11 @@ inline constexpr char kWorkflowIdempotentReplayError[] = "idempotent replay";
 
 /// Per-run controls. Every member is optional and an unset member is no hook, so a caller that
 /// sets none gets the engine's plain behaviour. The engine consumes the members it supports; a
-/// member it does not yet consume is ignored. Members are added here as the engine gains the
-/// matching hook, so the port signature never changes.
+/// member it does not yet consume is ignored, which for the safety hooks would be a silent
+/// fail-open, so each consumed member has its own test that sets only that member
+/// (`test_workflow_engine.cpp`, "every run-control hook is consumed"). Members are added here as
+/// the engine gains the matching hook, so the port signature never changes. `on_admitted` is read
+/// from here only: `WorkflowEngine::execute` has no separate parameter for it.
 ///
 /// Consumed today: `on_admitted`, `on_attempt`, `before_attempt`, `deadline`, `should_stop`,
 /// `on_interrupted`, `idempotency` and `on_replay`.
@@ -106,9 +119,11 @@ struct WorkflowRunControl {
     /// stops the run: the attempt is not made, the step is recorded failed, the remaining steps
     /// are skipped and the execution is finalized `failed`. The caller records why it said no.
     std::function<bool()> before_attempt;
-    /// Wall-clock bound for the whole run (steady clock; retry sleeps count against it). The
-    /// engine refuses to start an attempt at or after it, with the same stop as `before_attempt`,
-    /// and never sleeps a retry delay past it. A dispatch already in flight is not interrupted.
+    /// Wall-clock bound for the whole run (steady clock). It always cuts a retry delay to the time
+    /// left. It stops an attempt at or after it, with the same stop as `before_attempt`, ONLY when
+    /// `before_attempt` is unset: a caller that installs the hook owns the decision (and the reason
+    /// it recorded), and the engine does not compare the clock a second time. A dispatch already
+    /// in flight is not interrupted.
     std::optional<std::chrono::steady_clock::time_point> deadline;
     /// Polled at the top of every step and every attempt and during retry sleeps (at most one
     /// sliced wait, `kInterruptibleWaitSlice`, behind a change). The engine also holds an
@@ -136,5 +151,22 @@ struct WorkflowRunControl {
 using WorkflowRunFn = std::function<std::expected<std::string, std::string>(
     const std::string& workflow_id, const std::vector<std::string>& agent_ids,
     StepDispatchFn dispatch_fn, ConditionEvalFn condition_fn, const WorkflowRunControl& control)>;
+
+/// The run `caller`'s idempotency key is bound to, or `nullopt` when none is: the pre-check
+/// behind a repeat of `POST /api/v1/workflows/{id}/execute` / `execute_workflow`, which answers
+/// with that run instead of starting another. It is a core-internal port beside `WorkflowRunFn`,
+/// NOT a `WorkflowApi` method: it is the read half of the execute operation, not a public
+/// resource, and a method taking a principal on the versioned read seam would let any presentation
+/// or MCP caller ask about another principal's keys (ADR-0031 B3, INV-31-4). The principal is the
+/// authenticated `caller`'s own (`caller.principal`); a key is bound per principal, so the
+/// question can only ever be "has THIS caller already run this key". The execute sequence asks it
+/// only with the `DispatchCaller` its transport derived, never with a principal read from a
+/// request. Returns run metadata, no steps and no agent ids. `std::unexpected` is a genuine read
+/// failure (a `kDbErrorPrefix` store text, genericize before display) and is NEVER "no run
+/// bound": the sequence refuses the call, retryable, rather than risk a second dispatch. A null
+/// function is "engine not available".
+using WorkflowIdempotencyLookupFn =
+    std::function<std::expected<std::optional<WorkflowIdempotentRun>, std::string>(
+        const DispatchCaller& caller, const std::string& idempotency_key)>;
 
 } // namespace yuzu::server

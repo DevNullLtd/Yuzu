@@ -719,7 +719,6 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     const std::vector<std::string>& agent_ids,
     StepDispatchFn dispatch_fn,
     ConditionEvalFn condition_fn,
-    std::function<void(const std::string& execution_id)> on_admitted,
     const WorkflowRunControl& control) {
 
     if (!dispatch_fn)
@@ -914,15 +913,15 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // Execute steps sequentially
     std::string prev_result_json = "{}";
     bool execution_failed = false;
-    // A throw out of dispatch_fn / condition_fn / on_admitted must not leave the row `running`:
-    // `thrown` carries it past the finalize below, which closes the execution as usual.
+    // A throw out of dispatch_fn / condition_fn / control.on_admitted must not leave the row
+    // `running`: `thrown` carries it past the finalize below, which closes the execution as usual.
     std::exception_ptr thrown;
     int current_step_index = -1; // the step in flight (-1: none yet)
     bool current_step_open = false; // its result row is not yet written
 
     try {
-        if (on_admitted)
-            on_admitted(exec_id);
+        if (control.on_admitted)
+            control.on_admitted(exec_id);
 
         for (const auto& step : workflow.steps) {
             // A stop that arrived between steps ends the run before this step begins: this step

@@ -153,11 +153,11 @@ public:
     ///
     /// A failed step is recorded, not returned; a `permanent` StepDispatchError is not retried and
     /// is not slept on (the step's `on_failure` policy applies at once). A THROW from `dispatch_fn`,
-    /// `condition_fn` or `on_admitted` is a failed, never-retried step: the execution is closed
-    /// `failed` through the guarded finalize, the remaining steps are marked skipped, and the
-    /// exception is rethrown to the caller, so a run is never left `running` behind a throw.
-    /// `on_admitted` is called once with the new execution id after admission and before the first
-    /// step.
+    /// `condition_fn` or `control.on_admitted` is a failed, never-retried step: the execution is
+    /// closed `failed` through the guarded finalize, the remaining steps are marked skipped, and
+    /// the exception is rethrown to the caller, so a run is never left `running` behind a throw.
+    /// `control.on_admitted` is called once with the new execution id after admission and before
+    /// the first step.
     ///
     /// SHUTDOWN. The engine asks the higher of `control.should_stop` and the engine-level
     /// `set_should_stop` at the top of every step, before every attempt and while a retry delay is
@@ -188,7 +188,6 @@ public:
         const std::vector<std::string>& agent_ids,
         StepDispatchFn dispatch_fn,
         ConditionEvalFn condition_fn = nullptr,
-        std::function<void(const std::string& execution_id)> on_admitted = nullptr,
         const WorkflowRunControl& control = {});
 
     /// The run a client's idempotency key is bound to, or `nullopt` when none is. Bound to

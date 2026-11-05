@@ -2871,7 +2871,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return false;
         };
         auto result = workflow_engine->execute(workflow_id, agent_ids, dispatch_fn, condition_fn,
-                                               nullptr, control);
+                                               control);
 
         if (!result) {
             if (yuzu::server::is_generic_db_error(result.error())) {
@@ -2940,6 +2940,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             .persist_audit_fn = persist_audit_fn,
             .workflow_api = workflow_api,
             .workflow_run = deps.workflow_run,
+            .workflow_idempotency_lookup = deps.workflow_idempotency_lookup,
             .instruction_store_open =
                 [instruction_store] { return instruction_store && instruction_store->is_open(); },
             .approval_gate_available = [approval_manager] { return approval_manager != nullptr; },
