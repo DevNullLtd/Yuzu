@@ -274,10 +274,14 @@ cadences.
   `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
   default retention, no per-subject erasure), outside this sync and outside
   `--inventory-disable`. The sync blob also has `install_location` and
-  `uninstall_string` slots, but they are reserved: the server ignores them and
-  stores neither, until ADR-0016 §8 is re-classified for them with the
-  agent-side change, #5186. No shipped agent fills them; a build that does gets a
-  full-resend request every cycle until the server accepts them. (The only `HKCU`
+  `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
+  them and stores neither, and an agent that fills them gets a full-resend request
+  every cycle. The sectioned v3 blob stores `install_location` and keeps
+  `uninstall_string` reserved (see "Install type, scope and location, and the
+  sectioned report" below). No shipped agent sends either slot, and the agent-side
+  change that starts sending `install_location` decides what a machine-scope
+  collector may put in it, since a path under a user's profile names an account
+  (ADR-0016 §8, #5186). (The only `HKCU`
   read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
@@ -294,18 +298,124 @@ cadences.
   installed-software inventory. Deploy-time opt-out; not a server-side runtime
   toggle. It does not gate the operator `list`/`query`/`list_per_user` actions.
 
+### Install type, scope and location, and the sectioned report
+
+Each stored software row carries four more attributes. They are read-side facts today: the
+fleet query, catalogue and device pages do not return them yet, so they are visible only in the
+database.
+
+- **`install_type`** says how the software got onto the machine. The server derives it from the
+  producing collector (the row's `source`), and from the ecosystem when a row has no source:
+  `installer` (`installed_apps.list_inventory`, except that its Linux packages, whose ecosystem is
+  `deb`, `rpm`, `apk` or `pacman`, read `package_manager`, as they do from an agent that sends no
+  source), `msi` (`msi_packages.list_inventory`),
+  `package_manager` (`pkg_inventory.packages` and `pkg_inventory.managers`, which is the
+  Homebrew presence row), `store` (`pkg_inventory.store_packages`), `optional_feature`
+  (`windows_optional_features.list`), `runtime` (`runtimes.python`) and `middleware`
+  (`middleware.ibm_mq`). `component` and `driver` are reserved. A row whose source and ecosystem are both
+  unrecognised reads an empty `install_type`.
+- **`install_scope`** is `machine` or `user`. The sync collects machine scope only, so every row
+  reads `machine`.
+- **`install_location`** is the folder the software was installed into, when the collector reports
+  one. It is stored only from the v3 blob; the v2 blob's slot is ignored, so it is empty for every
+  device until an agent that sends v3 is deployed.
+- **`purl`** is the row's Package URL (for example
+  `pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12`), composed by the server from the
+  row's name, version, release, epoch, architecture and distribution. Linux package rows
+  (`deb`, `rpm`, `apk`, `pacman`, which the Package-URL specification calls `alpm`) and Homebrew
+  formulae and casks carry one; the other ecosystems have no registered Package-URL type, so
+  their `purl` is empty, and so is the Homebrew presence row. The server stores it only from the
+  v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
+  value is indexed, and the store can look up the devices carrying exactly one `purl`; the
+  dashboard and the API do not return it yet.
+
+**The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
+each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
+`disabled`). The server applies each section on its own: a `full` section replaces only that
+collector's rows, so one collector's failure no longer holds back the rest of the report, and a
+status-only section records why a collector did not report and keeps its previous rows. The
+latest status of each collector, with the section's content hash, when it last reported in full,
+how long the collector took and how many bytes it read, is kept per device. Nothing in the
+dashboard or the API shows that record yet.
+
+A section the server cannot accept is asked for again by name (`installed_software:<source>` in
+the acknowledgement's `need_full`), while the other sections of the same report are stored. The
+first v3 call from a device that applies a section removes the rows its earlier v2 reports left, so a device never
+shows the same software from two report formats. A `delta` section, and the
+`component_inventory` section, are checked but not applied by this server version: each is
+answered with a request for a full section, so nothing is lost. No shipped agent sends v3 yet;
+the agent side arrives in a later release. Operators can see the outcome of each section in
+`yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
+`need_full`, `delta_unsupported`, `rejected` or `error`, and `facet` is the collector source
+(`unknown` for a name the server does not recognise). The existing
+`yuzu_inventory_ingest_total` keeps one outcome per report; a v3 report with any section asked for
+again counts as `need_full`. A blob the server cannot split into sections at all (see below) counts
+as `dropped` there, and a call whose transaction failed counts as `error` for every section of the
+call that was not refused (a refused section stays `rejected`).
+
+**Sequencing, and what the shipped agent does with a per-section request.** Bring up every server
+replica before the agents of the same build enroll. The agent in this release does not understand the per-section request: it
+looks for its own source name in the acknowledgement's `need_full` list, and
+`installed_software:<source>` is not that name, so a per-section request reads to it as a clean
+sync until the agent release that sends v3 reads the new form. Nothing is lost today, because
+no shipped agent sends v3. One behaviour also changes with the format: when a collector that
+withholds its rows on a constrained read (the `drop_source` policy, for example
+`middleware.ibm_mq`) cannot answer, a v2 report replaces the device's rows without that
+source's, while a v3 report records a status-only section and keeps the previous rows.
+
+**When a section is refused.** `yuzu_inventory_section_ingest_total{outcome="rejected"}` counts a
+section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
+refused" names the agent and the reason. The reason is one of `unknown_facet`, `duplicate_facet`,
+`unknown_status`, `rows_in_status_only`, `delete_in_full`, `wrong_record_for_facet`,
+`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
+`nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
+own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
+deleted) until the agent is fixed. The one exception is a device's first v3 call that applies a section: its v2 rows were
+already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
+recognise the name: that is a version-skew incident (an agent and a server of different builds),
+fixed by reprovisioning matching builds rather than by fixing the agent. A blob that cannot be attributed to sections at all (a record
+before any section, a header with no section, an unusable section header, more than 32 sections,
+or over 3 MiB) is counted `dropped`, logged as "unusable v3 ... blob", and asked for again by the
+whole source name.
+
 ## How the sync behaves (and why it's quiet on the network)
 
 - **Daily, per source.** Installed software syncs every ~24 h.
 - **Spread, not lockstep.** Each endpoint picks a stable, per-agent time offset,
-  so a fleet does not all report at once. A freshly enrolled (or long-offline)
-  agent does its first sync shortly after connecting, jittered to avoid a
-  mass-enrollment thundering herd.
+  so a fleet does not all report at once (installed software: see the nightly
+  window below). A freshly enrolled (or long-offline) agent does its first sync
+  shortly after connecting, jittered to avoid a mass-enrollment thundering herd.
+- **Nightly window for installed software.** The regular daily installed-software
+  sync runs at a stable per-agent moment between 01:00 and 05:00 on the
+  endpoint's own clock and time zone. The first sync after enrolment, retries
+  after a skipped or refused sync, and an operator's Sync now can still land
+  outside it. Because the window is local, a fleet in one time zone reports
+  within four hours of the day, about six times the per-second rate of an even
+  spread. An endpoint with no time zone configured (a container, a VDI image, a
+  service with `TZ` unset) uses UTC, and 01:00 to 05:00 UTC can be working hours
+  where its users are. A laptop that is off during its window syncs when it next
+  wakes (see Gentle catch-up) and then returns to the next window. The window is
+  built into the agent: it has no setting yet, and the server cannot push one.
+- **Gentle catch-up.** An agent that was switched off, or a laptop that slept
+  through its sync, does not report the moment it wakes. A sync more than 15
+  minutes overdue is spread over the next 30 minutes by a stable per-agent
+  offset, and a schedule more than two days ahead (a clock stepped back) is
+  corrected the same way. The rule also applies while the server is
+  unreachable: an agent retries every 30 seconds for up to 15 minutes, then
+  pauses for its offset (up to 30 minutes) before the next burst.
+- **Sync now can be spread too.** The agent's `__sync__.now` command takes a
+  list of sources and an optional `delay_max_s` (0 to 86400 seconds); with it
+  the agent reports at a stable offset within that many seconds instead of
+  immediately. Nothing in the console sends either yet, so Sync now is
+  immediate today. If its first send fails (the server is unreachable), the
+  retries follow the pattern in Gentle catch-up, so it can arrive up to about
+  45 minutes after the click.
 - **Hash-skip.** If a device's installed software hasn't changed since its last
   successful sync, the agent sends only a small **content hash** instead of the
   full list. The server replies asking for the full list only when it can't match
   the hash (e.g. a fresh/restored server). A full list is also sent at least once
-  a week regardless, as a safety net.
+  a week regardless, as a safety net (up to 8 days for the nightly window, across
+  a spring-forward clock change).
 - **Resilient.** Sync state is kept on the agent and survives reconnects and
   reboots; a failed sync simply retries on the next cycle.
 
@@ -964,9 +1074,10 @@ ingest is failing. Four further series sharpen the picture:
   applying one source's report holds a pooled Postgres connection (advisory lock +
   the atomic replace, whose inserts are now batched into a single `unnest()`
   statement). `phase=full` is the full-payload replace; `phase=hash_only` is the
-  cheap hash-skip compare + `last_seen` bump — split so the steady-state
-  hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
-  a cold-cache `need_full` herd.
+  cheap hash-skip compare + `last_seen` bump; `phase=v3` is a sectioned report's
+  apply (up to 32 sections in one transaction) — split so the steady-state
+  hash_only majority doesn't bury the `full` and `v3` tail, the pool-pressure
+  signal under a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
@@ -1101,14 +1212,20 @@ Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
 `error` rate held for 15m), `YuzuInventoryHighNeedFullRatio` (>20% of ingests are
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
-payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
+payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob, or a v3 blob that cannot be split into
+sections, dropped + nacked),
 `YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
 `YuzuInventoryGenericBlobRejectedDepth` (a generic source blob rejected for
 nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 `YuzuInventoryReadDegraded` (a read returned a degrade, by reason),
-`YuzuInventoryIngestSlow` (full-payload ingests holding a connection >10s — a
-leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
-freshness gauge may be frozen).
+`YuzuInventoryIngestSlow` (full-payload and sectioned (`phase=~"full|v3"`) ingests
+holding a connection >10s — a leading pool-saturation indicator),
+`YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`,
+at least once in the last day, so a single refusal is enough; the refusal is a grammar failure
+that never self-heals, so fix the agent, except `facet="unknown"`, a version-skew incident fixed by reprovisioning matching builds),
+`YuzuInventorySectionDeltaUnsupported` (info, held 1h: a v3 delta was answered with a request
+for a full section because this server cannot apply deltas yet; expected, no action), and
+`YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
 
 A **recording rule**, `yuzu:inventory_ingest_duration_seconds:p99{source,phase}`,
 ships in the same group: it precomputes the 99th-percentile ingest duration per
@@ -1159,13 +1276,13 @@ The server turns every distinct installed-software title into a stable identity 
 - **What runs.** A background job reads the distinct (name, publisher, ecosystem) titles the catalogue rollup already computes, and writes one row per title to a permanent title dimension: the canonical publisher, product, edition, category (`web_server`, `database`, `message_broker`, `runtime` or `other`), the package-URL type for package ecosystems, and the version token embedded in the raw name. It works through the most widely installed titles first, in bounded passes of 2,000 titles, and each pass is a single transaction, so a restart never leaves half a batch. With several server replicas, one runs the job at a time.
 - **Cadence.** A quiet fleet is checked once an hour. A tick covers up to 200,000 titles or 60 seconds of work in total, whichever comes first. When it stops at either limit with more waiting (a new pack version, or the first run on a large fleet), the next tick starts after 60 seconds instead of an hour, so a backlog is worked off in back-to-back ticks rather than one tick an hour. The same 60 seconds applies right after a server start or upgrade when the catalogue rollup has not yet produced the title list: the job finds nothing to do and keeps checking every 60 seconds until the rollup has produced the title list, instead of waiting an hour. A tick that fails or times out is retried at the hourly interval, because an immediate retry would pick the same batch and fail the same way.
 - **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
-- **Settled titles are not re-resolved in this release.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale (editing a product, or adding or changing an alias, in the product registry store does that). Nothing in the server writes the registry yet: there is no route or screen to add a product or an alias by hand, so in this release a new pack version is what re-resolves settled titles.
+- **Settled titles are re-resolved only when something changes.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale. A curated alias (`POST /api/v1/inventory/software/normalization/aliases`) or a replaced pack (`POST .../pack`) marks every title stale in the same transaction, so the next hourly passes pick the fleet up again; rejecting a queue entry does not.
 - **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
 - **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
 - **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
 - **What is kept, and for how long.** The title dimension is permanent: it keeps one row for every distinct title the fleet has ever reported, and is never pruned. Titles that embed a version in their name (many do) therefore add rows over time, so the table grows with the number of distinct titles ever seen, not with the current fleet. `yuzu_software_titles` shows how many titles are in the current fleet; the table's size is visible in Postgres. A future retention policy would be a separate decision. The curation queue is different: its open rows always mirror the current fleet, and an empty title list (see below) empties it; only each row's first-queued time is lost, because the rows are rebuilt as titles return.
 - **Titles that are too long.** A title whose name, publisher and ecosystem together exceed 2,400 bytes is left out of the title list, and so is never normalised or queued; this is far beyond any real software name and exists so that one malformed report cannot stop the whole catalogue refresh. Each catalogue refresh that leaves such titles out writes one warning to the server log with their count.
-- **Where to look.** There is no REST route, MCP tool or page for this yet, and install-level normalisation status is not recorded. To inspect the results, query the Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and read the metrics below.
+- **Where to look.** `GET /api/v1/inventory/software/normalization/status` gives the pack version and the title and queue counts, and `GET .../queue` lists the titles waiting for curation, most-installed first (see [REST API](rest-api.md#software-normalisation-curation)). There is no MCP tool or page for this yet (the MCP twin is a recorded ADR-1005 exception, revisit by 2026-12-31). The Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and the metrics below, remain available.
 - **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no publisher (`git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
 - **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
 - **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
@@ -1207,6 +1324,9 @@ sync, defeating the hash-skip protocol.
   chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
+  Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
+  not read; storage topology is planned everywhere), and the stored sections are not yet
+  shown in the Hardware pages or API.
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
@@ -1239,6 +1359,8 @@ sync, defeating the hash-skip protocol.
   record would be too large); `server_cap:<n>` is the server's own cap. Sections fail
   independently: one section being unavailable never stops the others, or the base device
   fields, from being reported.
+
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and are not yet shown on the Hardware pages or returned by the REST or MCP device-record endpoints.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its

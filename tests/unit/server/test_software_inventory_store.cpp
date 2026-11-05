@@ -7,11 +7,14 @@
 
 #include "agent.pb.h"
 #include "crypto_library_model.hpp"
+#include "install_type_rules.hpp"
 #include "inventory_ingestion.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "product_normalize.hpp"
+#include "purl_compose.hpp"
 #include "software_catalog_rules.hpp"
 #include "software_inventory_store.hpp"
 
@@ -27,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
@@ -110,7 +114,7 @@ void swinv_reset() {
         "TRUNCATE software_inventory_store.installed_software, "
         "software_inventory_store.inventory_state, software_inventory_store.catalog_rollup, "
         "software_inventory_store.version_rollup, software_inventory_store.catalog_rollup_meta, "
-        "software_inventory_store.title_triples "
+        "software_inventory_store.title_triples, software_inventory_store.software_facet_state "
         "RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
@@ -172,8 +176,9 @@ SoftwareEntry full_v2_entry() {
     return e;
 }
 
-// full_v2_entry() plus the stored extended-tail fields. Wire slots 13-14 (install_location,
-// uninstall_string) are reserved and have no member: the server never stores or hashes them.
+// full_v2_entry() plus the stored extended-tail fields. Wire slot 14 (uninstall_string) is
+// reserved and has no member; slot 13 (install_location) is a member only the v3 `+` record
+// fills, so the v2 path neither stores nor hashes either.
 SoftwareEntry full_extended_entry() {
     SoftwareEntry e = full_v2_entry();
     e.package_id = "bash-5.2.21-3.fc40.x86_64";
@@ -703,9 +708,11 @@ TEST_CASE("blob contract extended tail: a 17th token is dropped, the 16 fields s
 
 TEST_CASE("blob contract extended tail: slots 13-14 are parsed but neither stored nor hashed",
           "[pg][software_inventory][extended_row]") {
-    // ADR-0016 section 8 has not been re-opened for install_location / uninstall_string
-    // (#5186), so a value an agent sends in those slots must not reach the database or the
-    // hash. An agent that does fill them gets need_full until the server accepts them.
+    // On the v2 path ADR-0016 section 8 has not been re-opened for install_location /
+    // uninstall_string (#5186), so a value an agent sends in those slots must not reach the
+    // database or the hash. An agent that does fill them gets need_full until the server
+    // accepts them. (The v3 `+` record stores slot 13 in the install_location column that
+    // migration v10 added; this v2 path never writes it, which is what the checks below pin.)
     SWINV_SHARED(store, pool);
     const SoftwareEntry e = full_extended_entry();
     const std::string path = "/Users/alice/Applications/Bash";
@@ -725,7 +732,8 @@ TEST_CASE("blob contract extended tail: slots 13-14 are parsed but neither store
     CHECK((*got)[0].source == e.source);
     CHECK(SoftwareInventoryStore::canonical_hash(*got) == kCrossPinHashExtended);
 
-    // No value reaches storage: the schema has no such columns, and no stored text holds them.
+    // No value reaches storage: there is no uninstall_string column, install_location is
+    // empty on this path, and no stored text holds either value.
     {
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
@@ -733,10 +741,17 @@ TEST_CASE("blob contract extended tail: slots 13-14 are parsed but neither store
             lease.get(),
             "SELECT count(*) FROM information_schema.columns "
             "WHERE table_schema = 'software_inventory_store' "
-            "AND column_name IN ('install_location', 'uninstall_string')",
+            "AND column_name = 'uninstall_string'",
             std::vector<std::string>{});
         REQUIRE(cols.status() == PGRES_TUPLES_OK);
         CHECK(std::string(PQgetvalue(cols.get(), 0, 0)) == "0");
+        pg::PgResult loc =
+            pg::exec_params(lease.get(),
+                            "SELECT count(*) FROM software_inventory_store.installed_software "
+                            "WHERE agent_id = 'agent-reserved' AND install_location <> ''",
+                            std::vector<std::string>{});
+        REQUIRE(loc.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(loc.get(), 0, 0)) == "0");
         // Positive control: the same catalog query does see this table's real columns, so the
         // zero above is not a vacuous result from a wrong schema or table name.
         pg::PgResult present = pg::exec_params(
@@ -1151,7 +1166,8 @@ TEST_CASE("SoftwareInventoryStore reports !is_open when any column its queries u
     }
     // A catalog read that returned only part of the schema would pass vacuously; name the tables.
     for (const char* table : {"installed_software", "inventory_state", "catalog_rollup",
-                              "version_rollup", "title_triples", "catalog_rollup_meta"}) {
+                              "version_rollup", "title_triples", "catalog_rollup_meta",
+                              "software_facet_state"}) {
         CAPTURE(table);
         REQUIRE(std::any_of(columns.begin(), columns.end(),
                             [&](const auto& c) { return c.first == table; }));
@@ -1791,6 +1807,65 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     auto other = store.get_agent_software("agent-never-existed");
     REQUIRE(other.has_value());
     CHECK(other->empty());
+}
+
+namespace {
+// Holds the per-agent ingest advisory lock on its own pooled connection until destroyed (an
+// in-flight ingest on another replica).
+struct HeldIngestLock {
+    PgPool::Lease lease;
+    HeldIngestLock(PgPool& pool, const std::string& agent) : lease(pool.acquire()) {
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(
+                    lease.get(),
+                    "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || "
+                    "$1, 0))",
+                    std::vector<std::string>{agent})
+                    .status() == PGRES_TUPLES_OK);
+    }
+    void release() {
+        if (!std::exchange(held_, false))
+            return;
+        pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
+    }
+    ~HeldIngestLock() { release(); }
+
+private:
+    bool held_{true};
+};
+} // namespace
+
+TEST_CASE("delete_agent waits on the per-agent ingest lock, gives up inside its bound, and erases "
+          "once the lock is free",
+          "[pg][software_inventory]") {
+    // Without the lock, delete_agent would commit straight past an in-flight ingest and the
+    // ingest's rows would resurrect the device afterwards (a ghost). Held lock => the delete
+    // cannot commit and nothing is erased; released => it erases.
+    SWINV_SHARED(store, pool);
+
+    const std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"},
+                                             {"Firefox", "120", "Mozilla", ""}};
+    REQUIRE(store.apply_installed_software("agent-lock",
+                                           SoftwareInventoryStore::canonical_hash(rows), rows,
+                                           1000) == InventoryIngestOutcome::kStored);
+
+    HeldIngestLock held(pool, "agent-lock");
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(store.delete_agent("agent-lock")); // lock_timeout, not an unbounded wait
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(9));
+    {
+        auto during = store.get_agent_software("agent-lock");
+        REQUIRE(during.has_value());
+        CHECK(during->size() == 2); // the failed delete rolled back: rows intact
+    }
+
+    held.release();
+    CHECK(store.delete_agent("agent-lock"));
+    auto after = store.get_agent_software("agent-lock");
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
 }
 
 TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][software_inventory]") {
@@ -4246,4 +4321,1323 @@ TEST_CASE("name-pattern reads: a deny-all scope is an empty value with no SQL; a
     q.agent_ids = std::nullopt;
     CHECK_FALSE(broken.software_name_pattern_rollup(q).has_value());
     CHECK_FALSE(broken.software_name_pattern_devices(dq).has_value());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Blob v3 + migration v10 (ADR-0016 Update 2026-11-04)
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using yuzu::server::V3Refusal;
+using yuzu::server::V3Report;
+using yuzu::server::V3Section;
+using yuzu::server::V3SectionOutcome;
+using yuzu::server::V3Status;
+using SqlTable = std::vector<std::vector<std::string>>;
+
+constexpr const char* kV3Apps = "installed_apps.list_inventory";
+constexpr const char* kV3Pkgs = "pkg_inventory.packages";
+constexpr const char* kV3Py = "runtimes.python";
+constexpr const char* kV3Comp = "component_inventory";
+
+// SHA-256 of the empty byte string: the section hash of an honest-empty full section.
+constexpr const char* kEmptySectionHash =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+SqlTable sql_rows(PgPool& pool, const std::string& sql,
+                  const std::vector<std::string>& params = {}) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    SqlTable t;
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
+        std::vector<std::string> row;
+        for (int j = 0; j < PQnfields(r.get()); ++j)
+            row.emplace_back(PQgetvalue(r.get(), i, j));
+        t.push_back(std::move(row));
+    }
+    return t;
+}
+
+// True iff the statement succeeded (a refusal such as a CHECK or unique violation is false).
+bool sql_ok(PgPool& pool, const std::string& sql, const std::vector<std::string>& params = {}) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
+    return r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK;
+}
+
+SoftwareEntry v3_entry(const std::string& name, const std::string& source,
+                       const std::string& version = "1.0", const std::string& location = "") {
+    SoftwareEntry e;
+    e.name = name;
+    e.version = version;
+    e.publisher = "Pub";
+    e.install_date = "2026-01-01";
+    e.kind = "app";
+    e.ecosystem = "windows";
+    e.arch = "x64";
+    e.install_location = location;
+    e.package_id = "pkg-" + name;
+    e.source = source;
+    return e;
+}
+
+V3Section v3_full(const std::string& facet, std::vector<SoftwareEntry> rows) {
+    V3Section s;
+    s.facet = facet;
+    s.status = V3Status::kFull;
+    s.rows = std::move(rows);
+    s.duration_ms = 11;
+    s.bytes_read = 22;
+    return s;
+}
+
+V3Section v3_status(const std::string& facet, V3Status st, const std::string& token = "") {
+    V3Section s;
+    s.facet = facet;
+    s.status = st;
+    s.token = token;
+    s.duration_ms = 5;
+    s.bytes_read = 6;
+    return s;
+}
+
+V3Report v3_report(std::vector<V3Section> sections) {
+    V3Report r;
+    r.sections = std::move(sections);
+    return r;
+}
+
+std::vector<std::string> names_of(PgPool& pool, const std::string& agent,
+                                  const std::string& source) {
+    std::vector<std::string> out;
+    for (const auto& row : sql_rows(pool,
+                                    "SELECT name FROM software_inventory_store.installed_software "
+                                    "WHERE agent_id = $1 AND source = $2 ORDER BY name",
+                                    {agent, source}))
+        out.push_back(row[0]);
+    return out;
+}
+
+std::string row_count(PgPool& pool, const std::string& agent) {
+    return sql_rows(pool,
+                    "SELECT count(*) FROM software_inventory_store.installed_software "
+                    "WHERE agent_id = $1",
+                    {agent})[0][0];
+}
+
+std::string facet_count(PgPool& pool, const std::string& agent) {
+    return sql_rows(pool,
+                    "SELECT count(*) FROM software_inventory_store.software_facet_state "
+                    "WHERE agent_id = $1",
+                    {agent})[0][0];
+}
+
+std::string stored_hash(PgPool& pool, const std::string& agent) {
+    const auto t = sql_rows(pool,
+                            "SELECT content_hash FROM software_inventory_store.inventory_state "
+                            "WHERE agent_id = $1 AND source = 'installed_software'",
+                            {agent});
+    return t.empty() ? std::string("<no row>") : t[0][0];
+}
+
+std::string section_hash_of(const std::vector<SoftwareEntry>& rows) {
+    return SoftwareInventoryStore::canonical_section_hash(rows);
+}
+
+// Wire builders (ingest-level cases drive the real seam with real bytes).
+std::string w_rec(std::initializer_list<std::string> fields) {
+    std::string out;
+    bool first = true;
+    for (const auto& f : fields) {
+        if (!first)
+            out += '\x1f';
+        out += f;
+        first = false;
+    }
+    return out + '\x1e';
+}
+std::string w_hdr() {
+    return "\037v3\036";
+}
+std::string w_sec(const std::string& facet, const std::string& status, const std::string& base = "",
+                  const std::string& token = "", const std::string& dur = "0",
+                  const std::string& bytes = "0") {
+    return w_rec({"S", facet, status, base, token, dur, bytes});
+}
+// A `+` record matching v3_entry(name, source, "1.0", loc) slot for slot (slot 14 empty).
+std::string w_plus(const std::string& name, const std::string& source,
+                   const std::string& loc = "") {
+    return w_rec({"+", name, "1.0", "Pub", "2026-01-01", "app", "windows", "", "", "x64", "", "",
+                  "", loc, "", "pkg-" + name, source});
+}
+
+} // namespace
+
+TEST_CASE("derive_install_keys: type, scope, identity key and instance key",
+          "[software_inventory][v3][keys]") {
+    SoftwareEntry a = v3_entry("Alpha", kV3Apps, "1.0", "C:\\Program Files\\Alpha\\");
+    SoftwareInventoryStore::derive_install_keys(a);
+    CHECK(a.install_type == "installer");
+    CHECK(a.install_scope == "machine");
+    // identity_key: norm_key(name, publisher) US version US arch US location_norm (lower-cased,
+    // trailing separators stripped).
+    CHECK(a.identity_key == yuzu::server::norm_key("Alpha", "Pub") + '\x1f' + "1.0" + '\x1f' +
+                                "x64" + '\x1f' + "c:\\program files\\alpha");
+    // instance_key is the SHA-256 of the row's single canonical record, i.e. the section hash
+    // of a one-row section (and the value a `-` record would name).
+    CHECK(a.instance_key ==
+          section_hash_of({v3_entry("Alpha", kV3Apps, "1.0", "C:\\Program Files\\Alpha\\")}));
+    CHECK(a.instance_key.size() == 64);
+
+    // The location's case and trailing separators do not move identity_key; they DO move
+    // instance_key (the stored location is part of the row).
+    SoftwareEntry b = v3_entry("Alpha", kV3Apps, "1.0", "c:\\PROGRAM FILES\\alpha");
+    SoftwareInventoryStore::derive_install_keys(b);
+    CHECK(b.identity_key == a.identity_key);
+    CHECK(b.instance_key != a.instance_key);
+    SoftwareEntry c = v3_entry("Alpha", kV3Apps, "1.0", "/opt/alpha///");
+    SoftwareInventoryStore::derive_install_keys(c);
+    CHECK(c.identity_key.ends_with(std::string(1, '\x1f') + "/opt/alpha"));
+
+    // A different version or arch is a different identity.
+    SoftwareEntry d = v3_entry("Alpha", kV3Apps, "2.0", "C:\\Program Files\\Alpha\\");
+    SoftwareInventoryStore::derive_install_keys(d);
+    CHECK(d.identity_key != a.identity_key);
+
+    // Deriving twice is stable, and the derived columns never enter the v2 canonical hash.
+    SoftwareEntry a2 = a;
+    SoftwareInventoryStore::derive_install_keys(a2);
+    CHECK(a2.identity_key == a.identity_key);
+    CHECK(a2.instance_key == a.instance_key);
+    SoftwareEntry ext = full_extended_entry();
+    SoftwareInventoryStore::derive_install_keys(ext);
+    // An rpm row stamped installed_apps.list_inventory is package_manager, like the same row
+    // from a pre-tail agent (empty source).
+    CHECK(ext.install_type == "package_manager");
+    CHECK(SoftwareInventoryStore::canonical_hash({ext}) == kCrossPinHashExtended);
+
+    // A pre-tail (v2, empty source) row falls back by ecosystem; an unknown one is not derived.
+    SoftwareEntry rpm = full_v2_entry();
+    SoftwareInventoryStore::derive_install_keys(rpm);
+    CHECK(rpm.install_type == "package_manager");
+    SoftwareEntry odd;
+    odd.name = "x";
+    SoftwareInventoryStore::derive_install_keys(odd);
+    CHECK(odd.install_type.empty());
+    CHECK(odd.install_scope == "machine");
+}
+
+TEST_CASE("canonical_section_hash is order and duplicate independent, 16 slots always, pinned",
+          "[software_inventory][v3][hash]") {
+    // Recipe for the pins (raw wire bytes, slot 14 empty, 0x1F-joined, 0x1E-terminated):
+    //   printf
+    //   'Alpha\0371.0\037Pub\0372026-01-01\037app\037windows\037\037\037x64\037\037\037\037C:\\Program
+    //   Files\\Alpha\037\037pkg-a\037installed_apps.list_inventory\036' | shasum -a 256
+    SoftwareEntry a;
+    a.name = "Alpha";
+    a.version = "1.0";
+    a.publisher = "Pub";
+    a.install_date = "2026-01-01";
+    a.kind = "app";
+    a.ecosystem = "windows";
+    a.arch = "x64";
+    a.install_location = "C:\\Program Files\\Alpha";
+    a.package_id = "pkg-a";
+    a.source = kV3Apps;
+    SoftwareEntry b;
+    b.name = "Beta";
+    b.version = "2";
+    b.kind = "app";
+    b.ecosystem = "windows";
+    b.source = kV3Apps;
+
+    CHECK(SoftwareInventoryStore::canonical_section_hash({a}) ==
+          "c573935d6af97c9deaef2b526cb01a3dabc2d3958b7e69b289968a6e80dbf229");
+    // Unsorted input with a duplicate hashes to the sorted, de-duplicated bytes.
+    CHECK(SoftwareInventoryStore::canonical_section_hash({b, a, a}) ==
+          "4f5f399d1a8f2cb7e94eee0487cf6dbb86b2bcdbb7b266fbc2869bd92b338fdd");
+    CHECK(SoftwareInventoryStore::canonical_section_hash({}) == kEmptySectionHash);
+
+    // Every stored field, install_location included, moves the hash; no conditional tail: a
+    // row with an empty package_id and source still writes all 16 slots, so it differs from
+    // the same row with only the tail changed.
+    const auto base = SoftwareInventoryStore::canonical_section_hash({a});
+    for (auto field : {&SoftwareEntry::install_location, &SoftwareEntry::package_id,
+                       &SoftwareEntry::source, &SoftwareEntry::distro_version}) {
+        SoftwareEntry other = a;
+        other.*field = "zz";
+        CHECK(SoftwareInventoryStore::canonical_section_hash({other}) != base);
+    }
+    SoftwareEntry bare = a;
+    bare.package_id.clear();
+    bare.source.clear();
+    CHECK(SoftwareInventoryStore::canonical_section_hash({bare}) != base);
+    // The server-derived columns never enter it.
+    SoftwareEntry derived = a;
+    SoftwareInventoryStore::derive_install_keys(derived);
+    CHECK(SoftwareInventoryStore::canonical_section_hash({derived}) == base);
+}
+
+TEST_CASE("v3_report_hash sorts by facet in byte order, carries the v3: prefix, pinned",
+          "[software_inventory][v3][hash]") {
+    const std::string pa(64, 'a');
+    const std::string pb(64, 'b');
+    //   printf 'installed_apps.list_inventory\037<64 b>\036runtimes.python\037<64 a>\036' | shasum
+    //   -a 256
+    const std::string expect =
+        "v3:ca5bfc4023f484d758323b20edec5362f2d927476067c0c6f31eef389bac4878";
+    CHECK(SoftwareInventoryStore::v3_report_hash({{kV3Py, pa}, {kV3Apps, pb}}) == expect);
+    CHECK(SoftwareInventoryStore::v3_report_hash({{kV3Apps, pb}, {kV3Py, pa}}) == expect);
+    CHECK(SoftwareInventoryStore::v3_report_hash({{kV3Apps, pb}}) ==
+          "v3:2026549037aa0802ef3b58c555d0919e8d0f240a8987c88428bfd45e1f06ff60");
+    // Byte order, not locale: an upper-case-leading or underscore facet sorts by raw bytes.
+    CHECK(SoftwareInventoryStore::v3_report_hash({{"b", pa}, {"B", pb}}) ==
+          SoftwareInventoryStore::v3_report_hash({{"B", pb}, {"b", pa}}));
+    // A v2 hash is plain hex: the prefix keeps the two families apart.
+    CHECK(SoftwareInventoryStore::v3_report_hash({}).starts_with("v3:"));
+    CHECK(SoftwareInventoryStore::canonical_hash({}).find("v3:") == std::string::npos);
+}
+
+TEST_CASE("migration v10 adds the v3 columns, checks, partial unique index and facet table over "
+          "live rows and re-runs idempotently",
+          "[pg][software_inventory][v3]") {
+    // Reproduce a v9-era schema: drop the v10 additions, seed legacy rows, rewind schema_meta to
+    // 9, reconstruct so v10 re-adds them over live data. Then rewind again and reconstruct to
+    // prove the migration text is idempotent.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    const auto rewind = [&] {
+        REQUIRE(sql_ok(pool, "UPDATE public.schema_meta SET version = 9 "
+                             "WHERE store = 'software_inventory_store'"));
+    };
+    REQUIRE(sql_ok(pool, "DROP TABLE software_inventory_store.software_facet_state"));
+    REQUIRE(sql_ok(pool, "ALTER TABLE software_inventory_store.installed_software "
+                         "DROP COLUMN install_type, DROP COLUMN install_scope, "
+                         "DROP COLUMN install_location, DROP COLUMN identity_key, "
+                         "DROP COLUMN instance_key, DROP COLUMN purl"));
+    for (const char* v : {"1.0", "2.0"}) {
+        REQUIRE(sql_ok(pool,
+                       "INSERT INTO software_inventory_store.installed_software "
+                       "(agent_id, name, version) VALUES ('agent-legacy', 'OldApp', $1)",
+                       {v}));
+    }
+    rewind();
+    SoftwareInventoryStore store{pool}; // re-runs v10 over the live rows
+    REQUIRE(store.is_open());
+
+    // The legacy rows read the documented "not derived" values.
+    const auto legacy = sql_rows(
+        pool, "SELECT install_type, install_scope, install_location, identity_key, instance_key "
+              "FROM software_inventory_store.installed_software WHERE agent_id = 'agent-legacy'");
+    REQUIRE(legacy.size() == 2);
+    for (const auto& row : legacy) {
+        CHECK(row[0] == "");
+        CHECK(row[1] == "machine");
+        CHECK(row[2] == "");
+        CHECK(row[3] == "");
+        CHECK(row[4] == "");
+    }
+    for (const auto& row : sql_rows(pool, "SELECT purl FROM "
+                                          "software_inventory_store.installed_software "
+                                          "WHERE agent_id = 'agent-legacy'")) {
+        CHECK(row[0] == "");
+    }
+
+    const auto verify_shape = [&] {
+        // Both CHECKs exist and are NOT VALID (no scan of existing rows).
+        const auto checks = sql_rows(
+            pool, "SELECT conname, convalidated::text FROM pg_constraint "
+                  "WHERE conrelid = 'software_inventory_store.installed_software'::regclass "
+                  "AND contype = 'c' ORDER BY conname");
+        REQUIRE(checks.size() == 2);
+        CHECK(checks[0][0] == "installed_software_install_scope_chk");
+        CHECK(checks[0][1] == "false");
+        CHECK(checks[1][0] == "installed_software_install_type_chk");
+        CHECK(checks[1][1] == "false");
+        // The unique index is partial: pre-v10 rows (instance_key '') are outside it.
+        const auto idx = sql_rows(
+            pool, "SELECT indexdef FROM pg_indexes WHERE schemaname = 'software_inventory_store' "
+                  "AND indexname = 'installed_software_instance_idx'");
+        REQUIRE(idx.size() == 1);
+        CHECK(idx[0][0].find("UNIQUE") != std::string::npos);
+        CHECK(idx[0][0].find("(agent_id, instance_key)") != std::string::npos);
+        CHECK(idx[0][0].find("WHERE") != std::string::npos);
+        // The purl index is a partial btree: rows without a purl hold no entry.
+        const auto pidx = sql_rows(
+            pool, "SELECT indexdef FROM pg_indexes WHERE schemaname = 'software_inventory_store' "
+                  "AND indexname = 'installed_software_purl_idx'");
+        REQUIRE(pidx.size() == 1);
+        CHECK(pidx[0][0].find("UNIQUE") == std::string::npos);
+        CHECK(pidx[0][0].find("(purl)") != std::string::npos);
+        CHECK(pidx[0][0].find("WHERE") != std::string::npos);
+        // The facet table has the contracted columns.
+        const auto cols = sql_rows(pool, "SELECT column_name FROM information_schema.columns "
+                                         "WHERE table_schema = 'software_inventory_store' AND "
+                                         "table_name = 'software_facet_state' "
+                                         "ORDER BY ordinal_position");
+        const std::vector<std::string> want = {"agent_id",
+                                               "facet",
+                                               "status",
+                                               "token",
+                                               "section_hash",
+                                               "enabled",
+                                               "last_confirmed_at",
+                                               "duration_ms",
+                                               "bytes_read",
+                                               "updated_at"};
+        REQUIRE(cols.size() == want.size());
+        for (std::size_t i = 0; i < want.size(); ++i)
+            CHECK(cols[i][0] == want[i]);
+    };
+    verify_shape();
+
+    // The index enforces uniqueness for derived keys only.
+    const std::string ins = "INSERT INTO software_inventory_store.installed_software "
+                            "(agent_id, name, instance_key) VALUES ($1, $2, $3)";
+    CHECK(sql_ok(pool, ins, {"agent-k", "A", "key-1"}));
+    CHECK_FALSE(sql_ok(pool, ins, {"agent-k", "B", "key-1"})); // same agent, same key
+    CHECK(sql_ok(pool, ins, {"agent-other", "A", "key-1"}));   // another agent may share it
+    CHECK(sql_ok(pool, ins, {"agent-k", "C", ""}));            // '' is outside the index
+    CHECK(sql_ok(pool, ins, {"agent-k", "D", ""}));
+
+    rewind();
+    SoftwareInventoryStore again{pool}; // second run over an already-migrated table
+    CHECK(again.is_open());
+    verify_shape();
+}
+
+TEST_CASE("install_type and install_scope CHECKs admit exactly the vocabulary and ''",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const std::string ins =
+        "INSERT INTO software_inventory_store.installed_software "
+        "(agent_id, name, install_type, install_scope) VALUES ('agent-chk', $1, $2, $3)";
+    // The frozen CHECK list in migration v10 and kInstallTypes are one vocabulary.
+    for (const auto t : yuzu::server::kInstallTypes) {
+        CAPTURE(t);
+        CHECK(sql_ok(pool, ins, {std::string("n-") + std::string(t), std::string(t), "machine"}));
+    }
+    CHECK(sql_ok(pool, ins, {"n-empty", "", "machine"})); // "not yet derived"
+    CHECK(sql_ok(pool, ins, {"n-user", "installer", "user"}));
+    CHECK_FALSE(sql_ok(pool, ins, {"n-bogus", "bogus", "machine"}));
+    // A plausible type nothing derives yet: the CHECK is the vocabulary, not "any word that fits".
+    CHECK_FALSE(sql_ok(pool, ins, {"n-portable", "portable", "machine"}));
+    CHECK_FALSE(sql_ok(pool, ins, {"n-case", "Installer", "machine"}));
+    CHECK_FALSE(sql_ok(pool, ins, {"n-scope", "installer", "global"}));
+    CHECK_FALSE(sql_ok(pool, ins, {"n-scope-empty", "installer", ""}));
+}
+
+TEST_CASE("v2 ingest stamps the derived keys; one MSI product listed twice stores both rows",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    // The same product through msi_packages AND installed_apps (ADR-0016 Update 2026-10-17: not
+    // de-duplicated). Identical name/version/publisher/arch, different ecosystem/kind/source.
+    SoftwareEntry msi;
+    msi.name = "Acme Tool";
+    msi.version = "1.0";
+    msi.publisher = "Acme";
+    msi.kind = "pkg";
+    msi.ecosystem = "msi";
+    msi.package_id = "{11111111-2222-3333-4444-555555555555}";
+    msi.source = "msi_packages.list_inventory";
+    SoftwareEntry apps = msi;
+    apps.kind = "app";
+    apps.ecosystem = "windows";
+    apps.package_id.clear();
+    apps.source = kV3Apps;
+    SoftwareEntry legacy = full_v2_entry(); // pre-tail agent: empty source
+    const std::vector<SoftwareEntry> rows = {apps, msi, apps /* exact duplicate */, legacy};
+
+    REQUIRE(store.apply_installed_software("agent-msi",
+                                           SoftwareInventoryStore::canonical_hash(rows), rows,
+                                           1000) == InventoryIngestOutcome::kStored);
+    const auto t = sql_rows(
+        pool, "SELECT source, install_type, install_scope, install_location, "
+              "identity_key, instance_key FROM software_inventory_store.installed_software "
+              "WHERE agent_id = 'agent-msi' ORDER BY ecosystem, source");
+    REQUIRE(t.size() == 3); // the exact duplicate collapsed, the MSI twin did not
+    std::set<std::string> instance_keys;
+    for (const auto& r : t) {
+        CHECK(r[2] == "machine");
+        CHECK(r[3] == "");
+        CHECK(r[4].find('\x1f') != std::string::npos); // identity_key is populated
+        CHECK(r[5].size() == 64);
+        instance_keys.insert(r[5]);
+    }
+    CHECK(instance_keys.size() == 3);
+    // ORDER BY ecosystem: msi, rpm, windows
+    CHECK(t[0][0] == "msi_packages.list_inventory");
+    CHECK(t[0][1] == "msi");
+    CHECK(t[1][0] == "");
+    CHECK(t[1][1] == "package_manager"); // empty source -> ecosystem rpm
+    CHECK(t[2][0] == kV3Apps);
+    CHECK(t[2][1] == "installer");
+    // The two MSI-product rows share an identity (R4's future consolidation key) but not an
+    // instance.
+    CHECK(t[0][4] == t[2][4]);
+    CHECK(t[0][5] != t[2][5]);
+
+    // The v2 hash bytes are untouched by any of it.
+    CHECK(stored_hash(pool, "agent-msi") == SoftwareInventoryStore::canonical_hash(rows));
+    CHECK(facet_count(pool, "agent-msi") == "0");
+}
+
+TEST_CASE("v3: a full section replaces only its own facet and records its facet state",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps, "1.0", "C:\\Apps\\Alpha");
+    const auto a2 = v3_entry("Beta", kV3Apps);
+    const auto p1 = v3_entry("libfoo", kV3Pkgs);
+
+    auto res = store.apply_installed_software_v3(
+        "agent-v3", v3_report({v3_full(kV3Apps, {a2, a1}), v3_full(kV3Pkgs, {p1})}));
+    REQUIRE(res.size() == 2);
+    CHECK(res[0].facet == kV3Apps);
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(res[1].facet == kV3Pkgs);
+    CHECK(res[1].outcome == V3SectionOutcome::kStored);
+    CHECK(names_of(pool, "agent-v3", kV3Apps) == std::vector<std::string>{"Alpha", "Beta"});
+    CHECK(names_of(pool, "agent-v3", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+
+    // Derived columns and the stored location landed.
+    SoftwareEntry expect_alpha = a1;
+    SoftwareInventoryStore::derive_install_keys(expect_alpha);
+    const auto keyed = sql_rows(pool, "SELECT install_type, install_scope, install_location, "
+                                      "identity_key, instance_key FROM "
+                                      "software_inventory_store.installed_software "
+                                      "WHERE agent_id = 'agent-v3' AND name = 'Alpha'");
+    REQUIRE(keyed.size() == 1);
+    CHECK(keyed[0][0] == "installer");
+    CHECK(keyed[0][1] == "machine");
+    CHECK(keyed[0][2] == "C:\\Apps\\Alpha");
+    CHECK(keyed[0][3] == expect_alpha.identity_key);
+    CHECK(keyed[0][4] == expect_alpha.instance_key);
+
+    // Facet state: status, token, the recomputed section hash, a confirmation time.
+    const auto fs = sql_rows(pool, "SELECT facet, status, token, section_hash, enabled::text, "
+                                   "duration_ms, bytes_read, (last_confirmed_at > 0)::text, "
+                                   "(updated_at > 0)::text FROM "
+                                   "software_inventory_store.software_facet_state "
+                                   "WHERE agent_id = 'agent-v3' ORDER BY facet");
+    REQUIRE(fs.size() == 2);
+    const std::vector<std::string> apps_state = {
+        kV3Apps, "full", "", section_hash_of({a1, a2}), "true", "11", "22", "true", "true"};
+    CHECK(fs[0] == apps_state);
+    CHECK(fs[1][0] == kV3Pkgs);
+    CHECK(fs[1][3] == section_hash_of({p1}));
+
+    // The stored report hash is the v3 aggregate; hash-only claims match it, nothing else.
+    const std::string h_apps = section_hash_of({a1, a2});
+    const std::string h_pkgs = section_hash_of({p1});
+    const std::string agg =
+        SoftwareInventoryStore::v3_report_hash({{kV3Pkgs, h_pkgs}, {kV3Apps, h_apps}});
+    CHECK(agg.starts_with("v3:"));
+    CHECK(stored_hash(pool, "agent-v3") == agg);
+    CHECK(store.apply_installed_software("agent-v3", agg, std::nullopt, 0) ==
+          InventoryIngestOutcome::kTouched);
+    CHECK(store.apply_installed_software("agent-v3", "v3:" + std::string(64, '0'), std::nullopt,
+                                         0) == InventoryIngestOutcome::kNeedFull);
+    // A v2 (plain hex) claim never matches a v3 state, even one built from the same rows.
+    CHECK(store.apply_installed_software("agent-v3",
+                                         SoftwareInventoryStore::canonical_hash({a1, a2, p1}),
+                                         std::nullopt, 0) == InventoryIngestOutcome::kNeedFull);
+
+    // A second call carrying ONLY the apps facet replaces it and leaves the packages alone.
+    const auto a3 = v3_entry("Gamma", kV3Apps);
+    res = store.apply_installed_software_v3("agent-v3", v3_report({v3_full(kV3Apps, {a3})}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(names_of(pool, "agent-v3", kV3Apps) == std::vector<std::string>{"Gamma"});
+    CHECK(names_of(pool, "agent-v3", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+    CHECK(stored_hash(pool, "agent-v3") ==
+          SoftwareInventoryStore::v3_report_hash(
+              {{kV3Pkgs, h_pkgs}, {kV3Apps, section_hash_of({a3})}}));
+
+    // An honest-empty full section deletes the facet's rows (and only those).
+    res = store.apply_installed_software_v3("agent-v3", v3_report({v3_full(kV3Apps, {})}));
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(names_of(pool, "agent-v3", kV3Apps).empty());
+    CHECK(names_of(pool, "agent-v3", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+    CHECK(sql_rows(pool,
+                   "SELECT section_hash FROM software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-v3' AND facet = $1",
+                   {kV3Apps})[0][0] == kEmptySectionHash);
+
+    // Rows a section sends twice collapse; the section hash is over the de-duplicated set.
+    res =
+        store.apply_installed_software_v3("agent-v3", v3_report({v3_full(kV3Apps, {a1, a1, a2})}));
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(names_of(pool, "agent-v3", kV3Apps) == std::vector<std::string>{"Alpha", "Beta"});
+    CHECK(sql_rows(pool,
+                   "SELECT section_hash FROM software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-v3' AND facet = $1",
+                   {kV3Apps})[0][0] == h_apps);
+}
+
+namespace {
+
+SoftwareEntry v3_linux(const std::string& name, const std::string& ecosystem,
+                       const std::string& version, const std::string& release,
+                       const std::string& source = kV3Apps) {
+    SoftwareEntry e;
+    e.name = name;
+    e.version = version;
+    e.release = release;
+    e.kind = "package";
+    e.ecosystem = ecosystem;
+    e.arch = "amd64";
+    e.distro_id = "debian";
+    e.distro_version = "12";
+    e.source = source;
+    return e;
+}
+
+std::string purl_of(PgPool& pool, const std::string& agent, const std::string& name) {
+    const auto t = sql_rows(pool,
+                            "SELECT purl FROM software_inventory_store.installed_software "
+                            "WHERE agent_id = $1 AND name = $2",
+                            {agent, name});
+    return t.size() == 1 ? t[0][0] : std::string("<" + std::to_string(t.size()) + " rows>");
+}
+
+} // namespace
+
+TEST_CASE("v3: a full section stores the composed purl; no-type ecosystems and v2 rows store ''",
+          "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    const auto deb = v3_linux("Curl", "deb", "7.88.1", "10");
+    const auto win = v3_entry("Alpha", kV3Apps); // ecosystem windows: no registered purl type
+    auto brew = v3_entry("sqlite", kV3Pkgs, "3.43.2");
+    brew.ecosystem = "brew";
+    brew.kind = "pkg";
+
+    const auto res = store.apply_installed_software_v3(
+        "agent-purl", v3_report({v3_full(kV3Apps, {deb, win}), v3_full(kV3Pkgs, {brew})}));
+    REQUIRE(res.size() == 2);
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-purl", "Curl") ==
+          "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12");
+    CHECK(purl_of(pool, "agent-purl", "Alpha") == "");
+    CHECK(purl_of(pool, "agent-purl", "sqlite") == "pkg:brew/sqlite@3.43.2");
+
+    // The stored purl is exactly what the pure composer returns for the stored row, and it is
+    // in neither hash: the section hash is the same with the purl field cleared or set.
+    CHECK(purl_of(pool, "agent-purl", "Curl") == compose_purl(deb));
+    auto with_purl = deb;
+    with_purl.purl = "pkg:deb/other/other@0";
+    CHECK(section_hash_of({with_purl}) == section_hash_of({deb}));
+
+    // A v2 report leaves the purl empty (the same coexistence rule as install_location).
+    const std::vector<SoftwareEntry> v2rows = {deb};
+    REQUIRE(store.apply_installed_software("agent-v2purl",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+    CHECK(purl_of(pool, "agent-v2purl", "Curl") == "");
+
+    // The device's first v3 report fills it in.
+    REQUIRE(store.apply_installed_software_v3("agent-v2purl",
+                                              v3_report({v3_full(kV3Apps, {deb})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-v2purl", "Curl") ==
+          "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12");
+}
+
+TEST_CASE("v3: a re-report with a changed version replaces the purl", "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    REQUIRE(store.apply_installed_software_v3(
+                "agent-purl-up", v3_report({v3_full(kV3Apps, {v3_linux("curl", "deb", "7.88.1", "10")})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-purl-up", "curl") ==
+          "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12");
+    REQUIRE(store.apply_installed_software_v3(
+                "agent-purl-up", v3_report({v3_full(kV3Apps, {v3_linux("curl", "deb", "7.88.1", "11")})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-purl-up", "curl") ==
+          "pkg:deb/debian/curl@7.88.1-11?arch=amd64&distro=debian-12");
+    CHECK(row_count(pool, "agent-purl-up") == "1");
+    // An honest-empty section removes the purl with its row.
+    REQUIRE(store.apply_installed_software_v3("agent-purl-up", v3_report({v3_full(kV3Apps, {})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(store.find_by_purl("pkg:deb/debian/curl@7.88.1-11?arch=amd64&distro=debian-12")
+              .value()
+              .empty());
+}
+
+TEST_CASE("find_by_purl: exact match across agents, ordered, bounded, and served by the index",
+          "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    const auto curl = v3_linux("curl", "deb", "7.88.1", "10");
+    for (const char* agent : {"agent-pb", "agent-pa"}) {
+        REQUIRE(store.apply_installed_software_v3(
+                    agent, v3_report({v3_full(kV3Apps, {curl, v3_linux("git", "deb", "2.39.2", "1")})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+    }
+    REQUIRE(store.apply_installed_software_v3(
+                "agent-pc", v3_report({v3_full(kV3Apps, {v3_linux("curl", "deb", "7.88.1", "9")})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+
+    const std::string target = "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12";
+    auto hit = store.find_by_purl(target);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->size() == 2); // exact: -9 and git do not match
+    CHECK((*hit)[0].agent_id == "agent-pa"); // ordered by agent_id
+    CHECK((*hit)[1].agent_id == "agent-pb");
+    CHECK((*hit)[0].entry.name == "curl");
+    CHECK((*hit)[0].entry.version == "7.88.1");
+    CHECK((*hit)[0].entry.ecosystem == "deb");
+    CHECK((*hit)[0].entry.purl == target);
+    CHECK((*hit)[0].install_id > 0);
+
+    CHECK(store.find_by_purl(target, 1).value().size() == 1);                 // limit honoured
+    CHECK(store.find_by_purl(target + "x").value().empty());                  // no prefix matching
+    CHECK(store.find_by_purl("PKG:DEB/DEBIAN/CURL@7.88.1-10").value().empty()); // case sensitive
+    CHECK(store.find_by_purl("").value().empty()); // '' names "no purl": a precondition miss
+
+    // The statement reaches the partial index (seq scan priced out: the table is tiny).
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    const std::vector<std::string> none;
+    struct RollbackGuard {
+        PGconn* conn;
+        ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+    };
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+    const RollbackGuard rollback{lease.get()};
+    REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
+            PGRES_COMMAND_OK);
+    pg::PgResult plan = pg::exec_params(
+        lease.get(), ("EXPLAIN (COSTS OFF) " + SoftwareInventoryStore::find_by_purl_sql()).c_str(),
+        std::vector<std::string>{target, "100"});
+    REQUIRE(plan.status() == PGRES_TUPLES_OK);
+    std::string text;
+    for (int i = 0; i < PQntuples(plan.get()); ++i)
+        text += std::string(PQgetvalue(plan.get(), i, 0)) + "\n";
+    CHECK(text.find("installed_software_purl_idx") != std::string::npos);
+}
+
+TEST_CASE("v3: the first v3 call deletes every row the v2 path left, and only that call",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    SoftwareEntry v2_apps = v3_entry("OldApp", kV3Apps);
+    SoftwareEntry v2_py = v3_entry("OldPython", kV3Py);
+    SoftwareEntry v2_bare = full_v2_entry(); // pre-tail: empty source
+    const std::vector<SoftwareEntry> v2rows = {v2_apps, v2_py, v2_bare};
+    REQUIRE(store.apply_installed_software("agent-tr",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+    REQUIRE(row_count(pool, "agent-tr") == "3");
+    REQUIRE_FALSE(stored_hash(pool, "agent-tr").starts_with("v3:"));
+
+    // A facet-state row left by an older binary's v2 replace (which does not know the table)
+    // must not survive the switch either, or it would stay in the report hash for ever.
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.software_facet_state "
+                   "(agent_id, facet, status, section_hash) "
+                   "VALUES ('agent-tr', $1, 'full', 'stale-hash')",
+                   {kV3Py}));
+
+    // The agent's first v3 contact carries one section only.
+    const auto p1 = v3_entry("libfoo", kV3Pkgs);
+    auto res = store.apply_installed_software_v3("agent-tr", v3_report({v3_full(kV3Pkgs, {p1})}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(row_count(pool, "agent-tr") == "1"); // no v2 leftover of ANY source survives
+    CHECK(names_of(pool, "agent-tr", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+    CHECK(facet_count(pool, "agent-tr") == "1"); // the stale facet row went too
+    CHECK(stored_hash(pool, "agent-tr") ==
+          SoftwareInventoryStore::v3_report_hash({{kV3Pkgs, section_hash_of({p1})}}));
+
+    // From then on a section replaces only its own facet: a second call must not wipe the first.
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    res = store.apply_installed_software_v3("agent-tr", v3_report({v3_full(kV3Apps, {a1})}));
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(row_count(pool, "agent-tr") == "2");
+
+    // A bystander agent is never touched by another agent's transition.
+    REQUIRE(store.apply_installed_software("agent-by",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+    res = store.apply_installed_software_v3("agent-tr", v3_report({v3_full(kV3Apps, {})}));
+    CHECK(row_count(pool, "agent-by") == "3");
+
+    // A first contact that is STATUS-ONLY is the transition too: no v2 row survives it, the
+    // facet state records the status, and the report hash carries no section.
+    REQUIRE(store.apply_installed_software("agent-st",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+    REQUIRE(row_count(pool, "agent-st") == "3");
+    res = store.apply_installed_software_v3(
+        "agent-st", v3_report({v3_status(kV3Apps, V3Status::kConstrained, "windows:apps:tok")}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kStatusOnly);
+    CHECK(row_count(pool, "agent-st") == "0");
+    CHECK(sql_rows(pool,
+                   "SELECT status FROM software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-st' AND facet = $1",
+                   {kV3Apps})[0][0] == "constrained");
+    CHECK(stored_hash(pool, "agent-st") == SoftwareInventoryStore::v3_report_hash({}));
+}
+
+TEST_CASE("v3: a status-only section records the status and leaves rows and confirmation alone",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    const auto p1 = v3_entry("libfoo", kV3Pkgs);
+    REQUIRE(store
+                .apply_installed_software_v3(
+                    "agent-so", v3_report({v3_full(kV3Apps, {a1}), v3_full(kV3Pkgs, {p1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    // Pin last_confirmed_at to a sentinel so "untouched" cannot pass by coincidence of the clock.
+    REQUIRE(sql_ok(pool, "UPDATE software_inventory_store.software_facet_state "
+                         "SET last_confirmed_at = 12345 WHERE agent_id = 'agent-so'"));
+
+    const auto res = store.apply_installed_software_v3(
+        "agent-so",
+        v3_report({v3_status(kV3Apps, V3Status::kConstrained, "windows:apps:registry_unreadable"),
+                   v3_status(kV3Py, V3Status::kDisabled),
+                   v3_status(kV3Pkgs, V3Status::kTimeout, "timeout")}));
+    REQUIRE(res.size() == 3);
+    for (const auto& r : res)
+        CHECK(r.outcome == V3SectionOutcome::kStatusOnly);
+
+    CHECK(names_of(pool, "agent-so", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(names_of(pool, "agent-so", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+    const auto fs = sql_rows(pool, "SELECT facet, status, token, section_hash, enabled::text, "
+                                   "last_confirmed_at, duration_ms, bytes_read FROM "
+                                   "software_inventory_store.software_facet_state "
+                                   "WHERE agent_id = 'agent-so' ORDER BY facet");
+    REQUIRE(fs.size() == 3);
+    // apps: status moved, its last full's hash and confirmation time are still there.
+    CHECK(fs[0] ==
+          (std::vector<std::string>{kV3Apps, "constrained", "windows:apps:registry_unreadable",
+                                    section_hash_of({a1}), "true", "12345", "5", "6"}));
+    CHECK(fs[1] == (std::vector<std::string>{kV3Pkgs, "timeout", "timeout", section_hash_of({p1}),
+                                             "true", "12345", "5", "6"}));
+    // A facet never seen before: no hash, never confirmed, and `disabled` clears `enabled`.
+    CHECK(fs[2] == (std::vector<std::string>{kV3Py, "disabled", "", "", "false", "0", "5", "6"}));
+
+    // None of the three is in a full/delta status any more, so the report hash holds no section.
+    CHECK(stored_hash(pool, "agent-so") == SoftwareInventoryStore::v3_report_hash({}));
+
+    // The facet comes back: a full section re-confirms it and puts it in the report hash again.
+    const auto back =
+        store.apply_installed_software_v3("agent-so", v3_report({v3_full(kV3Apps, {a1})}));
+    CHECK(back[0].outcome == V3SectionOutcome::kStored);
+    CHECK(stored_hash(pool, "agent-so") ==
+          SoftwareInventoryStore::v3_report_hash({{kV3Apps, section_hash_of({a1})}}));
+    CHECK(sql_rows(pool,
+                   "SELECT (last_confirmed_at > 12345)::text, enabled::text, token FROM "
+                   "software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-so' AND facet = $1",
+                   {kV3Apps})[0] == (std::vector<std::string>{"true", "true", ""}));
+}
+
+TEST_CASE("v3: delta and component sections are answered with need-full and change no rows",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    REQUIRE(store.apply_installed_software_v3("agent-dl", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    const std::string held = section_hash_of({a1});
+    const std::string before = stored_hash(pool, "agent-dl");
+
+    V3Section stale = v3_status(kV3Apps, V3Status::kDelta);
+    stale.base = "not-the-held-hash";
+    V3Section unseen = v3_status(kV3Pkgs, V3Status::kDelta);
+    unseen.base = "whatever"; // no state for the facet at all
+    V3Section on_base = v3_status(kV3Apps, V3Status::kDelta);
+    on_base.base = held;
+    on_base.rows = {v3_entry("Extra", kV3Apps)};
+
+    SECTION("a delta on a base we do not hold: need-full") {
+        const auto res = store.apply_installed_software_v3("agent-dl", v3_report({stale, unseen}));
+        REQUIRE(res.size() == 2);
+        CHECK(res[0].outcome == V3SectionOutcome::kNeedFull);
+        CHECK(res[1].outcome == V3SectionOutcome::kNeedFull);
+    }
+    SECTION("a delta whose base matches is still not applied: delta_unsupported") {
+        const auto res = store.apply_installed_software_v3("agent-dl", v3_report({on_base}));
+        REQUIRE(res.size() == 1);
+        CHECK(res[0].outcome == V3SectionOutcome::kDeltaUnsupported);
+        CHECK(yuzu::server::v3_section_needs_full(res[0].outcome));
+        // An empty base never matches, not even an empty stored hash.
+        V3Section empty_base = v3_status(kV3Py, V3Status::kDelta);
+        const auto res2 = store.apply_installed_software_v3("agent-dl", v3_report({empty_base}));
+        CHECK(res2[0].outcome == V3SectionOutcome::kNeedFull);
+    }
+    // Either way nothing was written: rows, facet state and the report hash are as before.
+    CHECK(names_of(pool, "agent-dl", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(stored_hash(pool, "agent-dl") == before);
+    CHECK(sql_rows(pool,
+                   "SELECT status, section_hash FROM software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-dl'")[0] == (std::vector<std::string>{"full", held}));
+}
+
+TEST_CASE("v3: a component_inventory section records its state, holds no hash, and is nacked",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    REQUIRE(store.apply_installed_software_v3("agent-cp", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    const std::string agg =
+        SoftwareInventoryStore::v3_report_hash({{kV3Apps, section_hash_of({a1})}});
+
+    V3Section comp = v3_status(kV3Comp, V3Status::kFull, "tok");
+    comp.components.push_back({});
+    auto res = store.apply_installed_software_v3("agent-cp", v3_report({comp}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kNeedFull);
+    const auto fs = sql_rows(pool,
+                             "SELECT status, token, section_hash, enabled::text, last_confirmed_at "
+                             "FROM software_inventory_store.software_facet_state "
+                             "WHERE agent_id = 'agent-cp' AND facet = $1",
+                             {kV3Comp});
+    REQUIRE(fs.size() == 1);
+    CHECK(fs[0] == (std::vector<std::string>{"full", "tok", "", "true", "0"}));
+    // The aggregate covers sections this store holds; the component facet is not one of them.
+    CHECK(stored_hash(pool, "agent-cp") == agg);
+    CHECK(store.apply_installed_software("agent-cp", agg, std::nullopt, 0) ==
+          InventoryIngestOutcome::kTouched);
+
+    // The nack is keyed on the status, not on whether records came: a `full` component section
+    // with NO records is answered need-full too (the store has no component storage to confirm
+    // it into), and it changes no rows.
+    res = store.apply_installed_software_v3(
+        "agent-cp", v3_report({v3_status(kV3Comp, V3Status::kFull, "tok2")}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kNeedFull);
+    CHECK(names_of(pool, "agent-cp", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(stored_hash(pool, "agent-cp") == agg);
+
+    // A status-only component section is a complete report, not a request for a resend.
+    res = store.apply_installed_software_v3("agent-cp",
+                                            v3_report({v3_status(kV3Comp, V3Status::kDisabled)}));
+    CHECK(res[0].outcome == V3SectionOutcome::kStatusOnly);
+}
+
+TEST_CASE("v3: a delta-only or all-refused call neither wipes v2 rows nor flips the state",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const std::vector<SoftwareEntry> v2rows = {v3_entry("OldApp", kV3Apps)};
+    const std::string v2hash = SoftwareInventoryStore::canonical_hash(v2rows);
+    REQUIRE(store.apply_installed_software("agent-nf", v2hash, v2rows, 0) ==
+            InventoryIngestOutcome::kStored);
+
+    V3Section delta = v3_status(kV3Apps, V3Status::kDelta);
+    delta.base = "x";
+    V3Section refused;
+    refused.facet = kV3Pkgs;
+    refused.refusal = V3Refusal::kSourceMismatch;
+    const auto res = store.apply_installed_software_v3("agent-nf", v3_report({delta, refused}));
+    REQUIRE(res.size() == 2);
+    CHECK(res[0].outcome == V3SectionOutcome::kNeedFull);
+    CHECK(res[1].outcome == V3SectionOutcome::kRejected);
+    CHECK(names_of(pool, "agent-nf", kV3Apps) == std::vector<std::string>{"OldApp"});
+    CHECK(stored_hash(pool, "agent-nf") == v2hash);
+
+    const auto only_refused = store.apply_installed_software_v3("agent-nf", v3_report({refused}));
+    CHECK(only_refused[0].outcome == V3SectionOutcome::kRejected);
+    CHECK(stored_hash(pool, "agent-nf") == v2hash);
+    CHECK(facet_count(pool, "agent-nf") == "0");
+}
+
+TEST_CASE("v3: a first contact split over several calls converges to the single-call hash",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    const auto p1 = v3_entry("libfoo", kV3Pkgs);
+    const std::string agg = SoftwareInventoryStore::v3_report_hash(
+        {{kV3Apps, section_hash_of({a1})}, {kV3Pkgs, section_hash_of({p1})}});
+
+    // One call with both sections.
+    REQUIRE(store
+                .apply_installed_software_v3(
+                    "agent-one", v3_report({v3_full(kV3Apps, {a1}), v3_full(kV3Pkgs, {p1})}))
+                .size() == 2);
+    CHECK(stored_hash(pool, "agent-one") == agg);
+
+    // The same sections, one per call, in either order.
+    for (const bool apps_first : {true, false}) {
+        const std::string agent = apps_first ? "agent-split-a" : "agent-split-b";
+        const auto first = apps_first ? v3_full(kV3Apps, {a1}) : v3_full(kV3Pkgs, {p1});
+        const auto second = apps_first ? v3_full(kV3Pkgs, {p1}) : v3_full(kV3Apps, {a1});
+        REQUIRE(store.apply_installed_software_v3(agent, v3_report({first}))[0].outcome ==
+                V3SectionOutcome::kStored);
+        // Mid-way the hash is the partial aggregate: a full claim does not match yet.
+        CHECK(stored_hash(pool, agent) != agg);
+        CHECK(store.apply_installed_software(agent, agg, std::nullopt, 0) ==
+              InventoryIngestOutcome::kNeedFull);
+        REQUIRE(store.apply_installed_software_v3(agent, v3_report({second}))[0].outcome ==
+                V3SectionOutcome::kStored);
+        CHECK(stored_hash(pool, agent) == agg);
+        CHECK(store.apply_installed_software(agent, agg, std::nullopt, 0) ==
+              InventoryIngestOutcome::kTouched);
+        CHECK(row_count(pool, agent) == "2");
+    }
+}
+
+TEST_CASE("v3: a v2 full report supersedes the facet state, and delete_agent cascades it",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    REQUIRE(store.apply_installed_software_v3("agent-dg", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    REQUIRE(facet_count(pool, "agent-dg") == "1");
+
+    // The agent is downgraded and sends a v2 full report.
+    const std::vector<SoftwareEntry> v2rows = {{"Chrome", "119", "Google", "2026-01-01"}};
+    const std::string v2hash = SoftwareInventoryStore::canonical_hash(v2rows);
+    REQUIRE(store.apply_installed_software("agent-dg", v2hash, v2rows, 0) ==
+            InventoryIngestOutcome::kStored);
+    CHECK(facet_count(pool, "agent-dg") == "0");
+    CHECK(stored_hash(pool, "agent-dg") == v2hash);
+    CHECK(names_of(pool, "agent-dg", kV3Apps).empty()); // the v3 rows were replaced too
+    // The v2 hash-only claim now matches again; the old v3 aggregate does not.
+    CHECK(store.apply_installed_software("agent-dg", v2hash, std::nullopt, 0) ==
+          InventoryIngestOutcome::kTouched);
+
+    // Back to v3, then decommission: the facet rows go with the agent, a bystander keeps its own.
+    REQUIRE(store.apply_installed_software_v3("agent-dg", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    REQUIRE(
+        store.apply_installed_software_v3("agent-bystander", v3_report({v3_full(kV3Apps, {a1})}))[0]
+            .outcome == V3SectionOutcome::kStored);
+    CHECK(store.delete_agent("agent-dg"));
+    CHECK(facet_count(pool, "agent-dg") == "0");
+    CHECK(row_count(pool, "agent-dg") == "0");
+    CHECK(stored_hash(pool, "agent-dg") == "<no row>");
+    CHECK(facet_count(pool, "agent-bystander") == "1");
+    CHECK(row_count(pool, "agent-bystander") == "1");
+}
+
+TEST_CASE("v3: a SQL failure rolls the whole call back and answers need-full for every section",
+          "[pg][software_inventory][v3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    REQUIRE(store.apply_installed_software_v3("agent-rb", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    const std::string before = stored_hash(pool, "agent-rb");
+
+    // Break the facet-state write only; the rows' DELETE/INSERT earlier in the same transaction
+    // would succeed on their own, so a leak shows as changed rows.
+    REQUIRE(sql_ok(pool, "ALTER TABLE software_inventory_store.software_facet_state "
+                         "RENAME TO software_facet_state_gone"));
+    V3Section refused;
+    refused.facet = kV3Py;
+    refused.refusal = V3Refusal::kUnknownRecord;
+    const auto res = store.apply_installed_software_v3(
+        "agent-rb", v3_report({v3_full(kV3Apps, {v3_entry("Beta", kV3Apps)}),
+                               v3_full(kV3Pkgs, {v3_entry("libfoo", kV3Pkgs)}),
+                               v3_status(kV3Comp, V3Status::kFull), refused}));
+    REQUIRE(res.size() == 4);
+    CHECK(res[0].outcome == V3SectionOutcome::kError);
+    CHECK(res[1].outcome == V3SectionOutcome::kError);
+    CHECK(res[2].outcome == V3SectionOutcome::kError);
+    CHECK(res[3].outcome == V3SectionOutcome::kRejected); // refused is refused, not an error
+    CHECK(yuzu::server::v3_section_needs_full(V3SectionOutcome::kError));
+
+    // Nothing of the failed call is visible.
+    CHECK(names_of(pool, "agent-rb", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(names_of(pool, "agent-rb", kV3Pkgs).empty());
+    CHECK(stored_hash(pool, "agent-rb") == before);
+
+    // A store that never opened answers every unrefused section with an error too.
+    REQUIRE(sql_ok(pool, "DROP SCHEMA software_inventory_store CASCADE"));
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    const auto none = broken.apply_installed_software_v3(
+        "agent-rb", v3_report({v3_full(kV3Apps, {a1}), refused}));
+    REQUIRE(none.size() == 2);
+    CHECK(none[0].outcome == V3SectionOutcome::kError);
+    CHECK(none[1].outcome == V3SectionOutcome::kRejected);
+}
+
+TEST_CASE(
+    "v3: a SQL failure on the FIRST v3 call rolls the transition delete back; v2 data survives",
+    "[pg][software_inventory][v3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // A v2 agent with stored rows and the v2 hash: its first v3 call is a TRANSITION, which
+    // deletes every pre-existing row before the section lands.
+    const std::vector<SoftwareEntry> v2rows = {{"Chrome", "119", "Google", "2026-01-01"},
+                                               {"Firefox", "120", "Mozilla", "2026-01-02"}};
+    const std::string v2hash = SoftwareInventoryStore::canonical_hash(v2rows);
+    REQUIRE(store.apply_installed_software("agent-rbt", v2hash, v2rows, 0) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(row_count(pool, "agent-rbt") == "2");
+
+    // The transition clears the agent's rows (succeeds) and THEN its facet state (fails on the
+    // renamed table), inside the same transaction. If the transition DELETE ran outside it, the
+    // v2 rows would be gone and the hash would still be v2: a v2 agent would lose its inventory
+    // to a failed v3 call.
+    REQUIRE(sql_ok(pool, "ALTER TABLE software_inventory_store.software_facet_state "
+                         "RENAME TO software_facet_state_gone"));
+    const auto res = store.apply_installed_software_v3(
+        "agent-rbt", v3_report({v3_full(kV3Apps, {v3_entry("Alpha", kV3Apps)})}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kError);
+
+    CHECK(row_count(pool, "agent-rbt") == "2");
+    CHECK(stored_hash(pool, "agent-rbt") == v2hash);
+    CHECK(names_of(pool, "agent-rbt", kV3Apps).empty());
+}
+
+TEST_CASE("ingest_inventory_report v3: a refused section nacks only its facet; the rest applies",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+
+    const std::string blob =
+        w_hdr() + w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps, "C:\\Apps\\Alpha") +
+        w_sec(kV3Pkgs, "full") +
+        w_rec({"-", std::string(64, 'a')}) /* refused: - in a full section */ +
+        w_sec(kV3Py, "constrained", "", "tok", "5", "6") + w_sec(kV3Comp, "full") +
+        w_rec({"comp", "jar", "log4j-core", "2.14.1", "pom", "/opt/app/log4j.jar", "1", "2", ""}) +
+        w_sec("made_up.source", "full");
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-seam", rep, ack, &metrics);
+
+    // Exactly the refused, the component and the unknown-facet sections are asked for again.
+    std::set<std::string> nacks(ack.need_full().begin(), ack.need_full().end());
+    CHECK(nacks == (std::set<std::string>{"installed_software:pkg_inventory.packages",
+                                          "installed_software:component_inventory",
+                                          "installed_software:made_up.source"}));
+    CHECK(ack.need_full_size() == 3); // no duplicates, and no whole-source nack
+
+    // The good section applied; the status-only one recorded its status.
+    CHECK(names_of(pool, "agent-seam", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(names_of(pool, "agent-seam", kV3Pkgs).empty());
+    CHECK(sql_rows(pool,
+                   "SELECT status, token, duration_ms, bytes_read FROM "
+                   "software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-seam' AND facet = $1",
+                   {kV3Py})[0] == (std::vector<std::string>{"constrained", "tok", "5", "6"}));
+    // The location rode in on slot 13.
+    CHECK(sql_rows(pool, "SELECT install_location FROM software_inventory_store.installed_software "
+                         "WHERE agent_id = 'agent-seam'")[0][0] == "C:\\Apps\\Alpha");
+
+    // Metrics: one section counter per section with a CLOSED facet label, the source-level
+    // outcome, and the v3 phase of the duration histogram.
+    const auto section = [&](const std::string& facet, const std::string& outcome) {
+        return metrics
+            .counter("yuzu_inventory_section_ingest_total",
+                     {{"facet", facet}, {"outcome", outcome}})
+            .value();
+    };
+    CHECK(section(kV3Apps, "stored") == 1.0);
+    CHECK(section(kV3Pkgs, "rejected") == 1.0);
+    CHECK(section(kV3Py, "status_only") == 1.0);
+    CHECK(section(kV3Comp, "need_full") == 1.0);
+    CHECK(section("unknown", "rejected") == 1.0); // never the agent's raw facet string
+    CHECK(metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "installed_software"}, {"outcome", "need_full"}})
+              .value() == 1.0);
+    CHECK(metrics
+              .histogram("yuzu_inventory_ingest_duration_seconds",
+                         {{"source", "installed_software"}, {"phase", "v3"}})
+              .snapshot()
+              .count == 1);
+}
+
+TEST_CASE("ingest_inventory_report v3: a full component_inventory section with no records is "
+          "nacked",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+
+    // A syntactically complete, honest-empty component section: header line only, no records.
+    const std::string blob = w_hdr() + w_sec(kV3Comp, "full");
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-seam-cz", rep, ack, &metrics);
+
+    CHECK(std::vector<std::string>(ack.need_full().begin(), ack.need_full().end()) ==
+          std::vector<std::string>{"installed_software:component_inventory"});
+    CHECK(metrics
+              .counter("yuzu_inventory_section_ingest_total",
+                       {{"facet", kV3Comp}, {"outcome", "need_full"}})
+              .value() == 1.0);
+    CHECK(metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "installed_software"}, {"outcome", "need_full"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("ingest_inventory_report v3: a section holding a NUL byte is refused, nothing of it is "
+          "stored, and the other sections still apply",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    const auto ingest = [&](const std::string& blob) {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+        (*rep.mutable_plugin_data())["installed_software"] = blob;
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-nul", rep, ack, &metrics);
+        return std::set<std::string>(ack.need_full().begin(), ack.need_full().end());
+    };
+
+    // "AB" and "A\0B" differ on the wire; stored as bound text they would both read "AB" while
+    // hashing apart. The whole section is refused instead, and the clean row beside them goes too.
+    const std::string nul_name("A\0B", 3);
+    const auto nacks = ingest(w_hdr() + w_sec(kV3Apps, "full") + w_plus("AB", kV3Apps) +
+                              w_plus(nul_name, kV3Apps) + w_sec(kV3Pkgs, "full") +
+                              w_plus("libfoo", kV3Pkgs));
+    CHECK(nacks == std::set<std::string>{"installed_software:installed_apps.list_inventory"});
+    CHECK(names_of(pool, "agent-nul", kV3Apps).empty());
+    CHECK(names_of(pool, "agent-nul", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+    // The refused facet has no state row: nothing about it was recorded.
+    CHECK(sql_rows(pool,
+                   "SELECT count(*) FROM software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-nul' AND facet = $1",
+                   {kV3Apps})[0][0] == "0");
+    CHECK(metrics
+              .counter("yuzu_inventory_section_ingest_total",
+                       {{"facet", kV3Apps}, {"outcome", "rejected"}})
+              .value() == 1.0);
+
+    // Rows the agent already held for the facet survive a later NUL section untouched.
+    CHECK(ingest(w_hdr() + w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps)).empty());
+    CHECK(names_of(pool, "agent-nul", kV3Apps) == std::vector<std::string>{"Alpha"});
+    const auto again = ingest(w_hdr() + w_sec(kV3Apps, "full") + w_plus(nul_name, kV3Apps));
+    CHECK(again == std::set<std::string>{"installed_software:installed_apps.list_inventory"});
+    CHECK(names_of(pool, "agent-nul", kV3Apps) == std::vector<std::string>{"Alpha"});
+}
+
+TEST_CASE("ingest_inventory_report v3: a blob cut off inside its last record refuses that section",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    std::string blob = w_hdr() + w_sec(kV3Pkgs, "full") + w_plus("libfoo", kV3Pkgs) +
+                       w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps) + w_plus("Beta", kV3Apps);
+    blob.pop_back(); // the last record loses its terminator
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-cut", rep, ack, &metrics);
+    CHECK(std::set<std::string>(ack.need_full().begin(), ack.need_full().end()) ==
+          std::set<std::string>{"installed_software:installed_apps.list_inventory"});
+    CHECK(names_of(pool, "agent-cut", kV3Apps).empty()); // "Alpha" was whole, but not applied alone
+    CHECK(names_of(pool, "agent-cut", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+}
+
+TEST_CASE("ingest_inventory_report v3: a clean report is stored, then hash-only claims match",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    const auto p1 = v3_entry("libfoo", kV3Pkgs);
+    const std::string agg = SoftwareInventoryStore::v3_report_hash(
+        {{kV3Apps, section_hash_of({a1})}, {kV3Pkgs, section_hash_of({p1})}});
+
+    {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = agg;
+        (*rep.mutable_plugin_data())["installed_software"] =
+            w_hdr() + w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps) + w_sec(kV3Pkgs, "full") +
+            w_plus("libfoo", kV3Pkgs) + w_sec(kV3Py, "not_collected");
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-clean", rep, ack, &metrics);
+        CHECK(ack.need_full_size() == 0);
+    }
+    CHECK(stored_hash(pool, "agent-clean") == agg);
+    CHECK(metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "installed_software"}, {"outcome", "stored"}})
+              .value() == 1.0);
+
+    // Hash-only follow-ups: the v3 aggregate matches; a v2-style claim does not.
+    const auto hash_only = [&](const std::string& claim) {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = claim;
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-clean", rep, ack, &metrics);
+        return std::vector<std::string>(ack.need_full().begin(), ack.need_full().end());
+    };
+    CHECK(hash_only(agg).empty());
+    CHECK(hash_only(SoftwareInventoryStore::canonical_hash({a1, p1})) ==
+          std::vector<std::string>{"installed_software"});
+}
+
+TEST_CASE("ingest_inventory_report v3: a blob that cannot be attributed to sections is dropped "
+          "and nacked whole",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    // A v2 state exists; a malformed v3 blob must leave it alone.
+    const std::vector<SoftwareEntry> v2rows = {{"Chrome", "119", "Google", "2026-01-01"}};
+    REQUIRE(store.apply_installed_software("agent-bad",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+
+    for (const std::string& blob :
+         {w_hdr(),                                         // a header naming no section at all
+          w_hdr() + w_plus("Orphan", kV3Apps),             // a record before any section
+          w_hdr() + w_rec({"S", "", "full"}),              // a section header with no facet
+          w_hdr() + std::string(4u * 1024 * 1024, 'x')}) { // over the 3 MiB cap
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = "x";
+        (*rep.mutable_plugin_data())["installed_software"] = blob;
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-bad", rep, ack, &metrics);
+        REQUIRE(ack.need_full_size() == 1);
+        CHECK(ack.need_full(0) == "installed_software"); // the whole source, not a facet
+    }
+    CHECK(metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "installed_software"}, {"outcome", "dropped"}})
+              .value() == 4.0);
+    CHECK(names_of(pool, "agent-bad", "") == std::vector<std::string>{"Chrome"});
+    CHECK(stored_hash(pool, "agent-bad") == SoftwareInventoryStore::canonical_hash(v2rows));
+}
+
+TEST_CASE("ingest_inventory_report: the v2 path is unchanged beside v3",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    // A v2 blob whose first product is literally named "v3" is still v2, and slot 13 is still
+    // parsed and discarded on that path (its hash and rows are the pre-v3 bytes).
+    SoftwareEntry first;
+    first.name = "v3";
+    first.version = "1.0";
+    const SoftwareEntry second = full_extended_entry();
+    const std::string blob =
+        wire_record(first, 4) + wire_record_reserved(second, "/Users/alice/Bash", "u");
+    agentpb::InventoryReport rep;
+    const std::string h = SoftwareInventoryStore::canonical_hash({first, second});
+    (*rep.mutable_content_hashes())["installed_software"] = h;
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-v2", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+    CHECK(stored_hash(pool, "agent-v2") == h);
+    CHECK_FALSE(stored_hash(pool, "agent-v2").starts_with("v3:"));
+    CHECK(facet_count(pool, "agent-v2") == "0");
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.installed_software "
+                         "WHERE agent_id = 'agent-v2' AND install_location <> ''")[0][0] == "0");
+    CHECK(row_count(pool, "agent-v2") == "2");
 }

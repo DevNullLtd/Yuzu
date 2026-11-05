@@ -19,6 +19,7 @@
  */
 
 #include "body_cap_policy.hpp"
+#include "post_read_stage_test_support.hpp"
 #include "test_loopback_http.hpp"
 #include "web_utils.hpp"
 
@@ -32,10 +33,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #if defined(__has_feature)
 #  if __has_feature(thread_sanitizer)
@@ -205,6 +208,16 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/configevil/log_level",                         4u * 1024 * 1024, false, "default"},
     {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp software_curation / software_alias_pack rows: the software-title
+    // curation routes. ANY method; the pack row (1 MiB, mirrors kMaxPackBytes) is longer than
+    // the 64 KiB subtree row and wins; segment-boundary probes prove lookalikes fall to default.
+    {"POST",   "/api/v1/inventory/software/normalization/aliases",                64u * 1024, false, "software_curation"},
+    {"POST",   "/api/v1/inventory/software/normalization/queue/abc/reject",       64u * 1024, false, "software_curation"},
+    {"GET",    "/api/v1/inventory/software/normalization/status",                 64u * 1024, false, "software_curation"},
+    {"POST",   "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
+    {"PUT",    "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
+    {"POST",   "/api/v1/inventory/software/normalization/packevil",               64u * 1024, false, "software_curation"},
+    {"POST",   "/api/v1/inventory/software/normalizationevil/aliases",            4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp commands row - POST /api/v1/commands (the REST v1 twin of MCP
     // execute_instruction). requires_measurable like the /mcp/ row; segment-boundary probe below.
     {"POST",   "/api/v1/commands",                                     4u * 1024 * 1024, true,  "commands"},
@@ -250,6 +263,8 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "dex_score_policy",
     "crypto",
     "config",
+    "software_curation",
+    "software_alias_pack",
     "default",
 };
 
@@ -385,7 +400,7 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 37 = mcp(1) +
+    // check while still silently growing the table. 39 = mcp(1) +
     // commands(1: POST /api/v1/commands, the REST v1 twin of execute_instruction) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
@@ -407,8 +422,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // dex_score_policy(1: the DEX score policy document) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
+    // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 37);
+    CHECK(std::size(kBodyCapTable) == 39);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -496,6 +512,8 @@ constexpr std::uint64_t kUnifiedTestCap = 4u * 1024 * 1024; // matches the real 
 
 struct UnifiedBodyCapTestServer {
     httplib::Server svr;
+    // Declared right after `svr` so it is destroyed first; see post_read_stage_test_support.hpp.
+    std::optional<yuzu::test::PostReadStageScope> stage_scope;
     std::thread server_thread;
     int port{0};
     std::atomic<int> handler_calls{0};
@@ -507,7 +525,7 @@ struct UnifiedBodyCapTestServer {
     // (later) stage.
     std::atomic<int> pre_routing_rejections{0};
     // body-cap-post-read-stage (#2898-aware): counts every invocation of the
-    // fixture's `set_pre_request_handler` below, admitted or refused. Used
+    // fixture's post-read stage below, admitted or refused. Used
     // to prove ORDERING against the pre-routing stage — a request the
     // pre-routing handler already refused never reaches `dispatch_request`
     // at all (httplib's routing() returns as soon as pre-routing answers
@@ -527,15 +545,43 @@ struct UnifiedBodyCapTestServer {
             handler_calls.fetch_add(1);
             res.set_content(R"({"ok":true})", "application/json");
         };
-        svr.Get("/api/v1/devices", ok_handler);
-        svr.Post("/api/v1/devices", ok_handler);
-        svr.Get("/health", ok_handler);
-        svr.Post("/health", ok_handler);
-        svr.Post("/mcp/v1/", ok_handler);
+        // body-cap-post-read-stage — GENUINELY WIRED into this fixture the
+        // same way server.cpp wires it (issue #2898: earlier versions of
+        // this fixture only reproduced the pre-routing decision with pure
+        // functions, which meant a test against the fixture could never
+        // observe a defect in server.cpp's real stage wiring): installed in
+        // `PostReadStageRegistry` BEFORE any route, with the routes below
+        // registered through an `HttplibRouteSink` that wraps each handler.
+        // Real httplib::Server here means `req.body` is genuinely populated
+        // by httplib's own `read_content` before this fires — including for
+        // a real chunked-Transfer-Encoding request the pre-routing handler
+        // admitted unmeasured, which is the whole point of this
+        // stage.
+        stage_scope.emplace(
+            svr, [this](const httplib::Request& req,
+                        httplib::Response& res) -> httplib::Server::HandlerResponse {
+                post_read_calls.fetch_add(1);
+                const auto cap_match = resolve_body_cap(req.method, req.path);
+                if (req.body.size() <= cap_match.max_body_bytes) {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+                post_read_rejections.fetch_add(1);
+                res.status = 413;
+                return httplib::Server::HandlerResponse::Handled;
+            });
+        yuzu::server::HttplibRouteSink sink{svr};
+
+        sink.Get("/api/v1/devices", ok_handler);
+        sink.Post("/api/v1/devices", ok_handler);
+        sink.Get("/health", ok_handler);
+        sink.Post("/health", ok_handler);
+        sink.Post("/mcp/v1/", ok_handler);
         // A small-cap (256 KiB), requires_measurable=false class — used by
         // the post-read-stage tests below so a genuine chunked over-cap body
         // stays cheap to send in a test.
-        svr.Post("/api/v1/ca/import-chain", ok_handler);
+        sink.Post("/api/v1/ca/import-chain", ok_handler);
+        sink.Post("/api/v1/inventory/software/normalization/aliases", ok_handler);
+        sink.Post("/api/v1/inventory/software/normalization/pack", ok_handler);
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
@@ -580,28 +626,6 @@ struct UnifiedBodyCapTestServer {
             // other admitted path. What matters is that it only gets here
             // AFTER the cap check above ran unconditionally (D3).
             return httplib::Server::HandlerResponse::Unhandled;
-        });
-
-        // body-cap-post-read-stage — GENUINELY WIRED into this fixture the
-        // same way server.cpp wires it (issue #2898: earlier versions of
-        // this fixture only reproduced the pre-routing decision with pure
-        // functions, which meant a test against the fixture could never
-        // observe a defect in server.cpp's real `set_pre_request_handler`).
-        // Real httplib::Server here means `req.body` is genuinely populated
-        // by httplib's own `read_content` before this fires — including for
-        // a real chunked-Transfer-Encoding request the pre-routing handler
-        // above admitted unmeasured, which is the whole point of this
-        // stage.
-        svr.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res)
-                                        -> httplib::Server::HandlerResponse {
-            post_read_calls.fetch_add(1);
-            const auto cap_match = resolve_body_cap(req.method, req.path);
-            if (req.body.size() <= cap_match.max_body_bytes) {
-                return httplib::Server::HandlerResponse::Unhandled;
-            }
-            post_read_rejections.fetch_add(1);
-            res.status = 413;
-            return httplib::Server::HandlerResponse::Handled;
         });
 
         port = svr.bind_to_any_port("127.0.0.1");
@@ -736,6 +760,40 @@ TEST_CASE("Pre-routing body cap: a GET with an oversized declared Content-Length
     const auto resp = raw_request_status_line(ts.port, req);
     CHECK(resp.starts_with("HTTP/1.1 413"));
     CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: the software curation routes refuse an oversized body "
+          "pre-auth and admit an in-limit one",
+          "[body_cap][bounds][integration]") {
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    // Over-cap declared Content-Length (never sent): refused before any read.
+    const auto over = [&](const char* path, std::size_t len) {
+        return raw_request_status_line(
+            ts.port, std::string("POST ") + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+                         "Content-Length: " + std::to_string(len) + "\r\n\r\n");
+    };
+    CHECK(over("/api/v1/inventory/software/normalization/aliases", 64u * 1024 + 1)
+              .starts_with("HTTP/1.1 413"));
+    CHECK(over("/api/v1/inventory/software/normalization/pack", 1u * 1024 * 1024 + 1)
+              .starts_with("HTTP/1.1 413"));
+    CHECK(ts.handler_calls.load() == 0);
+
+    // The pack route admits a body the alias class would refuse (the longer prefix wins).
+    httplib::Client cli("127.0.0.1", ts.port);
+    auto pack_big = cli.Post("/api/v1/inventory/software/normalization/pack",
+                             std::string(64u * 1024 + 1, 'x'), "text/csv");
+    REQUIRE(pack_big);
+    CHECK(pack_big->status == 200);
+    CHECK(ts.handler_calls.load() == 1);
+
+    // In-limit bodies reach the handler on both routes.
+    auto alias_ok = cli.Post("/api/v1/inventory/software/normalization/aliases",
+                             std::string(64u * 1024, 'x'), "application/json");
+    REQUIRE(alias_ok);
+    CHECK(alias_ok->status == 200);
+    CHECK(ts.handler_calls.load() == 2);
 }
 
 TEST_CASE("Pre-routing body cap: POST /health with an oversized declared Content-Length "
@@ -1053,13 +1111,13 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
 // ── 9. Post-read body cap, second stage (body-cap-post-read-stage) ────────
 //
 // GENUINELY WIRED into `UnifiedBodyCapTestServer` (see that fixture's
-// `set_pre_request_handler` above) — issue #2898 is the reason this needed
+// post-read stage above) — issue #2898 is the reason this needed
 // calling out explicitly: earlier body-cap fixtures in this file only
 // reproduced production's DECISION with the same pure functions
 // (`resolve_body_cap` etc.), never httplib's actual middleware wiring for
 // this stage, so a test written only against a fixture like that could not
 // have told a real server.cpp defect from a fixture defect. These cases
-// exercise the real httplib `pre_request_handler_` call site end-to-end —
+// exercise the real stage wiring (registry plus route-sink wrapper) end-to-end —
 // same reasoning as section 8 above for the pre-routing stage.
 #ifndef _WIN32
 TEST_CASE("Post-read body cap: a genuine chunked body over a class's cap is rejected "

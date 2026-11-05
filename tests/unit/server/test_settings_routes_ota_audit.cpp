@@ -631,7 +631,7 @@ TEST_CASE("updates fragment: an encoded package URL reaches the handler decoded,
 
     httplib::Server svr;
     SettingsRoutes wire_routes;
-    HttplibRouteSink wire_sink{svr};
+    HttplibRouteSink wire_sink{svr, yuzu::server::StageRequirement::ExemptNoStage};
     h.register_on(wire_routes, wire_sink);
     const int port = svr.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
