@@ -894,6 +894,7 @@ yuzu_server_core_lib = static_library(
     'src/vuln_finding_store.cpp',
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
+    'src/software_collection_settings_store.cpp',
     'src/software_normalization_pack.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
