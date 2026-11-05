@@ -1117,39 +1117,42 @@ real-time session outlives its process until something stops it, so a test proce
 crashes or is cancelled leaves its session running, and the four runner agents share one OS identity, so the leak is
 shared state. On 2026-11-05 `logman query -ets` on Wee Tam showed one such session for a dead pid while `echo unit
 tests` failed on every Windows run waiting for its own registry event (#7173, #7135); the leg passed in the two runs
-after the session was stopped by hand. Whether the leak is the cause is not established (35 of the 64 system sessions were in use, so the
-limit was not reached, and no mechanism by which a dead session starves a new one is known), so the guard is
-preventive and the root-cause question stays on #7135.
-The Windows job runs `scripts/ci/stop-dead-etw-sessions.ps1` three times, each step capped at 5 minutes:
-`Self-test the ETW leaked-session cleanup` before the suite (canned `logman` output with injected liveness and stop
-functions: it starts and stops no session and writes plain `selftest note:` lines, never an annotation),
-`Stop ETW sessions leaked by dead Yuzu test processes (pre-test)` before `Test (non-pg suites)`, and a `(post-test)` run
-under `always()` after the registry leftover assertion, so a session leaked by this job's own killed or cancelled test
-process is stopped and logged against this job rather than the next one. Each real run logs the total session count
-(limit 64, `::warning` from 48) and the Yuzu count. It stops a session by exact name only when the name matches
-`^Yuzu[A-Za-z]*Etw-[0-9]+$` (case-sensitive) and its pid is not a running process, so a live job on another runner slot
-keeps its session and no system or Defender session is ever matched; a liveness probe that fails for any reason other
-than "no such process" counts as alive. The pid is checked a second time just before `logman stop`, which only guards against a flip between the two
-checks; the window is not closed, which is safe because a live owner's session always has a live pid. It never fails the job: a
-listing or stop error is a `::warning` and the script exits 0. Every `logman` call runs in a child process that is
-killed after 45 s, inside a 180 s budget for the whole run, so a wedged ETW service costs a step at most about three
-minutes and then warns; the 5-minute step cap is only a backstop. "Never fails" describes the script's own logic: the
-step envelope can still fail the job (`pwsh` missing, or a failed self-test arm, which is deliberate: a broken guard
-should be loud). A listing with fewer than 3 session rows (a healthy box lists its kernel loggers) is treated as not
-understood and stops nothing. A stop that fails is checked against a fresh listing, and a session that has gone (a
-concurrent job stopped it first) is logged as gone. A successful stop is also annotated as a `::warning`, deliberately,
-so a leak shows on the job, and each run appends its counts to the job summary.
-*Acceptance check, one-off:* in the first three Windows runs after this lands, read the `ETW sessions (pre-test):`
-line (`N total (system limit 64), M Yuzu`). A green run whose log instead shows `could not list sessions`, `listing not
-understood` or `timed out` means the guard is inert there; nothing alerts on those, so someone must look. Residuals: a
-pid reused by an unrelated live process keeps its session until that process exits (and a leak whose pid was reused
-persists until a check happens to find that pid free); a process killed after the post-test step leaves its session
-for the next job's pre-test step; output the parser does not understand (a non-English Windows) stops nothing and
-warns; a session name of about 39 characters or more would be undercounted in the total (the Yuzu names are about 30).
-A name outside `^Yuzu[A-Za-z]*Etw-[0-9]+$`, such as one with a digit before `Etw`, is left alone. If the guard is itself
-broken, recover by hand on the runner host: `logman query -ets`, then `logman stop <exact name> -ets` for a `Yuzu*Etw-<pid>`
-session whose pid is not running, with no job running on any of the four slots. `nightly.yml`'s
-`windows-asan` job runs only the `agent` suite, whose tests do not start the echo session, so it needs no such step.
+after the session was stopped by hand. Whether the leak is the cause is not established (35 of the 64 system sessions
+were in use, so the limit was not reached, and no mechanism by which a dead session starves a new one is known), so
+the guard is preventive and the root-cause question stays on #7135.
+The Windows job runs `scripts/ci/stop-dead-etw-sessions.ps1` three times, each step capped at 5 minutes: `Self-test
+the ETW leaked-session cleanup` before the suite (canned `logman` output with injected liveness and stop functions,
+plus one arm that runs the host `pwsh` as a short-lived child to prove the call timeout: it starts and stops no ETW
+session and writes plain `selftest note:` lines, never an annotation), `Stop ETW sessions leaked by dead Yuzu test
+processes (pre-test)` before `Test (non-pg suites)`, and a `(post-test)` run under `always()` after the registry
+leftover assertion, so a session leaked by this job's own killed or cancelled test process is stopped and logged
+against this job rather than the next one. Each real run logs the total session count (limit 64, `::warning` from 48)
+and the Yuzu count. It stops a session by exact name only when the name matches `^Yuzu[A-Za-z]*Etw-[0-9]+$`
+(case-sensitive) and its pid is not a running process, so a live job on another runner slot keeps its session and no
+system or Defender session is ever matched; a liveness probe that fails for any reason other than "no such process"
+counts as alive. The pid is checked a second time just before `logman stop`, which only guards against a flip between
+the two checks; the window is not closed, which is safe because a live owner's session always has a live pid. It never
+fails the job: a listing or stop error is a `::warning` and the script exits 0. Every `logman` call runs in a child
+process that is killed after 45 s, inside a 180 s budget for the whole run, so a wedged ETW service costs a step at
+most about three minutes and then warns; the 5-minute step cap is only a backstop. "Never fails" describes the
+script's own logic: the step envelope can still fail the job (`pwsh` missing, or a failed self-test arm, which is
+deliberate: a broken guard should be loud). A listing with fewer than 3 session rows (a healthy box lists its kernel
+loggers) is treated as not understood and stops nothing. A stop that fails is checked against a fresh listing, and a
+session that has gone (a concurrent job stopped it first) is logged as gone. A successful stop is also annotated as a
+`::warning`, deliberately, so a leak shows on the job, and each run appends its counts to the job summary. `logman` is
+run from the Windows system directory only: if it is not there, nothing is stopped. *Acceptance check, one-off:* in
+the first three Windows runs after this change merges, read the `ETW sessions (pre-test):` line (`N total (system
+limit 64), M Yuzu`). A green run whose log instead shows `could not list sessions`, `listing not understood`, `timed
+out` or `could not stop leaked ETW session` means the guard is not working there; those are warnings, not failures,
+and nothing pages anyone, so someone must look. Residuals: a pid reused by an unrelated live process keeps its session
+until that process exits (and a leak whose pid was reused persists until a check happens to find that pid free); a
+process killed after the post-test step leaves its session for the next job's pre-test step; output the parser does
+not understand (a non-English Windows) stops nothing and warns; a session name of about 39 characters or more would be
+undercounted in the total (the Yuzu names are about 30). A name outside `^Yuzu[A-Za-z]*Etw-[0-9]+$`, such as one with
+a digit before `Etw`, is left alone. If the guard is itself broken, recover by hand on the runner host: `logman query
+-ets`, then `logman stop <exact name> -ets` for a `Yuzu*Etw-<pid>` session whose pid is not running, with no job
+running on any of the four slots. `nightly.yml`'s `windows-asan` job runs only the `agent` suite, whose tests do not
+start the echo session, so it needs no such step.
 
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran

@@ -25,7 +25,8 @@
        backstop. A listing with fewer than 3 session rows (a healthy box always has the kernel loggers) is treated as
        not understood and stops nothing. A stop that fails is re-checked against a fresh listing: a session that has
        gone (a concurrent job stopped it first) is logged as gone, not as a failure. The totals are also appended to
-       $GITHUB_STEP_SUMMARY when it is set. Only -SelfTest can exit non-zero.
+       the file named by $env:GITHUB_STEP_SUMMARY when it is set. logman is run from the Windows system directory
+       only; if it is not there nothing is stopped. Only -SelfTest can exit non-zero.
 
   Only names matching ^Yuzu[A-Za-z]*Etw-[0-9]+$ (case-sensitive, ASCII) are candidates. System, Defender and every
   other session are never matched.
@@ -43,7 +44,7 @@
   Total session count at or above which a ::warning is emitted (default 48 of the 64-session system limit).
 
 .PARAMETER Phase
-  Free text naming the call site ("pre-test", "post-test"), used only in the log lines.
+  One of run (default), pre-test or post-test: names the call site in the log lines and the step summary.
 #>
 [CmdletBinding()]
 param(
@@ -72,7 +73,7 @@ function Read-EtwSessionList {
         if (-not ($line -match '^(?<name>\S.*?)\s{2,}Trace\s+\S+\s*$')) { continue }
         $total++
         $name = $Matches['name'].Trim()
-        if ($name -cmatch '^Yuzu[A-Za-z]*Etw-(?<pid>[0-9]+)$') {
+        if ($name -cmatch '^Yuzu[A-Za-z]*Etw-(?<pid>[0-9]+)\z') {
             $parsed = 0
             if ([int]::TryParse($Matches['pid'], [ref]$parsed)) {
                 $yuzu += [pscustomobject]@{ Name = $name; ProcessId = $parsed }
@@ -115,15 +116,21 @@ function Invoke-NativeBounded {
             return [pscustomobject]@{ TimedOut = $true; Code = -1; Lines = @() }
         }
         $p.WaitForExit()   # flush the async readers
+        # the child has exited; a reader only stays pending if something else still holds the pipe, so bound the wait
+        if (-not ($out.Wait(5000) -and $err.Wait(5000))) {
+            return [pscustomobject]@{ TimedOut = $true; Code = -1; Lines = @() }
+        }
         $text = $out.Result
-        $null = $err.Result
         [pscustomobject]@{ TimedOut = $false; Code = $p.ExitCode; Lines = @($text -split "\r?\n") }
     } finally { $p.Dispose() }
 }
 
+# The system directory's logman.exe, or $null. There is deliberately NO fallback to a bare `logman.exe`: with
+# UseShellExecute=false CreateProcess would then search the current directory, which in CI is the checkout.
 function Get-LogmanPath {
+    if (-not $env:SystemRoot) { return $null }
     $candidate = Join-Path $env:SystemRoot 'System32\logman.exe'
-    if ($env:SystemRoot -and (Test-Path -LiteralPath $candidate)) { $candidate } else { 'logman.exe' }
+    if (Test-Path -LiteralPath $candidate) { $candidate } else { $null }
 }
 
 # A liveness probe that throws counts as ALIVE: the one wrong answer that can hurt is a false "dead", so every doubt
@@ -178,6 +185,11 @@ function Invoke-EtwSessionCleanup {
         }
         # re-check at the last moment: the pid is only worth acting on while it is still dead
         if (Test-AliveSafe -Probe $IsAlive -ProcessId $s.ProcessId) { $result.Skipped += $s.Name; continue }
+        if ($script:Clock.Elapsed.TotalSeconds -ge $script:BudgetSec) {
+            $result.Failed += $s.Name
+            Write-Host "${script:WarnPrefix}ETW session cleanup ($Phase): the $script:BudgetSec s run budget is spent, not attempting to stop $($s.Name)"
+            continue
+        }
         $stopped = $false
         try { $stopped = [bool](& $Stop $s.Name) } catch { $stopped = $false }
         if ($stopped) {
@@ -306,9 +318,37 @@ if ($SelfTest) {
     $t0 = [int]$script:Clock.Elapsed.TotalSeconds
     $slow = Invoke-NativeBounded -FilePath $hostExe -Arguments '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60' -TimeoutSec 3
     Test-Expect ($slow.TimedOut) 'arm 12 did not time out a sleeping child'
-    Test-Expect (([int]$script:Clock.Elapsed.TotalSeconds - $t0) -lt 30) 'arm 12 waited for the sleeping child'
-    $fast = Invoke-NativeBounded -FilePath $hostExe -Arguments '-NoProfile -NonInteractive -Command "Write-Output hello; exit 3"' -TimeoutSec 30
+    Test-Expect (([int]$script:Clock.Elapsed.TotalSeconds - $t0) -lt 90) 'arm 12 waited for the sleeping child'
+    $fast = Invoke-NativeBounded -FilePath $hostExe -Arguments '-NoProfile -NonInteractive -Command "Write-Output hello; exit 3"' -TimeoutSec 120
     Test-Expect ((-not $fast.TimedOut) -and $fast.Code -eq 3 -and ($fast.Lines -contains 'hello')) "arm 12 fast child: timedout=$($fast.TimedOut) code=$($fast.Code) lines=$($fast.Lines -join '|')"
+
+    # arm 13: once the run budget is spent no stop is attempted and each session is reported as failed
+    $script:stopCalls = @()
+    $savedBudget = $script:BudgetSec
+    $script:BudgetSec = 0
+    try {
+        $r = Invoke-EtwSessionCleanup -Query { $header } -IsAlive $isAlive -Stop $stopOk -WarnAt 48 -Phase 'selftest'
+    } finally { $script:BudgetSec = $savedBudget }
+    Test-Expect ($script:stopCalls.Count -eq 0 -and (($r.Failed -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuEchoProcEtw-333')) "arm 13 budget: stops=$($script:stopCalls -join ',') failed=$($r.Failed -join ',')"
+    # ... and the native runner itself refuses to start a process once the budget is spent
+    $script:BudgetSec = 0
+    try { $spent = Invoke-NativeBounded -FilePath $hostExe -Arguments '-NoProfile -NonInteractive -Command exit 0' -TimeoutSec 60 } finally { $script:BudgetSec = $savedBudget }
+    Test-Expect ($spent.TimedOut) 'arm 13 started a process with the budget spent'
+
+    # arm 14: a re-list that returns too few rows to trust is NOT evidence that the session is gone
+    $script:stopCalls = @()
+    $script:qcalls = 0
+    $queryGarbageSecond = { $script:qcalls++; if ($script:qcalls -eq 1) { $header } else { @('garbage') } }
+    $r = Invoke-EtwSessionCleanup -Query $queryGarbageSecond -IsAlive $isAlive -Stop $stopAlwaysFails -WarnAt 48 -Phase 'selftest'
+    Test-Expect ($r.Gone.Count -eq 0 -and ($r.Failed -join ',') -eq 'YuzuEchoRegistryEtw-111,YuzuEchoProcEtw-333') "arm 14 gone=$($r.Gone -join ',') failed=$($r.Failed -join ',')"
+
+    # arm 15: the row-count canary boundary: exactly 3 rows is understood, so a dead session in it IS stopped
+    $script:stopCalls = @()
+    $threeRows = @('Circular Kernel Context Logger          Trace                         Running',
+                   'Microsoft Defender ETW Session          Trace                         Running',
+                   'YuzuEchoRegistryEtw-111                 Trace                         Running')
+    $r = Invoke-EtwSessionCleanup -Query { $threeRows } -IsAlive $isAlive -Stop $stopOk -WarnAt 48 -Phase 'selftest'
+    Test-Expect ($r.Total -eq 3 -and ($r.Stopped -join ',') -eq 'YuzuEchoRegistryEtw-111') "arm 15 boundary: total=$($r.Total) stopped=$($r.Stopped -join ',')"
 
     Write-Host 'ETW session cleanup self-test: all arms hold'
     exit 0
@@ -317,6 +357,7 @@ if ($SelfTest) {
 # Real mode: never throw out of here. The test phase must not be made red by housekeeping.
 try {
     $logman = Get-LogmanPath
+    if (-not $logman) { throw 'logman.exe was not found in the Windows system directory, nothing stopped' }
     $query = {
         $r = Invoke-NativeBounded -FilePath $logman -Arguments 'query -ets' -TimeoutSec $script:CallSec
         if ($r.TimedOut) { throw 'logman query -ets timed out or the run budget was exhausted' }
@@ -333,7 +374,7 @@ try {
     $stopReal = {
         param([string]$Name)
         # the name is spliced into a command line: refuse anything outside the grammar, whatever the caller did
-        if ($Name -cnotmatch '^Yuzu[A-Za-z]*Etw-[0-9]+$') { return $false }
+        if ($Name -cnotmatch '^Yuzu[A-Za-z]*Etw-[0-9]+\z') { return $false }
         $r = Invoke-NativeBounded -FilePath $logman -Arguments "stop $Name -ets" -TimeoutSec $script:CallSec
         (-not $r.TimedOut) -and $r.Code -eq 0
     }

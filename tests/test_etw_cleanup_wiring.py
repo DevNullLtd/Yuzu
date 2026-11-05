@@ -11,9 +11,12 @@ its `always()`. This reads .github/workflows/ci.yml's `windows:` job and checks:
   3. every call is `shell: pwsh` with a `timeout-minutes` cap and goes through the one script, with -SelfTest only on
      the self-test step; the self-test and pre-test steps carry no `if:` and no `continue-on-error` (a skipped or
      ignored step would leave the guard silently off);
-  4. the script is ASCII only (Windows PowerShell 5.1 misreads BOM-less UTF-8); real mode (everything after the
-     -SelfTest block) wraps the cleanup in a catch-all `try`/`catch`, has no `exit 1`/`throw`, and ends `exit 0`, so
-     housekeeping can never turn the test phase red.
+  4. the script is ASCII only (Windows PowerShell 5.1 misreads BOM-less UTF-8) and never exits non-zero; real mode
+     (everything after the -SelfTest block) opens with a catch-all `try` and ends `} catch {` ... `exit 0`, and has no
+     line that STARTS with `throw` (the `throw`s inside the injected `$query` closure sit in `if` lines and are caught
+     by Invoke-EtwSessionCleanup's own try), so housekeeping can never turn the test phase red;
+  5. each real step runs the script with exactly `-Phase pre-test` / `-Phase post-test` (the script's ValidateSet
+     would turn any other value into a red step).
 """
 import pathlib
 import re
@@ -65,15 +68,19 @@ def main():
         for name in (SELFTEST, PRE):
             if re.search(r"^        ['\"]?(if|continue-on-error)['\"]?\s*:", steps[name], re.M):
                 errors.append(f"{name!r} must not carry `if:` or `continue-on-error` (the guard would be silently off)")
-        for name in (PRE, POST):
+        for name, phase in ((PRE, "pre-test"), (POST, "post-test")):
             if "-SelfTest" in steps[name]:
                 errors.append(f"{name!r} must not pass -SelfTest")
-            if "-Phase" not in steps[name]:
-                errors.append(f"{name!r} should name its -Phase")
+            # the script's ValidateSet makes any other value a parameter-binding failure, which is a red step
+            if not re.search(rf"stop-dead-etw-sessions\.ps1 -Phase {phase}\s*$", steps[name], re.M):
+                errors.append(f"{name!r} must run the script with exactly `-Phase {phase}`")
 
     ps1 = PS1.read_text(encoding="utf-8")
     if any(ord(c) > 127 for c in ps1):
         errors.append("stop-dead-etw-sessions.ps1 must be ASCII only")
+    # no `exit` with a non-zero code anywhere in the file (functions included): only a -SelfTest throw may fail a step
+    if [c for c in re.findall(r"^\s*exit\s+(\S+)", ps1, re.M) if c != "0"]:
+        errors.append("the script must only ever `exit 0` (a failed -SelfTest expectation throws instead)")
     outside = ps1.split("if ($SelfTest) {", 1)
     # the self-test block ends at the first top-level `exit 0` + `}`; everything after it is real mode
     real_mode = outside[1].split("\n    exit 0\n}", 1)[-1] if len(outside) == 2 and "\n    exit 0\n}" in outside[1] else ""
