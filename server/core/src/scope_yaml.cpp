@@ -4,6 +4,7 @@
 #include "yaml_scan.hpp"
 
 #include <cctype>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -35,6 +36,33 @@ bool is_safe_scope_token(const std::string& s) {
     return true;
 }
 
+// yaml_scan returns a list line it cannot place as one raw item (an inline
+// `[` list that does not close on its key's line, or a `-` line outside the
+// list's columns), so the charset message alone would not name the real cause.
+std::string_view unplaceable_item_hint(const std::string& item) {
+    if (!item.empty() && item.front() == '[')
+        return "; an inline [ ] list must open and close on the same line (use a block "
+               "list of '- item' lines for several lines)";
+    if (!item.empty() && item.front() == '-')
+        return "; check the indentation of the list's '- item' lines";
+    if (!item.empty() && item.front() == ' ')
+        return "; write the list as '- item' lines or an inline [a, b] list";
+    if (item.find(' ') != std::string::npos)
+        return "; an item must be a single token: no spaces, and not continued on a "
+               "following line";
+    return "";
+}
+
+std::size_t count_dash_lines(std::string_view block) {
+    std::size_t n = 0;
+    for (auto line : yaml_scan::split_lines(block)) {
+        const auto fc = line.find_first_not_of(" \t");
+        if (fc != std::string_view::npos && line[fc] == '-')
+            ++n;
+    }
+    return n;
+}
+
 } // namespace
 
 ScopeBlock parse_scope_block(const std::string& yaml_source) {
@@ -52,12 +80,20 @@ ScopeBlock parse_scope_block(const std::string& yaml_source) {
     if (sb.has_from_result_set)
         sb.from_result_set = yaml_scan::extract_yaml_value(scope_block, "fromResultSet");
 
+    std::string selector_block;
     if (yaml_scan::yaml_has_key(scope_block, "selector")) {
-        std::string selector_block = yaml_scan::extract_yaml_section(scope_block, "selector");
+        selector_block = yaml_scan::extract_yaml_section(scope_block, "selector");
         sb.has_selector = true;
         sb.selector_platform = yaml_scan::extract_yaml_value(selector_block, "platform");
         sb.selector_tags = yaml_scan::extract_yaml_list(selector_block, "tags");
     }
+
+    // The only list in a scope block is selector.tags, so every `- item` line in
+    // the block must lie inside the selector block. One outside it (misindented
+    // to selector's column or shallower) was never read as a tag.
+    if (count_dash_lines(scope_block) > count_dash_lines(selector_block))
+        sb.malformed = "spec.scope has a '- item' line that is not inside selector.tags; check "
+                       "the indentation of the list's '- item' lines";
 
     return sb;
 }
@@ -65,6 +101,8 @@ ScopeBlock parse_scope_block(const std::string& yaml_source) {
 std::optional<std::string> validate_scope_block(const ScopeBlock& sb,
                                                 const std::string& assignment_mode,
                                                 bool assignment_has_mgmt_groups) {
+    if (!sb.malformed.empty())
+        return sb.malformed;
     // Selector values are interpolated into the lowered scope-engine string
     // (`ostype == "<platform>"`, `EXISTS tag:<name>`); restrict them to the
     // scope-ident charset so each stays a single token — no grammar injection
@@ -76,7 +114,8 @@ std::optional<std::string> validate_scope_block(const ScopeBlock& sb,
         for (const auto& t : sb.selector_tags)
             if (!is_safe_scope_token(t))
                 return "spec.scope.selector.tags entry '" + t +
-                       "' may contain only letters, digits, and _ . : * -";
+                       "' may contain only letters, digits, and _ . : * -" +
+                       std::string(unplaceable_item_hint(t));
     }
 
     // Rules 1+2 only constrain the fromResultSet form. A selector-only or empty
@@ -102,6 +141,16 @@ std::optional<std::string> validate_scope_block(const ScopeBlock& sb,
         return "scope.fromResultSet requires assignment.mode: static (got 'dynamic'): a result "
                "set is a fixed target; dynamic re-evaluation would defeat it";
 
+    return std::nullopt;
+}
+
+std::optional<std::string>
+validate_management_group_ids(const std::vector<std::string>& group_ids) {
+    for (const auto& g : group_ids)
+        if (!is_safe_scope_token(g))
+            return "managementGroups entry '" + g +
+                   "' is not a management group id (ids are letters, digits, and _ . : * -)" +
+                   std::string(unplaceable_item_hint(g));
     return std::nullopt;
 }
 

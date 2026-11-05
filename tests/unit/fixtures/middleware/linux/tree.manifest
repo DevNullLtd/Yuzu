@@ -1,0 +1,2 @@
+# ls -ln of the IBM MQ install root the FakeFs run_leg tests point their candidates at (see provenance.txt)
+drwxr-xr-x 1 1001 0 4096 Oct  1 12:49 /opt/mqm

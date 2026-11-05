@@ -24,6 +24,8 @@
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
+#include "event_emit.hpp"     // EmitEventFn: the httplib adapter half (execution_mutation.hpp takes only the request-free hook)
+#include "execution_mutation.hpp" // cancel/rerun twins: the shared admit-audit-effect sequence + its test seam
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
@@ -608,8 +610,8 @@ public:
     /// Guardian rule create/update/delete/push, software package create,
     /// software deploy start, user delete/role-change, and the engine-principal
     /// and RBAC assignment routes). The routes that need step-up are classified
-    /// in step_up_policy.hpp; for those, the central check in server.cpp's
-    /// pre-request handler (step_up_gate.hpp) evaluates the same decision
+    /// in step_up_policy.hpp; for those, the central check in the post-read
+    /// stage `server.cpp` installs (step_up_gate.hpp) evaluates the same decision
     /// BEFORE the handler runs, ahead of the handler's own permission and
     /// its own cross-site copy (a cookie write has already met the server-wide
     /// same-site gate in pre-routing), and this functor repeats it from that
@@ -745,6 +747,21 @@ public:
     /// `device_ids` is unaffected either way.
     void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
 
+    /// TEST SEAM for POST /api/v1/executions/{id}/cancel and .../rerun. Production leaves this
+    /// unset and the routes bind `make_tracker_mutation_ports(execution_tracker)`; a test that
+    /// has no Postgres sets fake ports instead. MUST be called BEFORE `register_routes()`. An
+    /// unwired set of ports (the default) is ignored, never used as "no store".
+    void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
+        execution_mutation_ports_ = std::move(ports);
+    }
+
+    /// The platform event emitter (`ServerImpl::emit_event`) for the routes whose LEGACY siblings
+    /// publish an event: POST /api/v1/executions/{id}/cancel -> `execution.completed`,
+    /// POST /api/v1/executions/{id}/rerun -> `execution.created` (see
+    /// `apply_execution_mutation`). Best effort; unset = no event. MUST be called BEFORE
+    /// `register_routes()`.
+    void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
+
     /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
     /// EXPLICITLY instead of re-resolving it from the request's session.
     /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
@@ -856,6 +873,8 @@ private:
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
+    ExecutionMutationPorts execution_mutation_ports_; // see set_execution_mutation_ports_for_test
+    EmitEventFn emit_event_fn_;                       // see set_emit_event_fn
 };
 
 } // namespace yuzu::server

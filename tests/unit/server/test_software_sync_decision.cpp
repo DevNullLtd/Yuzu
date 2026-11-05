@@ -307,6 +307,16 @@ TEST_CASE("sync audit token: control bytes and field delimiters defanged; length
     CHECK(ss::audit_token(std::string(ss::kAuditTokenMax, 'x')) == std::string(ss::kAuditTokenMax, 'x'));
 }
 
+TEST_CASE("sync audit token: the length cut is on a code point boundary (CH-12)",
+          "[server][software_sync]") {
+    // A 3-byte character whose lead byte is the 128th: the cap would cut it in half.
+    const std::string straddle = std::string(ss::kAuditTokenMax - 1, 'a') + "\xE2\x82\xAC" + "tail";
+    CHECK(ss::audit_token(straddle) == std::string(ss::kAuditTokenMax - 1, 'a') + "...");
+    // A character that ends exactly on the cap survives whole.
+    const std::string fits = std::string(ss::kAuditTokenMax - 3, 'a') + "\xE2\x82\xAC" + "tail";
+    CHECK(ss::audit_token(fits) == std::string(ss::kAuditTokenMax - 3, 'a') + "\xE2\x82\xAC" + "...");
+}
+
 TEST_CASE("sync audit target: an expression never becomes an identifier", "[server][software_sync]") {
     CHECK(ss::target_label({DispatchArm::Broadcast, "__all__"}) == "__all__");
     CHECK(ss::target_label({DispatchArm::Scope, "tag:x AND ostype == \"linux\""}) == "expression");

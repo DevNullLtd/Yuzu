@@ -17,6 +17,7 @@
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
                          // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
+#include "instruction_execute.hpp" // #2146: Ports for execute_instruction_definition
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "config_write.hpp" // config::Backing: get/set_runtime_config's backing pointers
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
@@ -39,6 +40,8 @@
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
+#include "event_emit.hpp"        // EmitEventFn: legacy-equivalent events for the execution twins
+#include "execution_mutation.hpp" // cancel_execution/record_execution_rerun test seam type
 #include "execution_tracker.hpp"
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
 #include "fleet_topology_store.hpp" // #2146 Batch B3: FleetTopologyStore + merge_offline_topology
@@ -484,6 +487,14 @@ public:
     /// immediately above (the handler's `[=]` lambda captures `this`, so the
     /// injection is a live read on the next request).
     void set_authorize_dispatch_fn(AuthorizeDispatchFn fn) { authorize_dispatch_fn_ = std::move(fn); }
+    /// #2146: the shared pipeline's ports for `execute_instruction_definition`
+    /// (instruction_execute.hpp). server.cpp builds them with `instruction_execute::make_ports`
+    /// from the SAME stores, dispatch closure and authorizer the REST twin uses. Left unset,
+    /// every seam is empty and the tool FAILS CLOSED (definition store unavailable) rather than
+    /// running anything. Same setter idiom as `set_capability_classify_fn`.
+    void set_instruction_execute_ports(instruction_execute::Ports ports) {
+        instr_exec_ports_ = std::move(ports);
+    }
 
     /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
     /// set_engine_principal_store above (the handler's `[=]` lambda captures
@@ -517,6 +528,20 @@ public:
     /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
     /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
     void set_runtime_config_backing(config::Backing backing) { runtime_config_ = backing; }
+
+    /// TEST SEAM for cancel_execution / record_execution_rerun. Production leaves this unset and
+    /// the tools bind `make_tracker_mutation_ports(execution_tracker)`; a test with no Postgres
+    /// installs fake ports. An unwired set is ignored, never used as "no store".
+    void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
+        execution_mutation_ports_for_test_ = std::move(ports);
+    }
+
+    /// The platform event emitter (`ServerImpl::emit_event`) for the tools whose LEGACY siblings
+    /// publish an event: cancel_execution -> `execution.completed`, record_execution_rerun ->
+    /// `execution.created`, execute_instruction_definition -> `approval.created` /
+    /// `instruction.executed`. Best effort, after the effect; unset = no event. MUST be called
+    /// before the server starts listening.
+    void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
@@ -716,9 +741,9 @@ public:
     /// member) could see an incomplete or empty list despite being admitted
     /// (INV-4/INV-7 violation, not a merely-conservative narrowing). Fixed:
     /// both tools now read this UNFILTERED registry snapshot — the SAME
-    /// zero-arg source `list_agents`' own `agents_fn` and REST's
+    /// zero-arg source `list_agents`' own `DeviceApi` and REST's
     /// `GET /api/v1/devices` (#4033) use (`registry_.to_json_obj()`) — with
-    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `agents_fn` was
+    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `DeviceApi` read was
     /// never the gap: `require_fleet_read`'s `gate.scope` is the actual
     /// authorization boundary in that pattern, applied after the unfiltered
     /// read, exactly as here.
@@ -1289,6 +1314,8 @@ private:
     // pre-dispatch dry run in mcp_server.cpp fails closed rather than
     // silently reverting to the pre-#3687 collapsed-envelope behaviour.
     AuthorizeDispatchFn authorize_dispatch_fn_;
+    // #2146: see set_instruction_execute_ports. Default-constructed = every seam unwired.
+    instruction_execute::Ports instr_exec_ports_;
     // Posture cache shared across httplib worker threads (the POST handler lambda
     // is captured by value, so every worker shares this one object). Reads and
     // writes of the string fields MUST be serialised — an unsynchronised
@@ -1323,6 +1350,8 @@ private:
     // engine_principal_store_'s contract above.
     PluginConfigStore* plugin_config_store_{nullptr};
     config::Backing runtime_config_{};
+    ExecutionMutationPorts execution_mutation_ports_for_test_{}; // see set_execution_mutation_ports_for_test
+    EmitEventFn emit_event_fn_;                                  // see set_emit_event_fn
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
