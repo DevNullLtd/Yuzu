@@ -94,7 +94,7 @@ parse_workflow_execute_body(const nlohmann::json& body) {
             "scope is not supported here; name the devices in agent_ids"});
     if (!body.contains("agent_ids"))
         return std::unexpected(WorkflowExecuteBodyError{
-            "agent_ids_required",
+            std::string(kReasonWorkflowAgentIdsRequired),
             "agent_ids (a non-empty array of agent id strings) is required; a workflow run "
             "names its devices explicitly"});
     if (const auto v = check_targeting_shape(body))
@@ -103,7 +103,7 @@ parse_workflow_execute_body(const nlohmann::json& body) {
     const auto& arr = body["agent_ids"]; // array, non-empty, all strings: the shape check proved it
     if (arr.size() > mcp::kExecInstrAgentIdsMaxItems)
         return std::unexpected(WorkflowExecuteBodyError{
-            "agent_ids_count", "agent_ids may name at most " +
+            std::string(kReasonWorkflowAgentIdsCount), "agent_ids may name at most " +
                                    std::to_string(mcp::kExecInstrAgentIdsMaxItems) + " agents"});
     std::vector<std::string> ids;
     ids.reserve(arr.size());
@@ -111,7 +111,7 @@ parse_workflow_execute_body(const nlohmann::json& body) {
         const auto& s = v.get_ref<const std::string&>();
         if (s.empty() || s.size() > mcp::kExecInstrIdentMaxLen)
             return std::unexpected(WorkflowExecuteBodyError{
-                "agent_id_len", "each agent id must be 1 to " +
+                std::string(kReasonWorkflowAgentIdLen), "each agent id must be 1 to " +
                                     std::to_string(mcp::kExecInstrIdentMaxLen) + " bytes"});
         ids.push_back(s);
     }
@@ -229,6 +229,27 @@ void count_idempotent(const WorkflowExecutePorts& ports, std::string_view outcom
         return;
     try {
         ports.count_idempotent(outcome);
+    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
+    }
+}
+
+/// The idempotent-counter outcome of a replay that was answered: `in_progress` while the run is
+/// running, `indeterminate` when the replay body says so, `replayed` otherwise.
+std::string_view replay_counter_outcome(const WorkflowExecuteOutcome& o) {
+    if (o.replay_status == kReplayRunning)
+        return "in_progress";
+    if (o.replay_status == kReplayIndeterminate)
+        return kWorkflowRunIdempotentIndeterminate;
+    return "replayed";
+}
+
+/// Counts the run's first answer on `kWorkflowRunOutcomeMetric`. Never throws.
+void count_run_outcome(const WorkflowExecutePorts& ports, std::string_view outcome,
+                       std::string_view reason) noexcept {
+    if (!ports.count_run_outcome)
+        return;
+    try {
+        ports.count_run_outcome(outcome, reason);
     } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
     }
 }
@@ -502,7 +523,7 @@ std::optional<WorkflowExecuteOutcome> check_workflow_idempotency(const WorkflowE
         std::string(kActionExecute), "success", target_id,
         workflow_audit_prefix(req) + " execution_id=" + clip_token(run.execution_id) +
             " idempotent_replay=true run_status=" + o.replay_status + key_detail);
-    count_idempotent(ports, "replayed");
+    count_idempotent(ports, replay_counter_outcome(o));
     return o;
 }
 
@@ -542,6 +563,116 @@ std::string_view workflow_run_outcome_token(WorkflowRunOutcome outcome) {
         return "aborted";
     }
     return "failed";
+}
+
+namespace {
+
+/// The zero-reach causes a workflow step's dispatch can note (`classify_zero_reach` minus
+/// `invalid_scope`: a workflow names its agents, so the dispatch never parses a scope).
+constexpr std::array<std::string_view, 7> kStepZeroReachCauses{
+    zero_reach_token(ZeroReachCause::ContainmentUnreadable),
+    zero_reach_token(ZeroReachCause::RouteUnreadable),
+    zero_reach_token(ZeroReachCause::OsGateUnreadable),
+    zero_reach_token(ZeroReachCause::Generic),
+    zero_reach_token(ZeroReachCause::Quarantined),
+    zero_reach_token(ZeroReachCause::PluginNotFound),
+    zero_reach_token(ZeroReachCause::KillSwitchedOs)};
+
+constexpr std::string_view kReasonDeadlineExceeded = "deadline_exceeded";
+constexpr std::string_view kReasonServerShutdown = "server_shutdown";
+constexpr std::string_view kReasonLateDenied = "late_denied";
+constexpr std::string_view kReasonDefinitionChanged = "definition_changed";
+constexpr std::string_view kReasonRunFailed = "run_failed";
+
+std::vector<WorkflowRunOutcomeSeries> build_outcome_series() {
+    std::vector<WorkflowRunOutcomeSeries> v;
+    const auto outcome = [](WorkflowRunOutcome o) { return workflow_run_outcome_token(o); };
+    v.push_back({outcome(WorkflowRunOutcome::kSucceeded), kWorkflowRunReasonNone});
+    v.push_back({outcome(WorkflowRunOutcome::kPartial), kWorkflowRunReasonNone});
+    v.push_back({outcome(WorkflowRunOutcome::kInterrupted), kReasonServerShutdown});
+    for (const auto cause : kStepZeroReachCauses)
+        v.push_back({outcome(WorkflowRunOutcome::kFailed), cause});
+    v.push_back({outcome(WorkflowRunOutcome::kFailed), kReasonRunFailed});
+    v.push_back({outcome(WorkflowRunOutcome::kFailed), kWorkflowRunReasonDispatchException});
+    for (const auto reason : {kReasonDeadlineExceeded, kReasonServerShutdown,
+                              kReasonCredentialRevoked, kReasonCredentialIndeterminate,
+                              kReasonLateDenied, kReasonDefinitionChanged})
+        v.push_back({outcome(WorkflowRunOutcome::kAborted), reason});
+    for (const auto cause : kStepZeroReachCauses)
+        v.push_back({outcome(WorkflowRunOutcome::kAborted), cause});
+    return v;
+}
+
+} // namespace
+
+const std::vector<WorkflowRunOutcomeSeries>& workflow_run_outcome_series() {
+    static const std::vector<WorkflowRunOutcomeSeries> series = build_outcome_series();
+    return series;
+}
+
+std::string_view workflow_run_outcome_reason(const WorkflowExecuteOutcome& o) {
+    if (o.deadline_exceeded)
+        return kReasonDeadlineExceeded;
+    if (o.interrupted)
+        return kReasonServerShutdown;
+    if (o.credential_stop == kReasonCredentialRevoked)
+        return kReasonCredentialRevoked;
+    if (o.credential_stop == kReasonCredentialIndeterminate)
+        return kReasonCredentialIndeterminate;
+    if (o.status == WorkflowExecuteStatus::kNoAgentsReached) {
+        for (const auto& known : workflow_run_outcome_series()) {
+            if (known.reason == o.reason)
+                return known.reason; // the series' own constant: the view never aliases `o`
+        }
+        return kWorkflowRunReasonNone;
+    }
+    if (o.run_outcome == WorkflowRunOutcome::kAborted) {
+        for (const auto& n : o.steps) {
+            if (n.agents_reached == 0 && n.reason == kReasonDefinitionChanged)
+                return kReasonDefinitionChanged;
+            if (n.agents_reached == 0 && n.reason == kReasonLateDenied)
+                return kReasonLateDenied;
+        }
+        return kReasonLateDenied;
+    }
+    return kWorkflowRunReasonNone;
+}
+
+std::function<void(std::string_view, std::string_view)>
+make_workflow_run_outcome_counter(yuzu::MetricsRegistry* metrics) {
+    if (!metrics)
+        return {};
+    return [metrics](std::string_view outcome, std::string_view reason) {
+        try {
+            metrics
+                ->counter(kWorkflowRunOutcomeMetric,
+                          {{"outcome", std::string(outcome)}, {"reason", std::string(reason)}})
+                .increment();
+        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
+        }
+    };
+}
+
+void seed_workflow_run_metrics(yuzu::MetricsRegistry& metrics) {
+    for (const auto reason : workflow_target_reject_reasons())
+        metrics.counter("yuzu_server_dispatch_target_rejected_total",
+                        {{"route", "workflow"}, {"reason", std::string(reason)}});
+    for (const auto reason : kWorkflowRunRefusedReasons)
+        metrics.counter(kWorkflowRunRefusedMetric, {{"reason", std::string(reason)}});
+    for (const auto outcome : kWorkflowRunIdempotentOutcomes)
+        metrics.counter(kWorkflowRunIdempotentMetric, {{"outcome", std::string(outcome)}});
+    for (const auto& series : workflow_run_outcome_series())
+        metrics.counter(kWorkflowRunOutcomeMetric, {{"outcome", std::string(series.outcome)},
+                                                    {"reason", std::string(series.reason)}});
+}
+
+std::vector<std::string_view> workflow_target_reject_reasons() {
+    return {kReasonBodyType,           kReasonScopeUnsupported,
+            kReasonWorkflowAgentIdsRequired, kReasonAgentIdsType,
+            kReasonAgentIdsEmpty,      kReasonAgentIdType,
+            kReasonWorkflowAgentIdsCount, kReasonWorkflowAgentIdLen,
+            kReasonDestructiveUntargeted, kReasonForensicUntargeted,
+            kReasonDestructiveNoVisibleTarget};
 }
 
 WorkflowRunOutcome classify_workflow_run(std::string_view run_status, const WorkflowRunFacts& facts,
@@ -1287,7 +1418,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
         WorkflowExecuteOutcome o = replay_outcome(
             ports, WorkflowIdempotentRun{won.execution_id, won.workflow_id, won.fingerprint,
                                          won.status, won.started_at});
-        count_idempotent(ports, o.replay_status == kReplayRunning ? "in_progress" : "replayed");
+        count_idempotent(ports, replay_counter_outcome(o));
         return o;
     }
     if (!run) {
@@ -1440,6 +1571,10 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                      o.interrupted || !o.credential_stop.empty()
                  ? " reason=" + o.reason
                  : ""));
+    // The first answer of a classified run, once: after the evidence row, and never able to
+    // change the answer. A replay, a refusal and a lost claim race returned above.
+    count_run_outcome(ports, workflow_run_outcome_token(o.run_outcome),
+                      workflow_run_outcome_reason(o));
     // The legacy route's event: the engine admitted and ran this call, so it is published whatever
     // the outcome (a failed run is still a run). Last, after the evidence row, and never able to
     // change the answer.
@@ -1529,6 +1664,8 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
             ports.count_run_threw();
     } catch (...) { // NOLINT(bugprone-empty-catch): observability must not fail the answer
     }
+    count_run_outcome(ports, workflow_run_outcome_token(WorkflowRunOutcome::kFailed),
+                      kWorkflowRunReasonDispatchException);
     threw.agents_sent = progress.agents_sent;
     threw.late_denied = progress.late_denied;
     try {

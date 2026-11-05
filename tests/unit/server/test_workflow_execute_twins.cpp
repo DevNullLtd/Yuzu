@@ -201,6 +201,8 @@ struct Fx {
     std::string seen_control_principal;
     std::string seen_control_cid;
     std::map<std::string, int> idem_counts;
+    /// Every (outcome, reason) the run counted, in order (`count_run_outcome`).
+    std::vector<std::pair<std::string, std::string>> run_outcomes;
     /// Called by the stand-in engine right before it claims: lets a test bind a competing run
     /// AFTER the pre-check said "none" (the lost race).
     std::function<void(const WorkflowIdempotencyClaim&)> before_claim;
@@ -517,6 +519,9 @@ struct Fx {
         p.count_dispatch_denied = [this](std::string_view r) { counted_denials.emplace_back(r); };
         p.count_run_threw = [this] { ++run_threw_count; };
         p.count_idempotent = [this](std::string_view o) { ++idem_counts[std::string(o)]; };
+        p.count_run_outcome = [this](std::string_view o, std::string_view r) {
+            run_outcomes.emplace_back(std::string(o), std::string(r));
+        };
         p.now_epoch = [this] { return fixed_now; };
         if (wire_emit)
             p.emit = [this](std::string_view type, const json& attrs, const json& payload) {
@@ -2026,6 +2031,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: success is 202 with the run and 
     REQUIRE(r.saw_caller);
     CHECK(r.seen_caller.principal == "alice");
     CHECK(r.seen_caller.approval_provenance == ApprovalProvenance::None);
+    // The adapter wired the run-outcome counter: one run, one `succeeded` / `none`.
+    CHECK(r.metrics.counter(kWorkflowRunOutcomeMetric, {{"outcome", "succeeded"}, {"reason", "none"}})
+              .value() == 1);
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: a run the engine ended FAILED after a send is a 202 "
@@ -2046,6 +2054,8 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a run the engine ended FAILED af
     CHECK(at_path(j, "/data/steps/0/agents_reached") == 1);
     CHECK(r.fx.events.back() == "audit:failure");
     CHECK(r.fx.audit_details.back().find("run_outcome=partial") != std::string::npos);
+    CHECK(r.metrics.counter(kWorkflowRunOutcomeMetric, {{"outcome", "partial"}, {"reason", "none"}})
+              .value() == 1);
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: a step refused at send time after step 1 was sent is a "
@@ -3444,7 +3454,12 @@ TEST_CASE("idempotency: a FAILED, cancelled, RUNNING, stale-running or unknown-s
         } else {
             CHECK_FALSE(j.contains("retry_after_ms"));
             CHECK(j["retryable"] == false);
-            CHECK(fx.idem_counts == std::map<std::string, int>{{"replayed", 1}});
+            // `indeterminate` is split out of `replayed`: a stale or unprovable run is its own series.
+            CHECK(fx.idem_counts ==
+                  (std::string_view(row.expect) == "indeterminate"
+                       ? std::map<std::string, int>{{"indeterminate", 1}}
+                       : std::map<std::string, int>{{"replayed", 1}}));
+            CHECK(fx.run_outcomes.empty()); // a replay never counts a run outcome
         }
         if (std::string_view(row.expect) == "indeterminate") {
             CHECK(j["remediation"].get<std::string>().find("get_workflow_execution") !=
@@ -3744,11 +3759,256 @@ TEST_CASE("workflow execute: the zero-reach status list is closed, matches what 
 }
 
 TEST_CASE("idempotency: the idempotent counter's outcome set is closed", "[workflow][twin][idempotency]") {
-    REQUIRE(kWorkflowRunIdempotentOutcomes.size() == 3);
+    REQUIRE(kWorkflowRunIdempotentOutcomes.size() == 4);
     CHECK(kWorkflowRunIdempotentOutcomes[0] == "replayed");
     CHECK(kWorkflowRunIdempotentOutcomes[1] == "in_progress");
     CHECK(kWorkflowRunIdempotentOutcomes[2] == "conflict");
+    CHECK(kWorkflowRunIdempotentOutcomes[3] == "indeterminate");
+    CHECK(kWorkflowRunIdempotentOutcomes[3] == kWorkflowRunIdempotentIndeterminate);
     CHECK(std::string(kWorkflowRunIdempotentMetric) == "yuzu_server_workflow_run_idempotent_total");
+}
+
+TEST_CASE("run outcome counter: the closed (outcome, reason) set is reachable-only, unique, and tied to "
+          "the classifier's own tokens",
+          "[workflow][twin][outcome][metrics]") {
+    const auto& series = workflow_run_outcome_series();
+    CHECK(std::string(kWorkflowRunOutcomeMetric) == "yuzu_server_workflow_run_outcome_total");
+    // No pair twice, and every outcome token is one the classifier names.
+    std::set<std::pair<std::string, std::string>> seen;
+    std::set<std::string> outcomes;
+    for (const auto& s : series) {
+        INFO(s.outcome << "/" << s.reason);
+        CHECK(seen.emplace(std::string(s.outcome), std::string(s.reason)).second);
+        outcomes.emplace(std::string(s.outcome));
+    }
+    std::set<std::string> tokens;
+    for (const auto o : {WorkflowRunOutcome::kSucceeded, WorkflowRunOutcome::kFailed,
+                         WorkflowRunOutcome::kPartial, WorkflowRunOutcome::kInterrupted,
+                         WorkflowRunOutcome::kAborted})
+        tokens.emplace(std::string(workflow_run_outcome_token(o)));
+    CHECK(outcomes == tokens);
+    CHECK(series.size() == 25);
+    // Each zero-reach cause the dispatch can note is a `failed` AND an `aborted` reason; `invalid_scope`
+    // is not (a workflow names its agents).
+    for (const auto cause : {ZeroReachCause::ContainmentUnreadable, ZeroReachCause::RouteUnreadable,
+                             ZeroReachCause::OsGateUnreadable, ZeroReachCause::Quarantined,
+                             ZeroReachCause::PluginNotFound, ZeroReachCause::KillSwitchedOs,
+                             ZeroReachCause::Generic}) {
+        const auto t = zero_reach_token(cause);
+        INFO(t);
+        CHECK(seen.count({"failed", std::string(t)}) == 1);
+        CHECK(seen.count({"aborted", std::string(t)}) == 1);
+    }
+    CHECK(seen.count({"failed", std::string(zero_reach_token(ZeroReachCause::InvalidScope))}) == 0);
+    // Every reason the zero-reach status list names for a run is in the vocabulary (the list is
+    // the pinned contract of what a 503 / MCP status can say), so a cause added there without a
+    // series fails here.
+    std::set<std::string> reasons;
+    for (const auto& s : series)
+        reasons.emplace(std::string(s.reason));
+    for (const auto r : kWorkflowZeroReachStatuses)
+        CHECK(reasons.count(std::string(r)) == 1);
+    for (const char* r : {"credential_revoked", "credential_indeterminate", "server_shutdown",
+                          "dispatch_exception", "none"})
+        CHECK(reasons.count(r) == 1);
+}
+
+TEST_CASE("run outcome counter: workflow_run_outcome_reason folds an unknown reason to none and never "
+          "aliases the outcome",
+          "[workflow][twin][outcome][metrics]") {
+    WorkflowExecuteOutcome o;
+    o.status = WorkflowExecuteStatus::kNoAgentsReached;
+    o.run_outcome = WorkflowRunOutcome::kFailed;
+    o.reason = "some_future_cause";
+    CHECK(workflow_run_outcome_reason(o) == kWorkflowRunReasonNone);
+    o.reason = "quarantined";
+    CHECK(workflow_run_outcome_reason(o) == "quarantined");
+    // The deadline, the stopping server and the credential check outrank a zero-reach cause, in
+    // the order the closing audit row reads them.
+    o.deadline_exceeded = true;
+    CHECK(workflow_run_outcome_reason(o) == "deadline_exceeded");
+    o.deadline_exceeded = false;
+    o.interrupted = true;
+    CHECK(workflow_run_outcome_reason(o) == "server_shutdown");
+    o.interrupted = false;
+    o.credential_stop = std::string(kReasonCredentialIndeterminate);
+    CHECK(workflow_run_outcome_reason(o) == "credential_indeterminate");
+    o.credential_stop = "something_else";
+    CHECK(workflow_run_outcome_reason(o) == "quarantined");
+}
+
+TEST_CASE("run outcome counter: each classifier class is counted once with its reason, a replay counts "
+          "nothing, a refusal counts nothing",
+          "[workflow][twin][outcome][metrics]") {
+    const auto only = [](const Fx& f) {
+        REQUIRE(f.run_outcomes.size() == 1);
+        return f.run_outcomes.front();
+    };
+    using Pair = std::pair<std::string, std::string>;
+    SECTION("succeeded / none") {
+        Fx f;
+        CHECK(f.run(f.request()).status == WorkflowExecuteStatus::kOk);
+        CHECK(only(f) == Pair{"succeeded", "none"});
+    }
+    SECTION("failed / the dominant zero-reach cause") {
+        Fx f;
+        ConfinedDispatchOutcome zero;
+        zero.denied_quarantined_count = 1;
+        f.outcomes["i-ro"] = zero;
+        CHECK(f.run(f.request()).status == WorkflowExecuteStatus::kNoAgentsReached);
+        CHECK(only(f) == Pair{"failed", "quarantined"});
+    }
+    SECTION("failed / run_failed: the engine ended the run before any dispatch") {
+        Fx f;
+        f.engine_status = "failed";
+        auto a = f.api();
+        auto p = f.ports(a);
+        p.run = [&](const std::string&, const std::vector<std::string>&, StepDispatchFn,
+                    ConditionEvalFn, const WorkflowRunControl& control)
+            -> std::expected<std::string, std::string> {
+            if (control.on_admitted)
+                control.on_admitted("exec-1");
+            return std::string{"exec-1"};
+        };
+        CHECK(apply_workflow_execute(p, f.request()).reason == "run_failed");
+        CHECK(only(f) == Pair{"failed", "run_failed"});
+    }
+    SECTION("failed / dispatch_exception: the run threw after its requested row") {
+        Fx f;
+        f.dispatch_override = [](const WorkflowStepInstruction&, const std::vector<std::string>&,
+                                 const DispatchCaller&) -> ConfinedDispatchOutcome {
+            throw std::runtime_error("boom");
+        };
+        CHECK(f.run(f.request()).status == WorkflowExecuteStatus::kRunFailed);
+        CHECK(only(f) == Pair{"failed", "dispatch_exception"});
+        CHECK(f.run_threw_count == 1);
+    }
+    SECTION("aborted / late_denied and definition_changed, sent or not") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
+        CHECK(f.run(f.request()).run_outcome == WorkflowRunOutcome::kAborted);
+        CHECK(only(f) == Pair{"aborted", "late_denied"});
+        Fx g;
+        g.step_ids = {"i-ro", "i-ro2"};
+        g.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        g.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_uptime");
+        auto req = g.request();
+        req.expected_step_effects = WorkflowStepEffects{
+            {"i-ro", workflow_step_effect(g.defs["i-ro"])},
+            {"i-ro2", workflow_step_effect(g.defs["i-ro2"])}};
+        CHECK(g.run(req).run_outcome == WorkflowRunOutcome::kAborted);
+        CHECK(only(g) == Pair{"aborted", "definition_changed"});
+    }
+    SECTION("aborted / credential_revoked") {
+        Fx f;
+        f.step_ids = {"i-ro", "i-ro2"};
+        f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+        f.engine_status = "failed";
+        f.wire_reauth = true;
+        f.reauth_answers = {auth::CredentialCheck::kValid, auth::CredentialCheck::kRevoked};
+        CHECK(f.run(f.request()).credential_stop == kReasonCredentialRevoked);
+        CHECK(only(f) == Pair{"aborted", "credential_revoked"});
+    }
+    SECTION("aborted / deadline_exceeded") {
+        Fx f;
+        f.engine_status = "failed";
+        auto req = f.request();
+        req.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        CHECK(f.run(req).deadline_exceeded);
+        CHECK(only(f) == Pair{"aborted", "deadline_exceeded"});
+    }
+    SECTION("interrupted / server_shutdown") {
+        Fx f;
+        f.engine_status = "failed";
+        f.interrupt_before_step = 0;
+        CHECK(f.run(f.request()).interrupted);
+        CHECK(only(f) == Pair{"interrupted", "server_shutdown"});
+    }
+    SECTION("a replay and a refusal count no outcome; the replay moves the idempotent counter") {
+        Fx f;
+        f.bind("alice", kKey, "completed");
+        CHECK(f.run(keyed(f)).status == WorkflowExecuteStatus::kIdempotentReplay);
+        Fx r;
+        r.defs.clear(); // an unknown instruction: refused at the preflight, nothing started
+        CHECK(r.run(r.request()).status != WorkflowExecuteStatus::kOk);
+        CHECK(f.run_outcomes.empty());
+        CHECK(r.run_outcomes.empty());
+        CHECK(f.idem_counts == std::map<std::string, int>{{"replayed", 1}});
+    }
+    SECTION("a counter that throws never changes the answer") {
+        Fx f;
+        auto a = f.api();
+        auto p = f.ports(a);
+        p.count_run_outcome = [](std::string_view, std::string_view) { throw std::runtime_error("x"); };
+        CHECK(apply_workflow_execute(p, f.request()).status == WorkflowExecuteStatus::kOk);
+    }
+}
+
+TEST_CASE("workflow run metrics: seeding creates every closed-set series at 0 and nothing outside the set",
+          "[workflow][twin][outcome][metrics]") {
+    yuzu::MetricsRegistry m;
+    seed_workflow_run_metrics(m);
+    const auto text = m.serialize();
+    const auto has_zero = [&](const std::string& series) {
+        return text.find(series + " 0\n") != std::string::npos;
+    };
+    const auto count_of = [&](const std::string& prefix) {
+        std::size_t n = 0;
+        for (std::size_t at = text.find(prefix); at != std::string::npos;
+             at = text.find(prefix, at + 1))
+            ++n;
+        return n;
+    };
+    for (const auto reason : workflow_target_reject_reasons())
+        CHECK(has_zero("yuzu_server_dispatch_target_rejected_total{route=\"workflow\",reason=\"" +
+                       std::string(reason) + "\"}"));
+    CHECK(count_of("yuzu_server_dispatch_target_rejected_total{") == 11);
+    for (const auto reason : kWorkflowRunRefusedReasons)
+        CHECK(has_zero(std::string(kWorkflowRunRefusedMetric) + "{reason=\"" + std::string(reason) +
+                       "\"}"));
+    for (const auto outcome : kWorkflowRunIdempotentOutcomes)
+        CHECK(has_zero(std::string(kWorkflowRunIdempotentMetric) + "{outcome=\"" +
+                       std::string(outcome) + "\"}"));
+    CHECK(count_of(std::string(kWorkflowRunIdempotentMetric) + "{") == 4);
+    for (const auto& series : workflow_run_outcome_series())
+        CHECK(has_zero(std::string(kWorkflowRunOutcomeMetric) + "{outcome=\"" +
+                       std::string(series.outcome) + "\",reason=\"" + std::string(series.reason) +
+                       "\"}"));
+    CHECK(count_of(std::string(kWorkflowRunOutcomeMetric) + "{") ==
+          workflow_run_outcome_series().size());
+    // Counting a seeded pair moves it and adds no series: the label set stays closed.
+    make_workflow_run_outcome_counter(&m)("failed", "quarantined");
+    CHECK(count_of(std::string(kWorkflowRunOutcomeMetric) + "{") ==
+          workflow_run_outcome_series().size());
+}
+
+TEST_CASE("run outcome counter: the production counter writes the pre-seeded series, and the target "
+          "reject reasons of route=workflow are a closed, de-duplicated set",
+          "[workflow][twin][outcome][metrics]") {
+    yuzu::MetricsRegistry m;
+    const auto count = make_workflow_run_outcome_counter(&m);
+    REQUIRE(count);
+    count("aborted", "deadline_exceeded");
+    count("aborted", "deadline_exceeded");
+    CHECK(m.counter(kWorkflowRunOutcomeMetric,
+                    {{"outcome", "aborted"}, {"reason", "deadline_exceeded"}})
+              .value() == 2);
+    CHECK_FALSE(make_workflow_run_outcome_counter(nullptr));
+
+    const auto reasons = workflow_target_reject_reasons();
+    CHECK(reasons.size() == 11);
+    CHECK(std::set<std::string_view>(reasons.begin(), reasons.end()).size() == reasons.size());
+    for (const auto r : {kReasonBodyType, kReasonScopeUnsupported, kReasonAgentIdsType,
+                         kReasonAgentIdsEmpty, kReasonAgentIdType, kReasonDestructiveUntargeted,
+                         kReasonForensicUntargeted, kReasonDestructiveNoVisibleTarget,
+                         kReasonWorkflowAgentIdsRequired, kReasonWorkflowAgentIdsCount,
+                         kReasonWorkflowAgentIdLen})
+        CHECK(std::find(reasons.begin(), reasons.end(), r) != reasons.end());
+    // `scope` is refused before the shape check can see it, so these three are unreachable here.
+    for (const auto r : {kReasonScopeType, kReasonScopeEmpty, kReasonTargetConflict})
+        CHECK(std::find(reasons.begin(), reasons.end(), r) == reasons.end());
 }
 
 // ── the REST route ───────────────────────────────────────────────────────────────────────────
@@ -4022,6 +4282,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a lost clai
     CHECK(res->get_header_value("Retry-After") == "2");
     CHECK_FALSE(r.fx.dispatched_anything());
     CHECK(r.budget.active() == 0);
+    // The loser started nothing: it counts the idempotent answer, never a run outcome.
+    CHECK(r.metrics.counter(kWorkflowRunIdempotentMetric, {{"outcome", "in_progress"}}).value() == 1);
+    CHECK(r.metrics.serialize().find(kWorkflowRunOutcomeMetric) == std::string::npos);
 }
 
 // ── REPLAY PARITY (#2146 hp2-1, hp2-2): the replay says what the first answer said ──────────────
@@ -4047,6 +4310,9 @@ struct ParityRun {
     std::string first_class;
     long dispatches_after_first{0};
     long dispatches_after_replay{0};
+    std::vector<std::pair<std::string, std::string>> outcomes_after_first;
+    std::vector<std::pair<std::string, std::string>> outcomes_after_replay;
+    std::map<std::string, int> idem_after_replay;
 };
 
 long dispatch_count(const Fx& f) {
@@ -4062,14 +4328,30 @@ ParityRun run_then_replay(Fx& f, WorkflowExecuteRequest req) {
     p.first = f.run(req);
     p.first_class = first_answer_class(p.first);
     p.dispatches_after_first = dispatch_count(f);
+    p.outcomes_after_first = f.run_outcomes;
     p.replay = f.run(req);
     p.dispatches_after_replay = dispatch_count(f);
+    p.outcomes_after_replay = f.run_outcomes;
+    p.idem_after_replay = f.idem_counts;
     return p;
 }
 
-void expect_parity(const ParityRun& p, std::string_view expected_class) {
+void expect_parity(const ParityRun& p, std::string_view expected_class,
+                   std::string_view expected_reason) {
     INFO("first answer class " << p.first_class);
     CHECK(p.first_class == expected_class);
+    // The first answer counts the run ONCE, as its class, with the reason the classifier gives,
+    // and that pair is in the pre-seeded closed set; the replay counts nothing.
+    REQUIRE(p.outcomes_after_first.size() == 1);
+    CHECK(p.outcomes_after_first.front().first == expected_class);
+    CHECK(p.outcomes_after_first.front().second == expected_reason);
+    const auto& series = workflow_run_outcome_series();
+    CHECK(std::find(series.begin(), series.end(),
+                    WorkflowRunOutcomeSeries{p.outcomes_after_first.front().first,
+                                             p.outcomes_after_first.front().second}) != series.end());
+    CHECK(p.outcomes_after_replay == p.outcomes_after_first);
+    // The replay moves the idempotent counter instead: `replayed` for a run the rows prove.
+    CHECK(p.idem_after_replay == std::map<std::string, int>{{"replayed", 1}});
     REQUIRE(p.replay.status == WorkflowExecuteStatus::kIdempotentReplay);
     // The replay is the first answer's class, and `completed` is its word for `succeeded` alone.
     const std::string want = expected_class == "succeeded" ? "completed" : std::string(expected_class);
@@ -4094,7 +4376,7 @@ TEST_CASE("replay parity: a succeeded run replays `completed`, and nothing else 
     f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
     const auto p = run_then_replay(f, f.request());
     CHECK(p.first.status == WorkflowExecuteStatus::kOk);
-    expect_parity(p, "succeeded");
+    expect_parity(p, "succeeded", "none");
 }
 
 TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves the engine `completed`, "
@@ -4110,7 +4392,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.run_status == "completed"); // the engine's word, which the replay must not echo
         CHECK(p.replay.run_status == "completed");
-        expect_parity(p, "partial");
+        expect_parity(p, "partial", "none");
     }
     SECTION("the FIRST step reached nobody and a later one did") {
         Fx f;
@@ -4119,7 +4401,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         ConfinedDispatchOutcome zero;
         zero.denied_quarantined_count = 1;
         f.outcomes["i-ro"] = zero;
-        expect_parity(run_then_replay(f, f.request()), "partial");
+        expect_parity(run_then_replay(f, f.request()), "partial", "none");
     }
     SECTION("no step reached anyone: failed on both") {
         Fx f;
@@ -4131,7 +4413,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         f.outcomes["i-ro2"] = zero;
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.status == WorkflowExecuteStatus::kNoAgentsReached);
-        expect_parity(p, "failed");
+        expect_parity(p, "failed", "quarantined");
     }
     SECTION("two steps naming the SAME instruction: the failed one is not hidden by the one that reached") {
         Fx f;
@@ -4151,7 +4433,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         REQUIRE(p.first.steps.size() == 2);
         CHECK(p.first.steps[0].step_index == 0);
         CHECK(p.first.steps[1].step_index == 1);
-        expect_parity(p, "partial");
+        expect_parity(p, "partial", "none");
     }
 }
 
@@ -4189,7 +4471,7 @@ TEST_CASE("replay parity: a step retried to success is `completed` with run_outc
     CHECK(j.at("steps").at(0).at("attempt") == 1);
     CHECK(j.at("steps").at(1).at("attempt") == 2);
     CHECK_FALSE(j.contains("retryable"));
-    expect_parity(p, "succeeded");
+    expect_parity(p, "succeeded", "none");
 
     SECTION("still failing on the last attempt is not rescued by an earlier or later note") {
         Fx g;
@@ -4199,7 +4481,7 @@ TEST_CASE("replay parity: a step retried to success is `completed` with run_outc
         g.outcomes["i-ro"] = zero;
         const auto q = run_then_replay(g, g.request());
         CHECK(q.first.steps.size() == 2);
-        expect_parity(q, "failed");
+        expect_parity(q, "failed", "quarantined");
     }
 }
 
@@ -4213,7 +4495,7 @@ TEST_CASE("replay parity: a step refused at send time (late_denied, definition_c
         f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.late_denied);
-        expect_parity(p, "aborted");
+        expect_parity(p, "aborted", "late_denied");
     }
     SECTION("late_denied as the FIRST step, with the engine's run closed failed") {
         Fx f;
@@ -4221,7 +4503,7 @@ TEST_CASE("replay parity: a step refused at send time (late_denied, definition_c
         f.late_defs["i-ro"] = def("i-ro", "os_info", "os_version", "always");
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.late_denied);
-        expect_parity(p, "aborted");
+        expect_parity(p, "aborted", "late_denied");
     }
     SECTION("definition_changed: the step moved off the effect the ticket was bound to") {
         Fx f;
@@ -4234,7 +4516,7 @@ TEST_CASE("replay parity: a step refused at send time (late_denied, definition_c
             {"i-ro2", workflow_step_effect(f.defs["i-ro2"])}};
         const auto p = run_then_replay(f, req);
         CHECK(p.first.late_denied);
-        expect_parity(p, "aborted");
+        expect_parity(p, "aborted", "definition_changed");
     }
 }
 
@@ -4248,7 +4530,7 @@ TEST_CASE("replay parity: a run the server's shutdown ended is interrupted on bo
         f.interrupt_before_step = 1;
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.interrupted);
-        expect_parity(p, "interrupted");
+        expect_parity(p, "interrupted", "server_shutdown");
     }
     SECTION("before anything was sent") {
         Fx f;
@@ -4256,7 +4538,7 @@ TEST_CASE("replay parity: a run the server's shutdown ended is interrupted on bo
         f.interrupt_before_step = 0;
         const auto p = run_then_replay(f, f.request());
         CHECK_FALSE(f.dispatched_anything());
-        expect_parity(p, "interrupted");
+        expect_parity(p, "interrupted", "server_shutdown");
     }
 }
 
@@ -4271,7 +4553,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         f.reauth_answers = {auth::CredentialCheck::kValid, auth::CredentialCheck::kRevoked};
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.credential_stop == kReasonCredentialRevoked);
-        expect_parity(p, "aborted");
+        expect_parity(p, "aborted", "credential_revoked");
     }
     SECTION("the credential could not be confirmed before the first step: nothing was sent") {
         Fx f;
@@ -4281,7 +4563,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         const auto p = run_then_replay(f, f.request());
         CHECK_FALSE(f.dispatched_anything());
         CHECK(p.first.credential_stop == kReasonCredentialIndeterminate);
-        expect_parity(p, "aborted");
+        expect_parity(p, "aborted", "credential_indeterminate");
     }
     SECTION("the deadline passed between step 1 and step 2") {
         Fx f;
@@ -4298,7 +4580,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         };
         const auto p = run_then_replay(f, req);
         CHECK(p.first.deadline_exceeded);
-        expect_parity(p, "aborted");
+        expect_parity(p, "aborted", "deadline_exceeded");
     }
     SECTION("the deadline had passed before the first attempt: nothing was sent") {
         Fx f;
@@ -4308,7 +4590,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         const auto p = run_then_replay(f, req);
         CHECK_FALSE(f.dispatched_anything());
         CHECK(p.first.deadline_exceeded);
-        expect_parity(p, "aborted");
+        expect_parity(p, "aborted", "deadline_exceeded");
     }
 }
 
@@ -4330,12 +4612,12 @@ TEST_CASE("replay parity: a run whose dispatch threw is failed on both answers, 
         CHECK(p.first.status == WorkflowExecuteStatus::kRunFailed);
         // Step 1's send was real: the replay still calls the run failed, as the first answer did,
         // and never completed.
-        expect_parity(p, "failed");
+        expect_parity(p, "failed", "dispatch_exception");
     }
     SECTION("the engine ended failed although every attempted step reached an agent") {
         Fx f;
         f.engine_status = "failed";
-        expect_parity(run_then_replay(f, f.request()), "partial");
+        expect_parity(run_then_replay(f, f.request()), "partial", "none");
     }
 }
 
@@ -4412,6 +4694,12 @@ TEST_CASE("replay parity: rows that cannot prove an outcome are never `completed
         REQUIRE(out.status == WorkflowExecuteStatus::kIdempotentReplay);
         CHECK(out.replay_status == row.expect);
         CHECK_FALSE(f.dispatched_anything());
+        // Only an unprovable run lands on `indeterminate`; every other terminal answer is `replayed`.
+        CHECK(f.idem_counts ==
+              (std::string_view(row.expect) == "indeterminate"
+                   ? std::map<std::string, int>{{"indeterminate", 1}}
+                   : std::map<std::string, int>{{"replayed", 1}}));
+        CHECK(f.run_outcomes.empty());
     }
     SECTION("the two reads of the run disagree on its terminal status: the rows are not believed") {
         Fx f;

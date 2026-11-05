@@ -172,7 +172,7 @@
 ///     `success` row `idempotent_replay=true run_status=<replay status>`; a `running` replay writes NONE
 ///     (a client polling every 2 s would write 30 rows a minute; the counter is its record). The
 ///     key is neutralised (`clip_token`) in every detail. `yuzu_server_workflow_run_idempotent_total
-///     {outcome=replayed|in_progress|conflict}` counts them.
+///     {outcome=replayed|in_progress|conflict|indeterminate}` counts them.
 ///   * RETENTION: none. The key lives with its run row and nothing deletes that row; any future
 ///     prune of the run table owns the clock-guarded-retention obligation.
 ///
@@ -260,12 +260,17 @@ inline constexpr std::chrono::seconds kIdempotentRunStaleAfter{180};
 inline constexpr std::int64_t kIdempotentRunningRetryAfterMs = 2000;
 
 /// `yuzu_server_workflow_run_idempotent_total{outcome}`: a repeat of an idempotency key that was
-/// answered without sending anything. `replayed` (a terminal run: completed, failed or
-/// indeterminate), `in_progress` (the run is still running) and `conflict` (the same key with a
-/// different request). A closed set, every member pre-seeded to 0 at boot.
+/// answered without sending anything. `replayed` (a terminal run the stored rows prove:
+/// completed, partial, failed, aborted or interrupted), `in_progress` (the run is still
+/// running), `conflict` (the same key with a different request) and `indeterminate` (the replay
+/// body's own `indeterminate` status: a run the rows cannot prove an outcome for, or a `running`
+/// row older than `kIdempotentRunStaleAfter`). `indeterminate` is split out of `replayed` because
+/// it is the one answer that tells a worker it cannot know whether the steps were sent. A closed
+/// set, every member pre-seeded to 0 at boot.
 inline constexpr char kWorkflowRunIdempotentMetric[] = "yuzu_server_workflow_run_idempotent_total";
-inline constexpr std::array<std::string_view, 3> kWorkflowRunIdempotentOutcomes{
-    "replayed", "in_progress", "conflict"};
+inline constexpr std::string_view kWorkflowRunIdempotentIndeterminate = "indeterminate";
+inline constexpr std::array<std::string_view, 4> kWorkflowRunIdempotentOutcomes{
+    "replayed", "in_progress", "conflict", kWorkflowRunIdempotentIndeterminate};
 
 /// The `status` of a replay body (`workflow_idempotent_replay_json`). A closed set.
 inline constexpr std::string_view kReplayRunning = "running";
@@ -333,6 +338,23 @@ inline constexpr char kWorkflowRunRefusedDraining[] = "draining";
 inline constexpr std::array<std::string_view, 3> kWorkflowRunRefusedReasons{
     detail::StreamBudget::kRejectGlobal, detail::StreamBudget::kRejectPerPrincipal,
     kWorkflowRunRefusedDraining};
+
+/// The `reason` values `parse_workflow_execute_body` emits that `dispatch_target_shape.hpp` has no
+/// constant for (its route-level `agent_ids` bound checks). Named so the emit sites and the boot
+/// pre-seed (`workflow_target_reject_reasons`) share one spelling.
+inline constexpr std::string_view kReasonWorkflowAgentIdsRequired{"agent_ids_required"};
+inline constexpr std::string_view kReasonWorkflowAgentIdsCount{"agent_ids_count"};
+inline constexpr std::string_view kReasonWorkflowAgentIdLen{"agent_id_len"};
+
+/// Every `reason` the workflow-run surfaces can put on
+/// `yuzu_server_dispatch_target_rejected_total{route="workflow"}`: the body-parse refusals of
+/// `parse_workflow_execute_body` (`body_type`, `scope_unsupported`, `agent_ids_required`,
+/// `agent_ids_type`, `agent_ids_empty`, `agent_id_type`, `agent_ids_count`, `agent_id_len`), the
+/// per-step `destructive_untargeted` / `forensic_untargeted` / `destructive_no_visible_target`
+/// of the admission gate (the v1 twins and the legacy `POST /api/workflows/{id}/execute`). The
+/// boot pre-seed iterates this; `scope_type`, `scope_empty` and `target_conflict` are absent
+/// because `scope` is refused before the shape check can reach them.
+[[nodiscard]] std::vector<std::string_view> workflow_target_reject_reasons();
 
 /// The slice of an `InstructionDefinition` the sequence reads. Decoupled from the store type so
 /// the ports (and the tests) never need Postgres.
@@ -418,6 +440,11 @@ struct WorkflowExecutePorts {
     std::function<void()> count_run_threw;
     /// Optional: bumps `yuzu_server_workflow_run_idempotent_total{outcome}`.
     std::function<void(std::string_view outcome)> count_idempotent;
+    /// Optional: bumps `yuzu_server_workflow_run_outcome_total{outcome,reason}` once per run the
+    /// sequence classified (`workflow_run_outcome_reason`), or answered `kRunFailed` because it
+    /// threw. Never for a replay, a refusal or a lost claim race: those started nothing.
+    /// `make_workflow_run_outcome_counter` builds the one production implementation.
+    std::function<void(std::string_view outcome, std::string_view reason)> count_run_outcome;
     /// Optional: epoch seconds now, to age a `running` replay against `started_at` (default: the
     /// system clock, the clock the engine stamped `started_at` with). A seam for the stale test.
     std::function<std::int64_t()> now_epoch;
@@ -637,6 +664,59 @@ struct WorkflowExecuteOutcome {
     std::string replay_status;
     std::int64_t started_at{0};
 };
+
+/// `yuzu_server_workflow_run_outcome_total{outcome,reason}`: how every run the sequence started
+/// and answered ended, counted once at its FIRST answer (a replay never moves it). `outcome` is
+/// `workflow_run_outcome_token` (`succeeded`, `failed`, `partial`, `interrupted`, `aborted`);
+/// `reason` is `workflow_run_outcome_reason`: why the run was cut short or reached nobody, or
+/// `none` when it simply ran to the end. The closed pair set is `workflow_run_outcome_series`, and
+/// each pair in it is pre-seeded to 0 at boot, so a reason added to the classifier without a seed
+/// is caught by a test rather than by an `absent()` that reads "never happened".
+inline constexpr char kWorkflowRunOutcomeMetric[] = "yuzu_server_workflow_run_outcome_total";
+inline constexpr std::string_view kWorkflowRunReasonNone{"none"};
+inline constexpr std::string_view kWorkflowRunReasonDispatchException{"dispatch_exception"};
+
+struct WorkflowRunOutcomeSeries {
+    std::string_view outcome;
+    std::string_view reason;
+    bool operator==(const WorkflowRunOutcomeSeries&) const = default;
+};
+
+/// The closed set of `(outcome, reason)` pairs `workflow_run_outcome_reason` can yield with its
+/// outcome, pinned by test against every classifier scenario. Only reachable pairs:
+///   succeeded    none
+///   partial      none
+///   interrupted  server_shutdown
+///   failed       a zero-reach cause (7), run_failed, dispatch_exception (the run threw)
+///   aborted      deadline_exceeded, server_shutdown, credential_revoked,
+///                credential_indeterminate, late_denied, definition_changed, or a zero-reach
+///                cause of an earlier step that reached nobody
+[[nodiscard]] const std::vector<WorkflowRunOutcomeSeries>& workflow_run_outcome_series();
+
+/// The `reason` label of a run `drive_run` classified (`o.run_outcome` is set): the cause that
+/// cut it short, in the order the closing audit row's `reason=` reads it (the deadline, then the
+/// server stopping, then the credential check), then the dominant zero-reach cause of a run that
+/// reached nobody, then, for an `aborted` run that did send, the first step refused at send time
+/// (`late_denied`, or `definition_changed`), and `none` otherwise. A value outside the closed
+/// vocabulary is folded to `none`, never emitted: the label stays bounded whatever a future
+/// classifier change puts in `o.reason`. The thrown run is not judged here (`kRunFailed` is
+/// `failed` / `dispatch_exception`).
+[[nodiscard]] std::string_view workflow_run_outcome_reason(const WorkflowExecuteOutcome& o);
+
+/// Creates every series of the workflow-run families at 0, so `absent()` and the first `increase()`
+/// mean something: `yuzu_server_dispatch_target_rejected_total{route="workflow",reason}`
+/// (`workflow_target_reject_reasons`), `kWorkflowRunRefusedMetric{reason}`
+/// (`kWorkflowRunRefusedReasons`), `kWorkflowRunIdempotentMetric{outcome}`
+/// (`kWorkflowRunIdempotentOutcomes`) and `kWorkflowRunOutcomeMetric{outcome,reason}`
+/// (`workflow_run_outcome_series`). Called once from `ServerImpl`'s metrics setup (pinned by
+/// `tests/test_workflow_run_metrics_wiring_lexical.py`); the HELP text stays there.
+void seed_workflow_run_metrics(yuzu::MetricsRegistry& metrics);
+
+/// The production `WorkflowExecutePorts::count_run_outcome`: bumps `kWorkflowRunOutcomeMetric` on
+/// `metrics` (a null registry yields an unset function) and swallows a throw, because
+/// observability must not fail an answer. One copy for the REST and the MCP twin.
+[[nodiscard]] std::function<void(std::string_view, std::string_view)>
+make_workflow_run_outcome_counter(yuzu::MetricsRegistry* metrics);
 
 /// One step's FINAL outcome: what it came to after its last attempt, which is what the engine
 /// itself recorded for the step. A step whose first attempt reached nobody and whose retry

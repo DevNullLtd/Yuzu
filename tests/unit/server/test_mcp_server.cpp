@@ -48727,7 +48727,9 @@ TEST_CASE("MCP execute_workflow: a run where step 1 reached an agent and step 2 
     WfMcpFx fx;
     fx.seed(store);
     fx.zero_on_dispatch = 2;
+    yuzu::MetricsRegistry reg;
     McpTestServer ts;
+    ts.metrics_for_test = &reg;
     fx.wire(ts, store, appr);
     ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
     const std::string approval_id = wf_mint_and_approve(ts, appr);
@@ -48739,6 +48741,10 @@ TEST_CASE("MCP execute_workflow: a run where step 1 reached an agent and step 2 
     const auto payload = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
     CHECK(fx.dispatches == 2);
     CHECK(payload["status"] == "partial");
+    // The MCP twin wired the run-outcome counter: one run, one `partial` / `none`.
+    CHECK(reg.counter(yuzu::server::kWorkflowRunOutcomeMetric,
+                      {{"outcome", "partial"}, {"reason", "none"}})
+              .value() == 1);
     CHECK(payload["run_status"] == "completed");
     CHECK(payload["retryable"] == false);
     CHECK(payload["retry_after_ms"].is_null());

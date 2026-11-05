@@ -980,7 +980,8 @@ public:
                           "gauge");
         metrics_.describe(yuzu::server::kWorkflowRunsInFlightMetric,
                           "Synchronous workflow runs holding an HTTP worker right now (REST v1 "
-                          "execute and MCP execute_workflow); the workflow-run share of "
+                          "execute, MCP execute_workflow and the legacy "
+                          "POST /api/workflows/{id}/execute); the workflow-run share of "
                           "yuzu_http_held_open_responses. Sampled every ~15 seconds",
                           "gauge");
         metrics_.gauge(yuzu::server::kWorkflowRunsInFlightMetric).set(0);
@@ -1544,7 +1545,11 @@ public:
                           "all (#2500), plus Destructive-class capabilities targeted without "
                           "explicit agent_ids on REST (route=command, route=command_v1), MCP "
                           "execute_instruction (route=mcp) or the dashboard exec console "
-                          "(route=dashboard) (#3685). "
+                          "(route=dashboard) (#3685), plus the workflow-run surfaces "
+                          "(route=workflow: the v1 REST and MCP execute_workflow twins and the "
+                          "legacy POST /api/workflows/{id}/execute): a refused body, "
+                          "or a step that is Destructive or Forensics without explicit agent_ids "
+                          "or with no visible target. "
                           "Both labels are closed sets; every reachable pair "
                           "is pre-seeded at boot so absent() stays meaningful. The "
                           "withhold reasons quarantined, unknown_plugin and "
@@ -1582,18 +1587,13 @@ public:
         // `evaluate_destructive_targeting` into `/api/instructions/{id}/execute`
         // (workflow_routes.cpp) — `instruction_execute` too (the exclusion
         // this comment used to state, "that route has no Destructive gate
-        // yet", is stale: it does now). `workflow`: the SAME
-        // evaluate_destructive_targeting call, now run as a whole-request
-        // preflight over every step of `/api/workflows/{id}/execute` before
-        // WorkflowEngine::execute() is invoked at all — a genuinely NEW
-        // emission point, not a relabeling of the per-step dispatch_fn refusal
-        // (that refusal has no metrics/audit_fn/req access and stays a silent
-        // failed-step result by construction).
+        // yet", is stale: it does now). `workflow` is seeded below from
+        // `workflow_target_reject_reasons()` with the rest of its reachable set.
         // "dashboard" seeded alongside the other two (PR6.0b): a series created
         // only on first use reads as ABSENT until the first refusal, which is
         // exactly the absent()-alerting break the single-array discipline exists
         // to prevent -- and three docs tell operators to alert on this series.
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
@@ -1624,15 +1624,13 @@ public:
         // "never happened", not "no series yet". Nothing was read, sent or audited.
         metrics_.describe(yuzu::server::kWorkflowRunRefusedMetric,
                           "Workflow runs (POST /api/v1/workflows/{id}/execute, MCP "
-                          "execute_workflow) refused before anything was read or sent, by reason: "
+                          "execute_workflow, and the legacy POST /api/workflows/{id}/execute) "
+                          "refused before anything was read or sent, by reason: "
                           "global_stream_cap (the shared held-open budget is full; HTTP 429, MCP "
                           "-32012), per_principal_stream_cap (this principal already has 2 runs in "
                           "progress; 429), draining (the server is shutting down; HTTP 503, MCP "
                           "-32015). No audit row and no approval ticket is spent on a refusal",
                           "counter");
-        for (const auto reason : yuzu::server::kWorkflowRunRefusedReasons)
-            metrics_.counter(yuzu::server::kWorkflowRunRefusedMetric,
-                             {{"reason", std::string(reason)}});
         // Repeats of a workflow-run idempotency key answered WITHOUT sending anything, by
         // outcome: replayed (the run it is bound to is terminal), in_progress (that run is still
         // running: the caller is told to poll), conflict (the same key with a different request,
@@ -1642,16 +1640,37 @@ public:
                           "Repeats of a workflow-run idempotency key (POST /api/v1/workflows/{id}/"
                           "execute Idempotency-Key header, MCP execute_workflow idempotency_key) "
                           "answered without sending anything, by outcome: replayed (the run the "
-                          "key is bound to is completed, failed or indeterminate), in_progress "
+                          "key is bound to is terminal and its stored rows prove how it ended), "
+                          "indeterminate (the rows cannot prove it, or it has been running past "
+                          "the stale bound: the caller cannot know whether steps were sent), "
+                          "in_progress "
                           "(that run is still running; the caller polls get_workflow_execution), "
                           "conflict (the key is bound to a different request; HTTP 422, MCP "
                           "-32602, terminal). A sustained in_progress rate means clients poll by "
                           "repeating the call, which is correct; a rising conflict rate means "
                           "clients reuse keys across different requests",
                           "counter");
-        for (const auto outcome : yuzu::server::kWorkflowRunIdempotentOutcomes)
-            metrics_.counter(yuzu::server::kWorkflowRunIdempotentMetric,
-                             {{"outcome", std::string(outcome)}});
+        // How every workflow run the v1 / MCP twins started and answered ended, counted once at its
+        // first answer. The closed (outcome, reason) pair set is workflow_run_outcome_series(): only
+        // reachable pairs are seeded, so a zero is "has not happened" and never "cannot happen".
+        metrics_.describe(yuzu::server::kWorkflowRunOutcomeMetric,
+                          "Workflow runs (POST /api/v1/workflows/{id}/execute, MCP "
+                          "execute_workflow) by how the run ended, counted once when it is first "
+                          "answered; an idempotent replay never moves it. outcome is succeeded, "
+                          "partial, failed, aborted or interrupted. reason says what cut the run "
+                          "short or why it reached nobody: deadline_exceeded (the 60 second budget), "
+                          "server_shutdown, credential_revoked, credential_indeterminate (the "
+                          "caller's credential was checked before a step), late_denied or "
+                          "definition_changed (a step was refused at send time), a zero-reach cause "
+                          "(containment_unreadable, route_unreadable, os_gate_unreadable, "
+                          "no_agents_reached, quarantined, plugin_not_found, kill_switched_os), "
+                          "run_failed (the engine ended the run before any dispatch), "
+                          "dispatch_exception (the run threw after its requested audit row; steps "
+                          "may have been sent), or none. A run killed with the process, or whose "
+                          "final status write failed (yuzu_server_workflow_finalize_failed_total), "
+                          "is never counted here.",
+                          "counter");
+        yuzu::server::seed_workflow_run_metrics(metrics_);
         // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
         // `event_type` set, pre-seeded. Only the v1 / MCP twins count here (event_emit_hook.hpp);
         // the legacy routes' own emit calls do not touch this counter.
@@ -1673,7 +1692,7 @@ public:
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them
         // (a Forensics row is never Destructive, but reaches the same gate).
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
@@ -1695,10 +1714,13 @@ public:
         // as `/api/command` does, so it emits the same reason; the MCP twin shares the `mcp`
         // route label and is seeded with it. The v1 workflow run twins (REST and MCP
         // `execute_workflow`) confine each step the same way and count under `workflow`.
-        for (const char* route : {"instruction_execute", "mcp", "workflow"})
+        for (const char* route : {"instruction_execute", "mcp"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
+        // `route="workflow"` (the REST v1 and MCP `execute_workflow` twins plus the legacy
+        // `POST /api/workflows/{id}/execute`) is seeded with the other workflow-run families by
+        // `seed_workflow_run_metrics` above, from `workflow_target_reject_reasons()`.
         for (const auto reason : {yuzu::server::kReasonParentIdType,
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
@@ -1788,7 +1810,9 @@ public:
             "by which one; and, with phase=\"dispatch\" on route command_v1, "
             "instruction_execute or mcp, the dispatch call itself throwing (its execution "
             "row is left running), and, with route workflow, a workflow run throwing after its "
-            "requested audit row (the engine closes the execution failed). A well-behaved sink/helper should fail via its own "
+            "requested audit row (steps may already have been sent; the run is a workflow "
+            "execution, read with get_workflow_execution, not an executions-ledger row). A "
+            "well-behaved sink/helper should fail via its own "
             "return value, not an exception; a non-zero rate points at a bug in that sink/"
             "helper rather than at ordinary degradation.",
             "counter");

@@ -281,6 +281,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                 }
             };
 
+            ports.count_run_outcome = make_workflow_run_outcome_counter(d.metrics);
             ports.count_idempotent = [&](std::string_view outcome) {
                 if (!d.metrics)
                     return;

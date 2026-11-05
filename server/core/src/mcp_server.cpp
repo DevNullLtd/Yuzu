@@ -8672,6 +8672,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the answer
                     }
                 };
+                ports.count_run_outcome = make_workflow_run_outcome_counter(metrics);
                 ports.count_idempotent = [&](std::string_view outcome) {
                     if (!metrics)
                         return;
