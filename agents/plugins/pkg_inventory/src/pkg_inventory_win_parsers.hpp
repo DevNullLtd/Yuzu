@@ -172,9 +172,21 @@ namespace detail {
         pos = name_end;
         if (!detail::ieq(xml.substr(name_begin, name_end - name_begin), tag)) continue;
 
-        // The first matching start tag decides the answer.
-        const auto gt = xml.find('>', name_end);
-        if (gt == std::string_view::npos || xml[gt - 1] == '/') return std::nullopt;
+        // The first matching start tag decides the answer. Its end is the first `>` outside a
+        // quoted attribute value, so `<version note="a>b">1.0</version>` reads 1.0, not `b">1.0`.
+        std::size_t gt = name_end;
+        char quote = 0;
+        for (; gt < xml.size(); ++gt) {
+            const char c = xml[gt];
+            if (quote) {
+                if (c == quote) quote = 0;
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+            } else if (c == '>') {
+                break;
+            }
+        }
+        if (gt >= xml.size() || xml[gt - 1] == '/') return std::nullopt;
         const auto lt = xml.find('<', gt + 1);
         if (lt == std::string_view::npos || !xml.substr(lt).starts_with("</")) return std::nullopt;
         std::size_t close_end = lt + 2;

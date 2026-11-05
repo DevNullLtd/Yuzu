@@ -578,6 +578,16 @@ TEST_CASE("win packages: a nuspec cut at the read cap reads as unknown even when
     CHECK(rows == std::vector<std::string>{"package|chocolatey|cut|-|pkg"});
 }
 
+TEST_CASE("win nuspec: a '>' inside a quoted attribute value does not end the start tag",
+          "[pkg_inventory][windows][choco]") {
+    CHECK(pw::extract_xml_text("<package><metadata><version note=\"a>b\">1.2.3</version>", "version") ==
+          std::optional<std::string>{"1.2.3"});
+    CHECK(pw::extract_xml_text("<version note='x>y'>4.5</version>", "version") ==
+          std::optional<std::string>{"4.5"});
+    // an unterminated quote never closes the tag: unknown, not a leaked fragment
+    CHECK_FALSE(pw::extract_xml_text("<version note=\"a>1.0</version>", "version").has_value());
+}
+
 TEST_CASE("win packages: absent lib is silent, denied or failing lib is a token",
           "[pkg_inventory][windows][choco]") {
     {
