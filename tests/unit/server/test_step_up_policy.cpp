@@ -71,13 +71,13 @@ TEST_CASE("step-up policy: the gated set is exactly the 37 routes with an in-han
 
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (240 mutating REST routes: 37 required, 3 own-gate,
-    // 127 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
-    // commands row the v1 instruction-definition execute row and the v1 workflow execute row). A row added or reclassified
-    // without these numbers moving
-    // together fails here.
-    CHECK(kStepUpPolicyCount == 240);
-    CHECK(count_class(StepUpClass::kExempt) == 127);
+    // Executable pins for the table counts (243 mutating REST routes: 37 required, 3 own-gate,
+    // 130 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
+    // commands row, the v1 instruction-definition execute row and the v1 workflow execute row,
+    // and the software-title curation routes added the aliases, reject and pack rows). A row
+    // added or reclassified without these numbers moving together fails here.
+    CHECK(kStepUpPolicyCount == 243);
+    CHECK(count_class(StepUpClass::kExempt) == 130);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
     CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
               count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
@@ -301,7 +301,7 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
         kSyncTrigger,          kAgentUploadProtocol,    kScimBearer,      kMcpTransport,
         kContentAuthoring,     kPolicyLifecycle,        kEvidenceCapture, kCancelsRecord,
         kCreatesRerunRecord,   kAlertingConfig,         kMfaEnrolment,    kSchedulingGatedWork,
-        kSelfNotificationState};
+        kSelfNotificationState, kReferenceDataReplace};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

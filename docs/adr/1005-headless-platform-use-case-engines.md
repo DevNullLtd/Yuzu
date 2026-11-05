@@ -1224,6 +1224,30 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      tools marked Confined in `docs/user-manual/mcp.md` are. Removing the pins drops
      the 2027-01-31 revisit date from the ledger, and that date now lives on #4041.
 
+   - **2026-11-04 - software normalisation curation (REST only; the MCP twin is
+     a recorded exception).** The five
+     `/api/v1/inventory/software/normalization/` routes (`GET status`, `GET queue`,
+     `POST aliases`, `POST queue/{key}/reject`, `POST pack`) have no MCP tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as roadmap row **4.3-mcp** in the software estate roadmap (executed inside
+       delivery row SAM-29, the MCP twins of rule import, catalogue identity and
+       curation); **revisit by 2026-12-31**. The twin takes the same store methods
+       and the same field validators (`valid_cpe_product`, `known_ecosystem`,
+       `derive_curated_alias`), so there is no second validator. This entry
+       retires when the twin merges. No issue exists for that follow-up yet
+       (update this line when it is filed). No ledger row is added: the parity ledger
+       admits an `exception:` row for a `/api/v1` route but does not require one.
+     - **What an MCP-only caller can and cannot reach today.** The status, queue
+       and curated aliases are not reachable over MCP; the OpenAPI document is
+       readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Every route needs a global
+       `Inventory:Read` (reads) or `Inventory:Write` (writes) grant, refuses a
+       service-scoped token, audits each write BEFORE the store is touched and
+       fails closed with `503` and `Sec-Audit-Failed`, and answers a degraded read
+       with `503`, never an empty `200`. The A4 envelope and the OpenAPI entries
+       hold for all five. Wire reference: `docs/user-manual/rest-api.md`,
+       "Software normalisation curation".
+     - Recorded by the change author; ADR-owner acceptance pending.
    - **2026-11-05 - the `Workflow:Execute` residual of the 2026-10-30 entry is
      closed.** That entry accepted that no MCP tool mapped to the pair, so a
      supervised token had no ticket path to run a workflow. The MCP tool

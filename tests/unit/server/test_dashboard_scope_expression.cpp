@@ -79,6 +79,7 @@ struct Harness {
     std::vector<AuditRow> persisted; // rows that went through the persist-reporting sink
     std::vector<std::string> order;  // "audit:<result>" / "dispatch", in call order
     bool persist_ok = true;          // false = the audit store refuses the row
+    bool audit_ok = true;            // false = the store refuses rows written through audit_fn
     std::string auth_source{"local"}; // the resolved session's source ("local" = cookie session)
     int sent = 3;
     std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
@@ -99,6 +100,7 @@ struct Harness {
         auto audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                const std::string&, const std::string&, const std::string& d) {
             audits.push_back({a, r, d});
+            return audit_ok;
         };
         DashboardRoutes::DispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
@@ -389,14 +391,73 @@ TEST_CASE("scope_expression audit: an unwired persist sink refuses rather than d
     CHECK(h.calls.empty());
 }
 
-TEST_CASE("scope_expression audit: refusals burn no attempted row, and plain sends skip the sink",
-          "[server][dashboard][execute][scope_expression][audit]") {
+// #3619 flipped the second half of this case. It used to pin that a plain (non-expression) send
+// SKIPPED the persist sink; ADR-0033 section 9 ("no audit row, no mutation") applies to every
+// console send, so a plain send now writes its own `attempted` row before dispatching. Refusals
+// still burn none.
+TEST_CASE("scope_expression audit: refusals burn no attempted row, and a plain send writes one "
+          "before dispatching",
+          "[server][dashboard][execute][scope_expression][audit][3619]") {
     Harness h;
     h.post("instruction=version&scope_expression=" + enc(R"(ostypo != "windows")"));
     h.post("instruction=version&scope=__all__&scope_expression=" + enc(R"(ostype == "windows")"));
-    h.post("instruction=version&scope=agent-1");
     CHECK(h.persisted.empty());
-    CHECK(h.order == std::vector<std::string>{"dispatch"});
+    CHECK(h.order.empty());
+    h.post("instruction=version&scope=agent-1");
+    REQUIRE(h.persisted.size() == 1);
+    CHECK(h.persisted[0].action == "command.dispatch");
+    CHECK(h.persisted[0].result == "attempted");
+    CHECK(contains(h.persisted[0].detail, "os_info:os_version"));
+    CHECK_FALSE(contains(h.persisted[0].detail, "scope_expression="));
+    CHECK(h.order == std::vector<std::string>{"audit:attempted", "dispatch"});
+}
+
+TEST_CASE("dashboard execute audit (#3619): a plain send whose attempted row is not stored "
+          "dispatches NOTHING",
+          "[server][dashboard][execute][audit][security][3619]") {
+    Harness h;
+    h.persist_ok = false;
+    for (const std::string body : {"instruction=version&scope=agent-1", "instruction=version"}) {
+        INFO(body);
+        auto res = h.post(body);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(contains(res->body, "audit_unavailable"));
+        CHECK_FALSE(res->has_header("X-Yuzu-Dispatched"));
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.rows("command.dispatch", "success") == 0);
+}
+
+TEST_CASE("dashboard execute audit (#3619): an unwired persist sink refuses a plain send",
+          "[server][dashboard][execute][audit][security][3619]") {
+    Harness h;
+    h.routes.set_persist_audit_fn({});
+    auto res = h.post("instruction=version&scope=agent-1");
+    CHECK(res->status == 503);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("dashboard execute audit (#3619): a success row that is not stored keeps the send and "
+          "flags the response",
+          "[server][dashboard][execute][audit][3619]") {
+    Harness h;
+    h.audit_ok = false;
+    auto res = h.post("instruction=version&scope=agent-1");
+    CHECK(res->status == 200);
+    CHECK(res->has_header("X-Yuzu-Dispatched"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.calls.size() == 1);
+}
+
+TEST_CASE("dashboard execute audit (#3619): a zero-reach failure row that is not stored is flagged",
+          "[server][dashboard][execute][audit][3619]") {
+    Harness h;
+    h.sent = 0;
+    h.audit_ok = false;
+    auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    CHECK(h.rows("command.dispatch", "failure") == 1);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 TEST_CASE("scope_expression audit: a send that reaches no agent records a failure outcome",
@@ -613,4 +674,26 @@ TEST_CASE("dashboard execute: a same-site cookie-session write passes the gate",
     }
     CHECK(h.calls.size() == 1);
     CHECK(h.rows("csrf.denied", "denied") == 0);
+}
+
+TEST_CASE("dashboard execute audit (#3619): a plain send that reaches no agent records an "
+          "attempted row and a failure outcome",
+          "[server][dashboard][execute][audit][3619]") {
+    // qe-1 / CH-7: before #3619 only an expression send wrote the zero-reach failure row.
+    // Restoring that expression-only guard must turn this case red. hp-1: a send with NO
+    // `scope` field is the fleet by omission, and its attempted row says so.
+    Harness h;
+    h.sent = 0;
+    h.post("instruction=version");
+    REQUIRE(h.persisted.size() == 1);
+    CHECK(h.persisted[0].result == "attempted");
+    CHECK(h.persisted[0].detail == "os_info:os_version scope=__all__");
+    CHECK(h.order == std::vector<std::string>{"audit:attempted", "dispatch"});
+    int failures = 0;
+    for (const auto& a : h.audits)
+        if (a.action == "command.dispatch" && a.result == "failure") {
+            ++failures;
+            CHECK(a.detail == "reason=no_agents_reached");
+        }
+    CHECK(failures == 1);
 }
