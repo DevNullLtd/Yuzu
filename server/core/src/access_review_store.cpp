@@ -64,11 +64,12 @@ constexpr const char* kSelfSubject =
 // into the audit target; and the audit table has no column bound. Rejecting
 // both here (rather than in each transport) keeps ONE copy of the rule.
 //
-// 512 is deliberately generous: `auth::is_valid_principal` caps every prefixed
-// principal (oidc:/saml:/ad:/engine:) at 255 bytes and a local username is far
-// shorter, and rbac_store.cpp's kMaxExternalIdLength is also 512, so no real
-// grant's principal_id can be refused by it. (A provider's raw
-// "oidc:"+iss+"#"+sub could reach 516, but such a principal cannot be created.)
+// 512 is deliberately generous: `auth::is_valid_principal` caps the prefixed
+// external principals that account provisioning accepts (oidc:/saml:/ad:) at 255
+// bytes, a local username is far shorter, and rbac_store.cpp's kMaxExternalIdLength
+// is also 512, so an ordinary grant's principal_id is never refused by it. A grant
+// created by another path with a longer id would be refused here (400) rather than
+// risk the NUL / audit-size problems above.
 constexpr std::size_t kMaxIdentifierBytes = 512;
 
 // The reviewer's free-text justification is stored as evidence. A NUL byte would

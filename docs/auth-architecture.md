@@ -3843,8 +3843,9 @@ A `bad_request:` means an identifier contained a NUL byte or was longer than 512
 stops reading a parameter at the first NUL, so such a value would otherwise match a real row
 while its extra bytes reached the audit trail), the justification contained a NUL byte or was
 longer than 8192 bytes (it would be silently cut at the NUL), or the reviewer was empty. The
-512-byte bound cannot refuse a real grant: every prefixed principal id is capped at 255 bytes
-when it is created. The libpq text of a genuine database fault in `record_attestation` or
+512-byte bound is far above anything the account-provisioning path accepts (prefixed external
+ids are capped at 255 bytes and local usernames at 64), so an ordinary grant is never refused;
+a grant created by another path with a longer id would be refused here. The libpq text of a genuine database fault in `record_attestation` or
 `close_campaign` is logged on the server and never returned to the caller.
 
 **Known limits, stated plainly.** The control compares usernames byte for byte, so it is exactly
