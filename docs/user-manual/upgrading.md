@@ -625,6 +625,17 @@ Prometheus need separate `job`s. An install that brings its own certificates has
 nothing. A rollback to a build without the gauges silences both alerts, and no server `up == 0` alert ships, so
 configure one. Runbook: `docs/pki-architecture.md`, "CRL near expiry or expired".
 
+## New: alert for a CRL dated in the future (#7097)
+
+Additive; no behaviour change. `docs/prometheus/yuzu-alerts.yml` gains `YuzuCaCrlFutureDated` (**warning**) in the
+`yuzu-pki` group. It reads `yuzu_server_ca_crl_published_timestamp_seconds` (already exported since #6527) and fires
+when the newest CRL was published by a replica whose clock was more than about 62 minutes ahead of real time (every CRL
+a gateway refuses as `future_dated` alerts within about two minutes; the two expiry alerts stay silent). **Reload your Prometheus rule
+file to pick it up**; without the reload that case stays silent. Like the expiry alerts it takes `max by (job)`
+(every replica exports the same shared row, so one scrape suffices, but unrelated Yuzu deployments sharing one Prometheus need separate `job`s),
+needs a successful scrape (keep your own `up == 0` alert), and is silenced by a rollback to a build without the
+gauge. Runbook: `docs/pki-architecture.md`, "CRL dated in the future".
+
 ## Behaviour change: `device.filesystem.find_by_hash` is bounded and reports what it skipped (#5624)
 
 **What changed.** The agent hashes in-process and stops at the first of 20 seconds, 50,000 entries visited, 4 GiB hashed or 100 matches. The limits are fixed; scan a large tree one subdirectory at a time. When anything was skipped or the search stopped early, a `truncated|<reason>|visited=N|...` row precedes `matches_found|N`. Any symlink counts, so most scans have one; scripts must not read it as a match. The result is `CONSTRAINED`/`PARTIAL` when a limit was hit, an entry was unreadable, a network mount, UNC share or non-fixed Windows drive was skipped, or the mount table could not be read (a `network_mount_guard|unavailable` row says so). Symlinks are no longer followed, so a symlink to the target file is not reported; empty files are now hashed. Agents and server may upgrade in either order.
