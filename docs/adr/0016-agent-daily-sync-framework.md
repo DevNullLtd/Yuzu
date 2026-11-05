@@ -926,9 +926,10 @@ that starts sending slot 13, which must also test that no profile path is emitte
 The change ledger (the 2026-11-04 Update, schema v11) keeps a copy for its retention window:
 `software_changes.identity_key` carries the lower-cased location as its last segment for 400
 days, past the hard delete of the `installed_software` row (`delete_agent` removes the ledger
-rows with the device). That is accepted because the producer sends no per-user paths (the
-precondition above), so the copy names machine-scope roots only, and nothing reads the ledger
-back.
+rows with the device). That is accepted on the writer's requirement not to send per-user paths
+(the precondition above), which the server does not enforce, so the copy is expected to name
+machine-scope roots only; the writer's no-profile-path test covers the ledger copy as well, and
+nothing reads the ledger back.
 
 **`install_type` and `install_scope`.** Both are derived by the server at insert time and are
 never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
@@ -1106,19 +1107,20 @@ delete plus a `remove` row carrying name, publisher and that version text, so no
 `removed_at` filter.
 
 **Baseline rule.** A `full` section is a BASELINE (rows written, no ledger rows) unless the
-server holds the facet's rows: a facet state with a non-empty section hash whose status is not
-`disabled`. A baseline is therefore a device's first contact for the facet (including the first v3
-call that applies a section, which deletes the device's v2 rows), a facet whose only prior section
-was status-only (that creates a facet state with no hash), and a facet switched off and on again
-(a status-only section over a `disabled` facet clears its stored hash, so a timeout after the
-switch-off does not turn the next full into a diff). Changes made while a facet was disabled are
-never recorded, by design. In every other case the held rows are still in the table, because a
-status-only section leaves them in place, so the full section is diffed against them: a timeout
+server HOLDS the facet's rows. A facet is held when its state has a non-empty section hash, its
+status is not `disabled`, and the stored rows hash to that section hash. A baseline is therefore a
+device's first contact for the facet (including the first v3 call that applies a section, which
+deletes the device's v2 rows), a facet that has received only status-only sections (that creates a
+facet state with no hash), a facet switched off and then on (a status-only section over a
+`disabled` facet clears its stored hash, so a timeout following the switch-off does not turn the next
+full into a diff), and a facet whose stored rows do not hash to its section hash (an out-of-band
+delete or a partial-table restore; no product path produces one), which is baselined with a
+warning so a missing row is never recorded as a phantom `install`. The warning is the only signal
+of that last case: no counter or alert counts it, because no product path produces it. Changes made
+while a facet is disabled are never recorded, by design. A held facet's rows are in the table (a
+status-only section leaves them in place), so its full section is diffed against them: a timeout
 followed by a full carrying an upgrade writes one `upgrade`, and an honest-empty full followed by
 a populated one writes the installs.
-Held also means the stored rows hash to the held section hash. A facet whose rows do not (an
-out-of-band delete or a partial-table restore; no product path produces one) is a baseline with
-a warning, so a missing row is never recorded as a phantom `install`.
 
 **Components (`software_components`).** The component table lives in this store's schema, owned
 by `SoftwareInventoryStore`, because a component section is applied in the same transaction as
