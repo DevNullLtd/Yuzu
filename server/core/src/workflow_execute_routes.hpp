@@ -39,6 +39,12 @@ struct WorkflowExecuteRouteDeps {
     /// The shared chokepoint dry run (server.cpp's `authorize_dispatch`); unset == dispatch not
     /// available (503, nothing done).
     WorkflowAuthorizeFn authorize;
+    /// The credential liveness check the run asks before each step; unset == no check (test
+    /// harnesses only; production always wires it).
+    WorkflowRoutes::RevalidateFn revalidate;
+    /// The wait before the single retry of an indeterminate credential check; the default is the
+    /// production value, a test shortens it.
+    std::chrono::milliseconds reauthorize_retry_delay{kReauthorizeRetryDelay};
     WorkflowRoutes::CommandDispatchFn command_dispatch_fn;
     WorkflowRoutes::ConcurrencyDispatchFn command_dispatch_fn_concurrency;
     WorkflowRoutes::CallerFn caller_fn;

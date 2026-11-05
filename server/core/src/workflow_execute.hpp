@@ -93,6 +93,26 @@
 /// reason `server_shutdown` and `retryable:false`, and its closing audit row is `failure` with
 /// `run_outcome=interrupted reason=server_shutdown`.
 ///
+/// CREDENTIAL LIVENESS (per-step re-authority, owner ruling D2a). The transport supplies
+/// `WorkflowExecuteRequest::reauthorize`, a re-validation of the credential that made the call.
+/// The run asks it from the same `before_attempt` hook that carries the deadline (so the engine
+/// needs no field of its own): after the deadline test, before each dispatch attempt, i.e. once
+/// before each step's first attempt and once on waking from each retry sleep, never per sleep
+/// slice. A `foreach` step is asked per item (each item is an attempt). `kValid` and
+/// `kValidStale` continue; `kRevoked` stops the run; `kIndeterminate` (or a throw) is asked
+/// once more after `reauthorize_retry_delay` (at most `kReauthorizeRetryDelay`, never past the
+/// deadline) and a second non-continue answer stops the run, fail closed. A stopped run is
+/// answered as `WorkflowRunOutcome::kAborted` with reason `credential_revoked` or
+/// `credential_indeterminate`: a typed 2xx `status:"aborted"`, `retryable:false`, even when
+/// nothing had been sent; the engine records the unstarted steps `skipped` ("run stopped", the
+/// same as a deadline stop) and finalizes the execution `failed` through the guarded UPDATE.
+/// WHAT THIS IS NOT. It re-checks that the credential is still live, and the RBAC grants the
+/// shared dispatch chokepoint judges anew at every send, so a role removed mid-run is caught
+/// there per step. It does NOT re-derive the `DispatchCaller`: `principal_is_admin` (JIT
+/// elevation) and `exec_visible` (group scope) are the snapshot taken when the call was taken,
+/// so an elevation that expires or a group narrowing during the run is bounded only by the
+/// 60 s deadline (D2b, a follow-up). `kValidStale` is accepted for the whole run (at most 60 s).
+///
 /// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
 /// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches
 /// is decided later, per step, at the dispatch chokepoint (visibility, containment, plugin
@@ -144,6 +164,12 @@ namespace yuzu {
 class MetricsRegistry;
 }
 
+// Defined in <yuzu/server/auth.hpp>. Opaquely forward-declared (the underlying type is pinned
+// there) so this header stays off the auth header's include cost, as mcp_stream.hpp does.
+namespace yuzu::server::auth {
+enum class CredentialCheck : int;
+}
+
 namespace yuzu::server {
 
 class InstructionStore;
@@ -156,6 +182,16 @@ class InstructionStore;
 /// longer than this is refused up front), and the retry hint of a refused admission. A caller
 /// or an intermediary that gives up before it has no idempotency key, so the budget stays short.
 inline constexpr std::chrono::seconds kWorkflowSyncBudget{60};
+
+/// How long a run waits before it asks again when the credential check could not be answered
+/// (`kIndeterminate`): one retry, never more, and never past the run's deadline. A request may
+/// carry a shorter value (`WorkflowExecuteRequest::reauthorize_retry_delay`, for tests).
+inline constexpr std::chrono::milliseconds kReauthorizeRetryDelay{1000};
+
+/// The closing reasons of a run the credential check stopped (`WorkflowExecuteOutcome::reason`,
+/// the closing audit row's `reason=` and the 2xx body's `reason`). A closed pair.
+inline constexpr std::string_view kReasonCredentialRevoked = "credential_revoked";
+inline constexpr std::string_view kReasonCredentialIndeterminate = "credential_indeterminate";
 
 /// `Retry-After` / `retry_after_ms` of a run refused for capacity or for a draining server. A run
 /// holds its worker for up to `kWorkflowSyncBudget`, so a slot usually frees well inside a minute;
@@ -266,6 +302,18 @@ struct WorkflowExecuteRequest {
     /// kWorkflowSyncBudget`) so the time prepare spent counts against it. Unset falls back to
     /// `now + kWorkflowSyncBudget` at the start of the run: a run is never unbounded.
     std::optional<std::chrono::steady_clock::time_point> deadline;
+    /// Re-asks whether the caller's CREDENTIAL is still live (`AuthRoutes::revalidate_stream`
+    /// against the principal and the request that started the call). The run asks it from its
+    /// `before_attempt` hook: before every dispatch attempt, which is once before each step's
+    /// first attempt and once on waking from each retry sleep (never per sleep slice). `kValid`
+    /// and `kValidStale` continue; `kRevoked` stops the run; `kIndeterminate` is asked once
+    /// more after `reauthorize_retry_delay` and then stops the run (fail closed). A throw is
+    /// `kIndeterminate`. Unset == no check (an unmetered seam like `StreamBudget*` on the
+    /// siblings): production transports always set it. It is a LIVENESS check, not an authority
+    /// re-derivation: the `DispatchCaller` above is not rebuilt, so see the banner.
+    std::function<auth::CredentialCheck()> reauthorize;
+    /// The wait before the single retry of an indeterminate `reauthorize` answer.
+    std::chrono::milliseconds reauthorize_retry_delay{kReauthorizeRetryDelay};
 };
 
 /// A parse refusal for the request body. `reason` is a closed token (the
@@ -320,7 +368,9 @@ enum class WorkflowExecuteStatus {
 ///   * `kAborted`     a step was refused at send time (`late_denied`): its definition moved off the
 ///                    preflight or off the ticket-bound effect, or it no longer passed admission;
 ///                    OR the run reached its deadline (`kWorkflowSyncBudget`) and the engine
-///                    stopped it (`deadline_exceeded`). Takes precedence: the run was cut short,
+///                    stopped it (`deadline_exceeded`); OR the credential check stopped it
+///                    (`credential_stop`: the caller's credential was revoked, or could not be
+///                    confirmed after the one retry). Takes precedence: the run was cut short,
 ///                    whatever else it did.
 ///   * `kInterrupted` the engine ended the run because the server is stopping (the engine told the
 ///                    sequence through `WorkflowRunControl::on_interrupted`, at the moment it
@@ -399,6 +449,10 @@ struct WorkflowExecuteOutcome {
     bool deadline_exceeded{false};
     /// The server stopped and the engine ended the run (`kInterrupted`), reason `server_shutdown`.
     bool interrupted{false};
+    /// The credential check stopped the run: `kReasonCredentialRevoked` or
+    /// `kReasonCredentialIndeterminate`, empty otherwise. Always paired with `run_outcome ==
+    /// kAborted` and `status == kRunIncomplete`, even when nothing had been sent.
+    std::string credential_stop;
     /// False only when the closing outcome row failed to persist after the run had started.
     bool audit_persisted{true};
 };
@@ -408,7 +462,8 @@ struct WorkflowExecuteOutcome {
 [[nodiscard]] WorkflowRunOutcome
 classify_workflow_run(std::string_view run_status, bool late_denied,
                       const std::vector<WorkflowStepDispatchNote>& steps,
-                      bool deadline_exceeded = false, bool interrupted = false);
+                      bool deadline_exceeded = false, bool interrupted = false,
+                      bool credential_stopped = false);
 
 /// What `admit_workflow_run` decided. `lease` is engaged iff the run is admitted and must be held
 /// for the WHOLE run (a stack object in the transport, so a return or a throw releases it);

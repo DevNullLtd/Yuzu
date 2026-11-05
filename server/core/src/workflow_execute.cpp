@@ -10,6 +10,9 @@
 #include "sha256_hex.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp" // audit_token (CWE-117)
+#include "workflow_wait.hpp"
+
+#include <yuzu/server/auth.hpp> // auth::CredentialCheck (forward-declared in the header)
 
 #include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
@@ -181,8 +184,8 @@ nlohmann::json workflow_execute_result_json(const WorkflowExecuteOutcome& o,
         j["run_status"] = o.run_status;
         j["retryable"] = false;
         j["message"] = o.message;
-        if (o.deadline_exceeded || o.interrupted)
-            j["reason"] = o.reason; // "deadline_exceeded" | "server_shutdown"
+        if (o.deadline_exceeded || o.interrupted || !o.credential_stop.empty())
+            j["reason"] = o.reason; // deadline_exceeded | server_shutdown | credential_revoked | credential_indeterminate
     }
     if (!o.audit_persisted)
         j["audit_persisted"] = false;
@@ -223,8 +226,9 @@ std::string_view workflow_run_outcome_token(WorkflowRunOutcome outcome) {
 
 WorkflowRunOutcome classify_workflow_run(std::string_view run_status, bool late_denied,
                                          const std::vector<WorkflowStepDispatchNote>& steps,
-                                         bool deadline_exceeded, bool interrupted) {
-    if (late_denied || deadline_exceeded)
+                                         bool deadline_exceeded, bool interrupted,
+                                         bool credential_stopped) {
+    if (late_denied || deadline_exceeded || credential_stopped)
         return WorkflowRunOutcome::kAborted;
     if (interrupted)
         return WorkflowRunOutcome::kInterrupted;
@@ -578,7 +582,57 @@ struct RunProgress {
     bool deadline_hit{false};
     /// The engine ended the run because the server is stopping (`on_interrupted`).
     bool interrupted{false};
+    /// The credential check refused an attempt: `kReasonCredentialRevoked` or
+    /// `kReasonCredentialIndeterminate`. Set at the moment the hook says no.
+    std::string credential_stop;
 };
+
+/// The credential half of the `before_attempt` hook: true == the attempt may be made. See the
+/// "CREDENTIAL LIVENESS" banner in the header. Records why it said no in `progress`.
+bool credential_admits_attempt(const WorkflowExecuteRequest& req,
+                               std::chrono::steady_clock::time_point deadline,
+                               RunProgress& progress) {
+    using Check = auth::CredentialCheck;
+    // A throw is "could not answer", the same posture as an unreachable auth backend.
+    const auto ask = [&req]() -> Check {
+        try {
+            return req.reauthorize();
+        } catch (const std::exception& e) {
+            spdlog::warn("workflow execute: credential re-check threw: {}", e.what());
+        } catch (...) {
+            spdlog::warn("workflow execute: credential re-check threw a non-standard exception");
+        }
+        return Check::kIndeterminate;
+    };
+    Check verdict = ask();
+    if (verdict == Check::kIndeterminate) {
+        // One bounded retry. The wait never runs past the deadline: when the deadline arrives
+        // first the run is stopped by it, exactly as the deadline test above would have.
+        const auto left = std::max(deadline - std::chrono::steady_clock::now(),
+                                   std::chrono::steady_clock::duration::zero());
+        (void)interruptible_wait(
+            std::min<std::chrono::steady_clock::duration>(req.reauthorize_retry_delay, left),
+            [] { return false; });
+        if (std::chrono::steady_clock::now() >= deadline) {
+            progress.deadline_hit = true;
+            return false;
+        }
+        verdict = ask();
+    }
+    switch (verdict) {
+    case Check::kValid:
+    case Check::kValidStale:
+        return true;
+    case Check::kRevoked:
+        progress.credential_stop = std::string(kReasonCredentialRevoked);
+        return false;
+    case Check::kIndeterminate:
+        break;
+    }
+    // Still unanswered after the retry, or a value this build does not know: fail closed.
+    progress.credential_stop = std::string(kReasonCredentialIndeterminate);
+    return false;
+}
 
 /// Step 6 and the closing row. Anything it throws is answered by the caller as `kRunFailed`.
 WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const WorkflowExecuteRequest& req,
@@ -706,11 +760,17 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                                                 kWorkflowSyncBudget);
     control.deadline = deadline;
     control.on_interrupted = [&progress] { progress.interrupted = true; };
-    control.before_attempt = [&progress, deadline] {
-        if (std::chrono::steady_clock::now() < deadline)
+    // The deadline first (no I/O), then the caller's credential: one hook, so the engine needs no
+    // field of its own. The engine asks it before every dispatch attempt, which is before each
+    // step's first attempt and after each retry sleep.
+    control.before_attempt = [&progress, &req, deadline] {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            progress.deadline_hit = true;
+            return false;
+        }
+        if (!req.reauthorize)
             return true;
-        progress.deadline_hit = true;
-        return false;
+        return credential_admits_attempt(req, deadline, progress);
     };
     const auto run = ports.run(req.workflow_id, req.agent_ids, dispatch_fn, condition_fn, control);
     if (!run) {
@@ -742,16 +802,18 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
 
     o.deadline_exceeded = progress.deadline_hit;
     o.interrupted = progress.interrupted;
+    o.credential_stop = progress.credential_stop;
     o.run_outcome = classify_workflow_run(o.run_status, late_denied, o.steps, o.deadline_exceeded,
-                                          o.interrupted);
+                                          o.interrupted, !o.credential_stop.empty());
     const bool any_reached = std::any_of(o.steps.begin(), o.steps.end(),
                                          [](const auto& n) { return n.agents_reached > 0; });
     if (o.run_outcome == WorkflowRunOutcome::kSucceeded) {
         o.status = WorkflowExecuteStatus::kOk;
-    } else if (any_reached || o.run_outcome == WorkflowRunOutcome::kInterrupted) {
-        // Something was sent (or the server's own shutdown ended the run, whatever it had sent),
-        // so the run is readable and its steps matter: a typed 2xx, never a blind-retry
-        // invitation.
+    } else if (any_reached || o.run_outcome == WorkflowRunOutcome::kInterrupted ||
+               !o.credential_stop.empty()) {
+        // Something was sent (or the server's own shutdown, or the credential check, ended the
+        // run, whatever it had sent), so the run is readable and its steps matter: a typed 2xx,
+        // never a blind-retry invitation.
         o.status = WorkflowExecuteStatus::kRunIncomplete;
         o.reason = std::string(workflow_run_outcome_token(o.run_outcome));
         o.retryable = false;
@@ -764,6 +826,16 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
                 ? "the workflow started but the server began shutting down and the run was "
                   "stopped; the remaining steps did not run and steps already sent are not "
                   "recalled; read the run with get_workflow_execution before starting another"
+            : !o.credential_stop.empty()
+                ? (o.credential_stop == kReasonCredentialRevoked
+                       ? "the workflow started but the credential that made this call was no longer "
+                         "valid before a step, so the run was stopped; the remaining steps did not "
+                         "run and steps already sent are not recalled; read the run with "
+                         "get_workflow_execution before starting another"
+                       : "the workflow started but the credential that made this call could not be "
+                         "confirmed before a step, so the run was stopped; the remaining steps did "
+                         "not run and steps already sent are not recalled; read the run with "
+                         "get_workflow_execution before starting another")
             : o.run_outcome == WorkflowRunOutcome::kAborted
                 ? "the workflow started and some steps were sent, but a step was refused at "
                   "dispatch because its definition changed; the rest did not run"
@@ -773,6 +845,8 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             o.reason = "deadline_exceeded";
         else if (o.interrupted)
             o.reason = "server_shutdown";
+        else if (!o.credential_stop.empty())
+            o.reason = o.credential_stop;
     } else {
         o.status = WorkflowExecuteStatus::kNoAgentsReached;
         const WorkflowStepDispatchNote* first_zero = nullptr;
@@ -824,7 +898,7 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             (succeeded ? ""
                        : " run_outcome=" + std::string(workflow_run_outcome_token(o.run_outcome))) +
             (o.status == WorkflowExecuteStatus::kNoAgentsReached || o.deadline_exceeded ||
-                     o.interrupted
+                     o.interrupted || !o.credential_stop.empty()
                  ? " reason=" + o.reason
                  : ""));
     return o;

@@ -20967,6 +20967,12 @@ private:
         wf_deps.workflow_api = workflow_api;
         wf_deps.workflow_run = workflow_run_fn; // same closure MCP execute_workflow gets
         wf_deps.authorize_dispatch = authorize_dispatch; // the step-pair dry run (sec-4)
+        // The per-step credential liveness check of the v1 execute run: the SAME seam MCP's
+        // held-open streams re-validate through (tri-state; an engine principal's Active check
+        // included).
+        wf_deps.revalidate = [this](const httplib::Request& req, const std::string& principal) {
+            return auth_routes_->revalidate_stream(req, principal);
+        };
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();

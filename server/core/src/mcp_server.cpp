@@ -1384,6 +1384,15 @@ static const ToolDef kTools[] = {
      "workflow_exceeds_sync_budget before a ticket is minted. The run has 60 seconds from the call: "
      "no send starts after the deadline, the remaining steps are skipped and the run is closed "
      "failed (status aborted, reason deadline_exceeded, not retryable). "
+     "CREDENTIAL CHECK: before each step's first send, and after waking from each retry delay, the "
+     "run re-validates the credential this call was made with. A revoked or expired credential "
+     "(or an engine principal that is no longer active) stops the run with status aborted, reason "
+     "credential_revoked; a check that cannot be answered is asked once more and then stops it "
+     "with reason credential_indeterminate. Either way the remaining steps are skipped, steps "
+     "already sent are not recalled, retryable is false, and this holds even when nothing was "
+     "sent. A role grant removed mid-run is caught per step at the dispatch chokepoint; an "
+     "administrator elevation that expires, or a device-group narrowing, during the run is only "
+     "bounded by the 60 second deadline. "
      "AUDIT: an 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
      "it cannot be saved the call fails with a retryable error and nothing was sent. A step "
      "refused at send time because its definition changed is audited at that moment and is not "
@@ -1400,7 +1409,8 @@ static const ToolDef kTools[] = {
      "Otherwise, when something was sent, status is \"partial\" (some attempt reached nobody, or "
      "the engine did not complete after a send) or \"aborted\" (a step was refused at send time "
      "because its definition changed, or the run reached its 60 second deadline, reason "
-     "deadline_exceeded; the rest did not run) or \"interrupted\" (the server began stopping: "
+     "deadline_exceeded, or the credential check stopped it, reason credential_revoked or "
+     "credential_indeterminate; the rest did not run) or \"interrupted\" (the server began stopping: "
      "reason server_shutdown, the unstarted steps are skipped, and this holds even when nothing "
      "was sent), with run_status (the engine's own "
      "status), message, retryable false and retry_after_ms null: the run is NOT a success and "
@@ -1427,7 +1437,7 @@ static const ToolDef kTools[] = {
      R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
      R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
      R"j("message":{"type":"string","description":"Present only when no step reached any agent"},)j"
-     R"j("reason":{"type":"string","enum":["deadline_exceeded","server_shutdown"],"description":"Present only when the 60 second run budget stopped the run (deadline_exceeded) or the server stopped (server_shutdown, status interrupted)"},)j"
+     R"j("reason":{"type":"string","enum":["deadline_exceeded","server_shutdown","credential_revoked","credential_indeterminate"],"description":"Present only when the run was stopped: the 60 second run budget (deadline_exceeded), the server stopping (server_shutdown, status interrupted), or the caller's credential check before a step (credential_revoked, or credential_indeterminate when it could not be confirmed after one retry; status aborted)"},)j"
      R"j("retry_after_ms":{"type":["integer","null"],"description":"Present only when no step reached any agent: 5000 for a retryable cause, null for a permanent one"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row failed to persist after the run had started"})j"
      R"j(},"required":["execution_id","workflow_id","status","steps"]})j"},
@@ -22400,6 +22410,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The effects the consumed ticket was bound to: the run holds every fresh read to
                 // them, and sends nothing for a step that moved (definition_changed).
                 wreq.expected_step_effects = workflow_bound_effects;
+                // The credential liveness check before each step: the SAME seam the held-open
+                // streams re-validate through, asked against the principal and request of THIS
+                // call. The run is synchronous on this thread, so `req` outlives the closure. An
+                // unwired seam (test harnesses; build_handler warns at boot) is no check.
+                wreq.reauthorize_retry_delay =
+                    workflow_reauthorize_retry_delay_.value_or(kReauthorizeRetryDelay);
+                if (revalidate_fn) {
+                    wreq.reauthorize = [&] { return revalidate_fn(req, session->username); };
+                }
 
                 WorkflowExecuteOutcome out;
                 try {

@@ -787,6 +787,45 @@ TEST_CASE("WorkflowEngine: before_attempt alone decides when installed; false st
     // Step 2 was the one stopped; nothing after it exists to skip.
 }
 
+TEST_CASE("WorkflowEngine: before_attempt is asked once per dispatch attempt, after a retry sleep and "
+          "never once per sleep slice (the structure the per-step credential check relies on, #2146 D2a)",
+          "[workflow_engine][pg][execute][reauth]") {
+    WORKFLOW_ENGINE(engine);
+    // Step 1 fails once and retries after a 1 s delay (four 250 ms slices); step 2 is plain.
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: reauth-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      retryCount: 1\n"
+                             "      retryDelay: 1\n"
+                             "    - instruction: inst-2\n";
+    auto wf_id = *engine.create_workflow(yaml);
+    std::vector<std::string> events;
+    std::vector<std::chrono::steady_clock::time_point> asked_at;
+    int inst1_attempts = 0;
+    StepDispatchFn dispatch = [&](const std::string& id, const std::string&, const std::string&)
+        -> std::expected<std::string, StepDispatchError> {
+        events.push_back("dispatch:" + id);
+        if (id == "inst-1" && ++inst1_attempts == 1)
+            return std::unexpected(StepDispatchError{"transient", false});
+        return std::string(R"({"status":"ok"})");
+    };
+    WorkflowRunControl control;
+    control.before_attempt = [&] {
+        events.push_back("ask");
+        asked_at.push_back(std::chrono::steady_clock::now());
+        return true;
+    };
+    auto r = engine.execute(wf_id, {"agent-1"}, dispatch, nullptr, nullptr, control);
+    REQUIRE(r.has_value());
+    // Once before step 1's first attempt, once on waking from its retry sleep, once before step 2:
+    // three asks for three attempts, each ahead of its own dispatch.
+    CHECK(events == std::vector<std::string>{"ask", "dispatch:inst-1", "ask", "dispatch:inst-1",
+                                             "ask", "dispatch:inst-2"});
+    REQUIRE(asked_at.size() == 3);
+    // The second ask came AFTER the whole retry delay, not during it.
+    CHECK(asked_at[1] - asked_at[0] >= std::chrono::milliseconds(900));
+    CHECK(only_execution(engine, wf_id).status == "completed");
+}
+
 // ── Shutdown: wake-on-stop, drain, in-flight count, finalize retry (#2146) ───────────────────
 
 namespace {

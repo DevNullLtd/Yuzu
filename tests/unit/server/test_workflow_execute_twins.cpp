@@ -37,6 +37,7 @@
 #include "agent.pb.h"
 
 #include <yuzu/metrics.hpp>
+#include <yuzu/server/auth.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -136,6 +137,34 @@ struct Fx {
     /// >= 0: before dispatching the step at this 0-based position the stand-in engine behaves as
     /// the real one does on a server stop: it calls `on_interrupted` once and sends nothing more.
     int interrupt_before_step{-1};
+    /// Retry attempts the stand-in engine makes for a step whose dispatch failed non-permanently
+    /// (each asks `before_attempt` again, as the real engine does after its retry sleep).
+    int engine_retries{0};
+
+    // ── the per-step credential check (WorkflowExecuteRequest::reauthorize) ──
+    bool wire_reauth{false};
+    /// Answers handed out in order; once exhausted `reauth_after` is the answer. `reauth_script`,
+    /// when set, replaces both (a throwing check).
+    std::vector<auth::CredentialCheck> reauth_answers;
+    auth::CredentialCheck reauth_after{auth::CredentialCheck::kValid};
+    std::function<auth::CredentialCheck()> reauth_script;
+    int reauth_calls{0};
+    /// How many sends had been made when each ask happened (proves "before step N", not "after").
+    std::vector<int> reauth_dispatches_at;
+
+    auth::CredentialCheck next_reauth() {
+        ++reauth_calls;
+        int sent = 0;
+        for (const auto& e : events)
+            if (e.starts_with("dispatch:"))
+                ++sent;
+        reauth_dispatches_at.push_back(sent);
+        if (reauth_script)
+            return reauth_script();
+        if (reauth_calls <= static_cast<int>(reauth_answers.size()))
+            return reauth_answers[static_cast<size_t>(reauth_calls - 1)];
+        return reauth_after;
+    }
 
     WorkflowExecuteRequest request(std::vector<std::string> ids = {"a1"}) {
         WorkflowExecuteRequest r;
@@ -146,6 +175,10 @@ struct Fx {
                                   .exec_visible = std::nullopt,
                                   .principal_is_admin = false};
         r.audit_context = "surface=test";
+        if (wire_reauth) {
+            r.reauthorize = [this] { return next_reauth(); };
+            r.reauthorize_retry_delay = std::chrono::milliseconds(1); // no real second per test
+        }
         return r;
     }
 
@@ -210,13 +243,23 @@ struct Fx {
                     engine_stopped = true;
                     break;
                 }
-                if (control.before_attempt && !control.before_attempt()) {
+                bool stopped = false;
+                for (int attempt = 0;; ++attempt) {
+                    if (control.before_attempt && !control.before_attempt()) {
+                        stopped = true;
+                        break;
+                    }
+                    const auto r = fn(sid, "[]", "{}");
+                    if (r)
+                        break;
+                    step_errors.push_back(r.error());
+                    if (r.error().permanent || attempt >= engine_retries)
+                        break;
+                }
+                if (stopped) {
                     engine_stopped = true;
                     break;
                 }
-                const auto r = fn(sid, "[]", "{}");
-                if (!r)
-                    step_errors.push_back(r.error());
             }
             events.push_back("engine_returned");
             return engine_error;
@@ -931,6 +974,10 @@ TEST_CASE("workflow execute: the run outcome is judged by ONE function and its t
     // ... except that a step refused at send time or a passed deadline is judged first.
     CHECK(classify_workflow_run("failed", true, {reached(1)}, false, true) == O::kAborted);
     CHECK(classify_workflow_run("failed", false, {reached(1)}, true, true) == O::kAborted);
+    // A credential stop is an abort whatever was sent, and is judged ahead of a server stop.
+    CHECK(classify_workflow_run("failed", false, {reached(1)}, false, false, true) == O::kAborted);
+    CHECK(classify_workflow_run("failed", false, {}, false, false, true) == O::kAborted);
+    CHECK(classify_workflow_run("failed", false, {reached(1)}, false, true, true) == O::kAborted);
 }
 
 TEST_CASE("workflow execute: a protective action never reports the three gate-withhold causes",
@@ -1552,6 +1599,10 @@ struct Rest {
     // The one held-open budget the route leases from, and the server's draining flag.
     detail::StreamBudget budget{{.global_cap = 8}};
     bool draining{false};
+    // What the route handed the credential check: the principal, and a request header proving it
+    // is THIS request (not a copy made at registration).
+    std::vector<std::string> reauth_principals;
+    std::vector<std::string> reauth_tokens;
     yuzu::server::test::TestRouteSink sink;
 
     Rest() {
@@ -1606,6 +1657,12 @@ struct Rest {
         d.metrics = &metrics;
         d.stream_budget = &budget;
         d.draining = [this] { return draining; };
+        d.reauthorize_retry_delay = std::chrono::milliseconds(1);
+        d.revalidate = [this](const httplib::Request& req, const std::string& principal) {
+            reauth_principals.push_back(principal);
+            reauth_tokens.push_back(req.get_header_value("X-Yuzu-Token"));
+            return fx.next_reauth();
+        };
         register_workflow_execute_v1_route(sink, std::move(d));
     }
 
@@ -2444,4 +2501,248 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a workflow over the sync budget 
     CHECK(r.fx.events.empty());
     CHECK_FALSE(r.fx.engine_called);
     CHECK(r.budget.active() == 0);
+}
+
+// ───────────────────────────── per-step credential re-check (D2a) ───────────────────────────
+
+namespace {
+
+using CC = auth::CredentialCheck;
+
+/// A two-step workflow whose stand-in engine ends `failed` (what the real engine records for a
+/// run it stopped) and whose request carries the credential check.
+void two_steps_with_reauth(Fx& f, std::vector<CC> answers) {
+    f.step_ids = {"i-ro", "i-ro2"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    f.engine_status = "failed";
+    f.wire_reauth = true;
+    f.reauth_answers = std::move(answers);
+}
+
+} // namespace
+
+TEST_CASE("workflow credential check: a credential revoked after step 1 stops the run BEFORE step 2 is "
+          "sent; the run is aborted, credential_revoked, not retryable",
+          "[workflow][twin][reauth][outcome]") {
+    Fx f;
+    two_steps_with_reauth(f, {CC::kValid, CC::kRevoked});
+    const auto o = f.run();
+    // Step 1 was sent, step 2 never was.
+    CHECK(f.events.size() >= 2);
+    CHECK(o.steps.size() == 1);
+    CHECK(o.steps[0].instruction_id == "i-ro");
+    CHECK(f.engine_stopped);
+    CHECK(f.reauth_calls == 2);
+    CHECK(f.reauth_dispatches_at == std::vector<int>{0, 1}); // asked BEFORE each send
+    CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+    CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+    CHECK(o.credential_stop == "credential_revoked");
+    CHECK(o.reason == "credential_revoked");
+    CHECK_FALSE(o.retryable);
+    CHECK_FALSE(o.deadline_exceeded);
+    CHECK_FALSE(o.interrupted);
+    CHECK(o.execution_id == "exec-1");
+    // The closing row is a failure naming the outcome and the reason, and it is the last thing.
+    CHECK(f.events.back() == "audit:failure");
+    CHECK(f.audit_details.back().find("run_outcome=aborted") != std::string::npos);
+    CHECK(f.audit_details.back().find("reason=credential_revoked") != std::string::npos);
+    const auto j = workflow_execute_result_json(o, "wf-1");
+    CHECK(j["status"] == "aborted");
+    CHECK(j["reason"] == "credential_revoked");
+    CHECK(j["retryable"] == false);
+    CHECK(j["steps"].size() == 1);
+    CHECK(j["message"].get<std::string>().find("no longer valid") != std::string::npos);
+}
+
+TEST_CASE("workflow credential check: revoked before the first step sends nothing, and is still a typed "
+          "aborted run rather than a zero-reach error",
+          "[workflow][twin][reauth][outcome]") {
+    Fx f;
+    two_steps_with_reauth(f, {CC::kRevoked});
+    const auto o = f.run();
+    CHECK_FALSE(f.dispatched_anything());
+    CHECK(f.reauth_calls == 1);
+    CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+    CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+    CHECK(o.reason == "credential_revoked");
+    CHECK_FALSE(o.retryable);
+    CHECK(o.execution_id == "exec-1");
+    CHECK(f.audit_details.back().find("reason=credential_revoked") != std::string::npos);
+}
+
+TEST_CASE("workflow credential check: an indeterminate answer is asked ONCE more; valid continues, a "
+          "second non-answer aborts credential_indeterminate, a revocation on the retry is revoked",
+          "[workflow][twin][reauth][outcome]") {
+    SECTION("indeterminate then valid continues and every step is sent") {
+        Fx f;
+        two_steps_with_reauth(f, {CC::kIndeterminate, CC::kValid, CC::kValid});
+        f.engine_status = "completed";
+        const auto o = f.run();
+        CHECK(o.status == WorkflowExecuteStatus::kOk);
+        CHECK(o.steps.size() == 2);
+        CHECK(f.reauth_calls == 3); // step 1 asked twice, step 2 once
+        CHECK(o.credential_stop.empty());
+    }
+    SECTION("indeterminate twice aborts, step 1 is never sent") {
+        Fx f;
+        two_steps_with_reauth(f, {CC::kIndeterminate, CC::kIndeterminate});
+        const auto o = f.run();
+        CHECK_FALSE(f.dispatched_anything());
+        CHECK(f.reauth_calls == 2); // asked, retried once, never a third time
+        CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
+        CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+        CHECK(o.credential_stop == "credential_indeterminate");
+        CHECK(o.reason == "credential_indeterminate");
+        CHECK_FALSE(o.retryable);
+        CHECK(f.audit_details.back().find("run_outcome=aborted") != std::string::npos);
+        CHECK(f.audit_details.back().find("reason=credential_indeterminate") != std::string::npos);
+        const auto j = workflow_execute_result_json(o, "wf-1");
+        CHECK(j["status"] == "aborted");
+        CHECK(j["reason"] == "credential_indeterminate");
+        CHECK(j["message"].get<std::string>().find("could not be confirmed") != std::string::npos);
+    }
+    SECTION("indeterminate on step 2 after step 1 was sent aborts there") {
+        Fx f;
+        two_steps_with_reauth(f, {CC::kValid, CC::kIndeterminate, CC::kIndeterminate});
+        const auto o = f.run();
+        CHECK(o.steps.size() == 1);
+        CHECK(f.reauth_calls == 3);
+        CHECK(o.reason == "credential_indeterminate");
+    }
+    SECTION("indeterminate then revoked is revoked") {
+        Fx f;
+        two_steps_with_reauth(f, {CC::kIndeterminate, CC::kRevoked});
+        const auto o = f.run();
+        CHECK_FALSE(f.dispatched_anything());
+        CHECK(o.reason == "credential_revoked");
+    }
+    SECTION("a check that throws is indeterminate: once then valid continues, twice aborts") {
+        Fx f;
+        two_steps_with_reauth(f, {});
+        f.engine_status = "completed";
+        int n = 0;
+        f.reauth_script = [&n]() -> CC {
+            if (++n == 1)
+                throw std::runtime_error("auth store exploded");
+            return CC::kValid;
+        };
+        CHECK(f.run().status == WorkflowExecuteStatus::kOk);
+        CHECK(n == 3);
+
+        Fx g;
+        two_steps_with_reauth(g, {});
+        g.reauth_script = []() -> CC { throw std::runtime_error("auth store exploded"); };
+        const auto o = g.run();
+        CHECK_FALSE(g.dispatched_anything());
+        CHECK(o.reason == "credential_indeterminate");
+    }
+}
+
+TEST_CASE("workflow credential check: a stale-but-valid answer continues", "[workflow][twin][reauth]") {
+    Fx f;
+    two_steps_with_reauth(f, {CC::kValidStale, CC::kValidStale});
+    f.engine_status = "completed";
+    const auto o = f.run();
+    CHECK(o.status == WorkflowExecuteStatus::kOk);
+    CHECK(o.steps.size() == 2);
+    CHECK(f.reauth_calls == 2);
+}
+
+TEST_CASE("workflow credential check: asked once per dispatch attempt, so once per step plus once on "
+          "waking from each retry sleep",
+          "[workflow][twin][reauth]") {
+    Fx f;
+    f.step_ids = {"i-ro", "i-ro2", "i-ro3"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    f.defs["i-ro3"] = def("i-ro3", "os_info", "os_version");
+    f.engine_status = "failed";
+    f.wire_reauth = true;
+    // Step 2 reaches nobody (a non-permanent failure): the stand-in engine retries it twice.
+    f.outcomes["i-ro2"] = ConfinedDispatchOutcome{.sent = 0, .command_id = "cmd-i-ro2"};
+    f.engine_retries = 2;
+    (void)f.run();
+    // step 1 (1) + step 2 (first attempt + 2 retries = 3) + step 3 (1)
+    CHECK(f.reauth_calls == 5);
+    CHECK(f.reauth_dispatches_at == std::vector<int>{0, 1, 2, 3, 4});
+}
+
+TEST_CASE("workflow credential check: no port means no check, and the run is unchanged",
+          "[workflow][twin][reauth]") {
+    Fx f;
+    two_steps_with_reauth(f, {CC::kRevoked, CC::kRevoked});
+    f.wire_reauth = false; // the request carries no reauthorize
+    f.engine_status = "completed";
+    const auto o = f.run();
+    CHECK(o.status == WorkflowExecuteStatus::kOk);
+    CHECK(o.steps.size() == 2);
+    CHECK(f.reauth_calls == 0);
+}
+
+TEST_CASE("workflow credential check: the retry wait never runs past the run's deadline, and the deadline "
+          "then stops the run",
+          "[workflow][twin][reauth][deadline]") {
+    Fx f;
+    two_steps_with_reauth(f, {CC::kIndeterminate, CC::kValid});
+    auto req = f.request();
+    req.reauthorize_retry_delay = std::chrono::seconds(30); // far past the deadline below
+    req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(80);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto o = f.run(req);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+    CHECK_FALSE(f.dispatched_anything());
+    CHECK(f.reauth_calls == 1); // no second ask once the deadline arrived first
+    CHECK(o.deadline_exceeded);
+    CHECK(o.credential_stop.empty());
+    CHECK(o.run_outcome == WorkflowRunOutcome::kAborted);
+    CHECK(o.reason == "deadline_exceeded");
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a credential revoked after step 1 is a 202 aborted run "
+          "with reason credential_revoked, step 2 not sent, asked as THIS request and principal",
+          "[workflow][twin][rest][reauth][outcome]") {
+    Rest r;
+    two_steps_with_reauth(r.fx, {CC::kValid, CC::kRevoked});
+    r.sink.default_headers["X-Yuzu-Token"] = "tok-live";
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto j = body_of(*res);
+    CHECK(j["data"]["status"] == "aborted");
+    CHECK(j["data"]["reason"] == "credential_revoked");
+    CHECK(j["data"]["retryable"] == false);
+    CHECK(j["data"]["steps"].size() == 1);
+    CHECK(r.fx.reauth_calls == 2);
+    CHECK(r.reauth_principals == std::vector<std::string>{"alice", "alice"});
+    CHECK(r.reauth_tokens == std::vector<std::string>{"tok-live", "tok-live"});
+    CHECK(r.fx.audit_details.back().find("run_outcome=aborted") != std::string::npos);
+    CHECK(r.fx.audit_details.back().find("reason=credential_revoked") != std::string::npos);
+    CHECK(r.budget.active() == 0); // the lease is released
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: an indeterminate credential check that stays "
+          "indeterminate is a 202 aborted run with reason credential_indeterminate; a valid one runs on",
+          "[workflow][twin][rest][reauth][outcome]") {
+    SECTION("never answered") {
+        Rest r;
+        two_steps_with_reauth(r.fx, {CC::kIndeterminate, CC::kIndeterminate});
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        const auto j = body_of(*res);
+        CHECK(j["data"]["status"] == "aborted");
+        CHECK(j["data"]["reason"] == "credential_indeterminate");
+        CHECK(j["data"]["retryable"] == false);
+        CHECK(j["data"]["steps"].size() == 0);
+        CHECK_FALSE(r.fx.dispatched_anything());
+    }
+    SECTION("valid every time") {
+        Rest r;
+        two_steps_with_reauth(r.fx, {});
+        r.fx.engine_status = "completed";
+        const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(body_of(*res)["data"]["status"] == "completed");
+        CHECK(r.fx.reauth_calls == 2);
+    }
 }

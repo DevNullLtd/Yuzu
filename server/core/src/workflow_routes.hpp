@@ -52,6 +52,12 @@ class WorkflowRoutes {
 public:
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
+    /// Re-validates the credential on `req` against the principal the call was made as
+    /// (`AuthRoutes::revalidate_stream`, the seam MCP's held-open streams use). Asked by a
+    /// synchronous workflow run before each step (`WorkflowExecuteRequest::reauthorize`).
+    using RevalidateFn =
+        std::function<auth::CredentialCheck(const httplib::Request&, const std::string& principal)>;
+
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
@@ -232,6 +238,10 @@ public:
         /// execute route asks per distinct step pair before anything is sent. Unset ⇒ that
         /// route answers 503 "workflow dispatch not available" (fail closed, never "no gate").
         WorkflowAuthorizeFn authorize_dispatch;
+        /// The credential liveness check the v1 execute route hands its run (see
+        /// `WorkflowExecuteRequest::reauthorize`). Unset == the run makes no per-step credential
+        /// check: a test seam only, server.cpp always wires it (a lexical gate pins that).
+        RevalidateFn revalidate;
         /// ADR-0031 WS-A4 (seventh family): the schedule-read seam — replaces
         /// a direct `ScheduleEngine*` reach for `GET /fragments/schedules` /
         /// `GET /api/v1/schedules` (the seamed read triad; the unversioned

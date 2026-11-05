@@ -1090,6 +1090,10 @@ struct McpTestServer {
     /// fail-closed refusal. Empty (the default) is the production digest.
     std::function<std::optional<std::string>(std::string_view)> workflow_digest_for_test;
 
+    /// #2146 D2a: the wait before the single retry of an indeterminate per-step credential check.
+    /// Short by default so no test spends a real second on it.
+    std::chrono::milliseconds workflow_reauth_retry_for_test{1};
+
     /// #2146 A2-R1: optionally wire a real ScheduleEngine so list_schedules'
     /// definition_id/enabled_only filters can be exercised end-to-end.
     /// Default nullptr preserves the pre-existing "Schedule engine
@@ -1924,6 +1928,7 @@ private:
             mcp.set_draining_fn(draining_for_test);
         if (workflow_digest_for_test)
             mcp.set_workflow_digest_fn(workflow_digest_for_test);
+        mcp.set_workflow_reauthorize_retry_delay(workflow_reauth_retry_for_test);
         if (workflow_api_for_test) {
             mcp.set_workflow_api(workflow_api_for_test);
         } else if (workflow_engine_for_test) {
@@ -48707,6 +48712,151 @@ TEST_CASE("MCP execute_workflow: a run the engine stopped for a server stop is `
     CHECK(wf_audit_has(ts, "failure", "run_outcome=interrupted"));
     CHECK(wf_audit_has(ts, "failure", "reason=server_shutdown"));
     CHECK_FALSE(wf_audit_has(ts, "success", "execution_id=exec-1"));
+}
+
+TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; one revoked after step 1 "
+          "stops the run (aborted, credential_revoked), and a check asks the revalidate seam as THIS "
+          "call's principal and request",
+          "[mcp][pg][workflow][twin][security][tier][approval][outcome][reauth]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    using CC = yuzu::server::auth::CredentialCheck;
+
+    const auto make_server = [&](WfMcpFx& fx, McpTestServer& ts, std::vector<CC>& answers,
+                                 std::vector<std::string>& principals, int& asks) {
+        fx.wire(ts, store, appr);
+        // Failed-status read-back, as the real engine records a stopped run.
+        fx.api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+            yuzu::server::test::FnWorkflowApi::ListFn{},
+            [inner = fx.api](const std::string& id) { return inner->get_workflow(id); },
+            [](const std::string& id)
+                -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
+                yuzu::server::WorkflowExecution e;
+                e.id = id;
+                e.workflow_id = "wf-1";
+                e.status = "failed";
+                return std::optional<yuzu::server::WorkflowExecution>{e};
+            });
+        ts.workflow_api_for_test = fx.api;
+        // The engine stand-in asks the hook before every step and stops when it says no, as the
+        // real engine does before every dispatch attempt.
+        ts.workflow_run_for_test = [&fx](const std::string&, const std::vector<std::string>&,
+                                         yuzu::server::StepDispatchFn fn,
+                                         yuzu::server::ConditionEvalFn,
+                                         const yuzu::server::WorkflowRunControl& control)
+            -> std::expected<std::string, std::string> {
+            ++fx.run_calls;
+            if (control.on_admitted)
+                control.on_admitted("exec-1");
+            for (const auto& sid : fx.step_ids) {
+                if (control.before_attempt && !control.before_attempt())
+                    break;
+                (void)fn(sid, "[]", "{}");
+            }
+            return std::string{"exec-1"};
+        };
+        ts.revalidate_fn_for_test = [&](const httplib::Request& req, const std::string& principal) {
+            const int n = asks++;
+            (void)req;
+            principals.push_back(principal);
+            return n < static_cast<int>(answers.size()) ? answers[static_cast<size_t>(n)] : CC::kValid;
+        };
+    };
+
+    SECTION("revoked after step 1: step 2 is not sent, the run is aborted with credential_revoked") {
+        WfMcpFx fx;
+        fx.seed(store);
+        McpTestServer ts;
+        std::vector<CC> answers{CC::kValid, CC::kRevoked};
+        std::vector<std::string> principals;
+        int asks = 0;
+        make_server(fx, ts, answers, principals, asks);
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        const std::string approval_id = wf_mint_and_approve(ts, appr);
+        auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+        REQUIRE(recall);
+        INFO(recall->body);
+        const auto j = nlohmann::json::parse(recall->body);
+        REQUIRE(j.contains("result"));
+        const auto payload =
+            nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(fx.dispatches == 1); // step 1 stays sent, step 2 never was
+        CHECK(payload["status"] == "aborted");
+        CHECK(payload["reason"] == "credential_revoked");
+        CHECK(payload["run_status"] == "failed");
+        CHECK(payload["retryable"] == false);
+        CHECK(payload["retry_after_ms"].is_null());
+        CHECK(payload["execution_id"] == "exec-1");
+        CHECK(payload["steps"].size() == 1);
+        CHECK(asks == 2); // once before each step
+        // asked as the session's principal (McpTestServer's mock session user)
+        CHECK(principals == std::vector<std::string>{"test-user", "test-user"});
+        CHECK(wf_audit_has(ts, "failure", "run_outcome=aborted"));
+        CHECK(wf_audit_has(ts, "failure", "reason=credential_revoked"));
+        CHECK_FALSE(wf_audit_has(ts, "success", "execution_id=exec-1"));
+    }
+    SECTION("indeterminate on both asks aborts with credential_indeterminate and sends nothing") {
+        WfMcpFx fx;
+        fx.seed(store);
+        McpTestServer ts;
+        std::vector<CC> answers{CC::kIndeterminate, CC::kIndeterminate};
+        std::vector<std::string> principals;
+        int asks = 0;
+        make_server(fx, ts, answers, principals, asks);
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        const std::string approval_id = wf_mint_and_approve(ts, appr);
+        auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+        REQUIRE(recall);
+        INFO(recall->body);
+        const auto j = nlohmann::json::parse(recall->body);
+        REQUIRE(j.contains("result"));
+        const auto payload =
+            nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(fx.dispatches == 0);
+        CHECK(payload["status"] == "aborted");
+        CHECK(payload["reason"] == "credential_indeterminate");
+        CHECK(payload["retryable"] == false);
+        CHECK(asks == 2); // asked, then retried once, never a third time
+        CHECK(wf_audit_has(ts, "failure", "reason=credential_indeterminate"));
+    }
+    SECTION("stale-but-valid answers continue and every step is sent") {
+        WfMcpFx fx;
+        fx.seed(store);
+        McpTestServer ts;
+        std::vector<CC> answers{CC::kValidStale, CC::kValidStale};
+        std::vector<std::string> principals;
+        int asks = 0;
+        make_server(fx, ts, answers, principals, asks);
+        // The read-back of a clean run is `completed`.
+        fx.api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+            yuzu::server::test::FnWorkflowApi::ListFn{},
+            [inner = fx.api](const std::string& id) { return inner->get_workflow(id); },
+            [](const std::string& id)
+                -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
+                yuzu::server::WorkflowExecution e;
+                e.id = id;
+                e.workflow_id = "wf-1";
+                e.status = "completed";
+                return std::optional<yuzu::server::WorkflowExecution>{e};
+            });
+        ts.workflow_api_for_test = fx.api;
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        const std::string approval_id = wf_mint_and_approve(ts, appr);
+        auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+        REQUIRE(recall);
+        INFO(recall->body);
+        const auto j = nlohmann::json::parse(recall->body);
+        REQUIRE(j.contains("result"));
+        const auto payload =
+            nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(fx.dispatches == 2);
+        CHECK(payload["status"] == "completed");
+        CHECK(asks == 2);
+    }
 }
 
 TEST_CASE("MCP execute_workflow: a run that throws after the requested row is -32603 dispatch_exception "

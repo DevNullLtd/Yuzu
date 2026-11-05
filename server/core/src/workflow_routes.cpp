@@ -2882,6 +2882,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                       }}
                     : WorkflowClassifyFn{},
             .authorize = deps.authorize_dispatch,
+            .revalidate = deps.revalidate,
             .command_dispatch_fn = cmd_dispatch,
             .command_dispatch_fn_concurrency = cmd_dispatch_concurrency,
             .caller_fn = caller_fn,

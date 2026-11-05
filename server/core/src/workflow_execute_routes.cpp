@@ -234,6 +234,14 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             wreq.caller = caller;
             wreq.audit_context = "surface=rest";
             wreq.deadline = deadline;
+            // The run is synchronous on this handler thread, so `req` outlives every use of the
+            // closure and no copy of it is kept. The principal is the one `caller_fn` resolved
+            // (the session's username), the value `revalidate_stream` compares the credential to.
+            wreq.reauthorize_retry_delay = d.reauthorize_retry_delay;
+            if (d.revalidate)
+                wreq.reauthorize = [&req, &d, principal = caller.principal] {
+                    return d.revalidate(req, principal);
+                };
 
             WorkflowExecuteOutcome out;
             try {

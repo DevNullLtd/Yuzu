@@ -877,6 +877,13 @@ public:
     /// is never draining: a harness that does not wire it. server.cpp wires `draining_`.
     void set_draining_fn(std::function<bool()> fn) { draining_fn_ = std::move(fn); }
 
+    /// The wait before the single retry of an indeterminate per-step credential check in an
+    /// `execute_workflow` run. Unset (the production default) is `kReauthorizeRetryDelay`; set
+    /// only by a test that drives the indeterminate path.
+    void set_workflow_reauthorize_retry_delay(std::chrono::milliseconds d) {
+        workflow_reauthorize_retry_delay_ = d;
+    }
+
     /// The digest `execute_workflow` binds a ticket's step effects with. Unset (the production
     /// default) is `sha256_hex`; set only by a test that drives the fail-closed refusal.
     void set_workflow_digest_fn(std::function<std::optional<std::string>(std::string_view)> fn) {
@@ -1428,6 +1435,7 @@ private:
     WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
     std::function<bool()> draining_fn_;                      // see set_draining_fn
     std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
+    std::optional<std::chrono::milliseconds> workflow_reauthorize_retry_delay_; // see set_workflow_reauthorize_retry_delay
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.

@@ -57,6 +57,15 @@ call site would pass every existing test. This gate closes that:
      there, so a call placed after it keeps the count at one and every unit rig green while
      production answers 500 on both routes.
 
+  7. (#2146 D2a, per-step workflow credential check) The workflow-execute REST route's credential
+     liveness seam is wired: `wf_deps.revalidate = ` is assigned EXACTLY ONCE as an active line, and
+     the line `return auth_routes_->revalidate_stream(req, principal);` appears EXACTLY TWICE as
+     active lines (that assignment's body, and the MCP `StreamRevalidateFn` lambda beside
+     `build_handler`'s arguments, which `execute_workflow` also reads). Both seams are OPTIONAL by
+     construction (an empty one is "no check", so every unit rig leaves it unwired), which means
+     dropping either compiles cleanly, passes every unit test, and leaves a revoked credential able
+     to finish a workflow run it started; only production wiring can be pinned, here.
+
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
 `/* */` block that comments out an entire real site while preserving its exact leading
@@ -91,6 +100,8 @@ CLOSURE_REST = r"[ \t\r\f\v]*authorize_dispatch\);"
 CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_dispatch\);"
 AUDIT_SESSION = r"[ \t\r\f\v]*rest_api_v1_->set_audit_as_session_fn\(auth_routes_->audit_as_session_fn\(\)\);"
 REGISTER_ROUTES = r"[ \t\r\f\v]*rest_api_v1_->register_routes\("
+REVALIDATE_ASSIGN = r"[ \t\r\f\v]*wf_deps\.revalidate = .*"
+REVALIDATE_BODY = r"[ \t\r\f\v]*return auth_routes_->revalidate_stream\(req, principal\);"
 
 
 def problems(src):
@@ -106,6 +117,8 @@ def problems(src):
     audit_session = sum(1 for ln in lines if re.fullmatch(AUDIT_SESSION, ln))
     setter_at = [i for i, ln in enumerate(lines) if re.fullmatch(AUDIT_SESSION, ln)]
     register_at = [i for i, ln in enumerate(lines) if re.match(REGISTER_ROUTES, ln)]
+    revalidate_assign = sum(1 for ln in lines if re.fullmatch(REVALIDATE_ASSIGN, ln))
+    revalidate_body = sum(1 for ln in lines if re.fullmatch(REVALIDATE_BODY, ln))
     out = []
     if designated != 1:
         out.append("expected exactly 1 designated-init site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "
@@ -146,6 +159,13 @@ def problems(src):
         out.append("'rest_api_v1_->set_audit_as_session_fn(' must be called BEFORE 'rest_api_v1_->register_routes(': "
                    "the writer is captured by value at registration, so a later call leaves it empty and POST and "
                    "DELETE /api/v1/quarantine answer 500.")
+    if (revalidate_assign, revalidate_body) != (1, 2):
+        out.append("expected 'wf_deps.revalidate = ' assigned exactly once and "
+                   "'return auth_routes_->revalidate_stream(req, principal);' exactly twice (the REST workflow "
+                   "assignment's body and the MCP StreamRevalidateFn lambda) as active lines in server.cpp; found "
+                   f"assignment={revalidate_assign}, body={revalidate_body}. Either seam is optional and an "
+                   "empty one is 'no check', so a dropped line compiles and passes every unit rig while a "
+                   "revoked credential finishes the workflow run it started.")
     return out
 
 
@@ -155,6 +175,8 @@ CRYPTO_LINE = "                               .tier_policy_fn = auth_routes_->ga
 CLOSURE_REST_LINE = "            authorize_dispatch);\n"
 CLOSURE_MCP_LINE = "            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);\n"
 AUDIT_SESSION_LINE = "        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());\n"
+REVALIDATE_ASSIGN_LINE = "        wf_deps.revalidate = [this](const httplib::Request& req, const std::string& principal) {\n"
+REVALIDATE_BODY_LINE = "\n            return auth_routes_->revalidate_stream(req, principal);\n"  # leading newline: the MCP site is indented deeper
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 
 
@@ -170,7 +192,8 @@ class TierPolicyWiringLexical(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         src = self.src
-        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE):
+        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE,
+                  REVALIDATE_ASSIGN_LINE, REVALIDATE_BODY_LINE):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
@@ -217,6 +240,18 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T13 the writer wired with a hand-rolled lambda instead of the AuthRoutes factory",
              src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->set_audit_as_session_fn([](const auto&...) { return true; });\n", 1),
              ["set_audit_as_session_fn"]),
+            ("T16 the REST workflow revalidate assignment dropped (compiles: the seam is optional)",
+             src.replace(REVALIDATE_ASSIGN_LINE, "        wf_deps.unrelated = [this](const httplib::Request& req, const std::string& principal) {\n", 1),
+             ["wf_deps.revalidate"]),
+            ("T17 the REST workflow revalidate assignment commented out (anchoring proof)",
+             src.replace(REVALIDATE_ASSIGN_LINE, "// " + REVALIDATE_ASSIGN_LINE, 1),
+             ["wf_deps.revalidate"]),
+            ("T18 the REST workflow revalidate body replaced by a constant answer",
+             src.replace(REVALIDATE_BODY_LINE, "\n            return auth::CredentialCheck::kValid;\n", 1),
+             ["wf_deps.revalidate"]),
+            ("T19 a third revalidate_stream body appended",
+             src + REVALIDATE_BODY_LINE.lstrip("\n"),
+             ["wf_deps.revalidate"]),
             ("T11 the writer wired after register_routes (count stays one)",
              src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1) + AUDIT_SESSION_LINE,
              ["BEFORE"]),

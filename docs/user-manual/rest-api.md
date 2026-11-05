@@ -6713,7 +6713,7 @@ refused at send time because its definition changed after the preflight is audit
 that moment (detail ends `(late)`). A closing row records the outcome: `success` ONLY for a run
 whose `data.status` is `completed`, otherwise `failure` with `run_outcome=failed|partial|aborted|interrupted`
 in the detail (the same tokens as the `partial`/`aborted`/`interrupted` status, and `failed` for the `503` where
-nothing reached; `interrupted` is a run stopped by a server shutdown, with `reason=server_shutdown`); if that one is lost the `202` carries `data.audit_persisted: false` and
+nothing reached; `interrupted` is a run stopped by a server shutdown, with `reason=server_shutdown`; `aborted` also covers a run the credential check stopped, with `reason=credential_revoked` or `reason=credential_indeterminate`); if that one is lost the `202` carries `data.audit_persisted: false` and
 `Sec-Audit-Failed: true`. A refusal by the per-step checks (`approval_required`, `dispatch_denied`,
 `step_unclassified`, the targeting refusals) is audited as `denied` with the `reason`, and writes no
 `requested` row. A wiring failure, an unknown or empty workflow, an unknown instruction and a store
@@ -6755,6 +6755,27 @@ sent. Steps already sent are not recalled. The closing audit row is `failure` wi
 `run_outcome=interrupted reason=server_shutdown`. Read the run with `GET
 /api/v1/workflow-executions/{id}`: a step with no `command_id` was never sent.
 
+**Credential check before every step.** A run asks, before each step's first send and again on
+waking from each retry delay (once per wake, not once per 250 ms wait slice), whether the credential
+that made the call is still live: the same re-validation that cuts a held-open MCP stream, applied to
+this request's own cookie, `Authorization: Bearer` or `X-Yuzu-Token` and to the session's principal
+(for an engine principal, whether the principal is still `Active`). A live credential continues,
+including one answered from the short engine-principal cache. A revoked, expired or rebound
+credential stops the run before the next send. An answer that cannot be given (the auth store did
+not respond) is asked once more after at most one second, never past the run's deadline, and a
+second non-answer stops the run too: fail closed. A `foreach` step is asked once per item, since
+each item is a send. A stopped run is the typed `202` below with `data.status: "aborted"`,
+`data.reason: "credential_revoked"` (or `"credential_indeterminate"`) and `retryable: false`, even
+when nothing had been sent; the steps not yet started are `skipped` (`run stopped`, as for a
+deadline stop), the execution is closed `failed`, steps already sent are not recalled, and the
+closing audit row is `failure` with `run_outcome=aborted reason=credential_revoked` (or
+`credential_indeterminate`). **What this does not do:** it re-checks that the credential is live; it
+does not rebuild the caller. A role grant removed during the run is caught per step, because the
+shared dispatch chokepoint judges each send against the live RBAC store. An administrator
+elevation that expires during the run, and a device-group narrowing, are not re-read: the caller's
+elevation flag and visible device set are those taken when the call was accepted, so they are
+bounded only by the 60 second deadline.
+
 **Dispatch is synchronous, device work is not.** The call returns after every step's command has
 been sent, including step retries and delays (within the run budget above), so it can be slow. Each step is sent only to the
 agents the caller can see (the same confinement as every other dispatch); a named agent outside the
@@ -6776,8 +6797,9 @@ at send time and every send attempt reached at least one agent (commands were se
 necessarily finished). A run that sent something and did not meet all three is still a `202` (a
 `5xx` would invite a blind re-send of steps already sent) but is NOT a success: `data.status` is
 `partial` (some attempt reached nobody, or the engine did not complete after a send), `aborted` (a
-step was refused at send time because its definition changed, or the run reached its 60 second
-deadline, and the rest did not run) or `interrupted` (the server began stopping: `data.reason`
+step was refused at send time because its definition changed, the run reached its 60 second
+deadline, or the credential check stopped it: `data.reason` `deadline_exceeded`,
+`credential_revoked` or `credential_indeterminate`; the rest did not run) or `interrupted` (the server began stopping: `data.reason`
 `server_shutdown`), with
 `data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
 with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step retried
