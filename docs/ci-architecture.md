@@ -1478,9 +1478,12 @@ job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
-`timeout-minutes: 120` (a hung agent shard or echo entry now adds up to 8 minutes
-more, per #7135's 480 s and 180 s limits, and a flake-retry re-run of it the same
-again). At np=2 the Linux slot-wait case was the one that
+`timeout-minutes: 120`. Since #7135 a hung agent shard holds the step for up to
+480 s (was 240 s) and a hung echo entry up to 180 s (was 90 s), and `flake-retry.py`
+re-runs a failed suite once to enumerate its failures, so a hung entry costs its limit
+twice before the job fails (nothing is masked). That is about 16 minutes for one
+agent shard; several hung entries compound it and the 120-minute `timeout-minutes`
+is the backstop. At np=2 the Linux slot-wait case was the one that
 needed attention: the "revisit the 700s per-shard budget or the Linux
 `--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
 above) had a less severe trigger than at 16 shards (the all-at-cap ceiling alone
@@ -1965,7 +1968,8 @@ applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
-240 s for the harness, 192 s for an agent shard, 72 s for echo); and the entry
+240 s for the harness, 192 s for an agent shard, 72 s for echo, the last two at
+the pre-#7135 timeouts and 384 s and 144 s now); and the entry
 count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
 guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green

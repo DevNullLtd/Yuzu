@@ -5058,16 +5058,23 @@ struct LiveRun {
             if (!seen) {
                 // #7135: on the shared CI box this wait timed out with nothing in the job log to
                 // say why. The session is system-wide, so name what it delivered since this write
-                // (all writers), whether our own buffer evicted any (buffer_evicted), and what the
-                // session says it lost. Events arriving while events_lost or rt_buffers_lost grow
-                // points at the session overflowing under load, which would have dropped this
-                // write's event; no events at all with etw_running=1 and zero loss points at a
-                // session that is not delivering; etw_running=0 means the session died during the
-                // wait. The counters are cumulative for the session, and zero loss does not prove
-                // nothing was dropped (provider-side drops are not counted). If loss_query_ok is 0
-                // the counters are not evidence.
+                // (all writers), whether our own buffer evicted any (evicted), whether any
+                // buffered event carries this process's pid (from_this_pid: the await predicate
+                // also needs the op and value name, so 1 here with the wait still timed out means
+                // the event arrived but did not match), and what the session says it lost. Events
+                // arriving while events_lost or rt_buffers_lost grow points at the session
+                // overflowing under load, which would have dropped this write's event; no events
+                // at all with etw_running=1 and zero loss points at a session that is not
+                // delivering; etw_running=0 means the session died during the wait. The counters
+                // are cumulative for the session, and zero loss does not prove nothing was dropped
+                // (provider-side drops are not counted). If loss_query_ok is 0 the counters are
+                // not evidence.
                 const SessionLoss loss = session_loss();
                 const auto evicted = src->buffer_for_test().drop_info().count;
+                // A deadline already in the past evaluates the predicate once, without waiting.
+                const bool from_this_pid = src->buffer_for_test().wait_for_event(
+                    [](const RegistryEtwEvent& e) { return e.pid == ::GetCurrentProcessId(); },
+                    std::chrono::steady_clock::now());
                 FAIL("no ETW event from this write within 15 s. session delivered "
                      << (src->buffer_for_test().pushed() - pushed_before)
                      << " events from all writers since this write ("
@@ -5075,7 +5082,8 @@ struct LiveRun {
                      << " evicted since the session started); events_lost=" << loss.events_lost
                      << " rt_buffers_lost=" << loss.rt_buffers_lost
                      << " decode_failed=" << loss.decode_failed
-                     << " loss_query_ok=" << loss.query_ok << " etw_running=" << etw_running());
+                     << " loss_query_ok=" << loss.query_ok << " etw_running=" << etw_running()
+                     << " from_this_pid=" << from_this_pid);
             }
         }
         tick(t.db, *src);
