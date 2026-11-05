@@ -427,7 +427,8 @@ cmd_scenario() {
     fi
     sampler_stop "$run"
     # a server-synthesised terminal can arrive up to the 300 s SendCommand deadline after the send: re-read every send now
-    python3 -I "$CLIENT" resolve --run "$run" --url1 "$URL1" --url2 "$URL2" --cookies1 "$STATE/cookies1" --cookies2 "$STATE/cookies2"
+    python3 -I "$CLIENT" resolve --run "$run" --url1 "$URL1" --url2 "$URL2" --cookies1 "$STATE/cookies1" --cookies2 "$STATE/cookies2" \
+        || fail "resolve failed: late terminals were not re-read"
     docker wait "spike-2r-cap-$$" >/dev/null 2>&1; docker logs "spike-2r-cap-$$" > "$run/cap-victim-50055.txt" 2>&1; docker rm "spike-2r-cap-$$" >/dev/null 2>&1
     local since; since="$(date -u -d "@$((t0 / 1000 - 60))" +%FT%TZ)"
     for c in $(compose ps -q agent); do
@@ -443,7 +444,8 @@ cmd_scenario() {
             docker logs "$(cname "$r")" 2>&1 | grep -F "$aid" | sed "s/^/$r: /"
         done
     done < "$run/sample.txt" > "$run/registrations.txt"
-    python3 -I "$CLIENT" analyse --run "$run"
+    [ -s "$run/registrations.txt" ] || fail "registrations.txt is empty: the sampled agents' registration lines were not captured"
+    python3 -I "$CLIENT" analyse --run "$run" || fail "analyse failed"
     if [ "$FAILS" -eq 0 ]; then
         : > "$run/COMPLETE"; RUN_FINISHED=1
     else
@@ -457,8 +459,11 @@ cmd_scenario() {
 take_lock() {
     # keyed to the PROJECT, not to a state root: the project name, the subnet and the containers are global, so a
     # second command with another $TWOREP_STATE_ROOT must be refused too (and never get to flush a live run's fault)
-    local lock="${TMPDIR:-/tmp}/yuzu-ws13-7082-$PROJECT.lock"
-    exec 9>"$lock" || die "cannot open $lock"
+    # a FIXED path (not $TMPDIR, which differs per shell and would let two commands both take "the" lock), opened
+    # for append and refused if it is a symlink (a plain `>` would truncate the link's target)
+    local lock="/tmp/yuzu-ws13-7082-$PROJECT.lock"
+    [ ! -L "$lock" ] || die "$lock is a symlink; refusing to use it"
+    exec 9>>"$lock" || die "cannot open $lock"
     flock -n 9 || die "another command already holds the rig lock ($lock)"
 }
 

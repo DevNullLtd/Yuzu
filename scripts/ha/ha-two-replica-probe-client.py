@@ -75,8 +75,13 @@ def load_rows(path):
             if not line.strip():
                 continue
             try:
-                rows.append(json.loads(line))
+                obj = json.loads(line)
             except ValueError:
+                bad += 1
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+            else:
                 bad += 1
     if bad:
         print("WARNING: %d unparseable line(s) skipped in %s" % (bad, path), file=sys.stderr)
@@ -106,13 +111,36 @@ def classify_cohorts(rows):
     return sorted(bad)
 
 
-def run_validity(rd, rows):
+def capture_outbound_in_window(rd, t0, t_end):
+    """Outbound packets seen on :50055 in the 10 s buckets that fall wholly between t0 and t_end (seconds), or None
+    when there is no capture counts section to read."""
+    p = os.path.join(rd, "cap-victim-50055.txt")
+    if not os.path.exists(p):
+        return None
+    txt = open(p, errors="replace").read()
+    if "---COUNTS---" not in txt:
+        return None
+    lo = int(t0 // 10 * 10 + (0 if t0 % 10 == 0 else 10))
+    hi = int(t_end // 10 * 10)
+    n = 0
+    for line in txt.split("---COUNTS---", 1)[1].splitlines():
+        f = line.split()
+        if len(f) == 3 and f[0] == "out10s" and lo <= int(f[1]) < hi:
+            n += int(f[2])
+    return n
+
+
+def run_validity(rd, rows, require_complete=False, legacy_unmarked=False):
     """Reasons a run may NOT enter the trigger tally. Validity needs POSITIVE evidence: every expected cell must
-    exist. A run with no control rows, a missing replica or round, an empty probes file, or any rig error is
-    never reported as valid just because nothing in it failed."""
+    exist. A run with no control rows, no stated window, a missing replica or round, duplicate rows, an empty
+    probes file, any rig error, or (for a fault run) no capture showing the egress drop took effect is never
+    reported as valid just because nothing in it failed. With require_complete the runner's COMPLETE marker is
+    needed too, unless the caller attests the run predates the marker (legacy_unmarked)."""
     why = []
     if os.path.exists(os.path.join(rd, "INVALID")):
         why.append("INVALID marker: " + open(os.path.join(rd, "INVALID")).read().strip())
+    if require_complete and not os.path.exists(os.path.join(rd, "COMPLETE")) and not legacy_unmarked:
+        why.append("no COMPLETE marker (the run did not finish, or predates the marker and is not attested)")
     if not rows:
         return why + ["no probe rows"]
     meta = open(os.path.join(rd, "meta.txt")).read() if os.path.exists(os.path.join(rd, "meta.txt")) else ""
@@ -121,12 +149,17 @@ def run_validity(rd, rows):
         window = int(m.get("window", "0"))
     except ValueError:
         window = 0
+    if window < 61:
+        return why + ["meta.txt states no window above 60 s, so no fault-phase round is expected (a control-only run cannot be valid)"]
     sample = read_sample(rd, os.path.join(rd, "sample.txt"))
     clean = [x[0] for x in sample if x[1] == "clean"]
     if not clean:
         return why + ["no clean-cohort agents in the sample"]
     expected = ["control"] + ["+%ds" % t for t in (60, 120, 300, 420) if t < window]
-    have = {(r["label"], r["replica"], r["surface"], r["agent_id"]) for r in rows if r.get("arm") == "ids"}
+    keys = [(r.get("label"), r.get("replica"), r.get("surface"), r.get("agent_id"), r.get("arm")) for r in rows]
+    if len(keys) != len(set(keys)):
+        why.append("%d duplicate probe rows (the same round, replica, surface, agent and arm twice)" % (len(keys) - len(set(keys))))
+    have = {k[:4] for k in keys if k[4] == "ids"}
     missing = [(lab, rep, sf, a) for lab in expected for rep in (1, 2) for sf in ("v1", "legacy") for a in clean
                if (lab, rep, sf, a) not in have]
     if missing:
@@ -138,6 +171,20 @@ def run_validity(rd, rows):
     bad = classify_cohorts([dict(r) for r in rows])
     if bad and len(bad) == len(clean):
         why.append("every clean agent's control failed")
+    if m.get("id") == "F3-2r":
+        def rd_int(name):
+            q = os.path.join(rd, name)
+            return int(open(q).read()) if os.path.exists(q) else 0
+        t0, tu = rd_int("fault_ms"), rd_int("undo_ms")
+        if not t0:
+            why.append("no fault_ms: the fault was not recorded as injected")
+        else:
+            end = (tu / 1000.0) if tu else (t0 / 1000.0 + window)
+            out = capture_outbound_in_window(rd, t0 / 1000.0, end)
+            if out is None:
+                why.append("no packet-capture counts: nothing shows the egress drop took effect")
+            elif out > 0:
+                why.append("%d outbound packets on :50055 during the fault window: the drop did not hold" % out)
     return why
 
 
@@ -593,6 +640,7 @@ def cmd_export(a):
     per run x round x cohort x role x arm) and run-timeline.csv (one row per run). Raw logs, cookies and
     secrets are NOT exported."""
     os.makedirs(a.out, exist_ok=True)
+    legacy = set(x for x in a.legacy_unmarked.split(",") if x)
     runs = sorted(glob.glob(os.path.join(a.state, "run-*", "probes.jsonl")))
     if a.runs:
         want = set(x for x in a.runs.split(",") if x)
@@ -600,6 +648,9 @@ def cmd_export(a):
         if missing:
             sys.exit("export: no such run(s): %s" % ", ".join(sorted(missing)))
         runs = [x for x in runs if os.path.basename(os.path.dirname(x)) in want]
+    if not runs:
+        sys.exit("export: no runs matched under %s; refusing to replace the committed CSVs with empty files" % a.state)
+    skipped = []
     tmp_f, tmp_g = [os.path.join(a.out, n + ".tmp.%d" % os.getpid()) for n in ("probe-summary.csv", "run-timeline.csv")]
     with open(tmp_f, "w", newline="") as f, open(tmp_g, "w", newline="") as g:
         w = csv.writer(f, lineterminator="\n")
@@ -622,9 +673,10 @@ def cmd_export(a):
                 # an early shake-out run taken before probes carried a cohort and holder: its stale-session agents
                 # cannot be told from clean ones, so it is not summarised (its raw data stays in the state dir)
                 print("skipping %s: probes carry no cohort tag" % run)
+                skipped.append(run)
                 continue
             inconclusive = classify_cohorts(rows)
-            vreasons = run_validity(rd, rows)
+            vreasons = run_validity(rd, rows, require_complete=True, legacy_unmarked=run in legacy)
             for r in rows:
                 r.setdefault("reason", "")
             holders = sorted({r.get("holder", "") for r in rows if r.get("holder")})
@@ -659,9 +711,13 @@ def cmd_export(a):
                         *st(tl.get("first_nonroutable_s")), *st(tl.get("first_unarmed_s")),
                         *st(tl.get("first_routable_after_undo_s")),
                         len(inconclusive),
-                        "yes" if os.path.exists(os.path.join(rd, "COMPLETE")) else "no (run predates the marker or did not finish)",
+                        "yes" if os.path.exists(os.path.join(rd, "COMPLETE")) else ("attested by the author (predates the marker)" if run in legacy else "no"),
                         "yes" if not vreasons else "no", "; ".join(vreasons),
                         hashlib.sha256(open(pj, "rb").read()).hexdigest()])
+    if skipped and a.runs:
+        for q in (tmp_f, tmp_g):
+            os.path.exists(q) and os.remove(q)
+        sys.exit("export: named run(s) %s carry no cohort tag; nothing was replaced" % ", ".join(skipped))
     os.replace(tmp_f, os.path.join(a.out, "probe-summary.csv"))
     os.replace(tmp_g, os.path.join(a.out, "run-timeline.csv"))
     print("exported %d runs to %s" % (len(runs), a.out))
@@ -673,6 +729,7 @@ def main():
     pe = sp.add_parser("export")
     pe.add_argument("--state", required=True); pe.add_argument("--out", required=True)
     pe.add_argument("--runs", default="", help="comma list of run directory names to summarise (default: every tagged run)")
+    pe.add_argument("--legacy-unmarked", default="", help="comma list of runs that predate the COMPLETE marker and that the author attests finished")
     for name in ("holders", "sample", "probe", "recovered", "resolve", "analyse"):
         p = sp.add_parser(name)
         p.add_argument("--run", required=True)
