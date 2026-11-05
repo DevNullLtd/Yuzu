@@ -5063,10 +5063,9 @@ struct LiveRun {
                 // carrying this process's pid arrived since this write (from_this_pid: the await
                 // predicate also needs the op and value name, so 1 here with the wait still timed
                 // out means an event arrived but did not match), and what the session says it
-                // lost. Events
-                // arriving while events_lost or rt_buffers_lost grow points at the session
-                // overflowing under load, which would have dropped this write's event; no events
-                // at all with etw_running=1 and zero loss points at a session that is not
+                // lost. Events arriving while events_lost or rt_buffers_lost grow points at the
+                // session overflowing under load, which would have dropped this write's event; no
+                // events at all with etw_running=1 and zero loss points at a session that is not
                 // delivering; etw_running=0 means the session died during the wait. The counters
                 // are cumulative for the session, and zero loss does not prove nothing was dropped
                 // (provider-side drops are not counted). If loss_query_ok is 0 the counters are
