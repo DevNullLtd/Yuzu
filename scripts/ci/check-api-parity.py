@@ -2593,8 +2593,8 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
 
 
 def _pinned_table_errors(label, const, table, limit, live):
-    """Shrink-only, size-pinned allowlist errors shared by checks 6 and 7: the table's size must
-    equal its MAX and every entry must still match a live finding (`live` = the set of keys, or
+    """Size-pinned allowlist errors shared by checks 6 and 7 (a pin, not a shrink-only cap): the
+    table's size must equal its MAX, raised only by a ruling recorded in ADR-1005, and every entry must still match a live finding (`live` = the set of keys, or
     for the mismatch table a {key: value} dict checked by the caller)."""
     errors = []
     n = len(table)
