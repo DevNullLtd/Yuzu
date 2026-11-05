@@ -148,6 +148,32 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
                                         : 0,
                 yuzu::server::LeaderMetricsPublisher::steady_now_ns());
         }
+        // #6527: CRL freshness. Absolute timestamps, not "seconds remaining", so a scrape whose
+        // read fails or is skipped leaves the last value in place and Prometheus's `- time()`
+        // keeps counting down from it: for ONE replica that value stays true (only a publish moves
+        // nextUpdate). With several replicas a replica whose reads keep failing holds an OLDER
+        // nextUpdate than the shared row, which is why the alerts aggregate `max by (job)`: the
+        // freshest replica wins and a stale one cannot page. Nothing is published while no CRL
+        // exists, and a successful read that finds no row also leaves the last value (the re-root
+        // runbook restarts every instance, docs/pki-architecture.md). Every replica reads the shared
+        // row, so a wedged or absent leader is visible from any scrape. The read omits the DER; the
+        // pool lease wait is bounded by the store's read timeout (the query itself by the pool's
+        // statement timeout). It is skipped while the reachability probe (no I/O) says Postgres is
+        // down, so this series adds no stall to a scrape during that outage; a null probe means
+        // "unknown", so the read proceeds.
+        const bool pg_known_down =
+            deps.pg_reachability_probe &&
+            yuzu::server::pg_reachability::classify(deps.pg_reachability_probe->snapshot(),
+                                                    yuzu::server::PgReachabilityProbe::now_ns()) !=
+                yuzu::server::pg_reachability::Verdict::Ready;
+        if (!pg_known_down && deps.ca_store && deps.ca_store->is_open()) {
+            if (auto fresh = deps.ca_store->latest_crl_freshness(); fresh.has_value() && *fresh) {
+                deps.metrics->gauge("yuzu_server_ca_crl_next_update_timestamp_seconds")
+                    .set(static_cast<double>((*fresh)->next_update));
+                deps.metrics->gauge("yuzu_server_ca_crl_published_timestamp_seconds")
+                    .set(static_cast<double>((*fresh)->published_at));
+            }
+        }
         // Refresh management group gauges before serializing
         if (deps.mgmt_group_store && deps.mgmt_group_store->is_open()) {
             deps.metrics->gauge("yuzu_server_management_groups_total")
