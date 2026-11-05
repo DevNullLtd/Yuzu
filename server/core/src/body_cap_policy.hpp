@@ -87,16 +87,19 @@
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
 ///
-/// That gap is narrower than it once was: `server.cpp`'s `set_pre_request_
-/// handler` (body-cap-post-read-stage) is a SECOND chokepoint, driven by the
+/// That gap is narrower than it once was: the post-read stage (body-cap-post-read-stage,
+/// `step_up_wiring.hpp`'s `run_post_read_stage`) is a SECOND chokepoint, driven by the
 /// SAME `resolve_body_cap` table, that runs after httplib has read the body
 /// into `req.body` but before the route handler runs — so a chunked body
 /// that turns out to be over this table's cap is still refused, just after
 /// being buffered rather than before. It closes "reaches a handler
-/// uncapped", not "gets buffered uncapped" — see that handler's own doc
-/// comment for what it does and does not cover (notably: it cannot see a
+/// uncapped", not "gets buffered uncapped" — see the comment at its install
+/// in `server.cpp` for what it does and does not cover (notably: it cannot see a
 /// multipart request's body at all, since httplib never copies multipart
-/// content into `req.body`).
+/// content into `req.body`). It is installed through `PostReadStageRegistry`
+/// (`post_read_stage.hpp`) and run by `HttplibRouteSink`'s handler wrapper, NOT as
+/// `httplib::Server::set_pre_request_handler`: from cpp-httplib v0.47.0 that handler
+/// runs BEFORE the body is read, so a body-size check hung there would always see 0 bytes.
 ///
 ///
 /// ROUTED-CONCERN ROW: `.claude/routed-concerns-access-control.md`, which
@@ -202,7 +205,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // (session open POST, chunk PUT, status GET, commit POST, cancel DELETE).
     // ANY method: only the chunk PUT carries a large body, but scoping to PUT
     // would silently drop every sibling verb on this prefix to the catch-all
-    // (rule 4 in the routed-concern row — prefer any-method rows). Cap = the
+    // (rule 4 in the routed-concern row: a mutating route needs its own entry or a
+    // reviewed catch-all decision). Any-method rows are preferred. Cap = the
     // protocol's own per-chunk maximum, `upload_grant::kDefaultChunkMaxBytes`
     // (upload_grant_parsers.hpp; bound by a static_assert in
     // file_retrieval_routes.cpp so the two cannot drift). requires_measurable
@@ -546,7 +550,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // while keeping an unauthenticated flood against this subtree (whose
     // gates all run in the handler, after httplib buffers the body) 256x
     // under the 4 MiB catch-all it previously fell to. ANY method: the
-    // bodyless siblings share the prefix (rule 4 in the routed-concern row).
+    // bodyless siblings share the prefix.
     // requires_measurable stays OFF per the file-header default.
     {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
 
@@ -564,15 +568,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
     // even fully escaped. Mirrors the handler's own kLayoutBodyMaxBytes (16 KiB) exactly - the
     // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
-    // shares the prefix (rule 4 in the routed-concern row).
+    // shares the prefix.
     {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
 
     // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
     // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
     // tag key, an OIDC client secret or a short JSON array of routed observation types), well
     // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
-    // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
-    // row).
+    // ANY method: the sibling GET is bodyless and shares the prefix.
     {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
 
     // /api/v1/inventory/software/normalization/ — the software-title curation REST v1 routes
