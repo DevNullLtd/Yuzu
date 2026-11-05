@@ -25,14 +25,20 @@
 # Where it writes (the only changes this script makes):
 #   $YUZU_GCOVR_VENV   default ~/.local/share/yuzu/gcovr-venv   the virtualenv, plus beside it
 #                      <venv>.lock and, transiently, <venv>.yuzu-gcovr-old.<pid>; ~/.local/share/yuzu is created
-#   ~/.local/bin/gcovr a symlink to the venv's gcovr (replaces an existing symlink there, e.g. a
-#                      pipx shim; refuses to replace a regular file)
+#   ~/.local/bin/gcovr a symlink to the venv's gcovr. An existing link there is replaced ONLY when it
+#                      already points into this venv; a link to anything else (a pipx shim, another
+#                      install) and a regular file are refused, with the command to run yourself
 # pip may also write its own cache under ~/.cache/pip.
 #
 # RECOVERY / SAFETY: a rebuild MOVES the old venv aside (one atomic rename) before building, then
-# removes the moved copy, so an interrupt can never leave a half-deleted directory at $VENV; a
-# half-BUILT venv carries a marker written before venv creation, so the next run recognises and
-# replaces it, and a leftover <venv>.yuzu-gcovr-old.<pid> is removed by name. The delete guard refuses to touch a
+# removes the moved copy, so an interrupt can never leave a half-deleted directory at $VENV. If the
+# rebuild FAILS (pip, a timeout, Ctrl-C, a signal), the half-built venv this run created (it carries the
+# marker, or is empty) is removed and the previous venv is moved BACK, so a transient PyPI failure does
+# not cost you a working gcovr; a kill -9 or a power cut cannot run that code, and the next run then
+# rebuilds. A half-BUILT venv carries a marker written before venv creation, so the next run recognises
+# and replaces it. A leftover <venv>.yuzu-gcovr-old.<pid> is removed only when it carries this script's
+# own marker or stamp (the contents go first and the marker files last, so a kill part-way still leaves
+# it recognisable) or is empty; any other directory of that name is left alone and named. The delete guard refuses to touch a
 # $VENV that is not this script's own (it must carry the marker file or the requirements stamp this
 # script writes) unless it is empty: a plain Python venv of yours, such as a project .venv, is never
 # taken for ours. A managed venv that is fresh and healthy is not rebuilt just because something else
@@ -151,6 +157,14 @@ fi
 if [[ -e "$LINK" && ! -L "$LINK" ]]; then
     die "$LINK exists and is not a symlink; move it aside so the pinned gcovr can be linked there"
 fi
+# A link there is replaced only when it already points into THIS venv (the one this script wrote:
+# $VENV/bin/gcovr). Anything else is somebody's: a pipx shim, a link to another install.
+if [[ -L "$LINK" ]]; then
+    link_target="$(readlink "$LINK" 2>/dev/null || true)"
+    if [[ "$link_target" != "$VENV/bin/gcovr" && "$link_target" != "$VENV"/* ]]; then
+        die "$LINK is a symlink to '${link_target}', not into this script's virtualenv ($VENV), so it was NOT replaced; if you want the pinned gcovr there, remove it yourself (rm '$LINK') and re-run, or put $VENV/bin ahead of it on PATH"
+    fi
+fi
 
 # requirements-ci.txt pins gcovr 8.7, meson 1.12 and jsonschema 4.26, which all need Python 3.10+.
 # Say so up front: otherwise an older interpreter (RHEL9's 3.9, Ubuntu 20.04's 3.8) reaches pip, which
@@ -185,17 +199,65 @@ fi
 # enough -- any Python virtualenv, including a project's own .venv, has one.
 owned() { [[ -f "$1/$MARKER" || -f "$1/.requirements-ci.sha256" ]]; }
 empty_dir() { [[ -d "$1" && -z "$(ls -A "$1" 2>/dev/null)" ]]; }
-# Moved-aside leftovers live in a name only this script uses, <venv>.yuzu-gcovr-old.<pid>, so they are
-# ours by NAME even when half-deleted (a generic suffix like .old.N could be somebody's own directory).
-# Never a symlink.
+# remove_owned_tree DIR: delete a directory that carries this script's marker or stamp. The contents go
+# first and the two ownership files LAST, so a kill part-way leaves a tree that is still recognisably
+# ours (rm -rf in one go could delete the marker first and strand an unidentifiable half-tree).
+remove_owned_tree() {
+    local d="$1"
+    [[ -d "$d" && ! -L "$d" ]] || return 1
+    find "$d" -mindepth 1 -maxdepth 1 ! -name "$MARKER" ! -name ".requirements-ci.sha256" -exec rm -rf {} + || return 1
+    rm -f "$d/$MARKER" "$d/.requirements-ci.sha256" || return 1
+    rmdir "$d"
+}
+# Moved-aside leftovers live in a name only this script uses, <venv>.yuzu-gcovr-old.<pid>, but a name is
+# not ownership: with YUZU_GCOVR_VENV pointing at a path of yours, an unrelated directory could be called
+# that. So a leftover is removed only when it carries the marker or the stamp (or is empty); any other is
+# left in place and named once. Never a symlink.
 remove_leftovers() {
-    local old
+    local old loud="${1:-}"
     for old in "$VENV".yuzu-gcovr-old.*; do
         [[ -d "$old" && ! -L "$old" ]] || continue
-        rm -rf "$old"
+        if owned "$old"; then
+            remove_owned_tree "$old" || say "could not remove the leftover $old; remove it by hand (rm -rf) once you have checked it" >&2
+        elif empty_dir "$old"; then
+            rmdir "$old" 2>/dev/null || true
+        elif [[ -n "$loud" ]]; then
+            say "leaving $old alone: it has neither this script's marker (${MARKER}) nor its requirements stamp, so it is not known to be ours; if it is a leftover of an interrupted run of this script, remove it by hand (rm -rf)" >&2
+        fi
     done
 }
-remove_leftovers
+remove_leftovers loud
+
+# A failed rebuild gives the previous venv back. OLD_ASIDE is set just before the rename and the EXIT
+# trap runs only on a non-zero exit, so a successful run, a refusal that happens before any rebuild, and
+# the failures that come after the new venv is complete (see below) never restore. Positive evidence only:
+# the moved-aside directory must still be there, and what stands at $VENV must be what THIS run started
+# (it carries the marker, or is empty) -- never a symlink, never anything else.
+OLD_ASIDE=""
+restore_old_venv() {
+    local rc=$?
+    trap - EXIT
+    [[ -n "$OLD_ASIDE" && "$rc" -ne 0 ]] || return 0
+    [[ -d "$OLD_ASIDE" && ! -L "$OLD_ASIDE" ]] || return 0
+    if [[ -L "$VENV" ]]; then
+        say "NOT restoring the previous virtualenv: $VENV is a symlink; it is at $OLD_ASIDE" >&2
+        return 0
+    elif [[ -e "$VENV" ]]; then
+        if [[ -f "$VENV/$MARKER" ]]; then
+            remove_owned_tree "$VENV" || { say "could not remove the half-built virtualenv at $VENV; the previous one is left at $OLD_ASIDE" >&2; return 0; }
+        elif empty_dir "$VENV"; then
+            rmdir "$VENV" || { say "could not remove the empty $VENV; the previous virtualenv is left at $OLD_ASIDE" >&2; return 0; }
+        else
+            say "NOT restoring the previous virtualenv: $VENV is not what this run created; it is at $OLD_ASIDE" >&2
+            return 0
+        fi
+    fi
+    if mv "$OLD_ASIDE" "$VENV"; then
+        say "the rebuild failed; restored the previous virtualenv at $VENV" >&2
+    else
+        say "the rebuild failed and the previous virtualenv could not be moved back; it is at $OLD_ASIDE" >&2
+    fi
+}
 
 if managed_ok; then
     # Only the PATH order (or the link) is wrong; rebuilding would change nothing.
@@ -207,7 +269,12 @@ else
         fi
         # Atomic: after this rename $VENV does not exist, and the old tree is deleted afterwards. A kill
         # during the delete leaves only a <venv>.yuzu-gcovr-old.<pid> directory, never a half-deleted $VENV.
-        mv "$VENV" "$VENV.yuzu-gcovr-old.$$" || die "cannot move $VENV aside"
+        # The EXIT/INT/TERM traps go in first, so a failure or a signal anywhere below puts it back.
+        trap restore_old_venv EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        OLD_ASIDE="$VENV.yuzu-gcovr-old.$$"
+        mv "$VENV" "$OLD_ASIDE" || die "cannot move $VENV aside"
     fi
 
     say "installing gcovr==${pin} with hashes from requirements-ci.txt into ${VENV}"
@@ -220,6 +287,8 @@ else
         || die "pip could not install requirements-ci.txt with hashes (see the pip error above); the usual causes are no network access to PyPI, or a hash-pinned wheel that is not available for this platform"
     # The stamp is written only after pip succeeded, so a half-built venv never reads as fresh.
     printf '%s\n' "$req_sha" > "$STAMP" || die "cannot write $STAMP"
+    # The new venv is complete: from here a failure (the link, PATH) must NOT give the old one back.
+    OLD_ASIDE=""
     remove_leftovers
 fi
 ln -sfn "$VENV/bin/gcovr" "$LINK" || die "cannot link $LINK"

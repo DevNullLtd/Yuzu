@@ -31,6 +31,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -42,7 +43,7 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_DIR = Path(os.environ.get("YUZU_ENSURE_SCRIPT_DIR", ROOT / "scripts" / "test"))
 FARM_TOOLS = ("bash sh dirname basename sed head grep readlink sha256sum shasum cut cat ls mkdir rm ln mv "
-              "uname touch chmod tr mktemp tail wc od").split()
+              "uname touch chmod tr mktemp tail wc od find rmdir sleep").split()
 
 # A sequence stub: STUB_<VAR> is a space-separated list of outcomes ("ok"/"fail"), one per call; the
 # last repeats. The call count lives in $STUB_LOG.<name>.
@@ -147,9 +148,11 @@ if [ "$1" = -m ] && [ "$2" = venv ]; then
   echo "marker=$([ -e "$3/.yuzu-gcovr-venv" ] && echo 1 || echo 0) aside=$aside" >> "$STUB_LOG.venv"
   echo "venv-create """ + _FD9 + """" >> "$STUB_LOG.fd9"
   mkdir -p "$3/bin"; echo "home = /stub" > "$3/pyvenv.cfg"
+  if [ "${STUB_VENV_REPLACE:-0}" = 1 ]; then rm -f "$3/.yuzu-gcovr-venv"; echo "somebody else's file" > "$3/precious.txt"; fi
   cat > "$3/bin/pip" <<'EOF'
 #!/bin/sh
 echo "pip $*" >> "$STUB_LOG"
+if [ -n "$STUB_PIP_SLEEP_FLAG" ]; then : > "$STUB_PIP_SLEEP_FLAG"; sleep 30; fi
 echo "pip """ + _FD9 + """" >> "$STUB_LOG.fd9"
 [ "${STUB_PIP_RC:-0}" = 0 ] || { echo "pip ERROR: boom" >&2; exit "$STUB_PIP_RC"; }
 EOF
@@ -1358,19 +1361,113 @@ class EnsureGcovr(GcovrCase):
         self.assertEqual(self.old_dirs(), [])
         self.assertFalse((self.sb.venv / "sentinel").exists())
 
-    def test_failing_pip_leaves_a_state_the_next_run_recovers_from(self):
+    def stale_old_venv(self):
+        """A first install, then made stale (wrong requirements stamp) with a sentinel only the old tree has."""
         self.build()
         (self.sb.venv / "sentinel").write_text("old\n")
         self.stamp.write_text("deadbeef\n")
-        self.expect(self.run_script(STUB_PIP_RC="1"), 1, "pip could not install")
-        # the half-built venv is ours (marker, no stamp) and the previous one is still on disk
-        self.assertTrue((self.sb.venv / ".yuzu-gcovr-venv").exists())
-        self.assertFalse(self.stamp.exists())
-        self.assertEqual(len(self.old_dirs()), 1)
-        self.assertTrue((self.sb.venv.parent / self.old_dirs()[0] / "sentinel").exists())
+
+    def assert_previous_venv_is_back(self):
+        self.assertTrue((self.sb.venv / "sentinel").exists(), "the previous venv was not put back")
+        self.assertEqual(self.stamp.read_text(), "deadbeef\n")
+        self.assertEqual(self.old_dirs(), [])
+
+    def test_failing_pip_puts_the_previous_venv_back(self):
+        self.stale_old_venv()
+        r = self.run_script(STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertIn("restored the previous virtualenv", r.stderr)
+        self.assert_previous_venv_is_back()
+        # and the next run, with pip working, rebuilds it
         self.expect(self.run_script(), 0, "ready")
         self.assertEqual(self.stamp.read_text().strip(), self.sb.req_sha())
         self.assertEqual(self.old_dirs(), [])
+
+    def test_a_timed_out_venv_creation_puts_the_previous_venv_back_too(self):
+        self.stale_old_venv()
+        self.sb.stub("timeout", timeout_stub())
+        r = self.run_script(STUB_TIMEOUT_RC="124", STUB_TIMEOUT_ONLY="venv")
+        self.expect(r, 1, "could not create the virtualenv")
+        self.assert_previous_venv_is_back()
+
+    def test_a_signal_during_the_install_puts_the_previous_venv_back(self):
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(sig.name):
+                self.sb.reset_logs()
+                shutil.rmtree(self.sb.venv, ignore_errors=True)
+                self.link.unlink(missing_ok=True)
+                self.stale_old_venv()
+                flag = self.sb.tmp / f"pip_started_{sig.name}"
+                env = {"HOME": str(self.sb.home), "PATH": os.pathsep.join(map(str, [self.sb.bin, self.sb.home / ".local" / "bin", self.sb.farm])),
+                       "STUB_LOG": str(self.sb.log), "YUZU_GCOVR_VENV": str(self.sb.venv), "TMPDIR": str(self.sb.tmpdir),
+                       "LC_ALL": "C", "STUB_PIP_SLEEP_FLAG": str(flag)}
+                proc = subprocess.Popen([shutil.which("bash"), str(self.sb.repo / "scripts" / "test" / self.SCRIPT)],
+                                        env=env, cwd=self.sb.neutral, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, start_new_session=True)
+                try:
+                    for _ in range(200):
+                        if flag.exists():
+                            break
+                        time.sleep(0.05)
+                    self.assertTrue(flag.exists(), "pip never started")
+                    os.killpg(proc.pid, sig)   # the whole group: the script and the sleeping pip
+                    out, err = proc.communicate(timeout=30)
+                finally:
+                    if proc.poll() is None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.communicate()
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("restored the previous virtualenv", err)
+                self.assert_previous_venv_is_back()
+
+    def test_a_failure_after_the_new_venv_is_complete_does_not_give_the_old_one_back(self):
+        # the link directory is not on PATH: NOT READY, but the rebuild itself succeeded
+        self.stale_old_venv()
+        r = self.run_script(local_bin=False)
+        self.expect(r, 1, "is not on PATH")
+        self.assertNotIn("restored", r.stderr)
+        self.assertFalse((self.sb.venv / "sentinel").exists(), "the old tree must stay replaced")
+        self.assertEqual(self.stamp.read_text().strip(), self.sb.req_sha())
+        self.assertEqual(self.old_dirs(), [])
+
+    def test_a_failure_after_the_new_venv_is_complete_never_restores_even_when_the_old_tree_cannot_be_deleted(self):
+        # The old tree survives its sweep (a read-only directory in it), so it is still on disk when the
+        # run then fails on PATH: it must NOT be moved back over the venv that was just built.
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        self.stale_old_venv()
+        locked = self.sb.venv / "locked"
+        (locked).mkdir()
+        (locked / "file").write_text("x\n")
+        locked.chmod(0o555)
+        r = self.run_script(local_bin=False)
+        for d in self.sb.venv.parent.glob(self.sb.venv.name + ".yuzu-gcovr-old.*"):
+            (d / "locked").chmod(0o755)          # let the temp dir clean up
+        self.expect(r, 1, "is not on PATH")
+        self.assertIn("could not remove the leftover", r.stderr)
+        self.assertNotIn("restored", r.stderr)
+        self.assertFalse((self.sb.venv / "sentinel").exists(), "the stale tree was put back over the new venv")
+        self.assertEqual(self.stamp.read_text().strip(), self.sb.req_sha())
+
+    def test_the_previous_venv_is_never_put_back_over_something_that_is_not_the_half_built_one(self):
+        # the venv step leaves $VENV without our marker and with a file of somebody's: restoring would have to
+        # delete it, and nothing says it is ours
+        self.stale_old_venv()
+        r = self.run_script(STUB_VENV_REPLACE="1", STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertIn("NOT restoring", r.stderr)
+        self.assertEqual((self.sb.venv / "precious.txt").read_text(), "somebody else's file\n")
+        self.assertEqual(len(self.old_dirs()), 1)
+        self.assertTrue((self.sb.venv.parent / self.old_dirs()[0] / "sentinel").exists())
+
+    def test_a_failed_first_install_has_nothing_to_restore_and_the_next_run_recovers(self):
+        r = self.run_script(STUB_PIP_RC="1")
+        self.expect(r, 1, "pip could not install")
+        self.assertNotIn("restored", r.stderr)
+        self.assertTrue((self.sb.venv / ".yuzu-gcovr-venv").exists())   # a half-built venv, recognisably ours
+        self.assertFalse(self.stamp.exists())
+        self.expect(self.run_script(), 0, "ready")
 
     def test_failing_pip_on_a_fresh_box_is_recoverable_too(self):
         self.expect(self.run_script(STUB_PIP_RC="1"), 1, "pip could not install")
@@ -1425,22 +1522,26 @@ class EnsureGcovr(GcovrCase):
                 # A replaced $VENV is moved aside and removed; nothing (not even an empty husk) may remain.
                 self.assertEqual(self.old_dirs(venv), [])
 
-    def test_old_venv_leftovers_are_removed_by_name_only(self):
+    def test_old_venv_leftovers_are_removed_only_when_they_are_owned_or_empty(self):
         parent, name = self.sb.venv.parent, self.sb.venv.name
         removed, kept = [], []
-        for suffix, files in (("123", []),                       # empty (a kill mid-delete)
-                              ("99", []),                        # empty, no markers of any kind
-                              ("456", ["bin/x"]),                # half-deleted
-                              ("789", ["notes.txt"]),            # not even a venv: ours by NAME
-                              ("", ["notes.txt"]),               # whatever follows the dot
-                              ("x12", ["notes.txt"])):
+        for suffix, files in (("123", []),                                   # empty (a kill mid-delete)
+                              ("99", []),                                    # empty, no markers of any kind
+                              ("456", [".yuzu-gcovr-venv", "bin/x"]),        # half-deleted but still marked
+                              ("457", [".requirements-ci.sha256", "lib/y"]), # finished venv, stamp only
+                              ("789", [".yuzu-gcovr-venv", ".requirements-ci.sha256", "bin/python", "lib/a/b/c.py"]),
+                              ("x12", [".yuzu-gcovr-venv", "notes.txt"])):
             d = parent / f"{name}.yuzu-gcovr-old.{suffix}"
             d.mkdir()
             for f in files:
                 self.write(d / f, "x\n")
             removed.append(d)
-        # Nothing else: other people's `.old.N` directories (the name this script used to claim), names
-        # that merely start like ours, and anything that is not a directory.
+        # The name alone is not ownership: a directory of that name without our marker or stamp could be
+        # somebody's own (YUZU_GCOVR_VENV pointing at a path of theirs), and a half-deleted tree by an
+        # older version of this script has none either. Left in place, named on stderr.
+        unowned = [self.write(parent / f"{name}.yuzu-gcovr-old.{sfx}" / "notes.txt", "not known to be ours\n")
+                   for sfx in ("700", "701", "")]
+        # Nothing else either: other people's `.old.N` directories, names that merely start like ours.
         for leftover in (f"{name}.old.3", f"{name}.old.123", f"{name}.old.keep", f"{name}.old.",
                          f"{name}.yuzu-gcovr-old", f"{name}.yuzu-gcovr-oldx",
                          f"other.yuzu-gcovr-old.1", f"{name}x.yuzu-gcovr-old.1"):
@@ -1449,9 +1550,16 @@ class EnsureGcovr(GcovrCase):
         target = self.write(self.sb.tmp / "linked_target" / "notes.txt", "target\n")
         link = parent / f"{name}.yuzu-gcovr-old.999"
         link.symlink_to(target.parent)
-        self.expect(self.run_script(), 0, "ready")
+        r = self.run_script()
+        self.expect(r, 0, "ready")
         for d in removed:
             self.assertFalse(d.exists(), d.name)
+        for f in unowned:
+            self.assertEqual(f.read_text(), "not known to be ours\n", f.parent.name)
+            self.assertIn(str(f.parent), r.stderr)
+        # the sweep runs before and after the build: the notice is printed once per directory, not twice
+        self.assertEqual(r.stderr.count(f"leaving {unowned[0].parent} alone"), 1, r.stderr)
+        self.assertIn("neither this script's marker", r.stderr)
         for f in kept:
             self.assertEqual(f.read_text(), "not ours\n", f.parent.name)
         self.assertEqual(a_file.read_text(), "a file, not a directory\n")
@@ -1487,9 +1595,47 @@ class EnsureGcovr(GcovrCase):
         self.build()
         self.link.unlink()
         leftover = self.write(f"{self.sb.venv}.yuzu-gcovr-old.4242/bin/half", "half-deleted\n")
+        self.write(f"{self.sb.venv}.yuzu-gcovr-old.4242/.yuzu-gcovr-venv", "")   # the marker survives a part-way delete
         self.expect(self.run_script(), 0, "(re)linking")
-        self.assertFalse(leftover.parent.exists())
+        self.assertFalse(leftover.parent.parent.exists())
         self.assertTrue((self.sb.venv / ".yuzu-gcovr-venv").exists(), "the venv itself is untouched")
+
+    def test_a_leftover_is_emptied_before_its_ownership_files_go(self):
+        # A kill part-way through the delete must leave a tree that is still recognisably ours. A `find`
+        # stub records which ownership files existed at the moment it was asked to empty each leftover.
+        real_find = shutil.which("find")
+        self.sb.stub("find", f'#!/bin/sh\nfor d in "$@"; do case "$d" in *yuzu-gcovr-old*) echo "$d marker=$([ -e "$d/.yuzu-gcovr-venv" ] && echo 1 || echo 0) stamp=$([ -e "$d/.requirements-ci.sha256" ] && echo 1 || echo 0)" >> "$STUB_LOG.find";; esac; done\nexec {real_find} "$@"\n')
+        self.build()
+        self.link.unlink()
+        left = f"{self.sb.venv}.yuzu-gcovr-old.4242"
+        self.write(f"{left}/.yuzu-gcovr-venv", "")
+        self.write(f"{left}/.requirements-ci.sha256", "x\n")
+        self.write(f"{left}/bin/python", "x\n")
+        self.expect(self.run_script(), 0, "(re)linking")
+        self.assertFalse(Path(left).exists())
+        self.assertEqual(self.sb.side("find"), [f"{left} marker=1 stamp=1"])
+
+    def test_an_empty_venv_the_run_created_is_replaced_by_the_previous_one_after_a_failure(self):
+        # the marker cannot be written (the directory is read-only), so what stands at $VENV is EMPTY:
+        # still this run's own, still safe to remove, and the previous venv still comes back
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        real_mkdir = shutil.which("mkdir")
+        self.stale_old_venv()
+        self.sb.stub("mkdir", f'#!/bin/sh\n{real_mkdir} "$@" || exit $?\nfor d in "$@"; do [ "$d" = "$YUZU_GCOVR_VENV" ] && chmod 555 "$d"; done\nexit 0\n')
+        r = self.run_script()
+        self.expect(r, 1, "cannot write to")
+        self.assertIn("restored the previous virtualenv", r.stderr)
+        self.assert_previous_venv_is_back()
+
+    def test_a_leftover_without_any_marker_survives_the_next_run(self):
+        self.build()
+        self.link.unlink()
+        leftover = self.write(f"{self.sb.venv}.yuzu-gcovr-old.4242/bin/half", "unmarked\n")
+        r = self.run_script()
+        self.expect(r, 0, "(re)linking")
+        self.assertEqual(leftover.read_text(), "unmarked\n")
+        self.assertIn("leaving", r.stderr)
 
     def test_a_trailing_slash_on_the_venv_path_is_normalised(self):
         self.sb.stub("flock", FLOCK)
@@ -1569,6 +1715,44 @@ class EnsureGcovr(GcovrCase):
 
     def test_local_bin_missing_from_path(self):
         self.expect(self.run_script(local_bin=False), 1, "is not on PATH")
+
+    def test_a_foreign_symlink_at_the_link_is_not_replaced(self):
+        # a pipx shim, a link to another install: somebody's. Refused before anything is installed.
+        other = self.write(self.sb.tmp / "pipx" / "venvs" / "gcovr" / "bin" / "gcovr", "#!/bin/sh\n")
+        for name, target in (("a link to another install", other), ("a dangling link elsewhere", self.sb.tmp / "gone" / "gcovr"),
+                             ("a relative link", "../share/other-gcovr")):
+            with self.subTest(name):
+                self.link.parent.mkdir(parents=True, exist_ok=True)
+                self.link.unlink(missing_ok=True)
+                self.link.symlink_to(target)
+                self.sb.reset_logs()
+                r = self.run_script()
+                self.expect(r, 1, "was NOT replaced")
+                self.assertIn(f"rm '{self.link}'", r.stderr)          # the recovery command
+                self.assertEqual(os.readlink(self.link), str(target))
+                self.assertEqual(self.sb.calls(), [])
+                self.assertFalse(self.sb.venv.exists(), "nothing may be built when the link is refused")
+
+    def test_a_link_into_a_different_venv_is_not_replaced(self):
+        # YUZU_GCOVR_VENV changed since the link was made: it points into another venv, not this one
+        self.build()                                   # link -> <venv>/bin/gcovr
+        (self.sb.venv / "bin" / "gcovr").unlink()      # nothing at the pin any more
+        other_venv = self.sb.tmp / "other_venv"
+        r = self.run_script(YUZU_GCOVR_VENV=str(other_venv))
+        self.expect(r, 1, "was NOT replaced")
+        self.assertEqual(os.readlink(self.link), str(self.sb.venv / "bin" / "gcovr"))
+        self.assertEqual(self.sb.calls(), [])
+        self.assertFalse(other_venv.exists())
+
+    def test_a_link_into_this_venv_is_replaced_whatever_it_points_at_inside_it(self):
+        self.build()
+        (self.sb.venv / "bin" / "gcovr").unlink()                     # a dangling link into OUR venv
+        self.link.unlink()
+        self.link.symlink_to(self.sb.venv / "bin" / "gcovr")
+        self.stamp.write_text("deadbeef\n")
+        self.sb.reset_logs()
+        self.expect(self.run_script(), 0, "ready")
+        self.assertEqual(os.readlink(self.link), f"{self.sb.venv}/bin/gcovr")
 
     def test_regular_file_at_the_link_is_not_replaced(self):
         self.link.parent.mkdir(parents=True)
