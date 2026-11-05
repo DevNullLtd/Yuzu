@@ -7,6 +7,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
+#include "workflow_claim_outcome.hpp"
 #include "workflow_wait.hpp"
 
 #include <libpq-fe.h>
@@ -37,6 +38,10 @@ constexpr std::chrono::milliseconds kWriteTimeout{2000};
 // The ONE retry of a run's final status write, when the first attempt could not get a lease: a
 // row left `running` is an orphan nothing sweeps, so the retry is allowed to wait out a busy pool.
 constexpr std::chrono::milliseconds kFinalizeRetryTimeout{10000};
+// The most the final status write's retry may keep waiting once a server stop is seen: the web
+// server's shutdown bound is 15 s and the run's own skip writes, first finalize try and readback
+// have already spent part of it.
+constexpr std::chrono::milliseconds kFinalizeStopBudget{3000};
 
 /// Counts one run in `WorkflowEngine::in_flight_` for exactly the scope it is alive in, so no
 /// path out of `execute()` (a return, a rethrow) can leak the count and hold a shutdown drain.
@@ -162,6 +167,21 @@ std::int64_t to_i64(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0;
     return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+
+/// The fate of the claim transaction `xid` according to Postgres itself (`pg_xact_status`), on a
+/// fresh lease: the original one is gone with the failed transaction. No lease, a failed query or
+/// a NULL answer is `kUnknown`.
+ClaimTxnOutcome claim_txn_outcome(pg::PgPool& pool, const std::string& xid) {
+    auto lease = pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return ClaimTxnOutcome::kUnknown;
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT pg_xact_status($1::xid8)",
+                                       std::vector<std::string>{xid});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0 ||
+        PQgetisnull(res.get(), 0, 0))
+        return ClaimTxnOutcome::kUnknown;
+    return classify_xact_status(std::string_view(PQgetvalue(res.get(), 0, 0)));
 }
 
 int64_t now_epoch() {
@@ -769,7 +789,20 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     Admission admission = Admission::kNotFound;
     WorkflowRunReplay replay;
     const auto& claim = control.idempotency;
-    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+    // The claim's own transaction id, captured before anything is written, and whether the body
+    // reached its commit-ready end as an admission. Together they let a failed COMMIT be told from
+    // a lost acknowledgement (below): an unknown outcome is asked of Postgres, never guessed.
+    std::string claim_xid;
+    bool admitted_body_done = false;
+    auto claim_lease = pool_.try_acquire_for(kWriteTimeout);
+    bool ok = pool_.with_txn_on(std::move(claim_lease), [&](PGconn* conn) -> bool {
+        {
+            pg::PgResult xid = pg::exec_params(conn, "SELECT pg_current_xact_id()::text",
+                                               std::vector<std::string>{});
+            if (xid.status() != PGRES_TUPLES_OK || PQntuples(xid.get()) == 0)
+                return false;
+            claim_xid = col_str(xid.get(), 0, 0);
+        }
         // `principal` and `correlation_id` are stored on every row the twins admit (NULL when the
         // caller supplied none); a KEYED row's principal is the claim's, the key's namespace.
         pg::PgResult ires = claim
@@ -842,8 +875,39 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 return false;
             }
         }
+        if (claim_hooks_.in_txn_tail)
+            claim_hooks_.in_txn_tail(conn);
+        admitted_body_done = true;
         return true;
     });
+    if (ok && claim_hooks_.lose_commit_ack)
+        ok = false;
+
+    // A COMMIT that failed after a body that finished as an ADMISSION may still have committed:
+    // the run is then bound (its key, its row) and only the acknowledgement was lost. Failing the
+    // call would leave a running row nothing will ever dispatch, its key burned and, on MCP, its
+    // ticket spent, until the stale rule calls it indeterminate. Ask Postgres for the
+    // transaction's fate (pg_pool.hpp CHAOS-1/CHAOS-1b: never a row-exists read) and, if it
+    // committed, go on with the id this call minted. Rolled back or undeterminable fails as before.
+    if (!ok && admitted_body_done && admission == Admission::kAdmitted && !claim_xid.empty()) {
+        switch (claim_txn_outcome(pool_, claim_xid)) {
+        case ClaimTxnOutcome::kCommitted:
+            spdlog::error("WorkflowEngine::execute: the admission COMMIT of execution {} was "
+                          "reported failed but Postgres confirms transaction {} committed (a "
+                          "lost acknowledgement); proceeding with the run",
+                          exec_id, claim_xid);
+            ok = true;
+            break;
+        case ClaimTxnOutcome::kRolledBack:
+            break;
+        case ClaimTxnOutcome::kUnknown:
+            spdlog::error("WorkflowEngine::execute: the admission COMMIT of execution {} failed "
+                          "and the outcome of transaction {} could not be confirmed; the row may "
+                          "still appear as a running run that was never dispatched",
+                          exec_id, claim_xid);
+            break;
+        }
+    }
 
     if (!ok)
         return std::unexpected(std::string(kDbErrorPrefix) + "failed to admit execution");
@@ -1167,13 +1231,12 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                         // The delay never runs past the deadline: the next attempt then finds the
                         // run out of time and stops it, instead of the run sleeping on after the
                         // bound.
-                        auto delay = std::chrono::steady_clock::duration(
-                            std::chrono::seconds(step.retry_delay_seconds));
-                        if (control.deadline) {
-                            const auto left = *control.deadline - std::chrono::steady_clock::now();
-                            delay = std::clamp(left, std::chrono::steady_clock::duration::zero(),
-                                               delay);
-                        }
+                        const auto delay = bounded_retry_delay(
+                            step.retry_delay_seconds,
+                            control.deadline
+                                ? std::optional<std::chrono::steady_clock::duration>(
+                                      *control.deadline - std::chrono::steady_clock::now())
+                                : std::nullopt);
                         if (delay > std::chrono::steady_clock::duration::zero() &&
                             interruptible_wait(delay, [&] {
                                 return stop_level() != WorkflowStopLevel::kNone;
@@ -1310,16 +1373,19 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     enum class FinalizeTry { kLanded, kNoMatch, kDropped };
     // `persist` keeps asking for a lease until `lease_timeout` is spent: one `try_acquire_for`
     // on a saturated pool gives up after the pool's own fast-fail (500 ms) whatever timeout it
-    // was given, which would make the retry no longer than the first try.
+    // was given, which would make the retry no longer than the first try. An empty answer is
+    // followed by a back-off sleep (a pool whose connect breaker is armed answers empty at once),
+    // and once a stop is seen the wait is cut to `kFinalizeStopBudget`.
     const auto try_finalize = [&](std::chrono::milliseconds lease_timeout,
                                   bool persist) -> FinalizeTry {
-        const auto give_up = std::chrono::steady_clock::now() + lease_timeout;
-        auto lease = pool_.try_acquire_for(lease_timeout);
-        while (!lease && persist && std::chrono::steady_clock::now() < give_up)
-            lease = pool_.try_acquire_for(std::max(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    give_up - std::chrono::steady_clock::now()),
-                std::chrono::milliseconds(1)));
+        const auto try_lease = [&](std::chrono::milliseconds t) { return pool_.try_acquire_for(t); };
+        auto lease = persist
+            ? acquire_within(
+                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(lease_timeout),
+                  try_lease, [&] { return stop_level() == WorkflowStopLevel::kStop; },
+                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                      kFinalizeStopBudget))
+            : try_lease(lease_timeout);
         if (!lease) {
             spdlog::warn("WorkflowEngine::execute: lease unavailable for the final status write "
                          "of execution {}",

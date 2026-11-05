@@ -3495,3 +3495,74 @@ TEST_CASE("WorkflowEngine: a stopped or failed step's stored result carries the 
         CHECK(step_reason(exec.step_results[1]) == Reasons{kStepReasonDispatchException});
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// A claim COMMIT reported failed (UP2-3): committed-but-unacked proceeds, a rollback fails.
+// The fault is the engine's test hook, not a proxy: `lose_commit_ack` reports a COMMIT that
+// really landed as failed, and `in_txn_tail` aborts the transaction under a body that finished.
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WorkflowEngine: a claim COMMIT whose acknowledgement was lost proceeds with the "
+          "committed run",
+          "[workflow_engine][pg][execute][idempotency][claim_commit]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kTwoStepYaml);
+    WorkflowEngine::ClaimTxnTestHooks hooks;
+    hooks.lose_commit_ack = true;
+    engine.set_claim_txn_hooks_for_test(hooks);
+
+    SECTION("keyed: the run is admitted once, dispatched, bound to its key and not reported failed") {
+        const auto out = execute_keyed(engine, wf_id, claim_of("alice", "key-lostack-0001"));
+        REQUIRE(out.result.has_value());
+        CHECK(out.admitted_calls == 1);
+        CHECK(out.dispatches == 2);
+        CHECK_FALSE(out.replay);
+        const auto bound = engine.find_execution_by_key("alice", "key-lostack-0001");
+        REQUIRE(bound.has_value());
+        REQUIRE(bound->has_value());
+        CHECK((*bound)->execution_id == *out.result);
+        CHECK((*bound)->status == "completed");
+        CHECK(count_rows(wf_db_fx_.dsn(),
+                         "SELECT count(*) FROM workflow_engine.workflow_executions") == 1);
+        // The retry of the same key is an ordinary replay of that one run.
+        engine.set_claim_txn_hooks_for_test({});
+        const auto again = execute_keyed(engine, wf_id, claim_of("alice", "key-lostack-0001"));
+        REQUIRE_FALSE(again.result.has_value());
+        CHECK(again.result.error() == kWorkflowIdempotentReplayError);
+        CHECK(again.dispatches == 0);
+    }
+    SECTION("unkeyed: the run proceeds with the id it minted") {
+        int dispatches = 0;
+        StepDispatchFn fn = [&](const std::string&, const std::string&, const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            ++dispatches;
+            return std::string(R"({"status":"ok"})");
+        };
+        const auto r = engine.execute(wf_id, {"agent-1"}, fn);
+        REQUIRE(r.has_value());
+        CHECK(dispatches == 2);
+        const auto exec = engine.get_execution(*r);
+        REQUIRE(exec.has_value());
+        REQUIRE(exec->has_value());
+        CHECK((*exec)->status == "completed");
+    }
+}
+
+TEST_CASE("WorkflowEngine: a claim COMMIT that rolled back is reported as a database error and "
+          "leaves nothing bound",
+          "[workflow_engine][pg][execute][idempotency][claim_commit]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kTwoStepYaml);
+    WorkflowEngine::ClaimTxnTestHooks hooks;
+    hooks.in_txn_tail = [](pg_conn* conn) { PgResult r{PQexec(conn, "SELECT 1/0")}; };
+    engine.set_claim_txn_hooks_for_test(hooks);
+
+    const auto out = execute_keyed(engine, wf_id, claim_of("alice", "key-rollback-001"));
+    REQUIRE_FALSE(out.result.has_value());
+    CHECK(out.result.error().rfind(kDbErrorPrefix, 0) == 0);
+    CHECK(out.admitted_calls == 0);
+    CHECK(out.dispatches == 0);
+    CHECK_FALSE(engine.find_execution_by_key("alice", "key-rollback-001")->has_value());
+    CHECK(count_rows(wf_db_fx_.dsn(),
+                     "SELECT count(*) FROM workflow_engine.workflow_executions") == 0);
+}

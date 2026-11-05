@@ -34,6 +34,8 @@
 #include <string>
 #include <vector>
 
+struct pg_conn; // libpq's PGconn (typedef struct pg_conn PGconn)
+
 namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
@@ -116,6 +118,19 @@ public:
         write_timeout_ = write;
         finalize_retry_timeout_ = finalize_retry;
     }
+
+    /// Test-only fault injection into the admission (claim) transaction, the only way to reach
+    /// its COMMIT-failure arms without a network proxy. Production never sets it. Set-before-
+    /// traffic.
+    struct ClaimTxnTestHooks {
+        /// Runs inside the claim transaction after the run's rows were written, with its
+        /// connection. A statement that fails there aborts the transaction while the body still
+        /// reports success, which is a COMMIT that did not commit.
+        std::function<void(pg_conn*)> in_txn_tail;
+        /// After a transaction that really committed, report its COMMIT as failed (a lost ack).
+        bool lose_commit_ack{false};
+    };
+    void set_claim_txn_hooks_for_test(ClaimTxnTestHooks hooks) { claim_hooks_ = std::move(hooks); }
 
     /// Runs inside `execute()` right now, counted in-process from the top of `execute()` to after
     /// its final status write (a throw included). The shutdown drain waits on this. It is
@@ -250,6 +265,7 @@ private:
     std::chrono::milliseconds write_timeout_;
     std::chrono::milliseconds finalize_retry_timeout_;
     std::atomic<int> in_flight_{0};
+    ClaimTxnTestHooks claim_hooks_;
 
     std::string generate_id() const;
 
