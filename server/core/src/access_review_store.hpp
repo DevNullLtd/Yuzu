@@ -184,8 +184,11 @@ public:
     ///   * `self_attestation: ...` — reviewer is the subject / engine owner.
     ///                               REST 403. Outranks `already_decided:`.
     ///   * `bad_request: ...`      — a NUL byte / over-long (> 512 bytes)
-    ///                               identifier, an empty reviewer, or an
-    ///                               invalid decision. REST 400.
+    ///                               identifier, a justification with a NUL byte
+    ///                               or over 8192 bytes, an empty reviewer, or an
+    ///                               invalid decision. REST 400. (Scoped to this
+    ///                               method: the other methods do not take
+    ///                               caller-supplied evidence text.)
     /// Any other `unexpected(msg)` is a genuine write failure (503/retry); the
     /// libpq text is LOGGED server-side and never returned.
     [[nodiscard]] std::expected<void, std::string>
@@ -208,7 +211,15 @@ public:
     /// this store silently launders by forcing completion). Idempotent-
     /// rejecting: closing an already-closed or unknown campaign returns
     /// `unexpected("not_found: ...")` (machine-checkable prefix, as above);
-    /// any other `unexpected(msg)` is a genuine write failure.
+    /// any other `unexpected(msg)` is a genuine write failure (the libpq text
+    /// is logged on the server and never returned).
+    ///
+    /// LOCK CONTRACT (#4752): `record_attestation` takes a `FOR SHARE` lock on
+    /// the campaign row inside its write, so this UPDATE waits for attestations
+    /// already in flight and a later attestation re-checks the new status. The
+    /// order is campaign row (share) -> attestation row, and this method locks
+    /// ONLY the campaign row. If you change it to also touch attestation rows,
+    /// re-derive that order first or you can create a lock cycle.
     [[nodiscard]] std::expected<void, std::string>
     close_campaign(const std::string& campaign_id, const std::string& closed_by);
 

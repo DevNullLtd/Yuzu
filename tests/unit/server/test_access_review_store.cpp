@@ -725,6 +725,20 @@ TEST_CASE("record_attestation: an attest waiting on a closing campaign does not 
     std::thread attester([&] {
         result = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
     });
+    // If any check below throws while the attester is blocked on the closer's row lock,
+    // destroying a joinable std::thread would std::terminate the whole test binary, and a plain
+    // join would hang (the attester only unblocks when that transaction ends). So: roll the
+    // closer back FIRST, then join. (No std::jthread: Apple libc++ lacks it.)
+    struct AttesterGuard {
+        PgConn& closer;
+        std::thread& t;
+        ~AttesterGuard() {
+            if (t.joinable()) {
+                PgResult r{PQexec(closer.get(), "ROLLBACK")};
+                t.join();
+            }
+        }
+    } attester_guard{closer, attester};
 
     // Wait until the attest is genuinely blocked on a lock (not merely slow).
     PgConn probe{PQconnectdb(db.dsn().c_str())};
@@ -752,6 +766,64 @@ TEST_CASE("record_attestation: an attest waiting on a closing campaign does not 
     REQUIRE(view.has_value());
     CHECK(view->campaign.status == "closed");
     CHECK(view->pending_count == 3); // nothing was decided after the close
+}
+
+TEST_CASE("record_attestation refuses a NUL-bearing or oversize justification instead of truncating it",
+          "[access_review][store][pg][sod]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Just", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // libpq stops reading a bound parameter at the first NUL, so "ok\0hidden" would be stored
+    // as "ok" with no error: evidence text silently cut. It is refused instead.
+    auto nul = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol",
+                                        std::string("ok\0hidden", 9));
+    REQUIRE_FALSE(nul.has_value());
+    CHECK(yuzu::server::is_bad_request_error(nul.error()));
+    auto big = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol",
+                                        std::string(8193, 'j'));
+    REQUIRE_FALSE(big.has_value());
+    CHECK(yuzu::server::is_bad_request_error(big.error()));
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+
+    // Exactly at the bound is stored whole.
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol",
+                                     std::string(8192, 'j'))
+                .has_value());
+    auto view2 = store.get_campaign(cid);
+    REQUIRE(view2.has_value());
+    for (const auto& a : view2->attestations)
+        if (a.principal_id == "alice")
+            CHECK(a.justification.size() == 8192);
+}
+
+TEST_CASE("close_campaign: a failed write returns a fixed string, never libpq text",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("CloseFail", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{PQexec(conn.get(),
+                          "DROP TABLE access_review_store.access_review_campaign CASCADE")};
+        REQUIRE(d.ok());
+    }
+    auto rec = store.close_campaign(*open_res, "admin");
+    REQUIRE_FALSE(rec.has_value());
+    CHECK(rec.error() == "close_campaign write failed");
+    CHECK_FALSE(rec.error().starts_with("not_found:"));
 }
 
 TEST_CASE("attestation refusal classifiers map exactly the documented prefixes",

@@ -3836,13 +3836,16 @@ helper, so they cannot disagree:
 |---|---|---|---|
 | `self_attestation:` | 403 | `kPermissionDenied` | `access_review.attested` or `access_review.flagged`, `result=denied`, detail `self_attestation_blocked` |
 | `already_decided:` | 409 | `kInvalidParams` | same verbs, `result=denied`, detail `already_decided` |
-| `bad_request:` | 400 | `kInvalidParams` | `result=failure`, no caller bytes in the row |
+| `bad_request:` | 400 | `kInvalidParams` | `result=failure`, empty `target_id`, fixed `detail` (no caller bytes in the row) |
 | `not_found:` | 404 | `kInvalidParams` | `result=failure` (unchanged) |
 
 A `bad_request:` means an identifier contained a NUL byte or was longer than 512 bytes (Postgres
 stops reading a parameter at the first NUL, so such a value would otherwise match a real row
-while its extra bytes reached the audit trail), or the reviewer was empty. The libpq text of a
-genuine database fault is logged on the server and never returned to the caller.
+while its extra bytes reached the audit trail), the justification contained a NUL byte or was
+longer than 8192 bytes (it would be silently cut at the NUL), or the reviewer was empty. The
+512-byte bound cannot refuse a real grant: every prefixed principal id is capped at 255 bytes
+when it is created. The libpq text of a genuine database fault in `record_attestation` or
+`close_campaign` is logged on the server and never returned to the caller.
 
 **Known limits, stated plainly.** The control compares usernames byte for byte, so it is exactly
 as strong as the rule "one person, one principal id". Read these before you describe it to an
@@ -3864,8 +3867,9 @@ auditor.
   campaign closes with unreviewed rows. Assign `Reviewer` to a second person.
 - **It is not four-eyes.** Nothing stops two colluding reviewers deciding each other's grants.
   Four-eyes on distinct human roots is a separate control (ADR-0033 section 7 reserves
-  human-root resolution for it); this rule compares usernames only, as ADR-1005's 2026-10-19
-  addendum already accepts.
+  human-root resolution for it); this rule compares usernames only, the same limit ADR-1005's
+  2026-10-19 addendum records for approvals. No separate acceptance of that limit is recorded for
+  access reviews.
 - **Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is
   the subject of a grant can still open or close a campaign.
 - **Mixed-version replicas.** The rules live in the database write, so a replica still on the

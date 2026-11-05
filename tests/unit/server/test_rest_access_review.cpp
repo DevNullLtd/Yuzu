@@ -1326,9 +1326,44 @@ TEST_CASE("access-reviews: a NUL-carrying or oversize identifier is a 400 / inva
     REQUIRE(mcp_body.contains("error"));
     CHECK(mcp_body["error"]["code"].get<int>() == yuzu::server::mcp::kInvalidParams);
 
+    // The campaign_id leg: it comes straight from the URL path (REST) or the tool argument (MCP)
+    // and used to be echoed raw into the failure row's target even when the store had refused it.
+    const std::string huge_cid(600, 'c');
+    auto rest_cid = h.sink.Post("/api/v1/access-reviews/" + huge_cid + "/attestations",
+                                sod_body("nina", "NulRole", "attested").dump());
+    REQUIRE(rest_cid);
+    CHECK(rest_cid->status == 400);
+    const std::string nul_cid = std::string("cid") + '\0' + "forged-suffix";
+    auto mcp_cid = h.mcp_call_tool("record_attestation", {{"campaign_id", nul_cid},
+                                                           {"principal_type", "user"},
+                                                           {"principal_id", "nina"},
+                                                           {"role_name", "NulRole"},
+                                                           {"decision", "attested"}});
+    REQUIRE(mcp_cid);
+    CHECK(nlohmann::json::parse(mcp_cid->body)["error"]["code"].get<int>() ==
+          yuzu::server::mcp::kInvalidParams);
+    auto mcp_huge = h.mcp_call_tool("record_attestation", {{"campaign_id", huge_cid},
+                                                            {"principal_type", "user"},
+                                                            {"principal_id", "nina"},
+                                                            {"role_name", "NulRole"},
+                                                            {"decision", "attested"}});
+    REQUIRE(mcp_huge);
+    CHECK(nlohmann::json::parse(mcp_huge->body)["error"]["code"].get<int>() ==
+          yuzu::server::mcp::kInvalidParams);
+    // A justification is refused too, not truncated.
+    auto rest_just = h.sink.Post(url, nlohmann::json{{"principal_type", "user"},
+                                                     {"principal_id", "nina"},
+                                                     {"role_name", "NulRole"},
+                                                     {"decision", "attested"},
+                                                     {"justification", std::string(9000, 'j')}}
+                                          .dump());
+    REQUIRE(rest_just);
+    CHECK(rest_just->status == 400);
+
     for (const auto& a : h.audit_log) {
         INFO(a.action << " " << a.target_id);
         CHECK(a.target_id.find("forged-suffix") == std::string::npos);
+        CHECK(a.target_id.find(huge_cid) == std::string::npos);
         CHECK(a.detail.find("forged-suffix") == std::string::npos);
         CHECK(a.target_id.size() < 400);
     }

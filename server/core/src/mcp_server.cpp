@@ -3674,16 +3674,18 @@ static const ToolDef kTools[] = {
      "own grant (principal_type 'user' whose principal_id is the caller) nor an engine "
      "principal they own — refused as self_attestation, and another reviewer must decide it. "
      "Group grants are not covered by the owner check. Both refusals are audited with "
-     "result=denied. Mirrors POST /api/v1/access-reviews/{id}/attestations. Self-audited as "
+     "result=denied. An identifier with a NUL byte or over 512 bytes, or a justification with "
+     "a NUL byte or over 8192 bytes, is refused as invalid-params (nothing is truncated). "
+     "Mirrors POST /api/v1/access-reviews/{id}/attestations. Self-audited as "
      "access_review.attested or access_review.flagged (by decision). Requires "
      "AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1},)j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":512},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1},)j"
-     R"j("role_name":{"type":"string","minLength":1},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":512},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":512},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
-     R"j("justification":{"type":"string"})j"
+     R"j("justification":{"type":"string","maxLength":8192})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
      R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
 
@@ -29419,7 +29421,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                                principal_id + ":" + role_name,
                                            attestation_refusal_token(refusal))
                                 : audit_fn(req, audit_action, "failure", "AccessReview",
-                                           campaign_id, rec_res.error());
+                                           // bad_request: an identifier (possibly this very
+                                           // campaign_id) was NUL-bearing or over-long, so the
+                                           // row carries a fixed empty target, not the bytes.
+                                           is_bad_request_error(rec_res.error()) ? std::string{}
+                                                                                 : campaign_id,
+                                           rec_res.error());
                     mcp_audit(refused ? "denied" : "failure",
                               refused ? std::string(attestation_refusal_token(refusal))
                                       : rec_res.error());

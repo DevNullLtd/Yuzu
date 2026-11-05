@@ -63,7 +63,19 @@ constexpr const char* kSelfSubject =
 // carrying one would MATCH the real row while the caller's full bytes went on
 // into the audit target; and the audit table has no column bound. Rejecting
 // both here (rather than in each transport) keeps ONE copy of the rule.
+//
+// 512 is deliberately generous: `auth::is_valid_principal` caps every prefixed
+// principal (oidc:/saml:/ad:/engine:) at 255 bytes and a local username is far
+// shorter, and rbac_store.cpp's kMaxExternalIdLength is also 512, so no real
+// grant's principal_id can be refused by it. (A provider's raw
+// "oidc:"+iss+"#"+sub could reach 516, but such a principal cannot be created.)
 constexpr std::size_t kMaxIdentifierBytes = 512;
+
+// The reviewer's free-text justification is stored as evidence. A NUL byte would
+// silently truncate it (libpq stops reading a parameter at the first NUL) and its
+// size was otherwise bounded only by the request-body cap, so it gets the same
+// refuse-don't-truncate treatment with a limit sized for prose.
+constexpr std::size_t kMaxJustificationBytes = 8192;
 
 [[nodiscard]] bool bad_identifier(const std::string& s) {
     return s.size() > kMaxIdentifierBytes || s.find('\0') != std::string::npos;
@@ -291,6 +303,10 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         bad_identifier(principal_id) || bad_identifier(role_name) || bad_identifier(reviewer))
         return std::unexpected(std::string(kBadRequestPrefix) +
                                " an identifier contains a NUL byte or exceeds 512 bytes");
+    if (justification.size() > kMaxJustificationBytes ||
+        justification.find('\0') != std::string::npos)
+        return std::unexpected(std::string(kBadRequestPrefix) +
+                               " justification contains a NUL byte or exceeds 8192 bytes");
 
     // Fail closed on an unidentified reviewer, the same way `is_self_target`
     // treats an empty username as "self": without an identity the
@@ -482,9 +498,16 @@ AccessReviewStore::close_campaign(const std::string& campaign_id, const std::str
         "SET status='closed', closed_by=$2, closed_at_ms=$3::bigint "
         "WHERE campaign_id=$1 AND status='open' RETURNING campaign_id",
         std::vector<std::string>{campaign_id, closed_by, std::to_string(now_ms())});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("close_campaign write failed: ") +
-                               PQerrorMessage(lease.get()));
+    if (res.status() != PGRES_TUPLES_OK) {
+        // Same posture as record_attestation: the libpq text stays in the server
+        // log (with the sqlstate, e.g. 55P03 when the close waits on a lock) and the
+        // client gets a fixed string.
+        const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        spdlog::error("AccessReviewStore::close_campaign: write failed (campaign={}, sqlstate={}): {}",
+                      log_safe(campaign_id), sqlstate ? sqlstate : "?",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(std::string("close_campaign write failed"));
+    }
     if (PQntuples(res.get()) == 0)
         return std::unexpected("not_found: campaign missing or already closed");
     return {};

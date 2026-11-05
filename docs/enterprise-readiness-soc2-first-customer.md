@@ -131,11 +131,15 @@ refuses both, inside the database write, and a recorded decision is final. To as
 period, run the detection query in `docs/user-manual/upgrading.md` (self-attested `user` and
 `engine` grants) and look in the audit log for more than one `access_review.attested` or
 `access_review.flagged` `result=success` row for the same `target_id` (overwrites are not
-visible in the table). An honest statement of the control today: access-review decisions on
-`user` grants and on the owner of an engine principal are subject to server-enforced
-separation of duties and are immutable once recorded; this does not cover group grants, one
-person holding more than one account, or ownership changed after a campaign opened, and it
-needs at least two people able to attest.
+visible in the table), and note that audit rows are kept for 365 days by default while campaign
+rows are kept indefinitely, so for an older period the audit rows may already be pruned. An
+honest statement of the control today: once every server replica runs a build with #4752, the
+application refuses to let a reviewer decide a `user` grant held under their own username or an
+engine principal they owned when the campaign opened, and refuses to change a decision once it
+is recorded. That is enforced by the application, not by the database: a replica that has not
+been upgraded, or someone with write access to the database, can still change a row. It does
+not cover group grants, one person holding more than one account, or ownership changed after
+a campaign opened, and it needs at least two people able to attest.
 
 **Addendum — the access-review export now states whether RBAC was actually enforced
 (CC6.2, RBAC delivery plan A3).** #2376 above closed *who* can read the grant-population

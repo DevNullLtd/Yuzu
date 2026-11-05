@@ -8,7 +8,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 - The first `attested` or `flagged_revoke` recorded for a grant stays. A second call, by anyone, returns `409` (MCP: invalid-params) and changes nothing. The message names the decision already recorded.
 - A reviewer who is the subject of a `user` grant, or the owner of an `engine` principal as recorded when the campaign opened, gets `403` (MCP: permission-denied). Another reviewer must decide it.
-- An identifier (`campaign_id`, `principal_id`, `role_name`) containing a NUL byte or longer than 512 bytes gets `400`.
+- An identifier (`campaign_id`, `principal_id`, `role_name`) containing a NUL byte or longer than 512 bytes, or a `justification` containing a NUL byte or longer than 8192 bytes, gets `400`. Nothing is truncated.
 - A decision can no longer land in a campaign that is being closed at the same moment.
 
 Both refusals write `result=denied` under the existing `access_review.attested` / `access_review.flagged` actions (details `self_attestation_blocked` and `already_decided`), see [`audit-log.md`](audit-log.md). There is no schema change and no data migration.
@@ -32,6 +32,7 @@ Both refusals write `result=denied` under the existing `access_review.attested` 
   ```
 
   A decision that was **overwritten** before the upgrade cannot be seen in this table, which keeps only the last decision. The only trace is the audit log: more than one `access_review.attested` or `access_review.flagged` row with `result=success` for the same `target_id` (inside the audit retention, 365 days by default).
+- **PostgreSQL 16 or newer is required** (the documented minimum): the attestation write uses `pg_input_is_valid`. On an older server the first attestation answers `503` and the server log shows SQLSTATE `42883`.
 - **Rolling back** restores the old overwrite behaviour. Nothing is stored differently, so decisions recorded under the new rules stay valid and nothing needs converting.
 
 ## Behaviour change: installed-software schema v10 (the server accepts the sectioned report)
