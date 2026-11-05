@@ -483,9 +483,9 @@ public:
     ///    unique `-` count. The facet's rows are then re-read and their section hash must equal the
     ///    agent's `expect`. A stale `-`, an instance_key collision on a `+`, a facet left over
     ///    the per-call record cap, or a hash that differs rolls that section back to its
-    ///    savepoint and answers kMismatch (the other
-    ///    sections of the call still apply and the facet is nacked); on success the facet state
-    ///    carries status 'delta' and `expect` as its section hash.
+    ///    savepoint and answers kMismatch (the other sections of the call still apply and the
+    ///    facet is nacked); on success the facet state carries status 'delta' and `expect` as
+    ///    its section hash.
     ///  - LEDGER: every applied section writes `software_changes` rows (install | remove |
     ///    upgrade) in the same transaction, from `diff_changes` over the rows that went out and
     ///    came in. A full section is a BASELINE (no ledger rows) when its facet is not held at all
