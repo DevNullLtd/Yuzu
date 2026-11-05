@@ -4664,6 +4664,13 @@ TEST_CASE("canonical_section_hash pins a row whose publisher is an origin label 
     bare.publisher.clear();
     CHECK(SoftwareInventoryStore::canonical_section_hash({bare}) !=
           SoftwareInventoryStore::canonical_section_hash({e}));
+    // The v2 report hash (canonical_hash) is the 12-field form with no tail when no source is set;
+    // the agent pins the same two digests in test_inventory_sync.cpp. Recipe:
+    //   printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\036' | shasum -a 256
+    SoftwareEntry v2 = e;
+    v2.source.clear();
+    CHECK(SoftwareInventoryStore::canonical_hash({v2}) ==
+          "3efab992b1c46e477f74297ee3d55e9c1a0cc923aa3d2dd112fe9a074ead29a9");
     // The identity key ignores the label: a labelled row keys like a vendorless one.
     SoftwareEntry labelled = e;
     SoftwareInventoryStore::derive_install_keys(labelled);

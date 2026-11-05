@@ -4,6 +4,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "installed_apps_inventory.hpp" // the plugin's own row parsers/builder feed the publisher cases
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
@@ -3682,66 +3683,154 @@ TEST_CASE("vendor_or_origin: a declared vendor stays, an empty one becomes via:<
     CHECK(fields_of(records_of(blob)[0])[2].empty());
 }
 
+TEST_CASE("a row whose publisher is an origin label hashes to the server's pinned digests",
+          "[sync][hash][vendor]") {
+    // The same row and the same digests as the server test "canonical_section_hash pins a row
+    // whose publisher is an origin label (via:brew)" in test_software_inventory_store.cpp. Recipes:
+    //   16-field form (source set):
+    //     printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\037\037\037\037pkg_inventory.packages\036' | shasum -a 256
+    //   12-field v2 form (no source):
+    //     printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\036' | shasum -a 256
+    SwEntry e;
+    e.name = "wget";
+    e.version = "1.24";
+    e.publisher = "via:brew";
+    e.kind = "pkg";
+    e.ecosystem = "brew";
+    CHECK(sha256_hex(installed_software_canonical_blob({e})) ==
+          "3efab992b1c46e477f74297ee3d55e9c1a0cc923aa3d2dd112fe9a074ead29a9");
+    e.source = "pkg_inventory.packages";
+    CHECK(sha256_hex(installed_software_canonical_blob({e})) ==
+          "906ce129e4448180dcee1d554df55367a898b40e73551cf9dbfaa73d26d0c69f");
+    // ...and the label is in the hash: the same row with the slot empty hashes differently.
+    SwEntry bare = e;
+    bare.publisher.clear();
+    CHECK(sha256_hex(installed_software_canonical_blob({bare})) !=
+          sha256_hex(installed_software_canonical_blob({e})));
+}
+
 namespace {
-// Every record of a collector run must carry a publisher; returns the distinct publishers per
-// source so a case can pin the derivation of the sources it cares about.
-std::map<std::string, std::set<std::string>> publishers_by_source(const std::string& blob) {
+namespace ia_inv = yuzu::installed_apps::inventory;
+
+std::string inv_row_of(const std::optional<ia_inv::InvRecord>& r) {
+    REQUIRE(r.has_value());
+    return ia_inv::format_inv_row(*r);
+}
+
+// A row for the sources whose publisher the plugin takes from the OS rather than from a line this
+// test can feed the parser (the Windows Uninstall hive, the macOS signing certificate, a receipt).
+std::string inv_row(std::string name, std::string publisher, std::string kind, std::string eco) {
+    ia_inv::InvRecord r;
+    r.name = std::move(name);
+    r.version = "1";
+    r.publisher = std::move(publisher);
+    r.kind = std::move(kind);
+    r.ecosystem = std::move(eco);
+    return ia_inv::format_inv_row(r);
+}
+
+// "<source>|<ecosystem>" -> the distinct publishers of that pair across one collector run.
+std::map<std::string, std::set<std::string>> publishers_by_source_and_ecosystem(
+    const std::string& blob) {
     std::map<std::string, std::set<std::string>> out;
     for (const auto& rec : records_of(blob)) {
         const auto f = fields_of(rec);
         REQUIRE(f.size() == 16);
-        INFO("source=" << f[15] << " name=" << f[0]);
-        CHECK_FALSE(f[2].empty());
-        out[f[15]].insert(f[2]);
+        out[f[15] + "|" + f[5]].insert(f[2]);
     }
     return out;
 }
 } // namespace
 
-TEST_CASE("collector: every source's real-capture rows carry a publisher or a via: label",
+TEST_CASE("collector: every inventory action's rows carry exactly the publisher of their source",
           "[sync][vendor][collector]") {
-    SECTION("Mac-shaped run") {
-        fake_mac();
-        const auto got = collect_with(all_plugins());
-        REQUIRE(got.has_value());
-        const auto by = publishers_by_source(got->first);
-        CHECK(by.at("pkg_inventory.managers") == std::set<std::string>{"Homebrew"});
-        CHECK(by.at("pkg_inventory.packages") == std::set<std::string>{"via:brew"});
-        for (const auto& rec : records_of(got->first)) {
-            const auto f = fields_of(rec);
-            if (f[5] == "macos_pkgutil")
-                CHECK(f[2] == "via:macos_pkgutil"); // a reverse-domain id is not a vendor
-        }
+    fake_mac();
+    // installed_apps: one declared-vendor row and one vendorless row per ecosystem that has a
+    // vendor, built through the plugin's own parsers (deb, rpm, pacman, apk) or its row builder.
+    g_fake[0].out["list_inventory"] = nl({
+        inv_row_of(ia_inv::parse_dpkg_inv_line(
+            "bash\tii \t5.2.37-2\tarm64\tMatthias Klose <doko@debian.org>")),
+        inv_row_of(ia_inv::parse_dpkg_inv_line("nomaint\tii \t1.0\tall\t")),
+        // rpm: a Rocky Linux 9 row (PACKAGER is the build system, VENDOR the org) -> VENDOR; a row
+        // with only PACKAGER -> PACKAGER; a row with neither -> no publisher (labelled by the core)
+        inv_row_of(ia_inv::parse_rpm_inv_line(
+            "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tRocky Linux Build System (Peridot) "
+            "<releng@rockylinux.org>\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
+            "Rocky Enterprise Software Foundation")),
+        inv_row_of(ia_inv::parse_rpm_inv_line(
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\tFedora (43) Signing\td\t(none)\t(none)\t(none)")),
+        inv_row_of(ia_inv::parse_rpm_inv_line("bare\t0\t1\t1\tnoarch\t(none)\td\t(none)\t(none)\t(none)")),
+        inv_row_of(ia_inv::parse_pacman_inv_line("zlib 1:1.3.1-2")),
+        inv_row_of(ia_inv::parse_apk_inv_line("musl-1.2.5-r0")),
+        inv_row("Contoso Tool", "Contoso Ltd", "app", "windows"),
+        inv_row("No Publisher Tool", "", "app", "windows"),
+        inv_row("Acme App", "Developer ID Application: Acme Inc (ABCDE12345)", "app", "macos"),
+        inv_row("Ad Hoc App", "", "app", "macos"),
+        inv_row("com.example.pkg", "", "pkg", "macos_pkgutil"),
+        inv_row("No Ecosystem", "", "package", ""),
+    });
+    g_fake[1].out["managers"] = nl({supported_status("managers"),
+                                    pkg::format_manager_row(pkg::Manager::homebrew,
+                                                            pkg::Presence::present, "4.1",
+                                                            "/opt/homebrew", "-", "")});
+    g_fake[1].out["packages"] = nl({supported_status("packages"),
+                                    pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula)});
+    g_fake[1].out["store_packages"] =
+        nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
+            flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit)});
+    g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
+    {
+        msi::Inventory inv;
+        inv.products.push_back({"{A}", "Contoso Msi", "1.0", "Contoso Ltd"});
+        inv.products.push_back({"{B}", "Vendorless Msi", "1.0", ""});
+        std::string out;
+        for (const auto& row : msi::render(inv))
+            out += row + '\n';
+        g_fake[3].out["list_inventory"] = out;
     }
-    SECTION("Windows-shaped run") {
-        fake_windows();
-        const auto got = collect_with(all_plugins());
-        REQUIRE(got.has_value());
-        const auto by = publishers_by_source(got->first);
-        CHECK(by.at("windows_optional_features.list") == std::set<std::string>{"Microsoft"});
-        CHECK(by.count("msi_packages.list_inventory") == 1);
-    }
-    SECTION("Linux-shaped run: deb, store packages, python and ibm_mq") {
-        fake_mac();
-        g_fake[0].out["list_inventory"] =
-            capture_section("installed_apps", "linux.txt", "list_inventory");
-        g_fake[1].out["store_packages"] =
-            nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
-                flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit)});
-        g_fake[4].out["python"] = nl({supported_status("python"),
-                                      "python|cpython|3.14.6|C:/Python314/|PythonCore",
-                                      "python|unmodelled|3.11|/usr/bin/python3.11|-"});
-        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
-        const auto got = collect_with(with_middleware());
-        REQUIRE(got.has_value());
-        const auto by = publishers_by_source(got->first);
-        CHECK(by.at("pkg_inventory.store_packages") ==
-              std::set<std::string>{"via:snap", "via:flatpak"});
-        // The collector runs on the host OS: a vendor column is read only where it holds a vendor.
-        CHECK(by.at("runtimes.python") ==
-              (yuzu::agent::kPythonVendorColumnIsVendor ? std::set<std::string>{"PythonCore", "via:python"}
-                                                        : std::set<std::string>{"via:python"}));
-        CHECK(by.at("middleware.ibm_mq") == std::set<std::string>{"IBM"});
-        CHECK(by.count("installed_apps.list_inventory") == 1);
+    // runtimes.python: the vendor column is read where it holds a vendor (Windows, Linux) and
+    // ignored on macOS, where it is a bundle identifier; `-` is no vendor on any OS.
+    g_fake[4].out["python"] = nl({supported_status("python"),
+                                  "python|cpython|3.14.6|C:/Python314/|PythonCore",
+                                  "python|unmodelled|3.11|/usr/bin/python3.11|-"});
+    g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+
+    const auto got = collect_with(with_middleware());
+    REQUIRE(got.has_value());
+    const auto by = publishers_by_source_and_ecosystem(got->first);
+
+    using Set = std::set<std::string>;
+    const std::map<std::string, Set> expected = {
+        {"installed_apps.list_inventory|deb", {"Matthias Klose <doko@debian.org>", "via:deb"}},
+        {"installed_apps.list_inventory|rpm",
+         {"Rocky Enterprise Software Foundation", "Fedora (43) Signing", "via:rpm"}},
+        {"installed_apps.list_inventory|pacman", {"via:pacman"}},
+        {"installed_apps.list_inventory|apk", {"via:apk"}},
+        {"installed_apps.list_inventory|windows", {"Contoso Ltd", "via:windows"}},
+        {"installed_apps.list_inventory|macos",
+         {"Developer ID Application: Acme Inc (ABCDE12345)", "via:macos"}},
+        {"installed_apps.list_inventory|macos_pkgutil", {"via:macos_pkgutil"}},
+        {"installed_apps.list_inventory|", {"via:unknown"}},
+        {"pkg_inventory.managers|brew", {"Homebrew"}},
+        {"pkg_inventory.packages|brew", {"via:brew"}},
+        {"pkg_inventory.store_packages|snap", {"via:snap"}},
+        {"pkg_inventory.store_packages|flatpak", {"via:flatpak"}},
+        {"windows_optional_features.list|optional_feature", {"Microsoft"}},
+        {"msi_packages.list_inventory|msi", {"Contoso Ltd", "via:msi"}},
+        {"runtimes.python|python",
+         yuzu::agent::kPythonVendorColumnIsVendor ? Set{"PythonCore", "via:python"}
+                                                  : Set{"via:python"}},
+        {"middleware.ibm_mq|ibm_mq", {"IBM"}},
+    };
+    CHECK(by == expected);
+
+    // Every action of the table is exercised: a new inventory action without a case here fails.
+    for (const auto& [plugin, action] : yuzu::agent::installed_software_actions()) {
+        const std::string source = std::string(plugin) + "." + std::string(action);
+        INFO(source);
+        const bool seen = std::any_of(by.begin(), by.end(), [&](const auto& kv) {
+            return kv.first.starts_with(source + "|");
+        });
+        CHECK(seen);
     }
 }
