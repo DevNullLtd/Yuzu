@@ -5972,6 +5972,40 @@ TEST_CASE("v3: a delta-only or all-refused call neither wipes v2 rows nor flips 
     CHECK(facet_count(pool, "agent-nf") == "0");
 }
 
+TEST_CASE("v3: a first call whose only writing section is a colliding component section keeps "
+          "the v2 rows",
+          "[pg][software_inventory][v3][components]") {
+    SWINV_SHARED(store, pool);
+    const std::vector<SoftwareEntry> v2rows = {v3_entry("OldApp", kV3Apps)};
+    const std::string v2hash = SoftwareInventoryStore::canonical_hash(v2rows);
+    REQUIRE(store.apply_installed_software("agent-cx", v2hash, v2rows, 0) ==
+            InventoryIngestOutcome::kStored);
+
+    // The component section repeats a (kind, path): a mismatch that writes nothing, so the call
+    // writes nothing and the switch to v3 does not happen.
+    auto res = store.apply_installed_software_v3(
+        "agent-cx", v3_report({comp_full({comp("one", "/opt/x.jar", "1"),
+                                          comp("two", "/opt/x.jar", "2")})}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
+    CHECK(names_of(pool, "agent-cx", kV3Apps) == std::vector<std::string>{"OldApp"});
+    CHECK(stored_hash(pool, "agent-cx") == v2hash);
+    CHECK(facet_count(pool, "agent-cx") == "0");
+    // The unchanged v2 report is therefore still a match with its rows behind it.
+    CHECK(store.apply_installed_software("agent-cx", v2hash, std::nullopt, 0) ==
+          InventoryIngestOutcome::kTouched);
+
+    // A call that does write (a second, sound section) still makes the switch.
+    res = store.apply_installed_software_v3(
+        "agent-cx", v3_report({comp_full({comp("one", "/opt/x.jar"), comp("two", "/opt/x.jar")}),
+                               v3_full(kV3Apps, {v3_entry("Alpha", kV3Apps)})}));
+    REQUIRE(res.size() == 2);
+    CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
+    CHECK(res[1].outcome == V3SectionOutcome::kStored);
+    CHECK(names_of(pool, "agent-cx", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(stored_hash(pool, "agent-cx").starts_with("v3:"));
+}
+
 TEST_CASE("v3: a first contact split over several calls converges to the single-call hash",
           "[pg][software_inventory][v3]") {
     SWINV_SHARED(store, pool);

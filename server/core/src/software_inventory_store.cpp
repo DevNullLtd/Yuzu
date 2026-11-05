@@ -1423,7 +1423,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         return report.sections[i].facet == kComponentInventoryFacet;
     };
     bool any_work = false;  // some section is not refused
-    bool any_write = false; // some section is not refused and not a delta (it may write on first contact)
+    bool any_write = false; // some section is not refused, not a delta and not a collision
     for (std::size_t i = 0; i < n; ++i) {
         auto& sec = report.sections[i];
         if (sec.refusal != V3Refusal::kNone) {
@@ -1433,7 +1433,6 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         any_work = true;
         auto& p = prep[i];
         const bool delta = sec.status == V3Status::kDelta;
-        any_write = any_write || !delta;
         if (delta) {
             p.removals = std::move(sec.deletions);
             std::sort(p.removals.begin(), p.removals.end());
@@ -1462,6 +1461,14 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 e.purl = compose_purl(e); // v3 path only: a v2 row keeps '' (see SoftwareEntry)
             }
         }
+    }
+
+    // A delta needs a held base and a colliding section is a mismatch: neither writes, so neither
+    // may cost a v2 device its rows through the first-call transition below.
+    for (std::size_t i = 0; i < n; ++i) {
+        any_write = any_write || (report.sections[i].refusal == V3Refusal::kNone &&
+                                  report.sections[i].status != V3Status::kDelta &&
+                                  !prep[i].collision);
     }
 
     const auto all_unrefused_error = [&] {
@@ -1514,8 +1521,9 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         // First v3 call that applies a section: no pre-existing row may outlive the switch,
         // because from here on a section replaces only its own facet's rows. The facet state goes
         // with them, so a stale held facet cannot stay in the report hash for ever. A call made
-        // only of delta and refused sections changes nothing here: a delta needs a held base,
-        // which a non-v3 agent has none of.
+        // only of delta, refused and colliding sections changes nothing here: a delta needs a
+        // held base, which a non-v3 agent has none of, and a collision is answered mismatch
+        // without a write.
         if (!was_v3 && any_write) {
             pg::PgResult del = pg::exec_params(
                 c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
