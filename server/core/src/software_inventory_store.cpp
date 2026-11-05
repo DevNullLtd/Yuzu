@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <set>
@@ -425,9 +426,10 @@ const std::vector<pg::PgMigration>& migrations() {
          // software_changes: one row per install | remove | upgrade an applied section produced.
          // A removal is a hard delete from installed_software plus a `remove` row here carrying
          // name/publisher/version: there are NO tombstones on installed_software. observed_at is
-         // the SERVER receipt time in seconds (the retention column) and, with agent_id, groups
-         // the rows of one apply call (calls are serialised per agent). instance_key is the stable
-         // row identity (installed_software.install_id churns on a full replace). Indexes serve the
+         // the replica's own server clock in whole seconds (not the database clock; the retention
+         // column) and, with agent_id, groups the rows of one apply call; calls are serialised per
+         // agent but two calls in the same second share an observed_at, so change_id orders the
+         // rows within a group. instance_key is the stable row identity. Indexes serve the
          // per-device history read ((agent_id, observed_at, change_id)) and the retention probe
          // ((observed_at)).
          // software_components: the current component set per device, hard-deleted when a
@@ -467,7 +469,6 @@ const std::vector<pg::PgMigration>& migrations() {
          "  anchor_app     TEXT   NOT NULL DEFAULT '',"
          "  row_hash       TEXT   NOT NULL,"
          "  first_seen     BIGINT NOT NULL,"
-         "  last_seen      BIGINT NOT NULL,"
          "  PRIMARY KEY (agent_id, kind, path_hash));"
          "CREATE INDEX IF NOT EXISTS software_components_row_hash_idx "
          "ON software_components (agent_id, row_hash);"
@@ -665,6 +666,9 @@ bool insert_entries(PGconn* c, const std::string& agent_id_s,
     return true;
 }
 
+// Per-kind ledger row counts, indexed by SoftwareChangeKind.
+using ChangeCounts = std::array<std::int64_t, kSoftwareChangeKinds.size()>;
+
 // The facet's stored rows as SoftwareEntry values: the 15 stored wire fields (so the section hash
 // can be recomputed from the table) plus the derived identity_key/instance_key (the ledger diff).
 bool read_facet_rows(PGconn* c, const std::string& agent_id_s, const std::string& facet,
@@ -689,8 +693,8 @@ bool read_facet_rows(PGconn* c, const std::string& agent_id_s, const std::string
             &e.arch,         &e.signature_status, &e.distro_id,        &e.distro_version,
             &e.install_location, &e.package_id,   &e.source,           &e.identity_key,
             &e.instance_key};
-        for (int col = 0; col < 17; ++col)
-            *fields[col] = PQgetvalue(r.get(), i, col);
+        for (std::size_t col = 0; col < std::size(fields); ++col)
+            *fields[col] = PQgetvalue(r.get(), i, static_cast<int>(col));
         out.push_back(std::move(e));
     }
     return true;
@@ -778,8 +782,8 @@ bool insert_components(PGconn* c, const std::string& agent_id_s,
         c,
         "INSERT INTO software_inventory_store.software_components "
         "(agent_id, kind, path_hash, path, name, version, version_source, size, mtime, "
-        "anchor_app, row_hash, first_seen, last_seen) "
-        "SELECT $1, k, ph, p, n, v, vs, sz::bigint, mt::bigint, aa, rh, $2::bigint, $2::bigint "
+        "anchor_app, row_hash, first_seen) "
+        "SELECT $1, k, ph, p, n, v, vs, sz::bigint, mt::bigint, aa, rh, $2::bigint "
         "FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], "
         "$9::text[], $10::text[], $11::text[], $12::text[]) "
         "AS t(k, ph, p, n, v, vs, sz, mt, aa, rh)",
@@ -1158,8 +1162,10 @@ std::string SoftwareInventoryStore::canonical_component_section_hash(std::vector
 //  - part 6 (missing anchor) = Decline: ledger history is not regenerable, so a from-boot skewed
 //    clock must not silently delete it (audit_store's answer, not ResultSetStore's);
 //  - window 400 days in epoch SECONDS (observed_at); big_step_floor 1 day and implausibility_bound
-//    1 day (observed_at is server receipt time, never future, so a row more than a day ahead is
-//    skew and is excluded from the would-wipe denominator); min_plausible_reading year 2000;
+//    1 day (observed_at is the replica's own clock, so a forward-skewed replica can stamp the
+//    future: a row more than a day ahead is excluded from the would-wipe denominator); the
+//    cutoff and anchor read Postgres now(), a different clock domain, accepted because the window
+//    is 400 days (docs/clock-guarded-retention.md); min_plausible_reading year 2000;
 //  - cap_per_pass 50,000 at an hourly tick; the scale arithmetic and its two knobs (cadence, cap)
 //    are in the docs/clock-guarded-retention.md row for this store.
 int SoftwareInventoryStore::run_retention_prune_changes() {
@@ -1239,7 +1245,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
          "from_version, to_version, observed_at"},
         {"software_components",
          "agent_id, kind, path_hash, path, name, version, version_source, size, mtime, "
-         "anchor_app, row_hash, first_seen, last_seen"},
+         "anchor_app, row_hash, first_seen"},
         {"retention_meta", "key, value"},
         {"catalog_rollup",
          "name, grain, kind, ecosystem, source, publisher, device_count, version_count, "
@@ -1440,8 +1446,10 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
             p.comps = std::move(sec.components);
             normalize_components(p.comps);
             std::set<std::pair<std::string_view, std::string_view>> keys;
-            for (const auto& k : p.comps)
-                p.collision = !keys.emplace(k.kind, k.path).second || p.collision;
+            for (const auto& k : p.comps) {
+                if (!keys.emplace(k.kind, k.path).second)
+                    p.collision = true;
+            }
             if (!delta)
                 p.section_hash = component_hash_of_normalised(p.comps);
         } else {
@@ -1473,7 +1481,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
     const std::int64_t ts = now_secs();
     const std::string ts_s = std::to_string(ts);
     std::vector<O> done(n, O::kError);
-    std::array<std::int64_t, 3> change_counts{}; // indexed by SoftwareChangeKind, committed only
+    ChangeCounts change_counts{}; // indexed by SoftwareChangeKind, committed only
 
     const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         std::fill(done.begin(), done.end(), O::kError);
@@ -1503,7 +1511,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         const bool was_v3 = PQntuples(st.get()) > 0 &&
                             std::string_view(PQgetvalue(st.get(), 0, 0)).starts_with("v3:");
 
-        // First v3 contact (or a return from v2): no pre-existing row may outlive the switch,
+        // First v3 call that applies a section: no pre-existing row may outlive the switch,
         // because from here on a section replaces only its own facet's rows. The facet state goes
         // with them, so a stale held facet cannot stay in the report hash for ever. A call made
         // only of delta and refused sections changes nothing here: a delta needs a held base,
@@ -1607,7 +1615,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
 
         // An installed_software full or delta section, already inside its savepoint.
         const auto apply_rows = [&](std::size_t i, const Held* prior,
-                                    std::array<std::int64_t, 3>& counts) -> Step {
+                                    ChangeCounts& counts) -> Step {
             const auto& sec = report.sections[i];
             auto& p = prep[i];
             std::vector<SoftwareEntry> old_rows;
@@ -1655,11 +1663,14 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 if (section_hash_of_normalised(now_rows) != sec.expect)
                     return Step::kMismatch;
             } else {
-                // BASELINE (rows written, no ledger rows): the facet is not held at all (first
-                // contact, which includes the first v3 call that applies a section and deletes the v2 rows) or was last switched off. In every other
-                // case the held rows are still in the table -- a status-only section leaves them
-                // in place -- so the full section is diffed against them.
-                ledger = prior != nullptr && prior->status != "disabled";
+                // BASELINE (rows written, no ledger rows) unless the server holds this facet's
+                // rows: a facet_state row with a section hash, not switched off. A status-only
+                // section can create a facet_state row for a facet that never held rows (empty
+                // hash), and one arriving over a `disabled` facet clears the hash (below), so
+                // neither makes the next full a diff. A status-only section over a held facet
+                // leaves its rows in place, so that full is diffed against them.
+                ledger = prior != nullptr && !prior->section_hash.empty() &&
+                         prior->status != "disabled";
                 if (ledger) {
                     if (!read_facet_rows(c, agent_id_s, sec.facet, old_rows))
                         return Step::kFail;
@@ -1748,8 +1759,10 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
             const bool delta = sec.status == V3Status::kDelta;
 
             if (!v3_status_carries_rows(sec.status)) {
-                // Status-only: rows, section_hash and last_confirmed_at are left alone. Nothing
-                // was confirmed this cycle.
+                // Status-only: rows and last_confirmed_at are left alone, as is section_hash --
+                // except over a `disabled` facet, whose hash is cleared so the next full is a
+                // baseline and a delta is answered with a full request. Nothing was confirmed this
+                // cycle.
                 pg::PgResult up = pg::exec_params(
                     c,
                     "INSERT INTO software_inventory_store.software_facet_state "
@@ -1759,7 +1772,9 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                     "ON CONFLICT (agent_id, facet) DO UPDATE SET "
                     " status = EXCLUDED.status, token = EXCLUDED.token, "
                     " enabled = EXCLUDED.enabled, duration_ms = EXCLUDED.duration_ms, "
-                    " bytes_read = EXCLUDED.bytes_read, updated_at = EXCLUDED.updated_at",
+                    " bytes_read = EXCLUDED.bytes_read, updated_at = EXCLUDED.updated_at, "
+                    " section_hash = CASE WHEN software_facet_state.status = 'disabled' "
+                    "                     THEN '' ELSE software_facet_state.section_hash END",
                     std::vector<std::string>{agent_id_s, sec.facet,
                                              std::string(v3_status_name(sec.status)), sec.token,
                                              sec.status == V3Status::kDisabled ? "false" : "true",
@@ -1789,7 +1804,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
             // One constant name: each savepoint is released before the next section starts.
             if (!exec_ok("SAVEPOINT sec"))
                 return fail("savepoint");
-            std::array<std::int64_t, 3> counts{};
+            ChangeCounts counts{};
             const Step step = is_component(i) ? apply_components(i) : apply_rows(i, prior, counts);
             if (step == Step::kFail)
                 return fail("section apply");
@@ -1860,8 +1875,9 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         if (done[i] == O::kMismatch &&
             mismatch_seen.fetch_add(1, std::memory_order_relaxed) % kReadDegradeLogSample == 0) {
             spdlog::warn("SoftwareInventoryStore: agent={} sent a '{}' {} section that did not "
-                         "verify (stale base, key collision or a hash other than its expect); "
-                         "rolled back, asking for a full section",
+                         "verify (a `-` naming a row not held, a key or path collision, a cap "
+                         "breach, or a hash other than its expect); rolled back, asking for a "
+                         "full section",
                          agent_id, results[i].facet,
                          std::string(v3_status_name(report.sections[i].status)));
         }

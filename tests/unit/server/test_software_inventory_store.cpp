@@ -5243,7 +5243,7 @@ std::string comp_hash_of(const std::vector<V3Component>& rows) {
 
 SqlTable comp_rows(PgPool& pool, const std::string& agent) {
     return sql_rows(pool,
-                    "SELECT name, version, first_seen::text, last_seen::text FROM "
+                    "SELECT name, version, first_seen::text FROM "
                     "software_inventory_store.software_components WHERE agent_id = $1 "
                     "ORDER BY name, path",
                     {agent});
@@ -5415,6 +5415,39 @@ TEST_CASE("v3: a delta that does not verify is rolled back alone and nacked as a
     }
 }
 
+TEST_CASE("v3: yuzu_software_changes_total moves after a committed section and not on a rollback",
+          "[pg][software_inventory][v3][ledger][metrics]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto total = [&](const char* kind) {
+        return metrics.counter("yuzu_software_changes_total", {{"kind", kind}}).value();
+    };
+    const auto a1 = v3_entry("Alpha", kV3Apps, "1.0");
+    const auto a2 = v3_entry("Alpha", kV3Apps, "2.0");
+    REQUIRE(store.apply_installed_software_v3("agent-mc", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(total("upgrade") == 0.0); // a baseline writes no ledger row and counts nothing
+
+    // A delta that does not verify is rolled back: its ledger rows are never counted.
+    auto bad = v3_delta(kV3Apps, section_hash_of({a1}), {a2}, {a1}, {a2});
+    bad.expect = std::string(64, '0');
+    REQUIRE(store.apply_installed_software_v3("agent-mc", v3_report({bad}))[0].outcome ==
+            V3SectionOutcome::kMismatch);
+    CHECK(total("upgrade") == 0.0);
+    CHECK(ledger_count(pool, "agent-mc") == "0");
+
+    REQUIRE(store.apply_installed_software_v3(
+                "agent-mc",
+                v3_report({v3_delta(kV3Apps, section_hash_of({a1}), {a2}, {a1}, {a2})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(total("upgrade") == 1.0);
+    CHECK(total("install") == 0.0);
+    CHECK(total("remove") == 0.0);
+    CHECK(ledger_count(pool, "agent-mc") == "1");
+    store.set_metrics(nullptr);
+}
+
 TEST_CASE("v3: a full section on a held facet writes remove/install/upgrade rows",
           "[pg][software_inventory][v3][ledger]") {
     SWINV_SHARED(store, pool);
@@ -5487,6 +5520,61 @@ TEST_CASE("v3: a status-only section then a full one diffs against the rows left
         const auto led = ledger(pool, "agent-to");
         REQUIRE(led.size() == 1);
         CHECK(led[0][0] == "upgrade");
+    }
+    SECTION("timeout twice keeps the stored hash, and the next full still diffs") {
+        for (int i = 0; i < 2; ++i)
+            REQUIRE(store.apply_installed_software_v3(
+                        "agent-to", v3_report({v3_status(kV3Apps, V3Status::kTimeout, "timeout")}))[0]
+                        .outcome == V3SectionOutcome::kStatusOnly);
+        CHECK(facet_status(pool, "agent-to", kV3Apps) == "timeout/" + section_hash_of({a1}));
+        REQUIRE(store.apply_installed_software_v3("agent-to", v3_report({v3_full(kV3Apps, {a2})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        CHECK(ledger_count(pool, "agent-to") == "1");
+    }
+    SECTION("a never-held facet whose first section is status-only: its first full is a baseline") {
+        // kV3Pkgs has no facet_state row yet; the status-only section creates one with no hash.
+        REQUIRE(store.apply_installed_software_v3(
+                    "agent-to", v3_report({v3_status(kV3Pkgs, V3Status::kTimeout, "timeout")}))[0]
+                    .outcome == V3SectionOutcome::kStatusOnly);
+        CHECK(facet_status(pool, "agent-to", kV3Pkgs) == "timeout/");
+        const auto p1 = v3_entry("libfoo", kV3Pkgs, "1.0");
+        const auto p2 = v3_entry("libbar", kV3Pkgs, "1.0");
+        REQUIRE(store.apply_installed_software_v3("agent-to", v3_report({v3_full(kV3Pkgs, {p1, p2})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        CHECK(names_of(pool, "agent-to", kV3Pkgs).size() == 2);
+        CHECK(ledger_count(pool, "agent-to") == "0");
+        // Once held, the facet diffs like any other.
+        REQUIRE(store.apply_installed_software_v3("agent-to", v3_report({v3_full(kV3Pkgs, {p1})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        CHECK(ledger_count(pool, "agent-to") == "1");
+    }
+    SECTION("a device whose first v3 call is status-only: its first full is a baseline") {
+        REQUIRE(store.apply_installed_software_v3(
+                    "agent-fs", v3_report({v3_status(kV3Apps, V3Status::kTimeout, "timeout")}))[0]
+                    .outcome == V3SectionOutcome::kStatusOnly);
+        REQUIRE(store.apply_installed_software_v3("agent-fs",
+                                                  v3_report({v3_full(kV3Apps, {a1, v3_entry("B", kV3Apps)})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        CHECK(row_count(pool, "agent-fs") == "2");
+        CHECK(ledger_count(pool, "agent-fs") == "0");
+    }
+    SECTION("disabled, then a status-only timeout, then a full: still a baseline; a delta asks for a full") {
+        REQUIRE(store.apply_installed_software_v3(
+                    "agent-to", v3_report({v3_status(kV3Apps, V3Status::kDisabled)}))[0]
+                    .outcome == V3SectionOutcome::kStatusOnly);
+        REQUIRE(store.apply_installed_software_v3(
+                    "agent-to", v3_report({v3_status(kV3Apps, V3Status::kTimeout, "timeout")}))[0]
+                    .outcome == V3SectionOutcome::kStatusOnly);
+        // The timeout over a disabled facet cleared the stored hash.
+        CHECK(facet_status(pool, "agent-to", kV3Apps) == "timeout/");
+        CHECK(store.apply_installed_software_v3(
+                  "agent-to",
+                  v3_report({v3_delta(kV3Apps, section_hash_of({a1}), {a2}, {a1}, {a2})}))[0]
+                  .outcome == V3SectionOutcome::kNeedFull);
+        REQUIRE(store.apply_installed_software_v3("agent-to", v3_report({v3_full(kV3Apps, {a2})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+        CHECK(ledger_count(pool, "agent-to") == "0");
+        CHECK(facet_status(pool, "agent-to", kV3Apps) == "full/" + section_hash_of({a2}));
     }
     SECTION("a delta right after a status-only section needs a full: the status is not full|delta") {
         REQUIRE(store.apply_installed_software_v3(
@@ -5605,6 +5693,42 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
     }
 }
 
+TEST_CASE("component row hash and component section hash are pinned",
+          "[software_inventory][v3][hash][components]") {
+    // The agent writer must reproduce these bytes. Recipe (8 fields, 0x1F between, 0x1E ends the
+    // record, size and mtime in decimal), with an independent check by python3 hashlib:
+    //   printf 'jar\037log4j-core\0372.14.1\037pom\037/opt/app/log4j-core.jar\0371234\0371700000000\037AcmeApp\036' | shasum -a 256
+    //   printf 'jar\037guava\03731.0\037manifest\037/opt/app/guava.jar\03756\0377\037\036' | shasum -a 256
+    //   printf '<the guava record><the log4j-core record>' | shasum -a 256     (sorted by the record fields)
+    V3Component log4j;
+    log4j.kind = "jar";
+    log4j.name = "log4j-core";
+    log4j.version = "2.14.1";
+    log4j.version_source = "pom";
+    log4j.path = "/opt/app/log4j-core.jar";
+    log4j.size = 1234;
+    log4j.mtime = 1700000000;
+    log4j.anchor_app = "AcmeApp";
+    V3Component guava;
+    guava.kind = "jar";
+    guava.name = "guava";
+    guava.version = "31.0";
+    guava.version_source = "manifest";
+    guava.path = "/opt/app/guava.jar";
+    guava.size = 56;
+    guava.mtime = 7;
+
+    CHECK(SoftwareInventoryStore::component_row_hash(log4j) ==
+          "2a42ddba7479c8a7edbe10b9f64ebe33d35bb294588993515c9313e65bba588f");
+    CHECK(SoftwareInventoryStore::component_row_hash(guava) ==
+          "ec07687685e447a3fb37bc84a64e94ad9bf5433d20a6b01d2cc6ff3b38a5003a");
+    // Order and duplicates do not matter: the guava record sorts first.
+    const std::string section = "d9660fb3421ec2ad622c68ad05e58351ece4584d13b29e92cfea9f5c4b8af4cd";
+    CHECK(SoftwareInventoryStore::canonical_component_section_hash({guava, log4j}) == section);
+    CHECK(SoftwareInventoryStore::canonical_component_section_hash({log4j, guava, log4j}) == section);
+    CHECK(SoftwareInventoryStore::canonical_component_section_hash({}) == kEmptySectionHash);
+}
+
 TEST_CASE("v3: component sections: full stores rows, delta applies, honest-empty deletes",
           "[pg][software_inventory][v3][components]") {
     SWINV_SHARED(store, pool);
@@ -5620,14 +5744,14 @@ TEST_CASE("v3: component sections: full stores rows, delta applies, honest-empty
     auto rows = comp_rows(pool, "agent-cp");
     REQUIRE(rows.size() == 2);
     CHECK(rows[0][0] == "guava");
-    CHECK(rows[0][2] == rows[0][3]); // first_seen == last_seen on a full section
-    CHECK(rows[0][2] != "0");
+    CHECK(rows[0][2] != "0"); // first_seen: when the row was written
     // path_hash is the SHA-256 of the exact path bytes and row_hash names the record.
     const auto keys = sql_rows(pool, "SELECT path_hash, row_hash FROM "
                                      "software_inventory_store.software_components "
                                      "WHERE agent_id = 'agent-cp' AND name = 'guava'");
     REQUIRE(keys.size() == 1);
-    CHECK(keys[0][0].size() == 64);
+    // path_hash = SHA-256 of the exact path bytes: printf '/opt/app/guava.jar' | shasum -a 256
+    CHECK(keys[0][0] == "d255fcd34133e5c73da539533af7be057146e1dc5fe4bc47f3630cd1a719af75");
     CHECK(keys[0][1] == SoftwareInventoryStore::component_row_hash(c2));
     CHECK(facet_status(pool, "agent-cp", kV3Comp) == "full/" + comp_hash_of({c1, c2}));
 
@@ -5640,18 +5764,17 @@ TEST_CASE("v3: component sections: full stores rows, delta applies, honest-empty
     CHECK(ledger_count(pool, "agent-cp") == "0"); // components never write the install ledger
 
     // A delta: drop c2, add c3. c1 survives untouched: a delta rewrites only the rows it names.
-    sql_ok(pool, "UPDATE software_inventory_store.software_components SET first_seen = 1, "
-                 "last_seen = 1 WHERE agent_id = 'agent-cp'"); // so a rewrite is observable
+    sql_ok(pool, "UPDATE software_inventory_store.software_components SET first_seen = 1 "
+                 "WHERE agent_id = 'agent-cp'"); // so a rewrite is observable
     res = store.apply_installed_software_v3(
         "agent-cp", v3_report({comp_delta(comp_hash_of({c1, c2}), {c1, c3}, {c2}, {c3})}));
     REQUIRE(res[0].outcome == V3SectionOutcome::kStored);
     rows = comp_rows(pool, "agent-cp");
     REQUIRE(rows.size() == 2);
     CHECK(rows[0][0] == "log4j-core"); // ORDER BY name: log4j-core, slf4j
-    CHECK(rows[0][2] == "1");          // the survivor keeps first_seen ...
-    CHECK(rows[0][3] == "1");          // ... and last_seen: it was not rewritten
+    CHECK(rows[0][2] == "1");          // the survivor keeps first_seen: it was not rewritten
     CHECK(rows[1][0] == "slf4j");
-    CHECK(rows[1][2] == rows[1][3]);
+    CHECK(rows[1][2] != "1");          // the added row was written now
     CHECK(facet_status(pool, "agent-cp", kV3Comp) == "delta/" + comp_hash_of({c1, c3}));
 
     // A delta that does not verify is a mismatch and changes nothing.
@@ -5695,6 +5818,15 @@ TEST_CASE("v3: a component PK collision inside one section is a mismatch, rolled
         "agent-pk", v3_report({comp_delta(comp_hash_of({keep}), {keep, twin}, {}, {twin})}));
     CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
     CHECK(comp_rows(pool, "agent-pk").size() == 1);
+
+    // A `-` naming a component the server never stored is a mismatch too, and rolls back alone.
+    const auto ghost = comp("ghost", "/opt/ghost.jar");
+    res = store.apply_installed_software_v3(
+        "agent-pk", v3_report({comp_delta(comp_hash_of({keep}), {keep}, {ghost}, {})}));
+    CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
+    CHECK(yuzu::server::v3_section_needs_full(res[0].outcome));
+    CHECK(comp_rows(pool, "agent-pk").size() == 1);
+    CHECK(facet_status(pool, "agent-pk", kV3Comp) == "full/" + comp_hash_of({keep}));
 }
 
 TEST_CASE("v3: delete_agent removes the ledger and the components; a bystander keeps its own",
@@ -5718,15 +5850,16 @@ TEST_CASE("v3: delete_agent removes the ledger and the components; a bystander k
     CHECK(comp_rows(pool, "agent-keep").size() == 1);
 }
 
-TEST_CASE("v3: the first v3 contact of a former v2 agent baselines and drops stale components",
+TEST_CASE("v3: the first v3 call of a device holding v2 rows that applies a section baselines and "
+          "drops stale components",
           "[pg][software_inventory][v3][ledger][components]") {
     SWINV_SHARED(store, pool);
     const std::vector<SoftwareEntry> v2rows = {v3_entry("OldApp", kV3Apps)};
     REQUIRE(store.apply_installed_software("agent-tr", SoftwareInventoryStore::canonical_hash(v2rows),
                                            v2rows, 0) == InventoryIngestOutcome::kStored);
     REQUIRE(sql_ok(pool, "INSERT INTO software_inventory_store.software_components "
-                         "(agent_id, kind, path_hash, name, row_hash, first_seen, last_seen) "
-                         "VALUES ('agent-tr', 'jar', 'ph', 'stale', 'rh', 1, 1)"));
+                         "(agent_id, kind, path_hash, name, row_hash, first_seen) "
+                         "VALUES ('agent-tr', 'jar', 'ph', 'stale', 'rh', 1)"));
     const auto a1 = v3_entry("Alpha", kV3Apps);
     REQUIRE(store.apply_installed_software_v3("agent-tr", v3_report({v3_full(kV3Apps, {a1})}))[0]
                 .outcome == V3SectionOutcome::kStored);
