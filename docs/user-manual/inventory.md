@@ -382,14 +382,40 @@ whole source name.
 
 - **Daily, per source.** Installed software syncs every ~24 h.
 - **Spread, not lockstep.** Each endpoint picks a stable, per-agent time offset,
-  so a fleet does not all report at once. A freshly enrolled (or long-offline)
-  agent does its first sync shortly after connecting, jittered to avoid a
-  mass-enrollment thundering herd.
+  so a fleet does not all report at once (installed software: see the nightly
+  window below). A freshly enrolled (or long-offline) agent does its first sync
+  shortly after connecting, jittered to avoid a mass-enrollment thundering herd.
+- **Nightly window for installed software.** The regular daily installed-software
+  sync runs at a stable per-agent moment between 01:00 and 05:00 on the
+  endpoint's own clock and time zone. The first sync after enrolment, retries
+  after a skipped or refused sync, and an operator's Sync now can still land
+  outside it. Because the window is local, a fleet in one time zone reports
+  within four hours of the day, about six times the per-second rate of an even
+  spread. An endpoint with no time zone configured (a container, a VDI image, a
+  service with `TZ` unset) uses UTC, and 01:00 to 05:00 UTC can be working hours
+  where its users are. A laptop that is off during its window syncs when it next
+  wakes (see Gentle catch-up) and then returns to the next window. The window is
+  built into the agent: it has no setting yet, and the server cannot push one.
+- **Gentle catch-up.** An agent that was switched off, or a laptop that slept
+  through its sync, does not report the moment it wakes. A sync more than 15
+  minutes overdue is spread over the next 30 minutes by a stable per-agent
+  offset, and a schedule more than two days ahead (a clock stepped back) is
+  corrected the same way. The rule also applies while the server is
+  unreachable: an agent retries every 30 seconds for up to 15 minutes, then
+  pauses for its offset (up to 30 minutes) before the next burst.
+- **Sync now can be spread too.** The agent's `__sync__.now` command takes a
+  list of sources and an optional `delay_max_s` (0 to 86400 seconds); with it
+  the agent reports at a stable offset within that many seconds instead of
+  immediately. Nothing in the console sends either yet, so Sync now is
+  immediate today. If its first send fails (the server is unreachable), the
+  retries follow the pattern in Gentle catch-up, so it can arrive up to about
+  45 minutes after the click.
 - **Hash-skip.** If a device's installed software hasn't changed since its last
   successful sync, the agent sends only a small **content hash** instead of the
   full list. The server replies asking for the full list only when it can't match
   the hash (e.g. a fresh/restored server). A full list is also sent at least once
-  a week regardless, as a safety net.
+  a week regardless, as a safety net (up to 8 days for the nightly window, across
+  a spring-forward clock change).
 - **Resilient.** Sync state is kept on the agent and survives reconnects and
   reboots; a failed sync simply retries on the next cycle.
 
