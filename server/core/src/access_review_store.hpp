@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <expected>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -153,21 +154,43 @@ public:
                  const std::vector<GrantRef>& frozen_population,
                  std::string rbac_enforcement);
 
-    /// Record (or overwrite, on a later re-attest) a reviewer's decision for
-    /// one frozen grant. `decision` must be `"attested"` or
-    /// `"flagged_revoke"` — NEVER `"pending"` (that is the frozen-at-open
-    /// default only; there is no route back to pending once a reviewer has
-    /// spoken, matching how `record_failed_login`-style stores never allow a
-    /// terminal-shaped write to un-terminal itself). Stamps
-    /// `decided_at_ms = now` (caller-independent — this store reads the wall
-    /// clock, matching `EnginePrincipalStore`'s `now_epoch` idiom) and the
-    /// given `reviewer`/`justification`. `unexpected("not_found: ...")` —
-    /// note the machine-checkable `not_found:` prefix, so a REST caller can
-    /// map it to 404 rather than 503 — when the (campaign_id, principal_type,
-    /// principal_id, role_name) tuple is not in the frozen population, OR
-    /// the campaign is not open (closed campaigns are immutable evidence —
-    /// see `close_campaign`). Any other `unexpected(msg)` is a genuine
-    /// write failure (503/retry).
+    /// Record a reviewer's decision for one frozen grant, ONCE. `decision`
+    /// must be `"attested"` or `"flagged_revoke"` — NEVER `"pending"` (that is
+    /// the frozen-at-open default only). A decision is FINAL (#4752): the
+    /// first Attest/Flag on a grant sticks, so neither a second reviewer nor
+    /// the subject can replace it while the campaign is open. A mis-click is
+    /// fixed by opening a new campaign. Stamps `decided_at_ms = now`
+    /// (caller-independent — this store reads the wall clock, matching
+    /// `EnginePrincipalStore`'s `now_epoch` idiom) and the given
+    /// `reviewer`/`justification`. `reviewer` must be non-empty.
+    ///
+    /// SEPARATION OF DUTIES (#4752), enforced in the SAME statement as the
+    /// write so every caller (MCP, REST, any future one) inherits it and no
+    /// handler can forget it: the reviewer may not be the subject of the grant
+    /// (`principal_type == "user"`, exact byte comparison) nor the owner of an
+    /// engine principal as FROZEN into `grant_snapshot` at campaign open.
+    /// `group` subjects are NOT covered (no owner; membership is a
+    /// cross-store read) — a documented limit. There is ONE copy of the rule
+    /// (`kSelfSubject` in the .cpp); extend it, never fork it.
+    ///
+    /// Errors carry a machine-checkable prefix so a transport can map them
+    /// without parsing prose:
+    ///   * `not_found: ...`        — tuple not in the frozen population, OR the
+    ///                               campaign is not open (closed campaigns are
+    ///                               immutable evidence — see `close_campaign`).
+    ///                               REST 404.
+    ///   * `already_decided: ...`  — the grant already has a decision (the
+    ///                               message names it). REST 409.
+    ///   * `self_attestation: ...` — reviewer is the subject / engine owner.
+    ///                               REST 403. Outranks `already_decided:`.
+    ///   * `bad_request: ...`      — a NUL byte / over-long (> 512 bytes)
+    ///                               identifier, a justification with a NUL byte
+    ///                               or over 8192 bytes, an empty reviewer, or an
+    ///                               invalid decision. REST 400. (Scoped to this
+    ///                               method: the other methods do not take
+    ///                               caller-supplied evidence text.)
+    /// Any other `unexpected(msg)` is a genuine write failure (503/retry); the
+    /// libpq text is LOGGED server-side and never returned.
     [[nodiscard]] std::expected<void, std::string>
     record_attestation(const std::string& campaign_id, const std::string& principal_type,
                        const std::string& principal_id, const std::string& role_name,
@@ -188,7 +211,15 @@ public:
     /// this store silently launders by forcing completion). Idempotent-
     /// rejecting: closing an already-closed or unknown campaign returns
     /// `unexpected("not_found: ...")` (machine-checkable prefix, as above);
-    /// any other `unexpected(msg)` is a genuine write failure.
+    /// any other `unexpected(msg)` is a genuine write failure (the libpq text
+    /// is logged on the server and never returned).
+    ///
+    /// LOCK CONTRACT (#4752): `record_attestation` takes a `FOR SHARE` lock on
+    /// the campaign row inside its write, so this UPDATE waits for attestations
+    /// already in flight and a later attestation re-checks the new status. The
+    /// order is campaign row (share) -> attestation row, and this method locks
+    /// ONLY the campaign row. If you change it to also touch attestation rows,
+    /// re-derive that order first or you can create a lock cycle.
     [[nodiscard]] std::expected<void, std::string>
     close_campaign(const std::string& campaign_id, const std::string& closed_by);
 
@@ -209,5 +240,50 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
 };
+
+/// Machine-checkable error prefixes `record_attestation` produces. ONE
+/// definition each, used by BOTH the producer (access_review_store.cpp) and the
+/// classifiers below, so a typo is a compile error rather than a deliberate
+/// refusal silently degrading to a generic 503. (`not_found:` predates this and
+/// stays a literal at its existing sites.)
+inline constexpr std::string_view kSelfAttestationPrefix = "self_attestation:";
+inline constexpr std::string_view kAlreadyDecidedPrefix = "already_decided:";
+/// Client-caused input error the transport did not pre-validate (a NUL byte or
+/// over-long identifier, an empty reviewer). REST 400 / MCP invalid-params.
+inline constexpr std::string_view kBadRequestPrefix = "bad_request:";
+
+/// How `record_attestation` refused a decision on purpose (#4752), as opposed
+/// to a missing row (`not_found:`) or a store fault. The ONE place the store's
+/// error prefixes are turned into a transport-neutral verdict, so the REST and
+/// MCP handlers cannot disagree about which refusals are audited `denied`.
+enum class AttestationRefusal { None, SelfAttestation, AlreadyDecided };
+
+[[nodiscard]] inline AttestationRefusal classify_attestation_refusal(std::string_view err) noexcept {
+    if (err.starts_with(kSelfAttestationPrefix))
+        return AttestationRefusal::SelfAttestation;
+    if (err.starts_with(kAlreadyDecidedPrefix))
+        return AttestationRefusal::AlreadyDecided;
+    return AttestationRefusal::None;
+}
+
+/// True for a client-input error from any AccessReviewStore method.
+[[nodiscard]] inline bool is_bad_request_error(std::string_view err) noexcept {
+    return err.starts_with(kBadRequestPrefix);
+}
+
+/// Short, stable audit `detail` token for a refusal ("" for `None`). A token,
+/// not the store's prose, so the audit stream stays queryable and carries
+/// nothing caller-controlled.
+[[nodiscard]] inline const char* attestation_refusal_token(AttestationRefusal r) noexcept {
+    switch (r) {
+    case AttestationRefusal::SelfAttestation:
+        return "self_attestation_blocked";
+    case AttestationRefusal::AlreadyDecided:
+        return "already_decided";
+    case AttestationRefusal::None:
+        break;
+    }
+    return "";
+}
 
 } // namespace yuzu::server

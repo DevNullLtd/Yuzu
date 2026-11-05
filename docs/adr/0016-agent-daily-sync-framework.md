@@ -707,9 +707,8 @@ agent's next full report on the upgraded server.
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
 serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
 account or a personal label as the OS reports it, so the agent redacts such entries before sending
-(2026-11-01 entry, "Mount points (personal data)"). The sections read has no REST/MCP/UI route yet;
-the later REST read-surface change must serve it behind the same fail-closed audit as the
-audited `inventory.device.ci` read.
+(2026-11-01 entry, "Mount points (personal data)"). As of the 2026-11-04 entry at the end of this
+file (H.7), the sections are served on REST and MCP behind the audited `inventory.device.ci` read.
 
 ### 2026-11-01 — `device_ci` blob v2 (agent writer)
 
@@ -1138,3 +1137,61 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   reports at its next wake. With the 45 minutes above, both stay inside the 48 hour "two missed
   daily cycles" staleness threshold of `docs/user-manual/inventory.md`, and the freshness gauge
   keys on server receipt time, so no freshness expectation is weakened.
+
+### 2026-11-04 — `device_ci` read surface on REST and MCP (H.7)
+
+`GET /api/v1/hardware/{id}` and the MCP tool
+`get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
+The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
+served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
+level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
+generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
+(`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
+unreadable`; it is never a `200` with an empty sections list.
+
+Each table-backed section's status row also records `row_count` (migration v3, additive and
+nullable): the number of child rows the full replace actually inserted for it, taken from the insert in
+the same transaction and never from the agent. The read side compares it with the rows it reads in the
+same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
+restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
+rows that were read are still served.
+
+The status row also records `content_digest` (the same migration v3, additive and nullable): the
+SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
+count, row count, then each row's position and cells, with any NUL byte in a cell skipped because the
+store cannot keep one), computed by the server from the rows it inserts in the same transaction,
+never taken from the agent. It is stored as `v1:<64 hex>`: the prefix names the preimage layout, and a
+stored digest that is a well-formed digest of a different layout version (`v<n>:` with a non-empty
+remainder, n one to six digits, not 1, no leading zero) is treated as unverified, never as a mismatch; every other
+non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex, a malformed version,
+`v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
+same-count edit read as complete. A later layout change or a registry column change (see the warning in
+`device_ci_kinds.hpp`) can therefore be rolled out under a new prefix without raising a false integrity
+alarm on every stored row. One pure function
+(`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
+read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
+row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
+and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
+reason. The rows that were read are still served, but they are not the values the agent reported. A
+lost row is reported by the count token alone, since it changes the digest too. This is an integrity
+check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
+tables can also rewrite the digest column, and the digest covers the rows only, not the section's
+level or reason. It closes the same-count content drift that the count alone could not see (finding
+`up2r-up-3`). A status-only section (chassis, baseboard, machine_id) and a section written before v3
+store NULL for both, are not verified, and read exactly as before.
+Only a full replace records the count and repairs a mismatched section: a device whose hash is
+unchanged sends only a hash, which leaves the rows alone, so this happens on a hardware change, an
+operator Sync now of the device record (`POST /api/v1/hardware/{id}/sync`; the fleet-wide route and the
+MCP `sync_hardware_software` tool re-send installed software only and do not repair a section), or the
+weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
+for up to a week after upgrade. The wire format and the agent are unchanged. Migration 3 is a single
+additive `ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, ADD COLUMN IF
+NOT EXISTS content_digest TEXT NULL` (the digest column is folded into v3 because v3 had not shipped;
+the runner is gated on the recorded version only, so a development database that already recorded the
+earlier row-count-only v3 must be reset with `UPDATE public.schema_meta SET version = 2 WHERE store =
+'device_inventory_store';` and a server restart, or recreated). The rollback note above
+holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
+there, so the sections it writes are unverified until a v3 server next does a full replace for that
+device.

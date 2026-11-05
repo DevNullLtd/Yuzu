@@ -9,6 +9,7 @@
 /// behaviour lives here — the store keeps its class and every query.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,22 @@ struct DeviceCiSection {
     std::string level;  ///< agent-reported level, or "constrained" after a server cap
     std::string reason; ///< agent-reported reason; ";server_cap:<n>" appended on truncation
     std::vector<std::vector<std::string>> rows;
+    /// READ SIDE ONLY (never set by the parser; the writer derives it from the rows it actually
+    /// inserts): the child-row count persisted with the section's status row, so an out-of-band
+    /// loss of child rows is detectable. nullopt = a status-only kind, or a row written before
+    /// migration v3 - not verifiable, and read exactly as before. See `verify_section_row_count`
+    /// (hardware_list_model.hpp), the count half of the decision `verify_section_content` serves.
+    std::optional<int> row_count;
+    /// READ SIDE ONLY (the writer derives it from the rows it inserts, never from the agent): the
+    /// `v1:` + SHA-256 of the canonical serialization of the section's child rows
+    /// (`section_content_digest`, device_ci_section_digest.hpp), persisted with the status row so an
+    /// out-of-band edit, restore or swap of child rows - including one that keeps the row count -
+    /// is detectable. nullopt = a status-only kind, or a row written before migration v3: not
+    /// verifiable, read exactly as before; so is a well-formed digest of a different layout version
+    /// (`v2:...`). Any other non-NULL value that is not the current `v1:` form is a mismatch. An
+    /// integrity check against accident and non-malicious drift, NOT tamper resistance. See
+    /// `verify_section_content` (hardware_list_model.hpp).
+    std::optional<std::string> content_digest;
 };
 
 /// One device-CI record — the typed projection of the `device_ci` canonical wire
@@ -80,8 +97,9 @@ struct DeviceCiRecord {
     std::string machine_id_algorithm;
     std::string machine_id_source; ///< wire position 32
     /// v2 only: per-section statuses + list rows, in `kDeviceCiSections` order (only
-    /// sections the blob mentioned). Empty on v1. Not populated by `get_device_ci` —
-    /// read via `get_device_ci_sections`.
+    /// sections the blob mentioned). Empty on v1. Not populated by `get_device_ci`; populated
+    /// by `get_device_ci_with_sections` (one snapshot with the scalars) and readable alone via
+    /// `get_device_ci_sections`.
     std::vector<DeviceCiSection> sections;
 };
 
@@ -92,5 +110,15 @@ struct DeviceCiRecord {
 /// synced" note). Out-params are forbidden in new code (docs/cpp-conventions.md) —
 /// hence `std::expected` rather than an enum + out-param.
 enum class CiReadError { kDegraded };
+
+/// Result of `DeviceInventoryStore::get_device_ci_with_sections`: the record and its v2
+/// sections read in ONE snapshot, so the scalars and the section rows are always the same
+/// replace generation. `record == nullopt` is "no CI record" (a successful read). A record
+/// WITH `sections_failed == true` means the record read succeeded but a section statement
+/// failed: `record->sections` is then empty and must not be read as "the device has none".
+struct DeviceCiWithSections {
+    std::optional<DeviceCiRecord> record;
+    bool sections_failed{false};
+};
 
 } // namespace yuzu::server

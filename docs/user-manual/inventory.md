@@ -707,7 +707,7 @@ place, **Hardware** and **Software**, each its own page:
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
   `tag=<key>[=<value>]` directly), and the device-CI columns from before (manufacturer,
   model, serial, CPU model + cores/threads, RAM, OS version). All columns except DEX are
-  sortable; a server-side search box (hostname/serial/model/CPU), OS/status filter
+  sortable; a server-side search box (hostname, device id, serial, model, manufacturer, CPU, OS, chassis asset tag, chassis serial, board serial and similar identity fields), OS/status filter
   chips, a filter breadcrumb, and pagination narrow a large fleet. A new checkbox column
   plus a sticky bulk-tag bar let you apply or remove one tag across every selected
   device in one action — under the hood it loops the existing single-device tag routes,
@@ -1358,17 +1358,52 @@ sync, defeating the hash-skip protocol.
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
   Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
-  not read; storage topology is planned everywhere), and the stored sections are not yet
-  shown in the Hardware pages or API.
+  not read; storage topology is planned everywhere). The stored sections are served by
+  `GET /api/v1/hardware/{id}` and the MCP `get_hardware_ci` tool (they are not rendered in the
+  dashboard Hardware pages yet).
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
   means the server kept only the first `n` rows; `server:machine_id_shape` on the
-  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  `machine_id` section means the reported machine ID was not a hash and was discarded;
+  `server:row_count_mismatch` means the rows stored for the section no longer match the count
+  recorded when the device last synced in full (rows were lost outside the product, for example
+  a partial database restore), so the section is served `constrained` and incomplete with the
+  rows that remain. `server:content_digest_mismatch` means the number of rows still matches but
+  the rows no longer hash to the digest the server recorded beside the section's status when the
+  device last synced in full (a row was edited, or the rows were swapped for another sync's out
+  of band): the section is served `constrained` and incomplete, with the rows that were read, but
+  those rows are **not** the values the agent reported, so do not rely on them. A lost row
+  reports `server:row_count_mismatch` alone. Neither token is stored: both are worked out each
+  time the record is read, so they never appear in the `device_ci_section` query further down.
+  Reading the record again does not clear either token. **Only a full device-record sync
+  repairs either** (a device whose hardware has not changed sends only a hash on its daily sync,
+  which leaves the rows alone): use **Sync now** on the device's Hardware page, or
+  `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
+  `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed
+  software only and do not repair a section, and there is no MCP tool that does: an agentic
+  client should ask an operator to run Sync now on the device, or call
+  `POST /api/v1/hardware/{id}/sync` if it holds REST access. Otherwise it clears on the device's next hardware
+  change or its weekly full report (at most 7 days). A section stored before these checks existed
+  (before migration 3) has neither a recorded count nor a digest and is not verified until that
+  device's next full sync, so a freshly upgraded server verifies a device only after that sync.
+  The digest is computed by the server from the rows it was about to insert (the same projection
+  that is stored; never taken from the agent) and is an integrity check against accident and
+  non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
+  digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
+  layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
+  version (for example `v2:` followed by a digest) is treated as unverified, because this server
+  cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
+  by a colon and a non-empty remainder). Any other stored value that is not the current form (an
+  empty or damaged value, `V1:`, a bare hex string, a malformed version) is compared as a
+  mismatch and reported as `server:content_digest_mismatch`, so a damaged column cannot let an
+  edited section read as complete. Only an absent value (a section stored before migration 3, or
+  a status-only kind) or a well-formed digest of another layout version is unverified. A section
+  whose row count already disagrees reports the count token alone, and an `unavailable` or
+  `permission_denied` section is never compared.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
-  before the agents. No page or API reads the per-device rows yet: these values are stored
-  now and become visible when the device-CI read surface ships.
+  before the agents.
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:
@@ -1393,7 +1428,7 @@ sync, defeating the hash-skip protocol.
   independently: one section being unavailable never stops the others, or the base device
   fields, from being reported.
 
-On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and are not yet shown on the Hardware pages or returned by the REST or MCP device-record endpoints.
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and returned by `GET /api/v1/hardware/{id}` (the chassis, baseboard and machine-id values in `ci`, and every section's status, reason, source and rows in `ci.sections`; a `constrained` section reads as incomplete, and an `unavailable` or `permission_denied` one shows its reason and no rows). The MCP `get_hardware_ci` tool returns the same body and its output schema declares the new keys. They are not yet shown on the Hardware pages. The Hardware list search (`q`) also matches the chassis asset tag, chassis serial and board serial.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
