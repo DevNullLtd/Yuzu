@@ -3868,7 +3868,8 @@ test('gateway private epmd selftest',
 # Timeout sized to the sweep's own worst-case ceiling, not typical runtime:
 # with both scenarios' alerts shipped (#2854 rung D) all 6 (scenario,
 # interval) measure() calls run for real -- pull ladder ~195s plus 6 x
-# (30s check + 90s test) = ~915s -- so 1200 keeps a real margin over that.
+# (30s check + 90s test) + the ~30s daemon probe = ~945s -- so 1200 keeps a
+# real margin over that.
 # A third sweep scenario adds another ~360s: re-derive, don't inherit.
 test('audit retention alert coverage manifest',
   _python3_test,

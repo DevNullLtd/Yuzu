@@ -442,7 +442,8 @@ jobs:
     name: Prometheus alert rules
     runs-on: ubuntu-24.04
     # HISTORY - the 30 -> 45 derivation for #2340 PR-4, kept for its method.
-    # Its 480s-per-gate and ~915s figures are superseded by the 45 -> 55
+    # Every figure in it (480s per gate, ~1185s for step 1, ~915s for step 2,
+    # ~2100s, 45 minutes / 2700s, ~1.29x) is superseded by the 45 -> 55
     # paragraph below, which holds the CURRENT numbers.
     # 30 -> 45 for #2340 PR-4: marker-extraction added a SECOND full gate()
     # to step 1 (the shipped RULES/TESTS pair, then the extracted
@@ -465,12 +466,7 @@ jobs:
     # margin matching the prior 1800/1410 ratio. Sizing to the TYPICAL
     # combined runtime measured locally is what the original 10->15 bump did,
     # and is exactly the gap that let step 2 ship with a per-call ceiling the
-    # job budget could not actually survive. A THIRD sweep scenario grows
-    # step 2 by another ~360s, or a THIRD gate on step 1 adds another ~720s (480s
-    # before #7191):
-    # re-derive this number in that PR, don't inherit it (see the warning
-    # next to `SCENARIO_ALERTS` in `blind_band_sweep.py`, and
-    # run_promtool_tests.py's own pull_with_retry() comment).
+    # job budget could not actually survive. (End of the history paragraph.)
     # 45 -> 55 for #7191: the two `promtool test rules` calls per gate went
     # from 120s to 240s (one of four shards intermittently ran past 120s), so a
     # gate is 120 + 240 + 240 + 120 = 720s and step 1 is now ~1665s worst case
@@ -478,7 +474,11 @@ jobs:
     # 30s daemon probe and 720s of sweep (the ~915s above left the probe out).
     # Sum ~2610s (43.5 min); 55 minutes (3300s) leaves ~690s, a ~1.26x margin,
     # close to the ~1.29x the 45-minute value kept over the earlier sum.
-    # Re-derive this number if a call limit changes again.
+    # A THIRD sweep scenario grows step 2 by another ~360s, or a THIRD gate on
+    # step 1 adds another ~720s: re-derive this number in that PR, don't
+    # inherit it (see the warning next to `SCENARIO_ALERTS` in
+    # `blind_band_sweep.py`, and run_promtool_tests.py's own pull_with_retry()
+    # comment). Re-derive it too if a call limit changes again.
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

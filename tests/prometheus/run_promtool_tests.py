@@ -217,8 +217,9 @@ TEST_SHARDS = max(1, min(4, os.cpu_count() or 1))
 # than the local 30 s, but WHY (a slow runner, an uneven split, or a stall) is
 # not established. 240 s is simply 2x the old limit. It is not derived from a
 # measured shard cost: the per-shard `elapsed` line `run()` now prints is how
-# to re-tune it from real data. A stalled call still fails, 120 s later. `check rules` calls stay at 120 s: they are
-# a parse, measured in seconds. THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT
+# to re-tune it from real data. A stalled call still fails, but now after 240 s
+# rather than 120 s. `check rules` calls stay at 120 s: they are a parse,
+# measured in seconds. THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT
 # ENCLOSE IT: a gate is now 120 + 240 + 240 + 120 = 720 s - see main()'s ladder
 # comment, meson's `timeout:` and docs-lint.yml's `timeout-minutes`.
 TEST_RULES_TIMEOUT = 240
