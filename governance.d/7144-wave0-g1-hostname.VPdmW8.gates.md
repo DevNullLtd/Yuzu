@@ -1,4 +1,4 @@
-# Gate ledger for `governance.d/PENDING-wave0-g1-hostname.VPdmW8.jsonl`
+# Gate ledger for `governance.d/7144-wave0-g1-hostname.VPdmW8.jsonl`
 
 Companion to the run-ledger fragment of the same stem. The fragment holds one row per finding; this file records gate status and the Gate 1 Change Summary. Branch `perf/gateway-wave0-g1-hostname`, LOCAL ONLY (no push, no PR). Every reviewer is a subagent of one orchestrator session.
 
@@ -19,7 +19,7 @@ Companion to the run-ledger fragment of the same stem. The fragment holds one ro
 |---|---|
 | `gateway/apps/yuzu_gw/src/yuzu_gw_agent.erl` | `#data.agent_info :: map()` becomes `#data.hostname :: binary()` at the same tuple position; new `hostname_of/1`; `init_owner`, `restored_data` store only the hostname; `registering/3` and `register_again/1` read the field; `format_info/2` (the `get_info/1` answer) drops the `agent_info` key; new `code_change/4` clause reduces a same-size pre-G1 tuple whose hostname slot is a map |
 | `gateway/apps/yuzu_gw/test/yuzu_gw_agent_tests.erl` | two tests: no other AgentInfo field survives in the owner state; hot upgrade from the old record shape |
-| `changelog.d/PENDING-gateway-owner-hostname-only.changed.md` | new fragment, placeholder name (renamed when the PR exists) |
+| `changelog.d/7144-gateway-owner-hostname-only.changed.md` | new fragment (placeholder `PENDING-` name until PR #7144 existed, then renamed) |
 
 ### Interfaces affected
 
