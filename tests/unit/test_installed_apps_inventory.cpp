@@ -292,6 +292,15 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
         const auto none = parse_rpm_inv_line("p\t0\t1\t1\tnoarch\t(none)\td\t(none)\t(none)\t(none)");
         REQUIRE(none.has_value());
         CHECK(none->publisher.empty());
+        // an old rpm echoes an unknown tag as the literal format string: never a publisher
+        const auto echoed_vendor = parse_rpm_inv_line(
+            "p\t0\t1\t1\tnoarch\tAcme Packager\td\t(none)\t(none)\t%{VENDOR}");
+        REQUIRE(echoed_vendor.has_value());
+        CHECK(echoed_vendor->publisher == "Acme Packager");
+        const auto echoed_both = parse_rpm_inv_line(
+            "p\t0\t1\t1\tnoarch\t%{PACKAGER}\td\t(none)\t(none)\t%{VENDOR}");
+        REQUIRE(echoed_both.has_value());
+        CHECK(echoed_both->publisher.empty());
     }
     SECTION("wrong token count is dropped") {
         CHECK_FALSE(parse_rpm_inv_line("bash\t0\t5.2.21").has_value());

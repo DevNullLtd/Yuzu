@@ -151,6 +151,14 @@ inline bool rpm_sig_present(std::string_view raw) {
     return !v.empty() && v.rfind("%{", 0) != 0;
 }
 
+// A free-text rpm tag (VENDOR, PACKAGER) as honest-empty: "(none)" and an
+// unexpanded literal "%{...}" echo (an rpm too old to know the tag) both read
+// as empty, so the publisher falls through to the next source instead of
+// carrying the format string. Same guard as rpm_sig_present.
+inline std::string rpm_text_value(std::string_view raw) {
+    return rpm_sig_present(raw) ? std::string{raw} : std::string{};
+}
+
 // deb `${Version}` = [epoch:]upstream[-revision].
 inline EvrParts split_deb_version(std::string_view v) {
     return detail::split_evr(v);
@@ -284,9 +292,9 @@ inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     r.version = std::string(tok[2]);
     r.release = map_rpm_none(tok[3]);
     r.arch = map_rpm_none(tok[4]); // gpg-pubkey pseudo-packages have (none) arch
-    r.publisher = map_rpm_none(tok[9]); // VENDOR: the declared vendor
+    r.publisher = rpm_text_value(tok[9]); // VENDOR: the declared vendor
     if (r.publisher.empty())
-        r.publisher = map_rpm_none(tok[5]); // PACKAGER: a person, fallback only
+        r.publisher = rpm_text_value(tok[5]); // PACKAGER: a person, fallback only
     r.install_date = map_rpm_none(tok[6]);
     r.signature_status =
         (rpm_sig_present(tok[7]) || rpm_sig_present(tok[8])) ? "signed" : "unsigned";
