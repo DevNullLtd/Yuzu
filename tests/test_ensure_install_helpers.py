@@ -651,22 +651,25 @@ class GuardSnapshotSelfTest(unittest.TestCase):
     def test_every_test_class_in_this_file_skips_on_windows(self):
         """tests/meson.build says the whole file skips on Windows, and `/test` runs the docs suite natively
         there. A class that calls Path.symlink_to or POSIX stubs without a win32 skip would error on a Windows
-        account without the symlink privilege (WinError 1314)."""
+        account without the symlink privilege (WinError 1314). A class whose base is one of ours inherits
+        SandboxCase's skipIf; a class that derives straight from unittest.TestCase must carry its own."""
         import ast
         tree = ast.parse(Path(__file__).read_text())
-        guarded_bases = {"SandboxCase", "GcovrCase", "EnsurePuppeteer", "EnsureGcovr", "EnsureGcovrNonLinux",
-                         "EnsureGcovrPinMismatch"}   # these inherit SandboxCase's skipIf
-        for node in tree.body:
-            if not isinstance(node, ast.ClassDef):
-                continue
-            bases = {b.id for b in node.bases if isinstance(b, ast.Name)}
-            if not any(b.endswith("TestCase") for b in bases) and not bases & guarded_bases:
-                continue
-            if bases & guarded_bases:
-                continue
+        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        checked = []
+        for name, node in classes.items():
+            bases = [ast.unparse(b) for b in node.bases]
+            if any(b in classes for b in bases):
+                continue                                    # derives from a class of this file: inherits its skip
+            if not any(isinstance(f, ast.FunctionDef) and f.name.startswith("test_") for f in node.body) and not bases:
+                continue                                    # a plain helper (Sandbox), not a test class
+            self.assertTrue(any(b.endswith("TestCase") for b in bases), f"{name}: unexpected bases {bases}")
             skips = [ast.unparse(d) for d in node.decorator_list]
             self.assertTrue(any("skipIf" in d and "win32" in d for d in skips),
-                            f"{node.name} has no @unittest.skipIf(sys.platform == 'win32', ...): {skips}")
+                            f"{name} has no @unittest.skipIf(sys.platform == 'win32', ...): {skips}")
+            checked.append(name)
+        # not vacuous: the two classes that derive straight from unittest.TestCase were looked at
+        self.assertEqual(sorted(checked), ["GuardSnapshotSelfTest", "SandboxCase"])
 
 
 class EnsurePuppeteer(SandboxCase):
@@ -2126,6 +2129,26 @@ class EnsureGcovr(GcovrCase):
                 self.assertEqual(self.venv_creations(), [])
                 self.assertEqual(self.pip_calls(), [])
                 self.assertEqual(self.old_dirs(venv), [])
+
+    def test_a_directory_that_cannot_be_listed_is_never_taken_for_an_empty_one(self):
+        # an unreadable directory prints nothing from ls, which reads as "empty": it must be refused, not moved aside
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        for name, mode, files in (("no read permission", 0o311, {"precious.txt": "mine\n"}),
+                                  ("no read permission, token marker", 0o311, {".yuzu-gcovr-venv": TOKEN, "bin/x": "x\n"})):
+            with self.subTest(name):
+                venv = self.sb.tmp / f"unlistable_{mode}_{len(files)}"
+                for f, content in files.items():
+                    self.write(venv / f, content)
+                venv.chmod(mode)
+                self.addCleanup(venv.chmod, 0o755)
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=str(venv))
+                venv.chmod(0o755)
+                self.expect(r, 1, "refusing to replace")
+                self.assertEqual(self.venv_creations(), [])
+                self.assertEqual(self.old_dirs(venv), [], "it must not have been moved aside")
+                self.assertTrue(any(p.is_file() for p in venv.rglob("*")), "its contents are untouched")
 
     def test_a_symlinked_marker_does_not_make_a_directory_ours(self):
         venv = self.sb.tmp / "user_link"

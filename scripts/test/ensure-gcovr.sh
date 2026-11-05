@@ -231,12 +231,15 @@ if command -v flock >/dev/null 2>&1; then
     fi
 fi
 
-empty_dir() { [[ -d "$1" && ! -L "$1" && -z "$(ls -A "$1" 2>/dev/null)" ]]; }
+# Empty means EMPTY: a directory this process cannot list (no read or search permission) also prints nothing,
+# and must never be mistaken for an empty one, so it has to be readable and searchable first.
+empty_dir() { [[ -d "$1" && ! -L "$1" && -r "$1" && -x "$1" && -z "$(ls -A "$1" 2>/dev/null)" ]]; }
 
 # The top-level entries a venv of this script has (see OWNERSHIP in the header). An exact comparison, not a
 # substring test: a directory entry called "bin lib" must not pass.
 layout_ok() {
     local d="$1" name allowed ok
+    [[ -r "$d" && -x "$d" ]] || return 1       # a directory we cannot list is not known to be a venv's
     while IFS= read -r -d '' name; do
         ok=0
         for allowed in bin lib lib64 include share pyvenv.cfg .gitignore "$MARKER" "$STAMPNAME"; do
