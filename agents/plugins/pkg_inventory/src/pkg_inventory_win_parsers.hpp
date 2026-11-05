@@ -337,7 +337,8 @@ struct ValueRead {
 };
 struct FileRead {
     OpStatus status = OpStatus::ok;
-    std::string bytes; ///< at most the requested cap
+    std::string bytes;       ///< at most the requested cap
+    bool truncated = false;  ///< the file held more than the cap: a tag found in `bytes` is not trusted
 };
 
 // The seam a leg needs (RealOps below; FakeOps in the unit suite):
@@ -456,7 +457,8 @@ chocolatey_package_rows(const Ops& ops, yuzu::shared::ConstraintAccumulator& acc
         if (file.status == OpStatus::absent && !detail::absent_nuspec_is_unreliable(dir, path))
             continue;
         std::string version;
-        if (file.status == OpStatus::ok) {
+        // A nuspec cut at the cap reads as unknown, whatever `<version>` the first bytes held.
+        if (file.status == OpStatus::ok && !file.truncated) {
             if (auto v = extract_xml_text(file.bytes, "version"); v && plausible_version(*v))
                 version = std::move(*v);
         }
@@ -672,6 +674,7 @@ public:
         switch (r.status) {
         case yuzu::win::BoundedReadStatus::ok:
             out.bytes = std::move(r.bytes);
+            out.truncated = r.truncated;
             break;
         case yuzu::win::BoundedReadStatus::absent: out.status = OpStatus::absent; break;
         case yuzu::win::BoundedReadStatus::denied: out.status = OpStatus::denied; break;

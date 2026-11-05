@@ -564,6 +564,20 @@ TEST_CASE("win packages: a version past the nuspec read cap reads as unknown",
     CHECK(rows == std::vector<std::string>{"package|chocolatey|big|-|pkg"});
 }
 
+TEST_CASE("win packages: a nuspec cut at the read cap reads as unknown even when its first bytes hold a version",
+          "[pkg_inventory][windows][choco]") {
+    FakeOps ops;
+    ops.dir_lists[std::string{pw::kChocolateyLib}] = {pw::OpStatus::ok, {"cut"}, false, false};
+    // <version> sits inside the bytes that were read, but the file held more than the cap, so
+    // the seam flags it truncated and the version is not trusted.
+    ops.files[FakeOps::lower("C:\\ProgramData\\chocolatey\\lib\\cut\\cut.nuspec")] = {
+        pw::OpStatus::ok, "<package><metadata><version>1.2.3</version>", /*truncated=*/true};
+    ConstraintAccumulator acc;
+    const auto rows = pw::chocolatey_package_rows(ops, acc);
+    CHECK_FALSE(acc.any_failure());
+    CHECK(rows == std::vector<std::string>{"package|chocolatey|cut|-|pkg"});
+}
+
 TEST_CASE("win packages: absent lib is silent, denied or failing lib is a token",
           "[pkg_inventory][windows][choco]") {
     {
