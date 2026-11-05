@@ -6,6 +6,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "device_ci_section_digest.hpp"
 #include "sha256_hex.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -155,6 +156,24 @@ std::string migration_v2_sql() {
     return sql;
 }
 
+// Migration v3 (additive, online-safe, ADR-0008): the number of child rows stored for the
+// section (`row_count`) and the SHA-256 of their canonical serialization (`content_digest`),
+// both written in the same transaction as the rows. NULL = status-only kind (no child rows) or a
+// row written before v3 (unknown) - both read exactly as before (never verified). Nullable with
+// no default and no CHECK: the ALTERs are metadata-only and cannot fail on existing rows.
+// v3 is unreleased, so the digest column is folded into it rather than adding a v4. The ADDs are
+// IF NOT EXISTS so a re-run is harmless, BUT the runner is gated on the recorded version number
+// only (no checksum): a database that already recorded the earlier row_count-only v3 will NOT run
+// this again and lacks content_digest: every full ingest then fails at section_insert, and the
+// sections read fails (the REST record route answers 503, the MCP tool a retryable error). Reset
+// such a dev/UAT database before use, then restart the server:
+//   UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store';
+// or recreate the store schema.
+// Unqualified DDL - the runner sets search_path to the store schema.
+constexpr const char* kMigrationV3Sql =
+    "ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, "
+    "ADD COLUMN IF NOT EXISTS content_digest TEXT NULL;";
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
     // migration transaction, so `device_ci` lands in `device_inventory_store`.
@@ -195,6 +214,7 @@ const std::vector<pg::PgMigration>& migrations() {
          // Roster reads order by hostname; the index keeps the LIMIT scan ordered.
          "CREATE INDEX device_ci_hostname_idx ON device_ci (hostname);"},
         {2, migration_v2_sql()},
+        {3, kMigrationV3Sql},
     };
     return kMigrations;
 }
@@ -452,6 +472,16 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         // One pass: each kept section's row INSERT runs inline while its status columns are
         // collected for the single device_ci_section INSERT after the loop.
         std::vector<std::string_view> kinds, levels, reasons;
+        // Per kept section: the child-row count the INSERT below ACTUALLY stored (read from its
+        // command tag, never from the agent; it is expected to equal the parser-capped
+        // `sec.rows.size()`, and the tag is authoritative if a trigger ever diverges), or "" for
+        // a status-only kind (-> NULL: nothing to verify). The read side compares this to the
+        // rows it reads.
+        std::vector<std::string> row_counts;
+        // Per kept section: the content digest of the rows inserted (server-computed from the same
+        // padded rows the INSERT stores, via the one shared serialization), or "" -> NULL for a
+        // status-only kind. Written in the same transaction as the rows and the status row.
+        std::vector<std::string> digests;
         for (const auto& sec : r.sections) {
             const auto si = device_ci_section_index(sec.kind);
             if (!si)
@@ -460,10 +490,26 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             kinds.emplace_back(sec.kind);
             levels.emplace_back(sec.level);
             reasons.emplace_back(sec.reason);
-            if (def.table == nullptr || sec.rows.empty())
+            if (def.table == nullptr) {
+                row_counts.emplace_back(); // status-only kind: NULL
+                digests.emplace_back();
                 continue;
+            }
             const auto cols = split_columns(def.columns);
             const std::size_t ncol = cols.size();
+            // Computed from exactly what is about to be stored (short rows pad, long rows
+            // truncate to the registry's columns - the same rule the INSERT applies below).
+            const auto digest = section_content_digest(def, sec.rows);
+            if (!digest) {
+                const bool failed = fail("digest");
+                fail_err = "digest_provider_failed"; // no libpq statement failed: name the cause
+                return failed;
+            }
+            digests.push_back(*digest);
+            if (sec.rows.empty()) {
+                row_counts.emplace_back("0"); // table-backed, nothing inserted
+                continue;
+            }
             std::vector<std::string> ords;
             ords.reserve(sec.rows.size());
             std::vector<std::vector<std::string_view>> arrays(ncol);
@@ -499,15 +545,28 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
             if (ins.status() != PGRES_COMMAND_OK)
                 return fail("row_insert");
+            // The tag's row count is what Postgres stored under this transaction. A successful
+            // INSERT always carries one; an empty tag would silently store NULL (= unverified),
+            // so refuse it rather than fail open.
+            const char* const tag = PQcmdTuples(ins.get());
+            if (tag == nullptr || *tag == '\0')
+                return fail("row_insert");
+            row_counts.emplace_back(tag);
         }
         if (!kinds.empty()) {
             pg::PgResult si = pg::exec_params(
                 c,
                 "INSERT INTO device_inventory_store.device_ci_section (agent_id, kind, level, "
-                "reason) SELECT $1, k, l, r FROM unnest($2::text[], $3::text[], $4::text[]) "
-                "AS t(k, l, r)",
-                std::vector<std::string>{agent_id_s, pg::to_text_array(kinds),
-                                         pg::to_text_array(levels), pg::to_text_array(reasons)});
+                "reason, row_count, content_digest) SELECT $1, k, l, r, NULLIF(n, '')::integer, "
+                "NULLIF(d, '') FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], "
+                "$6::text[]) AS t(k, l, r, n, d)",
+                std::vector<std::string>{
+                    agent_id_s, pg::to_text_array(kinds), pg::to_text_array(levels),
+                    pg::to_text_array(reasons),
+                    pg::to_text_array(std::vector<std::string_view>(row_counts.begin(),
+                                                                    row_counts.end())),
+                    pg::to_text_array(std::vector<std::string_view>(digests.begin(),
+                                                                    digests.end()))});
             if (si.status() != PGRES_COMMAND_OK)
                 return fail("section_insert");
         }
@@ -600,6 +659,69 @@ std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(
     return out;
 }
 
+namespace {
+
+/// The section reads of one device, run on a connection that is ALREADY inside a REPEATABLE READ
+/// transaction (the caller owns BEGIN/isolation/COMMIT), so the section SELECT and every
+/// per-kind SELECT share the caller's snapshot. Appends to `out` in registry order (a status row
+/// or rows make a kind present; a kind with rows but no status row still surfaces, with a blank
+/// level). False on any statement failure - `out` is then partial and must be discarded.
+bool read_sections_in_txn(PGconn* c, const std::string& agent_id_s, std::vector<DeviceCiSection>& out) {
+    // `sections` is indexed by registry position; a non-empty `kind` marks a section seen.
+    std::array<DeviceCiSection, kDeviceCiSectionCount> sections;
+    pg::PgResult sres = pg::exec_params(
+        c,
+        "SELECT kind, level, reason, row_count, content_digest "
+        "FROM device_inventory_store.device_ci_section "
+        "WHERE agent_id = $1",
+        std::vector<std::string>{agent_id_s});
+    if (sres.status() != PGRES_TUPLES_OK)
+        return false;
+    for (int i = 0; i < PQntuples(sres.get()); ++i) {
+        const auto si = device_ci_section_index(PQgetvalue(sres.get(), i, 0));
+        if (!si)
+            continue; // unregistered kind: never surfaced
+        sections[*si].kind = kDeviceCiSections[*si].section;
+        sections[*si].level = PQgetvalue(sres.get(), i, 1);
+        sections[*si].reason = PQgetvalue(sres.get(), i, 2);
+        // NULL = status-only kind, or a row written before migration v3: never verified.
+        if (!PQgetisnull(sres.get(), i, 3))
+            sections[*si].row_count = static_cast<int>(to_i64(PQgetvalue(sres.get(), i, 3)));
+        if (!PQgetisnull(sres.get(), i, 4))
+            sections[*si].content_digest = PQgetvalue(sres.get(), i, 4);
+    }
+    // Registry order (deterministic).
+    for (std::size_t si = 0; si < kDeviceCiSectionCount; ++si) {
+        const auto& d = kDeviceCiSections[si];
+        auto& sec = sections[si];
+        if (d.table != nullptr) {
+            const std::string sql = std::string("SELECT ") + d.columns +
+                                    " FROM device_inventory_store." + d.table +
+                                    " WHERE agent_id = $1 ORDER BY ord";
+            pg::PgResult rres = pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
+            if (rres.status() != PGRES_TUPLES_OK)
+                return false;
+            const int nrow = PQntuples(rres.get());
+            const int ncol = PQnfields(rres.get());
+            sec.rows.reserve(static_cast<std::size_t>(nrow));
+            for (int i = 0; i < nrow; ++i) {
+                std::vector<std::string> row;
+                row.reserve(static_cast<std::size_t>(ncol));
+                for (int k = 0; k < ncol; ++k)
+                    row.emplace_back(PQgetvalue(rres.get(), i, k));
+                sec.rows.push_back(std::move(row));
+            }
+        }
+        if (sec.kind.empty() && sec.rows.empty())
+            continue;
+        sec.kind = d.section;
+        out.push_back(std::move(sec));
+    }
+    return true;
+}
+
+} // namespace
+
 std::expected<std::vector<DeviceCiSection>, CiReadError>
 DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
     if (!open_) {
@@ -612,12 +734,11 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
         return std::vector<DeviceCiSection>{}; // precondition miss -> empty, not a degrade
     const std::string agent_id_s{agent_id};
 
-    // One REPEATABLE READ transaction so the section SELECT and every per-kind SELECT share
-    // ONE snapshot: a concurrent full replace committing between them can never mix
-    // generations (a plain with_txn_for is READ COMMITTED — each statement re-snapshots).
-    // `sections` is indexed by registry position; a non-empty `kind` marks a section seen
-    // (a status row, or rows without one). with_txn_on runs the lambda exactly once, so the
-    // registry-order result is assembled inside it.
+    // One REPEATABLE READ READ ONLY transaction so the section SELECT and every per-kind SELECT
+    // share ONE snapshot: a concurrent full replace committing between them can never mix
+    // generations (a plain with_txn_for is READ COMMITTED - each statement re-snapshots).
+    // with_txn_on runs the lambda exactly once, so the registry-order result is assembled
+    // inside it.
     //
     // The lease is acquired here (bounded, nothing in between) rather than inside
     // with_txn_for so "no connection in time" and "the transaction failed" are told apart:
@@ -632,57 +753,12 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
                          agent_id, pool_.last_error());
         return std::unexpected(CiReadError::kDegraded);
     }
-    std::array<DeviceCiSection, kDeviceCiSectionCount> sections;
     std::vector<DeviceCiSection> out;
     const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
-        pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
+        pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
         if (iso.status() != PGRES_COMMAND_OK)
             return false;
-        pg::PgResult sres = pg::exec_params(
-            c,
-            "SELECT kind, level, reason FROM device_inventory_store.device_ci_section "
-            "WHERE agent_id = $1",
-            std::vector<std::string>{agent_id_s});
-        if (sres.status() != PGRES_TUPLES_OK)
-            return false;
-        for (int i = 0; i < PQntuples(sres.get()); ++i) {
-            const auto si = device_ci_section_index(PQgetvalue(sres.get(), i, 0));
-            if (!si)
-                continue; // unregistered kind: never surfaced
-            sections[*si].kind = kDeviceCiSections[*si].section;
-            sections[*si].level = PQgetvalue(sres.get(), i, 1);
-            sections[*si].reason = PQgetvalue(sres.get(), i, 2);
-        }
-        // Registry order (deterministic). A kind with rows but no status row still surfaces,
-        // with a blank level.
-        for (std::size_t si = 0; si < kDeviceCiSectionCount; ++si) {
-            const auto& d = kDeviceCiSections[si];
-            auto& sec = sections[si];
-            if (d.table != nullptr) {
-                const std::string sql = std::string("SELECT ") + d.columns +
-                                        " FROM device_inventory_store." + d.table +
-                                        " WHERE agent_id = $1 ORDER BY ord";
-                pg::PgResult rres =
-                    pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
-                if (rres.status() != PGRES_TUPLES_OK)
-                    return false;
-                const int nrow = PQntuples(rres.get());
-                const int ncol = PQnfields(rres.get());
-                sec.rows.reserve(static_cast<std::size_t>(nrow));
-                for (int i = 0; i < nrow; ++i) {
-                    std::vector<std::string> row;
-                    row.reserve(static_cast<std::size_t>(ncol));
-                    for (int k = 0; k < ncol; ++k)
-                        row.emplace_back(PQgetvalue(rres.get(), i, k));
-                    sec.rows.push_back(std::move(row));
-                }
-            }
-            if (sec.kind.empty() && sec.rows.empty())
-                continue;
-            sec.kind = d.section;
-            out.push_back(std::move(sec));
-        }
-        return true;
+        return read_sections_in_txn(c, agent_id_s, out);
     });
     if (!ok) {
         // Never an empty success on a failed read: a degrade the caller can surface.
@@ -693,6 +769,87 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
         return std::unexpected(CiReadError::kDegraded);
     }
     return out;
+}
+
+std::expected<DeviceCiWithSections, CiReadError>
+DeviceInventoryStore::get_device_ci_with_sections(std::string_view agent_id) {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: record+sections get on a closed store");
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    if (agent_id.empty())
+        return DeviceCiWithSections{}; // precondition miss -> absent, not a degrade
+    const std::string agent_id_s{agent_id};
+
+    // ONE lease and ONE REPEATABLE READ READ ONLY transaction for the record AND its sections:
+    // the scalars and the rows are always the same replace generation (two separate reads could
+    // pair gen N scalars with gen N+1 rows, undetectably). Acquired here, with nothing between
+    // the acquire and with_txn_on (that call's contract); see get_device_ci_sections.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: record+sections get skipped for agent={}, no "
+                         "connection in time ({})",
+                         agent_id, pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    // Held OUTSIDE the lambda so the record survives the rollback a failed section statement
+    // forces (an aborted Postgres transaction cannot run further statements).
+    enum class Stage { kNone, kRecordRead, kSectionsFailed, kDone };
+    Stage stage = Stage::kNone;
+    DeviceCiWithSections result;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
+        if (iso.status() != PGRES_COMMAND_OK)
+            return false;
+        const std::string sql = std::string("SELECT ") + kSelectCols +
+                                " FROM device_inventory_store.device_ci WHERE agent_id = $1";
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        stage = Stage::kRecordRead;
+        if (PQntuples(res.get()) == 0) {
+            stage = Stage::kDone; // no CI row yet -> absent
+            return true;
+        }
+        DeviceCiRecord rec;
+        fill_record(res.get(), 0, rec);
+        const bool v2 = rec.blob_version >= 2;
+        result.record = std::move(rec);
+        if (v2) {
+            std::vector<DeviceCiSection> sections;
+            if (!read_sections_in_txn(c, agent_id_s, sections)) {
+                stage = Stage::kSectionsFailed;
+                return false;
+            }
+            result.record->sections = std::move(sections);
+        }
+        stage = Stage::kDone;
+        return true;
+    });
+    if (ok)
+        return result;
+    if (stage == Stage::kSectionsFailed) {
+        // The record read answered; only a section statement failed. Say so - never an
+        // empty-sections success - and keep the record the caller may still need.
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
+                         pool_.last_error());
+        result.record->sections.clear();
+        result.sections_failed = true;
+        return result;
+    }
+    // Isolation, the record SELECT, or COMMIT failed (a COMMIT failure after a complete read is
+    // treated as a degrade, never a possibly-torn success).
+    static DegradeSampler s;
+    if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        spdlog::warn("DeviceInventoryStore: record+sections get failed for agent={} ({})", agent_id,
+                     pool_.last_error());
+    return std::unexpected(CiReadError::kDegraded);
 }
 
 bool DeviceInventoryStore::delete_agent(std::string_view agent_id) {

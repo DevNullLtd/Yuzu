@@ -50,6 +50,11 @@ struct InventoryDeviceRow {
     std::string ci_arch;
     std::string ci_domain;
     std::string ci_primary_mac;
+    /// v2 identifiers, searched by the Hardware list `q` only (not rendered or serialised on the
+    /// list row). Blank on a v1 record; may hold the agent's `-` placeholder.
+    std::string ci_chassis_asset_tag;
+    std::string ci_chassis_serial;
+    std::string ci_board_serial;
 
     // Round-3 merge fields (the retired /devices list + /device entity page folded
     // into Hardware — nothing left duplicated between the two surfaces):
