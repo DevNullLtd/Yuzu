@@ -146,11 +146,6 @@ enum class AuthDBError : std::uint8_t {
     /// a password reset also wipes the provisional secret, and that refusal must
     /// win.
     MfaEnrollmentCancelled,
-    /// #6079: a factor mutation (`mfa_regenerate_recovery_codes`, `mfa_disable_report`) was
-    /// admitted at one factor generation and found the account at another under the `auth.users`
-    /// row lock, so nothing was written. A business outcome, NOT a store fault
-    /// (`is_store_unavailable` is false): the caller refuses (409) and the operator re-proves.
-    FactorChanged,
     /// #6995 (follow-up to #4763): the CSPRNG failed while minting a TOTP secret
     /// (`mfa_init_enrollment`) or a recovery code (`mfa_verify_enrollment`,
     /// `mfa_regenerate_recovery_codes`). Fail-closed: nothing was enrolled or
@@ -163,8 +158,15 @@ enum class AuthDBError : std::uint8_t {
     /// `yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_enroll"|"mfa_recovery"}`
     /// instead. It IS still `is_store_unavailable()` so every existing fail-closed
     /// 503 mapping is preserved; a caller that tests the helper first must test
-    /// this value BEFORE it. Appended last: the enum is a fixed-width `uint8_t`.
+    /// this value BEFORE it. Appended after `MfaEnrollmentCancelled`: the enum is a fixed-width
+    /// `uint8_t`.
     EntropyUnavailable,
+    /// #6079: a factor mutation (`mfa_regenerate_recovery_codes`, `mfa_disable_report`) was
+    /// admitted at one factor generation and found the account at another under the `auth.users`
+    /// row lock, so nothing was written. A business outcome, NOT a store fault
+    /// (`is_store_unavailable` is false): the caller refuses (409) and the operator re-proves.
+    /// Appended last: the enum is a fixed-width `uint8_t` and the ordinals are pinned by a test.
+    FactorChanged,
 };
 
 /// True iff `e` maps to the fail-closed 503 class: the AuthDB store itself being

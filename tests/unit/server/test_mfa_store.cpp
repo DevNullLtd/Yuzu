@@ -539,14 +539,14 @@ TEST_CASE_METHOD(MfaFixture,
     auto original = db->mfa_verify_enrollment("alice", code_for_now(init->secret_base32),
                                               std::nullopt);
     REQUIRE(original.has_value());
-    REQUIRE(original->size() == 10);
+    REQUIRE(original->recovery_codes.size() == 10);
 
     // First, middle and last code of the batch: the DELETE and k-1 INSERTs have run each time.
     for (const int nth : {1, 5, 10}) {
         INFO("salt draw #" << nth);
         auto regen = [&] {
             yuzu::test::FailNthSaltDraw fail{nth};
-            auto r = db->mfa_regenerate_recovery_codes("alice");
+            auto r = db->mfa_regenerate_recovery_codes("alice", std::nullopt);
             REQUIRE(fail.fired()); // proves the intended draw was reached, not another failure
             return r;
         }();
@@ -558,12 +558,12 @@ TEST_CASE_METHOD(MfaFixture,
         REQUIRE(s.has_value());
         REQUIRE(s->recovery_codes_remaining == 10);
     }
-    auto consumed = db->mfa_consume_recovery_code("alice", (*original)[0]);
+    auto consumed = db->mfa_consume_recovery_code("alice", original->recovery_codes[0]);
     REQUIRE(consumed.has_value());
-    REQUIRE(*consumed);
+    REQUIRE(consumed->ok);
 
     // Healthy RNG afterwards: regeneration works again.
-    auto fresh = db->mfa_regenerate_recovery_codes("alice");
+    auto fresh = db->mfa_regenerate_recovery_codes("alice", std::nullopt);
     REQUIRE(fresh.has_value());
     REQUIRE(fresh->size() == 10);
 }
@@ -592,7 +592,7 @@ TEST_CASE_METHOD(MfaFixture,
 
     auto ok = db->mfa_verify_enrollment("alice", code, std::nullopt); // same code, healthy RNG
     REQUIRE(ok.has_value());
-    REQUIRE(ok->size() == 10);
+    REQUIRE(ok->recovery_codes.size() == 10);
 }
 // CH-2 (gov Gate 5): a fault in one regeneration racing a clean one. The two serialise on the
 // auth.users row lock; whichever order they run in, the faulting caller must roll back to nothing and
@@ -619,13 +619,13 @@ TEST_CASE_METHOD(MfaFixture,
         yuzu::test::FailNthSaltDraw fail{5};
         while (!go.load())
             std::this_thread::yield();
-        faulting = db->mfa_regenerate_recovery_codes("alice");
+        faulting = db->mfa_regenerate_recovery_codes("alice", std::nullopt);
         fired = fail.fired();
     }};
     std::thread b{[&] {
         while (!go.load())
             std::this_thread::yield();
-        clean = db->mfa_regenerate_recovery_codes("alice");
+        clean = db->mfa_regenerate_recovery_codes("alice", std::nullopt);
     }};
     go.store(true);
     a.join();
@@ -641,12 +641,12 @@ TEST_CASE_METHOD(MfaFixture,
     auto s = db->mfa_status("alice");
     REQUIRE(s.has_value());
     CHECK(s->recovery_codes_remaining == 10);
-    auto old_code = db->mfa_consume_recovery_code("alice", (*original)[0]);
+    auto old_code = db->mfa_consume_recovery_code("alice", original->recovery_codes[0]);
     REQUIRE(old_code.has_value());
-    CHECK_FALSE(*old_code);
+    CHECK_FALSE(old_code->ok);
     auto new_code = db->mfa_consume_recovery_code("alice", (*clean)[0]);
     REQUIRE(new_code.has_value());
-    CHECK(*new_code);
+    CHECK(new_code->ok);
 }
 
 #endif // !_WIN32

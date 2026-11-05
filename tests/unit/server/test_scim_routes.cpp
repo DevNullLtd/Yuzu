@@ -7082,14 +7082,15 @@ TEST_CASE("ScimRoutes: classify_role_read maps every AuthDB role-read outcome (#
 
     // Every AuthDBError value is either a store fault (is_store_unavailable) or Refused:
     // the classifier is exactly is_store_unavailable plus the role comparison.
-    static_assert(static_cast<unsigned>(AuthDBError::EntropyUnavailable) == 11,
+    static_assert(static_cast<unsigned>(AuthDBError::FactorChanged) == 12,
                   "AuthDBError grew: extend the classify_role_read coverage loop and revisit "
                   "is_store_unavailable");
-    // #6995: the loop now reaches EntropyUnavailable (11), which is_store_unavailable() accepts, so
-    // classify_role_read keeps failing it CLOSED (Unavailable). No role read can actually return it
-    // (only the MFA mint paths draw entropy); this pins the classifier for a future caller.
-    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(AuthDBError::EntropyUnavailable);
-         ++v) {
+    // #6995: the loop reaches EntropyUnavailable (11), which is_store_unavailable() accepts, so
+    // classify_role_read keeps failing it CLOSED (Unavailable). #6079: and FactorChanged (12), a
+    // business outcome that is_store_unavailable() rejects, so it is Refused. No role read can
+    // actually return either (only the MFA mint and factor-mutation paths do); this pins the
+    // classifier for a future caller.
+    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(AuthDBError::FactorChanged); ++v) {
         const auto e = static_cast<AuthDBError>(v);
         const auto verdict = classify_role_read(Read{std::unexpected(e)});
         CHECK(verdict == (yuzu::server::is_store_unavailable(e) ? GuardVerdict::Unavailable
