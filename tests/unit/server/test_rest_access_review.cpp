@@ -2730,7 +2730,10 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         // so.
         auto again = h.mcp_call_tool("close_access_review", {{"campaign_id", cid}});
         REQUIRE(again);
-        CHECK(nlohmann::json::parse(again->body).contains("error"));
+        const auto err = nlohmann::json::parse(again->body);
+        REQUIRE(err.contains("error"));
+        CHECK(err["error"].value("message", std::string{}).find("already closed") !=
+              std::string::npos);
     }
 }
 
