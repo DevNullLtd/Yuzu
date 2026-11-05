@@ -3363,6 +3363,11 @@ view) and the value `administrator: "unconfirmed"` (about the verdict) are diffe
 the same word. They answer different questions and can disagree in any combination; every
 combination in the table below is legitimate.
 
+**Forward compatibility.** `unconfirmed` is a single boolean and does not say why the view is
+unconfirmed. A later release may add a separate field that names the cause. If it does, every
+cause still reports `unconfirmed: true`, so the client rule above holds unchanged. Clients must
+ignore response fields they do not recognise. No such field is returned today.
+
 **`administrator`.**
 
 - `may`: the RBAC administration routes (role assignment and `PUT /api/v1/rbac/enforcement`) would

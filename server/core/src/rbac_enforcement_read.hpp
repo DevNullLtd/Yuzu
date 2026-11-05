@@ -9,7 +9,11 @@
 ///     view (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`). When `unconfirmed` is true
 ///     enforcement is to be treated as IN EFFECT whatever `enabled` says: a stale "off" is
 ///     treated as on, and a stale "on" is on either way (`enabled:false, unconfirmed:true` and
-///     `enabled:true, unconfirmed:true` are both possible).
+///     `enabled:true, unconfirmed:true` are both possible). `unconfirmed` is one bit and does not
+///     say WHY the view is unconfirmed. EXTENSION POINT: a later change may add a separate field
+///     naming the cause; if it does, every cause still reads `unconfirmed:true`, the client rule
+///     above is unchanged, and clients must ignore fields they do not recognise. Nothing emits a
+///     cause today; do not repurpose `unconfirmed` or `enabled` to carry one.
 ///   * `administrator` is `rbac_admin_hint` on the CALLER's surface. The builder calls it once and
 ///     neither forces nor suppresses the result when the view is degraded. The predicate behind
 ///     it does consult the cached enforcement label, but only to choose which durable source
