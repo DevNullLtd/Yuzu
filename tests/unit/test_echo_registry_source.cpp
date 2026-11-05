@@ -5024,6 +5024,8 @@ struct LiveRun {
     TestDb t = make_db();
     std::shared_ptr<RegistryDirtyTable> dirty;
     std::function<bool()> etw_running; // the reader's own answer: is the session delivering?
+    // The session's own loss counters; the failure message of a missed ETW event reads them (#7135).
+    std::function<SessionLoss()> session_loss;
     std::string root;                  // the watched root, as the dirty table names it
     std::unique_ptr<RegistryCursorSource> src;
     explicit LiveRun(const std::string& hklm_root, bool etw = true) : root("HKLM\\" + hklm_root) {
@@ -5035,6 +5037,7 @@ struct LiveRun {
         }
         dirty = reader.dirty;
         etw_running = reader.etw_running;
+        session_loss = reader.session_loss;
         src = make_registry_cursor_source(RegistryScope{{hklm_root}, {}}, std::move(reader));
         src->start(t.db);
     }
@@ -5048,9 +5051,24 @@ struct LiveRun {
     void transition(Write&& write, std::function<bool(const RegistryEtwEvent&)> await_event = {}) {
         write();
         REQUIRE(dirty->wait_dirty_for_test(root, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
-        if (await_event && etw_running())
-            REQUIRE(src->buffer_for_test().wait_for_event(
-               await_event, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
+        if (await_event && etw_running()) {
+            const bool seen = src->buffer_for_test().wait_for_event(
+                await_event, std::chrono::steady_clock::now() + std::chrono::seconds(15));
+            if (!seen) {
+                // #7135: on the shared CI box this wait timed out with nothing in the job log to
+                // say why. The session is system-wide, so name what it did deliver and what it
+                // says it lost: a large events_lost or rt_buffers_lost with events still arriving
+                // is the session overflowing under load (this write's event was dropped); zero
+                // loss and no events at all is a session that is not delivering.
+                const SessionLoss loss = session_loss();
+                FAIL("no ETW event from this write within 15 s. session delivered "
+                     << src->buffer_for_test().pushed() << " events from all writers ("
+                     << src->buffer_for_test().size() << " still buffered); events_lost="
+                     << loss.events_lost << " rt_buffers_lost=" << loss.rt_buffers_lost
+                     << " decode_failed=" << loss.decode_failed
+                     << " loss_query_ok=" << loss.query_ok);
+            }
+        }
         tick(t.db, *src);
         g_clock_offset = kEtwSettle100ns + SEC;
         tick(t.db, *src);

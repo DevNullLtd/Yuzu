@@ -1148,14 +1148,16 @@ foreach shard, spec : agent_shard_specs
     agent_test_exe,
     args: [spec, '--allow-running-no-tests', '--durations=yes'],
     suite: ['agent', 'agent-shard'],
-    # 240s per shard, unchanged from the old single entry; treat it as conservative
-    # headroom, not a measured need. Uncontended Windows is ~75s (a case-sum
-    # prediction), ~3x under 240s. The only measured contention figure is for SERVER
-    # `~[pg]` (c0 289s -> c4 603s, ~2.1x, across jobs, on the pre-#3443 combined step;
-    # docs/ci-architecture.md "Windows test-phase concurrency gate"); it has NOT been
-    # re-measured for agent shards, so do not size or lower this timeout from it. A
-    # real hang is also bounded by the job-level timeouts.
-    timeout: 240,
+    # 480s per shard (#7135; was 240s, the old single entry's figure). Measured on the
+    # Windows MSVC debug leg: shard C ran 185s, 212s and 212s on passing attempts, hit
+    # the 240s limit once under load with no code change on a rerun, and takes ~222s alone
+    # on a 16-thread host, so the worst case is at least 240s and the limit is 2x that.
+    # Shard A runs ~100s and shard B ~70s, so this is sized off C. Do not shorten tests to
+    # fit; split the shard instead if C outgrows this. The one other measured contention
+    # figure is for SERVER `~[pg]` (c0 289s -> c4 603s, ~2.1x, across jobs, on the
+    # pre-#3443 combined step; docs/ci-architecture.md "Windows test-phase concurrency
+    # gate"). A real hang is also bounded by the job-level timeouts.
+    timeout: 480,
     depends: agent_shard_deps,
   )
 endforeach
@@ -1416,7 +1418,10 @@ echo_test_exe = executable(
 )
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
-test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 90)
+# 180s (#7135; was 90s). The suite takes ~50s on the Windows CI runners when it passes and
+# ~82s on a standalone Windows host, and it timed out at 90s on a loaded runner, so the worst
+# case is at least 90s and the limit is 2x that. A failed live-registry case adds its own 15s waits on top.
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────

@@ -1942,8 +1942,10 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   the `Ok:`, `Fail:` and `Skipped:` lines: Ok 100, Fail 0, Skipped 5 for the first
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
-  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, echo
-  90 s, `gateway eunit` and `gateway ct` 600 s.
+  that matter: agent shards 480 s, `blocked log sink SIGTERM harness` 300 s, echo
+  180 s, `gateway eunit` and `gateway ct` 600 s. (The agent shards and echo were
+  240 s and 90 s until #7135; the sample figures and the 80% thresholds below are
+  against those.)
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
   carry these entries (the junit import runs once at job end and reads the last
@@ -2944,12 +2946,13 @@ one file is one PG-instance event, not a test bug.
 The agent suite's single `agent unit tests` entry (one serial Catch2 process,
 240 s budget) is three entries over the same `yuzu_agent_tests` binary:
 `agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
-'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
-and conservative headroom rather than a measured need: the only measured
-contention figure is for the server `~[pg]` suite, 289 s with no other test
-phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
-the pre-#3443 combined step, per "Windows test-phase
-concurrency gate"; it has not been re-measured for the agent shards) and
+'agent-shard']`, one positional tag spec, `timeout: 480` (raised from the old
+single entry's 240 s by #7135, which measured shard C at 185 s to 212 s on
+passing Windows MSVC debug attempts and over 240 s once under load; the sizing
+comment beside the `timeout:` records it, and shard C is the one to split if it
+outgrows the limit; the contention figure for the server `~[pg]` suite, 289 s
+with no other test phase running (c0) to 603 s with four overlapping (c4), about
+2.1x, is per "Windows test-phase concurrency gate") and
 `--allow-running-no-tests`. That flag is what stops the zero-match shard C from
 failing when `meson test --suite agent --test-args '[tag]'` appends a second
 positional spec. It does not make that a targeted run: Catch2 binds the extra
