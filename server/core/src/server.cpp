@@ -71,6 +71,7 @@
 // their free-function registrars take (they do not expose an httplib::Server&
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
+#include "post_read_stage.hpp"
 #include "pki_routes.hpp"
 #include "route_inventory.hpp"
 #include "plugin_config_routes.hpp"
@@ -107,10 +108,11 @@
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
-#include "step_up_wiring.hpp" // post-read body cap + MFA step-up chokepoint (pre-request handler body)
+#include "step_up_wiring.hpp" // post-read body cap + MFA step-up chokepoint (the post-read stage body)
 #include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
+#include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
@@ -234,6 +236,7 @@
 #include "device_containment_routes.hpp"
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
+#include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
 #include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
 #include "home_panels_routes.hpp" // HM-2: Dashboard policies + events fragments
@@ -387,6 +390,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <shared_mutex>
 #include <ranges>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <string_view>
@@ -1981,7 +1985,7 @@ public:
         // reach it. `reason=over_cap_post_read` (body-cap-post-read-stage) is ALSO
         // seeded for EVERY class, unconditionally — unlike `unmeasurable`,
         // this is not gated on `requires_measurable`: the post-read stage
-        // (this file's `set_pre_request_handler`) is the backstop for every
+        // (this file's `PostReadStageRegistry::install`) is the backstop for every
         // class that admits an unmeasurable body up to httplib's own 100 MiB
         // backstop, which today is every class but /mcp/, and in principle
         // any class could reach it if a future table edit ever widened a
@@ -2117,11 +2121,14 @@ public:
                           "a report skipped because another report for the same agent held its "
                           "lock, certificate_inventory only - not a failure)",
                           "counter");
+        // Closed facet x outcome label set, pre-seeded so the first refused section counts.
+        seed_section_ingest_series(metrics_);
         cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
-                          "(full = full-payload replace; hash_only = hash-skip compare)",
+                          "(full = full-payload replace; hash_only = hash-skip compare; "
+                          "v3 = sectioned apply)",
                           "histogram");
         // RbacStore observability (ADR-0041). Described + zero-seeded up front so
         // the HELP/TYPE lines and closed dims exist on an idle server — critical
@@ -9251,7 +9258,25 @@ public:
         // fail-closed deny-at-login) even though the feature is off.
         auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
 
-        start_web_server();
+        // The route sink fails closed with `std::logic_error` on: (a) a registration on a server
+        // with no post-read stage installed, (b) `PostReadStageRegistry::install` misuse (an empty
+        // stage, a second install, or a route already recorded), (c) a registration after the
+        // route table is sealed that the step-up policy does not classify (no current caller in
+        // start_web_server(): the seal runs after the last registration). Any other
+        // `std::logic_error` subtype is a refusal to start too and is logged with its text. Left
+        // to escape, these unwind run() into main's catch only after the gRPC listeners are
+        // bound, so agents and the gateway see accept-then-exit churn; route them through the same
+        // `startup_failed_` check as the other web-server boot failures. An unclassified route
+        // BEFORE the seal is not one of these triggers: the pre-seal sweep sets `startup_failed_`
+        // without throwing, and is not redundant with this catch. Exceptions that are not
+        // `std::logic_error` (bad_alloc, std::system_error from a thread constructor,
+        // filesystem_error) still unwind to main.
+        try {
+            start_web_server();
+        } catch (const std::logic_error& e) {
+            spdlog::critical("run(): web server startup refused (std::logic_error): {}", e.what());
+            startup_failed_ = true;
+        }
 
         // M/H3 follow-up (2026-07-10 review): start_web_server() can set
         // startup_failed_ (SCIM boot failure, or #4722 HTTPS cipher-pin
@@ -9269,8 +9294,9 @@ public:
         // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(among others: SCIM boot failure, HTTPS cipher-pin failure or the MFA "
-                         "step-up route classification abort; see the preceding critical log); "
+                         "(among others: SCIM boot failure, HTTPS cipher-pin failure, the MFA "
+                         "step-up route classification abort, a route-registration refusal or "
+                         "another std::logic_error; see the preceding critical log); "
                          "stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
@@ -11067,8 +11093,9 @@ public:
         // The web listener is joined (or was never started), so nothing registers on or reads
         // from this server's route inventory any more: drop its record so a later server that
         // reuses the address starts clean. The construction-time `forget` stays as well.
-        if (web_server_)
-            RouteInventory::instance().forget(web_server_.get());
+        if (web_server_) {
+            post_read_stage_.reset(); // drops the stage and the inventory record
+        }
 
         // agent_server_/mgmt_server_->Shutdown(deadline) already ran above
         // (#3495), immediately before the policy-eval/pre-flight/quarantine/
@@ -15326,6 +15353,7 @@ private:
         // A new server can reuse a destroyed one's address, so drop whatever the route inventory
         // still holds under it before any owner registers (the boot sweep below reads it back).
         RouteInventory::instance().forget(web_server_.get());
+        PostReadStageRegistry::instance().forget(web_server_.get());
 
         // Disable Nagle — SSE events are small and must reach the browser
         // immediately, not wait 200ms for the TCP send buffer to coalesce.
@@ -16190,16 +16218,45 @@ private:
         // — body is NOT size-checked there at all; it falls through to
         // httplib's own 100 MiB backstop (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`) and
         // is handed to the route handler uncapped by this table. This second
-        // stage closes that hole from the other side: httplib's
-        // `pre_request_handler_` (httplib.h `Server::dispatch_request`, called
-        // from `routing()` only once the pre-routing handler above has
-        // returned Unhandled) runs AFTER `read_content` has consumed the body
-        // off the socket into `req.body` and AFTER the route MATCHED
-        // (`req.matched_route` is set), but BEFORE the route's own handler
-        // runs. That ordering means this stage can compare the body's ACTUAL,
-        // now-known size against the same `resolve_body_cap` table the
-        // pre-routing gate uses — the one table, never forked — and refuse a
-        // request the earlier stage could not size before admitting it.
+        // stage closes that hole from the other side: it runs once the route
+        // has MATCHED (`req.matched_route` is set) and AFTER httplib's
+        // `read_content` has consumed the body off the socket into `req.body`,
+        // but BEFORE the route's own handler runs. That ordering means this
+        // stage can compare the body's ACTUAL, now-known size against the same
+        // `resolve_body_cap` table the pre-routing gate uses — the one table,
+        // never forked — and refuse a request the earlier stage could not
+        // size before admitting it.
+        //
+        // WHERE IT RUNS, AND WHY NOT `set_pre_request_handler`: the stage is
+        // installed in `PostReadStageRegistry` (post_read_stage.hpp) and
+        // `HttplibRouteSink` wraps every handler it registers on this server
+        // with `if (stage(req, res) == Handled) return; handler(req, res);`,
+        // so it runs inside the handler call, after the body is read. It used
+        // to be `set_pre_request_handler`'s body. That placement is correct on
+        // httplib up to 0.46.x, where `routing()` reads the
+        // body before `dispatch_request` runs the pre-request handler, but
+        // from cpp-httplib v0.47.0 `dispatch_request` runs the pre-request
+        // handler BEFORE it calls `read_content` itself: a stage hung there
+        // sees an empty `req.body`, its body-size check never fires, and the
+        // chunked-body backstop silently disappears. httplib has no hook
+        // between reading the body and calling the handler, so the wrapper is
+        // the only placement whose position in the request does not depend on
+        // the httplib version. No `set_pre_request_handler` is installed here.
+        // Coverage is therefore PER ROUTE registered through the sink: a route
+        // registered on the server outside the sink loses the post-read body cap
+        // and the step-up chokepoint (the pre-routing declared-length cap still
+        // applies).
+        //
+        // INSTALL BEFORE THE FIRST ROUTE: the sink looks the stage up when a
+        // route is registered, so a route registered earlier would be left
+        // unwrapped. `install` throws `std::logic_error` if `RouteInventory`
+        // already holds a route for this server (and on a second install),
+        // turning that mistake into a boot failure. Every registration on
+        // `*web_server_` follows this call (the first is
+        // `auth_routes_->register_routes(*web_server_)` below). The plaintext
+        // redirect listener (`redirect_server_`, which answers 301 and four bodyless GET health probes) has
+        // its own server key and NO stage, so its handlers register unwrapped;
+        // `TestRouteSink` never consults the registry.
         //
         // The two stages are complementary, not redundant: pre-routing bounds
         // what the server will ever BUFFER (a rejection there costs a header
@@ -16214,12 +16271,12 @@ private:
         // fires almost exclusively for the chunked/unmeasurable case the
         // earlier gate deliberately admits.
         //
-        // ROUTE-MATCH GATED, NOT UNIVERSAL: httplib's `dispatch_request` only
-        // invokes `pre_request_handler_` once a route has MATCHED (see the
-        // vendored httplib.h) — an unmatched path (a 404) never reaches this
-        // handler at all. Do not read this as a second universal pre-auth
-        // gate; the pre-routing handler above is that gate, and this is a
-        // narrower backstop that runs strictly behind it.
+        // ROUTE-MATCH GATED, NOT UNIVERSAL: the stage lives in a ROUTE'S
+        // handler, so it runs only for a request that MATCHED a route
+        // registered through the sink — an unmatched path (a 404) never
+        // reaches it. Do not read this as a second universal pre-auth gate;
+        // the pre-routing handler above is that gate, and this is a narrower
+        // backstop that runs strictly behind it.
         //
         // MULTIPART LIMITATION, recorded rather than implied away: httplib's
         // `read_content` only appends bytes to `req.body` on the
@@ -16233,12 +16290,14 @@ private:
         // the catch-all default) are multipart too. Enumerating instances is
         // how that error was made; the rule is what holds.
         //
-        // SECOND CALL SITE: httplib also reaches this handler from
-        // `dispatch_request_for_content_reader`, where the body was streamed
-        // through a `ContentReader` and `req.body` is likewise EMPTY — so a
-        // route registered that way is not covered either. Dormant today
-        // (this codebase registers no `ContentReader` route), but it is the
-        // same blind spot as multipart and will not announce itself.
+        // CONTENT-READER ROUTES: `HttpRouteSink` has no `ContentReader`
+        // overload, and httplib's `dispatch_request_for_content_reader` leaves
+        // `req.body` EMPTY (the body is streamed through the reader), so a
+        // route registered that way on `*web_server_` directly would be
+        // neither wrapped nor post-read capped, and carry no step-up
+        // chokepoint (the pre-routing declared-length cap still applies). This
+        // codebase registers none; it is the same blind spot as multipart and
+        // will not announce itself.
         //
         // Same table, same `path_class` label (never the attacker-controlled
         // `req.path`), same 413 A4/SCIM envelope shapes, and the same
@@ -16251,7 +16310,7 @@ private:
         // DOES NOT DOUBLE-COUNT: httplib's routing() returns immediately once
         // the pre-routing handler above answers Handled, without ever calling
         // dispatch_request — so a request the pre-routing gate already
-        // refused can never also reach this handler for the same request.
+        // refused can never also reach this stage for the same request.
         //
         // CONTAIN THE WHOLE BLOCK (governance Gate 8, security + cpp-safety).
         //
@@ -16259,10 +16318,11 @@ private:
         // difference matters because the wrong reason is the one a future
         // maintainer would trust. `enforce_pre_auth_body_cap` is contained
         // because httplib calls `pre_routing_handler_` from the UNGUARDED
-        // WebSocket-upgrade path. This handler is NOT reachable from there —
-        // that path calls only `pre_routing_handler_` and the upgrade
-        // entry's own handler, never `pre_request_handler_`. Both real call
-        // sites sit inside `routing()`, which httplib does wrap in try/catch.
+        // WebSocket-upgrade path. This stage is NOT reachable from there —
+        // that path calls `pre_routing_handler_` and the upgrade entry's own
+        // handler, never a route handler, and this stage runs inside the route
+        // handlers. A route handler runs inside `routing()`, which httplib's
+        // `process_request` wraps in try/catch.
         //
         // It is contained anyway, deliberately: relying on a caller's
         // try/catch means this block's safety depends on vendored code we do
@@ -16272,28 +16332,23 @@ private:
         //
         // `[this]` plus the two by-value init-captures named at the bottom of
         // this comment (the step-up session resolver and audit callable); NO
-        // reference captures. The httplib member function that invokes this
-        // handler (`Server::dispatch_request`) is `const`, but that constness
-        // is on httplib::Server's own members — it says nothing about what
-        // this lambda captures. `this` is the ServerImpl pointer, copied by
-        // value; calling `metrics_`/logging through it is unaffected. There
-        // are no pre-routing-handler locals in scope to capture by reference
-        // here, and none should be added — httplib can invoke
-        // `pre_request_handler_` from two distinct call sites
-        // (`dispatch_request` and `dispatch_request_for_content_reader`), so a
-        // captured reference to something scoped to one request's stack frame
-        // would be a dangling-reference hazard on the other.
+        // reference captures. The stage is copied into the registry and then
+        // run on every httplib worker thread for the life of the server, so a
+        // captured reference to anything scoped to one request's stack frame
+        // would dangle. `this` is the ServerImpl pointer, copied by value;
+        // calling `metrics_`/logging through it is unaffected.
         //
         // The MFA step-up chokepoint is the stage AFTER the cap: once the body is known to be
         // within bounds, `apply_step_up_chokepoint` looks the matched route up in
         // `step_up_policy.hpp` and, for a kRequired row, evaluates the caller's step-up proof
         // before the handler runs. A failure while evaluating a gated row is answered 503 inside
         // it (every allocation after the policy lookup is in its own try), so the last-resort 413
-        // catch in `detail::run_pre_request_stage` (step_up_wiring.hpp) is not expected to see
+        // catch in `detail::run_post_read_stage` (step_up_wiring.hpp) is not expected to see
         // it, but the chokepoint is not declared noexcept: if that ever stops holding, that 413
         // answers. The session resolver and audit callable are built once and captured by value;
         // per request only a small struct of pointers is made.
-        web_server_->set_pre_request_handler(
+        PostReadStageRegistry::instance().install(
+            web_server_.get(),
             [this,
              step_up_resolve = StepUpSessionFn([this](const httplib::Request& r) {
                  return auth_routes_->resolve_session(r);
@@ -16304,7 +16359,7 @@ private:
                  return audit_log(r, a, rs, tt, ti, d);
              })](const httplib::Request& req, httplib::Response& res)
                 -> httplib::Server::HandlerResponse {
-            // The body cap and the chokepoint live in `detail::run_pre_request_stage`
+            // The body cap and the chokepoint live in `detail::run_post_read_stage`
             // (step_up_wiring.hpp), which contains every throw. Building the deps does not
             // allocate or throw; the auth store pointer is re-read per request.
             const StepUpChokepointDeps step_up_deps{
@@ -16315,8 +16370,11 @@ private:
                 .metrics = &metrics_,
                 .window_secs = cfg_.mfa_step_up_window_secs,
                 .mfa_enforcement = cfg_.mfa_enforcement};
-            return detail::run_pre_request_stage(req, res, step_up_deps);
+            return detail::run_post_read_stage(req, res, step_up_deps);
         });
+        // Own the registration just made: ServerImpl::stop() and the destructor drop it (and the
+        // inventory record) through this guard instead of a hand-paired `forget`.
+        post_read_stage_ = ScopedPostReadStage(*web_server_);
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
         auth_routes_->register_routes(*web_server_);
@@ -16440,6 +16498,10 @@ private:
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         if (cfg_.https_enabled && cfg_.https_redirect) {
             redirect_server_ = std::make_unique<httplib::Server>();
+            // This listener runs no post-read stage (301s and four bodyless GET probes): drop any stage a
+            // destroyed server left under a reused address so the sink registers unwrapped.
+            RouteInventory::instance().forget(redirect_server_.get());
+            PostReadStageRegistry::instance().forget(redirect_server_.get());
             // Eager fixed pool, as web_server_ (rationale at its pool: the default dynamic pool
             // spawns on the accept loop with no handler). Size = httplib's default maximum
             // (4 x max(8, hw-1), hw = logical CPUs) capped at 64: this port serves 301s and four
@@ -16464,8 +16526,13 @@ private:
                 count_http_request);
         }
 #endif
+        // The plaintext redirect listener answers 301 and four bodyless GET health probes and has no
+        // post-read stage by design; this is the ONLY production sink that opts out of the stage
+        // (pinned by test_step_up_route_inventory.cpp's source scan). A body-bearing or mutating
+        // route added to it would run with no cap and no step-up.
         if (redirect_server_)
-            redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_);
+            redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_,
+                                                                StageRequirement::ExemptNoStage);
         auto auth_fn = [this](const httplib::Request& req,
                               httplib::Response& res) -> std::optional<auth::Session> {
             return require_auth(req, res);
@@ -20081,6 +20148,20 @@ private:
                              .forensics_plugins = forensics_plugins(),
                          });
 
+        // Software normalisation curation REST (queue, curated aliases, pack replace). The
+        // routes borrow product_registry_store_ and are served only until web_server_->stop(),
+        // which precedes the store reset in stop(); the class holds no state of its own.
+        {
+            HttplibRouteSink curation_sink{*web_server_};
+            SoftwareCurationRoutes{}.register_routes(
+                curation_sink, SoftwareCurationRoutes::Deps{
+                                   .auth_fn = auth_fn,
+                                   .perm_fn = perm_fn,
+                                   .audit_fn = audit_fn,
+                                   .registry = product_registry_store_.get(),
+                               });
+        }
+
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
         // attention, estate state). Every figure arrives through a closure over an
         // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
@@ -23599,6 +23680,9 @@ private:
     std::shared_ptr<instr::ParamValidatorCache> param_validator_cache_ =
         std::make_shared<instr::ParamValidatorCache>();
     std::unique_ptr<httplib::Server> web_server_;
+    // Declared AFTER web_server_ so it is destroyed first (it names web_server_'s address);
+    // stop() also resets it once the listener thread is joined.
+    ScopedPostReadStage post_read_stage_;
     std::thread web_thread_;
     // #2703 Gate 7 merge-slice item 2: signalled by web_thread_'s body right
     // after web_server_->listen() returns, so stop() can bound how long it

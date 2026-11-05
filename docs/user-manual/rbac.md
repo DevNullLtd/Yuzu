@@ -148,7 +148,12 @@ Recommended order for a fresh install:
 > §9: the row is written after every check above and before the group is created),
 > `group-from-results` answers `503` with `Sec-Audit-Failed: true` and the toast "The audit record
 > could not be stored. Nothing was created. Retry once the audit store recovers.", and creates
-> nothing.
+> nothing. Because that write can wait on the audit store, the session, `ManagementGroup:Write`
+> and the visible agent set are decided again after it: a session that is gone answers `401`, a
+> withdrawn `ManagementGroup:Write` grant the permission gate's refusal (normally `403`),
+> and a visible set that no longer holds any matched
+> agent the `422` above; each creates nothing and records `group.create_from_results` `failure`
+> (`session_revoked`, `permission_revoked name=<group name>`, `scope_revoked`).
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat

@@ -1354,8 +1354,9 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "the general limiter site uses the shared 429 writer");
     // The sink the probes register on must exist before register_health_routes is handed it:
     // deleting the construction leaves a null sink, which silently registers nothing.
-    expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_)", 1,
-           "the redirect listener's route sink is built");
+    expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_, "
+           "StageRequirement::ExemptNoStage)", 1,
+           "the redirect listener's route sink is built, and opts out of the post-read stage");
     {
         const auto built =
             flat.find(squeeze("redirect_sink_ = std::make_unique<HttplibRouteSink>("));
@@ -2382,7 +2383,7 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
             std::lock_guard<std::mutex> lk(seen_mu);
             seen.emplace_back(req.method, res.status);
         });
-    HttplibRouteSink plain{srv};
+    HttplibRouteSink plain{srv, StageRequirement::ExemptNoStage};
 
     Harness h;
     h.plain_override = &plain;
