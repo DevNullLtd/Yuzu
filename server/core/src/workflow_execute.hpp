@@ -113,15 +113,21 @@
 /// there per step. It does NOT re-derive the `DispatchCaller`: `principal_is_admin` (JIT
 /// elevation) and `exec_visible` (group scope) are the snapshot taken when the call was taken,
 /// so an elevation that expires or a group narrowing during the run is bounded only by the
-/// 60 s deadline (D2b, a follow-up). `kValidStale` is accepted for the whole run (at most 60 s).
-/// TOKEN CACHE LAG. For an API-token caller the check is served from the token store's
-/// per-process cache (`ApiTokenStore::kTokenCacheTtl`, 60 s from when the entry was made, not
-/// slid on a hit). A revoke handled by THIS replica erases its entry, so the next check sees
-/// `kRevoked`. A revoke handled by ANOTHER replica reaches this one only when its entry ages
-/// out (nothing signals across replicas), up to 60 s, which is the whole run budget: on a
-/// multi-replica deployment `kRevoked` may stop none of the remaining steps. Tracked as #4766;
-/// `AuthRoutes::revalidate_stream` carries a note on the held-open streams, which share the
-/// lag (the #2447 it cites is the separate grace-clock point).
+/// 60 s deadline (D2b, a follow-up). `kValidStale` would be accepted, but this question never
+/// yields it (see below).
+/// THE CHECK READS DURABLE STATE. The seams are wired with `CredentialReadMode::kAuthoritative`
+/// (`AuthRoutes::revalidate_stream`), not the cached read the held-open stream pump uses. An
+/// API-token caller (human, MCP or engine token) is checked against its `api_tokens` row, never
+/// the 60 s process-local token cache, and an engine token's backing principal against
+/// `engine_principals`, never the 15 s liveness cache. So a revoke committed by ANY replica
+/// before the read is seen at the next step boundary. Cost: one indexed read per check (two for an
+/// engine token), against the server's one read-write Postgres, from the pool with a 1.5 s lease
+/// wait; a run is capped at 2 per principal and 60 s. An unanswerable read is `kIndeterminate`
+/// (one retry, then stop), never `kRevoked` and never `kValid`. What remains: the step already
+/// sent when the revoke lands is not recalled, a cookie session is adjudicated by the durable
+/// session generation (polled at most once per second per replica, so a sign-out on another
+/// replica is seen within about a second), and the token's expiry is still judged on this
+/// replica's clock. The held-open streams and every other caller keep the cached read (#4766).
 ///
 /// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
 /// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches
@@ -498,7 +504,8 @@ struct WorkflowExecuteRequest {
     /// `now + kWorkflowSyncBudget` at the start of the run: a run is never unbounded.
     std::optional<std::chrono::steady_clock::time_point> deadline;
     /// Re-asks whether the caller's CREDENTIAL is still live (`AuthRoutes::revalidate_stream`
-    /// against the principal and the request that started the call). The run asks it from its
+    /// with `CredentialReadMode::kAuthoritative`, so the token and engine rows are read from
+    /// Postgres, against the principal and the request that started the call). The run asks it from its
     /// `before_attempt` hook: before every dispatch attempt, which is once before each step's
     /// first attempt and once on waking from each retry sleep (never per sleep slice). `kValid`
     /// and `kValidStale` continue; `kRevoked` stops the run; `kIndeterminate` is asked once

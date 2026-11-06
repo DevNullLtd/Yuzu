@@ -1488,6 +1488,9 @@ struct McpTestServer {
     /// control and always-valid — the posture the pre-PR-2 GET tests assume.
     yuzu::server::detail::StreamBudget* stream_budget_for_test{nullptr};
     yuzu::server::mcp::StreamRevalidateFn revalidate_fn_for_test{};
+    // execute_workflow's per-step credential check (McpServer::set_workflow_revalidate_fn): a
+    // separate seam from the stream pump's `revalidate_fn_for_test`.
+    yuzu::server::mcp::StreamRevalidateFn workflow_revalidate_fn_for_test{};
     yuzu::MetricsRegistry* metrics_for_test{nullptr};
 
     /// #2146: the shared pipeline's ports for execute_instruction_definition. Default-constructed
@@ -1937,6 +1940,8 @@ private:
         if (workflow_digest_for_test)
             mcp.set_workflow_digest_fn(workflow_digest_for_test);
         mcp.set_workflow_reauthorize_retry_delay(workflow_reauth_retry_for_test);
+        if (workflow_revalidate_fn_for_test)
+            mcp.set_workflow_revalidate_fn(workflow_revalidate_fn_for_test);
         if (workflow_api_for_test) {
             mcp.set_workflow_api(workflow_api_for_test);
         } else if (workflow_engine_for_test) {
@@ -48828,6 +48833,7 @@ TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; 
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     using CC = yuzu::server::auth::CredentialCheck;
+    int stream_seam_asks = 0; // the stream pump's function: a workflow run must never ask it
 
     const auto make_server = [&](WfMcpFx& fx, McpTestServer& ts, std::vector<CC>& answers,
                                  std::vector<std::string>& principals, int& asks) {
@@ -48863,7 +48869,12 @@ TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; 
             }
             return std::string{"exec-1"};
         };
-        ts.revalidate_fn_for_test = [&](const httplib::Request& req, const std::string& principal) {
+        ts.revalidate_fn_for_test = [&](const httplib::Request&, const std::string&) {
+            ++stream_seam_asks;
+            return CC::kValid;
+        };
+        ts.workflow_revalidate_fn_for_test = [&](const httplib::Request& req,
+                                                 const std::string& principal) {
             const int n = asks++;
             (void)req;
             principals.push_back(principal);
@@ -48897,6 +48908,7 @@ TEST_CASE("MCP execute_workflow: the credential is re-checked before each step; 
         CHECK(payload["execution_id"] == "exec-1");
         CHECK(payload["steps"].size() == 1);
         CHECK(asks == 2); // once before each step
+        CHECK(stream_seam_asks == 0); // the run asks its own (authoritative) seam, not the pump's
         // asked as the session's principal (McpTestServer's mock session user)
         CHECK(principals == std::vector<std::string>{"test-user", "test-user"});
         CHECK(wf_audit_has(ts, "failure", "run_outcome=aborted"));

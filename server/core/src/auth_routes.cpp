@@ -537,7 +537,8 @@ std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::
     return std::nullopt;
 }
 
-auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token) const {
+auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token,
+                                                          auth::CredentialReadMode mode) const {
     using R = auth::CredentialCheck;
 
     // Mirrors the two gates synthesize_token_session applies AFTER the token row
@@ -566,6 +567,20 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
     // authenticated stream — never from session synthesis or an on-behalf-of
     // target check, both of which call get_for_auth and read through to
     // Postgres every time (which is why this method is private).
+    if (mode == auth::CredentialReadMode::kAuthoritative) {
+        // A boundary check (the workflow run's per-step re-check), not a timer tick: ask
+        // Postgres, never the 15 s liveness cache. Same three-way mapping as below; nothing is
+        // reported stale because nothing was cached.
+        switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
+        case EngineLookupStatus::Active:
+            return R::kValid;
+        case EngineLookupStatus::MissingOrRevoked:
+            return R::kRevoked;
+        case EngineLookupStatus::StoreUnreachable:
+            return R::kIndeterminate;
+        }
+        return R::kRevoked; // unreachable: fail closed on a future enum value
+    }
     const auto engine = engine_principal_store_->get_for_auth_revalidate(token.principal_id);
     switch (engine.status) {
     case EngineLookupStatus::Active:
@@ -590,7 +605,8 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
 }
 
 auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
-                                                    const std::string& expected_principal) {
+                                                    const std::string& expected_principal,
+                                                    auth::CredentialReadMode mode) {
     using R = auth::CredentialCheck;
 
     // The invariant: a stream lives iff a FRESH request carrying these same headers
@@ -601,8 +617,11 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     // to also carry a stale cookie from a browser jar or a cookie-injecting proxy.
     // It failed closed, but it was still wrong.
 
-    // 1. Session cookie. AuthManager's session table is in-memory, so a "no" here is
-    //    always DEFINITIVE — there is no backend that could be unavailable.
+    // 1. Session cookie. `validate_session` answers from the cache of the durable session
+    //    store, whose generation it polls at most once per second (and distrusts past 30 s of
+    //    failed polls, going to the store). A "no" here is treated as DEFINITIVE even when it
+    //    came from a degraded store read: that fails closed (kRevoked), it never grants. The
+    //    mode does not change this arm: there is no per-credential cache to bypass.
     const auto cookie = extract_session_cookie(req);
     if (cookie.size() > auth::kMaxSessionTokenLength) {
         // resolve_session hard-rejects an oversized cookie rather than falling through,
@@ -637,7 +656,10 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     for (const auto& raw : candidates) {
         if (raw.empty() || raw.size() > auth::kMaxApiTokenLength || !api_token_store_)
             continue;
-        const auto checked = api_token_store_->validate_token_checked(raw);
+        const auto checked = api_token_store_->validate_token_checked(
+            raw, mode == auth::CredentialReadMode::kAuthoritative
+                     ? ApiTokenStore::TokenReadMode::kAuthoritative
+                     : ApiTokenStore::TokenReadMode::kCached);
         switch (checked.status) {
         case ApiTokenStore::TokenCheck::kValid:
             if (checked.token && checked.token->principal_id == expected_principal) {
@@ -650,12 +672,14 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
                 // Returned verbatim, including kValidStale (#2367): the engine
                 // gate is the only staleness this function models today, and
                 // flattening it to kValid here would undo the whole point of
-                // the distinction. NOTE the token half above is NOT modelled —
-                // `validate_token_checked` is served from its own 60 s cache
-                // and reports a hit as plain kValid, so a token-authenticated
-                // stream still carries the additive window this closes for
-                // engine principals. Pre-existing; tracked as #2447.
-                return engine_credential_state(*checked.token);
+                // the distinction. NOTE the token half above is NOT modelled
+                // under kCached: `validate_token_checked` is served from its
+                // own 60 s cache and reports a hit as plain kValid, so a
+                // token-authenticated stream still carries the additive window
+                // this closes for engine principals. Pre-existing; tracked as
+                // #2447. Under kAuthoritative the token row was just read from
+                // Postgres, so there is no cache residency to model.
+                return engine_credential_state(*checked.token, mode);
             }
             break; // a valid token for SOMEONE ELSE is not authority for this stream
         case ApiTokenStore::TokenCheck::kUnavailable:

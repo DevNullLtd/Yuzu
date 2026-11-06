@@ -1987,7 +1987,7 @@ TEST_CASE("revalidate_stream: a live token for the stream's principal is valid",
     AuthRoutesFixture f;
     const auto token = f.mint_token();
     auto req = request_with_header("Authorization", "Bearer " + token);
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kValid);
 }
 
 TEST_CASE("revalidate_stream: a revoked token DEFINITIVELY ends the stream",
@@ -2001,7 +2001,7 @@ TEST_CASE("revalidate_stream: a revoked token DEFINITIVELY ends the stream",
     auto req = request_with_header("Authorization", "Bearer " + token);
     // kRevoked, NOT kIndeterminate: an indeterminate answer would buy the revoked
     // credential a full grace window of extra life on a live stream.
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kRevoked);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kRevoked);
 }
 
 TEST_CASE("revalidate_stream: a valid token for ANOTHER principal is not authority",
@@ -2011,13 +2011,13 @@ TEST_CASE("revalidate_stream: a valid token for ANOTHER principal is not authori
     auto req = request_with_header("Authorization", "Bearer " + token);
     // The stream carries test_user's messages. A credential that authenticates as
     // somebody else does not entitle the holder to keep reading them.
-    CHECK(f.ar->revalidate_stream(req, "someone_else") == auth::CredentialCheck::kRevoked);
+    CHECK(f.ar->revalidate_stream(req, "someone_else", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kRevoked);
 }
 
 TEST_CASE("revalidate_stream: no credential at all is a definitive no", "[pg][auth][stream][ch4]") {
     AuthRoutesFixture f;
     httplib::Request bare;
-    CHECK(f.ar->revalidate_stream(bare, "test_user") == auth::CredentialCheck::kRevoked);
+    CHECK(f.ar->revalidate_stream(bare, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kRevoked);
 }
 
 TEST_CASE("revalidate_stream: a dead cookie FALLS THROUGH to a live token",
@@ -2033,7 +2033,7 @@ TEST_CASE("revalidate_stream: a dead cookie FALLS THROUGH to a live token",
     httplib::Request req;
     req.set_header("Cookie", "yuzu_session=dead-and-gone");
     req.set_header("Authorization", "Bearer " + token);
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kValid);
 }
 
 TEST_CASE("revalidate_stream: X-Yuzu-Token is honoured alongside a dead Bearer",
@@ -2043,7 +2043,7 @@ TEST_CASE("revalidate_stream: X-Yuzu-Token is honoured alongside a dead Bearer",
     httplib::Request req;
     req.set_header("Authorization", "Bearer yuzu_not_a_real_token_000000000000");
     req.set_header("X-Yuzu-Token", token);
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kValid);
 }
 
 TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not revoked",
@@ -2070,7 +2070,89 @@ TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not r
         REQUIRE(r.ok());
     }
 
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kIndeterminate);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kIndeterminate);
+}
+
+// ── revalidate_stream, kAuthoritative: the workflow run's per-step question ───
+//
+// The per-step credential re-check of a workflow run must see a revoke committed by ANOTHER
+// replica, whose in-process cache invalidation never ran here. These tests revoke by a direct
+// write from a second connection (the shape another replica's `revoke_token` has from this
+// process's point of view): `revoke_token` itself would bump the local generation and erase the
+// entry, which is exactly what a remote revoke does not do.
+
+namespace {
+void revoke_behind_the_cache(const std::string& dsn, const std::string& token_id) {
+    yuzu::server::pg::PgConn saboteur{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+    const char* params[1] = {token_id.c_str()};
+    yuzu::server::pg::PgResult r{PQexecParams(
+        saboteur.get(),
+        "UPDATE api_token_store.api_tokens SET revoked = true WHERE token_id = $1", 1, nullptr,
+        params, nullptr, nullptr, 0)};
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+    REQUIRE(std::string(PQcmdTuples(r.get())) == "1");
+}
+} // namespace
+
+TEST_CASE("revalidate_stream: a revoke made behind the token cache is seen by the authoritative "
+          "read and not by the cached one",
+          "[pg][auth][stream][ch4][authoritative]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    const auto live = f.api_tokens->validate_token(token); // warms the 60 s cache
+    REQUIRE(live.has_value());
+
+    revoke_behind_the_cache(f.api_tokens.dsn(), live->token_id);
+
+    // The cache lies, and that is the baseline this feature exists to step around.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) ==
+          auth::CredentialCheck::kValid);
+    // The authoritative read goes to the row.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kRevoked);
+    // ...and it touched the cache neither way: the cached read still answers as before.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) ==
+          auth::CredentialCheck::kValid);
+}
+
+TEST_CASE("revalidate_stream: the authoritative read answers kValid for a live token and does "
+          "not stamp it",
+          "[pg][auth][stream][ch4][authoritative]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kValid);
+    CHECK(f.api_tokens->cache_size() == 0); // read through, inserted nothing
+    // Another principal's token is not authority, in this mode either.
+    CHECK(f.ar->revalidate_stream(req, "someone_else", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kRevoked);
+}
+
+TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE for the authoritative "
+          "read even when the cache is warm",
+          "[pg][auth][stream][ch4][authoritative]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    REQUIRE(f.api_tokens->validate_token(token).has_value()); // WARM: the cached read will not ask
+
+    {
+        yuzu::server::pg::PgConn saboteur{PQconnectdb(f.api_tokens.dsn().c_str())};
+        REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(saboteur.get(), "DROP TABLE api_token_store.api_tokens")};
+        REQUIRE(r.ok());
+    }
+
+    // The cache still vouches for the token; the authoritative read could not ask, and "could not
+    // ask" is neither valid nor revoked.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) ==
+          auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kIndeterminate);
 }
 
 // ---------------------------------------------------------------------------

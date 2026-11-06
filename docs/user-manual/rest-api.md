@@ -6843,7 +6843,7 @@ waking from each retry delay (once per wake, not once per 250 ms wait slice), wh
 that made the call is still live: the same re-validation that cuts a held-open MCP stream, applied to
 this request's own cookie, `Authorization: Bearer` or `X-Yuzu-Token` and to the session's principal
 (for an engine principal, whether the principal is still `Active`). A live credential continues,
-including one answered from the short engine-principal cache. A revoked, expired or rebound
+whatever the answer's source. A revoked, expired or rebound
 credential stops the run before the next send. An answer that cannot be given (the auth store did
 not respond) is asked once more after at most one second, never past the run's deadline, and a
 second non-answer stops the run too: fail closed. A `foreach` step is asked once per item, since
@@ -6859,16 +6859,22 @@ elevation that expires during the run, and a device-group narrowing, are not re-
 elevation flag and visible device set are those taken when the call was accepted, so they are
 bounded only by the 60 second deadline.
 
-**A revoked API token can outlive a revoke on another replica, for up to 60 seconds.** For a caller
-authenticated with an API token the liveness check is answered from the token store's per-process
-cache, whose entries live 60 seconds from when they were made and are not renewed by a hit. A token
-revoked through the replica that is running the call is dropped from that cache at once, so the next
-check stops the run. A token revoked through a DIFFERENT replica reaches this one only when its cache
-entry ages out, which is up to 60 seconds, the whole run budget: on a deployment with more than one
-server replica the check may stop none of the remaining steps. The 60 second deadline, the live RBAC
-check at each send and the revoke itself still apply. The held-open MCP streams carry the same lag
-(see the MCP manual). Cookie sessions and engine principals are decided differently and are not
-covered by this paragraph.
+**Where the check reads from.** For a caller authenticated with an API token (an ordinary, MCP or
+engine token) the check reads the token's row from the server's Postgres at every step boundary, and,
+for an engine token, the backing engine principal's row too. It does not use the 60 second token
+cache or the 15 second engine-principal cache that the held-open streams use. So a token revoked
+through ANY replica before the read is seen at the next step boundary of a run on any replica: the
+next step is not sent. The cost is one indexed read per check (two for an engine token), at most one
+per step or retry wake, and a run is capped at 2 per principal and 60 seconds. If the database does
+not answer within the 1.5 second lease wait or the query fails, the answer is "cannot be given", not
+"revoked" and not "valid": it is asked once more and a second non-answer stops the run. What is not
+covered: a step already sent when the revoke lands is not recalled, a token's expiry time is still
+judged against the clock of the replica running the call, and a cookie session is decided by the
+durable session store's generation, which each replica polls at most once per second, so a sign-out
+on another replica is seen within about a second rather than at the very next boundary. The 60
+second deadline, the live RBAC check at each send and the revoke itself apply as before. Other
+callers of the token store, including the held-open MCP streams (see the MCP manual), keep the cached
+read and its lag (#4766).
 
 **Dispatch is synchronous, device work is not.** The call returns after every step's command has
 been sent, including step retries and delays (within the run budget above), so it can be slow. Each step is sent only to the

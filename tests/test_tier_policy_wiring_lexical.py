@@ -57,14 +57,17 @@ call site would pass every existing test. This gate closes that:
      there, so a call placed after it keeps the count at one and every unit rig green while
      production answers 500 on both routes.
 
-  7. (#2146 D2a, per-step workflow credential check) The workflow-execute REST route's credential
-     liveness seam is wired: `wf_deps.revalidate = ` is assigned EXACTLY ONCE as an active line, and
-     the line `return auth_routes_->revalidate_stream(req, principal);` appears EXACTLY TWICE as
-     active lines (that assignment's body, and the MCP `StreamRevalidateFn` lambda beside
-     `build_handler`'s arguments, which `execute_workflow` also reads). Both seams are OPTIONAL by
-     construction (an empty one is "no check", so every unit rig leaves it unwired), which means
-     dropping either compiles cleanly, passes every unit test, and leaves a revoked credential able
-     to finish a workflow run it started; only production wiring can be pinned, here.
+  7. (#2146 D2a / UP2-10, per-step workflow credential check) The workflow-execute run's credential
+     liveness seams are wired and ASK THE AUTHORITATIVE QUESTION: `wf_deps.revalidate = ` is assigned
+     EXACTLY ONCE as an active line; `mcp_server_->set_workflow_revalidate_fn(` is called EXACTLY ONCE as
+     an active line; the body `return auth_routes_->revalidate_stream(req, principal,
+     yuzu::server::auth::CredentialReadMode::kAuthoritative);` appears EXACTLY TWICE (those two seams'
+     bodies); and the body with `CredentialReadMode::kCached` appears EXACTLY ONCE (the MCP held-open
+     stream pump's `StreamRevalidateFn`, which ticks every few seconds and tolerates the 60 s token
+     cache by design). Every seam is OPTIONAL by construction (an empty one is "no check"), and the
+     mode is a plain argument, so dropping a seam, or flipping a workflow body back to `kCached`,
+     compiles, passes every unit test, and leaves a token revoked on another replica able to finish a
+     workflow run it started; only production wiring can be pinned, here.
 
   8. (#2146 sec-3/I1/I6, workflow run cap, shutdown drain and audit) The seams of the workflow-execute
      twins are OPTIONAL by construction (a null `StreamBudget` is "unmetered", an empty `draining`
@@ -133,7 +136,10 @@ CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_di
 AUDIT_SESSION = r"[ \t\r\f\v]*rest_api_v1_->set_audit_as_session_fn\(auth_routes_->audit_as_session_fn\(\)\);"
 REGISTER_ROUTES = r"[ \t\r\f\v]*rest_api_v1_->register_routes\("
 REVALIDATE_ASSIGN = r"[ \t\r\f\v]*wf_deps\.revalidate = .*"
-REVALIDATE_BODY = r"[ \t\r\f\v]*return auth_routes_->revalidate_stream\(req, principal\);"
+_REVAL_HEAD = r"^[ \t]*return auth_routes_->revalidate_stream\(req, principal,\s*yuzu::server::auth::CredentialReadMode::"
+REVALIDATE_BODY_AUTH = _REVAL_HEAD + r"kAuthoritative\);"
+REVALIDATE_BODY_CACHED = _REVAL_HEAD + r"kCached\);"
+REVALIDATE_MCP_SETTER = r"^[ \t]*mcp_server_->set_workflow_revalidate_fn\("
 # Clause 8: multi-line, matched over the whole source with re.M; `^[ \t]*` keeps a `//` copy out.
 _STOP_OR_DRAIN = (r"\{\s*return draining_\.load\(std::memory_order_acquire\) \|\|\s*"
                   r"stop_requested_\.load\(std::memory_order_acquire\);\s*\}")
@@ -225,7 +231,9 @@ def problems(src):
     setter_at = [i for i, ln in enumerate(lines) if re.fullmatch(AUDIT_SESSION, ln)]
     register_at = [i for i, ln in enumerate(lines) if re.match(REGISTER_ROUTES, ln)]
     revalidate_assign = sum(1 for ln in lines if re.fullmatch(REVALIDATE_ASSIGN, ln))
-    revalidate_body = sum(1 for ln in lines if re.fullmatch(REVALIDATE_BODY, ln))
+    revalidate_auth = count_rx(REVALIDATE_BODY_AUTH, src)
+    revalidate_cached = count_rx(REVALIDATE_BODY_CACHED, src)
+    revalidate_setter = count_rx(REVALIDATE_MCP_SETTER, src)
     wf_counts = {name: count_rx(pat, src) for name, pat in WORKFLOW_PINS}
     out = []
     if designated != 1:
@@ -267,13 +275,17 @@ def problems(src):
         out.append("'rest_api_v1_->set_audit_as_session_fn(' must be called BEFORE 'rest_api_v1_->register_routes(': "
                    "the writer is captured by value at registration, so a later call leaves it empty and POST and "
                    "DELETE /api/v1/quarantine answer 500.")
-    if (revalidate_assign, revalidate_body) != (1, 2):
-        out.append("expected 'wf_deps.revalidate = ' assigned exactly once and "
-                   "'return auth_routes_->revalidate_stream(req, principal);' exactly twice (the REST workflow "
-                   "assignment's body and the MCP StreamRevalidateFn lambda) as active lines in server.cpp; found "
-                   f"assignment={revalidate_assign}, body={revalidate_body}. Either seam is optional and an "
-                   "empty one is 'no check', so a dropped line compiles and passes every unit rig while a "
-                   "revoked credential finishes the workflow run it started.")
+    if (revalidate_assign, revalidate_auth, revalidate_cached, revalidate_setter) != (1, 2, 1, 1):
+        out.append("expected 'wf_deps.revalidate = ' assigned exactly once, "
+                   "'mcp_server_->set_workflow_revalidate_fn(' called exactly once, "
+                   "'return auth_routes_->revalidate_stream(req, principal, ...CredentialReadMode::kAuthoritative);' "
+                   "exactly twice (the REST workflow assignment's body and the MCP workflow seam's) and the same "
+                   "with ::kCached exactly once (the MCP stream pump's StreamRevalidateFn) as active lines in "
+                   f"server.cpp; found assignment={revalidate_assign}, setter={revalidate_setter}, "
+                   f"authoritative={revalidate_auth}, cached={revalidate_cached}. Every seam is optional and an "
+                   "empty one is 'no check', and the mode is a plain argument, so a dropped seam or a workflow "
+                   "body flipped to kCached compiles and passes every unit rig while a token revoked on another "
+                   "replica finishes the workflow run it started.")
     for name, _ in WORKFLOW_PINS:
         if wf_counts[name] != 1:
             out.append(f"expected {WORKFLOW_PIN_ADVICE[name]} exactly once as an active line in server.cpp; found "
@@ -289,7 +301,12 @@ CLOSURE_REST_LINE = "            authorize_dispatch);\n"
 CLOSURE_MCP_LINE = "            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);\n"
 AUDIT_SESSION_LINE = "        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());\n"
 REVALIDATE_ASSIGN_LINE = "        wf_deps.revalidate = [this](const httplib::Request& req, const std::string& principal) {\n"
-REVALIDATE_BODY_LINE = "\n            return auth_routes_->revalidate_stream(req, principal);\n"  # leading newline: the MCP site is indented deeper
+REVALIDATE_BODY_LINE = ("            return auth_routes_->revalidate_stream(req, principal,\n"
+                        "                                                   yuzu::server::auth::CredentialReadMode::kAuthoritative);\n")
+# The REST assignment and its body together: the authoritative body appears twice in the file, so the
+# body-only mutations anchor on the one that follows the assignment head.
+REVALIDATE_REST_BLOCK = REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE
+REVALIDATE_MCP_SETTER_LINE = "            mcp_server_->set_workflow_revalidate_fn(\n"
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 STREAM_BUDGET_LINE = "        wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface\n"
 WF_DRAINING_HEAD = "        wf_deps.draining = [this] {\n"
@@ -346,7 +363,7 @@ class TierPolicyWiringLexical(unittest.TestCase):
     def test_mutations_are_caught(self):
         src = self.src
         for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE,
-                  REVALIDATE_ASSIGN_LINE, REVALIDATE_BODY_LINE, STREAM_BUDGET_LINE, WF_DRAINING_HEAD, MCP_DRAINING_HEAD,
+                  REVALIDATE_ASSIGN_LINE, REVALIDATE_REST_BLOCK, REVALIDATE_MCP_SETTER_LINE, STREAM_BUDGET_LINE, WF_DRAINING_HEAD, MCP_DRAINING_HEAD,
                   RUN_ADAPTER_TAIL, AUDIT_FN_LINE, PERSIST_AUDIT_FN_LINE, WF_EMIT_LINE, MCP_EMIT_LINE,
                   SHOULD_STOP_HEAD, SHOULD_STOP_STOP,
                   SHOULD_STOP_DRAIN):
@@ -403,10 +420,21 @@ class TierPolicyWiringLexical(unittest.TestCase):
              src.replace(REVALIDATE_ASSIGN_LINE, "// " + REVALIDATE_ASSIGN_LINE, 1),
              ["wf_deps.revalidate"]),
             ("T18 the REST workflow revalidate body replaced by a constant answer",
-             src.replace(REVALIDATE_BODY_LINE, "\n            return auth::CredentialCheck::kValid;\n", 1),
+             src.replace(REVALIDATE_REST_BLOCK,
+                         REVALIDATE_ASSIGN_LINE + "            return auth::CredentialCheck::kValid;\n", 1),
              ["wf_deps.revalidate"]),
-            ("T19 a third revalidate_stream body appended",
-             src + REVALIDATE_BODY_LINE.lstrip("\n"),
+            ("T19 a third authoritative revalidate_stream body appended",
+             src + REVALIDATE_BODY_LINE,
+             ["wf_deps.revalidate"]),
+            ("T19b the REST workflow revalidate body flipped back to the cached read (UP2-10)",
+             src.replace(REVALIDATE_REST_BLOCK,
+                         REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE.replace("kAuthoritative", "kCached"), 1),
+             ["wf_deps.revalidate"]),
+            ("T19c the MCP workflow revalidate seam dropped (compiles: an unset seam is no check)",
+             src.replace(REVALIDATE_MCP_SETTER_LINE, "            mcp_server_->unrelated(\n", 1),
+             ["wf_deps.revalidate"]),
+            ("T19d the MCP workflow revalidate seam commented out (anchoring proof)",
+             src.replace(REVALIDATE_MCP_SETTER_LINE, "// " + REVALIDATE_MCP_SETTER_LINE, 1),
              ["wf_deps.revalidate"]),
             ("T20 the workflow stream budget wiring dropped (compiles: a null budget is unmetered)",
              src.replace(STREAM_BUDGET_LINE, STREAM_BUDGET_LINE.replace("wf_deps.stream_budget", "wf_deps.unrelated"), 1),

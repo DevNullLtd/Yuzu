@@ -1267,12 +1267,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Known residuals of this change (recorded by the change author; ADR-owner
        acceptance pending, except the confined-reader visibility consequence of the
        stored agent id cap in residual 13, which the owner accepted on 2026-11-06).**
-       Each was checked against the code at the commit that wrote this paragraph. Only the token-cache lag in residual 3 has a tracking
-       reference (#4766, token revocation and expiry without the durable-generation
-       discipline sessions have; `AuthRoutes::revalidate_stream` cites #2447, which is
-       the separate stream grace-clock point); no issue is filed
-       for the rest yet (file each and update its line with the number). The date
-       is the latest the residual is re-read, not a promise it is fixed by then.
+       Each was checked against the code at the commit that wrote this paragraph.
+       The per-step credential check no longer carries the token-cache lag it once did (it
+       reads the token and engine rows from Postgres, see residual 3); #4766 (token
+       revocation and expiry without the durable-generation discipline sessions have) stays
+       open for the other callers of the token cache and for expiry on the replica's clock,
+       and `AuthRoutes::revalidate_stream` cites #2447, the separate stream grace-clock
+       point. No issue is filed for the rest yet (file each and update its line with the
+       number). The date is the latest the residual is re-read, not a promise it is fixed
+       by then.
        1. *Write-ahead command id (revisit by 2026-12-15).* A step's command id is
           stored after the send, by a write that can be dropped, so a step recorded
           `pending` or `skipped` may still have been sent. The docs tell the reader
@@ -1287,9 +1290,12 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
           re-checks that the credential is live before each step but does not
           re-derive the `DispatchCaller` (D2b): an administrator elevation that
           expires, or a device-group narrowing, during the run is bounded only by the
-          60 s deadline. The liveness check for an API-token caller is answered from
-          a per-process cache of up to 60 s with no cross-replica signal, so a
-          revoke handled by another replica may stop none of the remaining steps.
+          60 s deadline. The liveness check for an API-token caller (and an engine
+          token's backing principal) reads the durable row at every step boundary, so a
+          revoke committed by any replica is seen at the next boundary; the step already
+          sent is not recalled, a cookie session is decided by the durable session
+          generation (polled at most once per second), and token expiry is judged on the
+          replica's clock.
        4. *No per-surface ceiling (revisit by 2026-12-15).* The workflow run leases
           from the one shared budget, 2 per principal, so 64 principals can hold all
           128 default slots for up to 60 s and every new stream or run is refused

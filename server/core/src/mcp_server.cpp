@@ -22593,14 +22593,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The effects the consumed ticket was bound to: the run holds every fresh read to
                 // them, and sends nothing for a step that moved (definition_changed).
                 wreq.expected_step_effects = workflow_bound_effects;
-                // The credential liveness check before each step: the SAME seam the held-open
-                // streams re-validate through, asked against the principal and request of THIS
-                // call. The run is synchronous on this thread, so `req` outlives the closure. An
-                // unwired seam (test harnesses; build_handler warns at boot) is no check.
+                // The credential liveness check before each step: the authoritative question
+                // (`set_workflow_revalidate_fn`, NOT the cached `revalidate_fn` the held-open
+                // streams tick on), asked against the principal and request of THIS call. The
+                // run is synchronous on this thread, so `req` outlives the closure. An unwired
+                // seam (test harnesses) is no check.
                 wreq.reauthorize_retry_delay =
                     workflow_reauthorize_retry_delay_.value_or(kReauthorizeRetryDelay);
-                if (revalidate_fn) {
-                    wreq.reauthorize = [&] { return revalidate_fn(req, session->username); };
+                if (workflow_revalidate_fn_) {
+                    wreq.reauthorize = [&] {
+                        return workflow_revalidate_fn_(req, session->username);
+                    };
                 }
 
                 WorkflowExecuteOutcome out;

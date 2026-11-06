@@ -21145,11 +21145,13 @@ private:
         wf_deps.workflow_run = workflow_run_fn; // same closure MCP execute_workflow gets
         wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn; // and the same lookup
         wf_deps.authorize_dispatch = authorize_dispatch; // the step-pair dry run (sec-4)
-        // The per-step credential liveness check of the v1 execute run: the SAME seam MCP's
+        // The per-step credential liveness check of the v1 execute run: the SAME function MCP's
         // held-open streams re-validate through (tri-state; an engine principal's Active check
-        // included).
+        // included), asked authoritatively: the API-token row and an engine principal are read
+        // from Postgres at each step boundary, never from the 60 s / 15 s caches.
         wf_deps.revalidate = [this](const httplib::Request& req, const std::string& principal) {
-            return auth_routes_->revalidate_stream(req, principal);
+            return auth_routes_->revalidate_stream(req, principal,
+                                                   yuzu::server::auth::CredentialReadMode::kAuthoritative);
         };
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
@@ -23099,6 +23101,14 @@ private:
             mcp_server_->set_workflow_concurrency_dispatch_fn(command_dispatch_concurrency_fn);
             mcp_server_->set_workflow_run_fn(workflow_run_fn);
             mcp_server_->set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_fn);
+            // execute_workflow's per-step credential check, authoritative (the stream pump's
+            // function passed to build_handler stays on the cached read).
+            mcp_server_->set_workflow_revalidate_fn(
+                [this](const httplib::Request& req,
+                       const std::string& principal) -> mcp::StreamRevalidate {
+                    return auth_routes_->revalidate_stream(req, principal,
+                                                           yuzu::server::auth::CredentialReadMode::kAuthoritative);
+                });
             mcp_server_->set_draining_fn([this] {
                 return draining_.load(std::memory_order_acquire) ||
                        stop_requested_.load(std::memory_order_acquire);
@@ -23341,7 +23351,8 @@ private:
                 stream_budget_.get(),
                 [this](const httplib::Request& req,
                        const std::string& principal) -> mcp::StreamRevalidate {
-                    return auth_routes_->revalidate_stream(req, principal);
+                    return auth_routes_->revalidate_stream(req, principal,
+                                                           yuzu::server::auth::CredentialReadMode::kCached);
                 },
                 // The operator's --mcp-max-streams-per-principal. Passing it is what
                 // makes the flag mean anything: the attach site previously read the

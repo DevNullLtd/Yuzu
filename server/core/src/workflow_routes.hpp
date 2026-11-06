@@ -55,8 +55,9 @@ public:
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     /// Re-validates the credential on `req` against the principal the call was made as
-    /// (`AuthRoutes::revalidate_stream`, the seam MCP's held-open streams use). Asked by a
-    /// synchronous workflow run before each step (`WorkflowExecuteRequest::reauthorize`).
+    /// (`AuthRoutes::revalidate_stream`, the function MCP's held-open streams use, asked here with
+    /// `CredentialReadMode::kAuthoritative`). Asked by a synchronous workflow run before each step
+    /// (`WorkflowExecuteRequest::reauthorize`).
     using RevalidateFn =
         std::function<auth::CredentialCheck(const httplib::Request&, const std::string& principal)>;
 

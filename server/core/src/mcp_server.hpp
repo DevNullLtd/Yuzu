@@ -891,6 +891,16 @@ public:
         workflow_reauthorize_retry_delay_ = d;
     }
 
+    /// The per-step credential check of an `execute_workflow` run, asked against the principal
+    /// and the request of THAT call. Separate from the `StreamRevalidateFn` that `build_handler`
+    /// takes for the GET stream pump, which may answer from the token and engine caches: a run
+    /// asks at a step boundary, so server.cpp wires the authoritative question here. Unset is
+    /// "no per-step check" (a harness that does not wire it); there is no fallback to the
+    /// stream function, so a missing wire cannot quietly turn into the cached question.
+    void set_workflow_revalidate_fn(StreamRevalidateFn fn) {
+        workflow_revalidate_fn_ = std::move(fn);
+    }
+
     /// The digest `execute_workflow` binds a ticket's step effects with. Unset (the production
     /// default) is `sha256_hex`; set only by a test that drives the fail-closed refusal.
     void set_workflow_digest_fn(std::function<std::optional<std::string>(std::string_view)> fn) {
@@ -1444,6 +1454,7 @@ private:
     std::function<bool()> draining_fn_;                      // see set_draining_fn
     std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
     std::optional<std::chrono::milliseconds> workflow_reauthorize_retry_delay_; // see set_workflow_reauthorize_retry_delay
+    StreamRevalidateFn workflow_revalidate_fn_;              // see set_workflow_revalidate_fn
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.

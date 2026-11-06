@@ -902,7 +902,8 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     return t;
 }
 
-ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::string& raw_token) {
+ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::string& raw_token,
+                                                                  TokenReadMode mode) {
     if (raw_token.empty())
         return {TokenCheck::kInvalid, std::nullopt};  // definitive: no credential is no credential
     if (!open_)
@@ -923,26 +924,29 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
     // "we asked and did not get an answer", and zero rows is the same definitive no.)
     const auto hash = sha256_hex(raw_token);
     const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
+    const bool authoritative = mode == TokenReadMode::kAuthoritative;
 
-    {
-        std::lock_guard cache_lock(cache_mtx_);
-        auto it = token_cache_.find(hash);
-        if (it != token_cache_.end()) {
-            if (std::chrono::steady_clock::now() - it->second.cached_at < kTokenCacheTtl) {
-                const auto& cached = it->second.token;
-                const auto now = now_epoch();
-                if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
-                    token_cache_.erase(it);
-                    cache_misses_.fetch_add(1, std::memory_order_relaxed);
-                    return {TokenCheck::kInvalid, std::nullopt}; // definitive
+    if (!authoritative) {
+        {
+            std::lock_guard cache_lock(cache_mtx_);
+            auto it = token_cache_.find(hash);
+            if (it != token_cache_.end()) {
+                if (std::chrono::steady_clock::now() - it->second.cached_at < kTokenCacheTtl) {
+                    const auto& cached = it->second.token;
+                    const auto now = now_epoch();
+                    if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
+                        token_cache_.erase(it);
+                        cache_misses_.fetch_add(1, std::memory_order_relaxed);
+                        return {TokenCheck::kInvalid, std::nullopt}; // definitive
+                    }
+                    cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                    return {TokenCheck::kValid, cached};
                 }
-                cache_hits_.fetch_add(1, std::memory_order_relaxed);
-                return {TokenCheck::kValid, cached};
+                token_cache_.erase(it);
             }
-            token_cache_.erase(it);
         }
+        cache_misses_.fetch_add(1, std::memory_order_relaxed);
     }
-    cache_misses_.fetch_add(1, std::memory_order_relaxed);
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
@@ -979,7 +983,11 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
     // check-then-lock ordering leaves a window where a racing revoke's erase runs
     // between the check and the insert, leaving a revoked=false entry alive for a full
     // kTokenCacheTtl — which on this path would keep a revoked credential's stream up.
-    {
+    //
+    // `kAuthoritative` leaves the cache alone altogether: a caller that bypasses the cache to
+    // see a revoke made elsewhere must not also change what every other caller on this replica
+    // is served (no insert, and no erase on a negative answer either).
+    if (!authoritative) {
         std::lock_guard cache_lock(cache_mtx_);
         if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
             token_cache_[hash] = CachedToken{t, std::chrono::steady_clock::now()};
