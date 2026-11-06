@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <memory>
@@ -4458,14 +4459,14 @@ struct ParityRun {
     WorkflowExecuteOutcome first;
     WorkflowExecuteOutcome replay;
     std::string first_class;
-    long dispatches_after_first{0};
-    long dispatches_after_replay{0};
+    std::ptrdiff_t dispatches_after_first{0};
+    std::ptrdiff_t dispatches_after_replay{0};
     std::vector<std::pair<std::string, std::string>> outcomes_after_first;
     std::vector<std::pair<std::string, std::string>> outcomes_after_replay;
     std::map<std::string, int> idem_after_replay;
 };
 
-long dispatch_count(const Fx& f) {
+std::ptrdiff_t dispatch_count(const Fx& f) {
     return std::count_if(f.events.begin(), f.events.end(),
                          [](const auto& e) { return e.starts_with("dispatch:"); });
 }
