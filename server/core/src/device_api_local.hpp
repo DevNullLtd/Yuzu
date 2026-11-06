@@ -21,6 +21,7 @@ namespace yuzu::server {
 class TagStore;
 namespace detail {
 class AgentRegistry;
+class AgentHealthStore; // #2240: source of the per-device guardian_backend field
 } // namespace detail
 
 /// Factory for the store-backed implementation (`LocalDeviceApi`,
@@ -42,7 +43,18 @@ class AgentRegistry;
 /// shape MUST preserve that ordering (or hold the API with a lifetime <= its
 /// stores) — this snapshot-at-construction idiom UAFs if the stores are torn
 /// down first.
+///
+/// #2240 `health` (the heartbeat `AgentHealthStore`) is a REFERENCE, not a nullable pointer: a
+/// wiring fault must be a compile error, not a fleet-wide field that silently reads null. Its
+/// lifetime is NOT the registry's: in `ServerImpl`, `registry_` and `tag_store_` are declared
+/// BEFORE every `DeviceApi` holder (`rest_api_v1_`, `mcp_server_`, `device_routes_`,
+/// `crypto_device_api_`), but `health_store_` is declared AFTER them, so it is destroyed FIRST.
+/// The reference is safe only because `stop()` quiesces every caller before destruction (the web
+/// thread join), and the holder that outlives the web thread, `crypto_device_api_`, is reset in
+/// `stop()` for that reason. `LocalNetworkApi` has the same shape. A new holder of this API
+/// outside `stop()`'s quiescence is a use-after-free.
 [[nodiscard]] std::shared_ptr<DeviceApi>
-make_local_device_api(detail::AgentRegistry& registry, TagStore* tags);
+make_local_device_api(detail::AgentRegistry& registry, TagStore* tags,
+                      const detail::AgentHealthStore& health);
 
 } // namespace yuzu::server

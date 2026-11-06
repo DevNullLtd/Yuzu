@@ -54,17 +54,29 @@
 namespace yuzu::server {
 
 /// One device row — the shape `GET /api/v1/devices` serves (mirrors
-/// `device_agent_row_json`'s exact 5-field set, `device_routes.cpp`).
+/// `device_agent_row_json`'s exact 6-field set, `device_routes.cpp`: five registry-derived
+/// fields plus `guardian_backend`, which is derived from the heartbeat health store, not the
+/// registry).
 /// Deliberately does NOT carry `online`/`last_seen`/`segment`/`dex_score` —
 /// those are either hardcoded constants, never assigned, or DEX-family data
 /// server.cpp's `DeviceRow` type carries for the dashboard fragment; this
 /// seam's row is the narrower public REST/MCP shape only.
+///
+/// `guardian_backend` MUST stay the LAST member: several test doubles build this struct with
+/// designated initialisers, which must keep compiling when a later field is appended.
 struct DeviceListRow {
     std::string agent_id;
     std::string hostname;
     std::string os;       ///< "windows" | "linux" | "darwin" | "" (unknown)
     std::string arch;     ///< "x86_64" | "arm64" | "" (unknown)
     std::string agent_version;
+    /// "legacy" | "spark" | "spark_failed" | "unwired", taken from the server's closed token
+    /// table (guardian_backend_fleet_tags.hpp), never the raw heartbeat bytes. nullopt = NOT
+    /// REPORTED: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that
+    /// faulted this beat, a rejected or forged value, no heartbeat within the health store's
+    /// staleness window (kAgentHealthStaleness), or no heartbeat yet. It NEVER defaults to
+    /// "legacy". Serialised as JSON null, key always present.
+    std::optional<std::string> guardian_backend;
 };
 
 /// One tag triple — this seam's OWN shape (deliberately not `tag_store.hpp`'s
@@ -78,7 +90,7 @@ struct DeviceTagRow {
 };
 
 /// Single-device detail — the shape `GET /api/v1/devices/{id}` serves:
-/// `DeviceListRow`'s fields plus the device's tags.
+/// `DeviceListRow`'s fields (including `guardian_backend`) plus the device's tags.
 struct DeviceDetail {
     DeviceListRow row;
     std::vector<DeviceTagRow> tags;
@@ -104,6 +116,12 @@ public:
     /// See the file banner's UNSCOPED DATA PROVIDER note: unfiltered,
     /// fleet-wide, no tags. Never fails (a registry read has no degraded
     /// state) — an empty fleet is a valid, honest empty vector.
+    ///
+    /// COST: each row's `guardian_backend` costs one health-store lookup, taken under that
+    /// store's single mutex (the heartbeat upsert path) for one pass over the fleet. Six
+    /// production callers use this method and four discard the field (the dashboard device
+    /// fragment, the crypto hostname map, and two `.size()`-only counts); they pay the lookup
+    /// anyway. That cost was accepted deliberately (#2240) in preference to a second seam method.
     [[nodiscard]] virtual std::vector<DeviceListRow> list_devices() const = 0;
 
     /// Single-device lookup by id — the shape `GET /api/v1/devices/{id}`

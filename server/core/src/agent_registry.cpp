@@ -2408,6 +2408,54 @@ AgentHealthStore::net_snapshot(std::chrono::seconds staleness) const {
     return out;
 }
 
+namespace {
+/// The shared body of guardian_backend_for / guardian_backend_of: staleness filter, then the SAME
+/// closed-set parse recompute_metrics uses. nullopt for absent, empty, rejected or stale; never a
+/// default. Caller holds AgentHealthStore::mu_.
+std::optional<std::string_view>
+guardian_backend_from_snapshot(const AgentHealthSnapshot& snap,
+                               std::chrono::steady_clock::time_point now,
+                               std::chrono::seconds staleness) {
+    if ((now - snap.last_seen) > staleness)
+        return std::nullopt; // the sweep prunes only every 15 s, so the accessor filters itself
+    static const std::string kKeyGuardianBackend{kGuardianBackendTag};
+    const auto it = snap.status_tags.find(kKeyGuardianBackend);
+    if (it == snap.status_tags.end() || it->second.empty())
+        return std::nullopt; // NotReported
+    const auto idx = parse_guardian_backend_token(it->second);
+    if (!idx)
+        return std::nullopt; // rejected: counted by the gauge, null on the device
+    return guardian_backend_token_view(*idx);
+}
+} // namespace
+
+std::vector<std::optional<std::string_view>>
+AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
+                                       std::chrono::seconds staleness) const {
+    std::vector<std::optional<std::string_view>> out;
+    out.reserve(agent_ids.size());
+    std::lock_guard lock(mu_);
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& id : agent_ids) {
+        const auto it = snapshots_.find(id);
+        out.push_back(it == snapshots_.end()
+                          ? std::nullopt
+                          : guardian_backend_from_snapshot(it->second, now, staleness));
+    }
+    return out;
+}
+
+std::optional<std::string_view>
+AgentHealthStore::guardian_backend_of(const std::string& agent_id,
+                                      std::chrono::seconds staleness) const {
+    std::lock_guard lock(mu_);
+    const auto it = snapshots_.find(agent_id);
+    if (it == snapshots_.end())
+        return std::nullopt;
+    return guardian_backend_from_snapshot(it->second, std::chrono::steady_clock::now(),
+                                          staleness);
+}
+
 void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                          std::chrono::seconds staleness) {
     std::lock_guard lock(mu_);

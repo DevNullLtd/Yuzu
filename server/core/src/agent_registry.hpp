@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -1527,6 +1528,28 @@ public:
     /// needs. Same staleness contract as recompute_metrics (pass the same value
     /// so the dashboard and the yuzu_fleet_net_* gauges see the same population).
     std::vector<AgentHealthSnapshot> net_snapshot(std::chrono::seconds staleness) const;
+
+    /// #2240: the per-device twin of the yuzu_fleet_guardian_backend gauge. Same table, same
+    /// strict parse (guardian_backend_fleet_tags.hpp) and same staleness contract as
+    /// recompute_metrics, so the gauge and the device field cannot disagree on classification or
+    /// on who is live; pass kAgentHealthStaleness. The one remaining difference is SAMPLING: the
+    /// gauge is republished every 15 s sweep, these read the live store, so they can differ by up
+    /// to one sweep. CLOCK: last_seen (the tag rides every beat today; a status-beat split must
+    /// move this and the gauge together - see the header).
+    ///
+    /// `guardian_backend_for` returns one entry per input id, ALIGNED by index: the token
+    /// (a view into the header's constexpr table, static storage, safe after mu_ is released)
+    /// or nullopt for an id that is unknown to the store, stale, has no tag or an empty one, or
+    /// carries a rejected value. nullopt NEVER means `legacy`. It takes mu_ ONCE and does one hash
+    /// lookup per id with no string copies (list_devices has six callers, four of which discard
+    /// the field; see device_api.hpp). `guardian_backend_of` is the O(1) point lookup for
+    /// lookup_device (#3564: no scan, so a miss costs the same as a hit). Neither may be called
+    /// from a hot path; both are for Infrastructure:Read device reads.
+    [[nodiscard]] std::vector<std::optional<std::string_view>>
+    guardian_backend_for(std::span<const std::string> agent_ids,
+                         std::chrono::seconds staleness) const;
+    [[nodiscard]] std::optional<std::string_view>
+    guardian_backend_of(const std::string& agent_id, std::chrono::seconds staleness) const;
 
 private:
     mutable std::mutex mu_;
