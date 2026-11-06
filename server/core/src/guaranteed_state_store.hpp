@@ -155,6 +155,12 @@ struct GuardianAgentRuleStatus {
     std::string rule_id;
     std::string state;       // "compliant" | "drifted" | "errored"
     std::string updated_at;  // ISO-8601 of the event that set it
+    // Ordering evidence (schema v4). `order_uncertain` is sticky: the order of the verdict
+    // persisted for this pair cannot be proven. `projection_pending`: a retained event
+    // for this pair has not reached the row. Both false does not establish freshness or
+    // completeness: an event that never arrived leaves no trace.
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 // The DEX read-model value types (GuardianObservationRow + the Dex* observation
@@ -247,6 +253,27 @@ public:
     /// Test seam: a budget of 0 refuses every Apps read, so the refusal path is
     /// reachable without holding real concurrent queries.
     void set_apps_read_budget_for_test(int n) noexcept { apps_read_budget_ = n; }
+
+    /// Test seam for the census lock order: `fn` runs immediately after the pair-lock statement
+    /// (every pending event row of the (agent, rule) pair, locked in `ingest_seq` order) returns
+    /// and before the census row is touched, so a test can hold one writer at that point while a
+    /// second writer, or `delete_rule`, runs. Production leaves it empty (a no-op). Set it before
+    /// the store is used concurrently and clear it with an empty function.
+    void set_census_lock_barrier_for_test(std::function<void()> fn) {
+        census_lock_barrier_ = std::move(fn);
+    }
+
+    /// Test seam for the pre-commit health check: `fn` runs with the transaction's `PGconn*` (as
+    /// `void*`, this header does not include libpq) immediately before each of the three
+    /// `txn_healthy` checks (the repair of a redelivered pending event, a single-event insert, a
+    /// batch insert), so a test can put the transaction into the aborted state and prove the commit
+    /// is refused instead of reporting success for a transaction that stored nothing. The handle is
+    /// borrowed for the call only: do not retain it, and do not COMMIT or ROLLBACK through it.
+    /// Production leaves it empty (a no-op). Set it before the store is used concurrently and clear
+    /// it with an empty function.
+    void set_pre_commit_hook_for_test(std::function<void(void*)> fn) {
+        pre_commit_hook_ = std::move(fn);
+    }
 
     // Rule CRUD. Mutating methods return `std::expected<void, std::string>`
     // (fail-hard — ADR-0038 posture). Duplicate-UNIQUE collisions (name or
@@ -433,12 +460,21 @@ public:
     /// 0, on any store/query failure.
     std::expected<std::size_t, std::string>
     errored_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
+    /// COUNT(DISTINCT rule_id) of live rules with an order-uncertain census row or a pending event
+    /// on at least one in-scope represented pair; same scope contract as errored_rule_count.
+    std::expected<std::size_t, std::string>
+    uncertain_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
 
     std::size_t rule_count() const;
     /// Type-distinguishable twin of `rule_count()`: an error string on a store that is not open,
     /// a pool timeout or a failed query, never 0 (the degrade-collapsing `rule_count()` would
     /// read as an empty rule set).
     std::expected<std::size_t, std::string> rule_count_checked() const;
+
+    /// Events stored with pending census evidence (their census write failed; a redelivery or
+    /// `delete_rule` retires it). Bounded by a 5 s statement timeout; an error means "not
+    /// answered", never zero.
+    std::expected<std::int64_t, std::string> pending_projection_count_checked() const;
     std::size_t event_count() const;
 
     // Monotonic policy generation — the version stamp of the rule SET, bumped
@@ -539,6 +575,8 @@ private:
     std::atomic<uint64_t> events_dropped_{0};      // event_id conflict, MISMATCHED payload
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
+    std::function<void()> census_lock_barrier_;     // test seam, empty in production
+    std::function<void(void*)> pre_commit_hook_;    // test seam, empty in production
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the
