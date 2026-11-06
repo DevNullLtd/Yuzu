@@ -85,6 +85,25 @@ struct ExecutionPageSql {
     const std::optional<std::vector<std::string>>& visible_agents,
     std::chrono::milliseconds statement_timeout = kExecutionPageStatementTimeout);
 
+// ── Run-table size gauges ───────────────────────────────────────────────────
+
+/// Planner-estimate size of `workflow_engine.workflow_executions`, sampled on the server's
+/// maintenance tick (not per scrape and never COUNT(*)). Rows are never pruned (ADR-1005 residual
+/// 13), so these are the operator's only warning that the table is filling the shared Postgres
+/// volume. The gauges are absent until the first successful sample (a fabricated 0 would read as
+/// "empty table"); a failed sample leaves the previous value and bumps the unavailable counter.
+inline constexpr char kWorkflowExecutionsRowsMetric[] = "yuzu_server_workflow_executions_rows";
+inline constexpr char kWorkflowExecutionsBytesMetric[] = "yuzu_server_workflow_executions_bytes";
+inline constexpr char kWorkflowExecutionsStatsUnavailableMetric[] =
+    "yuzu_server_workflow_executions_stats_unavailable_total";
+
+/// What one sample of the run table reports. `rows` is `max(n_live_tup, reltuples)`, both planner
+/// estimates; `bytes` is `pg_total_relation_size` (heap + TOAST + indexes) of the same table.
+struct ExecutionTableEstimate {
+    std::int64_t rows{0};
+    std::int64_t bytes{0};
+};
+
 // ── WorkflowEngine ──────────────────────────────────────────────────────────
 
 class WorkflowEngine {
@@ -256,6 +275,19 @@ public:
 
     /// Cancel a running execution.
     std::expected<void, std::string> cancel_execution(const std::string& id);
+
+    /// One cheap read of the run table's size: a single catalog/statistics row, no table scan, in
+    /// one transaction bounded by a 250 ms lease acquire and a 250 ms `statement_timeout`.
+    /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) is a genuine failure and is never a zero.
+    std::expected<ExecutionTableEstimate, std::string> execution_table_estimate() const;
+
+    /// Samples `execution_table_estimate()` and publishes it to the wired metrics sink
+    /// (`kWorkflowExecutionsRowsMetric`, `kWorkflowExecutionsBytesMetric`). A failed sample
+    /// leaves both gauges at their previous value and counts
+    /// `kWorkflowExecutionsStatsUnavailableMetric`. Never throws; no-op without a sink. Called
+    /// from the maintenance tick (`health_recompute_thread_`), so it must stay inside that
+    /// thread's serial budget (about 0.5 s worst case).
+    void refresh_table_size_metrics() noexcept;
 
 private:
     pg::PgPool& pool_;

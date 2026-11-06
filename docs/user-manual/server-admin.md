@@ -5674,7 +5674,16 @@ What a run row holds, and how to treat it:
   its scope, so for a run that named more than 1,000 devices a reader whose devices were not stored
   does not see it. The legacy execute route shares the same insert and the same bound. Rows are
   still never trimmed, so size the Postgres volume for the run rate you expect: the bound caps
-  each row, not the number of rows.
+  each row, not the number of rows. The server watches the row count for you:
+  `yuzu_server_workflow_executions_rows` (an estimate, sampled about every 15 seconds without a
+  table scan) and `yuzu_server_workflow_executions_bytes` (heap, TOAST and indexes, step results
+  excluded) are exported, and the `YuzuWorkflowExecutionsTableLarge` alert warns when the estimate
+  stays above 100,000 rows for 30 minutes. That is about 130 MB if a typical run names 10 devices
+  and up to about 13 GB if every run names 1,000 or more. When it fires, read the bytes gauge,
+  then find the caller (a looping client appears as many rows in
+  `GET /api/v1/workflow-executions` and as `workflow.execute` audit rows from one principal) and
+  stop it. Nothing deletes rows for you and no route does, so reclaiming space is a DBA decision
+  that must account for the idempotency keys below.
 - **Classification.** The pairing of an operator's account name with a set of devices and a time is
   personal data about that operator (usage-class, like the audit log). Include `workflow_executions`
   in your data inventory and in any works-council or subject-access process. There is no per-row

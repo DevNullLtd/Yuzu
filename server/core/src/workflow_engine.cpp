@@ -1781,4 +1781,52 @@ std::expected<void, std::string> WorkflowEngine::cancel_execution(const std::str
     return std::unexpected("execution is already " + col_str(check.get(), 0, 0));
 }
 
+std::expected<ExecutionTableEstimate, std::string> WorkflowEngine::execution_table_estimate() const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+    // The same bounds as the other maintenance-tick samplers (count_stale_agents): this runs on a
+    // serial thread shared with the revocation sweep, so both the acquire and the statement are
+    // capped.
+    constexpr std::chrono::milliseconds kSampleAcquireTimeout{250};
+    std::optional<ExecutionTableEstimate> out;
+    std::string failure = "pool exhausted";
+    const bool ran = pool_.with_txn_for(kSampleAcquireTimeout, [&](PGconn* c) -> bool {
+        failure = "sample failed";
+        pg::PgResult t = pg::exec_params(c, "SET LOCAL statement_timeout = '250ms'",
+                                         std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        // One catalog row: reltuples is -1 until the first vacuum/analyze and n_live_tup restarts
+        // from 0 after a crash, so each covers the other's blind spot. Neither scans the table.
+        pg::PgResult res = pg::exec_params(
+            c,
+            "SELECT GREATEST(COALESCE(s.n_live_tup, 0), GREATEST(r.reltuples, 0)::bigint)::bigint, "
+            "pg_total_relation_size(r.oid)::bigint "
+            "FROM pg_class r LEFT JOIN pg_stat_user_tables s ON s.relid = r.oid "
+            "WHERE r.oid = 'workflow_engine.workflow_executions'::regclass",
+            std::vector<std::string>{});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+            return false;
+        out = ExecutionTableEstimate{to_i64(col(res.get(), 0, 0)), to_i64(col(res.get(), 0, 1))};
+        return true;
+    });
+    if (!ran || !out)
+        return std::unexpected(std::string(kDbErrorPrefix) + failure);
+    return *out;
+}
+
+void WorkflowEngine::refresh_table_size_metrics() noexcept {
+    if (!metrics_)
+        return;
+    try {
+        if (auto est = execution_table_estimate()) {
+            metrics_->gauge(kWorkflowExecutionsRowsMetric).set(static_cast<double>(est->rows));
+            metrics_->gauge(kWorkflowExecutionsBytesMetric).set(static_cast<double>(est->bytes));
+        } else {
+            metrics_->counter(kWorkflowExecutionsStatsUnavailableMetric).increment();
+        }
+    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the maintenance tick
+    }
+}
+
 } // namespace yuzu::server

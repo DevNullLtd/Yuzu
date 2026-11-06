@@ -3027,6 +3027,7 @@ groups:
           severity: warning
         annotations:
           summary: "Held-open responses are above 80% of the capacity the HTTP worker pool is sized for"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#server-cli-flags"
           description: >-
             yuzu_http_held_open_responses is above 80% of yuzu_http_held_open_capacity
             on {{ $labels.instance }} for 5 minutes. Every streaming surface and every
@@ -3053,6 +3054,7 @@ groups:
           severity: warning
         annotations:
           summary: "A workflow run's final status write failed twice and left its execution row running"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#a-workflow-run-left-running"
           description: >-
             yuzu_server_workflow_finalize_failed_total moved on {{ $labels.instance }}:
             a workflow run finished its steps but the final status write failed twice (a
@@ -3077,6 +3079,7 @@ groups:
           severity: warning
         annotations:
           summary: "Workflow runs are being refused because the server's held-open budget is full"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#server-cli-flags"
           description: >-
             Workflow runs on {{ $labels.instance }} have been refused with reason
             global_stream_cap, a refusal rate above zero over the last 5 minutes, for 10
@@ -3100,6 +3103,7 @@ groups:
           severity: warning
         annotations:
           summary: "A workflow-run idempotency key was repeated and the run it is bound to cannot be proven"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#a-workflow-run-left-running"
           description: >-
             yuzu_server_workflow_run_idempotent_total{outcome="indeterminate"} moved on
             {{ $labels.instance }}: a client repeated an idempotency key and the run it is
@@ -3116,6 +3120,39 @@ groups:
             response stores by plugin and time before re-running with a new key. The
             counter moves once per repeat, so a looping client raises it quickly: the
             rule is increase()[15m] > 0 with for: 2m, not a rate.
+
+      # Workflow run table growth (#2146, ADR-1005 residual 13). Run rows are never pruned, and a
+      # run row is bounded but not small: agent_ids_json stores at most 1,000 ids, about 131 KB
+      # (1,000 x (128-byte id + 2 quotes + comma)), before TOAST compression. 100,000 rows is
+      # therefore about 13 GB if every row were at that worst case and about 130 MB at a typical
+      # 10-device run (about 1.3 KB). The series is yuzu_server_workflow_executions_rows
+      # (WorkflowEngine::refresh_table_size_metrics, planner estimate, sampled about every 15 s);
+      # every replica reads the same table, so the rule collapses the replicas with max by (job).
+      - alert: YuzuWorkflowExecutionsTableLarge
+        expr: |
+          max by (job) (yuzu_server_workflow_executions_rows) > 100000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The workflow run table has passed 100,000 rows and nothing prunes it"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#workflow-run-records-are-not-pruned-2146"
+          description: >-
+            workflow_engine.workflow_executions holds an estimated {{ $value | humanize }}
+            rows (yuzu_server_workflow_executions_rows, job {{ $labels.job }}) and has been
+            above 100,000 for 30 minutes. Run rows are never deleted, so the table only
+            grows, on the same Postgres that holds the audit, auth and session tables. A
+            row stores at most 1,000 device ids (about 131 KB before compression), so
+            100,000 rows is about 130 MB if a typical run names 10 devices and up to about
+            13 GB if every run named 1,000 or more. Read
+            yuzu_server_workflow_executions_bytes for the real size (heap, TOAST and
+            indexes), then find the caller: a looping client shows up as many rows in
+            GET /api/v1/workflow-executions and as workflow.execute audit rows from one
+            principal. Stop the loop, and size or grow the Postgres volume; there is no
+            supported delete route, so reclaiming space is a DBA decision (see the
+            runbook). The count is a planner estimate (the larger of reltuples and
+            n_live_tup), and the step results table is not included. The
+            threshold is a sizing claim, not tuned against fleet data.
 
   - name: yuzu-tls
     rules:

@@ -7346,14 +7346,16 @@ tests:
   # against the C++ source by tests/test_workflow_run_metrics_wiring_lexical.py, so a rename there
   # cannot leave a rule that parses and can never fire (#2553).
   #
-  # PROMTOOL WAS NOT AVAILABLE where these were first written (no native binary, no pulled image),
-  # so the timings below follow the measured shapes of their siblings rather than a run of their
-  # own: YuzuWorkflowRunGlobalCapRefused copies YuzuDispatchRecordWriteFailing's cases A-D (the same
-  # `rate(...[5m]) > 0` + `for: 10m` expression, whose times were measured against the pinned
-  # image), and the two `increase()` rules assert only times a full minute clear of the boundary.
-  # Run them through tests/prometheus/run_promtool_tests.py before trusting them.
+  # These cases were first written without promtool (no native binary, no pulled image), copying
+  # the measured shapes of their siblings. They have since been run: the whole file passed under
+  # the pinned image with `YUZU_TEST_ENABLE_PROMTOOL_DOCKER=1 python3
+  # tests/prometheus/run_promtool_tests.py` (exit 0, sharded alerts file ran, canary red) on the
+  # tree that added YuzuWorkflowExecutionsTableLarge (196 rules). Only that rule's cases were
+  # mutation-run (see the table-growth section below); the cases for the four rules in this
+  # section were run green but their "which case catches which change" lines are still reasoned,
+  # NOT mutation-run.
   #
-  # Which case is meant to catch which change to which rule (reasoned, NOT mutation-run: see above):
+  # Which case is meant to catch which change to which rule (reasoned, NOT mutation-run):
   #   YuzuHeldOpenUtilisationHigh
   #     * `> 0.8` weakened to `>= 0.8`                -> held-open case B (exactly 0.8 must be quiet)
   #     * `for: 5m` shortened to 2m or lengthened     -> held-open cases A and C (pending at 6m,
@@ -7664,4 +7666,77 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate=~"firing|pending"}'
         eval_time: 18m
+        exp_samples: []
+
+  # -- Workflow run table growth (group yuzu-dispatch, #2146) ------------------------------------
+  #
+  # YuzuWorkflowExecutionsTableLarge reads yuzu_server_workflow_executions_rows, a gauge every
+  # replica exports for the same shared table, and collapses them with `max by (job)`. Names are
+  # checked against the C++ source by tests/test_workflow_run_metrics_wiring_lexical.py.
+  #
+  # TABLE CASE A -- two replicas report the same table above 100,000 from minute 5: pending at 20m,
+  # still quiet at 30m (`for: 30m`, firing from 35m), firing at 40m and 60m, and exactly ONE alert
+  # for the two replicas. RED if the `max by (job)` collapse becomes a per-instance rule (two
+  # samples), if `for:` is shortened below 25m (firing at 30m) or lengthened past 35m (quiet at 40m).
+  # MUTATION-RUN on the pinned image, each reddening this file and each restored byte-identical
+  # (sha256 checked): threshold 100000 -> 200000 (cases A and C), `>` -> `>=` (case B), `for: 30m`
+  # -> `for: 10m` (case A fires at 30m), and `max by (job) (...)` -> the bare selector (case A sees
+  # two per-instance alerts).
+  - interval: 1m
+    name: workflow executions table - two replicas above 100000 for 30 minutes fire one alert
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "1000x4 150000x80"
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s2"}'
+        values: "1000x4 150000x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="pending"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="pending", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # TABLE CASE B -- exactly 100,000 rows and a table well under it are quiet: the threshold is
+  # strictly greater than 100000. RED if `>` is weakened to `>=` or the number is lowered.
+  - interval: 1m
+    name: workflow executions table - exactly 100000 rows and below are quiet
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "100000x80"
+      - series: 'yuzu_server_workflow_executions_rows{job="other",instance="s2"}'
+        values: "5000x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 70m
+        exp_samples: []
+
+  # TABLE CASE C -- a table that crosses 100,000 for ten minutes and then falls back (a DBA
+  # cleanup, a wrong estimate corrected by autovacuum) never reaches the 30 minute `for:`. RED if
+  # `for:` is lost.
+  - interval: 1m
+    name: workflow executions table - a ten minute excursion above 100000 never fires
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "1000x4 150000x9 1000x70"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="pending", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 50m
         exp_samples: []

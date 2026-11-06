@@ -1333,7 +1333,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            so the account name, the key and the agent list (at most 1,000 ids, about
            131 KB per run: a longer list stores its first 1,000 ids and a count and
            digest marker, `stored_agent_ids_json`) stay for the life of the database, and a deleted-and-
-           recreated username inherits the old account's keys.
+           recreated username inherits the old account's keys. The table now has a size
+           gauge (`yuzu_server_workflow_executions_rows`, `_bytes`) and a growth alert
+           (`YuzuWorkflowExecutionsTableLarge`, above 100,000 rows for 30 minutes); the
+           rows are still never pruned.
 
 ## Interim rules (until the named follow-ups ship)
 

@@ -7783,6 +7783,27 @@ public:
                                   "an orphan nothing closes. #2146.",
                                   "counter");
                 metrics_.counter("yuzu_server_workflow_finalize_failed_total", {});
+                // Run-table size (ADR-1005 residual 13: rows are never pruned). The gauges are
+                // sampled on health_recompute_thread_ and are ABSENT until the first successful
+                // sample, never a fabricated 0; only the failure counter is pre-seeded.
+                metrics_.describe(yuzu::server::kWorkflowExecutionsRowsMetric,
+                                  "Estimated rows in workflow_engine.workflow_executions, the "
+                                  "larger of the planner's reltuples and n_live_tup, sampled "
+                                  "about every 15 seconds without a table scan. Absent until the "
+                                  "first successful sample; a failed sample keeps the previous "
+                                  "value. Run rows are never pruned. #2146.",
+                                  "gauge");
+                metrics_.describe(yuzu::server::kWorkflowExecutionsBytesMetric,
+                                  "pg_total_relation_size of workflow_engine.workflow_executions "
+                                  "(heap, TOAST and indexes) in bytes, sampled with the row "
+                                  "estimate. The step results table is not included. #2146.",
+                                  "gauge");
+                metrics_.describe(yuzu::server::kWorkflowExecutionsStatsUnavailableMetric,
+                                  "Samples of the workflow run table size that failed (no pool "
+                                  "lease within 250 ms, statement timeout or query error); the "
+                                  "two gauges keep their previous value. #2146.",
+                                  "counter");
+                metrics_.counter(yuzu::server::kWorkflowExecutionsStatsUnavailableMetric, {});
                 metrics_.describe("yuzu_server_workflow_engine_writes_total",
                                   "WorkflowEngine create_workflow/delete_workflow/execute/"
                                   "cancel_execution outcomes, by op and result. ADR-0064.",
@@ -9578,6 +9599,10 @@ public:
                         .set(static_cast<double>(stream_budget_->active_for_surface(
                             yuzu::server::detail::SseSurface::kWorkflowRun)));
                 }
+                // Workflow run table size: one catalog row, bounded to ~0.5 s worst case and
+                // noexcept (a failed sample keeps the previous gauge values).
+                if (workflow_engine_)
+                    workflow_engine_->refresh_table_size_metrics();
                 if (pg_pool_) {
                     metrics_.gauge("yuzu_pg_pool_in_use")
                         .set(static_cast<double>(pg_pool_->in_use()));

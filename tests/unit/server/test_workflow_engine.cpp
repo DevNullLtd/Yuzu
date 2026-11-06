@@ -3777,3 +3777,91 @@ TEST_CASE("WorkflowEngine: a run over the stored-id cap dispatches to the full l
                          "SELECT count(*) FROM workflow_engine.workflow_executions") == 1);
     }
 }
+
+// ── Run-table size gauges (#2146, ADR-1005 residual 13) ──────────────────────
+
+TEST_CASE("WorkflowEngine: the run-table size estimate reflects inserted runs and the refresh "
+          "publishes it fail-soft",
+          "[workflow_engine][pg][table_size]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db_fx_, workflow_engine_tpl);
+    PgPool pool{{.conninfo = wf_db_fx_.dsn(), .size = 2, .lock_timeout_ms = 5000}};
+    REQUIRE(pool.valid());
+    WorkflowEngine engine{pool};
+    REQUIRE(engine.is_open());
+    yuzu::MetricsRegistry metrics;
+    engine.set_metrics(&metrics);
+    const auto wf_id = *engine.create_workflow(kOneStepYaml);
+
+    const auto analyze = [&] {
+        PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r = yuzu::server::pg::exec_params(
+            conn.get(), "ANALYZE workflow_engine.workflow_executions", std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+    const auto serialized_has = [&](std::string_view name) {
+        return metrics.serialize().find(name) != std::string::npos;
+    };
+
+    SECTION("the gauges are absent until the first successful sample, never a fabricated zero") {
+        CHECK_FALSE(serialized_has(kWorkflowExecutionsRowsMetric));
+        CHECK_FALSE(serialized_has(kWorkflowExecutionsBytesMetric));
+        engine.refresh_table_size_metrics();
+        CHECK(serialized_has(kWorkflowExecutionsRowsMetric));
+        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 0.0);
+        CHECK(metrics.gauge(kWorkflowExecutionsBytesMetric).value() > 0.0); // indexes exist empty
+        CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 0.0);
+    }
+    SECTION("inserted runs show in the estimate once the planner statistics have them") {
+        for (int i = 0; i < 3; ++i)
+            REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
+        analyze();
+        const auto est = engine.execution_table_estimate();
+        REQUIRE(est.has_value());
+        CHECK(est->rows == 3);
+        CHECK(est->bytes > 0);
+        engine.refresh_table_size_metrics();
+        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 3.0);
+        CHECK(metrics.gauge(kWorkflowExecutionsBytesMetric).value() ==
+              static_cast<double>(est->bytes));
+    }
+    SECTION("a failed sample keeps the previous value and counts the failure") {
+        for (int i = 0; i < 2; ++i)
+            REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
+        analyze();
+        engine.refresh_table_size_metrics();
+        REQUIRE(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 2.0);
+
+        // An ACCESS EXCLUSIVE lock makes pg_total_relation_size wait; the 250 ms statement
+        // timeout ends the sample as a failure. Grow the table first so a wrongly published value
+        // would differ from the held one.
+        REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
+        analyze();
+        PgConn holder{PQconnectdb(wf_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+        for (const char* sql : {"BEGIN", "LOCK TABLE workflow_engine.workflow_executions "
+                                         "IN ACCESS EXCLUSIVE MODE"}) {
+            PgResult r =
+                yuzu::server::pg::exec_params(holder.get(), sql, std::vector<std::string>{});
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+        const auto blocked = engine.execution_table_estimate();
+        REQUIRE_FALSE(blocked.has_value());
+        CHECK(blocked.error().starts_with(kDbErrorPrefix));
+        engine.refresh_table_size_metrics();
+        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 2.0); // held, not zeroed
+        CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 1.0);
+
+        PgResult release =
+            yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+        REQUIRE(release.status() == PGRES_COMMAND_OK);
+        engine.refresh_table_size_metrics();
+        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 3.0);
+        CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 1.0);
+    }
+    SECTION("without a metrics sink the refresh is a no-op") {
+        engine.set_metrics(nullptr);
+        engine.refresh_table_size_metrics();
+        CHECK_FALSE(serialized_has(kWorkflowExecutionsRowsMetric));
+    }
+}
