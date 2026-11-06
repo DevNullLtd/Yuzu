@@ -20,6 +20,15 @@ std::string id_json_text(std::string_view id) {
                                                 nlohmann::json::error_handler_t::replace);
 }
 
+// An id the stored copy never holds. Over `kStoredAgentIdMaxBytes` it cannot be a registered agent
+// id. One containing a NUL byte cannot either (registration refuses it), and it must not be
+// stored: nlohmann writes it as a `\u0000` escape, which jsonb refuses, and one such escape takes
+// the whole column out of every confined list, the creator's own included. Skipping it hides no
+// device.
+bool unstorable_id(std::string_view id) {
+    return id.size() > kStoredAgentIdMaxBytes || id.find('\0') != std::string_view::npos;
+}
+
 } // namespace
 
 std::string stored_agent_ids_json(const std::vector<std::string>& agent_ids,
@@ -49,14 +58,18 @@ std::string stored_agent_ids_json(const std::vector<std::string>& agent_ids,
         return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     };
 
-    // Whole copy: every distinct id fits the count and byte bounds and none is over-long.
+    // Whole copy: every distinct id fits the count and byte bounds and none is unstorable.
     {
         std::size_t bytes = 2; // '[' and ']'
         bool whole = distinct.size() <= max;
         for (std::size_t i = 0; whole && i < distinct.size(); ++i) {
             const auto& id = *distinct[i];
+            if (unstorable_id(id)) {
+                whole = false;
+                break;
+            }
             bytes += id_json_text(id).size() + (i == 0 ? 0 : 1);
-            whole = id.size() <= kStoredAgentIdMaxBytes && bytes <= max_bytes;
+            whole = bytes <= max_bytes;
         }
         if (whole)
             return dump(to_array(distinct));
@@ -64,7 +77,7 @@ std::string stored_agent_ids_json(const std::vector<std::string>& agent_ids,
 
     // Bounded copy: the ids `first` accepts, then the rest, each group in first-seen order,
     // admitted while the count, the byte budget (less the marker's reserve) and the per-id length
-    // allow; admission stops at the first id that would not fit. An over-long id is never stored.
+    // allow; admission stops at the first id that would not fit. An unstorable id is never stored.
     const std::size_t id_budget =
         max_bytes > kStoredAgentIdsMarkerReserve ? max_bytes - kStoredAgentIdsMarkerReserve : 0;
     std::vector<const std::string*> kept;
@@ -75,7 +88,7 @@ std::string stored_agent_ids_json(const std::vector<std::string>& agent_ids,
             if (!open)
                 return;
             const auto& id = *idp;
-            if ((first && first(id)) != want_first || id.size() > kStoredAgentIdMaxBytes)
+            if (unstorable_id(id) || (first && first(id)) != want_first)
                 continue;
             const auto add = id_json_text(id).size() + (kept.empty() ? 0 : 1);
             if (kept.size() >= max || bytes + add > id_budget) {

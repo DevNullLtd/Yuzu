@@ -3880,6 +3880,50 @@ TEST_CASE("stored_agent_ids_json: distinct ids are bounded by count and by bytes
         REQUIRE_NOTHROW(text = stored_agent_ids_json({bad, "agent-ok"}));
         CHECK(nlohmann::json::parse(text, nullptr, false).is_array());
     }
+    SECTION("an id holding a NUL byte is skipped and counted, never stored (jsonb refuses it)") {
+        const std::string nul("a\0b", 3);
+        const auto text = stored_agent_ids_json({"real-1", nul, "real-2"});
+        CHECK(text.find("u0000") == std::string::npos);
+        CHECK(strings_of(text) == std::vector<std::string>{"real-1", "real-2"});
+        CHECK(stored_agent_ids_total(text) == 3); // counted, so the copy carries the marker
+        const auto parsed = nlohmann::json::parse(text);
+        CHECK(parsed.back()["sha256"].get<std::string>() ==
+              *sha256_hex(nlohmann::json::array({"real-1", nul, "real-2"}).dump(
+                  -1, ' ', false, nlohmann::json::error_handler_t::replace)));
+
+        // A NUL id that is the only id leaves just the marker (it names no device).
+        const auto only = stored_agent_ids_json({nul});
+        CHECK(strings_of(only).empty());
+        CHECK(stored_agent_ids_total(only) == 1);
+
+        // The hook is not asked about an id that is never stored, and the creator's own ids still
+        // come first.
+        std::vector<std::string> asked;
+        const auto cut = stored_agent_ids_json(
+            {nul, "other", "mine"},
+            [&](const std::string& id) {
+                asked.push_back(id);
+                return id == "mine";
+            });
+        CHECK(strings_of(cut) == std::vector<std::string>{"mine", "other"});
+        CHECK(std::find(asked.begin(), asked.end(), nul) == asked.end());
+
+        // A NUL id sitting past the count cap or inside a budget-truncated list changes nothing
+        // for the ids that are stored.
+        auto many = numbered_agent_ids(kStoredAgentIdsMax);
+        many.insert(many.begin() + 10, nul);
+        const auto capped = stored_agent_ids_json(many);
+        CHECK(strings_of(capped).size() == kStoredAgentIdsMax);
+        CHECK(stored_agent_ids_total(capped) == static_cast<std::int64_t>(kStoredAgentIdsMax + 1));
+
+        // The reader oracle still sees the run through the ids that were stored.
+        WorkflowExecution we;
+        we.agent_ids_json = text;
+        CHECK(workflow_execution_visible(
+            we, authz::VisibleSet{std::unordered_set<std::string>{"real-2"}}));
+        CHECK_FALSE(workflow_execution_visible(
+            we, authz::VisibleSet{std::unordered_set<std::string>{nul}}));
+    }
     SECTION("the marker fits inside the budget even for a count-truncated 128 byte id list") {
         std::vector<std::string> ids;
         for (std::size_t i = 0; i < 1001; ++i)
@@ -4002,6 +4046,41 @@ TEST_CASE("WorkflowEngine: a run over the stored-id cap dispatches to the full l
         CHECK(page2->rows[0].id == id);
         (void)id2;
         (void)d2;
+    }
+    SECTION("an id holding a NUL byte keeps the stored column valid jsonb and the run listed for "
+            "every reader that could see it") {
+        const std::string nul("dev\0x", 5);
+        const std::vector<std::string> agents{"mine", nul, "other"};
+        std::vector<std::string> received;
+        StepDispatchFn fn = [&received](const std::string&, const std::string& agent_json,
+                                        const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            received.clear();
+            for (const auto& a : nlohmann::json::parse(agent_json))
+                received.push_back(a.get<std::string>());
+            return std::string(R"({"status":"ok"})");
+        };
+        WorkflowRunControl control;
+        control.stored_copy_first = [](const std::string& id) { return id == "mine"; };
+        const auto r = engine.execute(wf_id, agents, fn, nullptr, control);
+        REQUIRE(r.has_value());
+        CHECK(received == agents); // dispatch is the list as the caller sent it, NUL id included
+
+        const auto stored = stored_agent_ids_of(wf_db_fx_.dsn(), *r);
+        CHECK(stored_agent_ids_total(stored) == 3);
+        CHECK(nlohmann::json::parse(stored).size() == 3); // two ids and the marker
+        CHECK(count_rows(wf_db_fx_.dsn(),
+                         "SELECT CASE WHEN pg_input_is_valid(agent_ids_json, 'jsonb') THEN 1 "
+                         "ELSE 0 END FROM workflow_engine.workflow_executions") == 1);
+        for (const auto& reader : {"mine", "other"}) { // the creator, and a reader scoped to another id
+            const auto page = engine.query_executions_page({}, std::vector<std::string>{reader});
+            REQUIRE(page.has_value());
+            REQUIRE(page->rows.size() == 1);
+            CHECK(page->rows[0].id == *r);
+        }
+        const auto none = engine.query_executions_page({}, std::vector<std::string>{"elsewhere"});
+        REQUIRE(none.has_value());
+        CHECK(none->rows.empty());
     }
     SECTION("padding the list with one id does not hide a real id from a reader scoped to it") {
         std::vector<std::string> agents(kStoredAgentIdsMax, "agent-X");

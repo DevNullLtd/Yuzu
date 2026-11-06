@@ -47,8 +47,9 @@ inline constexpr std::size_t kStoredAgentIdsMax = 1000;
 /// legacy execute route checks no id length, so the count alone does not bound the column.
 inline constexpr std::size_t kStoredAgentIdsMaxBytes = 131072;
 
-/// An id longer than this is never stored (it is counted in the marker's total and digest). It is
-/// `auth::kMaxAgentIdLength`, the longest id any agent can have, so no real device is dropped.
+/// An id longer than this, or containing a NUL byte, is never stored (it is counted in the marker's
+/// total and digest). This is `auth::kMaxAgentIdLength`, the longest id any agent can have, and
+/// registration refuses a NUL, so no real device is dropped.
 inline constexpr std::size_t kStoredAgentIdMaxBytes = 256;
 
 /// Bytes held back from the budget for the truncation marker (about 125 with a 20 digit total).
@@ -58,13 +59,14 @@ inline constexpr std::size_t kStoredAgentIdsMarkerReserve = 160;
 ///
 /// The ids are first reduced to the DISTINCT ids in first-seen order (duplicates are dropped before
 /// any bound, so padding a list with copies of one id cannot push a real id out). If every distinct
-/// id is at most `kStoredAgentIdMaxBytes` long, there are at most `max` of them and their JSON text
-/// is at most `max_bytes`, the column is that JSON array of strings, and a list with no duplicates
-/// is stored unchanged. Otherwise it holds the ids admitted in this order: those for which `first`
-/// answers true (the caller's own visible devices, so a confined caller can still see the run it
-/// started), then the rest, each group in first-seen order. Admission stops at `max` ids or when
+/// id is at most `kStoredAgentIdMaxBytes` long and holds no NUL byte, there are at most `max` of
+/// them and their JSON text is at most `max_bytes`, the column is that JSON array of strings, and a
+/// list with no duplicates is stored unchanged. Otherwise it holds the ids admitted in this order:
+/// those for which `first` answers true (the caller's own visible devices, so a confined caller can
+/// still see the run it started), then the rest, each group in first-seen order. Admission stops at `max` ids or when
 /// the next id would take the text past `max_bytes` less `kStoredAgentIdsMarkerReserve`; an id over
-/// `kStoredAgentIdMaxBytes` is skipped. The array is then followed by ONE non-string element, the
+/// `kStoredAgentIdMaxBytes`, or holding a NUL byte, is skipped (so a copy that skipped one carries
+/// the marker even for a short list). The array is then followed by ONE non-string element, the
 /// marker `{"truncated":true,"total":<DISTINCT ids named>,"sha256":"<hex>"}`. `total` counts every
 /// distinct id including the skipped ones; `sha256` is the digest of the JSON text of the distinct
 /// list in first-seen order (the order the dispatcher received it, not the stored order), and is

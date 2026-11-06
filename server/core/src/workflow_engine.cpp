@@ -1607,6 +1607,9 @@ namespace {
 // with its direction in the "SQL visibility predicate" tests:
 //   - jsonb refuses a `\u0000` escape or a UTF-8 byte-order mark; nlohmann takes both. The whole
 //     document is "not an array" here, so a confined caller does NOT see the run (safe direction).
+//     An id holding a NUL byte is how a `\u0000` escape would reach the column, so
+//     `stored_agent_ids_json` skips it (counted in the marker's total, never stored): the engine
+//     itself never writes one. A byte-order mark cannot arrive through an id.
 //   - jsonb takes a number past double range (`["a1",1e400]`); nlohmann rejects the document. A
 //     confined caller whose scope holds "a1" DOES see the run here while the oracle hides it, so a
 //     listed run's detail read can answer not-visible. The run still names an in-scope agent, so
@@ -1841,7 +1844,13 @@ void WorkflowEngine::refresh_table_size_metrics() noexcept {
             note_failure(est.error());
         }
     } catch (const std::exception& e) {
-        note_failure(std::string("exception: ") + e.what());
+        // The cause string is built here, outside note_failure's own try, so an allocation failure
+        // while building it must not leave this noexcept function: it falls back to a fixed token.
+        try {
+            note_failure(std::string("exception: ") + e.what());
+        } catch (...) {
+            note_failure("exception");
+        }
     } catch (...) {
         note_failure("exception");
     }
