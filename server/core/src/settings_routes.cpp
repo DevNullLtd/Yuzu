@@ -2596,8 +2596,14 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
         // Nothing stored: keep the user's edits and the CURRENT revision (the REST ETag rule).
         DexTierPreview preview;
         preview.degraded = true;
-        if (dex_apps_fn_)
-            preview = dex_tier_preview(dex_apps_fn_(std::nullopt), dex_apps_fn_(r.in_force));
+        // "Now" is scored under the revision this handler read (the one the form edits), through
+        // the same explicit-policy path as the proposal, never under the provider's cache, which
+        // can trail another replica's write by a refresh interval. If that read and the dry run's
+        // own disagree, a write landed between them: unavailable is the honest answer.
+        if (dex_apps_fn_ && current && current->revision == r.previous_revision) {
+            const std::optional<DexPolicyInForce> now{*current};
+            preview = dex_tier_preview(dex_apps_fn_(now), dex_apps_fn_(r.in_force));
+        }
         res.set_header("HX-Trigger", dex_scoring_toast("Preview only: nothing saved", "success"));
         res.set_content(render_dex_scoring_section(shown, true, r.previous_revision, &posted,
                                                    std::nullopt, std::move(preview), ""),

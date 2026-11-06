@@ -155,7 +155,9 @@ split_override_key(std::string_view name) {
 }
 
 /// {key: value} of the keys named in `v` under `base`; a blank value is skipped when
-/// `skip_blank` (an override inherits), else carried so the validator names it.
+/// `skip_blank` (an override inherits), else carried so the validator names it. Blank is empty
+/// for a name (a space is a valid name character the validator accepts, so it keeps its bytes)
+/// and empty-after-trim for a number (a number cannot contain a space).
 template <class Keys>
 [[nodiscard]] inline json collect(const DexFormValues& v, const std::string& base,
                                   const Keys& keys, std::size_t count, bool numeric,
@@ -165,7 +167,7 @@ template <class Keys>
         const auto it = v.find(base + "." + std::string(keys[i]));
         if (it == v.end())
             continue;
-        if (skip_blank && trim(it->second).empty())
+        if (skip_blank && (numeric ? trim(it->second).empty() : it->second.empty()))
             continue;
         out[std::string(keys[i])] = numeric ? number_or_string(it->second) : json(it->second);
     }
@@ -201,7 +203,8 @@ inline void attach(json& obj, const char* key, json&& child) {
 }
 
 /// The submitted values, later duplicates winning, with every override row that carries
-/// nothing at all dropped (the blank trailing row a browser always submits).
+/// nothing at all dropped (the blank trailing row a browser always submits: empty strings, never
+/// whitespace, so a value of spaces is content and keeps its row).
 [[nodiscard]] inline DexFormValues dex_form_values(const DexFormPairs& pairs) {
     using namespace dex_form_detail;
     DexFormValues v;
@@ -211,7 +214,7 @@ inline void attach(json& obj, const char* key, json&& child) {
         const std::string pre = row_key(row, "");
         bool blank = true;
         for (auto it = v.lower_bound(pre); it != v.end() && it->first.starts_with(pre); ++it)
-            if (!trim(it->second).empty())
+            if (!it->second.empty())
                 blank = false;
         if (blank)
             for (auto it = v.lower_bound(pre); it != v.end() && it->first.starts_with(pre);)
@@ -288,7 +291,9 @@ dex_form_to_document(const DexFormPairs& pairs) {
     DexFormDocument out;
     json arr = json::array();
     for (const int row : rows) {
-        const std::string image = trim(value_of(v, row_key(row, "image")));
+        // The image key keeps its bytes: the validator accepts a space in a key, so trimming here
+        // would re-address a stored override on an unrelated save.
+        const std::string& image = value_of(v, row_key(row, "image"));
         if (value_of(v, row_key(row, "remove")) == "on")
             continue;
         // dex_form_values already dropped every all-blank row, so a row that reaches here with no

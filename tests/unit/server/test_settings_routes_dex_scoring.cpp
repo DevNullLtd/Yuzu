@@ -122,6 +122,12 @@ struct Harness {
     std::string refuse_result;
     int apps_calls{0};
     bool apps_degraded{false};
+    // What the shared scorer's provider cache still holds when it is asked for "the policy in
+    // force" (nullopt): unset = the store, set = a replica-lagged older write.
+    std::optional<std::string> lagging_cache;
+    // A write that lands right after the first store read (the handler's own), before the
+    // writer's.
+    std::optional<std::string> write_after_first_read;
 
     explicit Harness(bool wire_writer = true, bool wire_apps = true) {
         provider = std::make_shared<DexScorePolicyProvider>(
@@ -173,7 +179,7 @@ struct Harness {
                 DexAppsModel m;
                 m.window = "7d";
                 m.degraded = apps_degraded;
-                m.policy = p ? *p : dex_policy_in_force_from_stored(stored);
+                m.policy = p ? *p : dex_policy_in_force_from_stored(lagging_cache ? lagging_cache : stored);
                 // outlook.exe is Excellent until the excellent edge rises above 90.
                 m.apps = {DexAppStability{.subject = "outlook.exe",
                                           .figures = scored(m.policy.policy.tiers.edges.excellent > 90.0
@@ -212,7 +218,10 @@ struct Harness {
             ++reads;
             if (read_fails)
                 return std::unexpected(std::string("store down"));
-            return stored;
+            const auto seen = stored;
+            if (reads == 1 && write_after_first_read)
+                stored = write_after_first_read;
+            return seen;
         };
         d.compare_and_set = [this](const std::optional<std::string>& expected,
                                    const std::string& canonical,
@@ -522,6 +531,36 @@ TEST_CASE("scoring preview: validates, stores nothing, keeps the edits and the c
     CHECK(has(res->body, "1 of 2 applications change tier"));
     CHECK(has(res->body, "<td>outlook.exe</td><td>excellent</td><td>good</td>"));
     CHECK(has(res->get_header_value("HX-Trigger"), "Preview only"));
+}
+
+TEST_CASE("scoring preview: the current side is scored under the revision being edited, not the cache",
+          "[server][routes][dex][score_policy][scoring]") {
+    // The shared scorer's provider cache still holds another replica's older write (excellent
+    // edge 95, so outlook.exe is Good); the store, and the form's revision, are the default.
+    // Previewing the unchanged default must change nothing, whatever the cache says.
+    Harness h;
+    h.lagging_cache = doc_with_excellent(95.0);
+    const auto res =
+        h.post(kPreview, form_body(dex_form_values(dex_default_score_policy()), "default"), kHx);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "0 of 2 applications change tier"));
+    CHECK(h.cas_calls == 0);
+    CHECK_FALSE(h.stored);
+}
+
+TEST_CASE("scoring preview: a write between the handler's read and the dry run is unavailable",
+          "[server][routes][dex][score_policy][scoring]") {
+    // The handler reads the default; before the writer's own read the store moves to a document
+    // whose revision the form carries, so the dry run passes while the two reads disagree.
+    Harness h;
+    h.write_after_first_read = doc_with_excellent(95.0);
+    const auto rev = dex_score_policy_revision(*h.write_after_first_read);
+    const auto res = h.post(kPreview, form_body(dex_form_values(policy_with_excellent(95.0)), rev), kHx);
+    CHECK(res->status == 200);
+    CHECK(has(res->get_header_value("HX-Trigger"), "Preview only"));
+    CHECK(has(res->body, "Preview unavailable"));
+    CHECK(h.cas_calls == 0);
+    CHECK(h.stored == doc_with_excellent(95.0));
 }
 
 TEST_CASE("scoring preview: degraded or unwired scoring says unavailable and stores nothing",

@@ -564,13 +564,17 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // refused here (the hardware row's reasoning).
     {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
     // /api/settings/dex-scoring: the DEX Scoring tab's three POSTs (settings_routes.cpp). The
-    // body is the whole policy as a urlencoded form: 200 override rows of 17 fields come to about
-    // 150 KB, and a hostile image name can roughly triple a field's size, so 320 KiB (the REST
-    // row's cap above, for the same document) never refuses a legitimate form while an
-    // unauthenticated flood is held 12x under the 4 MiB catch-all. requires_measurable = true
-    // for the same reason as the REST row: the admin gate runs in the handler, after httplib
-    // buffers the body.
-    {kBodyCapAnyMethod, "/api/settings/dex-scoring", 320u * 1024, true, "dex_score_policy_form"},
+    // body is the whole policy as a urlencoded form, and Save, Preview and Reset each submit all
+    // of it. Worst case from the document's own limits: 200 override rows (kDexPolicyMaxOverrides)
+    // of 15 fields plus the Remove box, each with a 260-byte key (kDexPolicyMaxKeyBytes) of
+    // punctuation that percent-encodes to 3 bytes a character (780 B), four 24-byte names
+    // (288 B encoded), 17-digit numbers, and field names whose brackets are encoded too
+    // (`overrides%5B199%5D.`): about 1.8 KB a row, so about 360 KB with the globals. 512 KiB holds
+    // that with ~1.45x headroom and stays 8x under the 4 MiB catch-all; test_body_cap_policy.cpp
+    // rebuilds the worst case and pins it under this cap. The REST row above stays 320 KiB: its
+    // body is the 256 KiB JSON document. requires_measurable = true for the same reason as the
+    // REST row: the admin gate runs in the handler, after httplib buffers the body.
+    {kBodyCapAnyMethod, "/api/settings/dex-scoring", 512u * 1024, true, "dex_score_policy_form"},
     // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
     // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB

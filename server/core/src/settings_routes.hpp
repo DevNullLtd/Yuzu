@@ -117,8 +117,10 @@ public:
         dex_score_policy_writer_ = std::move(deps);
     }
 
-    /// Scores the Apps model (7 days, all platforms) under the policy in force (nullopt) or
-    /// under a substituted one (a value): the production scorer, never a recomputation here.
+    /// Scores the Apps model (7 days, all platforms) under the policy in force (nullopt: the
+    /// provider's cache, which can trail another replica's write by a refresh interval, used for
+    /// the suggestions only) or under an explicit one (a value; the preview scores both its
+    /// sides this way): the production scorer, never a recomputation here.
     /// Feeds the image-name suggestions and the pre-save tier-change preview. Set only where
     /// the signals store exists; with it unset the tab still edits, without suggestions and
     /// with the preview answering "unavailable".

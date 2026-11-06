@@ -5854,7 +5854,7 @@ The score policy is viewed and edited on the **DEX page, Scoring tab**: tier edg
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/dex/scoring` | The Scoring tab: DEX sub-nav, the policy in force and the edit form (HTMX). Needs `GuaranteedState:Read`; the form is editable for administrators and every control is disabled for any other reader. |
-| `POST` | `/api/settings/dex-scoring/save` | Save the whole policy. Body: the form (every field plus the hidden `if_match` revision), capped at 320 KiB. Needs `GuaranteedState:Read` and the Administrator role. A refusal (field error, stale revision) re-renders the form with the error against its field. Audit: `dex.score_policy.update`. |
+| `POST` | `/api/settings/dex-scoring/save` | Save the whole policy. Body: the form (every field plus the hidden `if_match` revision), capped at 512 KiB. Needs `GuaranteedState:Read` and the Administrator role. A refusal (field error, stale revision) re-renders the form with the error against its field. Audit: `dex.score_policy.update`. |
 | `POST` | `/api/settings/dex-scoring/preview` | Validate the form and show how many applications would change tier, without storing anything. Same body, cap and gates as save. Audit: `dex.score_policy.validate`. |
 | `POST` | `/api/settings/dex-scoring/reset` | Reset the policy to the shipped defaults. Same cap and gates as save. Audit: `dex.score_policy.reset`. |
 

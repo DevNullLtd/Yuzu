@@ -149,7 +149,7 @@ TEST_CASE("form: an override row with values but no image is refused by name, ne
           "[server][dex][score_policy][form]") {
     auto v = dex_form_values(dex_default_score_policy());
     v["overrides[0].image"] = "a.exe";
-    v["overrides[1].image"] = "  ";
+    v["overrides[1].image"] = "";
     v["overrides[1].tiers.edges.excellent"] = "95";
     v["overrides[1].weights.hangs"] = "";
     SECTION("typed values without an image") {
@@ -171,12 +171,44 @@ TEST_CASE("form: an override row with values but no image is refused by name, ne
         REQUIRE(doc);
         CHECK(doc->row_of_override == std::vector<int>{0});
     }
-    SECTION("blank and whitespace-only values are the browser's empty row") {
-        v["overrides[1].tiers.edges.excellent"] = " \t";
+    SECTION("empty values are the browser's empty row") {
+        v["overrides[1].tiers.edges.excellent"] = "";
         const auto doc = dex_form_to_document(pairs_of(v));
         REQUIRE(doc);
         CHECK(doc->row_of_override == std::vector<int>{0});
     }
+    SECTION("a whitespace-only number is typed input: refused on the image, never dropped") {
+        // A number input cannot produce this; a hand-built body can, and it is not the empty row.
+        v["overrides[1].tiers.edges.excellent"] = " \t";
+        v["overrides[1].tiers.edges.good"] = "";
+        const auto doc = dex_form_to_document(pairs_of(v));
+        REQUIRE_FALSE(doc);
+        CHECK(doc.error().field == "overrides[1].image");
+    }
+}
+
+TEST_CASE("form: whitespace the validator accepts in an image key or a name survives a save",
+          "[server][dex][score_policy][form]") {
+    // The validator admits ASCII space in keys and names, so a form edit must carry the bytes
+    // through unchanged, or an unrelated save re-addresses a stored override.
+    DexScorePolicy p;
+    p.overrides.push_back(override_named(" app.exe"));
+    p.overrides.push_back(override_named("app.exe "));
+    DexScoreOverride named = override_named("named.exe");
+    named.names[0] = " ";
+    p.overrides.push_back(named);
+    REQUIRE_FALSE(dex_score_policy_fault(p));
+
+    const auto doc = dex_form_to_document(pairs_of(dex_form_values(p)));
+    REQUIRE(doc);
+    CHECK(doc->row_of_override == std::vector<int>{0, 1, 2});
+    const auto parsed = dex_score_policy_validate_text(doc->text);
+    REQUIRE(parsed);
+    REQUIRE(parsed->overrides.size() == 3);
+    CHECK(parsed->overrides[0].image == " app.exe");
+    CHECK(parsed->overrides[1].image == "app.exe ");
+    CHECK(parsed->overrides[2].names[0] == std::optional<std::string>(" "));
+    CHECK(dex_score_policy_canonical(*parsed) == dex_score_policy_canonical(p));
 }
 
 TEST_CASE("form: blank and removed rows are dropped, order is kept and unset fields inherit",
