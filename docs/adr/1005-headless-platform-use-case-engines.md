@@ -1294,8 +1294,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
           token's backing principal) reads the durable row at every step boundary, so a
           revoke committed by any replica is seen at the next boundary; the step already
           sent is not recalled, a cookie session is decided by the durable session
-          generation (polled at most once per second), and token expiry is judged on the
-          replica's clock.
+          generation (polled at most once per second while the session store answers; a
+          replica whose poll is failing keeps trusting its cached sessions for up to
+          30 s, then fails closed), and token expiry is judged on the replica's clock.
        4. *No per-surface ceiling (revisit by 2026-12-15).* The workflow run leases
           from the one shared budget, 2 per principal, so 64 principals can hold all
           128 default slots for up to 60 s and every new stream or run is refused
@@ -1355,15 +1356,21 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            "accept and record").* For a run naming more than 1,000 distinct agent ids
            (or whose ids exceed the 131,072-byte stored budget), a CONFINED reader's
            scoped visibility of the run depends on the stored ids. The ids in the
-           creator's own dispatch scope (`Execution:Execute` visibility) are stored first;
-           the creator keeps seeing its run only while at least one stored id lies in the
-           scope its reads are checked against (`Workflow:Read`). Starting a run needs a
-           global `Workflow:Execute`, which of the seeded roles only `Administrator`
-           holds, so a confined creator is a custom role with that grant plus a scoped
-           one (for example an `Operator` assignment on a group), and the two scopes then
-           overlap; it is not guaranteed when they do not (a global `Execution:Execute`
-           grant with a group-scoped `Workflow:Read` stores the ids in request order, and
-           the creator can lose sight of its own run). Another confined reader whose devices fall past the cap
+           creator's own dispatch scope (`Execution:Execute` visibility) are stored first,
+           then the rest in the order named. The creator keeps seeing its run exactly
+           while at least one stored id lies in the scope its reads are checked against
+           (`Workflow:Read`). That is guaranteed when the run names at least one device
+           inside its `Execution:Execute` scope and that scope lies WITHIN its
+           `Workflow:Read` scope: the first stored id is then inside both. Overlap is not
+           enough. When the `Execution:Execute` scope reaches devices the `Workflow:Read`
+           scope does not, the creator can lose sight of its own run: a global
+           `Execution:Execute` grant with a group-scoped `Workflow:Read` makes every
+           named id "first", so the ids are stored in request order, and the creator
+           loses the run when none of its group's devices is among those stored (the two
+           scopes overlap here, and the run is still lost). Starting a run
+           needs a global `Workflow:Execute`, which of the seeded roles only
+           `Administrator` holds, so a confined creator is a custom role with that grant
+           plus a scoped one (for example an `Operator` assignment on a group). Another confined reader whose devices fall past the cap
            does not see the run in its scoped list or detail reads. Unconfined readers
            and the audit log still see it, and the check fails closed (a malformed or
            empty column is invisible to a confined reader). The trigger is distinct ids
@@ -1384,6 +1391,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            reading, not measured). The v1 route and MCP are capped at 10,000 ids and
            are not affected. The body cap bounds it; an id-count cap on the legacy route
            would remove it.
+       15. *Pool brownout wait at a step boundary (revisit by 2026-12-15).* The credential
+           check reads the token and engine rows from the primary, and (unlike the
+           held-open stream's cached read) is not covered by the engine liveness cache's
+           failure backoff. When the connection pool is exhausted or the database is slow,
+           one boundary can wait about 10 s (up to three reads per attempt at the 1.5 s
+           lease wait, two attempts with 1 s between), plus up to 10 s more for a connect
+           the pool had already started. The run still fails closed
+           (`credential_indeterminate`), is capped at 2 per principal and 60 s, and tests
+           its deadline again only after the retry wait.
 
 ## Interim rules (until the named follow-ups ship)
 

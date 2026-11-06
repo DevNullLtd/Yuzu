@@ -263,7 +263,8 @@ public:
     /// principal are read from Postgres, so a revoke committed on any replica before the read is
     /// seen. It costs one indexed `api_tokens` read per call, plus one `engine_principals` read
     /// for an engine token. A cookie session is adjudicated the same way in both modes
-    /// (`AuthManager::validate_session`: the durable generation, polled at most once per second).
+    /// (`AuthManager::validate_session`: the durable generation, polled at most once per second,
+    /// and trusted for up to 30 s while that poll is failing).
     auth::CredentialCheck revalidate_stream(const httplib::Request& req,
                                             const std::string& expected_principal,
                                             auth::CredentialReadMode mode);
