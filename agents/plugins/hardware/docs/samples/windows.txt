@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-03 · NT SERVICE virtual service account (not an administrator); serial numbers, UUID and machine-id hash replaced with synthetic values · leg-hash 3fa43aa6c9dc
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-03 · NT SERVICE virtual service account (not an administrator); serial numbers, UUID and machine-id hash replaced with synthetic values; the drivers_inventory block was captured 2026-11-04 as an interactive user (elevated) with the computer-device GUID and peripheral BLE addresses redacted · leg-hash f7b5dcc7d853
 == action=manufacturer
 manufacturer|Micro Computer (HK) Tech Limited
 [result_status] UNDECLARED / UNKNOWN / 
@@ -196,6 +196,147 @@ driver|166|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
 driver|167|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
 driver|168|Volume Manager|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM
 [result_status] UNDECLARED / UNKNOWN / 
+
+== action=drivers_inventory
+status|drivers_inventory|supported|-
+driver_inv|ACP HDA Node|-|-|-|-|-|-|-|ACP/DEVTYPE_0001&DEVREV_0000&VEN_1022&DEV_15E2&SUBSYS_102215E2&REV_63
+driver_inv|ACPI Power Button|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0C0C
+driver_inv|ACPI Processor Container Device|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_ACPI&DEV_0010
+driver_inv|ACPI Thermal Zone|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/ThermalZone
+driver_inv|ACPI x64-based PC|10.0.26100.1|2006-06-21|Microsoft|COMPUTER|Microsoft Windows|signed|hal.inf|acpiapic
+driver_inv|AMD Audio CoProcessor|6.0.0.109|2025-03-26|AMD|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem18.inf|PCI/VEN_1022&DEV_15E2&SUBSYS_15E21022&REV_63
+driver_inv|AMD Controller Emulation|24.20.0.10|2024-03-21|AMD|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem5.inf|ROOT/AMDXE
+driver_inv|AMD Crash Defender|25.10.0.1|2025-01-27|Advanced Micro Devices, Inc.|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem7.inf|ROOT/AMDLOG
+driver_inv|AMD GPIO Controller|2.2.0.130|2022-09-15|Advanced Micro Devices, Inc|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem0.inf|ACPI/VEN_AMDI&DEV_0030
+driver_inv|AMD High Definition Audio Device|10.0.1.40|2025-03-17|Advanced Micro Devices|MEDIA|Microsoft Windows Hardware Compatibility Publisher|signed|oem13.inf|HDAUDIO/FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100&REV_1008
+driver_inv|AMD Micro PEP Device|1.0.42.0|2023-02-10|Advanced Micro Devices, Inc.|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem2.inf|ACPI/VEN_AMDI&DEV_0009
+driver_inv|AMD PCI|2.0.0.14|2023-07-18|Advanced Micro Devices, Inc|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem3.inf|PCI/VEN_1022&DEV_14EC&SUBSYS_14EC1022&REV_00
+driver_inv|AMD PSP 11.0 Device|5.25.0.0|2023-07-31|Advanced Micro Devices Inc.|SECURITYDEVICES|Microsoft Windows Hardware Compatibility Publisher|signed|oem1.inf|PCI/VEN_1022&DEV_15C7&SUBSYS_B0161F4C&REV_00
+driver_inv|AMD Processor|10.0.26100.9549|2009-04-21|Microsoft|PROCESSOR|Microsoft Windows|signed|cpu.inf|ACPI/VEN_ACPI&DEV_0007
+driver_inv|AMD Radeon 780M Graphics|32.0.21030.2001|2025-09-25|Advanced Micro Devices, Inc.|DISPLAY|Microsoft Windows Hardware Compatibility Publisher|signed|oem71.inf|PCI/VEN_1002&DEV_1900&SUBSYS_B0161F4C&REV_D4
+driver_inv|AMD SMBUS|2.0.0.14|2023-07-18|Advanced Micro Devices, Inc|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem3.inf|PCI/VEN_1022&DEV_790B&SUBSYS_B0161F4C&REV_71
+driver_inv|AMD Streaming Audio Device|1.0.0.14|2024-04-29|AMD|MEDIA|Microsoft Windows Hardware Compatibility Publisher|signed|oem12.inf|Root/AMDSAFD&FUN_01&REV_01
+driver_inv|AMD-OpenCL User Mode Driver|32.0.21030.2001|2025-09-25|Advanced Micro Devices, Inc.|SOFTWARECOMPONENT|Microsoft Windows Hardware Compatibility Publisher|signed|oem72.inf|SWC/AMDOCL-25.10
+driver_inv|AMD-Windows Support Components|32.0.21030.2001|2025-09-25|Advanced Micro Devices, Inc.|SOFTWARECOMPONENT|Microsoft Windows Hardware Compatibility Publisher|signed|oem73.inf|SWC/AMDWIN-25.10
+driver_inv|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT|Microsoft Windows|signed|audioendpoint.inf|MMDEVAPI/AudioEndpoints
+driver_inv|Bluetooth Device (Personal Area Network)|10.0.26100.8972|2006-06-21|Microsoft|NET|Microsoft Windows|signed|bthpan.inf|BTH/MS_BTHPAN
+driver_inv|Bluetooth Device (RFCOMM Protocol TDI)|10.0.26100.9549|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|tdibth.inf|BTH/MS_RFCOMM
+driver_inv|Bluetooth LE Device|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLE/Dev_00005e005301
+driver_inv|Bluetooth LE Device|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLE/Dev_00005e005302
+driver_inv|Bluetooth LE Generic Attribute Service|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{0000180f-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b020_REV&0009
+driver_inv|Bluetooth LE Generic Attribute Service|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{0000180f-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b380_REV&0015
+driver_inv|Bluetooth LE Generic Attribute Service|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{0000fd72-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b380_REV&0015
+driver_inv|Bluetooth LE Generic Attribute Service|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{00010000-0000-1000-8000-011f2000046d}_Dev_VID&02046d_PID&b020_REV&0009
+driver_inv|Bluetooth LE Generic Attribute Service|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{00010000-0000-1000-8000-011f2000046d}_Dev_VID&02046d_PID&b380_REV&0015
+driver_inv|Bluetooth Low Energy GATT compliant HID device|10.0.26100.9549|2006-06-21|Microsoft|HIDCLASS|Microsoft Windows|signed|hidbthle.inf|BTHLEDevice/{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b020_REV&0009
+driver_inv|Bluetooth Low Energy GATT compliant HID device|10.0.26100.9549|2006-06-21|Microsoft|HIDCLASS|Microsoft Windows|signed|hidbthle.inf|BTHLEDevice/{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b380_REV&0015
+driver_inv|Composite Bus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|compositebus.inf|ROOT/CompositeBus
+driver_inv|Computer Device|10.0.26100.1|2006-06-21|Microsoft|COMPUTER|Microsoft Windows|signed|compdev.inf|COMPUTER/{00000000-0000-0000-0000-000000000003}
+driver_inv|Device Information Service|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{0000180a-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b020_REV&0009
+driver_inv|Device Information Service|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{0000180a-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b380_REV&0015
+driver_inv|Direct memory access controller|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0200
+driver_inv|Disk drive|10.0.26100.9711|2006-06-21|Microsoft|DISKDRIVE|Microsoft Windows|signed|disk.inf|SCSI/DiskNVMe____________________________YMTC_PC41Q-1TB-BYM11D343
+driver_inv|Generic Access Profile|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{00001800-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b020_REV&0009
+driver_inv|Generic Access Profile|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{00001800-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b380_REV&0015
+driver_inv|Generic Attribute Profile|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{00001801-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b020_REV&0009
+driver_inv|Generic Attribute Profile|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTHLEDevice/{00001801-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b380_REV&0015
+driver_inv|Generic PnP Monitor|10.0.26100.9278|2006-06-21|Microsoft|MONITOR|Microsoft Windows|signed|monitor.inf|MONITOR/AOCB206
+driver_inv|Generic SuperSpeed USB Hub|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbhub3.inf|USB/VID_2109&PID_0822&REV_9013
+driver_inv|Generic USB Hub|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbhub3.inf|USB/VID_2109&PID_2822&REV_9013
+driver_inv|Generic software component|10.0.26100.1|2006-06-21|Microsoft|SOFTWARECOMPONENT|Microsoft Windows|signed|c_swcomponent.inf|SWC/VID1002&PID0001
+driver_inv|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE|Microsoft Windows|signed|c_swdevice.inf|-
+driver_inv|High Definition Audio Controller|10.0.26100.9711|2026-10-10|Microsoft|SYSTEM|Microsoft Windows|signed|hdaudbus.inf|PCI/VEN_1002&DEV_1640&SUBSYS_B0161F4C&REV_00
+driver_inv|High Definition Audio Controller|10.0.26100.9711|2026-10-10|Microsoft|SYSTEM|Microsoft Windows|signed|hdaudbus.inf|PCI/VEN_1022&DEV_15E3&SUBSYS_B0161F4C&REV_00
+driver_inv|High precision event timer|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0103
+driver_inv|Hyper-V Virtual Switch Extension Adapter|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|wvms_mp_windows.inf|vms_vsmp
+driver_inv|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE|Microsoft Windows|signed|printqueue.inf|PRINTENUM/LocalPrintQueue
+driver_inv|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE|Microsoft Windows|signed|printqueue.inf|PRINTENUM/{084f01fa-e634-4d77-83ee-074817c03581}
+driver_inv|Microsoft ACPI-Compliant Embedded Controller|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0C09
+driver_inv|Microsoft ACPI-Compliant System|10.0.26100.9549|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|acpi.inf|ACPI_HAL/PNP0C08
+driver_inv|Microsoft Basic Display Driver|10.0.26100.8521|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|basicdisplay.inf|ROOT/BasicDisplay
+driver_inv|Microsoft Basic Render Driver|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|basicrender.inf|ROOT/BasicRender
+driver_inv|Microsoft Bluetooth Enumerator|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bth.inf|BTH/MS_BTHBRB
+driver_inv|Microsoft Bluetooth LE Enumerator|10.0.26100.9711|2006-06-21|Microsoft|BLUETOOTH|Microsoft Windows|signed|bthleenum.inf|BTH/MS_BTHLE
+driver_inv|Microsoft Hyper-V PCI Server|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|wvpcivsp.inf|root/Vpcivsp
+driver_inv|Microsoft Hyper-V Virtual Disk Server|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|wstorvsp.inf|root/storvsp
+driver_inv|Microsoft Hyper-V Virtual Machine Bus Provider|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|wvmbusr.inf|root/VMBus
+driver_inv|Microsoft Hyper-V Virtualization Infrastructure Driver|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|wvid.inf|ROOT/VID
+driver_inv|Microsoft Hypervisor Service|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|hvservice.inf|ROOT/hvservice
+driver_inv|Microsoft Kernel Debug Network Adapter|10.0.26100.8521|2006-06-21|Microsoft|NET|Microsoft Windows|signed|kdnic.inf|root/kdnic
+driver_inv|Microsoft Storage Spaces Controller|10.0.26100.9711|2006-06-21|Microsoft|SCSIADAPTER|Microsoft Windows|signed|spaceport.inf|Root/Spaceport
+driver_inv|Microsoft System Management BIOS Driver|10.0.26100.1|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|mssmbios.inf|ROOT/mssmbios
+driver_inv|Microsoft UEFI-Compliant System|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|uefi.inf|ACPI_HAL/UEFI
+driver_inv|Microsoft VHD Loopback Controller|10.0.26100.9711|2006-06-21|Microsoft|SCSIADAPTER|Microsoft Windows|signed|vhdmp.inf|{8e7bd593-6e6c-4c52-86a6-77175494dd8e}/MsVhdHba
+driver_inv|Microsoft Virtual Drive Enumerator|10.0.26100.1591|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|vdrvroot.inf|ROOT/vdrvroot
+driver_inv|Microsoft Wi-Fi Direct Virtual Adapter|10.0.26100.8972|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netvwifimp.inf|{5d624f94-8850-40c3-a3fa-a4fd2080baf3}/vwifimp_wfd
+driver_inv|Microsoft Windows Management Interface for ACPI|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|wmiacpi.inf|ACPI/VEN_PNP&DEV_0C14
+driver_inv|Microsoft iSCSI Initiator|10.0.26100.9711|2006-06-21|Microsoft|SCSIADAPTER|Microsoft Windows|signed|iscsi.inf|ROOT/ISCSIPRT
+driver_inv|Motherboard resources|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0C02
+driver_inv|NDIS Virtual Network Adapter Enumerator|10.0.26100.1|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|ndisvirtualbus.inf|ROOT/NdisVirtualBus
+driver_inv|NPU Compute Accelerator Device|32.0.203.258|2025-01-04|AMD|COMPUTEACCELERATOR|Microsoft Windows Hardware Compatibility Publisher|signed|oem11.inf|PCI/VEN_1022&DEV_1502&SUBSYS_15021022&REV_00
+driver_inv|PCI Express Root Complex|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|pci.inf|ACPI/VEN_PNP&DEV_0A08
+driver_inv|PCI Express Root Port|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|pci.inf|PCI/VEN_1022&DEV_14EB&SUBSYS_B0161F4C&REV_00
+driver_inv|PCI Express Root Port|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|pci.inf|PCI/VEN_1022&DEV_14ED&SUBSYS_B0161F4C&REV_00
+driver_inv|PCI Express Root Port|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|pci.inf|PCI/VEN_1022&DEV_14EE&SUBSYS_B0161F4C&REV_00
+driver_inv|PCI Express Root Port|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|pci.inf|PCI/VEN_1022&DEV_14EF&SUBSYS_14531022&REV_00
+driver_inv|PCI standard ISA bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_790E&SUBSYS_B0161F4C&REV_51
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14E8&SUBSYS_B0161F4C&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14EA&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F0&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F1&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F2&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F3&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F4&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F5&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F6&SUBSYS_00000000&REV_00
+driver_inv|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|PCI/VEN_1022&DEV_14F7&SUBSYS_00000000&REV_00
+driver_inv|Plug and Play Software Device Enumerator|10.0.26100.4202|2025-05-23|Microsoft|SYSTEM|Microsoft Windows|signed|swenum.inf|ROOT/SWENUM
+driver_inv|Power Button|10.0.22000.1|2006-06-21|Microsoft|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem64.inf|root/button
+driver_inv|Programmable interrupt controller|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0000
+driver_inv|RZ616 Bluetooth(R) Adapter|1.1037.0.412|2024-02-21|Mediatek Inc.|BLUETOOTH|Microsoft Windows Hardware Compatibility Publisher|signed|oem60.inf|USB/VID_0E8D&PID_C616&REV_0100&MI_00
+driver_inv|RZ616 Wi-Fi 6E 160MHz|3.3.0.972|2024-02-26|MediaTek, Inc.|NET|Microsoft Windows Hardware Compatibility Publisher|signed|oem61.inf|PCI/VEN_14C3&DEV_0616&SUBSYS_C61614C3&REV_00
+driver_inv|Realtek Asio Component|1.0.12.1|2024-05-16|Realtek|SOFTWARECOMPONENT|Microsoft Windows Hardware Compatibility Publisher|signed|oem33.inf|SWC/VEN_10EC&ASIO_ID_0001
+driver_inv|Realtek Audio Effects Component|13.0.6000.1167|2024-01-23|Realtek|AUDIOPROCESSINGOBJECT|Microsoft Windows Hardware Compatibility Publisher|signed|oem32.inf|SWC/VEN_10EC&AID_0001
+driver_inv|Realtek Audio Universal Service|1.0.773.0|2024-02-07|Realtek|SOFTWARECOMPONENT|Microsoft Windows Hardware Compatibility Publisher|signed|oem35.inf|SWC/VEN_10EC&SID_0001
+driver_inv|Realtek Gaming 2.5GbE Family Controller|1125.15.717.2023|2023-07-17|Realtek|NET|Microsoft Windows Hardware Compatibility Publisher|signed|oem36.inf|PCI/VEN_10EC&DEV_8125&SUBSYS_012310EC&REV_05
+driver_inv|Realtek Hardware Support Application|11.0.6000.334|2024-11-06|Realtek|SOFTWARECOMPONENT|Microsoft Windows Hardware Compatibility Publisher|signed|oem34.inf|SWC/VEN_10EC&HID_0001
+driver_inv|Realtek High Definition Audio|6.0.9703.1|2024-02-07|Realtek Semiconductor Corp.|MEDIA|Microsoft Windows Hardware Compatibility Publisher|signed|oem30.inf|HDAUDIO/FUNC_01&VEN_10EC&DEV_0269&SUBSYS_1F4CB016&REV_1002
+driver_inv|Remote Desktop Device Redirector Bus|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|rdpbus.inf|ROOT/RDPBUS
+driver_inv|Standard NVM Express Controller|10.0.26100.9549|2006-06-21|Microsoft|SCSIADAPTER|Microsoft Windows|signed|stornvme.inf|PCI/VEN_1E49&DEV_1081&SUBSYS_10811E49&REV_03
+driver_inv|System CMOS/real time clock|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0B00
+driver_inv|System Firmware|10.0.26100.4768|2006-06-21|Microsoft|FIRMWARE|Microsoft Windows|signed|c_firmware.inf|UEFI/RES_{e65fa87f-4934-4a64-ac85-ebdbd5081f62}&REV_6A
+driver_inv|System board|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0C01
+driver_inv|System speaker|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0800
+driver_inv|System timer|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0100
+driver_inv|Tailscale Tunnel|0.14.0.0|2021-10-13|WireGuard LLC|NET|Microsoft Windows Hardware Compatibility Publisher|signed|oem77.inf|Wintun
+driver_inv|Trusted Platform Module 2.0|10.0.26100.9549|2006-06-21|Microsoft|SECURITYDEVICES|Microsoft Windows|signed|tpm.inf|ACPI/VEN_MSFT&DEV_0101
+driver_inv|UMBus Root Bus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|umbus.inf|root/umbus
+driver_inv|USB Composite Device|10.0.26100.9711|2006-06-21|Microsoft|USB|Microsoft Windows|signed|usb.inf|USB/VID_0E8D&PID_C616&REV_0100
+driver_inv|USB Root Hub (USB 3.0)|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbhub3.inf|USB/ROOT_HUB30&VID1022&PID15B9&REV0000
+driver_inv|USB Root Hub (USB 3.0)|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbhub3.inf|USB/ROOT_HUB30&VID1022&PID15BA&REV0000
+driver_inv|USB Root Hub (USB 3.0)|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbhub3.inf|USB/ROOT_HUB30&VID1022&PID15C0&REV0000
+driver_inv|USB Root Hub (USB 3.0)|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbhub3.inf|USB/ROOT_HUB30&VID1022&PID15C1&REV0000
+driver_inv|USB xHCI Compliant Host Controller|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbxhci.inf|PCI/VEN_1022&DEV_15B9&SUBSYS_B0161F4C&REV_00
+driver_inv|USB xHCI Compliant Host Controller|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbxhci.inf|PCI/VEN_1022&DEV_15BA&SUBSYS_B0161F4C&REV_00
+driver_inv|USB xHCI Compliant Host Controller|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbxhci.inf|PCI/VEN_1022&DEV_15C0&SUBSYS_15C01022&REV_00
+driver_inv|USB xHCI Compliant Host Controller|10.0.26100.9711|2026-09-10|Microsoft|USB|Microsoft Windows|signed|usbxhci.inf|PCI/VEN_1022&DEV_15C1&SUBSYS_15C11022&REV_00
+driver_inv|USB4 Root Router|10.0.26100.9549|2026-09-17|Microsoft|USB|Microsoft Windows|signed|usb4devicerouter.inf|USB4/ROOT_DEVICE_ROUTER&VID_1022&PID_1668&REV_0000
+driver_inv|USB4 Root Router|10.0.26100.9549|2026-09-17|Microsoft|USB|Microsoft Windows|signed|usb4devicerouter.inf|USB4/ROOT_DEVICE_ROUTER&VID_1022&PID_1669&REV_0000
+driver_inv|USB4 Virtual power coordination device|-|-|-|-|-|-|-|USB4/VIRTUAL_POWER_PDO&VID_1022&PID_1668&REV_0000
+driver_inv|USB4 Virtual power coordination device|-|-|-|-|-|-|-|USB4/VIRTUAL_POWER_PDO&VID_1022&PID_1669&REV_0000
+driver_inv|USB4(TM) Host Router (Microsoft)|10.0.26100.9549|2026-09-17|Microsoft|USB|Microsoft Windows|signed|usb4hostrouter.inf|PCI/USB4_MS_CM
+driver_inv|Voice Clarity|1.0.4.7057|2026-06-16|Microsoft Corporation|AUDIOPROCESSINGOBJECT|Microsoft Windows Hardware Compatibility Publisher|signed|oem78.inf|SWC/VEN_MSFT&AUDIO_EFFECTPACK_VOICECLARITY
+driver_inv|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME|Microsoft Windows|signed|volume.inf|STORAGE/Volume
+driver_inv|Volume Manager|10.0.26100.9711|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|volmgr.inf|ROOT/VOLMGR
+driver_inv|WAN Miniport (IKEv2)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netavpna.inf|ms_agilevpnminiport
+driver_inv|WAN Miniport (IP)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netrasa.inf|ms_ndiswanip
+driver_inv|WAN Miniport (IPv6)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netrasa.inf|ms_ndiswanipv6
+driver_inv|WAN Miniport (L2TP)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netrasa.inf|ms_l2tpminiport
+driver_inv|WAN Miniport (Network Monitor)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netrasa.inf|ms_ndiswanbh
+driver_inv|WAN Miniport (PPPOE)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netrasa.inf|ms_pppoeminiport
+driver_inv|WAN Miniport (PPTP)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netrasa.inf|ms_pptpminiport
+driver_inv|WAN Miniport (SSTP)|10.0.26100.1|2006-06-21|Microsoft|NET|Microsoft Windows|signed|netsstpa.inf|ms_sstpminiport
+[result_status] OK / FULL / 
 
 == action=system
 serial|1234567890
