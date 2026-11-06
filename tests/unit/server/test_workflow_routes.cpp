@@ -42,6 +42,7 @@
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
 #include "workflow_engine.hpp"
+#include "workflow_model.hpp" // kStoredAgentIdsMax
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -4847,6 +4848,64 @@ TEST_CASE("CDX-FV-03 — workflow execute threads the caller's exec_visible into
     REQUIRE(h.last_dispatch_exec_visible.has_value());
     CHECK(h.last_dispatch_exec_visible->count("agent-A") == 1);
     CHECK(h.last_dispatch_exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("POST /api/workflows/:id/execute: a list over the stored-id cap dispatches to every id "
+          "and stores a bounded copy that keeps the caller's own device (#2146 g8-sre-1)",
+          "[pg][workflow][executions][execute][scope][stored_ids]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WFCAP", "wfcap");
+    auto wf_id = h.make_workflow("wf-cap", "def-WFCAP");
+    h.dispatch_cmd_override = "cmd-wfcap";
+    h.dispatch_sent_override = 1;
+
+    const std::size_t count = yuzu::server::kStoredAgentIdsMax + 500;
+    const std::string mine = "agent-" + std::to_string(count - 1);
+    h.caller_fn = [mine](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{
+            .exec_visible =
+                yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{mine}}};
+    };
+    nlohmann::json body{{"agent_ids", nlohmann::json::array()}};
+    for (std::size_t i = 0; i < count; ++i)
+        body["agent_ids"].push_back("agent-" + std::to_string(i));
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", body.dump());
+    REQUIRE(res);
+    REQUIRE(res->status == 202);
+    const auto exec_id = nlohmann::json::parse(res->body)["execution_id"].get<std::string>();
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_agent_ids.size() == count); // the step reached the FULL list
+
+    pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult len{PQexec(conn.get(), "SELECT length(agent_ids_json) FROM "
+                                        "workflow_engine.workflow_executions")};
+    REQUIRE(len.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(len.get()) == 1);
+    CHECK(std::strtoll(PQgetvalue(len.get(), 0, 0), nullptr, 10) < 140000);
+
+    // The confined caller's own device was stored first, so the run is still readable to it.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{mine}};
+    auto got = h.sink.Get("/api/v1/workflow-executions/" + exec_id);
+    REQUIRE(got);
+    REQUIRE(got->status == 200);
+    const auto detail = nlohmann::json::parse(got->body)["data"];
+    CHECK(detail["agent_ids"] == nlohmann::json::array({mine}));
+    CHECK(detail["agent_ids_truncated"] == true);
+    CHECK_FALSE(detail.contains("agent_ids_total"));
+
+    // An unconfined reader sees the bounded list and the true count.
+    h.fleet_read_scope = std::nullopt;
+    auto open = h.sink.Get("/api/v1/workflow-executions/" + exec_id);
+    REQUIRE(open);
+    REQUIRE(open->status == 200);
+    const auto all = nlohmann::json::parse(open->body)["data"];
+    CHECK(all["agent_ids"].size() == yuzu::server::kStoredAgentIdsMax);
+    CHECK(all["agent_ids_total"] == static_cast<std::int64_t>(count));
 }
 
 TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible derivation is unwired",

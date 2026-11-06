@@ -8,6 +8,7 @@
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
 #include "workflow_claim_outcome.hpp"
+#include "workflow_model.hpp" // stored_agent_ids_json
 #include "workflow_wait.hpp"
 
 #include <libpq-fe.h>
@@ -768,7 +769,9 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
 
     auto exec_id = generate_id();
     auto now = std::to_string(now_epoch());
+    // The text every step is dispatched with is the FULL list; the run row stores a bounded copy.
     const std::string agent_str = nlohmann::json(agent_ids).dump();
+    const std::string stored_agent_str = stored_agent_ids_json(agent_ids, control.stored_copy_first);
 
     // New atomicity (ADR-0064): execution-row creation + every step-result pre-creation are one
     // transaction. The execution insert is an INSERT...SELECT...WHERE deleted_at = 0, which
@@ -815,7 +818,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                   "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
                   "ON CONFLICT (principal, idempotency_key) WHERE idempotency_key IS NOT NULL "
                   "DO NOTHING RETURNING id",
-                  std::vector<std::string>{exec_id, workflow_id, agent_str, now, claim->principal,
+                  std::vector<std::string>{exec_id, workflow_id, stored_agent_str, now, claim->principal,
                                            claim->key, claim->fingerprint,
                                            control.correlation_id})
             : pg::exec_params(
@@ -826,7 +829,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                   "SELECT $1, w.id, 'running', $3, $4::bigint, 0, NULLIF($5, ''), NULLIF($6, '') "
                   "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
                   "RETURNING id",
-                  std::vector<std::string>{exec_id, workflow_id, agent_str, now,
+                  std::vector<std::string>{exec_id, workflow_id, stored_agent_str, now,
                                            control.principal, control.correlation_id});
         if (ires.status() != PGRES_TUPLES_OK) {
             spdlog::error("WorkflowEngine::execute: execution insert failed: {}",

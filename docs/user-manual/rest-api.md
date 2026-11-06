@@ -7022,6 +7022,14 @@ REST's usual fail-closed-on-audit-failure posture — this file's `AuditFn` pred
 For an unconfined (global-grant) caller, each step's `result` also carries `agents_reached` (the
 step's dispatch-time target-agent count) — stripped above for a confined caller, as described.
 
+A run row stores at most 1,000 of the agent ids the run named (the run itself still sends to every
+id). When a run named more, `agent_ids` holds only stored ids (a confined caller's own visible
+devices are kept first), `agent_ids_truncated` is `true`, and a caller with no device scope also
+gets `agent_ids_total`, the number the run named. Both fields are absent for a run stored whole,
+and `agent_ids_total` is never sent to a confined caller. A confined caller sees a truncated run
+only if one of the stored ids is in its scope. The same applies to `GET /api/workflow-executions/{id}`
+and MCP `get_workflow_execution`.
+
 #### `GET /api/v1/executions`
 
 **Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017), as is

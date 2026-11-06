@@ -1384,6 +1384,9 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
     control.principal = req.caller.principal;
     control.correlation_id = clip_token(req.correlation_id);
     control.on_interrupted = [&progress] { progress.interrupted = true; };
+    control.stored_copy_first = [&req](const std::string& id) {
+        return authz::in_scope(req.caller.exec_visible, id);
+    };
     control.on_attempt = [&progress](int step_index, int attempt) {
         progress.current_step = step_index;
         progress.current_attempt = attempt;

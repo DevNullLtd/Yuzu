@@ -1330,8 +1330,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            sweep clears it.
        13. *Run records are kept without limit (revisit by 2027-01-15).* No prune
            exists for `workflow_executions` (see `docs/clock-guarded-retention.md`),
-           so the account name, the key and the agent list (about 1.3 MB per run at
-           10,000 agents) stay for the life of the database, and a deleted-and-
+           so the account name, the key and the agent list (at most 1,000 ids, about
+           131 KB per run: a longer list stores its first 1,000 ids and a count and
+           digest marker, `stored_agent_ids_json`) stay for the life of the database, and a deleted-and-
            recreated username inherits the old account's keys.
 
 ## Interim rules (until the named follow-ups ship)

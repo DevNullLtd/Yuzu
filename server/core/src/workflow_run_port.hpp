@@ -102,7 +102,8 @@ inline constexpr char kWorkflowIdempotentReplayError[] = "idempotent replay";
 /// from here only: `WorkflowEngine::execute` has no separate parameter for it.
 ///
 /// Consumed today: `on_admitted`, `on_attempt`, `before_attempt`, `deadline`, `should_stop`,
-/// `on_interrupted`, `idempotency`, `on_replay`, `principal` and `correlation_id`.
+/// `on_interrupted`, `idempotency`, `on_replay`, `principal`, `correlation_id` and
+/// `stored_copy_first`.
 struct WorkflowRunControl {
     /// Called once with the new run's execution id after the engine has admitted the run and
     /// before the first step is dispatched.
@@ -154,6 +155,11 @@ struct WorkflowRunControl {
     /// namespace), which the sequence sets to the same value. Never consulted for admission.
     std::string principal;
     std::string correlation_id;
+    /// Which of the named agent ids the run row's stored copy keeps FIRST when the list is longer
+    /// than `kStoredAgentIdsMax` (`stored_agent_ids_json`, workflow_model.hpp). Storage only: the
+    /// run always targets the full list. A confined caller sets it to its own visible set, so the
+    /// run stays visible to the caller that started it; unset keeps the first ids in request order.
+    std::function<bool(const std::string&)> stored_copy_first;
 };
 
 using WorkflowRunFn = std::function<std::expected<std::string, std::string>(

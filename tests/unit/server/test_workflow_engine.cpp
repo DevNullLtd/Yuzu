@@ -30,6 +30,7 @@
 #include "workflow_api_local.hpp"
 #include "workflow_execute.hpp" // the idempotency pre-check over the real engine
 #include "workflow_model.hpp" // workflow_execution_visible: the differential oracle for the list predicate
+#include "sha256_hex.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -3565,4 +3566,214 @@ TEST_CASE("WorkflowEngine: a claim COMMIT that rolled back is reported as a data
     CHECK_FALSE(engine.find_execution_by_key("alice", "key-rollback-001")->has_value());
     CHECK(count_rows(wf_db_fx_.dsn(),
                      "SELECT count(*) FROM workflow_engine.workflow_executions") == 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// The stored agent id list is bounded (#2146 Gate 8, g8-sre-1): the run targets the FULL list,
+// the row keeps at most kStoredAgentIdsMax ids plus a marker.
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+std::vector<std::string> numbered_agent_ids(std::size_t n, const std::string& prefix = "agent-") {
+    std::vector<std::string> ids;
+    ids.reserve(n);
+    for (std::size_t i = 0; i < n; ++i)
+        ids.push_back(prefix + std::to_string(i));
+    return ids;
+}
+
+std::string stored_agent_ids_of(const std::string& dsn, const std::string& exec_id) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const char* const params[] = {exec_id.c_str()};
+    PgResult r{PQexecParams(conn.get(),
+                            "SELECT agent_ids_json FROM workflow_engine.workflow_executions "
+                            "WHERE id = $1",
+                            1, nullptr, params, nullptr, nullptr, 0)};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+} // namespace
+
+TEST_CASE("stored_agent_ids_json: complete up to the cap, bounded with a marker above it",
+          "[workflow_engine][stored_ids]") {
+    constexpr std::size_t n = kStoredAgentIdsMax;
+    SECTION("exactly the cap is stored whole, no marker") {
+        const auto ids = numbered_agent_ids(n);
+        const auto text = stored_agent_ids_json(ids);
+        CHECK(text == nlohmann::json(ids).dump());
+        CHECK_FALSE(stored_agent_ids_total(text).has_value());
+    }
+    SECTION("one over the cap keeps the first cap ids and one marker") {
+        const auto ids = numbered_agent_ids(n + 1);
+        const auto text = stored_agent_ids_json(ids);
+        const auto parsed = nlohmann::json::parse(text);
+        REQUIRE(parsed.is_array());
+        REQUIRE(parsed.size() == n + 1);
+        for (std::size_t i = 0; i < n; ++i)
+            CHECK(parsed[i] == ids[i]);
+        const auto& marker = parsed[n];
+        REQUIRE(marker.is_object());
+        CHECK(marker["truncated"] == true);
+        CHECK(marker["total"] == n + 1);
+        REQUIRE(marker["sha256"].is_string());
+        CHECK(marker["sha256"].get<std::string>() == *sha256_hex(nlohmann::json(ids).dump()));
+        CHECK(stored_agent_ids_total(text) == static_cast<std::int64_t>(n + 1));
+    }
+    SECTION("the longest accepted list stores a bounded number of bytes") {
+        std::vector<std::string> ids;
+        for (std::size_t i = 0; i < 10000; ++i)
+            ids.push_back(std::string(120, 'x') + std::to_string(i + 100000)); // 126 bytes each
+        const auto text = stored_agent_ids_json(ids);
+        CHECK(text.size() < 140000);
+        CHECK(nlohmann::json(ids).dump().size() > 1200000);
+        CHECK(stored_agent_ids_total(text) == 10000);
+    }
+    SECTION("ids the caller can see are kept first, in request order") {
+        const auto ids = numbered_agent_ids(30);
+        const auto text = stored_agent_ids_json(
+            ids, [](const std::string& id) { return id == "agent-27" || id == "agent-29"; }, 5);
+        const auto parsed = nlohmann::json::parse(text);
+        REQUIRE(parsed.size() == 6);
+        CHECK(parsed[0] == "agent-27");
+        CHECK(parsed[1] == "agent-29");
+        CHECK(parsed[2] == "agent-0");
+        CHECK(parsed[3] == "agent-1");
+        CHECK(parsed[4] == "agent-2");
+        CHECK(stored_agent_ids_total(text) == 30);
+    }
+}
+
+TEST_CASE("stored_agent_ids_json: readers skip the marker and show the truncation",
+          "[workflow_engine][stored_ids]") {
+    WorkflowExecution we;
+    we.id = "exec-1";
+    we.agent_ids_json = stored_agent_ids_json(numbered_agent_ids(12), {}, 5);
+    const authz::VisibleSet confined{std::unordered_set<std::string>{"agent-1", "agent-9"}};
+
+    CHECK(workflow_execution_visible(we, confined)); // agent-1 is stored
+    CHECK(workflow_execution_visible(we, authz::VisibleSet{}));
+    CHECK_FALSE(workflow_execution_visible(
+        we, authz::VisibleSet{std::unordered_set<std::string>{"agent-9"}})); // not stored: fail closed
+
+    const auto confined_ids = confined_workflow_agent_ids_json(we.agent_ids_json, confined);
+    CHECK(confined_ids == nlohmann::json::array({"agent-1"}));
+    CHECK(confined_workflow_agent_ids_json(we.agent_ids_json, authz::VisibleSet{}).size() == 5);
+
+    const auto open = workflow_execution_detail_json(we, authz::VisibleSet{});
+    CHECK(open["agent_ids"].size() == 5);
+    CHECK(open["agent_ids_truncated"] == true);
+    CHECK(open["agent_ids_total"] == 12);
+    const auto narrowed = workflow_execution_detail_json(we, confined);
+    CHECK(narrowed["agent_ids_truncated"] == true);
+    CHECK_FALSE(narrowed.contains("agent_ids_total")); // the out-of-scope count is not disclosed
+
+    we.agent_ids_json = stored_agent_ids_json(numbered_agent_ids(5), {}, 5);
+    const auto whole = workflow_execution_detail_json(we, authz::VisibleSet{});
+    CHECK_FALSE(whole.contains("agent_ids_truncated"));
+    CHECK_FALSE(whole.contains("agent_ids_total"));
+}
+
+TEST_CASE("WorkflowEngine: a run over the stored-id cap dispatches to the full list and stores a "
+          "bounded copy",
+          "[workflow_engine][pg][execute][stored_ids]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf_id = *engine.create_workflow(kTwoStepYaml);
+
+    const auto run = [&](const std::vector<std::string>& agents,
+                         std::function<bool(const std::string&)> first = {}) {
+        std::size_t dispatched_ids = 0;
+        StepDispatchFn fn = [&dispatched_ids](const std::string&, const std::string& agent_json,
+                                              const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            dispatched_ids = nlohmann::json::parse(agent_json).size();
+            return std::string(R"({"status":"ok"})");
+        };
+        WorkflowRunControl control;
+        control.stored_copy_first = std::move(first);
+        const auto r = engine.execute(wf_id, agents, fn, nullptr, control);
+        REQUIRE(r.has_value());
+        return std::make_pair(*r, dispatched_ids);
+    };
+
+    SECTION("exactly the cap: stored whole") {
+        const auto [id, dispatched] = run(numbered_agent_ids(kStoredAgentIdsMax));
+        CHECK(dispatched == kStoredAgentIdsMax);
+        const auto stored = stored_agent_ids_of(wf_db_fx_.dsn(), id);
+        CHECK(nlohmann::json::parse(stored).size() == kStoredAgentIdsMax);
+        CHECK_FALSE(stored_agent_ids_total(stored).has_value());
+    }
+    SECTION("one over the cap: every step is dispatched with all ids, the row keeps the cap") {
+        const auto [id, dispatched] = run(numbered_agent_ids(kStoredAgentIdsMax + 1));
+        CHECK(dispatched == kStoredAgentIdsMax + 1);
+        const auto stored = stored_agent_ids_of(wf_db_fx_.dsn(), id);
+        CHECK(nlohmann::json::parse(stored).size() == kStoredAgentIdsMax + 1); // ids + marker
+        CHECK(stored_agent_ids_total(stored) == static_cast<std::int64_t>(kStoredAgentIdsMax + 1));
+    }
+    SECTION("10,000 ids: the stored column is bounded and every reader still works") {
+        std::vector<std::string> ids;
+        for (std::size_t i = 0; i < 10000; ++i)
+            ids.push_back(std::string(120, 'u') + std::to_string(i + 100000)); // unknown devices
+        const auto [id, dispatched] = run(ids);
+        CHECK(dispatched == 10000);
+        const auto stored = stored_agent_ids_of(wf_db_fx_.dsn(), id);
+        CHECK(stored.size() < 140000);
+        CHECK(count_rows(wf_db_fx_.dsn(),
+                         "SELECT max(length(agent_ids_json)) FROM "
+                         "workflow_engine.workflow_executions") < 140000);
+
+        const auto got = engine.get_execution(id);
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((*got)->status == "completed");
+        CHECK((*got)->step_results.size() == 2);
+        const auto detail = workflow_execution_detail_json(**got, authz::VisibleSet{});
+        CHECK(detail["agent_ids"].size() == kStoredAgentIdsMax);
+        CHECK(detail["agent_ids_total"] == 10000);
+
+        const auto page = engine.query_executions_page({}, std::nullopt);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 1);
+    }
+    SECTION("a confined caller keeps the run through the ids it can see, wherever they sit") {
+        auto agents = numbered_agent_ids(kStoredAgentIdsMax + 500);
+        const std::string mine = agents.back();
+        const auto first = [mine](const std::string& id) { return id == mine; };
+        const auto [id, dispatched] = run(agents, first);
+        CHECK(dispatched == kStoredAgentIdsMax + 500);
+        const std::vector<std::string> visible{mine};
+        const auto page = engine.query_executions_page({}, visible);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].id == id);
+
+        // Without the hook the run is stored by request order and this caller loses sight of it:
+        // the documented, fail-closed cost of the bound for a caller that sets no priority.
+        const auto [id2, d2] = run(agents);
+        const auto page2 = engine.query_executions_page({}, visible);
+        REQUIRE(page2.has_value());
+        CHECK(page2->rows.size() == 1); // only the first run
+        CHECK(page2->rows[0].id == id);
+        (void)id2;
+        (void)d2;
+    }
+    SECTION("a keyed replay of a capped run is answered and writes nothing") {
+        const auto first =
+            execute_keyed(engine, wf_id, claim_of("alice", "key-capped-0001"),
+                          numbered_agent_ids(kStoredAgentIdsMax + 10));
+        REQUIRE(first.result.has_value());
+        CHECK(first.dispatches == 2);
+        const auto again =
+            execute_keyed(engine, wf_id, claim_of("alice", "key-capped-0001"),
+                          numbered_agent_ids(kStoredAgentIdsMax + 10));
+        REQUIRE_FALSE(again.result.has_value());
+        REQUIRE(again.replay.has_value());
+        CHECK(again.replay->execution_id == *first.result);
+        CHECK(again.dispatches == 0);
+        CHECK(count_rows(wf_db_fx_.dsn(),
+                         "SELECT count(*) FROM workflow_engine.workflow_executions") == 1);
+    }
 }

@@ -2109,6 +2109,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto agents = confined_workflow_agent_ids_json(exec.agent_ids_json, gate.scope);
         if (agents.is_array())
             view.device_count = static_cast<int>(agents.size());
+        // A truncated stored copy undercounts an unconfined viewer's run: show what it named.
+        if (!confined)
+            if (const auto total = stored_agent_ids_total(exec.agent_ids_json))
+                view.device_count = static_cast<int>(
+                    std::min<std::int64_t>(*total, std::numeric_limits<int>::max()));
 
         // The definition supplies step labels and the workflow name; a deleted or unreadable
         // definition just leaves the instruction ids.
@@ -2865,6 +2870,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         bool deadline_hit = false;
         yuzu::server::WorkflowRunControl control;
         control.deadline = run_deadline;
+        control.stored_copy_first = [&caller](const std::string& id) {
+            return authz::in_scope(caller.exec_visible, id);
+        };
         control.before_attempt = [&deadline_hit, run_deadline] {
             if (std::chrono::steady_clock::now() < run_deadline)
                 return true;
@@ -3050,17 +3058,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                  {"attempt", sr.attempt}});
         }
 
-        res.set_content(nlohmann::json({{"id", exec.id},
-                                        {"workflow_id", exec.workflow_id},
-                                        {"status", exec.status},
-                                        {"agent_ids", confined_workflow_agent_ids_json(
-                                                          exec.agent_ids_json, gate.scope)},
-                                        {"current_step", exec.current_step},
-                                        {"started_at", exec.started_at},
-                                        {"completed_at", exec.completed_at},
-                                        {"steps", steps_arr}})
-                            .dump(),
-                        "application/json");
+        nlohmann::json detail({{"id", exec.id},
+                               {"workflow_id", exec.workflow_id},
+                               {"status", exec.status},
+                               {"agent_ids", confined_workflow_agent_ids_json(exec.agent_ids_json,
+                                                                              gate.scope)},
+                               {"current_step", exec.current_step},
+                               {"started_at", exec.started_at},
+                               {"completed_at", exec.completed_at},
+                               {"steps", steps_arr}});
+        add_agent_ids_bound(detail, exec.agent_ids_json, static_cast<bool>(gate.scope));
+        res.set_content(detail.dump(), "application/json");
     });
 
     // -- REST v1 twins (#4030: executions/workflows/schedules read-twin programme) --

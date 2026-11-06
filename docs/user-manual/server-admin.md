@@ -5663,9 +5663,18 @@ What a run row holds, and how to treat it:
   `POST /api/workflows/{id}/execute` leaves it empty. `correlation_id` is the call's correlation id
   (the same value the call's audit rows carry). `idempotency_key` is the caller's own string,
   `request_fingerprint` a SHA-256 of the request.
-- **Where it ran.** `agent_ids_json` is the full list of device ids the caller named: up to 10,000
-  ids of up to 128 bytes each, so a single run can store about 1.3 MB. Rows are never trimmed, so
-  size the Postgres volume for the run rate you expect.
+- **Where it ran.** `agent_ids_json` holds the device ids the caller named, up to 1,000 of them
+  (about 131 KB at 128 bytes each). A run that names more still sends to every id it names; only the
+  stored copy is bounded. Above 1,000 ids the column holds the first 1,000 (for a caller confined to
+  a device scope, that caller's own visible devices are kept first) followed by one marker object,
+  `{"truncated":true,"total":<count named>,"sha256":"<hash of the full list's JSON text>"}`, so the
+  column is still a JSON array and the true count and a digest of the full list stay in the row.
+  The run's detail reads then show `agent_ids_truncated: true` and, to a caller with no device
+  scope, `agent_ids_total`. A confined reader sees the run only if one of the stored ids is in
+  its scope, so for a run that named more than 1,000 devices a reader whose devices were not stored
+  does not see it. The legacy execute route shares the same insert and the same bound. Rows are
+  still never trimmed, so size the Postgres volume for the run rate you expect: the bound caps
+  each row, not the number of rows.
 - **Classification.** The pairing of an operator's account name with a set of devices and a time is
   personal data about that operator (usage-class, like the audit log). Include `workflow_executions`
   in your data inventory and in any works-council or subject-access process. There is no per-row

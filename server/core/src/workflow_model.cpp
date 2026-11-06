@@ -1,8 +1,62 @@
 #include "workflow_model.hpp"
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "sha256_hex.hpp"
+
+#include <algorithm>
 
 namespace yuzu::server {
+
+std::string stored_agent_ids_json(const std::vector<std::string>& agent_ids,
+                                  const std::function<bool(const std::string&)>& first,
+                                  std::size_t max) {
+    if (agent_ids.size() <= max)
+        return nlohmann::json(agent_ids).dump();
+    nlohmann::json kept = nlohmann::json::array();
+    if (first) {
+        for (const auto& id : agent_ids)
+            if (kept.size() < max && first(id))
+                kept.push_back(id);
+    }
+    for (const auto& id : agent_ids) {
+        if (kept.size() >= max)
+            break;
+        if (first && first(id))
+            continue; // already kept above
+        kept.push_back(id);
+    }
+    const auto digest = sha256_hex(nlohmann::json(agent_ids).dump());
+    kept.push_back(nlohmann::json{{"truncated", true},
+                                  {"total", agent_ids.size()},
+                                  {"sha256", digest ? nlohmann::json(*digest) : nlohmann::json(nullptr)}});
+    return kept.dump();
+}
+
+std::optional<std::int64_t> stored_agent_ids_total(const std::string& agent_ids_json) {
+    const auto parsed = nlohmann::json::parse(agent_ids_json, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_array())
+        return std::nullopt;
+    for (const auto& e : parsed) {
+        if (!e.is_object())
+            continue;
+        const auto t = e.find("truncated");
+        const auto n = e.find("total");
+        if (t != e.end() && t->is_boolean() && t->get<bool>() && n != e.end() &&
+            n->is_number_integer())
+            return n->get<std::int64_t>();
+    }
+    return std::nullopt;
+}
+
+void add_agent_ids_bound(nlohmann::json& detail, const std::string& agent_ids_json,
+                         bool confined) {
+    const auto total = stored_agent_ids_total(agent_ids_json);
+    if (!total)
+        return;
+    detail["agent_ids_truncated"] = true;
+    if (!confined)
+        detail["agent_ids_total"] = *total;
+}
 
 namespace {
 
@@ -139,7 +193,7 @@ nlohmann::json workflow_execution_detail_json(const WorkflowExecution& we,
         });
     }
 
-    return nlohmann::json{
+    nlohmann::json detail{
         {"id", we.id},
         {"workflow_id", we.workflow_id},
         {"status", we.status},
@@ -149,6 +203,8 @@ nlohmann::json workflow_execution_detail_json(const WorkflowExecution& we,
         {"completed_at", we.completed_at},
         {"steps", steps},
     };
+    add_agent_ids_bound(detail, we.agent_ids_json, static_cast<bool>(scope));
+    return detail;
 }
 
 } // namespace yuzu::server
