@@ -1892,6 +1892,10 @@ struct Rest {
     // The one held-open budget the route leases from, and the server's draining flag.
     detail::StreamBudget budget{{.global_cap = 8}};
     bool draining{false};
+    // A drain that begins after the route's first look at the flag: >= 0 makes the flag read true
+    // from the (N+1)th ask on, whatever `draining` says.
+    int draining_flips_after_asks{-1};
+    int draining_asks{0};
     // What the route handed the credential check: the principal, and a request header proving it
     // is THIS request (not a copy made at registration).
     std::vector<std::string> reauth_principals;
@@ -1960,7 +1964,10 @@ struct Rest {
         d.caller_fn = [this](const httplib::Request&) { return caller; };
         d.metrics = &metrics;
         d.stream_budget = &budget;
-        d.draining = [this] { return draining; };
+        d.draining = [this] {
+            return draining ||
+                   (draining_flips_after_asks >= 0 && draining_asks++ >= draining_flips_after_asks);
+        };
         d.reauthorize_retry_delay = std::chrono::milliseconds(1);
         d.emit_event_fn = [this](const std::string& type, const httplib::Request&,
                                  const json& attrs, const json& payload) {
@@ -2478,6 +2485,32 @@ TEST_CASE("workflow run admission: a run leases kWorkflowRun, two per principal,
     CHECK(roomy.active() == 0);
     CHECK(refused_count(m, "draining") == 1);
 
+    // A drain that begins AFTER the first look at the flag but before the lease is held: the
+    // lease is taken, the flag is asked again, the run is refused and the lease is gone, so the
+    // shutdown drain that already decided there was nothing to wait for cannot be outlived by a
+    // run it never counted.
+    {
+        detail::StreamBudget flip{{.global_cap = 10}};
+        int asks = 0;
+        const std::function<bool()> after_first = [&] { return ++asks > 1; };
+        auto f = admit_workflow_run(&flip, after_first, "alice", &m);
+        CHECK(asks == 2);
+        CHECK_FALSE(f.lease);
+        REQUIRE(f.refusal);
+        CHECK(f.refusal->status == WorkflowExecuteStatus::kDraining);
+        CHECK(f.refusal->reason == "draining");
+        CHECK(f.refusal->retryable);
+        CHECK(flip.active() == 0);
+        CHECK(flip.active_for_surface(detail::SseSurface::kWorkflowRun) == 0);
+        CHECK(refused_count(m, "draining") == 2);
+        // A drain that has not begun by the second look admits the run as before.
+        asks = -1000;
+        auto ok = admit_workflow_run(&flip, after_first, "alice", &m);
+        CHECK(ok.lease);
+        CHECK_FALSE(ok.refusal);
+        CHECK(flip.active_for_surface(detail::SseSurface::kWorkflowRun) == 1);
+    }
+
     // A null budget is the unmetered test seam; a null draining port is never draining.
     auto u = admit_workflow_run(nullptr, {}, "alice", &m);
     CHECK_FALSE(u.refusal);
@@ -2591,6 +2624,22 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a draining server refuses a new 
     CHECK(r.fx.events.empty());
     r.draining = false;
     CHECK(r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})")->status == 202);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a drain that begins after the first look at the flag "
+          "but before the lease is a retryable 503, holds no lease and starts no run",
+          "[workflow][twin][rest][cap][drain]") {
+    Rest r;
+    r.draining_flips_after_asks = 1;
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(at_path(body_of(*res), "/error/reason") == "draining");
+    CHECK(r.draining_asks == 2);
+    CHECK(r.budget.active() == 0);
+    CHECK(r.refused("draining") == 1);
+    CHECK_FALSE(r.fx.engine_called);
+    CHECK(r.fx.events.empty());
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: a malformed workflow id is a non-retryable 400 "

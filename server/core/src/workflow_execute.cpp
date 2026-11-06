@@ -840,15 +840,18 @@ WorkflowRunAdmission admit_workflow_run(detail::StreamBudget* budget,
         } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
         }
     };
-    // Draining first: StreamBudget::try_acquire does not consult its closing flag, and a run
-    // admitted now would hold the drain open for up to the whole run budget.
-    if (draining && draining()) {
+    const auto refuse_draining = [&] {
         count(kWorkflowRunRefusedDraining);
         out.refusal = refuse(WorkflowExecuteStatus::kDraining,
                              "the server is shutting down and is not starting new workflow runs",
                              kWorkflowRunRefusedDraining, /*retryable=*/true);
         out.refusal->remediation =
             "retry after the server restarts, or against another replica; nothing was sent";
+    };
+    // Draining first: StreamBudget::try_acquire does not consult its closing flag, and a run
+    // admitted now would hold the drain open for up to the whole run budget.
+    if (draining && draining()) {
+        refuse_draining();
         return out;
     }
     if (!budget)
@@ -856,6 +859,12 @@ WorkflowRunAdmission admit_workflow_run(detail::StreamBudget* budget,
     auto acquired = budget->try_acquire(detail::SseSurface::kWorkflowRun, principal,
                                         detail::kPerPrincipalWorkflowRun);
     if (acquired.lease) {
+        // Asked again now the lease is held: the shutdown drain counts leases under the budget's
+        // mutex after it sets the flag, so a lease it did not count was taken after this read.
+        if (draining && draining()) {
+            refuse_draining(); // `acquired.lease` releases on the way out
+            return out;
+        }
         out.lease = std::move(acquired.lease);
         return out;
     }
