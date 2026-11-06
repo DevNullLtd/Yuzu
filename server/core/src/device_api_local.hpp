@@ -46,13 +46,13 @@ class AgentHealthStore; // #2240: source of the per-device guardian_backend fiel
 ///
 /// #2240 `health` (the heartbeat `AgentHealthStore`) is a REFERENCE, not a nullable pointer: a
 /// wiring fault must be a compile error, not a fleet-wide field that silently reads null. Its
-/// lifetime is NOT the registry's: in `ServerImpl`, `registry_` and `tag_store_` are declared
-/// BEFORE every `DeviceApi` holder (`rest_api_v1_`, `mcp_server_`, `device_routes_`,
-/// `crypto_device_api_`), but `health_store_` is declared AFTER them, so it is destroyed FIRST.
-/// The reference is safe only because `stop()` quiesces every caller before destruction (the web
-/// thread join), and the holder that outlives the web thread, `crypto_device_api_`, is reset in
-/// `stop()` for that reason. `LocalNetworkApi` has the same shape. A new holder of this API
-/// outside `stop()`'s quiescence is a use-after-free.
+/// lifetime is held by declaration order, not by `stop()` quiescence alone: in `ServerImpl`,
+/// `registry_`, `tag_store_` and `health_store_` are all declared BEFORE every `DeviceApi` holder
+/// (`rest_api_v1_`, `mcp_server_`, `device_routes_`, `crypto_device_api_`), so all three are
+/// destroyed AFTER every holder. `health_store_` was moved up beside `registry_` for exactly this
+/// reason (its comment in server.cpp says so); it used to be declared after the holders. A new
+/// holder of this API must be declared after `health_store_`, and `health_store_` must not be
+/// moved back below any holder (the reference would dangle in `~ServerImpl`).
 [[nodiscard]] std::shared_ptr<DeviceApi>
 make_local_device_api(detail::AgentRegistry& registry, TagStore* tags,
                       const detail::AgentHealthStore& health);
