@@ -16866,7 +16866,8 @@ private:
                         return auth_routes_->deny_service_scoped_session(req, res, action, message,
                                                                           target_type, target_id);
                     },
-                // The ONE call site of `rbac_admin_hint` (routed A2/A1 row): the page draws the
+                // The page's call site of `rbac_admin_hint` (routed A2/A1 row; the other is
+                // `read_rbac_enforcement`, the machine twin's builder): the page draws the
                 // Assign button and the enforcement switch from the authority the A2/A1 routes
                 // apply (the durable-Administrator predicate, then the regime check; A1 applies
                 // the regime rule inside set_enforcement), not from the session's base role.

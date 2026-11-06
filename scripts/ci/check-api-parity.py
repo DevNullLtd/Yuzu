@@ -136,7 +136,7 @@ WHAT IT CHECKS
      triple -> number of calls); and the refusal / confinement evidence above.
      A route with no recognisable gate (auth_fn
      only, a helper closure, a member-function gate) fails CLOSED unless named in the
-     size-pinned, shrink-only GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless
+     size-pinned GATE_PARITY_NO_GATE_ALLOWED (its table size must equal GATE_PARITY_NO_GATE_MAX, raised only by a dated ADR-1005 ruling); a mismatch is an error unless
      named, with its exact gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (the table size
      must EQUAL its pin, GATE_PARITY_KNOWN_MISMATCHES_MAX: it is a pin, not a shrink-only cap.
      It was raised 6 -> 7 by owner ruling 2026-10-31; raising it again needs a ruling recorded
@@ -480,8 +480,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
 # GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
-# get_me is the twin of the raw flag only, so this row still needs the degraded-bit read tracked in
-# #6033.
+# get_me is the twin of the raw flag only, so this row needed the degraded-bit read tracked in
+# #6033 (since delivered: see the 206 -> 205 line below).
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
@@ -505,9 +505,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get.api-agents and get.fragments-devices-list left their dated exception and are twinned to it.
 # The two 212-origin steps above ran on separate branches. Merged: 4 rows flipped by twin batch B and
 # 2 by #4041, the sets are disjoint, so 212 - 4 - 2 = 206.
-# 206 -> 210 (AP-3.12, DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
+# 206 -> 205 (enforcement read twins, ADR-1005 2026-11-03 entry): get.fragments-access-enforcement flipped from
+# `twinned-rest-only` to `twinned` (GET /api/v1/rbac/enforcement + the get_rbac_enforcement MCP tool, #6033).
+# 205 -> 209 (AP-3.12, DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
 # preview and reset POSTs) born `planned:#6087`, each with its merged REST v1 twin named and the MCP twin owed.
-BASELINE_UNTWINNED = 210
+BASELINE_UNTWINNED = 209
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -2383,7 +2385,7 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 13
+GATE_PARITY_NO_GATE_MAX = 14
 GATE_PARITY_NO_GATE_ALLOWED = {
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
@@ -2406,6 +2408,15 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
         "follow-up recorded as exception:#6432 revisit:2026-11-30, confirmed "
         "by the ADR owner (ADR-1005 2026-10-24 entry)"),
+    ("GET", "/api/v1/rbac/enforcement", "get_rbac_enforcement"): (
+        "session-only for parity with its HTML fragment and GET /api/v1/me: the route calls auth_fn "
+        "behind a service-scope refusal and holds no RBAC gate call, because a "
+        "perm_fn(Infrastructure, Read) gate would make the machine twin stricter than its fragment "
+        "and invent an authority the route does not have. The RBAC store is the data the route "
+        "reads, not its gate; the tool is gated at Infrastructure:Read for the MCP tier ladder and "
+        "the default-denied service-scope class only; retiring or making permanent this and the "
+        "get_me session-only entry together is tracked as exception:#6984 revisit:2026-11-30 "
+        "(ADR-1005 2026-11-03 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),
@@ -2584,8 +2595,8 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
 
 
 def _pinned_table_errors(label, const, table, limit, live):
-    """Shrink-only, size-pinned allowlist errors shared by checks 6 and 7: the table's size must
-    equal its MAX and every entry must still match a live finding (`live` = the set of keys, or
+    """Size-pinned allowlist errors shared by checks 6 and 7 (a pin, not a shrink-only cap): the
+    table's size must equal its MAX, raised only by a ruling recorded in ADR-1005, and every entry must still match a live finding (`live` = the set of keys, or
     for the mismatch table a {key: value} dict checked by the caller)."""
     errors = []
     n = len(table)
