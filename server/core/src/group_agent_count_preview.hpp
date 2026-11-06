@@ -61,7 +61,7 @@ std::vector<FacetFilter> resolve_group_preview_filters(
 /// whose `col_idx` does not resolve against `plugin`'s columns is skipped. Key
 /// NAMES only, never the values. REST and MCP report this additively as
 /// `unindexed_filter_keys`. The published order is sorted by key only because both callers
-/// supply filters from a sorted container (REST `req.params`, a multimap; MCP `args["filters"]`,
+/// supply filters from a sorted container (REST `req.params` copied through `model_detail::to_params` into a key-sorted multimap; `httplib::Params` itself is insertion-ordered; MCP `args["filters"]`,
 /// a `std::map`). Tests in test_mcp_server.cpp ("preview agent count: two over-bound keys come
 /// back sorted by key on REST and MCP ...") and test_rest_devices.cpp ("two over-bound keys come
 /// back sorted by key") pin that; a caller with another container must sort first.
