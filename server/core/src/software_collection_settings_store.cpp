@@ -132,6 +132,9 @@ std::optional<cs::StoredDocument> parse_row(const pg::PgResult& res, int row) {
     d.settings.plugins[std::string{cs::kRegisteredAppsPlugin}] = true;
     d.settings.priority = static_cast<int>(cell_i64(res, row, 6));
     d.version = PQgetvalue(res.get(), row, 7);
+    // A version no caller can send back as expected_version would wedge the group's writes.
+    if (!cs::is_version_text(d.version))
+        return std::nullopt;
     d.updated_at = cell_i64(res, row, 8);
     d.updated_by = PQgetvalue(res.get(), row, 9);
     if (!cs::validate(d.settings, d.group_id == cs::kRootGroupId))
@@ -140,6 +143,17 @@ std::optional<cs::StoredDocument> parse_row(const pg::PgResult& res, int row) {
 }
 
 constexpr const char* kCorruptMessage = "a stored collection settings row failed the read rule";
+
+// Logs the group (a validated hex id, or a placeholder) so an operator can find the row.
+Error corrupt(std::string_view op, std::string_view group_id) {
+    spdlog::warn("SoftwareCollectionSettingsStore: {} found a corrupt row for group {}", op,
+                 valid_group_id(group_id) ? group_id : std::string_view{"(invalid id)"});
+    return Error{Kind::Corrupt, kCorruptMessage, std::nullopt};
+}
+
+// Serialises creates so the row-count check and the insert cannot interleave past the cap.
+constexpr const char* kCreateLockSql =
+    "SELECT pg_advisory_xact_lock(hashtextextended('software_collection_settings_store.create', 0))";
 
 } // namespace
 
@@ -175,10 +189,8 @@ SoftwareCollectionSettingsStore::get(const std::string& group_id) {
     if (PQntuples(res.get()) == 0)
         return std::optional<cs::StoredDocument>{std::nullopt};
     auto doc = parse_row(res, 0);
-    if (!doc) {
-        spdlog::warn("SoftwareCollectionSettingsStore: get found a corrupt row");
-        return fail(Kind::Corrupt, kCorruptMessage);
-    }
+    if (!doc)
+        return std::unexpected(corrupt("get", group_id));
     return std::optional<cs::StoredDocument>{std::move(*doc)};
 }
 
@@ -196,16 +208,17 @@ std::expected<std::vector<cs::StoredDocument>, Error> SoftwareCollectionSettings
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(statement_error("list_all", res, Kind::Unavailable));
     const int n = PQntuples(res.get());
-    if (n > kListRowCap)
+    if (n > kListRowCap) {
+        spdlog::warn("SoftwareCollectionSettingsStore: list_all found more than {} rows",
+                     kListRowCap);
         return fail(Kind::TooMany, "more collection settings rows than the list cap");
+    }
     std::vector<cs::StoredDocument> out;
     out.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
         auto doc = parse_row(res, i);
-        if (!doc) {
-            spdlog::warn("SoftwareCollectionSettingsStore: list_all found a corrupt row");
-            return fail(Kind::Corrupt, kCorruptMessage);
-        }
+        if (!doc)
+            return std::unexpected(corrupt("list_all", PQgetvalue(res.get(), i, 0)));
         out.push_back(std::move(*doc));
     }
     return out;
@@ -279,6 +292,26 @@ SoftwareCollectionSettingsStore::put(const std::string& group_id,
         std::optional<cs::StoredDocument> previous;
         pg::PgResult written;
         if (!expected_version) {
+            // The write side refuses what the read side would refuse: a create past the row cap.
+            pg::PgResult lock = pg::exec_params(c, kCreateLockSql, std::vector<std::string>{});
+            if (lock.status() != PGRES_TUPLES_OK)
+                return fail_stmt("create lock", lock);
+            pg::PgResult count = pg::exec_params(
+                c,
+                "SELECT count(*), COALESCE(bool_or(group_id = $1), false) FROM "
+                "software_collection_settings_store.settings",
+                std::vector<std::string>{group_id});
+            if (count.status() != PGRES_TUPLES_OK)
+                return fail_stmt("create count", count);
+            const auto rows = cell_i64(count, 0, 0);
+            if (PQgetvalue(count.get(), 0, 1)[0] != 't' && rows >= kListRowCap) {
+                spdlog::warn("SoftwareCollectionSettingsStore: create for group {} refused at the "
+                             "row cap ({} rows)",
+                             group_id, rows);
+                error = Error{Kind::TooMany, "the collection settings document cap is reached",
+                              std::nullopt};
+                return false;
+            }
             const std::string sql =
                 "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
                 "window_start_min, window_end_min, timezone, plugins_json, priority, version, "
@@ -305,7 +338,7 @@ SoftwareCollectionSettingsStore::put(const std::string& group_id,
                     // A row that fails the read rule is Corrupt, never a 409 whose `current`
                     // reads as "no document exists".
                     if (!conflict.current) {
-                        error = Error{Kind::Corrupt, kCorruptMessage, std::nullopt};
+                        error = corrupt("put", group_id);
                         return false;
                     }
                 }
@@ -326,7 +359,7 @@ SoftwareCollectionSettingsStore::put(const std::string& group_id,
             previous = parse_row(cur, 0);
             // Corrupt first: a 409 carrying `current: null` would read as "no document exists".
             if (!previous) {
-                error = Error{Kind::Corrupt, kCorruptMessage, std::nullopt};
+                error = corrupt("put", group_id);
                 return false;
             }
             if (previous->version != *expected_version) {
@@ -356,7 +389,7 @@ SoftwareCollectionSettingsStore::put(const std::string& group_id,
 
         auto stored = parse_row(written, 0);
         if (!stored) {
-            error = Error{Kind::Corrupt, kCorruptMessage, std::nullopt};
+            error = corrupt("put", group_id);
             return false;
         }
 

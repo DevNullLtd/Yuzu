@@ -13,7 +13,9 @@
 /// configuration.
 ///
 /// Concurrency: a write names the version it expects to replace (`nullopt` = "no row may exist").
-/// Create is `INSERT ... ON CONFLICT DO NOTHING RETURNING` (no row back = a concurrent create
+/// Create takes a transaction-scoped advisory lock (creates only), refuses a new row once
+/// `kListRowCap` rows exist (`TooMany`, so the write side never reaches a state the read side
+/// refuses), then `INSERT ... ON CONFLICT DO NOTHING RETURNING` (no row back = a concurrent create
 /// won = Conflict carrying the winner). Replace is `SELECT ... FOR UPDATE`, a version compare, then
 /// `UPDATE ... WHERE version = $n RETURNING`. `ON CONFLICT DO UPDATE` is never used: a row lock on
 /// a row that does not exist locks nothing, so DO UPDATE would silently overwrite the winner of a
@@ -30,8 +32,9 @@
 /// and the list route ignore a document whose group is not in the tree.
 ///
 /// Read rule (the stored row is configuration, never silently defaulted): a row whose
-/// `plugins_json` does not parse, holds a non-boolean or an UNKNOWN key, or whose scalar fields fail
-/// `validate()` is `Error::Kind::Corrupt`. A MISSING known plugin key reads as that plugin's fleet
+/// `plugins_json` does not parse, holds a non-boolean or an UNKNOWN key, whose `version` is not 64
+/// lowercase hex (a caller could never send it back), or whose scalar fields fail `validate()` is
+/// `Error::Kind::Corrupt`, logged with the group id. A MISSING known plugin key reads as that plugin's fleet
 /// default (on), and the registered apps collector reads as on. The stored `version` is returned
 /// as written (it hashes the written document, not the widened read).
 
@@ -62,7 +65,7 @@ public:
             WriteFailed,     ///< a statement failed with a definite rollback
             OutcomeUnknown,  ///< the COMMIT did not confirm: the write may be live
             Corrupt,         ///< a stored row failed the read rule
-            TooMany,         ///< more than kListRowCap rows: never a truncated answer
+            TooMany,         ///< more than kListRowCap rows to read, or a create at the cap
         };
         Kind kind{Kind::Unavailable};
         std::string message;

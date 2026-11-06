@@ -19,6 +19,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using namespace yuzu::server;
 namespace cs = yuzu::server::collection_settings;
@@ -70,7 +71,7 @@ std::string scalar(const std::string& dsn, const std::string& sql) {
 
 const std::string kInsertRow =
     "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, plugins_json, "
-    "version, updated_at) VALUES ('aaaa11112222', 86400, '%s', 'v', 1)";
+    "version, updated_at) VALUES ('aaaa11112222', 86400, '%s', repeat('a', 64), 1)";
 
 std::string insert_with_plugins(const std::string& plugins) {
     std::string sql = kInsertRow;
@@ -237,6 +238,10 @@ TEST_CASE("SoftwareCollectionSettingsStore: the timezone must exist in the datab
 TEST_CASE("SoftwareCollectionSettingsStore: history keeps one row per save, bounded to the newest 200",
           "[pg][store][collection_settings]") {
     SETTINGS_STORE(store);
+    // A second group's trail, written around group A's saves: the trim is per group.
+    const std::string kGroupB = "bbbb11112222";
+    auto other = store.put(kGroupB, make(7200), std::nullopt, "bob");
+    REQUIRE(other.has_value());
     auto put = store.put(kGroupA, make(3600), std::nullopt, "alice");
     REQUIRE(put.has_value());
     {
@@ -252,9 +257,11 @@ TEST_CASE("SoftwareCollectionSettingsStore: history keeps one row per save, boun
         put = store.put(kGroupA, make(3600 + i), put->stored.version, "alice");
         REQUIRE(put.has_value());
     }
+    REQUIRE(store.put(kGroupB, make(10800), other->stored.version, "bob").has_value());
     CHECK(scalar(settings_db_fx_.dsn(), "SELECT count(*) FROM "
-                                        "software_collection_settings_store.settings_history") ==
-          "200");
+                                        "software_collection_settings_store.settings_history "
+                                        "WHERE group_id = 'aaaa11112222'") == "200");
+    CHECK(store.list_history(kGroupB, 500)->size() == 2);
     const auto h = store.list_history(kGroupA, 500);
     REQUIRE(h.has_value());
     REQUIRE(h->size() == 200);
@@ -283,7 +290,7 @@ TEST_CASE("SoftwareCollectionSettingsStore: a corrupt row is Corrupt, never a de
         exec_sql(settings_db_fx_.dsn(),
                  "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
                  "window_start_min, window_end_min, plugins_json, version, updated_at) VALUES "
-                 "('aaaa11112222', 90000, 60, 300, '{}', 'v', 1)"); // window on a 25 h interval
+                 "('aaaa11112222', 90000, 60, 300, '{}', repeat('a', 64), 1)"); // window on a 25 h interval
     }
     const auto got = store.get(kGroupA);
     REQUIRE_FALSE(got.has_value());
@@ -315,7 +322,7 @@ TEST_CASE("SoftwareCollectionSettingsStore: a missing known plugin key reads as 
         if (p != "runtimes")
             CHECK(d.settings.plugins.at(std::string{p}));
     }
-    CHECK(d.version == "v"); // returned as stored, not re-hashed
+    CHECK(d.version == std::string(64, 'a')); // returned as stored, not re-hashed
 }
 
 TEST_CASE("SoftwareCollectionSettingsStore: list_all returns every row and refuses past the cap",
@@ -331,14 +338,15 @@ TEST_CASE("SoftwareCollectionSettingsStore: list_all returns every row and refus
     exec_sql(settings_db_fx_.dsn(),
              "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
              "plugins_json, version, updated_at) SELECT 'cccc' || lpad(g::text, 8, '0'), 86400, "
-             "'{}', 'v', 1 FROM generate_series(1, " +
+             "'{}', repeat('a', 64), 1 FROM generate_series(1, " +
                  std::to_string(SoftwareCollectionSettingsStore::kListRowCap - 2) + ") g");
     const auto full = store.list_all();
     REQUIRE(full.has_value()); // exactly at the cap
     CHECK(full->size() == static_cast<std::size_t>(SoftwareCollectionSettingsStore::kListRowCap));
     exec_sql(settings_db_fx_.dsn(),
              "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
-             "plugins_json, version, updated_at) VALUES ('dddd00000001', 86400, '{}', 'v', 1)");
+             "plugins_json, version, updated_at) VALUES ('dddd00000001', 86400, '{}', repeat('a', 64), "
+             "1)");
     const auto over = store.list_all();
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error().kind == Kind::TooMany);
@@ -361,4 +369,77 @@ TEST_CASE("SoftwareCollectionSettingsStore: a held pool is Unavailable, never no
     const auto list = store.list_all();
     REQUIRE_FALSE(list.has_value());
     CHECK(list.error().kind == Kind::Unavailable);
+}
+
+TEST_CASE("SoftwareCollectionSettingsStore: a stored version that is not 64 lowercase hex is Corrupt",
+          "[pg][store][collection_settings]") {
+    SETTINGS_STORE(store);
+    std::string bad;
+    SECTION("empty") { bad = ""; }
+    SECTION("uppercase hex") { bad = std::string(64, 'A'); }
+    SECTION("too short") { bad = "v"; }
+    exec_sql(settings_db_fx_.dsn(),
+             "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
+             "plugins_json, version, updated_at) VALUES ('aaaa11112222', 86400, '{}', '" +
+                 bad + "', 1)");
+    const auto got = store.get(kGroupA);
+    REQUIRE_FALSE(got.has_value());
+    CHECK(got.error().kind == Kind::Corrupt);
+    const auto list = store.list_all();
+    REQUIRE_FALSE(list.has_value());
+    CHECK(list.error().kind == Kind::Corrupt);
+    // Neither write path can wedge on a version no caller can send back.
+    const auto create = store.put(kGroupA, make(), std::nullopt, "alice");
+    REQUIRE_FALSE(create.has_value());
+    CHECK(create.error().kind == Kind::Corrupt);
+    const auto replace = store.put(kGroupA, make(), std::string(64, 'a'), "alice");
+    REQUIRE_FALSE(replace.has_value());
+    CHECK(replace.error().kind == Kind::Corrupt);
+}
+
+TEST_CASE("SoftwareCollectionSettingsStore: a create at the row cap is TooMany; a replace lands",
+          "[pg][store][collection_settings]") {
+    SETTINGS_STORE(store);
+    exec_sql(settings_db_fx_.dsn(),
+             "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
+             "plugins_json, version, updated_at) SELECT 'cccc' || lpad(g::text, 8, '0'), 86400, "
+             "'{}', repeat('a', 64), 1 FROM generate_series(1, " +
+                 std::to_string(SoftwareCollectionSettingsStore::kListRowCap) + ") g");
+    const auto create = store.put(kGroupA, make(), std::nullopt, "alice");
+    REQUIRE_FALSE(create.has_value());
+    CHECK(create.error().kind == Kind::TooMany);
+    CHECK_FALSE(store.get(kGroupA)->has_value());
+    CHECK(store.list_history(kGroupA, 10)->empty());
+    // The read side answers at the cap, and a replace adds no row.
+    REQUIRE(store.list_all().has_value());
+    CHECK(store.put("cccc00000001", make(7200), std::string(64, 'a'), "alice").has_value());
+}
+
+TEST_CASE("SoftwareCollectionSettingsStore: concurrent writers from the same starting point - one wins",
+          "[pg][store][collection_settings]") {
+    SETTINGS_STORE(store);
+    using Put = std::expected<SoftwareCollectionSettingsStore::PutResult,
+                              SoftwareCollectionSettingsStore::Error>;
+    const auto race = [&](const std::optional<std::string>& expected) {
+        std::optional<Put> a, b;
+        std::thread ta([&] { a = store.put(kGroupA, make(7200), expected, "alice"); });
+        std::thread tb([&] { b = store.put(kGroupA, make(10800), expected, "bob"); });
+        ta.join();
+        tb.join();
+        REQUIRE((a->has_value() != b->has_value())); // exactly one write lands
+        const Put& winner = a->has_value() ? *a : *b;
+        const Put& loser = a->has_value() ? *b : *a;
+        CHECK(loser.error().kind == Kind::Conflict);
+        REQUIRE(loser.error().current.has_value());
+        CHECK(loser.error().current->version == winner->stored.version);
+        CHECK(store.get(kGroupA)->value().version == winner->stored.version);
+        return winner->stored.version;
+    };
+    SECTION("two creates") { race(std::nullopt); }
+    SECTION("two replaces naming the same version") {
+        const auto first = store.put(kGroupA, make(3600), std::nullopt, "carol");
+        REQUIRE(first.has_value());
+        race(first->stored.version);
+        CHECK(store.list_history(kGroupA, 10)->size() == 2);
+    }
 }
