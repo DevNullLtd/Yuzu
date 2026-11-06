@@ -703,11 +703,16 @@ static_assert(kMaxFacetValueBytes == 2048,
               "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
     {"list_agents",
-     "List the connected agents the caller may read, with hostname, OS, architecture, and "
-     "version. Read-only. Requires Infrastructure:Read. A live snapshot of the agents connected "
+     "List the connected agents the caller may read, with hostname, OS, architecture, "
+     "version and guardian_backend. Read-only. Requires Infrastructure:Read. A live snapshot of "
+     "the agents connected "
      "to this server: an enrolled device that is offline is not listed, so use list_hardware_ci "
      "for enrolled devices. Use get_agent_details for one device's tags and detail; each row's "
-     "agent_id feeds the per-agent tools. Confined: when the read is scoped to the devices the "
+     "agent_id feeds the per-agent tools. guardian_backend is the detection backend the device "
+     "reports on its latest heartbeat: legacy, spark, spark_failed or unwired, or null when it "
+     "has not reported one (an older agent, no Guardian, a faulted heartbeat tag group, a "
+     "forged value, or no heartbeat in the last 90 seconds); null is never legacy, and every "
+     "device reads legacy until prefer_spark is enabled. Confined: when the read is scoped to the devices the "
      "caller may read, the result carries scope_basis authority_scoped, and the text content is "
      "the object {agents, scope_basis} instead of the bare array of an unscoped read. It is a "
      "status, set whether or not anything was hidden; the number of hidden devices is never "
@@ -717,7 +722,7 @@ static const ToolDef kTools[] = {
      "permission denial is terminal; an authorization-store failure is a retryable 503 with "
      "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Reads legacy fleet-wide until prefer_spark is enabled."}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
@@ -770,12 +775,25 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"result_truncated_by_cap":{"type":"boolean","description":"true when the scan's response read hit the 10,000-row or 50 MiB payload cap: rows and counts are partial"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows"]})j"},
 
     {"get_agent_details",
-     "Get detailed info for a single agent including tags and inventory. "
-     "An \"Agent not found\" error means either the agent does not exist or "
-     "it exists outside your management-group scope -- deliberately "
-     "indistinguishable to prevent scope-probing.",
+     "Get one connected agent's identity (hostname, OS, architecture, agent version), its "
+     "guardian_backend and its tags (key, value, source). Read-only. Requires "
+     "Infrastructure:Read. Use list_agents first: each row's agent_id is the input here, and "
+     "list_agents is the right tool to enumerate or find devices. This is not an inventory "
+     "read; installed software and hardware are separate tools. The identity fields are a live "
+     "snapshot of the agent's session on this server, so a device that is not currently "
+     "connected is not found; the tags are read live from the tag store. guardian_backend is "
+     "the detection backend the device reports on its latest heartbeat: legacy, spark, "
+     "spark_failed or unwired, or null when it has not reported one (an older agent, no "
+     "Guardian, a faulted heartbeat tag group, a forged value, or no heartbeat in the last 90 "
+     "seconds); null is never legacy, and every device reads legacy until prefer_spark is "
+     "enabled. The tags array is always present, empty when the device has none. An \"Agent "
+     "not found\" error means the agent is not connected, does not exist, or exists outside "
+     "your management-group scope, deliberately indistinguishable to prevent scope-probing, "
+     "so an unreadable id is not proof the device is absent from the fleet. Not found and "
+     "permission denial are terminal; a tag-store failure (\"Tag store unavailable\") is "
+     "retryable with retry_after_ms 5000, never a device with empty tags.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","tags"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Reads legacy fleet-wide until prefer_spark is enabled."},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend","tags"]})j"},
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries (newest first, rows with "
@@ -9917,12 +9935,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 for (const auto& d : device_api->list_devices()) {
                     if (!authz::in_scope(gate.scope, d.agent_id))
                         continue;
-                    arr.add(JObj()
-                                .add("agent_id", d.agent_id)
-                                .add("hostname", d.hostname)
-                                .add("os", d.os)
-                                .add("arch", d.arch)
-                                .add("agent_version", d.agent_version));
+                    JObj row;
+                    row.add("agent_id", d.agent_id)
+                        .add("hostname", d.hostname)
+                        .add("os", d.os)
+                        .add("arch", d.arch)
+                        .add("agent_version", d.agent_version);
+                    // #2240: always present; null = not reported, never "legacy".
+                    if (d.guardian_backend)
+                        row.add("guardian_backend", *d.guardian_backend);
+                    else
+                        row.raw("guardian_backend", "null");
+                    arr.add(row);
                 }
                 // Confinement is reported as a STATUS, never a count of hidden devices
                 // (mcp_tools_hardware.cpp), in both channels so a client reading only
@@ -10140,7 +10164,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                                 // (in-scope only reaches here)
                     mcp_audit("failure", audit_caller_id(agent_id));
-                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                    // A genuine retryable store fault: carry the hint (A5 item 5) rather
+                    // than an inline exemption. The REST twin carries the same 5 s hint.
+                    res.set_content(a4_error(kInternalError, "Tag store unavailable",
+                                             "retry once the tag store recovers",
+                                             mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10160,6 +10188,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("os", detail.row.os)
                     .add("arch", detail.row.arch)
                     .add("agent_version", detail.row.agent_version);
+                // #2240: always present; null = not reported, never "legacy".
+                if (detail.row.guardian_backend)
+                    agent_obj.add("guardian_backend", *detail.row.guardian_backend);
+                else
+                    agent_obj.raw("guardian_backend", "null");
                 // ADR-0031 WS-A4 wave 2: DeviceApi always returns a (possibly
                 // empty) tags vector — a null/unwired TagStore at the seam
                 // degrades to empty, not an omitted key (device_api_local.hpp's
