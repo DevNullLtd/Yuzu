@@ -35,8 +35,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "product_name}, /sys/hypervisor/type, /proc/cpuinfo, /.dockerenv, /run/.containerenv "
          "and /proc/self/cgroup (bounded reads, no subprocess)",
          "ARM has no CPUID: SMBIOS and OS hints alone decide, and a host with neither reads "
-         "unknown, never bare_metal; a KVM or Xen host reads bare_metal (its own CPUID is not "
-         "virtualised); a cgroup-v2 namespace-obscured root reads container unknown"},
+         "unknown, never bare_metal; a KVM host reads bare_metal (its own CPUID is not "
+         "virtualised) but a Xen dom0 reads guest/xen; a cgroup-v2 namespace-obscured root reads "
+         "container unknown"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "sysctlbyname kern.hv_vmm_present and hw.model",
          "no CPUID on arm64: the sysctl is the readable negative; container is always no"},

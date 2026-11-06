@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::virtualization;
@@ -126,11 +127,20 @@ TEST_CASE("virtualization: SMBIOS vendor table is case-insensitive and ignores r
     CHECK(vm_vendor_from_smbios("Nutanix", "AHV") == "nutanix");
     CHECK(vm_vendor_from_smbios("Apple Inc.", "VirtualMac2,1") == "apple");
 
+    // The product-only fallback rows, with a neutral manufacturer and mixed case.
+    CHECK(vm_vendor_from_smbios("Some OEM", "VMWARE Virtual Platform") == "vmware");
+    CHECK(vm_vendor_from_smbios("Oracle Corporation", "VirtualBox") == "virtualbox");
+    CHECK(vm_vendor_from_smbios("Acme", "amazon ec2 instance") == "aws");
+
     // Real hardware maps to nullopt, including a Microsoft-made laptop.
     CHECK_FALSE(vm_vendor_from_smbios("Micro-Star International Co., Ltd.", "MS-7E12").has_value());
     CHECK_FALSE(vm_vendor_from_smbios("Apple Inc.", "Mac16,1").has_value());
     CHECK_FALSE(vm_vendor_from_smbios("Microsoft Corporation", "Surface Laptop 5").has_value());
     CHECK_FALSE(vm_vendor_from_smbios("Lenovo", "ThinkPad X1").has_value());
+
+    // Bare metal that shares a cloud or hyperconverged vendor's manufacturer string.
+    CHECK_FALSE(vm_vendor_from_smbios("Nutanix", "NX-3060-G7").has_value());
+    CHECK_FALSE(vm_vendor_from_smbios("Amazon EC2", "c5.metal").has_value());
 }
 
 TEST_CASE("virtualization: a real bare-metal Mac reads bare_metal", "[virtualization][classify]") {
@@ -324,6 +334,43 @@ TEST_CASE("virtualization: an identified guest with an unreadable SMBIOS stays g
     CHECK(p.reason == "linux:virtualization:dmi:permission_denied");
 }
 
+TEST_CASE("virtualization: a malformed hypervisor signature is a medium-confidence guest",
+          "[virtualization][classify][cpuid]") {
+    // SYNTHETIC: the hypervisor bit is set but the 0x40000000 signature is not 12 bytes.
+    Facts f = linux_facts();
+    f.cpuid = cpuid_hv("KVMKVMKVM");
+    f.smbios.state = State::absent;
+    const auto c = classify(f);
+    CHECK(c.kind == Kind::guest);
+    CHECK(c.is_virtual == Tri::yes);
+    CHECK(c.vendor == "other");
+    CHECK(c.confidence == Confidence::medium);
+    CHECK(decide(f).status == StatusState::supported); // nothing failed to read
+}
+
+TEST_CASE("virtualization: AWS .metal instances read bare_metal not guest", "[virtualization][classify]") {
+    // SYNTHETIC: sys_vendor "Amazon EC2" on an instance with no hypervisor bit.
+    Facts f = linux_facts();
+    f.cpuid = cpuid_clear();
+    f.smbios = smbios_ok("Amazon EC2", "c5.metal");
+    const auto c = classify(f);
+    CHECK(c.kind == Kind::bare_metal);
+    CHECK(c.vendor == "Amazon EC2");
+}
+
+TEST_CASE("virtualization: an unreadable SMBIOS with no reason still names its source",
+          "[virtualization][classify][strict]") {
+    Facts f = linux_facts();
+    f.cpuid = cpuid_clear();
+    f.smbios.state = State::unreadable; // no shell leaves the reason empty; the plugin must not trust that
+    const auto c = classify(f);
+    CHECK(c.kind == Kind::unknown);
+    CHECK(c.source == "linux:virtualization:smbios:unreadable");
+    const auto p = decide(f);
+    CHECK(p.status == StatusState::constrained);
+    CHECK(p.reason == "linux:virtualization:smbios:unreadable");
+}
+
 TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[virtualization][strict]") {
     SECTION("CPUID clear but DMI unreadable is unknown and the host row says why") {
         Facts f = linux_facts();
@@ -514,18 +561,22 @@ TEST_CASE("virtualization: an SMBIOS walk fault is a constraint not a clean abse
 }
 
 TEST_CASE("virtualization: DMI halves combine without hiding an unreadable one", "[virtualization][dmi]") {
-    FieldRead ok_v{State::ok, "Example", ""};
+    FieldRead ok_v{State::ok, "Example\n", ""};
     FieldRead ok_p{State::ok, "Board", ""};
     FieldRead gone{State::absent, "", ""};
-    FieldRead bad{State::unreadable, "", "linux:virtualization:dmi:permission_denied"};
+    FieldRead bad{State::unreadable, "", "permission_denied"};
 
     CHECK(combine_dmi(ok_v, ok_p).state == State::ok);
     CHECK(combine_dmi(ok_v, gone).state == State::ok);
     CHECK(combine_dmi(gone, gone).state == State::absent);
     const auto s = combine_dmi(ok_v, bad);
     CHECK(s.state == State::unreadable);
-    CHECK(s.manufacturer == "Example");
+    CHECK(s.manufacturer == "Example"); // trailing newline trimmed
     CHECK(s.reason == "linux:virtualization:dmi:permission_denied");
+    // Both halves failing keeps both reasons, an identical cause once.
+    CHECK(combine_dmi(bad, FieldRead{State::unreadable, "", "eio"}).reason ==
+          "linux:virtualization:dmi:permission_denied,linux:virtualization:dmi:eio");
+    CHECK(combine_dmi(bad, bad).reason == "linux:virtualization:dmi:permission_denied");
     CHECK(errno_token(ENOENT) == "enoent");
     CHECK(errno_token(EACCES) == "permission_denied");
     CHECK(errno_token(12345) == "errno_12345");
@@ -539,6 +590,109 @@ TEST_CASE("virtualization: cpuinfo flag parse matches the whole word on a flags 
     CHECK_FALSE(cpuinfo_has_hypervisor_flag("flags\t: fpu hypervisor_x lahf_lm\n"));
     CHECK_FALSE(cpuinfo_has_hypervisor_flag("model name\t: a hypervisor appliance\n"));
     CHECK_FALSE(cpuinfo_has_hypervisor_flag(""));
+}
+
+namespace {
+
+FieldRead read_ok(std::string v) { return FieldRead{State::ok, std::move(v), ""}; }
+FieldRead read_bad(std::string cause) { return FieldRead{State::unreadable, "", std::move(cause)}; }
+
+/// A clean bare-metal Linux read: every source answered, CPUID clear, nothing in a container.
+LinuxReads clean_reads() {
+    LinuxReads r;
+    r.sys_vendor = read_ok("Example Board Vendor\n");
+    r.product_name = read_ok("Example Board\n");
+    r.cgroup = read_ok("0::/system.slice/yuzu-agent.service\n");
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("virtualization: linux_facts builds the facts and tokens from the injected reads",
+          "[virtualization][linux]") {
+    SECTION("a clean read is bare_metal with no token") {
+        const Facts f = linux_facts(cpuid_clear(), clean_reads());
+        CHECK(f.os == "linux");
+        CHECK(f.smbios.manufacturer == "Example Board Vendor");
+        CHECK(f.failures.empty());
+        CHECK(f.container.reason.empty());
+        const auto p = decide(f);
+        CHECK(p.status == StatusState::supported);
+        CHECK(p.rows[0].rfind("host|no|bare_metal|Example Board Vendor|Example Board|cpuid|high", 0) == 0);
+        CHECK(p.rows[1] == "container|no|linux:no_container_marker");
+    }
+    SECTION("ENOENT reads as absent: no token anywhere") {
+        LinuxReads r = clean_reads();
+        r.sys_vendor = FieldRead{};
+        r.product_name = FieldRead{};
+        r.hypervisor_type = FieldRead{}; // absent
+        const Facts f = linux_facts(cpuid_clear(), r);
+        CHECK(f.smbios.state == State::absent);
+        CHECK(f.failures.empty());
+        CHECK(decide(f).status == StatusState::supported);
+    }
+    SECTION("the sys_hypervisor and cpuinfo failures carry their source prefix") {
+        LinuxReads r = clean_reads();
+        r.hypervisor_type = read_bad("eio");
+        r.cpuinfo = read_bad("oversized");
+        const Facts f = linux_facts(CpuidFacts{}, r);
+        REQUIRE(f.failures.size() == 2);
+        CHECK(f.failures[0] == "linux:virtualization:sys_hypervisor:eio");
+        CHECK(f.failures[1] == "linux:virtualization:cpuinfo:oversized");
+    }
+    SECTION("the sys_hypervisor value and the cpuinfo flag become the OS hint") {
+        LinuxReads r = clean_reads();
+        r.hypervisor_type = read_ok("xen\n");
+        CHECK(linux_facts(cpuid_clear(), r).hint.vendor_hint == "xen");
+        r.hypervisor_type = FieldRead{};
+        r.cpuinfo = read_ok("flags\t: fpu hypervisor\n");
+        CHECK(linux_facts(CpuidFacts{}, r).hint.source == "cpuinfo");
+    }
+    SECTION("a refused marker probe is a markers_ token, ENOENT is not") {
+        LinuxReads r = clean_reads();
+        r.dockerenv_errno = EACCES;
+        const Facts f = linux_facts(cpuid_clear(), r);
+        CHECK(f.container.reason == "linux:virtualization:container:markers_permission_denied");
+        CHECK(f.container.cgroup.has_value());
+        CHECK_FALSE(f.container.dockerenv);
+    }
+    SECTION("a present marker sets its flag and needs no token") {
+        LinuxReads r = clean_reads();
+        r.containerenv_errno = 0;
+        const Facts f = linux_facts(cpuid_clear(), r);
+        CHECK(f.container.containerenv);
+        CHECK(f.container.reason.empty());
+    }
+    SECTION("a missing /proc/self/cgroup defaults to cgroup_enoent") {
+        LinuxReads r = clean_reads();
+        r.cgroup = FieldRead{};
+        const Facts f = linux_facts(cpuid_clear(), r);
+        CHECK_FALSE(f.container.cgroup.has_value());
+        CHECK(f.container.reason == "linux:virtualization:container:cgroup_enoent");
+    }
+}
+
+TEST_CASE("virtualization: simultaneous source failures are all reported", "[virtualization][linux]") {
+    // Both DMI halves, both markers and the cgroup file fail, each for a different cause so the five
+    // tokens are distinct.
+    LinuxReads r = clean_reads();
+    r.sys_vendor = read_bad("permission_denied");
+    r.product_name = read_bad("eio");
+    r.dockerenv_errno = EACCES;
+    r.containerenv_errno = EIO;
+    r.cgroup = read_bad("eloop");
+    const auto p = decide(linux_facts(cpuid_clear(), r));
+
+    const std::string dmi = "linux:virtualization:dmi:permission_denied,linux:virtualization:dmi:eio";
+    const std::string container =
+        "linux:virtualization:container:markers_permission_denied,"
+        "linux:virtualization:container:markers_eio,linux:virtualization:container:cgroup_eloop";
+    CHECK(p.status == StatusState::constrained);
+    CHECK(p.reason == dmi + "," + container);
+    REQUIRE(p.rows.size() == 2);
+    // The host row explains the host verdict with the DMI failures only; the container row owns the rest.
+    CHECK(p.rows[0].find("|unknown|unknown|-|-|" + dmi + "|low") != std::string::npos);
+    CHECK(p.rows[1] == "container|unknown|" + container);
 }
 
 TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",

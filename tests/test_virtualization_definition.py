@@ -8,6 +8,7 @@ result column fails here rather than only in a dashboard.
 Runnable standalone: `python3 tests/test_virtualization_definition.py` (how meson runs it; a bare
 pytest-style file with no runner would execute zero assertions and always exit 0).
 """
+import re
 import unittest
 from pathlib import Path
 
@@ -22,13 +23,18 @@ EXPECTED_COLUMNS = ["row_kind", "field_1", "field_2", "field_3", "field_4", "fie
 ROW_KINDS = ["status", "host", "container"]
 
 
+def _documents() -> list:
+    return [d for d in yaml.safe_load_all(DEFINITION.read_text(encoding="utf-8")) if d]
+
+
 def _definitions() -> dict:
-    docs = [d for d in yaml.safe_load_all(DEFINITION.read_text(encoding="utf-8")) if d]
-    return {d["spec"]["execution"]["action"]: d for d in docs}
+    return {d["spec"]["execution"]["action"]: d for d in _documents()}
 
 
 class VirtualizationDefinitionColumns(unittest.TestCase):
     def test_one_definition_for_the_host_action(self):
+        # Counted before keying by action, which would collapse a duplicate `host` document.
+        self.assertEqual(len(_documents()), 1)
         defs = _definitions()
         self.assertEqual(sorted(defs), ["host"])
         d = defs["host"]
@@ -43,6 +49,21 @@ class VirtualizationDefinitionColumns(unittest.TestCase):
     def test_row_kind_values_are_the_status_host_and_container_rows(self):
         row_kind = _definitions()["host"]["spec"]["result"]["columns"][0]
         self.assertEqual(row_kind["values"], ROW_KINDS)
+
+    def test_operational_defaults_are_pinned(self):
+        spec = _definitions()["host"]["spec"]
+        self.assertEqual(spec["gather"]["ttlSeconds"], 3600)
+        self.assertEqual(spec["approval"]["mode"], "auto")
+        self.assertEqual(spec["permissions"]["executeRoles"], ["endpoint-admin", "endpoint-operator"])
+        self.assertEqual(spec["permissions"]["authorRoles"], ["content-author"])
+        self.assertEqual(spec["compatibility"]["requiredPlugins"], ["virtualization"])
+
+    def test_the_plugin_is_default_on(self):
+        # Inventory:Read device facts, not privacy-gated: no default-off kill-switch seed names it.
+        server = (REPO_ROOT / "server" / "core" / "src" / "server.cpp").read_text(encoding="utf-8")
+        seeds = re.findall(r"seed_kill_switch_default_off\s*\((.*?)\)\s*\)", server, re.DOTALL)
+        self.assertGreater(len(seeds), 0, "the seed-call pattern matched nothing; fix the regex")
+        self.assertFalse([c for c in seeds if "virtualization" in c])
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@
 
 #include "virtualization_legs.hpp" // execute_host / report_host
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
@@ -121,6 +122,14 @@ std::optional<LoadedPlugin> load_plugin() {
 
 /// Seam probes: execute_host over legs that throw / report a constrained read.
 int throwing_leg(yuzu::CommandContext&) { throw std::runtime_error("probe: the leg threw"); }
+
+/// Throws AFTER report_host already wrote its rows: the catch arm appends a second status row.
+int late_throwing_leg(yuzu::CommandContext& ctx) {
+    yuzu::virtualization::report_host(
+        ctx, yuzu::virtualization::Posture{yuzu::virtualization::StatusState::supported, "",
+                                           {"host|no|bare_metal|x|y|cpuid|high"}});
+    throw std::runtime_error("probe: the leg threw after reporting");
+}
 
 int constrained_leg(yuzu::CommandContext& ctx) {
     yuzu::virtualization::report_host(
@@ -303,4 +312,25 @@ TEST_CASE("virtualization execute seam: unknown action is escaped; a throwing le
     CHECK(s.result_status == YUZU_RESULT_STATUS_OK);
     CHECK(s.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
     CHECK(s.result_provenance.empty());
+}
+
+TEST_CASE("virtualization execute seam: a leg that throws after reporting keeps its rows and the last "
+          "status wins",
+          "[virtualization][dispatcher][seam]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor late{};
+    late.execute = &seam_execute<&late_throwing_leg>;
+
+    const auto r = dispatcher.run(&late, "host");
+    CHECK(r.rc == 0); // contained, never unwound
+    const auto rows = captured_rows(r.captured);
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0] == "status|host|supported|-");
+    CHECK(rows[1] == "host|no|bare_metal|x|y|cpuid|high"); // retained between the two status rows
+    CHECK(rows[2] == "status|host|unsupported|linux:leg:exception");
+    CHECK(std::count_if(rows.begin(), rows.end(),
+                        [](const std::string& row) { return starts_with(row, "status|host|"); }) == 2);
+    CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE); // the recovery's status, not the leg's OK
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    CHECK(r.result_provenance == "linux:leg:exception");
 }

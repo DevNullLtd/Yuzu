@@ -9,7 +9,8 @@
 //   1. SMBIOS / hardware model names a VM vendor            -> guest (high)
 //   2. CPUID hypervisor present, Microsoft Hv, and the Hyper-V root-partition bit set
 //                                                            -> host_with_hypervisor (not virtual)
-//   3. CPUID hypervisor present                              -> guest
+//   3. CPUID hypervisor present                              -> guest (medium when the vendor
+//                                                               signature is not a well-formed 12 bytes)
 //   3b. an OS hint says virtual (sysctl, /sys/hypervisor, /proc/cpuinfo flag) -> guest (medium)
 //   4. a readable negative signal AND no consulted source unreadable -> bare_metal
 //   5. anything else                                         -> unknown, with the reason tokens
@@ -45,6 +46,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::virtualization {
@@ -113,8 +115,11 @@ inline bool root_partition_leaf_readable(std::string_view vendor_sig, std::uint3
     return vendor_sig == "Microsoft Hv" && max_leaf >= kRootPartitionLeaf && interface_sig == "Hv#1";
 }
 
+/// The outcome of one bounded read: a value, a definitive absence (ENOENT), or a failure.
+enum class ReadState { ok, absent, unreadable };
+
 struct SmbiosFacts {
-    enum class State { ok, absent, unreadable };
+    using State = ReadState;
     State state = State::absent;
     /// May be set even when unreadable (a Type 1 decoded before a later walk fault is kept).
     std::string manufacturer;
@@ -205,14 +210,15 @@ inline constexpr std::array<SmbiosRow, 17> kSmbios{{
     {"", "google compute engine", "gce"},
     {"alibaba cloud", "", "alibaba"},
     {"openstack", "", "openstack"},
-    {"nutanix", "", "nutanix"},
+    {"nutanix", "ahv", "nutanix"},
     {"", "virtualmac", "apple"},
 }};
 
 } // namespace detail
 
 /// Maps a 12-byte CPUID hypervisor signature to a vendor token; `other` for a well-formed but
-/// unlisted signature; nullopt (unreadable) when it is not exactly 12 bytes.
+/// unlisted signature; nullopt (malformed) when it is not exactly 12 bytes. classify() reads a
+/// nullopt as `other` at medium confidence: the hypervisor bit is still a positive signal.
 inline std::optional<std::string_view> hypervisor_from_signature(std::string_view sig) {
     if (sig.size() != 12)
         return std::nullopt;
@@ -226,6 +232,11 @@ inline std::optional<std::string_view> hypervisor_from_signature(std::string_vie
 /// nullopt for real hardware.
 inline std::optional<std::string_view> vm_vendor_from_smbios(std::string_view manufacturer,
                                                              std::string_view product) {
+    // AWS bare-metal instance types carry `.metal` in product_name (manufacturer is still
+    // "Amazon EC2"); no VM product name does. Nutanix NX appliances are excluded by their row
+    // requiring the AHV product.
+    if (detail::contains_ci(product, ".metal"))
+        return std::nullopt;
     for (const auto& r : detail::kSmbios) {
         if (!r.manufacturer.empty() && !detail::contains_ci(manufacturer, r.manufacturer))
             continue;
@@ -284,8 +295,11 @@ inline bool root_partition_set(const CpuidFacts& c) {
 /// stable order. Container read failures are accounted separately (classify_container).
 inline std::vector<std::string> failure_tokens(const Facts& f) {
     std::vector<std::string> out = f.failures;
-    if (f.smbios.state == SmbiosFacts::State::unreadable && !f.smbios.reason.empty())
-        out.push_back(f.smbios.reason);
+    if (f.smbios.state == SmbiosFacts::State::unreadable)
+        // An unexplained unknown is the one output this plugin must never emit: no shell leaves
+        // the reason empty today, but if one did the status would still name the source.
+        out.push_back(f.smbios.reason.empty() ? detail::token(f, "smbios:unreadable")
+                                              : f.smbios.reason);
     return out;
 }
 
@@ -326,8 +340,8 @@ inline Classification classify(const Facts& f) {
     }
 
     const bool hv = f.cpuid.available && f.cpuid.hypervisor_present;
-    const std::string cpuid_vendor =
-        std::string{hypervisor_from_signature(f.cpuid.vendor_sig).value_or("other")};
+    const auto sig = hypervisor_from_signature(f.cpuid.vendor_sig);
+    const std::string cpuid_vendor{sig.value_or("other")};
 
     // 2. Hyper-V root partition: the OS is the host, not a guest.
     if (hv && cpuid_vendor == "hyperv" && detail::root_partition_set(f.cpuid)) {
@@ -351,7 +365,8 @@ inline Classification classify(const Facts& f) {
             f.cpuid.root_partition.has_value() &&
             root_partition_leaf_readable(f.cpuid.vendor_sig, f.cpuid.max_leaf, f.cpuid.interface_sig);
         const bool ms_root_unknown = cpuid_vendor == "hyperv" && !root_known;
-        c.confidence = (ms_root_unknown || sm_unreadable) ? Confidence::medium : Confidence::high;
+        c.confidence =
+            (ms_root_unknown || sm_unreadable || !sig) ? Confidence::medium : Confidence::high;
         return c;
     }
 
@@ -539,27 +554,52 @@ inline std::string errno_token(int err) {
     }
 }
 
-/// One DMI attribute read: ok (value), absent (ENOENT) or unreadable (with the token).
+/// One bounded file read as the Linux shell reports it: ok (value), absent (ENOENT) or
+/// unreadable. `cause` is the `[a-z0-9_]+` segment of the constraint token (`permission_denied`,
+/// `eio`, `oversized`, `not_regular`, ...); linux_facts builds the whole token from it.
 struct FieldRead {
-    SmbiosFacts::State state = SmbiosFacts::State::absent;
+    ReadState state = ReadState::absent;
     std::string value;
-    std::string reason;
+    std::string cause;
 };
 
+namespace detail {
+
+inline std::string linux_token(std::string_view source, std::string_view cause) {
+    return "linux:virtualization:" + std::string{source} + ":" + std::string{cause};
+}
+
+inline void push_unique(std::vector<std::string>& v, std::string s) {
+    if (std::find(v.begin(), v.end(), s) == v.end())
+        v.push_back(std::move(s));
+}
+
+inline std::string rtrim(std::string s) {
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+    return s;
+}
+
+} // namespace detail
+
 /// Combines the two Linux DMI attributes into SmbiosFacts. Either unreadable makes the whole
-/// unreadable (the readable half is kept); both absent is absent; otherwise ok.
+/// unreadable (the readable half is kept) and EVERY failed half is reported, comma-joined
+/// (identical causes once); both absent is absent; otherwise ok. Values lose their trailing
+/// newline.
 inline SmbiosFacts combine_dmi(const FieldRead& vendor, const FieldRead& product) {
     SmbiosFacts s;
-    s.manufacturer = vendor.value;
-    s.product = product.value;
-    using St = SmbiosFacts::State;
-    if (vendor.state == St::unreadable || product.state == St::unreadable) {
-        s.state = St::unreadable;
-        s.reason = vendor.state == St::unreadable ? vendor.reason : product.reason;
-    } else if (vendor.state == St::absent && product.state == St::absent) {
-        s.state = St::absent;
+    s.manufacturer = detail::rtrim(vendor.value);
+    s.product = detail::rtrim(product.value);
+    std::vector<std::string> reasons;
+    for (const FieldRead* r : {&vendor, &product})
+        if (r->state == ReadState::unreadable)
+            detail::push_unique(reasons, detail::linux_token("dmi", r->cause));
+    if (!reasons.empty()) {
+        s.state = ReadState::unreadable;
+        s.reason = join_tokens(reasons);
+    } else if (vendor.state == ReadState::absent && product.state == ReadState::absent) {
+        s.state = ReadState::absent;
     } else {
-        s.state = St::ok;
+        s.state = ReadState::ok;
     }
     return s;
 }
@@ -643,6 +683,64 @@ inline OsHint linux_os_hint(std::string_view sys_hypervisor_type, bool cpuinfo_f
         h.source = "cpuinfo";
     }
     return h;
+}
+
+/// Everything the Linux shell reads, before any decision: the five bounded file reads and the
+/// errno of the two container-marker probes (0 = present, ENOENT = absent, else a failure). The
+/// probes default to absent so an unfilled LinuxReads never reads as "in a container".
+struct LinuxReads {
+    FieldRead sys_vendor;
+    FieldRead product_name;
+    FieldRead hypervisor_type;
+    FieldRead cpuinfo; ///< left absent when CPUID answered: the flag adds nothing on x86
+    FieldRead cgroup;  ///< /proc/self/cgroup, the agent's own membership
+    int dockerenv_errno = ENOENT;
+    int containerenv_errno = ENOENT;
+};
+
+/// Linux Facts from the reads: the DMI combine, the `linux:virtualization:<source>:<cause>`
+/// tokens, the OS hint and the container inputs. Every failed container read is kept
+/// (comma-joined in container.reason); ENOENT is a definitive absence and never a token, except
+/// that /proc/self/cgroup missing entirely is `cgroup_enoent` (the agent cannot answer).
+inline Facts linux_facts(CpuidFacts cpuid, const LinuxReads& r) {
+    Facts f;
+    f.os = "linux";
+    f.cpuid = std::move(cpuid);
+    f.smbios = combine_dmi(r.sys_vendor, r.product_name);
+
+    std::string hv_type;
+    if (r.hypervisor_type.state == ReadState::ok)
+        hv_type = r.hypervisor_type.value;
+    else if (r.hypervisor_type.state == ReadState::unreadable)
+        f.failures.push_back(detail::linux_token("sys_hypervisor", r.hypervisor_type.cause));
+    bool cpuinfo_flag = false;
+    if (r.cpuinfo.state == ReadState::ok)
+        cpuinfo_flag = cpuinfo_has_hypervisor_flag(r.cpuinfo.value);
+    else if (r.cpuinfo.state == ReadState::unreadable)
+        f.failures.push_back(detail::linux_token("cpuinfo", r.cpuinfo.cause));
+    f.hint = linux_os_hint(hv_type, cpuinfo_flag);
+
+    f.container.mode = ContainerInputs::Mode::linux_read;
+    std::vector<std::string> failed;
+    const auto marker = [&failed](int err, bool& present) {
+        if (err == 0)
+            present = true;
+        else if (err != ENOENT)
+            detail::push_unique(failed,
+                                detail::linux_token("container", "markers_" + errno_token(err)));
+    };
+    marker(r.dockerenv_errno, f.container.dockerenv);
+    marker(r.containerenv_errno, f.container.containerenv);
+    if (r.cgroup.state == ReadState::ok)
+        f.container.cgroup = r.cgroup.value;
+    else
+        detail::push_unique(failed,
+                            detail::linux_token("container",
+                                                "cgroup_" + (r.cgroup.state == ReadState::absent
+                                                                 ? std::string{"enoent"}
+                                                                 : r.cgroup.cause)));
+    f.container.reason = join_tokens(failed);
+    return f;
 }
 
 // ---------------------------------------------------------------------------
