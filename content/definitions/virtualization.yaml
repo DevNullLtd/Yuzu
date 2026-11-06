@@ -33,9 +33,10 @@ metadata:
     the status row and in the host row's source field; a failed container read makes the status
     constrained. A leading status row states whether the read was complete: constrained means a
     source could not be read (a refused read stays refused until permissions change), unsupported
-    means the leg threw. Container membership is best effort: a container whose init is not
-    systemd and that sets no marker file reads no, and Windows does not read it. The answer is
-    gathered once an hour, so it can be up to 1 h old.
+    means the leg threw. Container membership is best effort: a container without a marker file
+    or systemd record can read no when its readable, non-root cgroup path has no recognised
+    runtime signature, and Windows does not read it. The answer is gathered once an hour, so it
+    can be up to 1 h old.
   tags: [inventory, virtualization, hypervisor, container, posture]
 
 spec:
@@ -72,7 +73,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_2
         type: string
-        description: 'status: supported, constrained or unsupported (a leg that threw). host: kind, guest, host_with_hypervisor (a Windows host running Hyper-V, VBS or WSL2), bare_metal (no virtualization signal seen, not proof of physical hardware) or unknown. container: the evidence (/.dockerenv, /run/.containerenv, /run/systemd/container, cgroup:<runtime>, linux:no_container_marker, macos:no_container_runtime) or, for unknown, the reason (linux:virtualization:container:cgroup_root_opaque for a cgroup-v2 namespace that hides the answer, windows:virtualization:container:not_read on Windows). A container no is best effort: a container whose init is not systemd and that sets no marker file reads no.'
+        description: 'status: supported, constrained or unsupported (a leg that threw). host: kind, guest, host_with_hypervisor (a Windows host running Hyper-V, VBS or WSL2), bare_metal (no virtualization signal seen, not proof of physical hardware) or unknown. container: the evidence (/.dockerenv, /run/.containerenv, /run/systemd/container, cgroup:<runtime>, linux:no_container_marker, macos:no_container_runtime) or, for unknown, the reason (linux:virtualization:container:cgroup_root_opaque for a cgroup-v2 namespace that hides the answer, windows:virtualization:container:not_read on Windows). A container no is best effort: a container without a marker file or systemd record can read no when its readable, non-root cgroup path has no recognised runtime signature.'
         example: bare_metal
         platforms: [windows, linux, darwin]
       - name: field_3

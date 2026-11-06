@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <optional>
 #include <regex>
 #include <set>
@@ -895,6 +896,15 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         CHECK(v.evidence == "/run/systemd/container");
         CHECK_FALSE(v.read_failed);
     }
+    SECTION("a readable systemd record answers even when the cgroup read failed") {
+        // The record branch precedes the failed-read branch: a refused /proc/self/cgroup does not
+        // turn a positive identification into unknown.
+        const auto v = verdict(false, false, std::nullopt, "linux:virtualization:container:cgroup_permission_denied",
+                               std::string{"lxc\n"});
+        CHECK(v.value == Tri::yes);
+        CHECK(v.evidence == "/run/systemd/container");
+        CHECK_FALSE(v.read_failed);
+    }
     SECTION("a marker file outranks /run/systemd/container, and an absent file changes nothing") {
         CHECK(verdict(true, false, "0::/\n", "", std::string{"lxc\n"}).evidence == "/.dockerenv");
         CHECK(verdict(false, true, "0::/\n", "", std::string{"lxc\n"}).evidence == "/run/.containerenv");
@@ -933,10 +943,12 @@ TEST_CASE("virtualization: row fields are scrubbed and escaped with the field co
     SECTION("pipes and newlines cannot open a field or a row") {
         Facts f = linux_base();
         f.cpuid = cpuid_clear();
-        f.smbios = smbios_ok("Example", "Bo|ard\nTwo");
+        f.smbios = smbios_ok("Ex|am\nple", "Bo|ard\nTwo");
         const auto row = decide(f).rows[0];
         CHECK(row.find('\n') == std::string::npos);
         CHECK(split_row(row).size() == 7);
+        // The manufacturer is firmware text and becomes the vendor field; the product is the other one.
+        CHECK(row.find("Ex\\|am ple") != std::string::npos);
         CHECK(row.find("Bo\\|ard Two") != std::string::npos);
     }
     SECTION("NUL and malformed UTF-8 become '?' per offending byte") {
