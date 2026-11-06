@@ -1216,7 +1216,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a sequence that went BACKWARDS dead-letter
     loop.tick();
     REQUIRE(probe.calls == 1);
 
-    fx.seq = 5; // e.g. a restore from backup, or a new leader whose local term is smaller
+    fx.seq = 5; // e.g. a restore from backup (only the shared term is judged for regression)
     fx.make_due("occ-back");
     loop.tick();
     CHECK(probe.calls == 1);
@@ -1566,7 +1566,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a stamp from ANOTHER leadership term is co
         CHECK(probe.calls == 0);
         CHECK(fx.raw_state("occ-x") == "failed");
     }
-    SECTION("this process's whole local count is charged, which can only over-count") {
+    SECTION("this process's whole local count is charged (an over-count of its own history; not a bound on what another process missed)") {
         fx.set_stamp("occ-x", 1000, 0, fx.epoch() - 1);
         fx.unrecorded = 10; // 10 >= horizon, even though they may all predate the stamp
         loop.tick();

@@ -476,7 +476,8 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         // clear it in the same fenced write and let the next attempt re-stamp. Otherwise a row
         // held back only by an unreadable gate would age toward a dead-letter without ever having
         // been sent. NEVER clear a stamp that predates this call (an earlier attempt, such as a
-        // rolled-back bookkeeping write, may really have sent).
+        // rolled-back bookkeeping write, may really have sent). A concurrent send by a stale
+        // ex-leader inside this window is the documented stale-replica gap, not excluded by this clear.
         (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff,
                                     /*clear_first_send_stamp=*/stamped_now && outcome.sent == 0);
         return;
