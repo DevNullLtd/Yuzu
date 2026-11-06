@@ -2539,8 +2539,7 @@ TEST_CASE("GuaranteedStateStore: insert_events batch projects only observations"
 
 TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the sentinel",
           "[pg][guaranteed_state_store][events][dex][security]") {
-    // Adversarial-review F1: the batch insert_events path (the preferred gRPC
-    // GuaranteedStatePush ingest) must apply the SAME sentinel guard as the
+    // Adversarial-review F1: the batch insert_events path (no production caller today) must apply the SAME sentinel guard as the
     // single-row path — a batch carrying rule_id="__observation__" with a
     // census-mapping event_type (drift.detected) must NOT mint a phantom
     // (agent, __observation__) census row (§24). Enforce server-side, never trust
@@ -3334,6 +3333,7 @@ TEST_CASE("GuaranteedStateStore: overview aggregations", "[pg][guaranteed_state_
                   std::string ts) {
         auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
         e.event_type = std::move(type);
+        e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp);
         return e;
     };
     // Insertion order == rowid order, so the LAST event per (agent,rule) is "latest".
@@ -3380,6 +3380,7 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
                   std::string ts) {
         auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
         e.event_type = std::move(type);
+        e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp);
         return e;
     };
     // agent_rule_statuses is now type-distinguishable (ADR-0038 catastrophic-
@@ -3463,8 +3464,9 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
           "[pg][guaranteed_state_store][census]") {
     // guard.errored is the #2818 spark subscription-death detach lifecycle event. It
     // must set the per-(agent, rule) census state to "errored" exactly as
-    // guard.unhealthy does. The upsert is ordered by updated_at with `>=` (equal
-    // timestamps overwrite), so D4 characterises that existing tie behaviour.
+    // guard.unhealthy does. The census is ordered by the (key, ingest_seq) tuple, with the agent
+    // stamp as the key (equal timestamps overwrite), so D4 characterises that existing tie
+    // behaviour.
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store{pool, /*retention_days=*/30};
@@ -3474,6 +3476,7 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
                   std::string ts) {
         auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
         e.event_type = std::move(type);
+        e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp);
         return e;
     };
     auto census = [&] {
@@ -3502,7 +3505,8 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
         REQUIRE(store.insert_event(ev("d3b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
         CHECK(census()[{"a1", "r1"}] == "compliant");
     }
-    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (existing >=)") {
+    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (and the pair is "
+            "flagged, #5690)") {
         REQUIRE(store.insert_event(ev("d4a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
         REQUIRE(store.insert_event(ev("d4b", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
         CHECK(census()[{"a1", "r1"}] == "errored");
@@ -3512,9 +3516,10 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
         CHECK(census()[{"a1", "r2"}] == "compliant");
     }
     SECTION("D5: an exact redelivery of the errored event never reaches the census write") {
-        // Equal timestamps (compliant arrives after errored, so it wins the >= tie): had the
-        // redelivery reached the upsert, the tie would flip the row to errored, so the final
-        // census assertion can observe a reached census write.
+        // Equal timestamps (compliant arrives after errored, so it wins the same-key tie by
+        // arrival, and the pair is flagged, #5690): had the redelivery reached the upsert, the tie
+        // would flip the row to errored, so the final census assertion can observe a reached census
+        // write.
         const auto errored = ev("d5x", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z");
         CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Inserted);
         REQUIRE(store.insert_event(ev("d5y", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
@@ -3727,7 +3732,7 @@ TEST_CASE("GuaranteedStateStore: a census write for a deleted rule keeps the eve
     }
 }
 
-TEST_CASE("GuaranteedStateStore: a failed census write keeps the event, is counted once, and "
+TEST_CASE("GuaranteedStateStore: a failed census write keeps a single event, is counted once, and "
           "leaves the old census row and the transaction intact",
           "[pg][guaranteed_state_store][events][census]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
@@ -3758,17 +3763,18 @@ TEST_CASE("GuaranteedStateStore: a failed census write keeps the event, is count
               "2026-04-19T12:10:00Z");
     }
 
-    SECTION("batch: rows before and after the failed one still land") {
+    SECTION("batch: a failed census write rolls the whole batch back") {
+        // The batch path records no pending evidence, so it never stores an event whose census
+        // write failed: the rows before and after the failed one are rolled back with it.
         auto n = store.insert_events({make_event("b1", "r1", "agent-B", "high", "2026-04-19T12:01:00Z"),
                                       make_drift("b2", "r1", "agent-A", "2026-04-19T12:06:00Z"),
                                       make_event("b3", "r1", "agent-C", "high", "2026-04-19T12:02:00Z")});
-        REQUIRE(n.has_value());
-        CHECK(*n == 3);
-        CHECK(store.event_count() == 4);
+        REQUIRE_FALSE(n.has_value());
+        CHECK(n.error().find("batch rolled back") != std::string::npos);
+        CHECK(store.event_count() == 1);
         CHECK(store.census_proj_failures_total() == 1);
         CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
-        CHECK(census_state(db.dsn(), "agent-B", "r1") == "compliant");
-        CHECK(census_state(db.dsn(), "agent-C", "r1") == "compliant");
+        CHECK(census_count(db.dsn()) == "1"); // agent-B's row from b1 was rolled back; agent-C never ran
     }
 }
 
@@ -3869,7 +3875,7 @@ TEST_CASE("GuaranteedStateStore: migration v3 deletes orphan census rows and add
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta "
-                                 "WHERE store = 'guaranteed_state_store'") == "3");
+                                 "WHERE store = 'guaranteed_state_store'") == "4");
     CHECK(census_count(db.dsn()) == "1");
     CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
     CHECK(query_scalar(db.dsn(), "SELECT confdeltype FROM pg_constraint WHERE conname = "

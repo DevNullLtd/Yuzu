@@ -924,18 +924,19 @@ constexpr const char* kEgressCleartextPublicReason = OidcProvider::kEgressCleart
 constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
-// classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver
-// might read differently, such as `127.1`) is resolved here, with httplib's own bounded resolver,
-// and EVERY returned address is classified by its bytes. Returns the numeric addresses the
-// connection may be PINNED to (the permitted ones, in resolver order, at most kMaxPinnedAddresses),
-// or an EMPTY list when the host is an IP literal that needs no pin. A refusal or a resolver
-// failure is a fixed reason (never the address, never resolver text). Pinning closes the window
-// between this check and the connect: httplib is told to connect to that numeric address and does
-// no second lookup, so a DNS answer that changes in between cannot redirect the request. The
-// caller tries the permitted addresses in order while a connect fails (a host whose first address
-// family is unreachable still works, as it did when httplib walked the resolver's list itself). TLS
-// server-name indication and certificate verification keep using the host NAME (httplib keys them
-// on the host, not on the pinned address).
+// classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver might
+// read differently, such as `127.1`) is resolved here, with httplib's own resolver, and EVERY
+// returned address is classified by its bytes. On a glibc build that resolver is not held to the
+// caller's time bound: a lookup against an unresponsive resolver can take about 30 s. Returns the
+// numeric addresses the connection may be PINNED to (the permitted ones, in resolver order, at most
+// kMaxPinnedAddresses), or an EMPTY list when the host is an IP literal that needs no pin. A
+// refusal or a resolver failure is a fixed reason (never the address, never resolver text). Pinning
+// closes the window between this check and the connect: httplib is told to connect to that numeric
+// address and does no second lookup, so a DNS answer that changes in between cannot redirect the
+// request. The caller tries the permitted addresses in order while a connect fails (a host whose
+// first address family is unreachable still works, as it did when httplib walked the resolver's
+// list itself). TLS server-name indication and certificate verification keep using the host NAME
+// (httplib keys them on the host, not on the pinned address).
 constexpr std::size_t kMaxPinnedAddresses = 4;
 
 // The test resolver (OidcProvider::set_resolver_for_test); empty in production.
@@ -954,13 +955,14 @@ struct ResolvedAddress {
     std::array<unsigned char, 16> bytes{};
 };
 
-// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses within about
-// `timeout_sec` seconds. False when the name did not resolve or the lookup timed out. Own
-// function per platform because httplib's helper cannot be consumed generically: on Windows it
-// returns a GetAddrInfoExW result cast to `addrinfo`, whose layout differs after ai_addr (the
-// blob, blob length and provider fields precede ai_next) and which must be released with
-// FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it with freeaddrinfo
-// is the wrong deleter.
+// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. The lookup is cancelled
+// after `timeout_sec` seconds, except on a glibc build where httplib then waits for the resolver
+// itself (about 30 s against an unresponsive one). False when the name did not resolve or the
+// lookup timed out. Own function per platform because httplib's helper cannot be consumed
+// generically: on Windows it returns a GetAddrInfoExW result cast to `addrinfo`, whose layout
+// differs after ai_addr (the blob, blob length and provider fields precede ai_next) and which must
+// be released with FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it
+// with freeaddrinfo is the wrong deleter.
 #ifdef _WIN32
 // One GetAddrInfoExW lookup. It owns a HANDLE and a resolver-allocated list, and the OS references
 // it while the lookup is pending, so it may be destroyed only once the lookup has completed.
@@ -1447,7 +1449,8 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     try {
         // Use heap-allocated client and explicit reset to work around httplib
         // 0.37.1 SSLClient destructor crash (invalid free in OpenSSL context
-        // cleanup after HTTPS connections).
+        // cleanup after HTTPS connections). 0.59.0 rewrote that destructor and this was not
+        // re-tested against it; the explicit reset is kept because it is harmless.
         // Egress policy: vet the target and pin the connect to a vetted address (the same
         // function the GETs use); nothing is sent to an address the policy refuses. A failed
         // CONNECT moves on to the next permitted address (no request was sent, so a retry is
@@ -2070,7 +2073,7 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme,
 // SHUT_RD, not SHUT_RDWR. Shutting the write side too killed a test process with SIGPIPE in 4 of
 // 4 runs of an HTTPS response that completes right at the deadline (default SIGPIPE disposition;
 // measured in Gate 5, not the handshake-drip case); with SHUT_RD there were none. Production is
-// protected anyway: httplib::Server's constructor ignores SIGPIPE process-wide (httplib.h:10405)
+// protected anyway: httplib::Server's constructor ignores SIGPIPE process-wide (httplib.h v0.59.0:12951-12958)
 // and nothing in server/core/src installs another disposition; the read side is simply the
 // smaller hammer. Tests that drive the watchdog set SIGPIPE to ignored themselves.
 //
@@ -2082,7 +2085,7 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme,
 // select(): shutdown() (SD_RECEIVE or SD_BOTH) on the duplicate or on the original does NOT wake
 // the waiter, but CancelIoEx() on the duplicate does (select() returned WSAEINTR at once; 6 of 6
 // runs), without touching the connection. That experiment is not the evidence for this class:
-// httplib 0.37.1 waits with WSAPoll on Windows (httplib.h poll_wrapper, behind select_impl and
+// httplib (0.37.1 and 0.59.0) waits with WSAPoll on Windows (httplib.h poll_wrapper, behind select_impl and
 // wait_until_socket_is_ready), not select(). The evidence that the cut ends a stalled handshake
 // through httplib's real wait is the end-to-end Windows drip test (test_oidc_provider.cpp).
 #ifndef _WIN32
@@ -2325,7 +2328,8 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify,
             return std::unexpected("request failed: no file descriptor available");
         // Egress policy: resolve and classify the target BEFORE any socket exists, then pin the
         // connect to a vetted address (see vet_egress_target). Name resolution is part of the
-        // total bound below.
+        // total bound below, except on a glibc build where it can run to about 30 s against an
+        // unresponsive resolver.
         const auto pins = vet_egress_target(target->host, allow_private_networks, target->cleartext,
                                             timeout_ms, nat64_prefixes);
         if (!pins)
@@ -2339,7 +2343,8 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify,
         const std::size_t attempts = std::max<std::size_t>(1, pins->size());
         for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
             // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can
-            // crash after a failed connection to a non-routable host.
+            // crash after a failed connection to a non-routable host (0.59.0 rewrote that
+            // destructor; not re-tested against it, the reset is kept because it is harmless).
             auto client = std::make_unique<httplib::Client>(target->origin);
             // Fail closed if httplib would connect to a host other than the one just vetted.
             if (client->host() != target->host)

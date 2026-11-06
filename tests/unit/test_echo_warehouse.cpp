@@ -1,12 +1,14 @@
-// test_echo_warehouse.cpp -- Issue #60 coverage gaps:
+// test_echo_warehouse.cpp -- Issue #60 coverage gaps, restated for the roll-up model:
 //
-//  * every source/table combination is in the DDL,
-//  * live-to-aggregate rollup SQL exists for every documented pair,
-//  * retention independence across granularities (row-count vs time-based),
-//  * restart double-capture caveat for TCP (documented behavior — no diff
+//  * every source/tier is in the DDL (the roll-up tiers as `_r` tables and views, the plain
+//    tables in the registry's own DDL, and never an index on a view),
+//  * the tier-to-tier roll-up SQL the v10 migration uses is defined for exactly the pairs
+//    that exist,
+//  * retention types and default windows of every tier,
+//  * restart double-capture caveat for TCP (documented behavior -- no diff
 //    is possible against an empty `previous` snapshot, so all current
 //    connections appear as `connected`),
-//  * midnight rollover and carry-over for User_Daily,
+//  * midnight rollover for the daily tier,
 //  * schema validation: `columns_for_table` agrees with the GranularityDef
 //    column list plus the implicit `id` PK.
 //
@@ -15,6 +17,8 @@
 
 #include "echo_collectors.hpp"
 #include "echo_db.hpp"
+#include "echo_fold.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -29,30 +33,46 @@ using namespace yuzu::echo;
 
 // ── DDL coverage ───────────────────────────────────────────────────────────
 
-TEST_CASE("Echo warehouse DDL: every source/granularity has CREATE TABLE",
+TEST_CASE("Echo warehouse DDL: every source/granularity has a table and a roll-up tier a view",
           "[echo][warehouse][issue60]") {
-    auto ddl = generate_warehouse_ddl();
-    REQUIRE_FALSE(ddl.empty());
+    const auto plain = generate_warehouse_ddl();
+    const auto fold = generate_fold_ddl();
+    REQUIRE_FALSE(plain.empty());
+    REQUIRE_FALSE(fold.empty());
 
     for (const auto& src : capture_sources()) {
         for (const auto& g : src.granularities) {
-            std::string table = std::string{src.name} + "_" + std::string{g.suffix};
-            std::string create = "CREATE TABLE IF NOT EXISTS " + table;
-            INFO("expected DDL: " << create);
-            CHECK(ddl.find(create) != std::string::npos);
+            std::string name = std::string{src.name} + "_" + std::string{g.suffix};
+            INFO("tier: " << name);
+            if (is_fold_view(name)) {
+                // The name is a VIEW over `<name>_r`; the registry's own DDL must not create a
+                // table (or an index) under it, or it collides with the view.
+                CHECK(fold.find("CREATE TABLE IF NOT EXISTS " + name + "_r") != std::string::npos);
+                CHECK(fold.find("CREATE VIEW IF NOT EXISTS " + name + " AS") != std::string::npos);
+                CHECK(plain.find(name) == std::string::npos);
+            } else {
+                CHECK(plain.find("CREATE TABLE IF NOT EXISTS " + name) != std::string::npos);
+            }
         }
     }
 }
 
-TEST_CASE("Echo warehouse DDL: every source/granularity has a timestamp index",
+TEST_CASE("Echo warehouse DDL: every source/granularity has a bucket-leading index",
           "[echo][warehouse][issue60]") {
-    auto ddl = generate_warehouse_ddl();
+    const auto plain = generate_warehouse_ddl();
+    const auto fold = generate_fold_ddl();
     for (const auto& src : capture_sources()) {
         for (const auto& g : src.granularities) {
-            std::string table = std::string{src.name} + "_" + std::string{g.suffix};
-            std::string idx_prefix = "CREATE INDEX IF NOT EXISTS idx_" + table + "_";
-            INFO("expected index prefix: " << idx_prefix);
-            CHECK(ddl.find(idx_prefix) != std::string::npos);
+            std::string name = std::string{src.name} + "_" + std::string{g.suffix};
+            INFO("tier: " << name);
+            if (is_fold_view(name)) {
+                // the unique index is both the UPSERT target and the retention index: bucket first
+                CHECK(fold.find("CREATE UNIQUE INDEX IF NOT EXISTS " + name + "_r_uq ON " + name +
+                                "_r(" + std::string{ts_column_for_suffix(g.suffix)}) !=
+                      std::string::npos);
+            } else {
+                CHECK(plain.find("CREATE INDEX IF NOT EXISTS idx_" + name + "_") != std::string::npos);
+            }
         }
     }
 }
@@ -141,134 +161,108 @@ TEST_CASE("Echo warehouse: is_queryable_table allows registry + base tables, den
     for (const auto& t : kDeniedDespiteRegistered) CHECK_FALSE(is_queryable_table(t));
 }
 
-// ── Rollup SQL coverage ────────────────────────────────────────────────────
+// ── Tier-to-tier roll-up SQL (the v10 migration) ───────────────────────────
 
-TEST_CASE("Echo warehouse rollups: process live -> hourly -> daily -> monthly",
+TEST_CASE("Echo warehouse roll-up: process hourly -> daily -> monthly",
           "[echo][warehouse][rollup][issue60]") {
-    CHECK_FALSE(rollup_sql("process", "hourly").empty());
-    CHECK_FALSE(rollup_sql("process", "daily").empty());
-    CHECK_FALSE(rollup_sql("process", "monthly").empty());
+    const auto daily = fold_tier_from_tier_sql("process", "hourly", "daily");
+    const auto monthly = fold_tier_from_tier_sql("process", "daily", "monthly");
+    REQUIRE_FALSE(daily.empty());
+    REQUIRE_FALSE(monthly.empty());
 
-    // Each rollup must cite the lower tier as its FROM and the upper tier
-    // as its INSERT INTO target — otherwise we'd be aggregating from the
-    // wrong place or writing to the wrong granularity.
-    CHECK(rollup_sql("process", "hourly").find("FROM process_live") != std::string::npos);
-    CHECK(rollup_sql("process", "daily").find("FROM process_hourly") != std::string::npos);
-    CHECK(rollup_sql("process", "monthly").find("FROM process_daily") != std::string::npos);
-
-    CHECK(rollup_sql("process", "hourly").find("INSERT INTO process_hourly") != std::string::npos);
-    CHECK(rollup_sql("process", "daily").find("INSERT INTO process_daily") != std::string::npos);
-    CHECK(rollup_sql("process", "monthly").find("INSERT INTO process_monthly") != std::string::npos);
+    // Each step cites the lower tier's table as its FROM and the upper tier's as its INSERT
+    // target -- otherwise we'd be aggregating from the wrong place or writing to the wrong tier.
+    CHECK(daily.find("FROM process_hourly_r") != std::string::npos);
+    CHECK(monthly.find("FROM process_daily_r") != std::string::npos);
+    CHECK(daily.find("INSERT INTO process_daily_r") != std::string::npos);
+    CHECK(monthly.find("INSERT INTO process_monthly_r") != std::string::npos);
+    // bucketed to the coarser grain, merged by the fold's own rules
+    CHECK(daily.find("86400") != std::string::npos);
+    CHECK(monthly.find("start of month") != std::string::npos);
+    CHECK(daily.find("start_count=start_count+excluded.start_count") != std::string::npos);
+    // only rows at or above the mark the caller binds
+    CHECK(daily.find("r.hour_ts >= ?1") != std::string::npos);
 }
 
-TEST_CASE("Echo warehouse rollups: tcp live -> hourly -> daily -> monthly",
+TEST_CASE("Echo warehouse roll-up: tcp hourly -> daily -> monthly",
           "[echo][warehouse][rollup][issue60]") {
-    CHECK(rollup_sql("tcp", "hourly").find("FROM tcp_live") != std::string::npos);
-    CHECK(rollup_sql("tcp", "daily").find("FROM tcp_hourly") != std::string::npos);
-    CHECK(rollup_sql("tcp", "monthly").find("FROM tcp_daily") != std::string::npos);
+    CHECK(fold_tier_from_tier_sql("tcp", "hourly", "daily").find("FROM tcp_hourly_r") !=
+          std::string::npos);
+    CHECK(fold_tier_from_tier_sql("tcp", "daily", "monthly").find("FROM tcp_daily_r") !=
+          std::string::npos);
 }
 
-TEST_CASE("Echo warehouse rollups: service hourly only",
+TEST_CASE("Echo warehouse roll-up: service hourly and daily only",
           "[echo][warehouse][rollup][issue60]") {
-    CHECK_FALSE(rollup_sql("service", "hourly").empty());
-    // Service does not roll up beyond hourly; daily/monthly should be empty.
-    CHECK(rollup_sql("service", "daily").empty());
-    CHECK(rollup_sql("service", "monthly").empty());
+    CHECK_FALSE(fold_tier_from_tier_sql("service", "hourly", "daily").empty());
+    // service has no monthly tier
+    CHECK(fold_tier_from_tier_sql("service", "daily", "monthly").empty());
+    // a last-by-guard measure carries its guard in the merge
+    CHECK(fold_tier_from_tier_sql("service", "hourly", "daily").find("excluded.last_ts>=last_ts") !=
+          std::string::npos);
 }
 
-TEST_CASE("Echo warehouse rollups: user live -> daily (midnight rollover)",
+TEST_CASE("Echo warehouse roll-up: the daily bucket is the UTC day (midnight rollover)",
           "[echo][warehouse][rollup][issue60]") {
-    auto sql = rollup_sql("user", "daily");
+    // Midnight rollover correctness: all events on one UTC day share a daily bucket, whatever
+    // the hour. Carry-over (a login on day N still active on day N+1) is a login on day N and no
+    // logout until it happens: Echo records *events*, not session durations.
+    const int64_t day0 = 1793577600; // 2026-11-02T00:00:00Z
+    CHECK(bucket_start(day0, "daily").value() == day0);
+    CHECK(bucket_start(day0 + 86399, "daily").value() == day0);
+    CHECK(bucket_start(day0 + 86400, "daily").value() == day0 + 86400);
+    CHECK(bucket_start(day0 + 3600 * 23 + 59 * 60, "hourly").value() == day0 + 3600 * 23);
+    const auto sql = fold_tier_from_tier_sql("user", "hourly", "daily");
     REQUIRE_FALSE(sql.empty());
-    CHECK(sql.find("FROM user_live") != std::string::npos);
-    CHECK(sql.find("INSERT INTO user_daily") != std::string::npos);
-
-    // Midnight rollover correctness: the day boundary is `(ts / 86400) *
-    // 86400`, which buckets all events on the same UTC day together.
-    // Carry-over (login on day N still active on day N+1) yields a login
-    // event on day N and no logout — the user appears in user_daily once,
-    // with login_count=1 and logout_count=0. This is intentional: Echo
-    // records *events*, not session durations.
-    CHECK(sql.find("(ts / 86400) * 86400") != std::string::npos);
-    CHECK(sql.find("login_count") != std::string::npos);
-    CHECK(sql.find("logout_count") != std::string::npos);
+    CHECK(sql.find("login_count=login_count+excluded.login_count") != std::string::npos);
+    CHECK(sql.find("logout_count=logout_count+excluded.logout_count") != std::string::npos);
 }
 
-TEST_CASE("Echo warehouse rollups: unknown source returns empty",
+TEST_CASE("Echo warehouse roll-up: unknown source or unsupported step is empty",
           "[echo][warehouse][rollup][issue60]") {
-    CHECK(rollup_sql("nope", "hourly").empty());
-    CHECK(rollup_sql("process", "yearly").empty());  // unsupported tier
+    CHECK(fold_tier_from_tier_sql("nope", "hourly", "daily").empty());
+    CHECK(fold_tier_from_tier_sql("process", "hourly", "monthly").empty()); // not a supported step
+    CHECK(fold_tier_from_tier_sql("process", "daily", "hourly").empty());
+    CHECK(fold_tier_from_tier_sql("usage", "hourly", "daily").empty());     // own tables, no tiers
 }
 
 // ── Retention independence across granularities ────────────────────────────
 
-TEST_CASE("Echo warehouse retention: row-count tier uses OFFSET delete pattern",
+TEST_CASE("Echo warehouse retention: only netqual_boot and usage_live are row-count tables",
           "[echo][warehouse][retention][issue60]") {
-    // Verify every kRowCount tier's SQL uses the OFFSET-boundary pattern
-    // (H6) rather than NOT IN, which is O(n*k) and broke under load.
-    // Retention TYPE is the granularity's declared choice, not a property of
-    // the tier suffix — perf_live is time-based (a fixed-cadence sampler
-    // keeps a time window, so the window must not shrink if an operator
-    // raises the sample rate), while the event-diff live tiers are row-count.
-    int seen = 0;
+    // Retention TYPE is the granularity's declared choice. Every roll-up tier is time-based (the
+    // bucket start against a window); the two plain tables that remain keep a row cap.
+    std::set<std::string> row_count;
+    int time_based = 0;
     for (const auto& src : capture_sources()) {
         for (const auto& g : src.granularities) {
-            if (g.retention_type != RetentionType::kRowCount)
-                continue;
-            std::string table = std::string{src.name} + "_" + std::string{g.suffix};
-            auto sql = retention_sql(table, /*now_epoch=*/1'700'000'000);
-            INFO("table=" << table);
-            REQUIRE_FALSE(sql.empty());
-            CHECK(sql.find("OFFSET") != std::string::npos);
-            CHECK(sql.find("DELETE FROM " + table) != std::string::npos);
-            ++seen;
-        }
-    }
-    REQUIRE(seen > 0); // guard against a vacuous pass if no kRowCount tier exists
-}
-
-TEST_CASE("Echo warehouse retention: time-based tier uses ts cutoff",
-          "[echo][warehouse][retention][issue60]") {
-    // Every kTimeBased tier must produce a DELETE with a `< <cutoff>`
-    // predicate against the granularity's timestamp column (this includes
-    // perf_live — see the row-count test above for why that tier is
-    // time-based).
-    int seen = 0;
-    for (const auto& src : capture_sources()) {
-        for (const auto& g : src.granularities) {
-            if (g.retention_type != RetentionType::kTimeBased) continue;
-            std::string table = std::string{src.name} + "_" + std::string{g.suffix};
-            auto sql = retention_sql(table, /*now_epoch=*/1'700'000'000);
-            INFO("table=" << table);
-            REQUIRE_FALSE(sql.empty());
-            CHECK(sql.find("DELETE FROM " + table) != std::string::npos);
-            CHECK(sql.find("<") != std::string::npos);
-            ++seen;
-        }
-    }
-    REQUIRE(seen > 0); // guard against a vacuous pass if no kTimeBased tier exists
-}
-
-TEST_CASE("Echo warehouse retention: each granularity retains independently",
-          "[echo][warehouse][retention][issue60]") {
-    // Independence invariant: deleting from a daily table must not touch
-    // the hourly table for the same source, and vice versa. The SQL is
-    // single-table, so this is true by construction — but the test pins
-    // the contract so a future "join cleanup" refactor cannot accidentally
-    // couple them.
-    for (const auto& src : capture_sources()) {
-        for (const auto& g : src.granularities) {
-            std::string table = std::string{src.name} + "_" + std::string{g.suffix};
-            auto sql = retention_sql(table, /*now_epoch=*/1'700'000'000);
-            REQUIRE_FALSE(sql.empty());
-            // For every OTHER granularity in the same source, the SQL must
-            // not name that table.
-            for (const auto& other : src.granularities) {
-                if (other.suffix == g.suffix) continue;
-                std::string other_table = std::string{src.name} + "_" + std::string{other.suffix};
-                INFO("retention sql for " << table << " must not mention " << other_table);
-                CHECK(sql.find(other_table) == std::string::npos);
+            const std::string table = std::string{src.name} + "_" + std::string{g.suffix};
+            if (g.retention_type == RetentionType::kRowCount)
+                row_count.insert(table);
+            else
+                ++time_based;
+            if (is_fold_view(table)) {
+                INFO("tier=" << table);
+                CHECK(g.retention_type == RetentionType::kTimeBased);
             }
+        }
+    }
+    CHECK(row_count == std::set<std::string>{"netqual_boot", "usage_live"});
+    REQUIRE(time_based > 0); // guard against a vacuous pass
+}
+
+TEST_CASE("Echo warehouse retention: each tier keeps its own default window",
+          "[echo][warehouse][retention][issue60]") {
+    // 90 days hourly, 180 days daily, a year monthly; usage_daily keeps its 31 days.
+    for (const auto& src : capture_sources()) {
+        for (const auto& g : src.granularities) {
+            const std::string table = std::string{src.name} + "_" + std::string{g.suffix};
+            if (!is_fold_view(table))
+                continue;
+            INFO("tier=" << table);
+            CHECK(g.retention_default == (g.suffix == "hourly"  ? 7776000
+                                          : g.suffix == "daily" ? 15552000
+                                                                : 31536000));
         }
     }
 }
@@ -307,60 +301,74 @@ TEST_CASE("Echo diff: TCP post-restart with empty previous yields all-connected"
     }
 }
 
-TEST_CASE("Echo warehouse rollups: arp/dns are live + hourly only (ADR-0015)",
+TEST_CASE("Echo warehouse roll-up: arp/dns are hourly only (ADR-0015)",
           "[echo][warehouse][rollup][arp][dns]") {
-    // ARP/DNS have a live + hourly tier only — assert the hourly rollup exists and
-    // the daily/monthly tiers do NOT (so a future incorrect granularity is caught).
-    CHECK_FALSE(rollup_sql("arp", "hourly").empty());
-    CHECK(rollup_sql("arp", "daily").empty());
-    CHECK(rollup_sql("arp", "monthly").empty());
-    CHECK(rollup_sql("arp", "hourly").find("FROM arp_live") != std::string::npos);
-    CHECK(rollup_sql("arp", "hourly").find("INSERT INTO arp_hourly") != std::string::npos);
+    // ARP/DNS keep an hourly tier only -- assert there is no daily/monthly view and no step to
+    // one (so a future incorrect granularity is caught).
+    for (const auto* source : {"arp", "dns"}) {
+        const auto* def = fold_source(source);
+        REQUIRE(def != nullptr);
+        CHECK(def->tiers == std::vector<std::string_view>{"hourly"});
+        CHECK(fold_tier_from_tier_sql(source, "hourly", "daily").empty());
+        CHECK_FALSE(is_fold_view(std::string{source} + "_daily"));
+        CHECK_FALSE(is_fold_view(std::string{source} + "_monthly"));
+    }
 
-    CHECK_FALSE(rollup_sql("dns", "hourly").empty());
-    CHECK(rollup_sql("dns", "daily").empty());
-    CHECK(rollup_sql("dns", "monthly").empty());
-    CHECK(rollup_sql("dns", "hourly").find("FROM dns_live") != std::string::npos);
-    CHECK(rollup_sql("dns", "hourly").find("INSERT INTO dns_hourly") != std::string::npos);
-
-    // DDL + $-name translation + the read-only authorizer reach the new tables.
-    auto ddl = generate_warehouse_ddl();
-    CHECK(ddl.find("arp_live") != std::string::npos);
-    CHECK(ddl.find("dns_hourly") != std::string::npos);
+    // DDL + $-name translation + the read-only authorizer reach the tables, and the retired raw
+    // names answer with an empty shim view rather than failing.
+    CHECK(generate_fold_ddl().find("CREATE VIEW IF NOT EXISTS arp_hourly") != std::string::npos);
     CHECK(translate_dollar_name("$ARP_Live").value_or("") == "arp_live");
+    CHECK(translate_dollar_name("$ARP_Hourly").value_or("") == "arp_hourly");
     CHECK(translate_dollar_name("$DNS_Hourly").value_or("") == "dns_hourly");
     CHECK(is_queryable_table("arp_live"));
+    CHECK(is_queryable_table("arp_hourly"));
     CHECK(is_queryable_table("dns_live"));
+    CHECK(is_queryable_table("dns_hourly"));
+    CHECK(legacy_live_shim_ddl().find("CREATE VIEW IF NOT EXISTS arp_live") != std::string::npos);
 }
 
-TEST_CASE("Echo warehouse rollups: mapdrive is live + hourly only (§3.8)",
+TEST_CASE("Echo warehouse roll-up: mapdrive is hourly + daily (§3.8)",
           "[echo][warehouse][rollup][mapdrive]") {
-    CHECK_FALSE(rollup_sql("mapdrive", "hourly").empty());
-    CHECK(rollup_sql("mapdrive", "daily").empty());
-    CHECK(rollup_sql("mapdrive", "monthly").empty());
-    CHECK(rollup_sql("mapdrive", "hourly").find("FROM mapdrive_live") != std::string::npos);
-    CHECK(rollup_sql("mapdrive", "hourly").find("INSERT INTO mapdrive_hourly") !=
-          std::string::npos);
-    // direction participates in the rollup grouping.
-    CHECK(rollup_sql("mapdrive", "hourly").find("direction") != std::string::npos);
-    // `historical` rows are excluded so a recent-artifact backfill row cannot emit a
-    // zero-count hourly row (adversarial-review LOW).
-    CHECK(rollup_sql("mapdrive", "hourly").find("action IN ('appeared', 'removed')") !=
-          std::string::npos);
+    const auto* def = fold_source("mapdrive");
+    REQUIRE(def != nullptr);
+    CHECK(def->tiers == std::vector<std::string_view>{"hourly", "daily"});
+    CHECK_FALSE(fold_tier_from_tier_sql("mapdrive", "hourly", "daily").empty());
+    CHECK(fold_tier_from_tier_sql("mapdrive", "daily", "monthly").empty());
 
-    auto ddl = generate_warehouse_ddl();
-    CHECK(ddl.find("mapdrive_live") != std::string::npos);
-    CHECK(ddl.find("mapdrive_hourly") != std::string::npos);
+    // `historical` events count in historical_count and in neither appear nor remove: a
+    // recent-artifact backfill row cannot emit a phantom appearance (adversarial-review LOW).
+    MapDriveEvent historical;
+    historical.ts = 1'700'000'000;
+    historical.action = "historical";
+    historical.direction = "outbound";
+    TierAccumulator acc(*def);
+    mapdrive_delta({historical}, acc);
+    const auto rows = acc.rows("hourly");
+    REQUIRE(rows.size() == 1);
+    CHECK(std::get<int64_t>(*acc.measure(rows[0], "historical_count")) == 1);
+    CHECK(std::get<int64_t>(*acc.measure(rows[0], "appear_count")) == 0);
+    CHECK(std::get<int64_t>(*acc.measure(rows[0], "remove_count")) == 0);
+    // direction participates in the identity.
+    CHECK(std::get<std::string>(*acc.key(rows[0], "direction")) == "outbound");
+
     CHECK(translate_dollar_name("$MapDrive_Live").value_or("") == "mapdrive_live");
     CHECK(translate_dollar_name("$MapDrive_Hourly").value_or("") == "mapdrive_hourly");
     CHECK(is_queryable_table("mapdrive_live"));
     CHECK(is_queryable_table("mapdrive_hourly"));
 
-    // The live table carries the direction-polymorphic columns + origin.
-    auto cols = columns_for_table("mapdrive_live");
+    // The tier carries the direction-polymorphic identity columns; the username, provider and
+    // origin of the retired raw rows are not kept (the shim keeps their names for old queries).
+    auto cols = columns_for_table("mapdrive_hourly");
+    for (const auto* c : {"direction", "local_mount", "remote_path", "remote_host"}) {
+        INFO("mapdrive_hourly column=" << c);
+        CHECK(std::find(cols.begin(), cols.end(), c) != cols.end());
+    }
+    for (const auto* c : {"username", "provider", "origin"})
+        CHECK(std::find(cols.begin(), cols.end(), c) == cols.end());
+    auto legacy = columns_for_table("mapdrive_live");
     for (const auto* c : {"direction", "local_mount", "remote_path", "remote_host", "username",
                           "provider", "origin"}) {
-        INFO("mapdrive_live column=" << c);
-        CHECK(std::find(cols.begin(), cols.end(), c) != cols.end());
+        INFO("mapdrive_live (shim) column=" << c);
+        CHECK(std::find(legacy.begin(), legacy.end(), c) != legacy.end());
     }
 }

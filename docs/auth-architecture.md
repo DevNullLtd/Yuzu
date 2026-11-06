@@ -1463,7 +1463,7 @@ account policy)"* — this ships **both** halves.
   placeholder certificate strings). An earlier draft parsed the file with a
   different loader and disagreed with the verifier in both directions
   (`BEGIN TRUSTED CERTIFICATE` rejected, Ed25519 accepted), so the single shared
-  helper is load-bearing: do not add a second certificate probe.
+  helper is load-bearing: do not add a second certificate probe. The helper also refuses a key type outside the verifier's algorithm allowlist (RSA and EC key data), so a key that xmlsec can adopt but the verifier would refuse (Ed25519 and Ed448 on xmlsec 1.3.12) is reported broken at start-up, not at the first sign-in.
 
   Deliberate limits of that second check:
   - **Local only — no network.** OIDC discovery and signing-key fetches stay
@@ -3527,8 +3527,8 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 - 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 38 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
-  - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
-  - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
+  - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution on macOS (the resolver is capped at the per-operation timeout if httplib's non-blocking resolver is compiled in; that build setting has not been checked for macOS) and on Windows, but not on a Linux build with glibc: there cpp-httplib 0.59.0 cancels a lookup at that timeout and then waits for the resolver itself to finish, about 30 s with default resolver settings (cpp-httplib's header says the system resolver timeout, about 30 s by default, past the caller's timeout; read as about 30 s from the start of the lookup, not measured) (longer with several nameservers or search domains), and only an unresponsive resolver causes the wait (an answered NXDOMAIN fails at once). `resolve_host_addresses` calls `httplib::detail::getaddrinfo_with_timeout` directly, so the IdP GETs, the check before the token-exchange POST connects (`exchange_code` -> `vet_egress_target`) and the one-time NAT64 probe lookup, and with them sign-in and Test Connection, are not held to the 10 s figure on glibc; a musl build uses a bounded thread fallback. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
+  - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib (0.37.1 and 0.59.0) waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
   - The token-exchange POST has per-operation timeouts only (10/15/15 s on Linux and macOS; Windows uses the WinHTTP defaults) and no total bound. Its response is capped at 256 KiB on every platform (on Windows the size of each chunk is checked against the remaining allowance before it is allocated), and the Windows request sets the WinHTTP redirect policy to never and accepts only HTTP status 200 (`WinHttpQueryHeaders`), so a 3xx answer fails the sign-in instead of being followed to an unchecked host or parsed as a token response.
   - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
   - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key, while a token with no `kid` is checked against each usable key in turn (at most the first 16, in the order published). An RSA key with a modulus under 2048 bits, or an exponent below 3, even or over 32 bits, is skipped at parse: defence in depth against a weak IdP key, not against a tampered JWKS. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
@@ -3724,6 +3724,162 @@ only when a change cannot be expressed as an idempotent additive re-seed
 (`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
+
+## Periodic access reviews (SOC 2 CC6.2)
+
+A reviewer periodically confirms that every role grant in the fleet is still
+appropriate, and the confirmation is kept as evidence. The surface is six
+operations on two transports: `GET /api/v1/access-reviews/export`,
+`GET /api/v1/access-reviews`, `POST /api/v1/access-reviews` (open),
+`GET /api/v1/access-reviews/{id}`, `POST /api/v1/access-reviews/{id}/attestations`
+and `POST /api/v1/access-reviews/{id}/close`, with the MCP twins
+`export_access_review`, `list_access_reviews`, `open_access_review`,
+`get_access_review`, `record_attestation` and `close_access_review`.
+Opening a campaign freezes one `pending` row per (principal, role) grant in
+`AccessReviewStore` (Postgres schema `access_review_store`); a reviewer then
+records `attested` or `flagged_revoke` against each row; closing stamps who and
+when. Design notes and the audit shape: `docs/security-reviews/access-reviews-2026-07-21.md`.
+
+### The gate is global, and dedicated (#2225)
+
+Reads need `AccessReview:Read`, writes `AccessReview:Attest`. Both are seeded
+only to `Administrator` and the non-admin `Reviewer` role. The global gate is
+deliberate: a grant has no per-agent or management-group boundary to
+admit-then-filter against, and a confinement-filtered slice would be worthless
+as CC6.2 evidence, because an auditor needs the complete grant population every
+time. That makes the global gate a stronger least-privilege posture (via the seeded `Reviewer`
+role) than a confinement-filtered slice would be, not a weaker one. Do not move these routes
+onto `authorize_list_read`.
+
+**#2225 round 2.** An earlier round gated the surface on `AuditLog:Read` /
+`AuditLog:Attest`. That over-disclosed the full fleet-wide grant population to
+the `Operator` and `PlatformEngineer` roles, which hold `AuditLog:Read` for
+unrelated reasons but neither holds `UserManagement:Read` or
+`EnginePrincipal:Read`, the permissions that gate the equivalent-sensitivity
+`/rbac/roles` and `/engine-principals/{id}/roles` routes (the latter moved off
+`Security:Read` in #2376). `AccessReview` was cut away from `AuditLog:*` and
+must not be put back.
+
+### Flag is not revoke
+
+`decision: "flagged_revoke"` records evidence only. It never calls
+`unassign_role` or revokes an engine principal. Acting on a flag is a separate,
+explicitly gated operator action.
+
+### The population is read from the grant table
+
+`build_access_review` reads the grant table directly
+(`RbacStore::list_all_principal_roles_checked()`), so a grant whose principal is
+in no roster (a deleted user, a stale IdP row, an orphan OIDC/SSO principal) is
+surfaced as `source="orphan"` instead of being omitted. A roster walk would hide
+exactly the grants an auditor most needs to see.
+
+### Campaigns are never pruned
+
+A closed campaign is the compliance evidence and is kept indefinitely. Do not
+copy the `/auto` Pre-flight 14-day prune. Any retention policy is a separate,
+explicitly reviewed decision.
+
+### Separation of duties and final decisions (#4752)
+
+Two rules, both enforced inside the single `UPDATE` in
+`AccessReviewStore::record_attestation`, so the MCP tool, the REST route and any
+future caller inherit them and no handler can forget either.
+
+**A reviewer may not decide their own grant.** The write is refused when the
+acting reviewer is:
+
+- the subject of a `user` grant (`principal_id` equals the reviewer's username,
+  compared byte for byte with no case folding or normalisation, so an alias is a
+  different principal), or
+- the owner of an `engine` principal, as frozen into the row's `grant_snapshot`
+  (`owner_or_email`) when the campaign was opened. The owner is frozen, not
+  looked up live: the reviewed population is frozen at open, and the check needs
+  no cross-store read. An empty or legacy snapshot has no owner and is not
+  blocked.
+
+The reviewer is always the session's username. An API-token or MCP-token session
+acts as the token's owner, so attesting through your own token is caught the
+same way. An engine-classed session can never be a reviewer (both transports
+refuse it before the store is reached).
+
+**A decision is final.** A grant moves from `pending` to `attested` or
+`flagged_revoke` exactly once while its campaign is open. A second call, by
+anyone, is refused and the first decision, reviewer and justification stay
+untouched. This stops a subject from quietly replacing another reviewer's
+`flagged_revoke` with `attested`, which would leave the closed campaign showing
+only the self-signed result. If a decision was a mistake, open a new campaign. This was ruled
+by the project owner on 2026-11-05 (#4752): a correction is a new campaign, never an edit, so a
+closed campaign shows what each reviewer actually decided.
+(This also closes #2326 item 2, the silent last-write-wins between two
+concurrent reviewers.)
+
+**A decision cannot land in a campaign that is closing.** The write takes a share lock on the
+campaign row, so a close waits for attestations already in flight and an attestation that
+arrives after the close is refused (`not_found`).
+
+The engine owner is read from the `owner_or_email` key of the row's frozen `grant_snapshot`.
+That key is a contract between the handlers that write the snapshot when a campaign opens and
+the store's SQL; the REST and MCP engine-owner tests (`[sod]`) are its tripwire, because
+renaming the key would silently stop the engine check. A snapshot that is empty, not valid JSON
+or has no owner has no readable owner, and its row stays attestable.
+
+When both rules apply to one attempt, `self_attestation` is reported, because a
+subject trying to overwrite a decision about their own grant is the signal that
+matters.
+
+**How a refusal reaches the caller.** The store returns a prefixed error and the
+two transports translate it with the shared `classify_attestation_refusal`
+helper, so they cannot disagree:
+
+| Store prefix | REST | MCP | Audit row |
+|---|---|---|---|
+| `self_attestation:` | 403 | `kPermissionDenied` | `access_review.attested` or `access_review.flagged`, `result=denied`, detail `self_attestation_blocked` |
+| `already_decided:` | 409 | `kInvalidParams` | same verbs, `result=denied`, detail `already_decided` |
+| `bad_request:` | 400 | `kInvalidParams` | `result=failure`, empty `target_id`, fixed `detail` (no caller bytes in the row) |
+| `not_found:` | 404 | `kInvalidParams` | `result=failure` (unchanged) |
+
+A `bad_request:` means an identifier contained a NUL byte or was longer than 512 bytes (Postgres
+stops reading a parameter at the first NUL, so such a value would otherwise match a real row
+while its extra bytes reached the audit trail), the justification contained a NUL byte or was
+longer than 8192 bytes (it would be silently cut at the NUL), or the reviewer was empty. The
+512-byte bound is far above anything the account-provisioning path accepts (prefixed external
+ids are capped at 255 bytes and local usernames at 64), so an ordinary grant is never refused;
+a grant created by another path with a longer id would be refused here. The libpq text of a genuine database fault in `record_attestation` or
+`close_campaign` is logged on the server and never returned to the caller.
+
+**Known limits, stated plainly.** The control compares usernames byte for byte, so it is exactly
+as strong as the rule "one person, one principal id". Read these before you describe it to an
+auditor.
+
+- **One person with more than one account.** A person who holds a local account and an SSO or
+  SCIM-provisioned identity (`oidc:<issuer>#<subject>`, `saml:`, `ad:`) is two principals to this
+  check, so they can decide the grant held under their other identity. The same goes for a
+  person's membership of a group (below).
+- **`group` grants have no owner**, and group membership is a cross-store read, so a member of a
+  group is not blocked from deciding that group's grant.
+- **Engine ownership is the owner recorded when the campaign opened.** Ownership moved by
+  `transfer_owner` afterwards is not reflected (the old owner stays blocked, the new owner is
+  not), an engine principal's `created_by` is not checked, and an engine deleted after the
+  campaign opened keeps a snapshot with no readable owner, which anyone may decide.
+- **It needs at least two people able to attest.** A sole Administrator (RBAC off, the default,
+  admits only administrators) cannot decide that administrator's own grants. They stay
+  `pending` until someone closes the campaign, and `close` has no separation of duties, so the
+  campaign closes with unreviewed rows. Assign `Reviewer` to a second person.
+- **It is not four-eyes.** Nothing stops two colluding reviewers deciding each other's grants.
+  Four-eyes on distinct human roots is a separate control (ADR-0033 section 7 reserves
+  human-root resolution for it); this rule compares usernames only, the same limit ADR-1005's
+  2026-10-19 addendum records for approvals. No separate acceptance of that limit is recorded for
+  access reviews.
+- **Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is
+  the subject of a grant can still open or close a campaign.
+- **Mixed-version replicas.** The rules live in the database write, so a replica still on the
+  old build keeps overwriting and accepting self-attestation until it is upgraded
+  (`docs/user-manual/upgrading.md`).
+- `record_attestation` stays `Destructive` on MCP because the write is now final
+  and irreversible. Lowering the annotation would loosen tier gating and is a
+  security decision of its own. It remains exempt from MFA step-up as evidence
+  capture under its own securable (`step_up_detail::kEvidenceCapture`).
 
 ## Render-time permission probes (capability hints)
 
@@ -5012,6 +5168,21 @@ The CSP uses `'unsafe-inline'` for `script-src`/`style-src` because the dashboar
 Operators can extend the CSP via `--csp-extra-sources "https://cdn.example.com https://beacon.example.com"` (space-separated, validated at CLI parse — control bytes / semicolons / `'unsafe-eval'` are rejected at startup with a clear error). The flag's value is appended to `script-src`/`style-src`/`connect-src`/`img-src` only.
 
 Header construction lives in `server/core/src/security_headers.{hpp,cpp}` (`yuzu::server::security` namespace) — the production server and the unit/integration tests in `tests/unit/server/test_security_headers.cpp` (38 cases) share the same `HeaderBundle::make()`/`apply()` code path. The resolved bundle is logged at INFO at startup so operators can confirm activation: `Security headers active: CSP=N bytes, HSTS=on/off, Referrer-Policy="...", Permissions-Policy=N bytes`.
+
+### Close rule for an unread request body (cpp-httplib 0.59)
+
+The main listener's post-routing handler calls `close_if_unread_framed_body`
+(`server/core/src/body_cap_httplib.hpp`) on every response, a pre-routing `Handled`
+answer included: a response below `400` that left a declared request body
+unread carries `Connection: close` (httplib closes a `400`-or-above response
+itself). Keep that single call in the post-routing handler: never add a
+per-return `set_header` in the pre-routing handler, where a new early return
+would forget it, and never move `close_if_unread_framed_body` to
+`set_pre_request_handler`, which runs before the body is read. The plain-HTTP
+redirect listener closes its redirect answer unconditionally instead (`health_routes.cpp`). The
+wiring is pinned by a lexical case in `test_step_up_wiring.cpp`. This rule is
+not part of the MFA step-up chokepoint: it sits next to the security-headers
+call because both run in the same post-routing handler.
 
 ## Self-target principal-destruction guard (hard invariant, #397/#403/ca-B1)
 
