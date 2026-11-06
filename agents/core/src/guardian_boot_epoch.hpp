@@ -23,7 +23,7 @@
 // FAILURE RULES. A claim that cannot be made durably is 0 ("unordered"), and nothing is
 // invented in memory: an in-memory epoch would not be persisted, so the next boot would
 // repeat it. Epoch 0 makes the engine emit the pair as 0/0, which a pair-comparing
-// server treats as unordered and orders by the timestamp key instead. 0 is returned for:
+// server treats as unordered and orders by the census ordering key instead. 0 is returned for:
 // a null store, a read error (including an unreadable synchronous pragma), a write failure,
 // a clock term at or above the ceiling, a store that REPORTS a durability level below FULL
 // (see below), and, for the three-argument overload, an instance lock this process does not

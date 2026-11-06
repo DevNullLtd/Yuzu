@@ -3,10 +3,11 @@
 // Guardian emit-order stamp (UP-14).
 //
 // The event timestamp is the agent wall clock, so after a backward clock step an older
-// compliant event can outrank a newer errored one at the server. The remedy is an
+// compliant event can carry a later stamp than a newer errored one; the server's census
+// ordering key then holds or flags the pair but cannot order it. The remedy is an
 // agent-assigned ordinal drawn where QUEUE ORDER IS DECIDED, carried on the wire as the
 // pair (boot_epoch, emit_seq); a server that compares it orders lexicographically, one
-// that does not ignores it and keeps ordering by the timestamp.
+// that does not ignores it and keeps ordering by the census ordering key.
 //
 // GuardianEmitSeqSource is that ordinal. One instance is owned (by shared_ptr) by the
 // GuardianEngine and handed to every producer that decides queue order, so the legacy
@@ -56,7 +57,7 @@ static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
 /// Stamp the ordering pair on a wire event. The pair is both-or-neither: it is written
 /// only when BOTH `boot_epoch` and `seq` are nonzero; otherwise both fields are left
 /// untouched at their unset value 0, so a pair-comparing server falls back to the
-/// timestamp key instead of ordering on half a pair.
+/// census ordering key instead of ordering on half a pair.
 inline void stamp_emit_pair(::yuzu::guardian::v1::GuaranteedStateEvent& ev,
                             std::uint64_t boot_epoch, std::uint64_t seq) noexcept {
     if (boot_epoch == 0 || seq == 0)

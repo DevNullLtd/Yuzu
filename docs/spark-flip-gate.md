@@ -2861,8 +2861,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   mutex to a younger errored send released after H, so the errored reaches the wire first.
   UP-14: `enqueued_ns` is `system_clock`; a backward wall-clock step between an older compliant
   and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
-  whatever the wire order (the pair is flagged `order_uncertain` when the errored arrives
-  second; in the other order the compliant applies, and the pair is flagged only if one of the
+  whatever the wire order (the (agent, rule) pair is flagged `order_uncertain` when the errored arrives
+  second; in the other order the compliant applies, and the (agent, rule) pair is flagged only if one of the
   conditions in the Guardian guide's section 'When a verdict is flagged or does not move'
   holds), and the hold cannot touch it (server side). The agent now also
   stamps a `(boot_epoch, emit_seq)` pair at the point queue order is decided (legacy executor
@@ -2884,7 +2884,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   Status will be tracked on #5690 and in the agent change's pull request description (one
   checkbox per item) once that pull request exists:
   1. The comparator orders per (agent_id, rule_id), compares the pair only when both sides
-     carry a nonzero pair and otherwise uses the timestamp. Tests: isolation between agents and
+     carry a nonzero pair and otherwise uses the census ordering key. Tests: isolation between agents and
      rules (one agent's pair never affects another agent's rows), ordered to unordered to
      ordered transitions, and a test that rejects "an unset pair ranks lowest". The pair is
      agent-asserted and unauthenticated.
@@ -2921,7 +2921,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      signal is one error-level log line.
      For every case above, tests show that stale state is not silently presented as the current
      verdict. When the available ordering information cannot establish freshness, the server
-     exposes that uncertainty or obtains fresh state; timestamp fallback, metadata retention,
+     exposes that uncertainty or obtains fresh state; census-ordering-key fallback, metadata retention,
      or documenting the selected result alone does not satisfy this criterion.
   5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
      server change owns the fields); the agent change takes the server change's version of

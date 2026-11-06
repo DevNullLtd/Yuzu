@@ -167,7 +167,7 @@ public:
     /// and passed in so this constructor stays I/O-free. 0 (the default, and what every
     /// test using the 2- or 3-argument form gets) means "unordered": events still draw an
     /// emit_seq internally but the wire carries 0/0 (a server that compares the pair
-    /// ignores a 0/0 pair and keeps ordering by the timestamp).
+    /// ignores a 0/0 pair and keeps ordering by the census ordering key).
     GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark = false,
                    std::uint64_t boot_epoch = 0);
     ~GuardianEngine();
@@ -219,15 +219,15 @@ public:
     /// part (c) — never the kick's own wall-clock `now`; a real verdict delivered
     /// between two losses is legitimately older than the SECOND loss and should
     /// still be overwritten by a repair covering that second loss, which stamping
-    /// with `now` instead of `last_lost` would otherwise let a stale repair do to
-    /// a NEWER, already-delivered real verdict, via the server's own
+    /// with `now` instead of `last_lost` would otherwise let a stale repair overwrite
+    /// a NEWER, already-delivered real verdict through the server's own
     /// census ordering key; the executor's own seq-guarded clearing and
     /// dequeue-time supersession check are the agent-side stale-repair defence, see
     /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
     /// census goes fail-closed (errored) for a gapped rule until either the
     /// repair is confirmed delivered or the rule's next real verdict clears it
-    /// (a verdict with a later census ordering key, until the server compares the pair;
-    /// D11's "first verdict clears" semantics,
+    /// (today the verdict with the later census ordering key, and with the later pair once
+    /// the server compares it; D11's "first verdict clears" semantics,
     /// docs/spark-legacy-delta-registry.md); locally, the executor's
     /// own gap ledger can ALSO be cleared by that same next real verdict, before
     /// any repair for it is ever dispatched — see
@@ -1296,8 +1296,9 @@ private:
     /// dequeue-time supersession check are the agent-side stale-repair defence; the
     /// backdated timestamp is an input to the server's census ordering key, which
     /// sees the repair at the time of the loss rather than the time of the repair.
-    /// UP-14: that stays a display/backdating choice and is NOT
-    /// an ordering authority the agent can rely on. A repair goes through offer() like
+    /// UP-14: the backdated stamp is an input to that key, not an ordering authority the
+    /// agent can rely on (the key is capped at receipt plus 300 s, and a tie is decided by
+    /// arrival). A repair goes through offer() like
     /// any event and draws a FRESH (boot_epoch, emit_seq) pair at admission; the pair and
     /// the timestamp are both inputs, a server that compares the pair orders the repair
     /// against other verdicts by it, and one that does not (or sees 0/0) falls back to

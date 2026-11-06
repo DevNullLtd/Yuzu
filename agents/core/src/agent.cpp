@@ -936,7 +936,7 @@ public:
         // source its executor and Spark runtime share). It is NOT read in start_local(),
         // which is deferred past the network. A null kv_store_ is handled by the claim
         // (epoch 0 = unordered: the wire pair is 0/0, which a pair-comparing server treats
-        // as unordered and orders by the timestamp key). The literal `false` stays visible on
+        // as unordered and orders by the census ordering key). The literal `false` stays visible on
         // purpose: prefer_spark_ is never passed true in production.
         // UP-9: exclusive per-data-dir lock held for the life of the process (a member, so it
         // outlives guardian_). The wait covers a service restart overlapping the old process's

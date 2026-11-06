@@ -993,8 +993,8 @@ at admission, under the executor lock, and the Spark runtime draws it when it en
 outbox entry. Entries re-sent from the lifecycle journal carry 0/0, because their original
 position is not journalled; DEX observations also carry 0/0. 0/0 means unordered, not oldest.
 A receiver should compare the pair only when both sides carry a nonzero pair, and otherwise
-order by the timestamp. A server that compares the pair orders by it; one that does not
-ignores it and keeps ordering by the timestamp. The server change owns the comparator and the
+order by the census ordering key. A server that compares the pair orders by it; one that does not
+ignores it and keeps ordering by the census ordering key. The server change owns the comparator and the
 recovery path for a pinned or lost epoch. Acceptance list for the server change: see the UP-14
 entry in `docs/spark-flip-gate.md` and issue #5690.
 
@@ -1020,7 +1020,7 @@ Known limits of the boot epoch:
     reported as `contended` with `native_error=32`;
   - a local principal that can open the file before the agent starts can hold it (POSIX: lock
     it; Windows: keep it open) and leave the agent at 0/0 for that process lifetime (accepted:
-    the result is the pre-feature timestamp ordering, and the agent logs `contended`; on POSIX
+    the result is ordering by the census ordering key alone, as before the feature, and the agent logs `contended`; on POSIX
     the requested mode 0600 limits this to the agent's account and root unless the mode was
     changed or the file already existed with a looser one; on Windows it depends on the data
     directory ACL, which was not measured);
@@ -1041,7 +1041,7 @@ Known limits of the boot epoch:
 - An agent whose epoch claim fails (no store, a read or write failure, a store that reports a
   `PRAGMA synchronous` level below FULL (outcome `durability_below_full`, not expected for the
   agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), a clock reading at or above the 2^62 ceiling, or the data-directory lock not held (`instance_lock_not_held`)) sends the pair as 0/0 for the whole process lifetime, ordered by
-  the timestamp. Today this is visible only as an error-level `Guardian boot_epoch claim` log
+  the census ordering key. Today this is visible only as an error-level `Guardian boot_epoch claim` log
   line.
 - Events replayed from the lifecycle journal carry 0/0, so a replayed event is not
   byte-identical to its live original in fields 24 and 25.

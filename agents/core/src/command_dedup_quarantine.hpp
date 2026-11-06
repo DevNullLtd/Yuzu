@@ -103,7 +103,7 @@ inline std::optional<std::pair<long long, long long>> parse_quarantine_name(std:
 /// not hold for that call. If 10,000 names are taken it FAILS (nullopt) rather than overwrite.
 ///
 /// This protects the EVIDENCE only. It does not make recovery safe for two agent daemons on one data
-/// dir (unsupported; there is no instance lock): process B can still drop the fresh store that
+/// dir (unsupported; no instance lock covers the dedup store: the Guardian boot-epoch lock guards only the epoch claim): process B can still drop the fresh store that
 /// process A just created, leaving A on an orphaned inode.
 ///
 /// `epoch_seconds` is clamped to >= 0: a clock before 1970 would otherwise write `.corrupt--5`,

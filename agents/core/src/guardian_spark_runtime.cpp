@@ -5173,11 +5173,12 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     //  - enqueued_ns is system_clock (stamped at the enqueue sites, wall = system_clock::now();
     //    replayed lifecycle entries keep the original persisted ns):
     //    a backward wall-clock step between an older compliant and a newer errored makes the
-    //    errored timestamp earlier, so a server that orders by timestamp keeps compliant
-    //    regardless of wire order; the hold cannot affect this. UP-14 puts the (boot_epoch,
+    //    errored timestamp earlier, so the server's census ordering key keeps compliant and
+    //    flags the pair `order_uncertain` (after the one-hour stale-mark recovery it follows
+    //    arrival order, still flagged); the hold cannot affect this. UP-14 puts the (boot_epoch,
     //    emit_seq) pair on every live entry; a server that compares the pair orders by it
-    //    AHEAD of the timestamp, one that does not ignores it and keeps ordering by the
-    //    timestamp (the comparator is the server's, not this function's), so this bullet
+    //    AHEAD of the census ordering key, one that does not ignores it and keeps ordering by the
+    //    census ordering key (the comparator is the server's, not this function's), so this bullet
     //    applies in full to entries sent without a pair (an unclaimed epoch, or a replayed
     //    entry) and to any server that does not compare it;
     //  - replayed journal entries vs live compliance (seq is stamped at page time, and carries
