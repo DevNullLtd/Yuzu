@@ -99,7 +99,7 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
     set_fault(fault, GuardianReadFault::kNone);
     // #7217: retained events with no census row are invisible to the census read below. Same
     // ADR-0038 posture: a degrade must never render as "nothing pending". Issued BEFORE the
-    // census read (SG-F3 / UP-4): a pair repaired between the two reads then appears in BOTH
+    // census read, so that a pair repaired between the two reads then appears in BOTH
     // categories (a harmless over-report) instead of in neither. The reads are not one atomic
     // snapshot; the counts are exact per read, not a joint snapshot.
     auto unrepresented = store.unrepresented_pending_for_agent(agent_id, std::nullopt);
@@ -178,7 +178,7 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
     // agent_rule_statuses_for_agent. Same ADR-0038 posture and same audit obligation as the reads
     // below (pii_access_began is already true): a degrade must never render as "nothing
     // pending". An empty guard_ids is an engaged-empty filter, which the store answers without a
-    // query. Issued BEFORE the census read (SG-F3 / UP-4): a pair repaired between the two reads
+    // query. Issued BEFORE the census read, so that a pair repaired between the two reads
     // then appears in BOTH categories (a harmless over-report) instead of in neither. The reads
     // are not one atomic snapshot; the counts are exact per read, not a joint snapshot.
     auto unrepresented = store.unrepresented_pending_for_agent(

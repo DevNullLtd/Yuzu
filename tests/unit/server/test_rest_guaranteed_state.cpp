@@ -36,6 +36,7 @@
 #include "mcp_retry.hpp" // kGuardianCensusDeviceTimeoutMessage/Remedy: the 57014 response wording (#7217)
 #include "rest_api_v1.hpp"
 #include "test_dex_perf_api_double.hpp"
+#include "test_events_table_lock.hpp"
 #include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_guardian_api_double.hpp" // ADR-0031 WS-A4 (ninth family): FnGuardianApi
 #include "test_network_api_double.hpp"
@@ -6245,40 +6246,15 @@ double degrade_count(yuzu::MetricsRegistry& m, const char* source, const char* r
         .value();
 }
 
-int device_view_audits(const RestGsHarness& h, const char* result) {
+// guardian.device.view rows with this result for THIS device: the target_id check keeps a row for
+// the wrong device from satisfying a fault test.
+int device_view_audits(const RestGsHarness& h, const char* result, const char* agent_id) {
     return static_cast<int>(std::count_if(
-        h.audit_log.begin(), h.audit_log.end(), [result](const AuditRecord& a) {
-            return a.action == "guardian.device.view" && a.result == result;
+        h.audit_log.begin(), h.audit_log.end(), [result, agent_id](const AuditRecord& a) {
+            return a.action == "guardian.device.view" && a.result == result &&
+                   a.target_id == agent_id;
         }));
 }
-
-// Holds ACCESS EXCLUSIVE on the events table from a separate connection, so the unrepresented-pending
-// read (the only read of the two per-device routes that touches that table) blocks until its
-// statement timeout. This is the real backlog-shaped failure, not an injected one.
-class EventsTableLock {
-public:
-    explicit EventsTableLock(const std::string& dsn) : conn_{PQconnectdb(dsn.c_str())} {
-        REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
-        yuzu::server::pg::PgResult r{PQexec(
-            conn_.get(),
-            "BEGIN; LOCK TABLE guaranteed_state_store.guaranteed_state_events IN ACCESS EXCLUSIVE "
-            "MODE")};
-        REQUIRE(r.ok());
-    }
-    EventsTableLock(const EventsTableLock&) = delete;
-    EventsTableLock& operator=(const EventsTableLock&) = delete;
-    void release() noexcept {
-        if (conn_) {
-            yuzu::server::pg::PgResult r{PQexec(conn_.get(), "ROLLBACK")};
-            conn_ = yuzu::server::pg::PgConn{};
-        }
-    }
-    ~EventsTableLock() { release(); }
-
-private:
-    yuzu::server::pg::PgConn conn_;
-};
-
 
 } // namespace
 
@@ -6455,8 +6431,8 @@ TEST_CASE("REST gs.device-compliance: a failed unrepresented-pending read is a r
     CHECK_FALSE(j.contains("data"));
     CHECK(res->body.find("unrepresented_pending") == std::string::npos);
     CHECK(seam->calls.load() == 1);
-    CHECK(device_view_audits(h, "failure") == 1);
-    CHECK(device_view_audits(h, "success") == 0); // the failed read is never audited as served
+    CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+    CHECK(device_view_audits(h, "success", "WS-1") == 0); // the failed read is never audited as served
     // Counted on the per-device source with the generic reason; the gauge-count source never moved.
     CHECK(degrade_count(m, "guardian_census_device", "query_error") == 1.0);
     CHECK(degrade_count(m, "guardian_census_device", "statement_timeout") == 0.0);
@@ -6493,8 +6469,8 @@ TEST_CASE("REST gs.device-all-guards: a failed unrepresented-pending read is a r
     CHECK_FALSE(j.contains("data"));
     CHECK(res->body.find("unrepresented_pending") == std::string::npos);
     CHECK(seam->calls.load() == 1);
-    CHECK(device_view_audits(h, "failure") == 1);
-    CHECK(device_view_audits(h, "success") == 0);
+    CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+    CHECK(device_view_audits(h, "success", "WS-1") == 0);
     CHECK(degrade_count(m, "guardian_census_device", "query_error") == 1.0);
     CHECK(degrade_count(m, "guardian_census", "query_error") == 0.0);
     CHECK(h.gs_pool->in_use() == 0);
@@ -6510,7 +6486,7 @@ TEST_CASE("REST gs.device-all-guards: a failed unrepresented-pending read is a r
     CHECK(h.gs_pool->in_use() == 0);
 }
 
-// CH-7: the store fails AND the failure-audit row cannot persist. The audit outage supersedes the
+// The store fails AND the failure-audit row cannot persist. The audit outage supersedes the
 // data fault (REST fails closed with Sec-Audit-Failed): no data, no zeros, on either route.
 TEST_CASE("REST gs.device-compliance and all-guards: a store fault with a failing audit write is "
           "an audit-unavailable 503, never data or zeros (#7217)",
@@ -6584,8 +6560,8 @@ TEST_CASE("REST gs.device-compliance and all-guards: a pending-read statement ti
               std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
         CHECK(j["error"]["remediation"].get<std::string>().find("statement_timeout") !=
               std::string::npos);
-        CHECK(device_view_audits(h, "failure") == 1);
-        CHECK(device_view_audits(h, "success") == 0);
+        CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+        CHECK(device_view_audits(h, "success", "WS-1") == 0);
 
         // The same route on an ordinary degrade: the retry hint is back.
         mode->store(1);
@@ -6594,7 +6570,7 @@ TEST_CASE("REST gs.device-compliance and all-guards: a pending-read statement ti
         REQUIRE(transient);
         CHECK(transient->status == 503);
         CHECK(nlohmann::json::parse(transient->body)["error"]["retry_after_ms"] == 5000);
-        CHECK(device_view_audits(h, "failure") == 1);
+        CHECK(device_view_audits(h, "failure", "WS-1") == 1);
     }
 }
 
@@ -6643,7 +6619,7 @@ TEST_CASE("REST gs.device-compliance and all-guards: a real statement timeout on
     seed_ordering_uncertainty(h);
     h.store->set_unrepresented_pending_timeout_ms_for_test(50);
 
-    EventsTableLock lock(h.gs_db_pg->dsn());
+    yuzu::test::EventsTableLock lock(h.gs_db_pg->dsn());
     int requests = 0;
     for (const char* url : {kComplianceUrl, kAllGuardsUrl}) {
         INFO(url);
@@ -6660,8 +6636,8 @@ TEST_CASE("REST gs.device-compliance and all-guards: a real statement timeout on
         CHECK(j["error"]["remediation"].get<std::string>() ==
               std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
         CHECK(res->body.find("unrepresented_pending") == std::string::npos);
-        CHECK(device_view_audits(h, "failure") == 1);
-        CHECK(device_view_audits(h, "success") == 0);
+        CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+        CHECK(device_view_audits(h, "success", "WS-1") == 0);
         CHECK(h.gs_pool->in_use() == 0); // the timed-out read returned its lease
     }
     CHECK(degrade_count(m, "guardian_census_device", "statement_timeout") ==
@@ -6679,7 +6655,7 @@ TEST_CASE("REST gs.device-compliance and all-guards: a real statement timeout on
     CHECK(h.gs_pool->in_use() == 0);
 }
 
-// QE-F1: a builder that reported ids.size() as the count, or an unbounded id list, or ids in a
+// A builder that reported ids.size() as the count, or an unbounded id list, or ids in a
 // locale-dependent order, survives every case with at most 50 pending-only pairs.
 TEST_CASE("REST gs.device-compliance and all-guards: more than 50 pending-only pairs are counted "
           "exactly, the id list is capped at 50 and in ascending byte order (#7217)",
@@ -6717,7 +6693,7 @@ TEST_CASE("REST gs.device-compliance and all-guards: more than 50 pending-only p
     }
 }
 
-// QE-F2: uncertain_guards counts the EMITTED guards. A flagged represented pair outside the Baseline
+// uncertain_guards counts the EMITTED guards. A flagged represented pair outside the Baseline
 // snapshot is not one of them (it appears on the all-guards read, not here).
 TEST_CASE("REST gs.device-compliance: a flagged represented pair outside the snapshot is not counted "
           "in uncertain_guards (#7217)",
@@ -6738,7 +6714,7 @@ TEST_CASE("REST gs.device-compliance: a flagged represented pair outside the sna
     CHECK(guard_row(g["guards"], "r9")["order_uncertain"].get<bool>());
 }
 
-// CH-4 (the pair repaired while a request is in flight). The fault seam is consulted at the START of
+// The pair repaired while a request is in flight. The fault seam is consulted at the START of
 // the unrepresented read, which is issued BEFORE the census read; a hook that returns false and adds
 // the missing census row at that moment therefore lands before both reads: the pair is a guard and
 // is not reported unrepresented. Under the reverse read order (census first) the same hook would fire

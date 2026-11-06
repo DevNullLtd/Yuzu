@@ -4621,7 +4621,7 @@ groups:
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
       # statement_timeout on guardian_census_device for a read that ran past its
-      # 5 s budget because of a large retained pending backlog): "guardian_state"
+      # 5 s budget, most likely because of a large retained pending backlog): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -4658,9 +4658,11 @@ groups:
             per-device guards read): the degrade is a 503 on REST or an MCP
             error, never an empty result, and the gauge is not affected.
             reason="statement_timeout" on that source is not transient: the
-            read ran past its 5 s budget because the retained pending backlog
-            is large, the REST 503 carries no retry_after_ms and the MCP error
-            is non-retryable, so a retry fails identically; compare
+            read ran past its 5 s budget, most likely because the retained
+            pending backlog is large (a lock wait, a loaded database or an
+            administrator cancel is reported the same way), the REST 503
+            carries no retry_after_ms and the MCP error is non-retryable, so
+            a retry usually fails identically until the cause clears; compare
             max(yuzu_server_guardian_census_pending_events) and see "When a
             verdict is flagged or does not move", step 5, in the Guaranteed
             State guide.

@@ -16,6 +16,7 @@
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "test_json_schema_subset.hpp" // yuzu::test::schema_violation (get_me output-schema conformance)
 #include "test_principal_lock_gate.hpp" // yuzu::test::GrantReadFault (get_me real-store fault)
+#include "test_events_table_lock.hpp" // yuzu::test::EventsTableLock (held events-table lock -> SQLSTATE 57014)
 #include "dashboard_api_routes.hpp"     // get_me parity against legacy GET /api/me
 #include "mcp_policy.hpp"
 #include "../test_log_capture.hpp"
@@ -45238,35 +45239,15 @@ double mcp_degrade_count(yuzu::MetricsRegistry& m, const char* source, const cha
         .value();
 }
 
-long mcp_audits(const McpTestServer& ts, const char* action_result) {
-    return std::count(ts.audit_log.begin(), ts.audit_log.end(), action_result);
+// "action|result" rows for THIS device. audit_log and audit_target_ids are parallel, so a test that
+// clears one MUST clear the other.
+std::ptrdiff_t mcp_audits(const McpTestServer& ts, const char* action_result, const char* agent_id) {
+    std::ptrdiff_t n = 0;
+    for (std::size_t i = 0; i < ts.audit_log.size() && i < ts.audit_target_ids.size(); ++i)
+        if (ts.audit_log[i] == action_result && ts.audit_target_ids[i] == agent_id)
+            ++n;
+    return n;
 }
-
-// Holds ACCESS EXCLUSIVE on the events table from a separate connection, so the unrepresented-pending
-// read blocks until its statement timeout (a real backlog-shaped failure, not an injected one).
-class McpEventsTableLock {
-public:
-    explicit McpEventsTableLock(const std::string& dsn) : conn_{PQconnectdb(dsn.c_str())} {
-        REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
-        yuzu::server::pg::PgResult r{PQexec(
-            conn_.get(),
-            "BEGIN; LOCK TABLE guaranteed_state_store.guaranteed_state_events IN ACCESS EXCLUSIVE "
-            "MODE")};
-        REQUIRE(r.ok());
-    }
-    McpEventsTableLock(const McpEventsTableLock&) = delete;
-    McpEventsTableLock& operator=(const McpEventsTableLock&) = delete;
-    void release() noexcept {
-        if (conn_) {
-            yuzu::server::pg::PgResult r{PQexec(conn_.get(), "ROLLBACK")};
-            conn_ = yuzu::server::pg::PgConn{};
-        }
-    }
-    ~McpEventsTableLock() { release(); }
-
-private:
-    yuzu::server::pg::PgConn conn_;
-};
 
 // The payload of a successful MCP tool call (audit_persisted is MCP-only, present only when the
 // audit row dropped, so it is erased before payloads are compared with the REST data).
@@ -45346,6 +45327,7 @@ TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable erro
     for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
         INFO(call);
         ts.audit_log.clear();
+        ts.audit_target_ids.clear();
         auto res = ts.call(call);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
@@ -45357,8 +45339,8 @@ TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable erro
         CHECK_FALSE(body["error"]["data"].contains("audit_persisted")); // the failure row persisted
         CHECK(res->body.find("unrepresented_pending") == std::string::npos);
         CHECK(seam->calls.load() == ++expected_calls);
-        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
-        CHECK(mcp_audits(ts, "guardian.device.view|success") == 0);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure", "WS-1") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|success", "WS-1") == 0);
         CHECK(pool.in_use() == 0);
     }
     CHECK(mcp_degrade_count(metrics, "guardian_census_device", "query_error") == 2.0);
@@ -45370,14 +45352,15 @@ TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable erro
     for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
         INFO(call);
         ts.audit_log.clear();
+        ts.audit_target_ids.clear();
         auto res = ts.call(call);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("result"));
         auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
         CHECK(data["unrepresented_pending_guards"].get<int>() >= 1);
-        CHECK(mcp_audits(ts, "guardian.device.view|success") == 1);
-        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 0);
+        CHECK(mcp_audits(ts, "guardian.device.view|success", "WS-1") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure", "WS-1") == 0);
     }
     CHECK(seam->calls.load() == 2 * expected_calls); // consulted again, answered "no fault"
     // The pool still serves a write.
@@ -45385,7 +45368,7 @@ TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable erro
     CHECK(pool.in_use() == 0);
 }
 
-// CH-7 on MCP: the store fails AND the failure-audit row cannot persist. MCP is set-and-proceed, so
+// On MCP: the store fails AND the failure-audit row cannot persist. MCP is set-and-proceed, so
 // the error is still returned (never data, never zeros) and says the audit row dropped.
 TEST_CASE("MCP Guardian: a store fault with a failing audit write is still an error, never data, "
           "and reports audit_persisted:false (#7217)",
@@ -45441,6 +45424,7 @@ TEST_CASE("MCP Guardian: a pending-read statement timeout is a non-retryable err
         INFO(call);
         mode->store(0);
         ts.audit_log.clear();
+        ts.audit_target_ids.clear();
         auto res = ts.call(call);
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
@@ -45451,22 +45435,23 @@ TEST_CASE("MCP Guardian: a pending-read statement timeout is a non-retryable err
         CHECK(body["error"]["data"]["retry_after_ms"].is_null());
         CHECK(body["error"]["data"]["remediation"].get<std::string>() ==
               std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
-        CHECK(body["error"]["data"]["remediation"].get<std::string>().find("fails identically") !=
+        CHECK(body["error"]["data"]["remediation"].get<std::string>().find("usually fails identically") !=
               std::string::npos);
         CHECK_FALSE(body["error"]["data"].contains("audit_persisted"));
-        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
-        CHECK(mcp_audits(ts, "guardian.device.view|success") == 0);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure", "WS-1") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|success", "WS-1") == 0);
 
         // The same tool on an ordinary degrade: the retry hint is back.
         mode->store(1);
         ts.audit_log.clear();
+        ts.audit_target_ids.clear();
         auto transient = ts.call(call);
         REQUIRE(transient);
         auto tbody = nlohmann::json::parse(transient->body);
         REQUIRE(tbody.contains("error"));
         CHECK(tbody["error"]["data"]["retry_after_ms"].get<int>() ==
               yuzu::server::mcp::kMcpStoreFaultRetryMs);
-        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure", "WS-1") == 1);
 
         // The timeout with the failure-audit write failing: still the timeout error, and it says
         // the audit row dropped.
@@ -45505,11 +45490,12 @@ TEST_CASE("MCP Guardian: a real statement timeout on the pending read is a non-r
                                     const std::string&) -> bool { return true; };
     ts.start("readonly");
 
-    McpEventsTableLock lock(db.dsn());
+    yuzu::test::EventsTableLock lock(db.dsn());
     int requests = 0;
     for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
         INFO(call);
         ts.audit_log.clear();
+        ts.audit_target_ids.clear();
         auto res = ts.call(call);
         REQUIRE(res);
         ++requests;
@@ -45522,8 +45508,8 @@ TEST_CASE("MCP Guardian: a real statement timeout on the pending read is a non-r
         CHECK(body["error"]["data"]["remediation"].get<std::string>() ==
               std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
         CHECK(res->body.find("unrepresented_pending") == std::string::npos);
-        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
-        CHECK(mcp_audits(ts, "guardian.device.view|success") == 0);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure", "WS-1") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|success", "WS-1") == 0);
         CHECK(pool.in_use() == 0);
     }
     CHECK(mcp_degrade_count(metrics, "guardian_census_device", "statement_timeout") ==
@@ -45541,7 +45527,7 @@ TEST_CASE("MCP Guardian: a real statement timeout on the pending read is a non-r
     CHECK(pool.in_use() == 0);
 }
 
-// QE-F1 on MCP: more than 50 pending-only pairs, REST equal to MCP, count exact, ids capped and in
+// On MCP: more than 50 pending-only pairs, REST equal to MCP, count exact, ids capped and in
 // ascending byte order.
 TEST_CASE("MCP Guardian: more than 50 pending-only pairs are counted exactly, capped at 50 ids in "
           "byte order, and equal to the REST data (#7217)",
@@ -45634,7 +45620,7 @@ TEST_CASE("MCP Guardian: a draft Baseline reports the zero summary, equal to the
     CHECK(seam->calls.load() == 0); // a draft Baseline never reads the store for the summary
 }
 
-// QE-F2 on MCP: a flagged represented pair outside the snapshot is not counted in uncertain_guards.
+// On MCP: a flagged represented pair outside the snapshot is not counted in uncertain_guards.
 TEST_CASE("MCP Guardian: a flagged represented pair outside the snapshot is not counted in "
           "uncertain_guards (#7217)",
           "[pg][mcp][integration][guardian][ordering]") {
@@ -45736,7 +45722,7 @@ TEST_CASE("MCP Guardian: the advertised output schemas list the #7217 fields as 
     const std::string gdesc = guards["description"].get<std::string>();
     CHECK(gdesc.size() < 4096);
     CHECK(gdesc.find("unrepresented_pending_guards") != std::string::npos);
-    // CA-6: the sentence that tells a worker an empty guards[] is not "no evidence".
+    // The sentence that tells a worker an empty guards[] is not "no evidence".
     CHECK(gdesc.find("nonzero count with an empty guards[] means evidence") != std::string::npos);
     CHECK(gdesc.find("non-retryable") != std::string::npos);
     CHECK(cdesc.find("non-retryable") != std::string::npos);

@@ -230,9 +230,13 @@ struct GuardianDeviceComplianceRollup {
 /// of `GuardianApi::device_guards` / `device_compliance` alongside the existing degrade signal (a
 /// `nullopt` result, and `*store_degraded` on compliance). `kTransient` means a retry can succeed
 /// (store not open, pool timeout, a failed statement). `kStatementTimeout` means the unrepresented
-/// pending read exceeded its time budget (SQLSTATE 57014): the cause is the size of the retained
-/// pending backlog, so retrying the same request fails identically until the backlog shrinks and
-/// the transports must NOT advertise a retry interval. `kNone` is the value when the read answered.
+/// pending read exceeded its time budget (SQLSTATE 57014): the most likely cause is the size of the
+/// retained pending backlog, so retrying the same request usually fails identically until the cause
+/// clears and the transports must NOT advertise a retry interval. `kNone` is the value when the read answered.
+/// An implementation that returns `nullopt` without setting a fault is read by the transports as
+/// `kNone`, which they treat as a retryable degrade (the safe default); a seam implementation MUST
+/// set `kTransient` or `kStatementTimeout` on every degrade except a genuine Baseline miss on
+/// compliance.
 enum class GuardianReadFault : std::uint8_t { kNone = 0, kTransient, kStatementTimeout };
 
 /// Per-device all-guards report - the rows of `GuardianDeviceGuardRow` plus the unrepresented

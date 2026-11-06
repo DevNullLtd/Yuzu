@@ -1686,7 +1686,7 @@ static const ToolDef kTools[] = {
      "non-atomic observations (a pair may appear in both guards[] and the unrepresented list); a "
      "zero count or false flag establishes neither freshness nor "
      "completeness. A pending-evidence read that times out answers a non-retryable error (no "
-     "retry hint): the cause is a large retained pending backlog. Per-device scoped "
+     "retry hint): the most likely cause is a large retained pending backlog. Per-device scoped "
      "(management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
@@ -1890,7 +1890,7 @@ static const ToolDef kTools[] = {
      "appear in both guards[] and the unrepresented list); last_updated "
      "stays census-only; a zero count or false flag establishes neither freshness nor "
      "completeness. A pending-evidence read that times out answers a non-retryable error (no "
-     "retry hint): the cause is a large retained pending backlog. "
+     "retry hint): the most likely cause is a large retained pending backlog. "
      "get_guardian_device_guards lists every rule of the device, not limited to "
      "this Baseline.",
      R"j({"type":"object","properties":{)j"
@@ -16614,7 +16614,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         // size of the retained pending backlog, so a retry fails identically.
                         // The failure audit above was written exactly as for any degrade; a
                         // dropped row is signalled with audit_persisted:false.
-                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, audit_ok), "application/json"); // retry-hint-exempt: deterministic statement timeout (SQLSTATE 57014), a retry fails identically until the retained pending backlog shrinks
+                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, audit_ok), "application/json"); // retry-hint-exempt: statement timeout (SQLSTATE 57014), most likely a large retained pending backlog, so a retry usually fails identically until the cause clears
                         return;
                     }
                     res.set_content(
@@ -17792,13 +17792,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (store_degraded) {
                     // Scoped re-review fix: a degrade in the baseline lookup itself is
                     // genuinely pre-PII (no audit owed, same posture as before), but a
-                    // degrade in any of the other three reads happens only after this
+                    // degrade in any of the other four reads happens only after this
                     // agent's per-baseline PII has already been touched - that MUST
                     // still be audited as "failure", never silently dropped (a
                     // completed PII read leaving zero audit trail is worse than the
                     // mislabeled-"success" bug this whole extraction fixed).
                     // MCP is set-and-proceed: the error is returned either way, and a dropped
-                    // failure-audit row is signalled with audit_persisted:false (UP-9).
+                    // failure-audit row is signalled with audit_persisted:false.
                     bool degrade_audit_ok = true;
                     if (pii_access_began) {
                         degrade_audit_ok = yuzu::server::detail::try_persist_audit(
@@ -17810,7 +17810,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         // Not transient (#7217): the pending-evidence read timed out because of
                         // the size of the retained pending backlog, so a retry fails
                         // identically.
-                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, degrade_audit_ok), "application/json"); // retry-hint-exempt: deterministic statement timeout (SQLSTATE 57014), a retry fails identically until the retained pending backlog shrinks
+                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, degrade_audit_ok), "application/json"); // retry-hint-exempt: statement timeout (SQLSTATE 57014), most likely a large retained pending backlog, so a retry usually fails identically until the cause clears
                         return;
                     }
                     res.set_content(

@@ -22,6 +22,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_events_table_lock.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -142,27 +143,6 @@ void make_deployed_baseline(BaselineStore& baseline_store, const std::string& na
     deployed.lifecycle = yuzu::server::kBaselineDeployed;
     REQUIRE(baseline_store.update_baseline(deployed).has_value());
 }
-
-// Holds ACCESS EXCLUSIVE on the events table from a separate connection until destroyed (closing
-// the connection rolls the transaction back), so a read of that table blocks until its statement
-// timeout fires (SQLSTATE 57014).
-class EventsTableLock {
-public:
-    explicit EventsTableLock(const std::string& dsn)
-        : conn_{PQconnectdb(dsn.c_str())} {
-        REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
-        run("BEGIN");
-        run(std::format("LOCK TABLE {}.guaranteed_state_events IN ACCESS EXCLUSIVE MODE", kGsSchema));
-    }
-
-private:
-    void run(const std::string& sql) {
-        yuzu::server::pg::PgResult r{PQexec(conn_.get(), sql.c_str())};
-        INFO(PQresultErrorMessage(r.get()));
-        REQUIRE(r.ok());
-    }
-    yuzu::server::pg::PgConn conn_;
-};
 
 } // namespace
 
@@ -415,7 +395,7 @@ TEST_CASE("GuardianApi: a null guaranteed_state_store with a LIVE baseline_store
 
 // ── #7217: read order and degrade kinds ──────────────────────────────────────
 
-// The unrepresented read is issued BEFORE the census read (SG-F3 / UP-4). The fault seam fires at
+// The unrepresented read is issued BEFORE the census read (#7217). The fault seam fires at
 // the start of the unrepresented read, so a side effect there that writes the pair's census row
 // lands between "before the unrepresented read" and "before the census read" only if the census
 // read comes AFTER it: census-first would read no row, then the repair would make the pair
@@ -531,7 +511,7 @@ TEST_CASE("GuardianApi: a statement timeout of the unrepresented read is kStatem
     auto api = make_local_guardian_api(&store, &baseline_store);
 
     {
-        EventsTableLock lock{gs_db.dsn()};
+        yuzu::test::EventsTableLock lock{gs_db.dsn()};
 
         GuardianReadFault fault = GuardianReadFault::kNone;
         CHECK_FALSE(api->device_guards("agent-1", &fault).has_value());
@@ -548,6 +528,8 @@ TEST_CASE("GuardianApi: a statement timeout of the unrepresented read is kStatem
         CHECK(fault == GuardianReadFault::kStatementTimeout);
     } // lock released
 
+    // Restore the production budget before the follow-up read.
+    store.set_unrepresented_pending_timeout_ms_for_test(5000);
     GuardianReadFault fault = GuardianReadFault::kTransient;
     auto report = api->device_guards("agent-1", &fault);
     REQUIRE(report.has_value());

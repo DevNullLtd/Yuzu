@@ -128,7 +128,7 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
 ///
 /// Three reads, issued in this order: `unrepresented_pending_for_agent`, then
 /// `agent_rule_statuses_for_agent`, then `rule_names_for`. The unrepresented read goes FIRST
-/// (#7217 SG-F3 / UP-4): a pair repaired between the two reads can then only appear in BOTH
+/// (#7217), so that a pair repaired between the two reads can then only appear in BOTH
 /// categories (a harmless over-report), never in neither. The reads are NOT one atomic snapshot:
 /// a pair may appear both in `guards` and in the unrepresented list for one request after a
 /// concurrent repair, and the counts are exact per read, not a joint snapshot.
@@ -158,7 +158,7 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
 ///
 /// Read order: baseline lookup, `deployed_member_rule_ids`, `unrepresented_pending_for_agent`,
 /// `rule_names_for`, then `agent_rule_statuses_for_agent` LAST. The unrepresented read precedes
-/// the census read on purpose (#7217 SG-F3 / UP-4): a pair repaired between the two can then only
+/// the census read on purpose (#7217), so that a pair repaired between the two can then only
 /// appear in BOTH categories (a harmless over-report), never in neither. The reads are not one
 /// atomic snapshot: a pair may appear both in `guards` and in the unrepresented list for one
 /// request after a concurrent repair; counts are exact per read, not a joint snapshot.

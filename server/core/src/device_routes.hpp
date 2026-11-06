@@ -187,8 +187,11 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
 /// ids are agent-reported identifiers). When the count is above zero the lens renders a notice and
 /// NEVER the clean tile state: the tile uses the same warn tone and "ordering uncertain" wording as
 /// an order-uncertain guard, and an empty `guards` list is not rendered as "No guards evaluated"
-/// (the device has evidence the census does not show). Defaults of 0 / empty leave every earlier
-/// caller's output byte-identical.
+/// (the device has evidence the census does not show). Defaults of 0 / empty are not a no-op for the
+/// tile label: a lens with every guard compliant (100%) and either `uncertain>0` (a guard whose
+/// ordering is uncertain or whose retained event is unreflected) or a nonzero `unrepresented_pending`
+/// now labels the tile "Compliant, ordering uncertain" in the warn tone, where it used to read
+/// "Compliant"; every other input renders as before.
 std::string render_device_guardian_lens(const std::string& agent_id,
                                         const std::vector<DeviceGuardRow>& guards, bool tabs = true,
                                         std::int64_t unrepresented_pending = 0,

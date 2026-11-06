@@ -92,14 +92,24 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
         // list (which would misreport a device as having no guards, or drop live drift verdicts,
         // for the operator viewing this lens). A failed unrepresented-pending read degrades the
         // whole read (the seam returns nullopt), so it lands here too; a STATEMENT TIMEOUT of that
-        // read gets its own text, because the cause is a retained pending backlog and re-opening the
-        // tab will not help until it shrinks.
+        // read gets its own text, because the cause is most likely a large retained pending backlog
+        // and re-opening the tab usually will not help until it shrinks.
         GuardianReadFault fault = GuardianReadFault::kNone;
-        auto guards_result = guardian_api_->device_guards(id, &fault);
+        std::optional<GuardianDeviceGuardsReport> guards_result;
+        try {
+            guards_result = guardian_api_->device_guards(id, &fault);
+        } catch (...) {
+            // A read that throws still began a per-device PII read, so it is audited as a failure
+            // here (set-and-proceed) and the exception then propagates to the caller unchanged:
+            // exactly one guardian.device.view row per request on every path.
+            (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "failure",
+                                                "Agent", id, "device Guardian lens (per-guard compliance)");
+            throw;
+        }
         // Behavioural-PII access audit — set-and-proceed (HTML fragment), parity with the DEX lens
         // above and the shared #1647 helper. Written AFTER the read so its result is true (a
-        // degraded read audits "failure", as REST and MCP do); the per-device PII read has begun
-        // either way, so it is audited either way.
+        // degraded read audits "failure", as REST and MCP do); a read that throws is audited
+        // "failure" by the catch above, so every path writes exactly one row.
         (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view",
                                             guards_result ? "success" : "failure", "Agent", id,
                                             "device Guardian lens (per-guard compliance)");
@@ -108,9 +118,9 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
                 render_device_lens_placeholder(
                     "guardian", id,
                     fault == GuardianReadFault::kStatementTimeout
-                        ? "Guardian pending-evidence read timed out. A large retained pending "
-                          "backlog exceeds the read's time budget; reloading will not help until "
-                          "the backlog shrinks."
+                        ? "Guardian pending-evidence read timed out. Most likely a large retained "
+                          "pending backlog exceeds the read's time budget; reloading usually will "
+                          "not help until it clears."
                         : "Guardian store degraded.",
                     tabs),
                 "text/html; charset=utf-8");

@@ -3646,8 +3646,9 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
         return unavailable(std::string("BEGIN failed: ") + PQerrorMessage(conn));
     }
     pg::PgTxn txn(conn);
+    const int timeout_ms = unrepresented_pending_timeout_ms_.load(std::memory_order_relaxed);
     pg::PgResult timeout = pg::exec_params(
-        conn, std::format("SET LOCAL statement_timeout = '{}ms'", unrepresented_pending_timeout_ms_).c_str(),
+        conn, std::format("SET LOCAL statement_timeout = '{}ms'", timeout_ms).c_str(),
         std::vector<std::string>{});
     if (timeout.status() != PGRES_COMMAND_OK) {
         degrade(kReasonQueryError, "statement_timeout failed", PQresultErrorMessage(timeout.get()));
@@ -3660,10 +3661,12 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
     // NO index is built for this read, deliberately (owner ruling 2026-11-06). Nothing indexes agent_id
     // WITHIN the pending partition: idx_gse_pending is (rule_id, agent_id) WHERE projection_pending,
     // so agent_id is its second column, and idx_gse_agent_time reaches a device's rows but visits
-    // every event of it, pending or not. Measured on PG16/17/18 with ~125k pending of 530k events
-    // and with 1.2M pending, every plan took under 100 ms. RE-OPEN when the pending backlog grows
-    // past that measured size, which shows up as a 'statement timeout' log line from this function
-    // or a rising yuzu_server_guardian_read_degrade_total{source="guardian_census_device",
+    // every event of it, pending or not. Measured envelope: on PG16/17/18 with ~125k pending of 530k
+    // events and with 1.2M pending, every plan took under 100 ms and read fewer than 2000 buffers;
+    // a PG18 scratch replica with 7M events and 2M pending read in ~190 ms unfiltered, per agent.
+    // RE-OPEN when the pending backlog grows past that envelope, which shows up as a 'statement
+    // timeout' log line from this function or a rising
+    // yuzu_server_guardian_read_degrade_total{source="guardian_census_device",
     // reason="statement_timeout"}. The fix is a partial (agent_id, rule_id) WHERE projection_pending
     // index, carried into the UP-14 server PR's v5 migration or #7147; the boot index-shape check
     // in the schema DO block (idx_gse_pending) must learn it in the same change.
@@ -3687,15 +3690,19 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
     if (res.status() != PGRES_TUPLES_OK) {
         const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
         const std::string msg = PQresultErrorMessage(res.get());
+        // SQLSTATE 57014 (query_canceled) is also reported for an administrator cancel
+        // (pg_cancel_backend) and for a lock wait, not only for the statement_timeout set above,
+        // so the text says "most likely" a retained pending backlog, never "because of" one.
         if (state && std::string_view(state) == "57014") {
             // Count first, then log: the counter is the signal that must never be skipped.
             if (const auto d =
                     note_read_degrade(metrics_, kReasonStatementTimeout, kDegradeSourceCensusDevice, sampler);
                 d.should_log)
                 spdlog::warn("GuaranteedStateStore::unrepresented_pending_for_agent: statement timeout "
-                             "after {} ms: the retained pending backlog is too large for this per-device "
-                             "read, so retrying fails identically until the backlog shrinks: {}",
-                             unrepresented_pending_timeout_ms_, ::yuzu::log_key_token(msg));
+                             "after {} ms: most likely the retained pending backlog is too large for this "
+                             "per-device read, so retrying usually fails identically until the cause "
+                             "clears: {}",
+                             timeout_ms, ::yuzu::log_key_token(msg));
             return std::unexpected(UnrepresentedPendingError{
                 UnrepresentedPendingFault::kStatementTimeout, "statement timeout: " + msg});
         }

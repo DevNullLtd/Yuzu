@@ -263,7 +263,7 @@ Every per-device route is scoped to the device's management group (a global gran
 
 A device with zero reported guards and no pending evidence renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
 
-A device with no census rows but with pending evidence renders the notice and "No guards in the compliance census" instead. If the pending-evidence read itself times out (a large retained pending backlog), the tab shows "Guardian pending-evidence read timed out" and says reloading will not help until the backlog shrinks; any other store failure shows "Guardian store degraded.". Either way the open is audited as `guardian.device.view` with result `failure`.
+A device with no census rows but with pending evidence renders the notice and "No guards in the compliance census" instead. If the pending-evidence read itself times out (most likely a large retained pending backlog; a lock wait, a loaded database or an administrator cancel can also cause it), the tab shows "Guardian pending-evidence read timed out" and says reloading usually will not help until the cause clears; any other store failure shows "Guardian store degraded.". Either way the open is audited as `guardian.device.view` with result `failure`.
 
 #### Get live info
 

@@ -4257,8 +4257,8 @@ public:
         // "guardian_census_device" (#7217) is the per-device unrepresented-pending
         // reads behind the device-compliance and all-guards routes (fail-hard: REST
         // 503 / MCP error), and is the only source with the extra reason
-        // "statement_timeout" (SQLSTATE 57014, a retained-backlog symptom whose retry
-        // fails identically). Pre-seeded below (same closed
+        // "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog symptom whose
+        // retry usually fails identically). Pre-seeded below (same closed
         // {reason x source} cross-product pre-seed pattern as
         // yuzu_server_kek_operations_total above) so absent()/rate() alerting
         // is meaningful before the first degrade ever fires.
@@ -4275,7 +4275,8 @@ public:
                           "the census pending-evidence count read, whose gauge keeps its last "
                           "value; guardian_census_device = the per-device unrepresented-pending "
                           "reads, fail-hard, the device request is refused and a statement_timeout "
-                          "means a large retained pending backlog that a retry will not clear). "
+                          "most likely means a large retained pending backlog, which a retry usually "
+                          "does not clear). "
                           "A sampled warn accompanies each new degrade episode.",
                           "counter");
         for (const auto source : {"guardian_state", "guardian_rules", "guardian_census",

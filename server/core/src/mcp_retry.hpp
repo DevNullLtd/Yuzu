@@ -45,18 +45,21 @@ inline constexpr std::string_view kCryptoPoolTooSmallRemedy =
 
 /// The remediation of a per-device Guardian read (device-compliance, all-guards; REST and MCP) whose
 /// pending-evidence read hit its statement timeout (SQLSTATE 57014, #7217): no retry hint, a retry
-/// fails identically because the cause is the size of the retained pending backlog. Shared by
-/// mcp_server.cpp and rest_api_v1.cpp so the two transports cannot drift on the wording.
+/// usually fails identically until the cause clears. Shared by mcp_server.cpp and rest_api_v1.cpp
+/// so the two transports cannot drift on the wording.
 inline constexpr std::string_view kGuardianCensusDeviceTimeoutRemedy =
-    "do not retry in a loop: a retry fails identically until the retained pending backlog shrinks; "
+    "do not retry in a loop: a retry usually fails identically until the cause clears; "
     "ask an administrator to inspect max(yuzu_server_guardian_census_pending_events) and "
     "yuzu_server_guardian_read_degrade_total{source=\"guardian_census_device\","
     "reason=\"statement_timeout\"}";
 
-/// The message paired with `kGuardianCensusDeviceTimeoutRemedy` on both transports.
+/// The message paired with `kGuardianCensusDeviceTimeoutRemedy` on both transports. SQLSTATE 57014
+/// is also reported for a lock wait, a loaded database and an administrator cancel, so the cause
+/// is stated as the most likely one, not as the only one.
 inline constexpr std::string_view kGuardianCensusDeviceTimeoutMessage =
-    "the pending-evidence read for this device exceeded its time budget because of a large "
-    "retained pending backlog; retrying the same request will not help until the backlog shrinks";
+    "the pending-evidence read for this device exceeded its time budget, most likely because of a "
+    "large retained pending backlog (a lock wait or a loaded database can also cause it, and an "
+    "administrator cancel is reported the same way)";
 
 /// `retry_after_ms` for the plugin-config / API-token rotation family (the
 /// ~20-site bare-`2000` family). Anchor: `rotate_api_token`'s existing

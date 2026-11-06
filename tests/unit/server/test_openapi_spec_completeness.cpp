@@ -2265,7 +2265,7 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
         check_flags(gdata["properties"].at("guards").at("items"));
         CHECK(gget.value("description", "").find("unrepresented_pending_guards") !=
               std::string::npos);
-        // N3: the 200 description names the new keys, not only the old three.
+        // The 200 description names the new keys, not only the old three.
         const std::string g200 = gget.at("responses").at("200").value("description", "");
         CHECK(g200.find("unrepresented_pending_guards") != std::string::npos);
         CHECK(g200.find("unrepresented_pending_rule_ids") != std::string::npos);

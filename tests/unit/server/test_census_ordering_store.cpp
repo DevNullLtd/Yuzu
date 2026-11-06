@@ -12,6 +12,7 @@
 #include "pg/pg_raii.hpp"
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
+#include "test_events_table_lock.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -2146,7 +2147,7 @@ double degrade_total(yuzu::MetricsRegistry& metrics, const char* source) {
     return total;
 }
 
-// CH-1: after any fault arm the pool holds no lease and the store still serves a read AND a write.
+// After any fault arm the pool holds no lease and the store still serves a read AND a write.
 // `tag` keeps the rule id of the write distinct per call.
 void expect_pool_and_store_intact(PgPool& pool, GuaranteedStateStore& store, const std::string& dsn,
                                   const std::string& tag) {
@@ -2159,37 +2160,6 @@ void expect_pool_and_store_intact(PgPool& pool, GuaranteedStateStore& store, con
     CHECK(store.create_rule(make_rule("w-" + tag, "intact-write-" + tag)).has_value());
     CHECK(pool.in_use() == 0);
 }
-
-// A second connection that holds ACCESS EXCLUSIVE on the events table, so any read of that table
-// waits until the lock is released. Released (rolled back) on destruction.
-class EventsTableLock {
-public:
-    explicit EventsTableLock(const std::string& dsn) : conn_{PQconnectdb(dsn.c_str())} {
-        REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
-        run("BEGIN");
-        run(std::string("LOCK TABLE ") + kSchema + ".guaranteed_state_events IN ACCESS EXCLUSIVE MODE");
-        held_ = true;
-    }
-    ~EventsTableLock() { release(); }
-    EventsTableLock(const EventsTableLock&) = delete;
-    EventsTableLock& operator=(const EventsTableLock&) = delete;
-
-    void release() noexcept {
-        if (!held_)
-            return;
-        held_ = false;
-        pg::PgResult r{PQexec(conn_.get(), "ROLLBACK")};
-    }
-
-private:
-    void run(const std::string& sql) {
-        pg::PgResult r{PQexec(conn_.get(), sql.c_str())};
-        INFO(PQresultErrorMessage(r.get()));
-        REQUIRE(r.ok());
-    }
-    pg::PgConn conn_;
-    bool held_{false};
-};
 
 // Pending event whose agent and rule travel as bind parameters, so a hostile id is stored as is.
 void raw_pending_param(const std::string& dsn, const std::string& agent, const std::string& rule) {
@@ -2318,7 +2288,7 @@ TEST_CASE("census ordering: unrepresented pending reports a statement timeout as
     const double before = degrade_count(metrics, kSourceDevice, "statement_timeout");
     {
         // The read blocks behind the lock until its 50 ms statement timeout cancels it (57014).
-        EventsTableLock lock(db.dsn());
+        yuzu::test::EventsTableLock lock(db.dsn());
         const auto r = store.unrepresented_pending_for_agent("A", scope);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().kind == UnrepresentedPendingFault::kStatementTimeout);
@@ -2330,7 +2300,9 @@ TEST_CASE("census ordering: unrepresented pending reports a statement timeout as
         // The failed transaction was rolled back and its connection returned.
         CHECK(pool.in_use() == 0);
     }
-    // Lock released: the same store answers the same read, then a follow-up read and write succeed.
+    // Lock released: restore the production budget, then the same store answers the same read and
+    // a follow-up read and write succeed.
+    store.set_unrepresented_pending_timeout_ms_for_test(5000);
     const auto ok = store.unrepresented_pending_for_agent("A", scope);
     REQUIRE(ok.has_value());
     CHECK(ok->count == 1);

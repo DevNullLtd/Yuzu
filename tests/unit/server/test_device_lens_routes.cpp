@@ -634,7 +634,7 @@ TEST_CASE(
                        "not move'.") != std::string::npos); // and points at the runbook
 }
 
-// ── #7217 (Gate 7 ruling 1): the lens shows the unrepresented-pending summary ─────────────────────
+// ── #7217: the lens shows the unrepresented-pending summary ──────────────────────────────────────
 
 namespace {
 
@@ -792,6 +792,70 @@ TEST_CASE("Guardian lens renderer: unrepresented ids are HTML-escaped, bounded a
         CHECK(h.find("<code>" + std::string(63, 'z') + "...</code>") != std::string::npos);
         CHECK(h.find('\xC3') == std::string::npos); // no lead byte left dangling
     }
+    // The cases below read the rendered <code> text back and require it to be a whole-sequence
+    // UTF-8 prefix of the id plus the "..." marker, so a split sequence cannot hide behind a
+    // substring check.
+    const auto lens_code_text = [](const std::string& id) {
+        const auto h = render_device_guardian_lens("a-1", {lens_clean_row()}, true, 1, {id});
+        const auto b = h.find("<code>");
+        REQUIRE(b != std::string::npos);
+        const auto e = h.find("</code>", b);
+        REQUIRE(e != std::string::npos);
+        return h.substr(b + 6, e - (b + 6));
+    };
+    const auto valid_utf8 = [](const std::string& t) {
+        std::size_t i = 0;
+        while (i < t.size()) {
+            const auto c = static_cast<unsigned char>(t[i]);
+            std::size_t n = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3
+                                       : (c & 0xF8) == 0xF0 ? 4 : 0;
+            if (n == 0 || i + n > t.size())
+                return false;
+            for (std::size_t k = 1; k < n; ++k)
+                if ((static_cast<unsigned char>(t[i + k]) & 0xC0) != 0x80)
+                    return false;
+            i += n;
+        }
+        return true;
+    };
+    SECTION("a three-byte sequence straddling byte 64 is dropped whole") {
+        // The euro sign (E2 82 AC) starts at index 62: bytes 62 and 63 fall inside the first 64.
+        const std::string id = std::string(62, 'a') + "\xE2\x82\xAC" + std::string(10, 'b');
+        const auto t = lens_code_text(id);
+        CHECK(t == std::string(62, 'a') + "...");
+        CHECK(valid_utf8(t));
+    }
+    SECTION("a four-byte sequence straddling byte 64 is dropped whole") {
+        // U+1F600 (F0 9F 98 80) starts at index 61: bytes 61..63 fall inside the first 64.
+        const std::string id = std::string(61, 'a') + "\xF0\x9F\x98\x80" + std::string(10, 'b');
+        const auto t = lens_code_text(id);
+        CHECK(t == std::string(61, 'a') + "...");
+        CHECK(valid_utf8(t));
+    }
+    SECTION("a four-byte sequence whose lead byte is the last one kept is dropped whole") {
+        const std::string id = std::string(63, 'a') + "\xF0\x9F\x98\x80" + std::string(10, 'b');
+        const auto t = lens_code_text(id);
+        CHECK(t == std::string(63, 'a') + "...");
+        CHECK(valid_utf8(t));
+    }
+    SECTION("an id of exactly 64 bytes ending in a whole multibyte character is not cut") {
+        const std::string id = std::string(62, 'a') + "\xC3\xA9";
+        REQUIRE(id.size() == 64);
+        const auto t = lens_code_text(id);
+        CHECK(t == id);
+        CHECK(valid_utf8(t));
+    }
+    SECTION("an id of 65 bytes is cut and marked") {
+        const std::string id(65, 'x');
+        const auto t = lens_code_text(id);
+        CHECK(t == std::string(64, 'x') + "...");
+    }
+    SECTION("an id made only of continuation bytes renders just the marker") {
+        const std::string id(100, '\x80');
+        const auto t = lens_code_text(id);
+        CHECK(t == "...");
+        CHECK(valid_utf8(t));
+    }
 }
 
 TEST_CASE("device lenses: Guardian lens routes the unrepresented summary into the page (#7217)",
@@ -833,10 +897,40 @@ TEST_CASE("device lenses: Guardian lens routes the unrepresented summary into th
     }
 }
 
+TEST_CASE("device lenses: a Guardian read that throws is audited once as a failure and the "
+          "exception propagates (#7217)",
+          "[device][routes][ordering][unrepresented]") {
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    std::vector<std::string> actions;
+    std::vector<std::string> results;
+    auto audit = [&](const httplib::Request&, const std::string& action, const std::string& result,
+                     const std::string&, const std::string&, const std::string&) {
+        actions.push_back(action);
+        results.push_back(result);
+        return true;
+    };
+    auto api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        /*list_rules_fn=*/nullptr, /*get_rule_fn=*/nullptr, /*status_fn=*/nullptr,
+        /*agent_status_fn=*/nullptr, /*rule_status_fn=*/nullptr,
+        [](const std::string&, GuardianReadFault*) -> std::optional<GuardianDeviceGuardsReport> {
+            throw std::runtime_error("device_guards blew up");
+        });
+    yuzu::server::test::TestRouteSink sink;
+    DeviceLensRoutes routes;
+    routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, api, audit);
+
+    // TestRouteSink runs the handler without a catch, so the rethrown exception reaches the test.
+    CHECK_THROWS_AS(sink.Get("/fragments/device/guardian?id=a-1&bare=1"), std::runtime_error);
+    REQUIRE(actions.size() == 1);
+    CHECK(actions[0] == "guardian.device.view");
+    CHECK(results[0] == "failure");
+}
+
 TEST_CASE("device lenses: Guardian lens distinguishes a pending-evidence timeout from a transient "
           "degrade and audits both as failures (#7217)",
           "[device][routes][ordering][unrepresented]") {
-    SECTION("a statement timeout names the cause and says reloading does not help") {
+    SECTION("a statement timeout names the likely cause and says reloading usually does not help") {
         std::vector<std::string> results;
         const auto body = fetch_guardian_lens(
             [](const std::string&, GuardianReadFault* fault) -> std::optional<GuardianDeviceGuardsReport> {
@@ -845,7 +939,8 @@ TEST_CASE("device lenses: Guardian lens distinguishes a pending-evidence timeout
             },
             &results);
         CHECK(body.find("Guardian pending-evidence read timed out.") != std::string::npos);
-        CHECK(body.find("reloading will not help until the backlog shrinks") != std::string::npos);
+        CHECK(body.find("Most likely a large retained pending backlog") != std::string::npos);
+        CHECK(body.find("reloading usually will not help until it clears") != std::string::npos);
         CHECK(body.find("Guardian store degraded.") == std::string::npos);
         REQUIRE(results.size() == 1);
         CHECK(results[0] == "failure");

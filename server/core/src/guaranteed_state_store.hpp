@@ -226,8 +226,8 @@ struct UnrepresentedPendingSummary {
 };
 
 /// Why `unrepresented_pending_for_agent` failed (#7217). `kStatementTimeout` is SQLSTATE 57014: the
-/// read ran past its time budget because of the size of the retained pending backlog, so a retry
-/// fails identically until the backlog shrinks. Everything else (store not open, pool timeout,
+/// read ran past its time budget, most likely because of the size of the retained pending backlog,
+/// so a retry usually fails identically until the cause clears. Everything else (store not open, pool timeout,
 /// BEGIN / SET LOCAL / query failure) is `kUnavailable` and is worth retrying.
 enum class UnrepresentedPendingFault { kUnavailable, kStatementTimeout };
 
@@ -298,9 +298,10 @@ public:
 
     /// Test seam: the statement timeout `unrepresented_pending_for_agent` applies, in milliseconds
     /// (default 5000). A test lowers it to reach SQLSTATE 57014 in well under a second instead of
-    /// waiting out the production budget. Set it while no read is in flight. Production never sets it.
+    /// waiting out the production budget. Production never sets it. The value is atomic, like
+    /// its sibling `apps_read_budget_`, so a read on another thread never races the setter.
     void set_unrepresented_pending_timeout_ms_for_test(int ms) noexcept {
-        unrepresented_pending_timeout_ms_ = ms;
+        unrepresented_pending_timeout_ms_.store(ms, std::memory_order_relaxed);
     }
 
     /// Test seam for the pre-commit health check: `fn` runs with the transaction's `PGconn*` (as
@@ -634,7 +635,7 @@ private:
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
-    int unrepresented_pending_timeout_ms_{5000};         // test seam, 5000 in production
+    std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production
     std::function<void(void*)> pre_commit_hook_;    // test seam, empty in production
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
