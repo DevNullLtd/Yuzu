@@ -30,7 +30,7 @@ env:
   # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
   # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
-  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
   VCPKG_BINARY_SOURCES: "default"
   # ccache sizing — mirror ci.yml. Without this the self-hosted build-linux
   # leg inherits the host default (5 GiB on Big Tam), far too small for ~700
