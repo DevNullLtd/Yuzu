@@ -91,7 +91,7 @@ jobs:
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '4b77da7fed37817f124936239197833469f1b9a8'
+          vcpkgGitCommitId: '9eec002df1cd109f8f104cd966a763daf9751489'
 
       - name: Configure without shared caches
         env:

@@ -1481,6 +1481,7 @@ if build_server
       'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
       'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired as the post-read stage (registry + HttplibRouteSink wrapper), over a real httplib::Server (no PG)
       'unit/server/test_post_read_stage.cpp', # PostReadStageRegistry + HttplibRouteSink handler wrapper: order, short-circuit, install guards, unwrapped servers (no PG)
+      'unit/server/test_model_param_to_params.cpp', # model_detail::to_params: key-sorted copy of httplib params for the pure parsers (no PG)
       'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
       'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
       'unit/server/test_mfa_qr.cpp',

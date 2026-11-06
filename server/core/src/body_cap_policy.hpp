@@ -14,7 +14,7 @@
 /// (#2407).
 ///
 /// THE DEFECT: an unauthenticated caller can make the server buffer up to
-/// httplib's 100 MiB default (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`, httplib.h:130)
+/// httplib's 100 MiB default (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`, httplib.h v0.59.0:130)
 /// on every route except `/mcp/`, which `server.cpp`'s pre-routing handler
 /// already caps at 4 MiB (#2437, `mcp_body_exceeds_cap`/`mcp_body_unmeasurable`
 /// in `web_utils.hpp`). This header generalizes that per-path cap into one
@@ -79,10 +79,11 @@
 ///
 /// KNOWN LIMITATION, recorded deliberately, not implied away: because of the
 /// default above, a chunked or Content-Length-less body is NOT refused BEFORE
-/// BEING READ on any class but `/mcp/` — this table's pre-routing chokepoint
+/// BEING READ on any class that keeps `requires_measurable` off (all but the
+/// five listed above); this table's pre-routing chokepoint
 /// admits it, up to httplib's own 100 MiB backstop, without checking this
 /// table's cap at all. A comment or doc that says chunked bodies are
-/// "refused" without naming `/mcp/` as the sole PRE-READ exception is wrong.
+/// "refused" without naming all five classes that require a measurable body is wrong.
 /// This is a recorded adjudication, not an oversight — see the paragraph
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
@@ -232,7 +233,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // POST /api/settings/updates/upload — OTA agent binary upload
     // (settings_routes.cpp:5146 handler start, :5206 the unbounded file
     // read). No route-local limit exists today; keep httplib's own 100 MiB
-    // default (httplib.h:130, CPPHTTPLIB_PAYLOAD_MAX_LENGTH) as the outer
+    // default (httplib.h v0.59.0:130, CPPHTTPLIB_PAYLOAD_MAX_LENGTH) as the outer
     // backstop rather than squeeze a legitimate multi-ten-MB installer
     // binary. This entry exists so the class is an explicit, reviewed
     // decision rather than an accidental fallthrough to the catch-all.
@@ -744,11 +745,26 @@ struct BodyCapDecision {
 /// PRODUCTION combination (an inverted condition, a swapped status, a
 /// dropped branch) had no test that could see it: the fixture's own,
 /// separately-written combination still matched its own separately-written
-/// expectations. Routing both call sites through this one function makes
-/// that divergence structurally impossible instead of something to keep
-/// re-verifying by hand — see `docs/postgres-store-playbook.md`-style
-/// reasoning applied to a chokepoint rather than a store: EXTEND this
-/// function, never fork it.
+/// expectations. Routing both call sites through this one function shares
+/// the combination of predicates, so it need not be re-verified by hand
+/// (the same reasoning as `docs/postgres-store-playbook.md`, applied to a
+/// chokepoint rather than a store): EXTEND this function, never fork it.
+///
+/// The caller supplies the arguments, and every header-derived one MUST agree
+/// with what httplib's own reader acts on, taken through a named accessor and
+/// never a raw `get_header_value` first-line read: `content_length_for_body_cap(req)`
+/// and `transfer_encoding_for_body_cap(req)` (web_utils.hpp; the latter is the
+/// first line, or a "present" marker when that line is empty but the header
+/// exists, because the gate only tests non-emptiness),
+/// `content_encoding_for_body_cap(req)` (body_cap_httplib.hpp, the combined
+/// value httplib decodes against) and `is_chunked_for_body_cap(req)`
+/// (body_cap_httplib.hpp, httplib's own chunked decision). An empty first
+/// `Transfer-Encoding` or `Content-Encoding` line hides a later one that httplib
+/// still honours. `has_content_length` comes from `has_content_length_for_body_cap(req)`
+/// (body_cap_httplib.hpp: the presence of any `Content-Length` line), whose body
+/// test_body_cap_policy.cpp pins. `server.cpp`'s one call is pinned in full (the whole
+/// argument list, in order) by test_step_up_wiring.cpp; the test fixture uses the same
+/// accessors.
 ///
 /// Composes `resolve_body_cap` (this header) with the framing/encoding
 /// predicates in `web_utils.hpp` (`has_non_identity_content_encoding`,
@@ -770,13 +786,13 @@ struct BodyCapDecision {
 ///
 /// NO `httplib::Request` IN THE SIGNATURE, deliberately, even though every
 /// production caller has one at hand: `is_chunked` MUST come from httplib's
-/// own `httplib::detail::is_chunked_transfer_encoding(req.headers)` (see
+/// own chunked decision, `is_chunked_for_body_cap(req)` (see
 /// `content_length_is_authoritative`'s doc comment for why re-deciding that
 /// bit from the raw header text was a live bypass, twice). Accepting
 /// `const httplib::Request&` here would tempt a future caller to re-derive
 /// `is_chunked` (or `content_length`, or `has_content_length`) INSIDE this
 /// function from the request instead of from the caller's own
-/// `content_length_for_body_cap`/`is_chunked_transfer_encoding` calls — at
+/// `content_length_for_body_cap`/`is_chunked_for_body_cap` calls, at
 /// which point the production call site and the test fixture below are back
 /// to two independent implementations of the same httplib quirk, which is
 /// precisely the class of defect #2407 R2 was. Taking the already-extracted
@@ -792,7 +808,7 @@ struct BodyCapDecision {
 /// The header-comment requirement in `server.cpp` to "CONTAIN THE WHOLE
 /// BLOCK" in a `try`/`catch(...)` still applies to the WIRING around this
 /// call — extracting the request's `Content-Length`/`Transfer-Encoding`/
-/// `Content-Encoding` header VALUES (`req.get_header_value*`) can throw, and
+/// `Content-Encoding` header VALUES (`req.get_header_value*`, the accessors above) can throw, and
 /// that extraction happens at the caller, before this function is invoked —
 /// this function itself is not the boundary that containment protects, the
 /// caller's header reads are.
