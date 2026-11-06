@@ -151,6 +151,19 @@ TEST_CASE("collection settings resolve: the root document is the default layer",
     CHECK(r->effective.interval_s == 7200);
 }
 
+TEST_CASE("collection settings resolve: a device in no group gets the root document",
+          "[collection_settings][resolve]") {
+    const std::vector<cs::GroupNode> tree{node(kRoot, "", 1), node("aa", "", 2)};
+    const std::vector<cs::StoredDocument> docs{doc(kRoot, make(7200)), doc("aa", make(10800))};
+    for (const std::vector<std::string>& membership :
+         {std::vector<std::string>{}, std::vector<std::string>{"ghost"}}) {
+        const auto r = cs::resolve(membership, tree, docs, kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == kRoot);
+        CHECK(r->effective.interval_s == 7200);
+    }
+}
+
 TEST_CASE("collection settings resolve: a top-level group beats an older root document",
           "[collection_settings][resolve]") {
     // Root is older and at depth 0 like a top-level group; it must never compete.

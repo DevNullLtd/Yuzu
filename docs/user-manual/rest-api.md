@@ -8170,7 +8170,7 @@ The settings that apply to one device, resolved across every management group it
 - The plugin kill switches always win: a killed collector is `false` in `effective.plugins` and listed in `kill_switched`. Registered apps collection (`installed_apps`) is on unless it is itself kill-switched. Only the all-OS kill-switch layer is read.
 - `version` is the SHA-256 of the effective fields only (interval, window, zone, sorted switches): no priority, source group or timestamps. It is a different hash from a stored document's `version`, which includes `priority`: a priority-only edit changes the document's `version` and leaves this one unchanged.
 - `source_group_id` is the winning group, the root group id (`000000000000`) when the root document applies, or empty for the built-in default. It is an opaque id and can name a group outside a scoped caller's branch when the device is also a member there.
-- A device in no group, or one the server has no record of, answers `200` with the fleet default and an empty `source_group_id`; no device lookup is made.
+- A device in no group, or one the server has no record of, answers `200` with the root document and `source_group_id` `000000000000` when a root document exists, else the built-in default with an empty `source_group_id`; no device lookup is made.
 - Requires `Inventory:Read` on the device. A membership, settings or kill-switch read that cannot be completed is a `503`, never a document with collectors off.
 
 ---

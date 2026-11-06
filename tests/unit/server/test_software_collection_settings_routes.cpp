@@ -848,6 +848,14 @@ TEST_CASE("collection settings host route: effective settings over the pure reso
               "e27b0298c4ad0aabc3963e6dfa2ca5a3d60b687fa15315557385a020816d1696");
         CHECK(b["data"]["kill_switched"].empty());
     }
+    SECTION("a root document present: a device in no group gets it, named by the root id") {
+        REQUIRE(rig.call("PUT", rig.doc_path(rig.root), boss, put_body(10800))->status == 200);
+        auto res = rig.call("GET", host_unknown, boss);
+        REQUIRE(res->status == 200);
+        const auto b = rig.parse(*res);
+        CHECK(b["data"]["source_group_id"] == rig.root);
+        CHECK(b["data"]["effective"]["interval_s"] == 10800);
+    }
     SECTION("the answer matches the pure resolver on the same inputs") {
         REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
         const auto b = rig.parse(*rig.call("GET", host1, boss));
