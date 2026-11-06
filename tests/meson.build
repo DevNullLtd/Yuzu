@@ -1631,6 +1631,8 @@ if build_server
       'unit/server/test_rbac_admin_hint.cpp', # #6034: rbac_admin_hint == the real POST assign / PUT enforcement answer, per persona
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
+      'unit/server/test_rbac_enforcement_read.cpp', # #6033: GET /api/v1/rbac/enforcement (REST twin of the enforcement fragment)
+      'unit/server/test_rbac_enforcement_read_mcp.cpp', # #6033: MCP get_rbac_enforcement
       'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
       'unit/server/test_list_read_confinement.cpp',
