@@ -91,19 +91,6 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch), except `publisher`, which is never empty: see below. Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
-  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
   | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java |
   |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
   | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` |
@@ -113,7 +100,7 @@ cadences.
   | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — |
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) | `Microsoft` | ✓ (the build's self-reported `IMPLEMENTOR`; empty if absent) |
+  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` |
   | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -233,7 +220,8 @@ cadences.
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
   or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
   none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
-  Windows) and `publisher` the file's `IMPLEMENTOR`. The publisher is self-reported by the
+  Windows) and `publisher` the file's `IMPLEMENTOR`, else `via:jvm` (no `IMPLEMENTOR`, no
+  `release` file, or a Windows home known only by its registry key). The publisher is self-reported by the
   build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
   the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
   JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu registry keys and then each home's `release` file; Linux

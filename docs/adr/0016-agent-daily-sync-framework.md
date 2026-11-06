@@ -1181,6 +1181,8 @@ holds after migrations 2 and 3: an older server that runs against the migrated d
 there, so the sections it writes are unverified until a v3 server next does a full replace for that
 device.
 
+> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
+
 ### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
 
 Every row of every `installed_software` source carries a non-empty `publisher`, so slot 3 of the
@@ -1214,6 +1216,8 @@ the fallback.
 | `runtimes.python`, Linux | none: the Linux producer always emits `-` in the vendor column | `via:python` |
 | `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
 | `middleware.ibm_mq` | `IBM`, from the product table | n/a |
+| `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
+| `runtimes.jvm` | the row's vendor column, the `release` file's self-reported `IMPLEMENTOR` | `via:jvm` when the column is `-` (no `IMPLEMENTOR`, no `release` file, or a Windows home known only by its registry tag) |
 
 The rpm `list_inventory` query format has ten columns, `%{VENDOR}` the last; the pinned argv
 literal in `docs/agent-spawn-sink-manifest.md` carries the same format, and `parse_rpm_inv_line`
@@ -1251,4 +1255,3 @@ if it is still unwanted.
 **Hash.** The publisher is part of each row's hash. The agent's collector characterisation
 digests over the real capture samples include it, and the agent and the server pin the same
 labelled row to the same digests.
-> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
