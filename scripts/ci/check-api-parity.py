@@ -505,7 +505,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get.api-agents and get.fragments-devices-list left their dated exception and are twinned to it.
 # The two 212-origin steps above ran on separate branches. Merged: 4 rows flipped by twin batch B and
 # 2 by #4041, the sets are disjoint, so 212 - 4 - 2 = 206.
-BASELINE_UNTWINNED = 206
+# 206 -> 210 (AP-3.12, DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
+# preview and reset POSTs) born `planned:#6087`, each with its merged REST v1 twin named and the MCP twin owed.
+BASELINE_UNTWINNED = 210
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific

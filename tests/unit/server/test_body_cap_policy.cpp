@@ -200,6 +200,12 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
     {"DELETE", "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
     {"PUT",    "/api/v1/dex/score-policyx",                            4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp dex_score_policy_form row: the DEX Scoring tab's three form POSTs
+    // (the whole policy as a urlencoded form). ANY method, measurable; segment boundary probed.
+    {"POST",   "/api/settings/dex-scoring/save",                       320u * 1024, true,  "dex_score_policy_form"},
+    {"POST",   "/api/settings/dex-scoring/preview",                    320u * 1024, true,  "dex_score_policy_form"},
+    {"POST",   "/api/settings/dex-scoring/reset",                      320u * 1024, true,  "dex_score_policy_form"},
+    {"POST",   "/api/settings/dex-scoringx/save",                      4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp crypto row - the /crypto REST v1 subtree; PUT dashboard/layout is the
     // only body-bearing route (crypto_widget_catalogue.hpp kLayoutBodyMaxBytes). ANY method.
     {"PUT",    "/api/v1/crypto/dashboard/layout",                      16u * 1024, false, "crypto"},
@@ -261,6 +267,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "guardian_policy_generation",
     "users",
     "dex_score_policy",
+    "dex_score_policy_form",
     "crypto",
     "config",
     "software_curation",
@@ -400,7 +407,7 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 39 = mcp(1) +
+    // check while still silently growing the table. 40 = mcp(1) +
     // commands(1: POST /api/v1/commands, the REST v1 twin of execute_instruction) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
@@ -420,11 +427,12 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // guardian_policy_generation(1: the Guardian policy-generation raise) +
     // users(1: the /api/v1/users subtree, #5342 password routes) +
     // dex_score_policy(1: the DEX score policy document) +
+    // dex_score_policy_form(1: the DEX Scoring tab's form POSTs) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 39);
+    CHECK(std::size(kBodyCapTable) == 40);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -435,7 +443,7 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
 // regression on the upload_session opt-in would have shipped with this
 // test green.
 TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session and "
-         "hardware and dex_score_policy and OFF for every other named class",
+         "hardware and dex_score_policy and dex_score_policy_form and OFF for every other named class",
          "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
@@ -446,6 +454,7 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_sess
     CHECK(resolve_body_cap("GET", "/api/v1/hardware").requires_measurable);
     CHECK(resolve_body_cap("PUT", "/api/v1/dex/score-policy").requires_measurable);
     CHECK(resolve_body_cap("GET", "/api/v1/dex/score-policy").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/settings/dex-scoring/save").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
     // product-pack/workflow authoring, OTA upload, and plugin-config all

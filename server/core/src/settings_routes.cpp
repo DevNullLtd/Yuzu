@@ -2246,6 +2246,16 @@ const char* const kDexAlertsCss = R"CSS(
 .dxa .chk code{color:var(--mut);font-size:12.5px}
 .dxa .pb p{margin:0 0 8px}
 .dxa .pb p:last-child{margin-bottom:0}
+.dxs{margin-top:16px}
+.dxs .grp{border:0;margin:0 0 14px;padding:0}
+.dxs legend{font-weight:500;color:var(--ink2);padding:0 0 4px}
+.dxs .fld input{max-width:14rem}
+.dxs .err{display:block;margin-top:4px;color:var(--bad);font-size:12.5px}
+.dxs input[aria-invalid=true],.dxs fieldset[data-invalid="1"]{border-color:var(--bad)}
+.dxs details.ovr{border-top:1px solid var(--line)}
+.dxs details.ovr summary{cursor:pointer;padding:8px 0;color:var(--ink2)}
+.dxs .chk{display:flex;gap:8px;align-items:baseline;padding:3px 0}
+.dxs .btns{padding:0}
 )CSS";
 
 std::string dex_alerts_style() {
@@ -2382,6 +2392,218 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     html += "<div class=\"btns\"><button type=\"submit\" class=\"btn btn-secondary\">"
             "Save routing</button></div></form></section>";
     return html;
+}
+
+namespace {
+
+// Policy in force from the writer's own reader (the one the REST GET reads); an exception from
+// the injected reader is an unreadable store.
+std::expected<DexPolicyInForce, std::string> dex_scoring_in_force(const DexScorePolicyWriteDeps& d) {
+    try {
+        const auto stored = d.read_stored();
+        if (!stored)
+            return std::unexpected(stored.error());
+        return dex_policy_in_force_from_stored(*stored);
+    } catch (const std::exception& e) {
+        return std::unexpected(std::string("read threw: ") + e.what());
+    }
+}
+
+constexpr const char* kDexScoringUnavailable =
+    "<div class=\"note warn\"><b>Config store unavailable.</b> The score policy cannot be read or "
+    "saved until the server's runtime-config store is open. Check server /healthz.</div>";
+
+const char* dex_scoring_refusal_token(DexScorePolicyWriteStatus s) {
+    switch (s) {
+    case DexScorePolicyWriteStatus::Ok: return "";
+    case DexScorePolicyWriteStatus::IfMatchMissing: return "if_match_missing";
+    case DexScorePolicyWriteStatus::IfMatchMalformed: return "if_match_malformed";
+    case DexScorePolicyWriteStatus::Stale: return "stale";
+    case DexScorePolicyWriteStatus::Invalid: return "invalid";
+    case DexScorePolicyWriteStatus::WriterBusy: return "writer_busy";
+    case DexScorePolicyWriteStatus::StoreUnavailable: return "store_unavailable";
+    case DexScorePolicyWriteStatus::OutcomeUnknown: return "outcome_unknown";
+    case DexScorePolicyWriteStatus::AuditUnavailable: return "audit_unavailable";
+    }
+    return "invalid";
+}
+
+// Fixed text only: the toast never carries the validator's message or any submitted value.
+const char* dex_scoring_refusal_toast(DexScorePolicyWriteStatus s) {
+    switch (s) {
+    case DexScorePolicyWriteStatus::Invalid: return "Score policy not saved: fix the marked field";
+    case DexScorePolicyWriteStatus::Stale: return "Score policy not saved: changed by someone else";
+    case DexScorePolicyWriteStatus::IfMatchMissing:
+    case DexScorePolicyWriteStatus::IfMatchMalformed:
+        return "Score policy not saved: reload and try again";
+    case DexScorePolicyWriteStatus::AuditUnavailable:
+        return "Score policy not saved: audit unavailable, try again shortly";
+    default: return "Score policy not saved: try again shortly";
+    }
+}
+
+std::string dex_scoring_toast(const char* message, const char* level) {
+    return nlohmann::json{{"showToast", {{"message", message}, {"level", level}}}}.dump();
+}
+
+} // namespace
+
+std::string SettingsRoutes::render_dex_scoring_section(
+    const DexPolicyInForce& in_force, bool admin, const std::string& if_match,
+    const DexFormValues* posted, std::optional<DexFormError> error,
+    std::optional<DexTierPreview> preview, const std::string& refused) {
+    DexScoringView v;
+    v.values = posted ? *posted : dex_form_values(in_force.policy);
+    v.revision = in_force.revision;
+    v.if_match = if_match;
+    v.source = in_force.source;
+    v.fault = in_force.fault;
+    v.admin = admin;
+    v.error = std::move(error);
+    v.preview = std::move(preview);
+    v.refused = refused;
+    if (dex_apps_fn_) {
+        const auto m = dex_apps_fn_(std::nullopt);
+        if (!m.degraded)
+            for (const auto& a : m.apps)
+                v.suggestions.push_back(a.subject);
+    }
+    return yuzu::server::render_dex_scoring_section(v);
+}
+
+// POST /api/settings/dex-scoring/{save,preview,reset}. Every outcome answers the section BODY
+// (swapped innerHTML), so no response nests a second #dex-scoring-section.
+//
+// DUAL ANSWER. The dashboard's htmx config swaps no 4xx/5xx body (static_js_bundle.cpp
+// responseHandling), so a per-field refusal could never reach the page. A request carrying
+// HX-Request therefore gets 200 with the body re-rendered, the error against its field and
+// `data-refused=<reason>`, plus an error toast; any other caller gets the real status and the A4
+// envelope, exactly as PUT/DELETE /api/v1/dex/score-policy answers it.
+void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Response& res,
+                                      DexScorePolicyWriteRequest::Op op, bool dry_run) {
+    const bool put = op == DexScorePolicyWriteRequest::Op::Put;
+    const char* leaf = dry_run ? "preview" : (put ? "save" : "reset");
+    if (!admin_fn_(req, res))
+        return;
+    const auto session = auth_fn_(req, res);
+    if (!session)
+        return;
+    if (refuse_cross_site(req, res, *session, std::string("POST /api/settings/dex-scoring/") + leaf))
+        return;
+    if (!dex_score_policy_writer_ || !dex_score_policy_writer_->read_stored) {
+        res.status = 503;
+        res.set_header("HX-Trigger", dex_scoring_toast("Config store unavailable", "error"));
+        res.set_content(detail::a4_error(res, "Config store unavailable"), "application/json");
+        return;
+    }
+    const bool htmx = req.has_header("HX-Request");
+    const auto pairs = dex_form_pairs(req.body);
+    std::optional<std::string> if_match;
+    for (const auto& [name, value] : pairs)
+        if (name == "if_match")
+            if_match = value;
+
+    // The policy in force right now, for the panel; best effort (a refusal path).
+    const auto current = dex_scoring_in_force(*dex_score_policy_writer_);
+    const DexPolicyInForce shown = current ? *current : DexPolicyInForce{};
+    const DexFormValues posted = dex_form_values(pairs);
+
+    // A refusal answers per the dual answer above.
+    const auto refuse = [&](const char* token, const char* toast, int status,
+                            const std::string& field, std::string message,
+                            std::optional<std::int64_t> retry_after_ms, std::string remediation) {
+        if (htmx) {
+            res.status = 200;
+            res.set_header("HX-Trigger", dex_scoring_toast(toast, "error"));
+            res.set_content(
+                render_dex_scoring_section(shown, true, if_match.value_or(shown.revision), &posted,
+                                           DexFormError{field, std::move(message)}, std::nullopt,
+                                           token),
+                "text/html; charset=utf-8");
+            return;
+        }
+        res.status = status;
+        res.set_content(detail::a4_error(res, message,
+                                         {.retry_after_ms = retry_after_ms,
+                                          .remediation = std::move(remediation)}),
+                        "application/json");
+    };
+
+    DexScorePolicyWriteRequest rq;
+    rq.op = op;
+    if (dry_run)
+        rq.dry_run = "true";
+    rq.if_match = if_match;
+    rq.actor = session->username;
+    std::vector<int> row_of_override;
+    if (put) {
+        auto doc = dex_form_to_document(pairs);
+        if (!doc) {
+            refuse("invalid", dex_scoring_refusal_toast(DexScorePolicyWriteStatus::Invalid), 400,
+                   doc.error().field, doc.error().message, std::nullopt, {});
+            return;
+        }
+        rq.body = std::move(doc->text);
+        row_of_override = std::move(doc->row_of_override);
+    }
+
+    DexScorePolicyWriteDeps deps = *dex_score_policy_writer_;
+    deps.audit = {};
+    if (audit_as_session_fn_) {
+        // Stamped from the session this handler resolved, never re-resolved from the request.
+        // The bool survives: a refused 'attempted' row is the writer's AuditUnavailable 503.
+        deps.audit = [this, &req, &session, role = auth::role_to_string(auth::effective_role(*session))](
+                         std::string_view verb, std::string_view result,
+                         const std::string& detail_json) {
+            return audit_as_session_fn_(req, *session, role, std::string(verb), std::string(result),
+                                        "RuntimeConfig", std::string(kDexScorePolicyKey),
+                                        detail_json);
+        };
+    }
+
+    const auto r = apply_dex_score_policy(rq, deps);
+    if (r.status != DexScorePolicyWriteStatus::Ok) {
+        std::string field = "document";
+        std::string message = r.message;
+        if (r.status == DexScorePolicyWriteStatus::Invalid && put) {
+            // The writer reports the field only in its audit detail; the validator is pure and
+            // deterministic over the same text, so asking it again yields the same field.
+            if (const auto v = dex_score_policy_validate_text(rq.body); !v) {
+                field = dex_form_remap_field(v.error().field, row_of_override);
+                if (field != v.error().field && !v.error().field.empty()) {
+                    // The message names the JSON path; name the submitted row instead.
+                    for (std::size_t at = 0;
+                         (at = message.find(v.error().field, at)) != std::string::npos;
+                         at += field.size())
+                        message.replace(at, v.error().field.size(), field);
+                }
+            }
+        }
+        refuse(dex_scoring_refusal_token(r.status), dex_scoring_refusal_toast(r.status),
+               dex_score_policy_http_status(r.status), field, std::move(message), r.retry_after_ms,
+               r.remediation);
+        return;
+    }
+
+    if (dry_run) {
+        // Nothing stored: keep the user's edits and the CURRENT revision (the REST ETag rule).
+        DexTierPreview preview;
+        preview.degraded = true;
+        if (dex_apps_fn_)
+            preview = dex_tier_preview(dex_apps_fn_(std::nullopt), dex_apps_fn_(r.in_force));
+        res.set_header("HX-Trigger", dex_scoring_toast("Preview only: nothing saved", "success"));
+        res.set_content(render_dex_scoring_section(shown, true, r.previous_revision, &posted,
+                                                   std::nullopt, std::move(preview), ""),
+                        "text/html; charset=utf-8");
+        return;
+    }
+    res.set_header("HX-Trigger",
+                   dex_scoring_toast(put ? "Scoring policy saved"
+                                         : "Scoring policy reset to the shipped defaults",
+                                     "success"));
+    res.set_content(render_dex_scoring_section(r.in_force, true, r.in_force.revision, nullptr,
+                                               std::nullopt, std::nullopt, ""),
+                    "text/html; charset=utf-8");
 }
 
 std::string SettingsRoutes::render_mcp_fragment() {
@@ -3525,6 +3747,52 @@ void SettingsRoutes::register_routes(
             R"({"showToast":{"message":"Cohort export key saved","level":"success"}})");
         res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
     });
+
+    // -- AP-3.12: the DEX page's Scoring tab -----------------------------------------
+    // Reads gate on GuaranteedState:Read (the quiet probe server.cpp binds, else perm_fn_)
+    // BEFORE either the policy or the application names are read, exactly as GET
+    // /api/v1/dex/score-policy and /fragments/dex/apps gate. A reader who is not an
+    // administrator gets the same page with every control disabled (a quiet role test, no
+    // denied row, as the Alerts tab); the three POSTs keep the loud admin_fn_.
+    sink.Get("/fragments/dex/scoring", [this](const httplib::Request& req,
+                                              httplib::Response& res) {
+        if (!read_perm(req, res, "GuaranteedState", "Read"))
+            return;
+        const auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        const bool admin = session->token_scope_service.empty() && session->mcp_tier.empty() &&
+                           auth::effective_role(*session) == auth::Role::admin;
+        std::string html = dex_subnav("scoring", 7) + dex_alerts_style();
+        // #dex-scoring-section is the inner swap target of every POST; the sub-nav above it is
+        // never re-rendered.
+        html += "<div id=\"dex-scoring-section\">";
+        if (!dex_score_policy_writer_ || !dex_score_policy_writer_->read_stored) {
+            html += kDexScoringUnavailable;
+        } else if (const auto in_force = dex_scoring_in_force(*dex_score_policy_writer_);
+                   !in_force) {
+            spdlog::warn("GET /fragments/dex/scoring: store read failed: {}",
+                         ::yuzu::log_key_token(in_force.error()));
+            html += kDexScoringUnavailable;
+        } else {
+            html += render_dex_scoring_section(*in_force, admin, in_force->revision, nullptr,
+                                               std::nullopt, std::nullopt, "");
+        }
+        html += "</div>";
+        res.set_content(html, "text/html; charset=utf-8");
+    });
+    sink.Post("/api/settings/dex-scoring/save",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Put, false);
+              });
+    sink.Post("/api/settings/dex-scoring/preview",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Put, true);
+              });
+    sink.Post("/api/settings/dex-scoring/reset",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Reset, false);
+              });
 
     sink.Get("/fragments/settings/plugin-signing",
              [this](const httplib::Request& req, httplib::Response& res) {

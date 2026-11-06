@@ -563,6 +563,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body must be
     // refused here (the hardware row's reasoning).
     {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
+    // /api/settings/dex-scoring: the DEX Scoring tab's three POSTs (settings_routes.cpp). The
+    // body is the whole policy as a urlencoded form: 200 override rows of 17 fields come to about
+    // 150 KB, and a hostile image name can roughly triple a field's size, so 320 KiB (the REST
+    // row's cap above, for the same document) never refuses a legitimate form while an
+    // unauthenticated flood is held 12x under the 4 MiB catch-all. requires_measurable = true
+    // for the same reason as the REST row: the admin gate runs in the handler, after httplib
+    // buffers the body.
+    {kBodyCapAnyMethod, "/api/settings/dex-scoring", 320u * 1024, true, "dex_score_policy_form"},
     // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
     // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
