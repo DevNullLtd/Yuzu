@@ -204,22 +204,24 @@ struct RoutesRig {
         group_c = make_group("C", group_p);
         group_s = make_group("S", "");
 
-        register_routes([this](const httplib::Request& req, httplib::Response& res,
-                               const std::string& type, const std::string& op) {
-            return ar->probe_permission_unavailable_aware(req, res, type, op);
-        });
+        register_on(sink, store.get());
     }
 
-    void register_routes(SoftwareCollectionSettingsRoutes::ProbePermFn probe) {
+    // The routes over the real gate on `target`, reading `settings_store`.
+    void register_on(yuzu::server::test::TestRouteSink& target,
+                     SoftwareCollectionSettingsStore* settings_store) {
         routes.register_routes(
-            sink,
+            target,
             SoftwareCollectionSettingsRoutes::Deps{
                 .auth_fn = [this](const httplib::Request& req,
                                   httplib::Response& res) { return ar->require_auth(req, res); },
                 .perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                   const std::string& t,
                                   const std::string& o) { return ar->require_permission(req, res, t, o); },
-                .probe_perm_fn = std::move(probe),
+                .probe_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                        const std::string& type, const std::string& op) {
+                    return ar->probe_permission_unavailable_aware(req, res, type, op);
+                },
                 .scoped_perm_fn =
                     [this](const httplib::Request& req, httplib::Response& res, const std::string& t,
                            const std::string& o, const std::string& agent) {
@@ -233,7 +235,7 @@ struct RoutesRig {
                     audit.push_back({action, result, tt, tid, detail});
                     return true;
                 },
-                .store = store.get(),
+                .store = settings_store,
                 .mgmt_store = &mgmt,
                 .plugin_config_store = plugins.get(),
             });
@@ -851,4 +853,91 @@ TEST_CASE("collection settings routes: a deleted group's document is not listed 
     const auto resolved = rig.parse(*rig.call("GET", host, boss));
     CHECK(resolved["data"]["source_group_id"] == rig.group_p);
     CHECK(resolved["data"]["effective"]["interval_s"] == 7200);
+}
+
+TEST_CASE("collection settings routes: an owner of a descendant only is refused on the parent",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto owner = rig.group_owner("cowner", rig.group_c);
+    rig.audit.clear();
+    CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(7200))->status == 403);
+    CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 403);
+    CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
+    CHECK(rig.audit_count("denied") == 2);
+    // The owner's own group: admitted for write and read.
+    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), owner, put_body(7200))->status == 200);
+    CHECK(rig.call("GET", rig.doc_path(rig.group_c), owner)->status == 200);
+}
+
+TEST_CASE("collection settings PUT: a versioned write on a group with no document is a 409 with "
+          "error.current null",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    auto res = rig.call("PUT", rig.doc_path(rig.group_p), boss,
+                        put_body(7200, 0, std::string(64, 'a')));
+    CHECK(res->status == 409);
+    const auto body = rig.parse(*res);
+    REQUIRE(body["error"].contains("current"));
+    CHECK(body["error"]["current"].is_null());
+    CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
+}
+
+TEST_CASE("collection settings routes: an unavailable group tree read is a 503",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
+    REQUIRE(rig.mgmt.add_member(rig.group_c, "agent-1").has_value());
+    TableFault fault{rig.mgmt_bundle.dsn(), "management_group_store.management_groups"};
+    fault.arm();
+    SECTION("per-group GET: the group read behind a global admit") {
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), boss)->status == 503);
+    }
+    SECTION("host route: the tree read (the membership read is a separate table and succeeds)") {
+        CHECK(rig.call("GET", "/api/v1/inventory/software/hosts/agent-1/collection-settings", boss)
+                  ->status == 503);
+    }
+    SECTION("list route: the tree read that drops orphans") {
+        CHECK(rig.call("GET", "/api/v1/inventory/software/collection-settings", boss)->status ==
+              503);
+    }
+}
+
+TEST_CASE("collection settings PUT: a timezone check that cannot run is a 503 and writes nothing",
+          "[pg][routes][collection_settings]") {
+    // The store's check reads `pg_timezone_names` unqualified. A session search_path that names a
+    // schema ahead of pg_catalog lets a test view of that name fail the statement; the store code
+    // is unchanged. A schema-qualified check would bypass the view and fail this test loudly.
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    exec_sql(rig.settings_db.dsn(),
+             "CREATE SCHEMA tzfault; "
+             "CREATE FUNCTION tzfault.fail() RETURNS SETOF text LANGUAGE plpgsql AS "
+             "$$ BEGIN RAISE EXCEPTION 'injected timezone check fault'; END $$; "
+             "CREATE VIEW tzfault.pg_timezone_names AS SELECT f AS name FROM tzfault.fail() f");
+    PgPool faulted_pool{{.conninfo = rig.settings_db.dsn() +
+                                     " options='-c search_path=tzfault,pg_catalog,public'",
+                         .size = 1}};
+    SoftwareCollectionSettingsStore faulted{faulted_pool};
+    REQUIRE(faulted.is_open());
+    yuzu::server::test::TestRouteSink faulted_sink;
+    rig.register_on(faulted_sink, &faulted);
+    const auto put = [&](const std::string& tz) {
+        auto res = faulted_sink.dispatch("PUT", rig.doc_path(rig.group_p),
+                                         put_body(7200, 0, "none", tz), "application/json", boss);
+        REQUIRE(res != nullptr);
+        return res;
+    };
+    // Control: no zone, no check, the write lands through the same store.
+    REQUIRE(put("")->status == 200);
+    const auto before_tz = rig.store->get(rig.group_p)->value().version;
+    rig.audit.clear();
+    auto res = put("Europe/London");
+    CHECK(res->status == 503);
+    CHECK(rig.store->get(rig.group_p)->value().version == before_tz);
+    REQUIRE(rig.audit.size() == 2);
+    CHECK(rig.audit[0].result == "requested");
+    CHECK(rig.audit[1].result == "failure");
+    CHECK(rig.audit[1].detail == "store write failed");
 }
