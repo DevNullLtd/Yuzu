@@ -506,6 +506,10 @@ nlohmann::json device_agent_row_json(const DeviceListRow& row) {
         {"os", row.os},
         {"arch", row.arch},
         {"agent_version", row.agent_version},
+        // #2240: the key is ALWAYS present. JSON null = not reported (never "legacy"); the
+        // value, when present, is already one of the server's closed token strings.
+        {"guardian_backend", row.guardian_backend ? nlohmann::json(*row.guardian_backend)
+                                                  : nlohmann::json(nullptr)},
     };
 }
 

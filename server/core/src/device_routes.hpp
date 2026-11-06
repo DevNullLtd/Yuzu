@@ -85,10 +85,14 @@ class HttpRouteSink;
 // a future refactor of the MCP handlers has a function to call instead of a
 // third inline copy.
 
-/// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`,
-/// straight off `DeviceApi::DeviceListRow`'s fields (already defensively
-/// extracted at the seam — see `device_api.hpp`). Mirrors MCP
-/// `list_agents`'s inline row-building exactly.
+/// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`
+/// and `guardian_backend`, straight off `DeviceApi::DeviceListRow`'s fields (already
+/// defensively extracted at the seam — see `device_api.hpp`). `guardian_backend` is ALWAYS
+/// present (#2240): one of "legacy" | "spark" | "spark_failed" | "unwired", or JSON null when the
+/// device has not reported the heartbeat tag (never "legacy"; see
+/// `guardian_backend_fleet_tags.hpp`). MCP `list_agents` / `get_agent_details` mirror this by
+/// hand in `JObj` (same key set, same values, same null semantics; the key ORDER differs, so
+/// REST/MCP parity is semantic, not byte-identical).
 nlohmann::json device_agent_row_json(const DeviceListRow& row);
 
 /// PURE: the device DETAIL object — `device_agent_row_json`'s fields plus a
