@@ -238,6 +238,7 @@ struct RoutesRig {
                 .store = settings_store,
                 .mgmt_store = &mgmt,
                 .plugin_config_store = plugins.get(),
+                .rbac_store = &rbac,
             });
     }
 
@@ -536,6 +537,7 @@ TEST_CASE("collection settings PUT: an engine session never gets the group fallb
             .store = rig.store.get(),
             .mgmt_store = &rig.mgmt,
             .plugin_config_store = rig.plugins.get(),
+            .rbac_store = &rig.rbac,
         });
     const auto path = rig.doc_path(rig.group_c);
     // Control: the same identity as a human session is admitted by the ancestor walk.
@@ -729,6 +731,56 @@ TEST_CASE("collection settings PUT: an unavailable authority read is a 503, neve
         REQUIRE(res->headers.count("X-Correlation-Id") == 1);
         CHECK(json::parse(res->body)["error"]["correlation_id"] ==
               res->get_header_value("X-Correlation-Id"));
+    }
+}
+
+TEST_CASE("collection settings routes: the group fallback honours the ITServiceOwner role grant",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto owner = rig.group_owner("gadmin", rig.group_p);
+    const auto boss = rig.global_admin();
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
+    const auto version = rig.store->get(rig.group_p)->value().version;
+
+    SECTION("the seeded grant admits the owner") {
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 200);
+        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version))
+                  ->status == 200);
+    }
+    SECTION("a revoked Write grant refuses the PUT and leaves the read") {
+        REQUIRE(rig.rbac.remove_permission("ITServiceOwner", "ManagementGroup", "Write")
+                    .has_value());
+        rig.audit.clear();
+        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version))
+                  ->status == 403);
+        CHECK(rig.audit_count("denied") == 1);
+        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 200);
+    }
+    SECTION("a revoked Read grant refuses the GET") {
+        REQUIRE(rig.rbac.remove_permission("ITServiceOwner", "ManagementGroup", "Read")
+                    .has_value());
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 403);
+    }
+    SECTION("a deny row on the role refuses both") {
+        for (const char* op : {"Read", "Write"})
+            REQUIRE(rig.rbac.set_permission({"ITServiceOwner", "ManagementGroup", op, "deny"})
+                        .has_value());
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 403);
+        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version))
+                  ->status == 403);
+        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
+        // The global grant does not pass through the role read.
+        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(9000, 0, version))
+                  ->status == 200);
+    }
+    SECTION("an unavailable role grant read is a 503, never an admit") {
+        TableFault fault{rig.rbac_bundle.dsn(), "rbac_store.role_permissions"};
+        fault.arm();
+        auto res = rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version));
+        CHECK(res->status == 503);
+        fault.repair();
+        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
     }
 }
 

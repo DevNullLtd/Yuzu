@@ -5,6 +5,7 @@
 
 #include "collection_settings_resolve.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth
+#include "rbac_store.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "rest_audit.hpp"
 
@@ -85,7 +86,8 @@ void store_unavailable(httplib::Response& res, const SettingsError& e) {
 
 enum class Authority { AdmitGlobal, AdmitGroup, Deny, Degraded };
 
-// Global ManagementGroup grant, else an ITServiceOwner row on the group or an ancestor.
+// Global ManagementGroup grant, else an ITServiceOwner row on the group or an ancestor while the
+// ITServiceOwner role grants the pair.
 // `op` is "Read" or "Write". The unavailable-aware probe runs into a THROWAWAY response so an
 // admit through the group walk never answers on a response the probe dirtied; a 503 from it (the
 // RBAC read could not be completed) is copied to `res` and ends the request, so an outage never
@@ -122,15 +124,25 @@ Authority group_authority(const SoftwareCollectionSettingsRoutes::Deps& deps,
         unavailable(res, "management group role read unavailable");
         return Authority::Degraded;
     }
-    for (const auto& r : *rows) {
-        if (r.principal_type != "user" || r.principal_id != session.username ||
-            r.role_name != "ITServiceOwner")
-            continue;
-        if (r.group_id == group_id ||
-            std::ranges::find(*ancestors, r.group_id) != ancestors->end())
-            return Authority::AdmitGroup;
+    const bool assigned = std::ranges::any_of(*rows, [&](const auto& r) {
+        return r.principal_type == "user" && r.principal_id == session.username &&
+               r.role_name == "ITServiceOwner" &&
+               (r.group_id == group_id ||
+                std::ranges::find(*ancestors, r.group_id) != ancestors->end());
+    });
+    if (!assigned)
+        return Authority::Deny;
+    // The assignment admits only as far as the role grants the pair: a removed grant or a deny
+    // row on ITServiceOwner refuses, and a read that cannot be completed is a 503.
+    const auto granted =
+        deps.rbac_store ? deps.rbac_store->role_permission_allowed_checked("ITServiceOwner",
+                                                                           kGroupTargetType, op)
+                        : std::expected<bool, std::string>{std::unexpected("rbac store unwired")};
+    if (!granted) {
+        unavailable(res, "role permission read unavailable");
+        return Authority::Degraded;
     }
-    return Authority::Deny;
+    return *granted ? Authority::AdmitGroup : Authority::Deny;
 }
 
 // nullopt = not an integer, or out of int range.

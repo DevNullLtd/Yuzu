@@ -11,7 +11,9 @@
 /// The fleet list needs the global `ManagementGroup:Read` grant. A group's document is readable
 /// with that grant or as an ITServiceOwner of the group or any ancestor; it is written with the
 /// global `ManagementGroup:Write` grant or as an ITServiceOwner of the group or an ancestor, and the
-/// root group and any priority change need the global grant. The group fallback never admits a
+/// root group and any priority change need the global grant. The group fallback admits only while
+/// the ITServiceOwner role grants `ManagementGroup:Read`/`Write` (a removed grant or a deny row
+/// refuses; a role read that cannot be completed is a 503), and it never admits a
 /// service-scoped, MCP-tier or engine session (the MCP tier belt lives inside the permission gate,
 /// so a fallback must not re-admit what the gate refused). The host route resolves the effective
 /// settings of one device through the pure resolver (collection_settings_resolve.hpp) and is
@@ -36,6 +38,8 @@
 #include <string>
 
 namespace yuzu::server {
+
+class RbacStore;
 
 class SoftwareCollectionSettingsRoutes {
 public:
@@ -66,6 +70,8 @@ public:
         SoftwareCollectionSettingsStore* store{nullptr};  ///< borrowed; null answers 503
         ManagementGroupStore* mgmt_store{nullptr};        ///< borrowed; null answers 503
         PluginConfigStore* plugin_config_store{nullptr};  ///< borrowed; null answers 503
+        const RbacStore* rbac_store{nullptr}; ///< borrowed; the group fallback's role grant read,
+                                              ///< null answers 503 on that path
     };
 
     void register_routes(HttpRouteSink& sink, Deps deps);

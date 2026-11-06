@@ -20218,6 +20218,7 @@ private:
                     .store = software_collection_settings_store_.get(),
                     .mgmt_store = mgmt_group_store_.get(),
                     .plugin_config_store = plugin_config_store_.get(),
+                    .rbac_store = rbac_store_.get(),
                 });
         }
 
