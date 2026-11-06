@@ -1623,10 +1623,15 @@ static const ToolDef kTools[] = {
      "confined), compliant_rules/drifted_rules (still 0 — full status ingest lands in a later "
      "rung), errored_rules (real, management-group-confined for a non-global caller). Mirrors "
      "GET /api/v1/guaranteed-state/status exactly — same shared builder, same "
-     "require_list_read (ADR-0017) confinement. A service-scoped API token is refused outright "
-     "(this is a fleet rollup with no per-service slice to narrow to).",
+     "require_list_read (ADR-0017) confinement. uncertain_rules counts live rules with at least "
+     "one reported (agent, rule) pair whose census ordering cannot be proven (order_uncertain) or "
+     "whose retained event is not yet reflected (projection_pending), within the caller's scope; "
+     "0 does NOT prove the census is fresh or complete, since an event that never arrived leaves "
+     "no trace, and a pending event whose pair has no census row is not counted. A service-scoped "
+     "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
+     "to).",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules"]})j"},
+     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules"]})j"},
 
     {"list_guardian_rules",
      "List every Guaranteed State rule (Guard) in the catalogue — full rule bodies "
@@ -1654,18 +1659,24 @@ static const ToolDef kTools[] = {
      "/api/v1/guaranteed-state/rules/{rule_id}/status exactly, same shared builder, same "
      "require_list_read (ADR-0017) confinement as get_guardian_status. Raw census — does NOT "
      "fold an offline agent's last-reported state to \"unknown\" the way the dashboard fragment "
-     "does. 404-equivalent (kInvalidParams) if rule_id names no rule.",
+     "does. Each row carries order_uncertain (sticky: the verdict persisted for "
+     "the pair cannot be proven to be the latest; false does not prove freshness) and "
+     "projection_pending (a retained event for the pair has not reached the row, so the state "
+     "shown may lag it); a true flag means do not report the pair as settled, and "
+     "get_guardian_device_guards shows the same flags for one device. 404-equivalent (kInvalidParams) if rule_id names no rule.",
      R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1}},"required":["rule_id"]})",
-     R"j({"type":"object","properties":{"rule_id":{"type":"string"},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"}},"required":["agent_id","state","updated_at"]}},"total":{"type":"integer"}},"required":["rule_id","agents","total"]})j"},
+     R"j({"type":"object","properties":{"rule_id":{"type":"string"},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["agent_id","state","updated_at","order_uncertain","projection_pending"]}},"total":{"type":"integer"}},"required":["rule_id","agents","total"]})j"},
 
     {"get_guardian_device_guards",
      "Per-device all-guards view: every Guard's state for ONE device, unscoped to any one "
      "Baseline (contrast with the existing device-compliance surface, which is scoped to one "
      "named Baseline). Mirrors the new GET /api/v1/guaranteed-state/agents/{agent_id}/rules "
-     "exactly, same shared builder. Per-device scoped (management-group aware) via the same "
+     "exactly, same shared builder. Each guard carries order_uncertain and projection_pending "
+     "with the meaning documented on get_guardian_rule_status; a guard reading compliant with "
+     "either true must not be reported as settled. Per-device scoped (management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"}},"required":["rule_id","name","state","updated_at"]}},"total_guards":{"type":"integer"}},"required":["agent_id","guards","total_guards"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"}},"required":["agent_id","guards","total_guards"]})j"},
 
     // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
     // Closes the remaining MCP gap on the Guaranteed State surface: the 6
@@ -1835,9 +1846,11 @@ static const ToolDef kTools[] = {
      "(guardian_agent_status_rollup). Per-device behavioral read — every call is "
      "audit-logged (guardian.device.view). Per-device scoped (management-group aware) via "
      "the SAME gate get_guardian_device_guards uses; a service-scoped API token is confined "
-     "to its own service's agents rather than denied outright.",
+     "to its own service's agents rather than denied outright. uncertain_rules counts this "
+     "device's rules whose row is order_uncertain or projection_pending; 0 does not prove "
+     "freshness.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"note":{"type":"string"},"audit_persisted":{"type":"boolean"}},"required":["agent_id","total_rules","compliant_rules","drifted_rules","errored_rules"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"note":{"type":"string"},"audit_persisted":{"type":"boolean"}},"required":["agent_id","total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules"]})j"},
 
     {"get_guardian_device_compliance",
      "Is this device compliant with ONE named Baseline: the Guards actually applicable to "
@@ -1847,7 +1860,10 @@ static const ToolDef kTools[] = {
      "compliance signal to act on (draft Baseline, or nothing reported yet) — do not compute "
      "a percentage when false. Per-device behavioral read — every call is audit-logged "
      "(guardian.device.view). Per-device scoped (management-group aware) via the SAME gate "
-     "get_guardian_agent_status uses.",
+     "get_guardian_agent_status uses. Counts and states cover REPRESENTED pairs only and do not "
+     "report ordering uncertainty or pending census evidence: a guard reading compliant here may "
+     "still be order_uncertain or projection_pending; call get_guardian_device_guards for those "
+     "flags before reporting the device as settled.",
      R"j({"type":"object","properties":{)j"
      R"j("baseline":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline name (stable across reseeds, unlike baseline_id)"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256})j"
@@ -16184,6 +16200,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                              .add("compliant_rules", rollup->compliant_rules)
                                              .add("drifted_rules", rollup->drifted_rules)
                                              .add("errored_rules", rollup->errored_rules)
+                                             .add("uncertain_rules", rollup->uncertain_rules)
                                              .str(),
                                         kObjectOutputSchema)),
                     "application/json");
@@ -16444,7 +16461,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     arr.add(JObj()
                                 .add("agent_id", r.agent_id)
                                 .add("state", r.state)
-                                .add("updated_at", r.updated_at));
+                                .add("updated_at", r.updated_at)
+                                .add("order_uncertain", r.order_uncertain)
+                                .add("projection_pending", r.projection_pending));
                     ++total;
                 }
                 JObj payload;
@@ -16511,7 +16530,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("rule_id", r.rule_id)
                                 .add("name", r.name)
                                 .add("state", r.state)
-                                .add("updated_at", r.updated_at));
+                                .add("updated_at", r.updated_at)
+                                .add("order_uncertain", r.order_uncertain)
+                                .add("projection_pending", r.projection_pending));
                 }
                 JObj payload;
                 payload.add("agent_id", agent_id)
@@ -16964,11 +16985,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto result = guaranteed_state_store->delete_rule(rule_id);
                 if (!result) {
                     (void)yuzu::server::detail::try_persist_audit(
-                        audit_fn, req, "guaranteed_state.rule.delete", "denied",
+                        audit_fn, req, "guaranteed_state.rule.delete",
+                        result.error().starts_with("not found") ? "denied" : "failure",
                         "GuaranteedState", rule_id, result.error());
-                    // retry-hint-exempt: mirrors REST's own posture — delete_rule
-                    // conflates not-found with a genuine failure into one error
-                    // string, so this is not distinguishably a transient store fault.
+                    // retry-hint-exempt: delete_rule returns one error string for a
+                    // missing rule and for a store fault (the audit row above tells them
+                    // apart by that string's prefix), so the fault half cannot yet carry an
+                    // honest retry_after_ms; mirrors REST, which answers 404 for both. The
+                    // error-class split that would close this is tracked in #7148.
                     res.set_content(error_response(id, kInvalidParams, result.error()),
                                     "application/json");
                     return;
@@ -17567,10 +17591,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("compliant_rules", rollup->compliant_rules)
                     .add("drifted_rules", rollup->drifted_rules)
                     .add("errored_rules", rollup->errored_rules)
+                    .add("uncertain_rules", rollup->uncertain_rules)
                     .add("note", "total_rules and errored_rules are both real (M1 "
                                 "census-derived, #2298 item 6d) and both intersected "
                                 "against the live rule catalogue; compliant_rules/"
-                                "drifted_rules land with full status ingest in a later rung");
+                                "drifted_rules land with full status ingest in a later rung; "
+                                "uncertain_rules counts this device's rules whose row is "
+                                "order-uncertain or pending, and 0 does not prove freshness");
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(

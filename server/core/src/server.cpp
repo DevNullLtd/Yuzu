@@ -4193,25 +4193,64 @@ public:
                           "model row is lost. >0 means /dex is under-counting - investigate "
                           "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
                           "counter");
-        metrics_.describe("yuzu_server_guardian_census_proj_failures_total",
-                          "Compliance-census (guardian_agent_rule_status) writes that failed "
-                          "for a reason other than the rule not existing. The failure does not "
-                          "discard the source event; only the census row update is lost, so "
-                          "the pair keeps its previous state until a later state-changing "
-                          "event for it arrives. >0 means the census may be stale; the server "
-                          "log line 'census upsert failed' names the agent and rule. A write "
-                          "refused because the rule is not defined on this server (SQLSTATE "
-                          "23503) is a normal outcome and is not counted.",
+        metrics_.describe(
+            "yuzu_server_guardian_census_proj_failures_total",
+            "Compliance-census (guardian_agent_rule_status) writes that failed "
+            "for a reason other than the rule not existing. The failure of a single "
+            "event does not discard it: it stays stored with pending census "
+            "evidence, and the pair keeps its previous state "
+            "until a redelivery of that event repairs it or a later event for the pair arrives. A "
+            "repair that fails is counted here again. >0 means the census may be "
+            "stale; the server log line 'census upsert failed' names the agent "
+            "and rule. A write refused because the rule is not defined on this "
+            "server (the census foreign key, SQLSTATE 23503) is a normal "
+            "outcome and is not counted; a failure to retire the evidence of "
+            "such an event is an ingest error.",
+            "counter");
+        metrics_.describe("yuzu_server_guardian_census_projection_total",
+                          "Compliance-census projections by source (first_delivery, repair, "
+                          "batch) and outcome (applied, refused_flagged, refused_noop, "
+                          "pending_retired, rejected, failed, abandoned). A refused outcome means "
+                          "the event was dominated by the stored verdict; refused_flagged also "
+                          "marks the pair order_uncertain. pending_retired is a repair that found "
+                          "its evidence already retired; rejected is a write refused because the "
+                          "rule is gone (not a fault); failed is a fault that leaves pending "
+                          "evidence, except for source batch, whose failure rolls back the whole batch "
+                          "(this count is not rolled back; see "
+                          "..._census_proj_failures_total); abandoned aborted the "
+                          "transaction (counted again as an ingest error). Counted when the "
+                          "projection returns, before the transaction commits. Resets on server "
+                          "restart.",
                           "counter");
+        metrics_.describe(detail::kGuardianEventsRejectedMetric,
+                          "Guardian events refused at the ingest boundary before reaching the "
+                          "store, by reason. empty_rule_id: the event carried no rule id, so it "
+                          "could not be projected or matched, and it is not stored. Resets on "
+                          "server restart.",
+                          "counter");
+        for (const char* source : {"first_delivery", "repair", "batch"})
+            for (const char* outcome : {"applied", "refused_flagged", "refused_noop",
+                                        "pending_retired", "rejected", "failed", "abandoned"})
+                metrics_.counter("yuzu_server_guardian_census_projection_total",
+                                 {{"source", source}, {"outcome", outcome}});
+        metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
+        metrics_.describe("yuzu_server_guardian_census_pending_events",
+                          "Guardian events stored with pending census evidence: their census "
+                          "write failed and no redelivery has repaired it. Not updated while "
+                          "the store cannot answer. A sustained non-zero value means census "
+                          "verdicts are waiting on an agent redelivery that may never come "
+                          "(the stranded classes are listed in docs/clock-guarded-retention.md).",
+                          "gauge");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
-        // #4856: two sources share this counter, both by reason
+        // #4856: sources share this counter ("guardian_census" added for the census
+        // pending-evidence count read, #5690), each by reason
         // (store_not_open/pool_acquire_timeout/query_error) — "guardian_state"
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
         // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-        // agent_rule_statuses*/rule_names*/errored_rule_count, fail-hard: the
+        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count, fail-hard: the
         // caller gets a std::expected error and aborts the push/reconcile
         // rather than fan out empty/stale data). Pre-seeded below (same closed
         // {reason x source} cross-product pre-seed pattern as
@@ -4225,10 +4264,12 @@ public:
                           "in-flight budget) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
                           "served; guardian_rules = authoritative rule/status reads, fail-hard, "
-                          "push/reconcile aborts rather than fans out empty). A sampled warn "
+                          "push/reconcile aborts rather than fans out empty; guardian_census = "
+                          "the census pending-evidence count read, whose gauge keeps its last "
+                          "value). A sampled warn "
                           "accompanies each new degrade episode.",
                           "counter");
-        for (const auto source : {"guardian_state", "guardian_rules"})
+        for (const auto source : {"guardian_state", "guardian_rules", "guardian_census"})
             for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
                 metrics_.counter("yuzu_server_guardian_read_degrade_total",
                                  {{"reason", reason}, {"source", source}});
@@ -10096,6 +10137,10 @@ public:
                     metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_reaped_total()));
+                    // Published only on success: an unanswered count must not read as zero.
+                    if (auto pending = guaranteed_state_store_->pending_projection_count_checked())
+                        metrics_.gauge("yuzu_server_guardian_census_pending_events")
+                            .set(static_cast<double>(*pending));
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")

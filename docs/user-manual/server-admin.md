@@ -2929,14 +2929,14 @@ The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` before
 templating; any other character returns `400`.
 
 **Connection window — `fleet_snapshot_window_seconds` (Echo plugin config).**
-`echo.fleet_snapshot` reports not only the connections ESTABLISHED at the
-exact `/proc` sample instant but also connections Echo observed recently
-in its `tcp_live` warehouse, so short-lived flows still reach the viz.
-The look-back window is operator-tunable via the Echo plugin's KV config
-key `fleet_snapshot_window_seconds` (default `3600`). It is an Echo plugin
-config key, not a server CLI flag — set it through the Echo plugin's
-configuration surface. The 60 s sampler still cannot see sub-interval
-connections; that needs kernel eventing (tracked separately).
+The key is still accepted but has no effect since Echo became roll-up-only:
+`echo.fleet_snapshot` reports the connections ESTABLISHED at the exact
+`/proc` sample instant and nothing else. It used to add connections Echo had
+observed recently in its `tcp_live` warehouse, so short-lived flows still
+reached the viz; the roll-up tiers keep hourly counts per remote and process,
+not per socket, so there is nothing to look back through. It is an Echo plugin
+config key, not a server CLI flag. The 60 s sampler still cannot see
+sub-interval connections; that needs kernel eventing (tracked separately).
 
 ### vNEXT — Agent interval triggers now functional
 

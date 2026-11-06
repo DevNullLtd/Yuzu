@@ -100,6 +100,13 @@ struct GuaranteedStateEventRow {
     int64_t detection_latency_us{0};
     int64_t remediation_latency_us{0};
     std::string timestamp;         // ISO-8601
+    // Census ordering inputs (schema v4, set by the ingest boundary; a direct store caller may
+    // leave both 0). `agent_ns` is the validated agent stamp in nanoseconds, 0 when absent or
+    // unusable; `received_ns` is the server receipt in nanoseconds, 0 = the store substitutes its
+    // own clock. They feed the store's derived key `min(agent_ns, received_ns + 300 s)` and stay
+    // OUT of the duplicate identity. `query_events` does not populate them.
+    std::int64_t agent_ns{0};
+    std::int64_t received_ns{0};
 };
 
 struct GuaranteedStateEventQuery {
@@ -133,6 +140,7 @@ struct GuardianStatusRollup {
     std::int64_t compliant_rules{0};
     std::int64_t drifted_rules{0};
     std::int64_t errored_rules{0};
+    std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
 };
 
 /// Per-agent Guaranteed State status rollup — shared by
@@ -146,6 +154,7 @@ struct GuardianAgentStatusRollup {
     std::int64_t compliant_rules{0};
     std::int64_t drifted_rules{0};
     std::int64_t errored_rules{0};
+    std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
 };
 
 /// Per-guard fleet-wide agent-status drilldown row — one row per agent that
@@ -156,6 +165,8 @@ struct GuardianRuleAgentStatusRow {
     std::string agent_id;
     std::string state;      // "compliant" | "drifted" | "errored"
     std::string updated_at; // ISO-8601 of the event that set it
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 /// Per-device all-guards view row — one row per guard this device has
@@ -168,6 +179,8 @@ struct GuardianDeviceGuardRow {
                              // rule has since been deleted from the catalogue
     std::string state;      // "compliant" | "drifted" | "errored"
     std::string updated_at; // ISO-8601 of the event that set it
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 /// Per-baseline device-compliance rollup — shared by
