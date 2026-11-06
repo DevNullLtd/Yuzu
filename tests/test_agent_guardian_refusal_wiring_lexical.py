@@ -13,9 +13,11 @@ call it after the Write, and every behavioural test would stay green. Pinned her
      the Write, and serialises `wire_ev` (not a second conversion).
   3. The helper decides through guardian_event_refused_by_server, logs the event id only through
      log_id_token (CWE-117), and wraps the log in try/catch(...).
-  4. The legacy drift-sink lambda's T_wire record is not marked sent for a refused event.
+  4. The legacy drift-sink lambda's T_wire record is not marked sent for a refused event:
+     `sent` excludes a refused event AND is what `r.sent` is set from.
 
-Robustness: `//` comments are stripped and whitespace collapsed before matching. Carries an
+Robustness: `//` comments are stripped and whitespace collapsed before matching (`/* */` blocks
+are deliberately not stripped, so code disabled that way still matches). Carries an
 in-memory mutation self-test; a mutation whose pattern no longer matches fails loudly (stale
 pattern) rather than passing vacuously. Lexical only: it cannot see a relocation that keeps the
 tokens but changes control flow (review-enforced).
@@ -57,18 +59,21 @@ def problems(src):
     if not re.search(r"if \( ?!guardian_event_refused_by_server\( ?ev ?\) ?\) return false;", body):
         out.append("refuse_unsendable_guardian_event no longer decides via guardian_event_refused_by_server" + HINT)
     if not re.search(r"try \{ spdlog::warn\([^;]*::yuzu::log_id_token\( ?ev\.event_id\(\) ?\)[^;]*\); "
-                     r"\} catch \( ?\.\.\. ?\)", body):
-        out.append("the refusal log no longer goes through log_id_token inside try/catch(...)" + HINT)
+                     r"\} catch \( ?\.\.\. ?\)", body) or len(re.findall(r"event_id\(\)", body)) != 1:
+        out.append("the refusal log no longer goes through log_id_token (and only it) inside "
+                   "try/catch(...)" + HINT)
     if not re.search(r"const bool sent = \( ?outcome == LegacySendOutcome::Sent ?\) && "
                      r"!guardian_event_refused_by_server\( ?ev ?\);", t):
         out.append("the legacy T_wire record can mark a refused event sent" + HINT)
+    if not re.search(r"r\.sent = sent;", t):
+        out.append("the legacy T_wire record is no longer set from the refusal-aware `sent`" + HINT)
     return out
 
 
 MUTATIONS = [
     ("legacy refusal removed",
      'if (refuse_unsendable_guardian_event(ev, "legacy"))', 'if (false)'),
-    ("legacy refusal returns Retain-like outcome",
+    ("legacy refusal returns WriteFailed",
      'return LegacySendOutcome::Sent; // dropped by design', 'return LegacySendOutcome::WriteFailed; // dropped by design'),
     ("spark refusal removed",
      'if (refuse_unsendable_guardian_event(wire_ev, "spark"))', 'if (false)'),
@@ -78,6 +83,10 @@ MUTATIONS = [
      'resp.set_payload(wire_ev.SerializeAsString());', 'resp.set_payload(e.event.SerializeAsString());'),
     ("raw event id in the log",
      '::yuzu::log_id_token(ev.event_id())', 'ev.event_id()'),
+    ("T_wire record ignores the refusal-aware sent",
+     'r.sent = sent;', 'r.sent = true;'),
+    ("raw event id beside the token in the log",
+     '::yuzu::log_id_token(ev.event_id()), n);', '::yuzu::log_id_token(ev.event_id()), ev.event_id(), n);'),
     ("T_wire marks refused sent",
      '(outcome == LegacySendOutcome::Sent) &&\n                                          !guardian_event_refused_by_server(ev);',
      '(outcome == LegacySendOutcome::Sent);'),

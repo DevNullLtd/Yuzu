@@ -20,7 +20,6 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption (boot, upgrade window)
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
-#include <yuzu/log_token.hpp> // log_id_token (CWE-117) for the refusal log line
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/reconnect_backoff.hpp>
 #include <yuzu/agent/server_address_resolver.hpp>
@@ -32,6 +31,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
+#include <yuzu/log_token.hpp> // log_id_token (CWE-117) for the refusal log line
 
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
@@ -4150,10 +4150,11 @@ private:
     // and Retain/WriteFailed would respectively wedge the outbox head or record a gap against an
     // empty rule id. No producer reaches this today: a pushed rule set with an empty rule id is
     // rejected whole by apply_rules' is_valid_rule_id scan, json_to_rule rejects one on boot
-    // re-arm, and DEX observations carry the `__observation__` sentinel. On the Spark path the journal mint gate only keeps such a record out of the
-    // journal (the live entry is still enqueued), so this refusal is what stops it reaching the
-    // wire; it is the last line. Logged on the first occurrence and then every 1024th, so a bad
-    // producer cannot flood; the counter exists only to set that cadence and is not exported.
+    // re-arm, and DEX observations carry the `__observation__` sentinel. On the Spark path the
+    // journal mint gate only keeps such a record out of the journal (the live entry is still
+    // enqueued), so this refusal is what stops it reaching the wire; it is the last line. Logged
+    // on the first occurrence and then every 1024th, so a bad producer cannot flood; the counter
+    // exists only to set that cadence and is not exported.
     // The legacy drift-sink lambda logs sent=0 in its T_wire line for a refused event, so the
     // line never claims a write that did not happen.
     bool refuse_unsendable_guardian_event(const gpb::GuaranteedStateEvent& ev,

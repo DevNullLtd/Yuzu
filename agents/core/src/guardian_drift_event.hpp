@@ -18,7 +18,7 @@
 //
 // Also home to guardian_event_refused_by_server, the one agent-side mirror of a server ingest
 // refusal (an empty rule_id). It is not a drift mapping; it lives here because this is the agent's
-// pure event-helper header, and both Guardian wire senders in agent.cpp include it for this call.
+// pure event-helper header, and agent.cpp, which holds both Guardian wire senders, includes it for this call.
 // The server is the authority for the rule (guardian_ingest.cpp); change the two together.
 
 #include <yuzu/plugin.h>        // YUZU_EXPORT
