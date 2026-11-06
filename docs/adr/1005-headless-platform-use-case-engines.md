@@ -1356,12 +1356,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            (or whose ids exceed the 131,072-byte stored budget), a CONFINED reader's
            scoped visibility of the run depends on the stored ids. The ids in the
            creator's own dispatch scope (`Execution:Execute` visibility) are stored first;
-           the creator keeps seeing its run only while that scope lies within the scope
-           its reads are checked against (`Workflow:Read`). That holds for a group-scoped
-           `Operator`, which holds both permissions at one scope; it is not guaranteed
-           for a custom-role mix (a global `Execution:Execute` grant with a group-scoped
-           `Workflow:Read` stores the ids in request order, and the creator can lose
-           sight of its own run). Another confined reader whose devices fall past the cap
+           the creator keeps seeing its run only while at least one stored id lies in the
+           scope its reads are checked against (`Workflow:Read`). Starting a run needs a
+           global `Workflow:Execute`, which of the seeded roles only `Administrator`
+           holds, so a confined creator is a custom role with that grant plus a scoped
+           one (for example an `Operator` assignment on a group), and the two scopes then
+           overlap; it is not guaranteed when they do not (a global `Execution:Execute`
+           grant with a group-scoped `Workflow:Read` stores the ids in request order, and
+           the creator can lose sight of its own run). Another confined reader whose devices fall past the cap
            does not see the run in its scoped list or detail reads. Unconfined readers
            and the audit log still see it, and the check fails closed (a malformed or
            empty column is invisible to a confined reader). The trigger is distinct ids
@@ -1372,11 +1374,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        14. *Dedupe memory on the legacy execute route (revisit by 2027-01-15).*
            `stored_agent_ids_json` holds a set of the distinct ids while it works. The
            legacy `POST /api/workflows/{id}/execute` checks no id count, so a request
-           near its 16 MiB body cap (millions of short distinct ids) costs roughly
-           140 to 160 MiB of transient memory in that set and the distinct list, freed
-           when the helper returns (a standalone probe of the same containers measured
-           about 140 MiB at 2.3 million distinct 7-byte ids; the review estimated 150 to
-           160 MiB from node sizes). The v1 route and MCP are capped at 10,000 ids and
+           near its 16 MiB body cap (the reachable ceiling is about 2.5 million distinct
+           ids of at most 4 bytes) costs roughly 150 MiB of transient memory in that set
+           and the distinct list (the set is freed before the digest is built, the list
+           when the helper returns; a standalone probe of the same containers measured
+           about 140 MiB at 2.3 million ids, and the review derived 150 to 160 MiB from
+           node sizes). The digest's JSON copy of the list, which already existed,
+           coexists with the list, so the helper's peak is about 200 MiB (derived by
+           reading, not measured). The v1 route and MCP are capped at 10,000 ids and
            are not affected. The body cap bounds it; an id-count cap on the legacy route
            would remove it.
 

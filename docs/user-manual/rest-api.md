@@ -7034,14 +7034,15 @@ A run row stores each distinct agent id the run named once, in the order first n
 sent). When the distinct ids do not all fit (or one was skipped: an id over 256 bytes or holding a
 NUL byte is never stored), `agent_ids` holds only the stored ids (when the creator is a confined
 caller, the ids in the creator's own dispatch scope, its `Execution:Execute` visibility, are
-stored first; the creator keeps seeing the run while that scope lies within the scope its reads
-are checked against, `Workflow:Read`, which a group-scoped `Operator` satisfies and a custom-role
-mix may not), `agent_ids_truncated` is `true`,
+stored first; the creator keeps seeing the run while at least one stored id lies in the scope its reads
+are checked against, `Workflow:Read`; a confined creator is a custom role that holds
+`Workflow:Execute` globally plus a scoped grant, since no seeded role below `Administrator` can
+start a run, and a mismatch of the two scopes may lose the run), `agent_ids_truncated` is `true`,
 and a caller with no device scope also gets `agent_ids_total`, the number of distinct ids the run
 named. Both fields are absent for a run stored whole, and `agent_ids_total` is never sent to a
 confined caller. A confined caller sees a truncated run only if one of the stored ids is in its
 scope, so a confined reader whose devices fall past the stored ids does not see the run, and that
-can include the creator when its dispatch scope is not within its read scope (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
+can include the creator when its dispatch scope does not overlap its read scope (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
 unconfined readers and the audit log still see it. The same applies to
 `GET /api/workflow-executions/{id}` and MCP `get_workflow_execution`.
 

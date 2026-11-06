@@ -1291,8 +1291,9 @@ static const ToolDef kTools[] = {
      "to their visible agents and each step's result.agents_reached is stripped. A run row "
      "stores each distinct id once, at most 1000 of them and at most 131072 bytes: when they do not "
      "all fit agent_ids_truncated is true, plus agent_ids_total for a caller with no device "
-     "scope, and a confined reader other than the creator may not see the run if none of its "
-     "devices were stored. Audited as "
+     "scope, and a confined reader may not see the run if none of its devices were stored, the "
+     "creator included when its Execution:Execute dispatch scope does not overlap its "
+     "Workflow:Read scope (an owner-accepted residual). Audited as "
      "workflow_execution.detail.fetch (set-and-proceed, audit_persisted:false on an admitted "
      "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",

@@ -5683,12 +5683,14 @@ What a run row holds, and how to treat it:
   **Accepted residual (owner decision, 2026-11-06).** A confined reader sees a run only if one
   of the stored ids is in its scope. For a run that names more than 1,000 distinct ids, or whose
   ids do not fit the 131,072-byte budget, that depends on which ids were stored: the confined
-  creator keeps seeing its own run only while the ids stored first (those in its `Execution:Execute`
-  dispatch scope) lie within the scope its reads are checked against (`Workflow:Read`). That holds
-  for a group-scoped `Operator`, which holds both permissions at one scope, and is not guaranteed
-  for a custom-role mix: with a global `Execution:Execute` grant and a group-scoped `Workflow:Read`
-  the ids are stored in the order named and the creator can lose sight of its own run past the
-  cap. Another confined reader whose devices fall past the cap does not see the run in its list or
+  creator keeps seeing its own run only while at least one of the ids stored first (those in its
+  `Execution:Execute` dispatch scope) lies in the scope its reads are checked against
+  (`Workflow:Read`). Starting a run needs a global `Workflow:Execute`, which of the seeded roles
+  only `Administrator` holds, so a confined creator is a custom role that holds `Workflow:Execute`
+  globally plus a scoped grant such as an `Operator` assignment on a group; the two scopes then
+  overlap, and the creator keeps its run. It is not guaranteed when they do not: with a global
+  `Execution:Execute` grant and a group-scoped `Workflow:Read` the ids are stored in the order
+  named and the creator can lose sight of its own run past the cap. Another confined reader whose devices fall past the cap does not see the run in its list or
   its detail read. Unconfined readers and the audit log still see it, and a malformed or empty column is
   invisible to a confined reader, never visible. The trigger is distinct ids beyond the cap
   (an id that names no device counts; a repeated id does not; an id over 256 bytes or holding a NUL
