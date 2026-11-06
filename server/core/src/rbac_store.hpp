@@ -676,8 +676,9 @@ public:
     /// before the breaker, exactly as for `check_permission`. A real role-query failure is counted
     /// under `yuzu_server_rbac_read_degrade_total{reason="query_error"}` and booked as a breaker
     /// FAILURE; a healthy empty role set is neither. Only a caller that can act on "unavailable"
-    /// differently from "denied" (the Forensics-tier resolver through
-    /// `AuthRoutes::probe_permission_unavailable_aware`) should use this; every other caller uses
+    /// differently from "denied" (the Forensics-tier resolver and the software collection settings
+    /// per-group routes, both through `AuthRoutes::probe_permission_unavailable_aware`) should use
+    /// this; every other caller uses
     /// the Boolean wrapper. The list-read gates (`authorize_list_read`, via
     /// `ListReadAuthorization::read_failed`) and `engine_grant_checked` also use it.
     [[nodiscard]] std::expected<bool, std::string>

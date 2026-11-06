@@ -809,7 +809,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                                     const std::string& securable_type,
                                     const std::string& operation) {
     // Every route keeps ADR-0041's documented answer: an RBAC read that could not be completed
-    // is a 403 (deny-on-degrade). Only the Forensics-tier resolver opts into the 503 mapping.
+    // is a 403 (deny-on-degrade). Only the callers of probe_permission_unavailable_aware (the
+    // Forensics-tier resolver, the software collection settings per-group routes) opt into the 503
+    // mapping.
     return require_permission_impl(req, res, securable_type, operation,
                                    RbacDegradeMapping::DenyAs403);
 }
@@ -1043,8 +1045,8 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
         const auto checked =
             rbac_store_->check_permission_checked(session->username, securable_type, operation);
         if (!checked && degrade == RbacDegradeMapping::UnavailableAs503) {
-            // Opt-in only (the Forensics-tier resolver): a read that could not be completed is a
-            // retryable outage, not a missing grant. Every other route takes the 403 below.
+            // Opt-in only (probe_permission_unavailable_aware): a read that could not be completed
+            // is a retryable outage, not a missing grant. Every other route takes the 403 below.
             respond_rbac_unavailable(req, res, securable_type, operation, "RBAC");
             return false;
         }

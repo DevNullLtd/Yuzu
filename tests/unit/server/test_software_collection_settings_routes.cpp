@@ -736,7 +736,7 @@ TEST_CASE("collection settings GET: list and per-group reads", "[pg][routes][col
             CHECK(a.action == "software_estate.collection_settings.read");
             CHECK(a.result == "denied");
             CHECK(a.target_type == "ManagementGroup");
-            CHECK(a.detail == "not authorised to read this group");
+            CHECK(a.detail == "refused by the ManagementGroup:Read gate");
         }
         CHECK(rig.audit[0].target_id == rig.group_s);
         CHECK(rig.audit[1].target_id == rig.group_p);

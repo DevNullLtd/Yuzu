@@ -153,7 +153,7 @@ Error corrupt(std::string_view op, std::string_view group_id) {
 
 // Serialises creates so the row-count check and the insert cannot interleave past the cap.
 constexpr const char* kCreateLockSql =
-    "SELECT pg_advisory_xact_lock(hashtextextended('software_collection_settings_store.create', 0))";
+    "SELECT pg_advisory_xact_lock(hashtextextended('software_collection_settings_store:create', 0))";
 
 } // namespace
 

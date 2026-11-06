@@ -84,7 +84,9 @@ void store_unavailable(httplib::Response& res, const SettingsError& e) {
     if (e.kind == SettingsError::Kind::Corrupt)
         permanent(res, "a stored collection settings document is unreadable");
     else if (e.kind == SettingsError::Kind::TooMany)
-        permanent(res, "the collection settings document cap (20,000) is reached");
+        permanent(res, "the collection settings document cap (" +
+                           std::to_string(SoftwareCollectionSettingsStore::kListRowCap) +
+                           ") is reached");
     else
         unavailable(res, "collection settings store unavailable");
 }
@@ -289,7 +291,7 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                      // writes its own.
                      (void)detail::try_persist_audit(deps.audit_fn, req, kVerbRead, "denied",
                                                      kGroupTargetType, group_id,
-                                                     "not authorised to read this group");
+                                                     "refused by the ManagementGroup:Read gate");
                      fail(res, 403, "forbidden");
                      return;
                  }
@@ -343,7 +345,7 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                 return;
             }
             if (authority == Authority::Deny) {
-                refuse(403, "forbidden", "not authorised to write this group");
+                refuse(403, "forbidden", "refused by the ManagementGroup:Write gate");
                 return;
             }
 
