@@ -725,6 +725,10 @@ TEST_CASE("collection settings PUT: an unavailable authority read is a 503, neve
         REQUIRE(res != nullptr);
         CHECK(res->status == 503);
         CHECK_FALSE(rig.store->get(rig.group_c).value().has_value());
+        // One correlation id, and the body names the same one.
+        REQUIRE(res->headers.count("X-Correlation-Id") == 1);
+        CHECK(json::parse(res->body)["error"]["correlation_id"] ==
+              res->get_header_value("X-Correlation-Id"));
     }
 }
 

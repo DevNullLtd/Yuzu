@@ -101,6 +101,9 @@ Authority group_authority(const SoftwareCollectionSettingsRoutes::Deps& deps,
     if (probe.status == 503) {
         res.status = probe.status;
         res.body = probe.body;
+        // The probe minted its own correlation id and its body names it: that one replaces
+        // the id on `res`, so the response carries exactly one.
+        res.headers.erase("X-Correlation-Id");
         for (const auto& [k, v] : probe.headers)
             res.set_header(k, v);
         return Authority::Degraded;
