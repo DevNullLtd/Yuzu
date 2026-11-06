@@ -4392,7 +4392,9 @@ private:
                 // undeduplicated (claim had failed — fail-open) or this is a
                 // duplicate terminal write. NOT the same as the eviction-driven
                 // double-execute, which produces a fresh claim and is not
-                // separately detectable here (bounded by kMaxDedupRows).
+                // separately detectable here (limited, as an ESTIMATE, by kMaxDedupRows
+                // exceeding the server's outbox redelivery horizon, #3678; see
+                // common/include/yuzu/command_replay_horizon.hpp for what it misses).
                 metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total").increment();
                 break;
             case RecordOutcome::Error:

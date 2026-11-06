@@ -164,7 +164,7 @@ AdaptedRows failed(std::string reason) {
 // What a `constrained` level does is the action's `policy` (the table's
 // `constrained` column). ConstrainedPolicy::fail: the action fails the cycle
 // (packages: a constrained listing is an incomplete package list). When
-// keep_rows_if_present_seen (managers) the constraint names facts the presence
+// keep_rows_if_present_seen (managers, dotnet, jvm) the constraint names facts the presence
 // row does not carry, so the adapted rows are kept (status ok, reason = the status
 // token) -- but ONLY if at least one PRESENT data row of the action's kind was
 // seen, mapped or not (`on_row` returns true for it): constrained with zero such
@@ -327,6 +327,21 @@ const InventoryAction kInventoryActions[] = {
          return parse_middleware_output(o, "ibm_mq", pol);
      },
      .constrained = ConstrainedPolicy::drop_source},
+    // A constrained answer is per-home or per-root (one JDK on a removable drive, one NFS root, one
+    // oversized release file) and still carries a row for every install it found, so the rows are
+    // KEPT when at least one was seen; a constrained answer with ZERO rows skips the cycle (stored
+    // rows untouched) rather than deleting them. The typed answer is CONSTRAINED + PARTIAL, hence
+    // accept_partial, as for managers.
+    {.plugin = "runtimes",
+     .action = "dotnet",
+     .adapt = parse_runtimes_dotnet_output,
+     .accept_partial = true,
+     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
+    {.plugin = "runtimes",
+     .action = "jvm",
+     .adapt = parse_runtimes_jvm_output,
+     .accept_partial = true,
+     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
 };
 
 } // namespace
@@ -514,6 +529,58 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
         e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
         e.kind = "app";
         e.ecosystem = "python";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
+AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPolicy policy) {
+    // dotnet|<flavour>|<version or ->|<install_path or ->|<vendor or -> (runtimes plugin: runtime
+    // /sdk/netfx on Windows, core/sdk/unmodelled on Linux and macOS). Same shape and escape-aware
+    // split as the python adapter; the vendor column is dropped, the publisher is always Microsoft.
+    return adapt_pkg_inventory(out, "dotnet",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "dotnet" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        if (tok[1] == "runtime" || tok[1] == "core")
+            e.name = ".NET Runtime";
+        else if (tok[1] == "sdk")
+            e.name = ".NET SDK";
+        else if (tok[1] == "netfx")
+            e.name = ".NET Framework";
+        else
+            e.name = ".NET";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = "Microsoft";
+        e.kind = "app";
+        e.ecosystem = "dotnet";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
+AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy policy) {
+    // jvm|<flavour>|<version or ->|<install_path or ->|<vendor or ->. The vendor is the release
+    // file's IMPLEMENTOR, free text the producer escapes, so the split is escape-aware; the vendor
+    // is clamped and stored as the publisher.
+    return adapt_pkg_inventory(out, "jvm",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "jvm" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        if (tok[1] == "jdk")
+            e.name = "Java JDK";
+        else if (tok[1] == "jre")
+            e.name = "Java JRE";
+        else
+            e.name = "Java";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = tok[4] == "-" ? std::string{} : clamp_field(tok[4], kMaxFieldLen);
+        e.kind = "app";
+        e.ecosystem = "jvm";
         entries.push_back(std::move(e));
         return true;
     }, policy, /*escaped=*/true);
@@ -728,8 +795,8 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 return skip(source + ":partial");
             }
             if (!rows.reason.empty())
-                spdlog::info("sync: {}.{} constrained ({}) — rows kept: the constraint names facts "
-                             "this row does not carry",
+                spdlog::info("sync: {}.{} constrained ({}) — rows kept: anything the read "
+                             "could not see is absent from this cycle's report",
                              row.plugin, row.action, rows.reason);
             for (auto& e : rows.entries) {
                 e.source = source;

@@ -259,7 +259,7 @@ Every per-device route is scoped to the device's management group (a global gran
 |---|---|---|
 | **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | `Infrastructure:Read`, scoped to the device |
 | **DEX** | Per-device DEX score + a summary of recent signal observations, with a link to the full DEX drill-down (which carries an *Application performance over time* panel — retained daily per-app-version CPU/memory from the central store, no live query, no `Execute`). | `GuaranteedState:Read`, scoped to the device. Signal-history view audited as `dex.device.view`; the app-perf panel audited as `dex.device.app_perf.view` (separate verb) |
-| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
+| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). The compliance tile is not shown as clean while any guard's ordering is uncertain or has an unreflected event: the tile counts them and the guard row carries an "ordering uncertain" marker. | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
 
 A device with zero reported guards renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
 

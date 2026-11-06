@@ -39,6 +39,44 @@
 ///  stays `pending` for the true leader (the duplicate send it may already
 ///  have made is absorbed by command_id dedup).
 ///
+///  R4 — REDELIVERY HORIZON (#3678). Effectively-once rests on the agent's dedup ring
+///  (WS-0, `CommandDedupStore`), which forgets a terminal command after
+///  `kAgentDedupRingRows` newer ones; a stable command_id re-sent AFTER that is a fresh claim
+///  and RE-EXECUTES. So a redrive is bounded by a COUNT of dispatches, not a clock. The counters
+///  (`Deps::dispatch_seq_fn`, `ExecutionTracker::current_dispatch_position`) are stamped on the
+///  row BEFORE its first attempt (`CommandOutboxStore::stamp_first_send`): the SHARED sequence, the
+///  stamping process's own unrecorded-dispatch count, and the leader epoch of the stamping term.
+///  A redrive's elapsed estimate is
+///      (shared_now - shared_stamp)  +  local
+///  where `local` is `unrecorded_now - unrecorded_stamp` when the stamp's epoch equals THIS term's
+///  epoch (same process, so the two local counts are comparable and the count can only have
+///  grown) and the reader's WHOLE `unrecorded_now` otherwise (a different process: the reader
+///  charges its whole unrecorded count, which includes failures that predate the stamp). Elapsed
+///  `>= redelivery_horizon_commands` dead-letters the row
+///  (`redelivery_horizon_exceeded`); a shared sequence BELOW the stamp (a restore, a lost-WAL
+///  failover) dead-letters it as `redelivery_sequence_regressed`. The local count is never summed
+///  into the shared one: they are on different scales.
+///
+///  Every unreadable-position, unwired-reader or failed-stamp case HOLDS the row (no send) -- the
+///  direction that cannot re-execute; an unreadable or unwired position also ends the tick. A
+///  stamp written by an attempt that provably reached no agent (`sent == 0` on a retry outcome) is
+///  cleared in the same fenced reschedule, so a row blocked only by an unreadable gate is never
+///  aged toward a dead-letter without having been sent. The horizon is
+///  `kMaxOutboxRedeliveryHorizonCommands` (`common/include/yuzu/command_replay_horizon.hpp`,
+///  static_asserted below the ring) and the constructor clamps any larger `Deps` value down to
+///  it. A dead-lettered row is NOT force-cancelled (`decline_or_cancel_exec` is not called): an
+///  earlier attempt may have reached agents and their responses may still be arriving.
+///
+///  The estimate is conservative in several ways that dead-letter a row EARLY (a fan-out push
+///  records one call per target; any principal's dispatches advance the shared term; every
+///  redrive that re-records its own id advances it; a reader in another term charges its whole
+///  unrecorded count, which never decays inside a process) and has residuals that can let a row go
+///  LATE (unrecorded dispatches made by a replica OTHER than the reader, or by an EARLIER
+///  PROCESS LIFETIME of the same replica -- a restart or a leader change -- are not in the
+///  reader's count; commands dispatched before the stamp but claimed by the agent after it are
+///  not counted). It is an estimate, not a proof: see the header comment of
+///  `command_replay_horizon.hpp`.
+///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
 /// historical discipline): a systemic transient gate/directory failure
 /// (`containment_unreadable` OR, WS-4 4.2b Task D, `route_unreadable` — a
@@ -57,10 +95,14 @@
 
 #include "dispatch_caller.hpp"          // DispatchCaller, ApprovalProvenance
 #include "dispatch_confined_arms.hpp"   // ConfinedDispatchOutcome
+#include "dispatch_position.hpp"         // DispatchPosition (#3678)
+
+#include <yuzu/command_replay_horizon.hpp> // kMaxOutboxRedeliveryHorizonCommands (#3678)
 
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -104,6 +146,10 @@ public:
                                              const std::string& plugin,
                                              const std::string& action)>;
 
+    /// #3678 (R4): the dispatch counters (`dispatch_position.hpp`), `nullopt` when they cannot be
+    /// read. server.cpp binds this to `ExecutionTracker::current_dispatch_position`.
+    using DispatchSeqFn = std::function<std::optional<DispatchPosition>()>;
+
     struct Deps {
         CommandOutboxStore* outbox{nullptr};          // required
         LeaderElector* leader{nullptr};               // required — supplies the fenced epoch
@@ -119,6 +165,13 @@ public:
         std::function<bool()> should_stop;
         int max_per_tick{100};
         std::chrono::seconds retry_backoff{std::chrono::seconds(30)};
+        /// R4 (#3678): REQUIRED and fail-closed -- an unset reader holds every occurrence
+        /// (never sends), exactly like an unset `arming_check` denies.
+        DispatchSeqFn dispatch_seq_fn;
+        /// R4: dispatch calls that may elapse between an occurrence's first send and a redrive.
+        /// The constructor clamps this into [1, kMaxOutboxRedeliveryHorizonCommands]; tests lower
+        /// it, nothing can raise it past the agent-ring-derived constant.
+        std::int64_t redelivery_horizon_commands{yuzu::kMaxOutboxRedeliveryHorizonCommands};
     };
 
     explicit CommandOutboxDelivery(Deps deps);
@@ -129,8 +182,16 @@ public:
     /// a defensive `epoch().has_value()` check bails if leadership is not held.
     void tick();
 
+    /// TEST-ONLY: the horizon in force after the constructor's clamp (#3678).
+    [[nodiscard]] std::int64_t redelivery_horizon_for_test() const noexcept {
+        return d_.redelivery_horizon_commands;
+    }
+
 private:
     void deliver(const OutboxCommand& c, const std::string& lock_name, std::int64_t epoch);
+    /// R4 (#3678): record a HOLD (no send, no fail, no reschedule). `systemic` also ends the
+    /// current tick via `hold_remaining_`.
+    void hold_row(const OutboxCommand& c, const char* cause, bool systemic);
     void audit(const OutboxCommand& c, const std::string& result, const std::string& detail);
 
     /// governance Gate 4+ systematic fix (unhappy-path BLOCKING finding, then
@@ -184,6 +245,8 @@ private:
     void count_cause(const char* name, const char* cause);
 
     Deps d_;
+    /// Set by `hold_row(systemic)` and read by `tick()`; both run on the one delivery thread.
+    bool hold_remaining_{false};
 };
 
 } // namespace yuzu::server

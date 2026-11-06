@@ -4,6 +4,7 @@
 /// (crypto_library_model.hpp); the read itself behind the `CryptoApi` seam.
 
 #include "crypto_routes.hpp"
+#include "model_param_helpers.hpp"
 
 #include "app_shell.hpp"
 #include "body_cap_policy.hpp" // the pre-routing twin of kLayoutBodyMaxBytes (static_assert below)
@@ -120,7 +121,7 @@ void soften_gate_denial(const httplib::Request& req, httplib::Response& res, boo
         }
         // A devices request that parses retries itself (a continuation row, or the first-page
         // drill into its own box); one that does not has nothing to retry.
-        const auto q = cl::parse_devices_params(req.params);
+        const auto q = cl::parse_devices_params(model_detail::to_params(req.params));
         if (row)
             send_html(res, q ? crypto_html::render_unavailable_row(
                                    "Crypto library devices", crypto_html::devices_page_url(*q),
@@ -336,7 +337,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, crypto_html::render_summary_unavailable("Crypto library data"));
             return;
         }
-        const auto parsed = cl::parse_summary_params(req.params);
+        const auto parsed = cl::parse_summary_params(model_detail::to_params(req.params));
         if (!parsed) {
             send_html(res, crypto_html::render_summary_caveat(parsed.error()));
             return;
@@ -388,7 +389,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // audit-loss notice when the failure row did not persist.
         auto fail_unavailable = [&](CryptoReadCause cause = CryptoReadCause::kStoreDegraded,
                                     std::string prefix = {}) {
-            const auto q = cl::parse_devices_params(req.params);
+            const auto q = cl::parse_devices_params(model_detail::to_params(req.params));
             if (row)
                 send_html(res, std::move(prefix) +
                                    (q ? crypto_html::render_unavailable_row(
@@ -410,7 +411,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             fail_unavailable();
             return;
         }
-        const auto parsed = cl::parse_devices_params(req.params);
+        const auto parsed = cl::parse_devices_params(model_detail::to_params(req.params));
         if (!parsed) {
             fail_note(parsed.error());
             return;
@@ -632,7 +633,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session)
             return;
         const bool row = is_ca_continuation(req);
-        const auto parsed = cw::parse_cert_params(req.params);
+        const auto parsed = cw::parse_cert_params(model_detail::to_params(req.params));
         const std::string retry = parsed ? crypto_html::ca_certificates_url(*parsed) : std::string{};
         switch (ca_drill_gate(deps_, req, res)) {
         case CaGateOutcome::kAdmitted:
@@ -706,7 +707,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             rest_error(res, 503, "service unavailable");
             return;
         }
-        const auto parsed = cl::parse_summary_params(req.params);
+        const auto parsed = cl::parse_summary_params(model_detail::to_params(req.params));
         if (!parsed) {
             rest_error(res, 400, parsed.error());
             return;
@@ -751,7 +752,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             rest_error(res, 503, "service unavailable");
             return;
         }
-        const auto parsed = cl::parse_summary_params(req.params);
+        const auto parsed = cl::parse_summary_params(model_detail::to_params(req.params));
         if (!parsed) {
             rest_error(res, 400, parsed.error());
             return;
@@ -807,7 +808,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             rest_error(res, 503, "service unavailable");
             return;
         }
-        const auto parsed = cl::parse_devices_params(req.params);
+        const auto parsed = cl::parse_devices_params(model_detail::to_params(req.params));
         if (!parsed) {
             rest_error(res, 400, parsed.error());
             return;
