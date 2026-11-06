@@ -4,10 +4,11 @@
  * Two layers:
  *   - unwired-dependency shapes (no Postgres): every route answers a 503 A4 envelope;
  *   - [pg][routes] over a REAL AuthRoutes gate (RbacStorePg, ManagementGroupStorePg, ApiTokenStorePg)
- *     and the real settings and plugin-config stores: the global grant, the group-scoped
- *     ITServiceOwner fallback (parent grant reaches the child, never a sibling or the root), the
- *     503-versus-403 split on an unavailable RBAC read, the MCP-tier and service-scoped token
- *     exclusions, audit ordering, 409 bodies, and the host route over the pure resolver.
+ *     and the real settings and plugin-config stores: the global grant as the only authority (a
+ *     group-scoped role assignment, a plain, MCP-tier or service-scoped token without the grant is
+ *     refused on every route), the re-check ahead of the write, the 503-versus-403 split on an
+ *     unavailable RBAC read, audit ordering, 409 bodies, the store-error mapping, and the host
+ *     route over the pure resolver.
  */
 
 #include "auth_routes.hpp"
@@ -39,6 +40,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -160,6 +162,7 @@ struct RoutesRig {
     std::unique_ptr<AuthRoutes> ar;
     std::vector<AuditRow> audit;
     bool audit_ok{true};
+    std::function<void(const AuditRow&)> on_audit; // runs once a row is stored
     SoftwareCollectionSettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
@@ -233,12 +236,13 @@ struct RoutesRig {
                     if (!audit_ok)
                         return false;
                     audit.push_back({action, result, tt, tid, detail});
+                    if (on_audit)
+                        on_audit(audit.back());
                     return true;
                 },
                 .store = settings_store,
                 .mgmt_store = &mgmt,
                 .plugin_config_store = plugins.get(),
-                .rbac_store = &rbac,
             });
     }
 
@@ -255,13 +259,6 @@ struct RoutesRig {
     std::unordered_map<std::string, std::string> global_admin() {
         auto h = cookie("boss", auth::Role::user);
         REQUIRE(rbac.assign_role({"user", "boss", "Administrator"}).has_value());
-        return h;
-    }
-    // A user whose only authority is an ITServiceOwner row on `group`.
-    std::unordered_map<std::string, std::string> group_owner(const std::string& user,
-                                                              const std::string& group) {
-        auto h = cookie(user);
-        REQUIRE(mgmt.assign_role({group, "user", user, "ITServiceOwner"}).has_value());
         return h;
     }
 
@@ -502,190 +499,97 @@ TEST_CASE("collection settings PUT: a COMMIT that does not confirm is a 503 outc
     CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
 }
 
-TEST_CASE("collection settings PUT: an engine session never gets the group fallback",
+TEST_CASE("collection settings routes: a caller without the global grant is refused on every route",
           "[pg][routes][collection_settings]") {
     RoutesRig rig;
-    rig.group_owner("gowner", rig.group_p);
-    bool engine = false;
-    yuzu::server::test::TestRouteSink sink;
-    SoftwareCollectionSettingsRoutes routes;
-    routes.register_routes(
-        sink,
-        SoftwareCollectionSettingsRoutes::Deps{
-            .auth_fn = [&](const httplib::Request&,
-                           httplib::Response&) -> std::optional<auth::Session> {
-                auth::Session s;
-                s.username = "gowner";
-                if (engine)
-                    s.principal_kind = "engine";
-                return s;
-            },
-            .perm_fn = [](const httplib::Request&, httplib::Response& res, const std::string&,
-                          const std::string&) {
-                res.status = 403;
-                return false;
-            },
-            // The global probe refuses (no grant), as the real gate does for this identity.
-            .probe_perm_fn = [](const httplib::Request&, httplib::Response& res,
-                                const std::string&, const std::string&) {
-                res.status = 403;
-                return false;
-            },
-            .scoped_perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                                 const std::string&, const std::string&) { return true; },
-            .audit_fn = {},
-            .store = rig.store.get(),
-            .mgmt_store = &rig.mgmt,
-            .plugin_config_store = rig.plugins.get(),
-            .rbac_store = &rig.rbac,
-        });
-    const auto path = rig.doc_path(rig.group_c);
-    // Control: the same identity as a human session is admitted by the ancestor walk.
-    auto human = sink.dispatch("PUT", path, put_body(7200));
-    REQUIRE(human != nullptr);
-    CHECK(human->status == 200);
-    const auto cv = rig.store->get(rig.group_c)->value().version;
-    engine = true;
-    auto eng = sink.dispatch("PUT", path, put_body(9000, 0, cv));
-    REQUIRE(eng != nullptr);
-    CHECK(eng->status == 403);
-    CHECK(rig.store->get(rig.group_c)->value().settings.interval_s == 7200);
+    const auto boss = rig.global_admin();
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
+    const auto version = rig.store->get(rig.group_p)->value().version;
+    // An ITServiceOwner row on P (no route authors one; the store can) carries no authority here.
+    REQUIRE(rig.mgmt.assign_role({rig.group_p, "user", "gowner", "ITServiceOwner"}).has_value());
+    const auto expiry = now_secs() + 3600;
+    const auto owner = rig.cookie("gowner");
+    auto plain = rig.api_tokens->create_token("plain", "gowner", expiry);
+    auto mcp = rig.api_tokens->create_token("mcp", "gowner", expiry, "", "readonly");
+    auto svc = rig.api_tokens->create_token("svc", "gowner", expiry, "billing");
+    REQUIRE(plain.has_value());
+    REQUIRE(mcp.has_value());
+    REQUIRE(svc.has_value());
+    const std::vector<std::pair<std::string, std::unordered_map<std::string, std::string>>> callers{
+        {"group owner session", owner},
+        {"plain token", rig.bearer(*plain)},
+        {"MCP-tier token", rig.bearer(*mcp)},
+        {"service-scoped token", rig.bearer(*svc)},
+        {"no grant at all", rig.cookie("nobody")}};
+    for (const auto& [who, h] : callers) {
+        INFO(who);
+        rig.audit.clear();
+        CHECK(rig.call("GET", "/api/v1/inventory/software/collection-settings", h)->status == 403);
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), h)->status == 403);
+        CHECK(rig.call("GET", rig.doc_path(rig.group_c), h)->status == 403);
+        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), h, put_body(9000, 0, version))->status ==
+              403);
+        CHECK(rig.call("PUT", rig.doc_path(rig.group_c), h, put_body(9000))->status == 403);
+        CHECK(rig.call("PUT", rig.doc_path(rig.root), h, put_body(9000))->status == 403);
+        // Every per-group refusal leaves its own denied row; nothing is requested.
+        CHECK(rig.audit_count("requested") == 0);
+        CHECK(rig.audit_count("denied") == 5);
+    }
+    CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
+    CHECK_FALSE(rig.store->get(rig.group_c)->has_value());
+    CHECK_FALSE(rig.store->get(rig.root)->has_value());
 }
 
-TEST_CASE("collection settings PUT: the real gate admits a group owner on the group and below only",
+TEST_CASE("collection settings PUT: a fleet administrator writes any group, the root and a priority",
           "[pg][routes][collection_settings]") {
     RoutesRig rig;
-    const auto owner = rig.group_owner("gadmin", rig.group_p);
     const auto boss = rig.global_admin();
-
-    // Control: a parent grant reaches the parent and its child through the walk.
-    auto on_parent = rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(7200));
-    CHECK(on_parent->status == 200);
-    CHECK_FALSE(rig.parse(*on_parent).contains("error")); // the throwaway probe left no body behind
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), owner, put_body(7200))->status == 200);
-    // Never a sibling branch and never the root.
-    rig.audit.clear();
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_s), owner, put_body(7200))->status == 403);
-    CHECK(rig.call("PUT", rig.doc_path(rig.root), owner, put_body(7200))->status == 403);
-    CHECK(rig.audit_count("denied") == 2);
-    CHECK_FALSE(rig.store->get(rig.group_s)->has_value());
-    CHECK_FALSE(rig.store->get(rig.root)->has_value());
-    // A priority change needs the global grant, whatever the expected version says.
-    const auto cv = rig.store->get(rig.group_c)->value().version;
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), owner, put_body(7200, 5, "none"))->status ==
-          403);
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), owner, put_body(7200, 5, cv))->status == 403);
-    CHECK(rig.store->get(rig.group_c)->value().settings.priority == 0);
-
-    // The global grant is admitted everywhere, including the root and a priority.
     CHECK(rig.call("PUT", rig.doc_path(rig.group_s), boss, put_body(7200))->status == 200);
     CHECK(rig.call("PUT", rig.doc_path(rig.root), boss, put_body(7200))->status == 200);
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), boss, put_body(7200, 5, cv))->status == 200);
-    // A user with no authority at all.
-    const auto nobody = rig.cookie("nobody");
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_p), nobody, put_body(9000))->status == 403);
-}
-
-TEST_CASE("collection settings PUT: an omitted priority keeps the stored one for a group owner",
-          "[pg][routes][collection_settings]") {
-    RoutesRig rig;
-    const auto owner = rig.group_owner("gadmin", rig.group_p);
-    const auto boss = rig.global_admin();
-    const auto path = rig.doc_path(rig.group_c);
-    const auto no_priority = [](const std::string& expected) {
-        auto b = json::parse(put_body(9000, 0, expected));
-        b.erase("priority");
-        return b.dump();
-    };
-    REQUIRE(rig.call("PUT", path, boss, put_body(7200, 5))->status == 200);
-    auto cv = rig.store->get(rig.group_c)->value().version;
-
-    SECTION("omitted: the owner's write lands with the stored priority") {
-        auto res = rig.call("PUT", path, owner, no_priority(cv));
-        REQUIRE(res->status == 200);
-        CHECK(rig.parse(*res)["data"]["priority"] == 5);
-        const auto stored = rig.store->get(rig.group_c)->value();
-        CHECK(stored.settings.priority == 5);
-        CHECK(stored.settings.interval_s == 9000);
-    }
-    SECTION("the same value echoed back is admitted") {
-        CHECK(rig.call("PUT", path, owner, put_body(9000, 5, cv))->status == 200);
-        CHECK(rig.store->get(rig.group_c)->value().settings.priority == 5);
-    }
-    SECTION("an explicit different value is a 403 that says how to keep it") {
-        auto res = rig.call("PUT", path, owner, put_body(9000, 0, cv));
-        CHECK(res->status == 403);
-        CHECK(res->body.find("omit priority to keep the stored value") != std::string::npos);
-        CHECK(rig.audit.back().result == "denied");
-        CHECK(rig.audit.back().detail == "priority change needs the global grant");
-        CHECK(rig.store->get(rig.group_c)->value().settings.interval_s == 7200);
-    }
-    SECTION("omitted on a group with no document: priority 0") {
-        const auto pv = rig.call("PUT", rig.doc_path(rig.group_p), owner, no_priority("none"));
-        REQUIRE(pv->status == 200);
-        CHECK(rig.store->get(rig.group_p)->value().settings.priority == 0);
-    }
-    SECTION("the global grant replaces the whole document: omitted is 0") {
-        REQUIRE(rig.call("PUT", path, boss, no_priority(cv))->status == 200);
-        CHECK(rig.store->get(rig.group_c)->value().settings.priority == 0);
-    }
-}
-
-TEST_CASE("collection settings PUT: tokens the permission gate refuses never get the group fallback",
-          "[pg][routes][collection_settings]") {
-    RoutesRig rig;
-    rig.group_owner("gowner", rig.group_p);
-    const auto expiry = now_secs() + 3600;
-
-    auto plain = rig.api_tokens->create_token("plain", "gowner", expiry);
-    REQUIRE(plain.has_value());
-    // Control: an ordinary token of the same user is admitted by the walk.
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), rig.bearer(*plain), put_body(7200))->status ==
-          200);
-
-    auto mcp = rig.api_tokens->create_token("mcp", "gowner", expiry, "", "readonly");
-    REQUIRE(mcp.has_value());
-    const auto mcp_session = rig.ar->resolve_session([&] {
-        httplib::Request r;
-        r.headers.emplace("Authorization", "Bearer " + *mcp);
-        return r;
-    }());
-    REQUIRE(mcp_session.has_value());
-    REQUIRE_FALSE(mcp_session->mcp_tier.empty());
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_c), boss, put_body(7200, 5))->status == 200);
     const auto cv = rig.store->get(rig.group_c)->value().version;
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), rig.bearer(*mcp), put_body(9000, 0, cv))
-              ->status == 403);
+    // A full replace: the body's priority, and an omitted priority is 0.
+    auto b = json::parse(put_body(9000, 0, cv));
+    b.erase("priority");
+    auto res = rig.call("PUT", rig.doc_path(rig.group_c), boss, b.dump());
+    REQUIRE(res->status == 200);
+    CHECK(rig.parse(*res)["data"]["priority"] == 0);
+    CHECK(rig.store->get(rig.group_c)->value().settings.priority == 0);
+}
 
-    auto svc = rig.api_tokens->create_token("svc", "gowner", expiry, "billing");
-    REQUIRE(svc.has_value());
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), rig.bearer(*svc), put_body(9000, 0, cv))
-              ->status == 403);
-    CHECK(rig.store->get(rig.group_c)->value().settings.interval_s == 7200);
+TEST_CASE("collection settings PUT: a grant revoked behind the requested row refuses the write",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    REQUIRE(rig.rbac.create_role({.name = "SettingsWriter", .description = "d"}).has_value());
+    for (const char* op : {"Read", "Write"})
+        REQUIRE(rig.rbac.set_permission({"SettingsWriter", "ManagementGroup", op, "allow"})
+                    .has_value());
+    const auto writer = rig.cookie("writer");
+    REQUIRE(rig.rbac.assign_role({"user", "writer", "SettingsWriter"}).has_value());
+    // Control: the grant admits.
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), writer, put_body(7200))->status == 200);
+    const auto version = rig.store->get(rig.group_p)->value().version;
+
+    rig.audit.clear();
+    bool revoked = false;
+    rig.on_audit = [&](const AuditRow& a) {
+        if (a.result == "requested" && !revoked)
+            revoked = rig.rbac.remove_permission("SettingsWriter", "ManagementGroup", "Write")
+                          .has_value();
+    };
+    auto res = rig.call("PUT", rig.doc_path(rig.group_p), writer, put_body(9000, 0, version));
+    CHECK(revoked);
+    CHECK(res->status == 403);
+    CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
+    REQUIRE(rig.audit.size() == 2);
+    CHECK(rig.audit[0].result == "requested");
+    CHECK(rig.audit[1].result == "denied");
+    CHECK(rig.audit[1].detail == "global grant withdrawn ahead of the write");
 }
 
 TEST_CASE("collection settings PUT: an unavailable authority read is a 503, never a 403 or an admit",
           "[pg][routes][collection_settings]") {
     RoutesRig rig;
-    rig.group_owner("gadmin", rig.group_p);
-
-    SECTION("the group hierarchy read") {
-        TableFault fault{rig.mgmt_bundle.dsn(), "management_group_store.management_groups"};
-        fault.arm();
-        rig.audit.clear();
-        auto res = rig.call("PUT", rig.doc_path(rig.group_c), rig.cookie("gadmin2"), put_body());
-        CHECK(res->status == 503);
-        CHECK(rig.audit_count("denied") == 1);
-        CHECK(rig.audit_count("requested") == 0);
-    }
-    SECTION("the role assignment read") {
-        // The ancestor read works; the batched assignments read fails.
-        TableFault fault{rig.mgmt_bundle.dsn(), "management_group_store.management_group_roles"};
-        fault.arm();
-        auto res = rig.call("PUT", rig.doc_path(rig.group_c), rig.cookie("gadmin3"), put_body());
-        CHECK(res->status == 503);
-        fault.repair();
-        CHECK_FALSE(rig.store->get(rig.group_c)->has_value());
-    }
     SECTION("an unavailable RBAC read answers 503 from the unavailable-aware probe") {
         // A cold replica of the RBAC store whose role read is broken.
         PgPool replica_pool{{.conninfo = rig.rbac_bundle.dsn(), .size = 1}};
@@ -731,63 +635,17 @@ TEST_CASE("collection settings PUT: an unavailable authority read is a 503, neve
         REQUIRE(res->headers.count("X-Correlation-Id") == 1);
         CHECK(json::parse(res->body)["error"]["correlation_id"] ==
               res->get_header_value("X-Correlation-Id"));
-    }
-}
-
-TEST_CASE("collection settings routes: the group fallback honours the ITServiceOwner role grant",
-          "[pg][routes][collection_settings]") {
-    RoutesRig rig;
-    const auto owner = rig.group_owner("gadmin", rig.group_p);
-    const auto boss = rig.global_admin();
-    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
-    const auto version = rig.store->get(rig.group_p)->value().version;
-
-    SECTION("the seeded grant admits the owner") {
-        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 200);
-        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version))
-                  ->status == 200);
-    }
-    SECTION("a revoked Write grant refuses the PUT and leaves the read") {
-        REQUIRE(rig.rbac.remove_permission("ITServiceOwner", "ManagementGroup", "Write")
-                    .has_value());
-        rig.audit.clear();
-        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version))
-                  ->status == 403);
-        CHECK(rig.audit_count("denied") == 1);
-        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
-        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 200);
-    }
-    SECTION("a revoked Read grant refuses the GET") {
-        REQUIRE(rig.rbac.remove_permission("ITServiceOwner", "ManagementGroup", "Read")
-                    .has_value());
-        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 403);
-    }
-    SECTION("a deny row on the role refuses both") {
-        for (const char* op : {"Read", "Write"})
-            REQUIRE(rig.rbac.set_permission({"ITServiceOwner", "ManagementGroup", op, "deny"})
-                        .has_value());
-        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 403);
-        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version))
-                  ->status == 403);
-        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
-        // The global grant does not pass through the role read.
-        CHECK(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(9000, 0, version))
-                  ->status == 200);
-    }
-    SECTION("an unavailable role grant read is a 503, never an admit") {
-        TableFault fault{rig.rbac_bundle.dsn(), "rbac_store.role_permissions"};
-        fault.arm();
-        auto res = rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(9000, 0, version));
-        CHECK(res->status == 503);
-        fault.repair();
-        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
+        auto read = degraded_sink.dispatch("GET", rig.doc_path(rig.group_c), "",
+                                           "application/json", headers);
+        REQUIRE(read != nullptr);
+        CHECK(read->status == 503);
     }
 }
 
 TEST_CASE("collection settings GET: list and per-group reads", "[pg][routes][collection_settings]") {
     RoutesRig rig;
     const auto boss = rig.global_admin();
-    const auto owner = rig.group_owner("gadmin", rig.group_p);
+    const auto outsider = rig.cookie("nobody");
     REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
     const std::string list_path = "/api/v1/inventory/software/collection-settings";
 
@@ -800,14 +658,14 @@ TEST_CASE("collection settings GET: list and per-group reads", "[pg][routes][col
               "e27b0298c4ad0aabc3963e6dfa2ca5a3d60b687fa15315557385a020816d1696");
         REQUIRE(body["data"]["documents"].size() == 1);
         CHECK(body["data"]["documents"][0]["group_id"] == rig.group_p);
-        CHECK(rig.call("GET", list_path, owner)->status == 403);
+        CHECK(rig.call("GET", list_path, outsider)->status == 403);
     }
-    SECTION("a group owner reads the branch they govern, an outsider does not") {
+    SECTION("the global grant reads any group, an outsider none") {
         rig.audit.clear();
-        CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 200);
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), boss)->status == 200);
         CHECK(rig.audit.empty()); // a served read writes no row
-        CHECK(rig.call("GET", rig.doc_path(rig.group_s), owner)->status == 403);
-        CHECK(rig.call("GET", rig.doc_path(rig.group_p), rig.cookie("nobody"))->status == 403);
+        CHECK(rig.call("GET", rig.doc_path(rig.group_s), outsider)->status == 403);
+        CHECK(rig.call("GET", rig.doc_path(rig.group_p), outsider)->status == 403);
         // Each cookie-session refusal leaves the route's own denied row (the quiet probe
         // withholds its row for a cookie session).
         REQUIRE(rig.audit.size() == 2);
@@ -819,8 +677,8 @@ TEST_CASE("collection settings GET: list and per-group reads", "[pg][routes][col
         }
         CHECK(rig.audit[0].target_id == rig.group_s);
         CHECK(rig.audit[1].target_id == rig.group_p);
-        // A governed group with no document is a 404, not an empty 200.
-        CHECK(rig.call("GET", rig.doc_path(rig.group_c), owner)->status == 404);
+        // A group with no document is a 404, not an empty 200.
+        CHECK(rig.call("GET", rig.doc_path(rig.group_c), boss)->status == 404);
         // An unknown group the caller is globally entitled to read is a 404.
         CHECK(rig.call("GET", rig.doc_path("ffffffffffff"), boss)->status == 404);
         const auto doc = rig.parse(*rig.call("GET", rig.doc_path(rig.group_p), boss));
@@ -919,20 +777,6 @@ TEST_CASE("collection settings routes: a deleted group's document is not listed 
     CHECK(resolved["data"]["effective"]["interval_s"] == 7200);
 }
 
-TEST_CASE("collection settings routes: an owner of a descendant only is refused on the parent",
-          "[pg][routes][collection_settings]") {
-    RoutesRig rig;
-    const auto owner = rig.group_owner("cowner", rig.group_c);
-    rig.audit.clear();
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_p), owner, put_body(7200))->status == 403);
-    CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 403);
-    CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
-    CHECK(rig.audit_count("denied") == 2);
-    // The owner's own group: admitted for write and read.
-    CHECK(rig.call("PUT", rig.doc_path(rig.group_c), owner, put_body(7200))->status == 200);
-    CHECK(rig.call("GET", rig.doc_path(rig.group_c), owner)->status == 200);
-}
-
 TEST_CASE("collection settings PUT: a versioned write on a group with no document is a 409 with "
           "error.current null",
           "[pg][routes][collection_settings]") {
@@ -944,6 +788,9 @@ TEST_CASE("collection settings PUT: a versioned write on a group with no documen
     const auto body = rig.parse(*res);
     REQUIRE(body["error"].contains("current"));
     CHECK(body["error"]["current"].is_null());
+    // The answer says how to create, not to GET a document that does not exist.
+    CHECK(body["error"]["message"] == "no document exists for this group");
+    CHECK(body["error"]["remediation"] == "send expected_version none to create the document");
     CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
 }
 
@@ -1004,4 +851,117 @@ TEST_CASE("collection settings PUT: a timezone check that cannot run is a 503 an
     CHECK(rig.audit[0].result == "requested");
     CHECK(rig.audit[1].result == "failure");
     CHECK(rig.audit[1].detail == "store write failed");
+}
+
+TEST_CASE("collection settings routes: a stored version no caller can send back is a 503, not a wedge",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
+    REQUIRE(rig.mgmt.add_member(rig.group_p, "agent-1").has_value());
+    exec_sql(rig.settings_db.dsn(), "UPDATE software_collection_settings_store.settings SET "
+                                    "version = 'NOT-A-VERSION' WHERE group_id = '" +
+                                        rig.group_p + "'");
+    const auto permanent_503 = [&](const std::unique_ptr<httplib::Response>& res) {
+        CHECK(res->status == 503);
+        const auto e = rig.parse(*res)["error"];
+        CHECK(e["retry_after_ms"].is_null()); // a damaged row is not fixed by retrying
+        CHECK(e["remediation"].get<std::string>().find("operator action required") !=
+              std::string::npos);
+    };
+    permanent_503(rig.call("GET", rig.doc_path(rig.group_p), boss));
+    permanent_503(rig.call("GET", "/api/v1/inventory/software/collection-settings", boss));
+    permanent_503(
+        rig.call("GET", "/api/v1/inventory/software/hosts/agent-1/collection-settings", boss));
+    permanent_503(rig.call("PUT", rig.doc_path(rig.group_p), boss,
+                           put_body(9000, 0, std::string(64, 'a'))));
+    permanent_503(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(9000)));
+}
+
+TEST_CASE("collection settings routes: the row cap and a failed statement map to 503",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    const auto seed = [&](int from, int to) {
+        exec_sql(rig.settings_db.dsn(),
+                 "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
+                 "plugins_json, version, updated_at) SELECT 'cccc' || lpad(g::text, 8, '0'), "
+                 "86400, '{}', repeat('a', 64), 1 FROM generate_series(" +
+                     std::to_string(from) + ", " + std::to_string(to) + ") g");
+    };
+    SECTION("a create at the cap is refused for good; the list answers") {
+        seed(1, SoftwareCollectionSettingsStore::kListRowCap);
+        rig.audit.clear();
+        auto res = rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200));
+        CHECK(res->status == 503);
+        CHECK(rig.parse(*res)["error"]["retry_after_ms"].is_null());
+        CHECK(rig.parse(*res)["error"]["remediation"].get<std::string>().find(
+                  "operator action required") != std::string::npos);
+        REQUIRE(rig.audit.size() == 2);
+        CHECK(rig.audit[1].result == "failure");
+        CHECK(rig.audit[1].detail == "document cap reached");
+        CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
+        CHECK(rig.call("GET", "/api/v1/inventory/software/collection-settings", boss)->status ==
+              200);
+    }
+    SECTION("past the cap the list and the host route are 503 with no retry hint") {
+        seed(1, SoftwareCollectionSettingsStore::kListRowCap + 1);
+        for (const std::string path :
+             {"/api/v1/inventory/software/collection-settings",
+              "/api/v1/inventory/software/hosts/agent-1/collection-settings"}) {
+            INFO(path);
+            auto res = rig.call("GET", path, boss);
+            CHECK(res->status == 503);
+            CHECK(rig.parse(*res)["error"]["retry_after_ms"].is_null());
+        }
+    }
+    SECTION("a failed write statement is a retryable 503 and an audited failure") {
+        TableFault fault{rig.settings_db.dsn(), "software_collection_settings_store.settings_history"};
+        fault.arm();
+        rig.audit.clear();
+        auto res = rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200));
+        CHECK(res->status == 503);
+        CHECK(rig.parse(*res)["error"]["retry_after_ms"] == 2000);
+        REQUIRE(rig.audit.size() == 2);
+        CHECK(rig.audit[1].detail == "store write failed");
+        fault.repair();
+        CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
+    }
+}
+
+TEST_CASE("collection settings PUT: every body shape check answers 400",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    const auto path = rig.doc_path(rig.group_p);
+    const auto with = [](const char* key, const json& v) {
+        auto b = json::parse(put_body());
+        b[key] = v;
+        return b.dump();
+    };
+    auto no_interval = json::parse(put_body());
+    no_interval.erase("interval_s");
+    auto no_plugins = json::parse(put_body());
+    no_plugins.erase("plugins");
+    auto plugin_not_bool = json::parse(put_body());
+    plugin_not_bool["plugins"]["runtimes"] = 1;
+    std::string deep;
+    for (int i = 0; i < 200; ++i)
+        deep += "[";
+    for (int i = 0; i < 200; ++i)
+        deep += "]";
+    for (const std::string& body :
+         {no_interval.dump(), with("interval_s", "86400"), with("interval_s", 1.5),
+          with("interval_s", json(std::uint64_t{1} << 40)), with("window", json::array({60, 300})),
+          with("window", json{{"start_min", 60}}),
+          with("window", json{{"start_min", "60"}, {"end_min", 300}}),
+          with("window", json{{"start_min", 60}, {"end_min", 300}, {"x", 1}}), with("timezone", 1),
+          no_plugins.dump(), with("plugins", json::array()), plugin_not_bool.dump(),
+          with("priority", "5"), with("priority", 1.5), with("expected_version", 7),
+          std::string(R"({"interval_s":86400,"plugins":)") + deep + "}"}) {
+        INFO(body.substr(0, 120));
+        CHECK(rig.call("PUT", path, boss, body)->status == 400);
+    }
+    CHECK_FALSE(rig.store->get(rig.group_p)->has_value());
+    CHECK(rig.audit_count("requested") == 0);
 }

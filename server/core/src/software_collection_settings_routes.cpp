@@ -5,14 +5,12 @@
 
 #include "collection_settings_resolve.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth
-#include "rbac_store.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "rest_audit.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <expected>
 #include <limits>
 #include <map>
@@ -51,6 +49,13 @@ void unavailable(httplib::Response& res, std::string_view message) {
     fail(res, 503, message, {.retry_after_ms = 2000, .remediation = "retry the request"});
 }
 
+// A store condition a retry cannot clear (a damaged row, the document cap): no retry hint.
+void permanent(httplib::Response& res, std::string_view message) {
+    fail(res, 503, message,
+         {.remediation = "operator action required; retrying does not help (see the REST API "
+                         "manual, Software collection settings)"});
+}
+
 json window_json(const std::optional<cs::Window>& w) {
     return w ? json{{"start_min", w->start_min}, {"end_min", w->end_min}} : json(nullptr);
 }
@@ -77,72 +82,36 @@ json effective_json(const cs::EffectiveSettings& e) {
 // A store error that is not the caller's mistake: every kind but the ones a PUT maps itself.
 void store_unavailable(httplib::Response& res, const SettingsError& e) {
     if (e.kind == SettingsError::Kind::Corrupt)
-        unavailable(res, "a stored collection settings document is unreadable");
+        permanent(res, "a stored collection settings document is unreadable");
     else if (e.kind == SettingsError::Kind::TooMany)
-        unavailable(res, "too many collection settings documents to list");
+        permanent(res, "the collection settings document cap (20,000) is reached");
     else
         unavailable(res, "collection settings store unavailable");
 }
 
-enum class Authority { AdmitGlobal, AdmitGroup, Deny, Degraded };
+enum class Authority { Admit, Deny, Degraded };
 
-// Global ManagementGroup grant, else an ITServiceOwner row on the group or an ancestor while the
-// ITServiceOwner role grants the pair.
-// `op` is "Read" or "Write". The unavailable-aware probe runs into a THROWAWAY response so an
-// admit through the group walk never answers on a response the probe dirtied; a 503 from it (the
-// RBAC read could not be completed) is copied to `res` and ends the request, so an outage never
-// widens or silently narrows authority. The group walk is excluded for sessions the permission
-// gate would itself have refused: service-scoped, MCP-tier and engine sessions.
-Authority group_authority(const SoftwareCollectionSettingsRoutes::Deps& deps,
-                          const httplib::Request& req, httplib::Response& res,
-                          const auth::Session& session, const std::string& group_id,
-                          const char* op, bool needs_global) {
+// The global ManagementGroup grant is the only authority: settings are managed by fleet
+// administrators, and this build has no group-scoped delegation. `op` is "Read" or "Write". The
+// unavailable-aware probe runs into a THROWAWAY response: a refusal is answered by the route with
+// its own audited 403, and a 503 from it (the RBAC read could not be completed) is copied to `res`
+// and ends the request, so an outage is never read as a refusal or an admit.
+Authority global_authority(const SoftwareCollectionSettingsRoutes::Deps& deps,
+                           const httplib::Request& req, httplib::Response& res, const char* op) {
     httplib::Response probe; // throwaway
     if (deps.probe_perm_fn(req, probe, kGroupTargetType, op))
-        return Authority::AdmitGlobal;
-    if (probe.status == 503) {
-        res.status = probe.status;
-        res.body = probe.body;
-        // The probe minted its own correlation id and its body names it: that one replaces
-        // the id on `res`, so the response carries exactly one.
-        res.headers.erase("X-Correlation-Id");
-        for (const auto& [k, v] : probe.headers)
-            res.set_header(k, v);
-        return Authority::Degraded;
-    }
-    if (needs_global)
+        return Authority::Admit;
+    if (probe.status != 503)
         return Authority::Deny;
-    if (!session.token_scope_service.empty() || !session.mcp_tier.empty() || session.is_engine())
-        return Authority::Deny;
-    const auto ancestors = deps.mgmt_store->get_ancestor_ids(group_id);
-    if (!ancestors) {
-        unavailable(res, "management group hierarchy read unavailable");
-        return Authority::Degraded;
-    }
-    const auto rows = deps.mgmt_store->get_assignments_for_principal(session.username, {});
-    if (!rows) {
-        unavailable(res, "management group role read unavailable");
-        return Authority::Degraded;
-    }
-    const bool assigned = std::ranges::any_of(*rows, [&](const auto& r) {
-        return r.principal_type == "user" && r.principal_id == session.username &&
-               r.role_name == "ITServiceOwner" &&
-               (r.group_id == group_id ||
-                std::ranges::find(*ancestors, r.group_id) != ancestors->end());
-    });
-    if (!assigned)
-        return Authority::Deny;
-    // The assignment admits only as far as the role grants the pair: a removed grant or a deny
-    // row on ITServiceOwner refuses, and a read that cannot be completed is a 503.
-    const auto granted =
-        deps.rbac_store ? deps.rbac_store->role_permission_allowed_checked("ITServiceOwner",
-                                                                           kGroupTargetType, op)
-                        : std::expected<bool, std::string>{std::unexpected("rbac store unwired")};
-    if (!granted) {
-        unavailable(res, "role permission read unavailable");
-        return Authority::Degraded;
-    }
-    return *granted ? Authority::AdmitGroup : Authority::Deny;
+    res.status = probe.status;
+    res.body = probe.body;
+    // Each probe header replaces the same-named one on `res` (`set_header` appends): the probe
+    // minted its own correlation id and its body names it, so the response carries exactly one.
+    for (const auto& [k, v] : probe.headers)
+        res.headers.erase(k);
+    for (const auto& [k, v] : probe.headers)
+        res.set_header(k, v);
+    return Authority::Degraded;
 }
 
 // nullopt = not an integer, or out of int range.
@@ -166,7 +135,6 @@ struct ParsedPut {
     cs::CollectionSettings settings;
     std::optional<std::string> expected_version; // nullopt = create only
     std::string expected_text;                    // "none" or the 64-hex, for the audit row
-    bool priority_given{false};                   // the body carried a `priority` key
 };
 
 std::expected<ParsedPut, std::string> parse_put(const std::string& body) {
@@ -221,7 +189,6 @@ std::expected<ParsedPut, std::string> parse_put(const std::string& body) {
         if (!priority)
             return Bad("priority must be an integer");
         out.settings.priority = *priority;
-        out.priority_given = true;
     }
     out.expected_text = "none";
     if (const auto ev = j.find("expected_version"); ev != j.end()) {
@@ -304,13 +271,11 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
              [deps, wired](const httplib::Request& req, httplib::Response& res) {
                  if (!wired(res, true))
                      return;
-                 const auto session = deps.auth_fn(req, res);
-                 if (!session)
+                 if (!deps.auth_fn(req, res))
                      return;
                  const std::string group_id = req.matches[1].str();
-                 switch (group_authority(deps, req, res, *session, group_id, "Read", false)) {
-                 case Authority::AdmitGlobal:
-                 case Authority::AdmitGroup:
+                 switch (global_authority(deps, req, res, "Read")) {
+                 case Authority::Admit:
                      break;
                  case Authority::Degraded:
                      return;
@@ -363,8 +328,7 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
             };
 
             const bool is_root = group_id == cs::kRootGroupId;
-            const Authority authority =
-                group_authority(deps, req, res, *session, group_id, "Write", is_root);
+            const Authority authority = global_authority(deps, req, res, "Write");
             if (authority == Authority::Degraded) {
                 (void)detail::try_persist_audit(deps.audit_fn, req, kVerbUpdate, "denied",
                                                 kGroupTargetType, group_id,
@@ -381,7 +345,7 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                 refuse(400, parsed_or.error(), parsed_or.error());
                 return;
             }
-            ParsedPut& parsed = *parsed_or;
+            const ParsedPut& parsed = *parsed_or;
             if (const auto ok = cs::validate(parsed.settings, is_root); !ok) {
                 refuse(400, ok.error(), ok.error());
                 return;
@@ -401,20 +365,6 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                 store_unavailable(res, stored.error());
                 return;
             }
-            const int stored_priority = *stored ? (*stored)->settings.priority : 0;
-            // Priority is outside a group owner's writable surface: an omitted one keeps the
-            // stored value, an explicit different one is refused.
-            if (!parsed.priority_given && authority == Authority::AdmitGroup)
-                parsed.settings.priority = stored_priority;
-            if (parsed.settings.priority != stored_priority &&
-                authority != Authority::AdmitGlobal) {
-                refuse(403,
-                       "changing the priority needs the global ManagementGroup:Write grant; omit "
-                       "priority to keep the stored value",
-                       "priority change needs the global grant");
-                return;
-            }
-
             const std::optional<cs::CollectionSettings> prior_settings =
                 *stored ? std::optional<cs::CollectionSettings>{(*stored)->settings}
                         : std::nullopt;
@@ -427,15 +377,31 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                      {.retry_after_ms = 5000});
                 return;
             }
-
-            const auto put = deps.store->put(group_id, parsed.settings, parsed.expected_version,
-                                             session->username);
             // The outcome row. A failed persist here cannot undo a landed write: the
             // Sec-Audit-Failed header carries the signal.
             const auto outcome = [&](const char* result, const std::string& text) {
                 (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, kVerbUpdate, result,
                                                     kGroupTargetType, group_id, text);
             };
+
+            // The grant again, immediately ahead of the write: a revoke that lands while the
+            // request waited on its reads and the requested row refuses it. The settings
+            // transaction cannot join the RBAC tables: a revoke landing between this check and
+            // the COMMIT is ordered behind the write (an accepted window of one store call).
+            switch (global_authority(deps, req, res, "Write")) {
+            case Authority::Admit:
+                break;
+            case Authority::Degraded:
+                outcome("denied", "authority read degraded");
+                return;
+            case Authority::Deny:
+                outcome("denied", "global grant withdrawn ahead of the write");
+                fail(res, 403, "forbidden");
+                return;
+            }
+
+            const auto put = deps.store->put(group_id, parsed.settings, parsed.expected_version,
+                                             session->username);
             if (put) {
                 outcome("success",
                         "before=" + one_line(put->previous ? std::optional<cs::CollectionSettings>{
@@ -455,8 +421,14 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                 outcome("failure", "version mismatch");
                 res.status = 409;
                 auto body = json::parse(
-                    detail::a4_error(res, "the stored document changed since the caller read it",
-                                     {.remediation = "GET the document and retry with its version"}));
+                    e.current
+                        ? detail::a4_error(res,
+                                           "the stored document changed since the caller read it",
+                                           {.remediation =
+                                                "GET the document and retry with its version"})
+                        : detail::a4_error(
+                              res, "no document exists for this group",
+                              {.remediation = "send expected_version none to create the document"}));
                 body["error"]["current"] = e.current ? document_json(*e.current) : json(nullptr);
                 res.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace),
                                 "application/json");
@@ -476,7 +448,9 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                      {.retry_after_ms = 2000, .remediation = "GET the document to verify"});
                 return;
             default:
-                outcome("failure", "store write failed");
+                outcome("failure", e.kind == SettingsError::Kind::Corrupt ? "stored document unreadable"
+                                   : e.kind == SettingsError::Kind::TooMany ? "document cap reached"
+                                                                            : "store write failed");
                 store_unavailable(res, e);
                 return;
             }

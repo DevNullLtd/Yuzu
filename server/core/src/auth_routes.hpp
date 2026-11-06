@@ -307,10 +307,11 @@ public:
     /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the consumers
     /// whose correctness depends on telling "could not determine" from "definitively denied": the
     /// Forensics-tier resolver (`resolve_forensics_visible`), where a collapsed answer would
-    /// silently serve a 200 with the Forensics rows missing, and the collection settings group
-    /// authority (`group_authority` in `software_collection_settings_routes.cpp`), where a
-    /// collapsed answer would read an RBAC outage as "no global grant" and decide through the
-    /// group-owner fallback instead of answering 503. A new caller needs the same justification;
+    /// silently serve a 200 with the Forensics rows missing, and the collection settings authority
+    /// (`global_authority` in `software_collection_settings_routes.cpp`), which writes its own
+    /// audited refusal and re-checks the write grant behind its `requested` audit row, where a
+    /// collapsed answer would record an RBAC outage as a refused or withdrawn grant instead of
+    /// answering 503. A new caller needs the same justification;
     /// do not switch `require_permission` itself (about a hundred routes document the 403).
     [[nodiscard]] bool probe_permission_unavailable_aware(const httplib::Request& req,
                                                           httplib::Response& res,

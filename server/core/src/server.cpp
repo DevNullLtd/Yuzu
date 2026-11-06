@@ -20198,8 +20198,10 @@ private:
         // Per-group software collection settings REST (SAM-34). Registered here, ahead of
         // rest_api_v1_->register_routes: httplib dispatches in registration order, and the bare
         // GET /api/v1/inventory/software/collection-settings would otherwise be taken by the
-        // generic GET /api/v1/inventory/{a}/{b}. The routes borrow three stores that outlive the
-        // web server (see stop()); the class holds no state of its own.
+        // generic GET /api/v1/inventory/{a}/{b}. The routes borrow three stores (settings,
+        // management groups, plugin config) and, through the probe lambda's `this`, auth_routes_;
+        // stop() joins the web thread ahead of resetting any of them, and the class holds no
+        // state of its own.
         {
             HttplibRouteSink collection_settings_sink{*web_server_};
             SoftwareCollectionSettingsRoutes{}.register_routes(
@@ -20218,7 +20220,6 @@ private:
                     .store = software_collection_settings_store_.get(),
                     .mgmt_store = mgmt_group_store_.get(),
                     .plugin_config_store = plugin_config_store_.get(),
-                    .rbac_store = rbac_store_.get(),
                 });
         }
 

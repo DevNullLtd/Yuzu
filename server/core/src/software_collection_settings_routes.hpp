@@ -8,19 +8,15 @@
 ///   PUT /api/v1/inventory/software/collection-settings/{group_id}
 ///   GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings
 ///
-/// The fleet list needs the global `ManagementGroup:Read` grant. A group's document is readable
-/// with that grant or as an ITServiceOwner of the group or any ancestor; it is written with the
-/// global `ManagementGroup:Write` grant or as an ITServiceOwner of the group or an ancestor, and the
-/// root group and any priority change need the global grant. The group fallback admits only while
-/// the ITServiceOwner role grants `ManagementGroup:Read`/`Write` (a removed grant or a deny row
-/// refuses; a role read that cannot be completed is a 503), and it never admits a
-/// service-scoped, MCP-tier or engine session (the MCP tier belt lives inside the permission gate,
-/// so a fallback must not re-admit what the gate refused). The host route resolves the effective
-/// settings of one device through the pure resolver (collection_settings_resolve.hpp) and is
-/// gated by the device-scoped `Inventory:Read`.
+/// Settings are managed by fleet administrators: the list and a group's document need the global
+/// `ManagementGroup:Read` grant, a write needs the global `ManagementGroup:Write` grant, and this
+/// build has no group-scoped delegation. An RBAC read that cannot be completed is a 503, never a
+/// 403 or an admit. The host route resolves the effective settings of one device through the pure
+/// resolver (collection_settings_resolve.hpp) and is gated by the device-scoped `Inventory:Read`.
 ///
-/// A PUT is audited ahead of the write (`requested`, fail-closed 503 when the row cannot be stored)
-/// and again with its outcome. Saving never triggers a collection: this class has no dispatch or
+/// A PUT is audited ahead of the write (`requested`, fail-closed 503 when the row cannot be stored),
+/// re-checks the write grant immediately ahead of the store call, and is audited again with its
+/// outcome. Saving never triggers a collection: this class has no dispatch or
 /// sync-runner dependency. Registered from server.cpp ahead of `RestApiV1::register_routes`, because
 /// the bare list path would otherwise be taken by the generic `GET /api/v1/inventory/{a}/{b}`.
 
@@ -38,8 +34,6 @@
 #include <string>
 
 namespace yuzu::server {
-
-class RbacStore;
 
 class SoftwareCollectionSettingsRoutes {
 public:
@@ -70,8 +64,6 @@ public:
         SoftwareCollectionSettingsStore* store{nullptr};  ///< borrowed; null answers 503
         ManagementGroupStore* mgmt_store{nullptr};        ///< borrowed; null answers 503
         PluginConfigStore* plugin_config_store{nullptr};  ///< borrowed; null answers 503
-        const RbacStore* rbac_store{nullptr}; ///< borrowed; the group fallback's role grant read,
-                                              ///< null answers 503 on that path
     };
 
     void register_routes(HttpRouteSink& sink, Deps deps);
