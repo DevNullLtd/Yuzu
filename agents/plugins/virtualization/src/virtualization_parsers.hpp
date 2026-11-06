@@ -633,8 +633,7 @@ inline bool cpuinfo_has_hypervisor_flag(std::string_view cpuinfo) {
 inline OsHint linux_os_hint(std::string_view sys_hypervisor_type, bool cpuinfo_flag) {
     OsHint h;
     std::string t = detail::lower(sys_hypervisor_type);
-    while (!t.empty() && (t.back() == '\n' || t.back() == ' ' || t.back() == '\r'))
-        t.pop_back();
+    t.erase(t.find_last_not_of(" \r\n") + 1);
     if (!t.empty()) {
         h.os_says_virtual = true;
         h.source = "sys_hypervisor";
