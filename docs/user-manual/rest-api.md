@@ -10099,7 +10099,8 @@ counts as disabled. This view instead reports the store error. If no row has eve
 reads `enabled: true`. Without `os` the route reports only the all-OS layer and never shows a per-OS
 OFF row. With `os`, `enabled` is the effective state of the two layers combined: the OS layer can
 narrow the all-OS layer but never widen it, and within the OS layer an `action@os` ON row overrides a
-`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row).
+`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row), and
+`reason`, `set_by` and `updated_at_ms` come from that same row.
 
 ```json
 {
@@ -10137,9 +10138,12 @@ not the effective state, in the same shape as the `GET` above.
 
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
-may not have been applied: read the switch back with the same `plugin`, `action` and `os`, and comparing `enabled`, `reason` and `updated_at_ms`
-with what you sent (the `GET` reports the effective state, and `source` names the row that produced the answer,
-which is not yours when another layer disables the switch), or repeat the `PUT`, which is safe to repeat), `503` (store
+may not have been applied: read the switch back with the same `plugin`, `action` and `os`. The write is
+confirmed when `source` names the row you wrote (`plugin`, `plugin.action`, with `@os` appended when `os`
+was set), `enabled` and `reason` match what you sent, and `updated_at_ms` is not earlier than your request.
+A different or empty `source` does not show whether the write applied, because the `GET` reports the
+effective state and takes `reason` and `updated_at_ms` from the row that decided it. In that case, or when
+in doubt, repeat the `PUT`, which is safe to repeat), `503` (store
 unavailable, or the audit row could not be saved).
 
 ---
