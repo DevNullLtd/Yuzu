@@ -34,6 +34,7 @@
 #include "pg_reachability_probe.hpp"
 #include "plugin_config_store.hpp"
 #include "principal_class.hpp"
+#include "raw_close_probe.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -2519,4 +2520,48 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     expect_security_headers(down);
     counted(10, "GET", 503);
 }
+
+#ifndef _WIN32
+TEST_CASE("health_routes: the plaintext redirect closes the connection after a request that "
+          "declares a body it never reads",
+          "[server][routes][health_routes][plaintext][live][bounds]") {
+    // From httplib 0.59 a response below 400 that leaves a declared request body unread must
+    // carry `Connection: close`. The probe is a raw socket on purpose:
+    // httplib::Client sends `Connection: close` itself and the server echoes it, and it sends
+    // `Expect: 100-continue` instead of a declared body of 1024 bytes or more once the early 301
+    // arrives, so a Client-based check passes with the server's own close removed. The raw probe
+    // sends no Connection header, asserts the 301 head carries `Connection: close`, and waits
+    // for EOF.
+    httplib::Server srv;
+    srv.set_read_timeout(30, 0);
+    health::install_plaintext_redirect_pre_routing(srv, "127.0.0.1", 8443);
+    const int port = srv.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { srv.listen_after_bind(); });
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            srv.wait_until_ready();
+            srv.stop();
+            th.join();
+        }
+    }};
+    srv.wait_until_ready();
+    REQUIRE(srv.is_running());
+
+    for (const auto& [name, request] :
+         {std::pair<const char*, std::string>{"chunked", yuzu::test::kChunkedPostRequest},
+          std::pair<const char*, std::string>{"content-length 64 MiB declared",
+                                              yuzu::test::kLengthPostRequest},
+          std::pair<const char*, std::string>{"empty then chunked Transfer-Encoding lines",
+                                              yuzu::test::kEmptyThenChunkedPostRequest}}) {
+        DYNAMIC_SECTION(name) {
+            const auto r = yuzu::test::probe_for_close(port, request);
+            INFO(r.head);
+            CHECK(r.head.starts_with("HTTP/1.1 301"));
+            CHECK(r.head.find("Connection: close") != std::string::npos);
+            CHECK(r.closed);
+        }
+    }
+}
+#endif // !_WIN32
 #endif // !YUZU_HEALTH_ROUTES_LIVE_TSAN

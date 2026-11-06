@@ -90,6 +90,7 @@ std::vector<UserSession> enumerate_users() {
         us.user = user;
         us.domain = domain.empty() ? "local" : domain;
         us.session_id = std::to_string(wts_sessions[i].SessionId);
+        us.disconnected = wts_sessions[i].State == WTSDisconnected;
 
         // Determine logon type from session name
         auto station_name = from_wide(wts_sessions[i].pWinStationName);

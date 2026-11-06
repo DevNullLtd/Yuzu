@@ -7,6 +7,8 @@
 //   3. the $Module schema is registered and self-consistent — every tier
 //      translates, is queryable, carries module_dir + signing, and has rollup SQL.
 
+#include "echo_fold.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_module_stream.hpp"
 #include "echo_schema_registry.hpp"
 
@@ -100,23 +102,29 @@ TEST_CASE("module_live carries the M1 columns including module_dir + signing",
     CHECK(has("is_kernel"));
 }
 
-TEST_CASE("$Module rollup SQL is defined for every aggregate tier", "[echo][module][schema]") {
+TEST_CASE("$Module is rolled up in every aggregate tier", "[echo][module][schema]") {
     for (const auto* tier : {"hourly", "daily", "monthly"}) {
         INFO("tier=" << tier);
-        auto sql = rollup_sql("module", tier);
-        REQUIRE_FALSE(sql.empty());
-        CHECK(sql.find("module_" + std::string(tier)) != std::string::npos);
-        CHECK(sql.find("load_count") != std::string::npos);
+        CHECK(is_fold_view(std::string{"module_"} + tier));
+        const auto cols = columns_for_table(std::string{"module_"} + tier);
+        CHECK(std::find(cols.begin(), cols.end(), "load_count") != cols.end());
     }
 }
 
-TEST_CASE("$Module hourly rollup counts the 'loaded' action token", "[echo][module][schema]") {
-    // Tie the rollup SQL's literal action predicate to the C++ token vocabulary,
-    // so renaming module_action_token(kLoaded) can't silently desync the count.
-    auto sql = rollup_sql("module", "hourly");
-    REQUIRE_FALSE(sql.empty());
-    CHECK(sql.find(std::string{"action = '"} +
-                   std::string{module_action_token(ModuleAction::kLoaded)} + "'") != std::string::npos);
+TEST_CASE("$Module counts the 'loaded' action token", "[echo][module][schema]") {
+    // Tie the delta's literal action vocabulary to the C++ token vocabulary, so renaming
+    // module_action_token(kLoaded) can't silently desync the count.
+    const auto* def = fold_source("module");
+    REQUIRE(def != nullptr);
+    ModuleRow loaded;
+    loaded.ts = 1793613600;
+    loaded.action = std::string{module_action_token(ModuleAction::kLoaded)};
+    loaded.module_name = "ntdll.dll";
+    TierAccumulator acc(*def);
+    module_delta({loaded}, acc);
+    const auto rows = acc.rows("hourly");
+    REQUIRE(rows.size() == 1);
+    CHECK(std::get<int64_t>(*acc.measure(rows[0], "load_count")) == 1);
 }
 
 TEST_CASE("module capture methods are pre-stageable while kPlanned", "[echo][module][schema]") {
