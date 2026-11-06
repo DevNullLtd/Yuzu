@@ -5550,6 +5550,7 @@ TEST_CASE("ScimRoutes: POST active:false with a healthy session store deactivate
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].result == "success");
     CHECK(rows[0].detail.find("sessions_db_error") == std::string::npos);
+    CHECK(rows[0].detail.find("session_leg_backstopped") == std::string::npos);
     CHECK(rows[0].detail.find("api_tokens_db_error") == std::string::npos);
     REQUIRE(h.calls.size() == 1);
     CHECK(h.calls[0] == std::vector<std::string>{"pia"});
@@ -5573,6 +5574,7 @@ TEST_CASE("ScimRoutes: POST active:false is NOT stranded by a failed session del
         REQUIRE(res);
         CHECK(res->status == 201);
         CHECK_FALSE(f.auth_mgr.get_user_role("quin").has_value()); // deactivated, not stranded
+        CHECK(durable_session_rows(f, "quin") == 0);
         const auto rows = provisioned_rows(f);
         REQUIRE(rows.size() == 1);
         CHECK(rows[0].result == "success");
@@ -5597,6 +5599,10 @@ TEST_CASE("ScimRoutes: POST active:false is NOT stranded by a failed session del
         CHECK(rows[0].result == "failure");
         CHECK(rows[0].detail.find("account deactivated; durable session wipe failed") !=
               std::string::npos);
+        // The revoke leg's own failure is on this refused row too, with the backstop marker (the
+        // backstop was relied on and then failed).
+        CHECK(rows[0].detail.find("sessions_db_error=true") != std::string::npos);
+        CHECK(rows[0].detail.find("session_leg_backstopped=true") != std::string::npos);
     }
 }
 
@@ -5622,6 +5628,40 @@ TEST_CASE("ScimRoutes: POST active:false still fails closed on the API-token leg
     CHECK(rows[0].result == "partial");
     CHECK(rows[0].detail.find("api_tokens_db_error=true") != std::string::npos);
     CHECK(rows[0].detail.find("sessions_db_error") == std::string::npos);
+    // The call was refused before the account removal: the account stays active and mapped (the
+    // documented create-inactive non-convergence: the IdP's retry meets 409).
+    CHECK(f.auth_mgr.get_user_role("sol").has_value());
+}
+
+// When the token leg refuses the call the backstop is never relied on, so the marker that means
+// "the account removal's own wipe is the backstop" must NOT be written on that `partial` row.
+TEST_CASE("ScimRoutes: POST active:false with BOTH legs failing is a partial that carries no "
+          "backstop marker (#4772)",
+          "[pg][scim][routes][adr2001][deprovision][sessions-persisted]") {
+    Fixture f;
+    f.use_session_store();
+    yuzu::server::pg::PgPool starved_pool{{.conninfo = f.auth_db.dsn(), .size = 1}};
+    ApiTokenStore starved_token_store{starved_pool};
+    REQUIRE(starved_token_store.is_open());
+    HookedScim h{f, /*throws=*/false, &starved_token_store};
+    auto hog = starved_pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog);
+    f.wipe_fault.arm();
+    auto res = h.send(f, "POST", "/scim/v2/Users",
+                      json{{"userName", "ula"}, {"active", false}}.dump());
+    f.wipe_fault.repair();
+    hog.reset();
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    // Only the token leg gates here, so the body names only it; the audit detail names both.
+    CHECK(res->body.find("failed to revoke API tokens for one or more linked identities") !=
+          std::string::npos);
+    const auto rows = provisioned_rows(f);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "partial");
+    CHECK(rows[0].detail.find("api_tokens_db_error=true") != std::string::npos);
+    CHECK(rows[0].detail.find("sessions_db_error=true") != std::string::npos);
+    CHECK(rows[0].detail.find("session_leg_backstopped") == std::string::npos);
 }
 
 // When BOTH credential legs fail, the 500 names both (it used to name only the API tokens), and the

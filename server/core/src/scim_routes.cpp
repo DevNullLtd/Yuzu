@@ -1705,7 +1705,8 @@ void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_
 ///    and the caller leaves the account untouched, so the IdP can retry and converge.
 ///  - `BackstoppedByAccountRemoval`: ONLY for SCIM create-inactive. The account was created or
 ///    revived a moment earlier under a fresh scim_id, so the principal set is the slug alone and
-///    holds no sessions of its own to revoke; the account removal that follows runs its own
+///    holds no sessions of its own to revoke (if a linked principal has appeared by the time the
+///    set is resolved, the gate reverts to `Required`: the backstop wipes the slug only); the account removal that follows runs its own
 ///    post-deactivation session wipe (`AuthManager::remove_user_checked`), which fails closed
 ///    (`RemoveUserOutcome::RemovedSessionWipeFailed` / `StoreFailure`). Failing here instead would
 ///    only strand a created-but-active account that the IdP's retry meets with a 409. The failure
@@ -1775,14 +1776,24 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
     // revoke, except where `session_gate` says the account removal that follows is the backstop
     // (SCIM create-inactive). A session row that did not delete survives and is rehydrated by
     // another replica (or after a restart), so the principal would stay signed in.
+    // The backstop is `remove_user_checked`, which wipes the LOCAL USERNAME's sessions only. It
+    // cannot cover a linked `oidc:`/`saml:` principal (a first SSO login can link a freshly
+    // created resource in the window before the principal set is resolved), so the carve-out
+    // holds only while the set is exactly that one principal; otherwise the session leg gates.
+    const SessionLegGate gate = (session_gate == SessionLegGate::BackstoppedByAccountRemoval &&
+                                 principals->size() == 1)
+                                    ? SessionLegGate::BackstoppedByAccountRemoval
+                                    : SessionLegGate::Required;
     DeprovisionRevokeResult gating = revoke_result;
-    if (session_gate == SessionLegGate::BackstoppedByAccountRemoval)
+    if (gate == SessionLegGate::BackstoppedByAccountRemoval)
         gating.sessions_persisted = true; // not what fails this call; still recorded below
     if (!revoke_result.api_tokens_persisted)
         detail_out += " api_tokens_db_error=true";
     if (!revoke_result.sessions_persisted) {
         detail_out += " sessions_db_error=true";
-        if (session_gate == SessionLegGate::BackstoppedByAccountRemoval)
+        // The marker means "the account removal's own wipe is the backstop for this", so it is
+        // written only when the call actually goes on to that removal, never on a refused call.
+        if (gate == SessionLegGate::BackstoppedByAccountRemoval && gating.all_persisted())
             detail_out += " session_leg_backstopped=true";
     }
     if (!gating.all_persisted()) {

@@ -133,6 +133,19 @@ struct DeprovisionRevokeResult {
         return api_tokens_persisted && sessions_persisted;
     }
 };
+// A new field changes the arity and fails this assert, forcing its author to read the note on
+// `all_persisted()` and fold the new leg into it and into `failed_legs_phrase()`.
+static_assert(
+    [] {
+        auto [revoked, tokens_ok, sessions_revoked, sessions_ok] = DeprovisionRevokeResult{};
+        (void)revoked;
+        (void)tokens_ok;
+        (void)sessions_revoked;
+        (void)sessions_ok;
+        return true;
+    }(),
+    "DeprovisionRevokeResult changed shape: fold the new credential leg into all_persisted() "
+    "and failed_legs_phrase()");
 
 /// Names the credential leg(s) that did not persist, for the operator-facing
 /// failure text: "API tokens", "sessions", or "API tokens and sessions".
