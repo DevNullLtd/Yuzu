@@ -236,6 +236,7 @@ Every enrolled agent reports identity attributes during registration and heartbe
 | `arch` | CPU architecture | `x86_64`, `aarch64` |
 | `os_version` | OS version string | `Windows 11 Pro 10.0.26200` |
 | `agent_version` | Running agent binary version | `0.9.3` |
+| `guardian_backend` | Guardian detection backend from the heartbeat: `legacy`, `spark`, `spark_failed`, `unwired`, or `null` when not reported (never assumed `legacy`). Served on the device REST and MCP surfaces (`GET /api/v1/devices[/{id}]`, `list_agents`, `get_agent_details`), not on the legacy `/api/agents` list | `legacy` |
 
 These fields are used by the [Scope Engine](scope-engine.md) for device targeting and by [Management Groups](management-groups.md) for access scoping.
 

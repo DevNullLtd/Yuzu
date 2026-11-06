@@ -58,7 +58,8 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
       `use-after-poison` before any test runs), so it needs the `x64-linux-asan` triplet
       built first; `triplets/x64-linux-asan.cmake`'s own header documents this.
 - [ ] **3. 3-OS matrix**, written concretely: per-OS `yuzu.guardian_backend` heartbeat tag +
-      `spark_running`/`spark_disabled` posture-key evidence captured, for:
+      `spark_running`/`spark_disabled` posture-key evidence captured (the tag is also visible as
+      `yuzu_fleet_guardian_backend{os,backend}` and the per-device `guardian_backend` field, #2240), for:
       - Linux - Service mechanism on spark; File/Registry unsupported (left unregistered, per
         `agent.cpp`'s per-mechanism factory pattern).
       - Windows - all three mechanisms armed (File/Registry/Service).
@@ -2470,10 +2471,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   this doc) rests on a code-reading assertion, not an auditor-checkable per-deployment
   signal. The wire-level tag already exists (`kGuardianBackendTag`/`yuzu.guardian_backend`,
   correctly distinguishing legacy vs. spark enforcement per agent) and is ingested
-  server-side into the per-agent `status_tags` map, but **no server code reads it** - no
-  REST field, no dashboard surface. Not specific to #2818 (it's a general PR-5-readiness
-  gap), so not filed as its own #2818-scoped issue; recorded here since several of this
-  PR's own non-blocking dispositions depend on it.
+  server-side into the per-agent `status_tags` map. **Resolved by #2240:** the server now reads
+  it (`AgentHealthStore::recompute_metrics` rolls it up as `yuzu_fleet_guardian_backend{os,backend}`)
+  and serves it per device as the nullable `guardian_backend` field on `GET /api/v1/devices[/{id}]`,
+  `list_agents` and `get_agent_details`. No alert rule ships; reading `legacy` fleet-wide is the
+  correct reading until `prefer_spark` is enabled. Not specific to #2818 (it was a general
+  PR-5-readiness gap), so not filed as its own #2818-scoped issue; recorded here since several of
+  this PR's own non-blocking dispositions depend on it.
 - **Baseline-persist signal emitted but unread (#4045, F14 precondition).** Same shape as the
   `yuzu.guardian_backend` gap above: `yuzu.guardian_baseline_persist_failures` is emitted on
   the heartbeat (Spark path only, cumulative, mixing retryable failures with permanent
@@ -2640,7 +2644,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two remaining pre-PR-5 GATING items
   from the PR-2d follow-ups (the three sre observability gaps; the
-  yuzu.guardian_backend server-side-reader gap), plus two items from #4045 (the fleet-visible
+  yuzu.guardian_backend server-side-reader gap, now resolved by #2240), plus two items from #4045 (the fleet-visible
   baseline-persist signal (F14 precondition, section 3a) and the missing
   remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
   recognition (C-1), is resolved by #5667 with residuals (a)-(d) carried in the C-1 bullet
@@ -2797,7 +2801,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 **#3416** (+#3415, #3485, #3486)
 - Detection signal: already shipped and live - per-OS `yuzu.guardian_backend` heartbeat tag +
   posture keys (`agent_registry.cpp:2124`/`:2296` computes `spark_failed_os`, confirmed in §2
-  criterion 3).
+  criterion 3); the tag is also rolled up as `yuzu_fleet_guardian_backend{os,backend}` (#2240).
 - Operator action: N/A - already mitigated by the above.
 - Compensating control: the shipped heartbeat/posture-key surface itself.
 - Owner / milestone: P4 lane; recheck cost at P4 start.
@@ -3248,7 +3252,7 @@ mode; `/etc/yuzu-agent/` has no such collision.
    (`agent.cpp:1254`) records `SparkAvailability::SparkDisabled`, and the `SparkDisabled` case
    of the backend-derivation log switch (`:1269–1272`) reports `detection backend = legacy`
    regardless of `prefer_spark`'s compiled-in value - SparkDisabled always means legacy,
-   unconditionally. Verify via the `yuzu.guardian_backend` heartbeat tag on the next beat.
+   unconditionally. Verify via the `yuzu.guardian_backend` heartbeat tag on the next beat (or the device's `guardian_backend` field, or `yuzu_fleet_guardian_backend{backend="legacy"}` after the next sweep).
 4. Confirm no spark state leaks: both sub-checks follow directly from step 2's
    `spark_engine_` staying null - with no `SparkEngine` instance, there is nothing to hold an
    armed subscription and nothing to drain an outbox from, by construction, not by a separate
