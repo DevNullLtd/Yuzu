@@ -3794,10 +3794,11 @@ test('plugin readme gate',
 #
 # TIMEOUT (#2340 PR-4): the harness now runs TWO full gates per invocation -
 # the shipped RULES/TESTS pair, then the marker-extracted yuzu-guardian-journal
-# group (CH-2 + CH-5-PROM) - each up to 4x120s (check + test + the canary's own
-# test + check) = 480s worst case, plus ~225s for the docker daemon probe and
-# pull ladder under the opt-in (0 under a native promtool). Worst case is
-# 225 + 480x2 = 1185s; 1500 keeps ~300s of margin over that, the same
+# group (CH-2 + CH-5-PROM) - each up to 120 + 240 + 240 + 120 (check + test +
+# the canary's own test + check; the two test calls were 120s until #7191)
+# = 720s worst case, plus ~225s for the docker daemon probe and pull ladder
+# under the opt-in (0 under a native promtool). Worst case is
+# 225 + 720x2 = 1665s; 2000 keeps ~335s of margin over that, the same
 # methodology run_promtool_tests.py's own pull_with_retry() comment uses for
 # its ladder ("must fit inside the timeouts that enclose it") - see that
 # comment for the full arithmetic and how it composes with the CI job's own
@@ -3806,7 +3807,7 @@ test('prometheus alert rules',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py')],
   suite: 'docs',
-  timeout: 1500,
+  timeout: 2000,
 )
 
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv
@@ -3867,7 +3868,8 @@ test('gateway private epmd selftest',
 # Timeout sized to the sweep's own worst-case ceiling, not typical runtime:
 # with both scenarios' alerts shipped (#2854 rung D) all 6 (scenario,
 # interval) measure() calls run for real -- pull ladder ~195s plus 6 x
-# (30s check + 90s test) = ~915s -- so 1200 keeps a real margin over that.
+# (30s check + 90s test) + the ~30s daemon probe = ~945s -- so 1200 keeps a
+# real margin over that.
 # A third sweep scenario adds another ~360s: re-derive, don't inherit.
 test('audit retention alert coverage manifest',
   _python3_test,
