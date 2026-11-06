@@ -60,6 +60,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
+#include "guardian_drift_event.hpp" // guardian_event_refused_by_server
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "guardian_spark_timing.hpp" // #4606 criterion-10 T_wire: SendTimingRecord/format_send_timing_line
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
@@ -4122,6 +4123,8 @@ private:
     // should make the same choice deliberately rather than copy whichever pattern it
     // happens to see first.
     LegacySendOutcome emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+        if (refuse_unsendable_guardian_event(ev, "legacy"))
+            return LegacySendOutcome::Sent; // dropped by design; a retry could never succeed
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
@@ -4132,6 +4135,29 @@ private:
             return LegacySendOutcome::LinkDown;
         return guardian_sink_stream_->Write(resp, grpc::WriteOptions()) ? LegacySendOutcome::Sent
                                                                         : LegacySendOutcome::WriteFailed;
+    }
+
+    // True (and logged) when `ev` is one the server drops at ingest for want of a rule id
+    // (guardian_event_refused_by_server). The server answers an ingest refusal with nothing, so
+    // this is the only place the agent can see it. Callers then skip the Write and report the
+    // event as Sent: a retry could never succeed, and Retain/WriteFailed would respectively wedge
+    // the outbox head or record a gap against an empty rule id. No producer reaches this today
+    // (the journal mint and replay gates reject an empty rule_id first); it is the last line.
+    // Logged on the first occurrence and then every 1024th, so a bad producer cannot flood.
+    bool refuse_unsendable_guardian_event(const gpb::GuaranteedStateEvent& ev,
+                                          std::string_view path) {
+        if (!guardian_event_refused_by_server(ev))
+            return false;
+        const auto n = guardian_unsendable_events_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n % 1024 == 0) {
+            try {
+                spdlog::warn("Guardian {} sender: not sending event {} with an empty rule_id, the "
+                             "server would drop it (refused so far: {})",
+                             path, ev.event_id(), n);
+            } catch (...) { // best-effort diagnostic; never propagate onto a send worker
+            }
+        }
+        return true;
     }
 
     // The send callback the Guardian spark outbox drain worker uses (rung 7.7a). It
@@ -4159,11 +4185,14 @@ private:
 #else
             "linux";
 #endif
+        const auto wire_ev = guardian_outbox_entry_to_event(e, kHostPlatform);
+        if (refuse_unsendable_guardian_event(wire_ev, "spark"))
+            return SendResult::Sent; // Retain would wedge the outbox head on a row that can never send
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
         resp.set_status(pb::CommandResponse::SUCCESS);
-        resp.set_payload(guardian_outbox_entry_to_event(e, kHostPlatform).SerializeAsString());
+        resp.set_payload(wire_ev.SerializeAsString());
         bool ok;
         {
             std::lock_guard lock(stream_write_mu_);
@@ -4729,6 +4758,8 @@ private:
     // bursts within one millisecond; agent_id (folded into the id) disambiguates
     // ACROSS agents so a fleet-wide signal wave doesn't collide on the global PK.
     std::atomic<std::uint64_t> dex_seq_{0};
+    /// Guardian events refused by refuse_unsendable_guardian_event (empty rule_id).
+    std::atomic<std::uint64_t> guardian_unsendable_events_{0};
     // Runtime arm/health of the DEX observer — flipped to false by the observer's
     // error callback on a runtime subscription failure on any channel (UP-1). A
     // shared_ptr<atomic> (not `this`) so a late OS-threadpool error callback stays

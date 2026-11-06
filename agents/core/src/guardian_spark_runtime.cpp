@@ -4743,7 +4743,8 @@ std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
     case JournalReject::SkewedClock:
         journal_clock_rejected_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
-    default: // EmbeddedNul / Oversized / InvalidUtf8 - a field the journal cannot carry byte-exact
+    default: // EmbeddedNul / Oversized / InvalidUtf8 / EmptyRuleId - a field the journal cannot carry
+             // byte-exact, or one the server would refuse at ingest
         journal_field_rejected_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }

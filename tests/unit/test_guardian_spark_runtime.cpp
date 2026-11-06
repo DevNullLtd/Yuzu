@@ -4768,6 +4768,19 @@ TEST_CASE("page_into_window replays an \"errored\" record without quarantining i
     CHECK(lc[0].event_id == "e-r1");
 }
 
+TEST_CASE("page_into_window quarantines a persisted row with an empty rule_id instead of replaying it",
+          "[spark][runtime][journal]") {
+    // persist() trusts that mint-time validation ran; a hand-edited or corrupt-but-parseable
+    // row can still carry rule_id:"". The server refuses such an event at ingest, so replay
+    // quarantines it (counted) rather than putting it on the wire.
+    PageRig rig;
+    rig.persist("");
+    auto stats = rig.journal->page_into_window(*rig.rt, /*now_ms=*/1'700'000'100'000);
+    CHECK(stats.records_paged == 0);
+    CHECK(rig.journal->quarantined() == 1);
+    CHECK(drain_lifecycle(*rig.rt).empty());
+}
+
 TEST_CASE("page_into_window does not re-page a windowed entry (skips entries already windowed)",
           "[spark][runtime][journal]") {
     PageRig rig;

@@ -30,4 +30,12 @@ namespace yuzu::agent {
 YUZU_EXPORT void apply_drift_to_event(const GuardDrift& d,
                                       ::yuzu::guardian::v1::GuaranteedStateEvent& ev);
 
+/// True when the server will refuse `ev` at ingest for want of a rule id (guardian_ingest.cpp
+/// drops an event whose rule_id is empty; ruleless observations carry the reserved
+/// `__observation__` id, never an empty one). Both Guardian wire senders in agent.cpp call this
+/// so the agent never writes an event it knows will be dropped, and logs the drop locally: the
+/// server answers an ingest refusal with nothing, so this is the only place the agent can see it.
+YUZU_EXPORT bool guardian_event_refused_by_server(
+    const ::yuzu::guardian::v1::GuaranteedStateEvent& ev);
+
 } // namespace yuzu::agent

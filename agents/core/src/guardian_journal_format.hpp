@@ -260,6 +260,10 @@ enum class JournalReject {
                   // silently replacing bytes would flip the server compare to a false Conflict)
     SkewedClock,  // enqueued_ns floors to epoch seconds <= 0 - the server would stamp
                   // receipt-now instead, making every replay mismatch on timestamp
+    EmptyRuleId,  // rule_id is empty - the server refuses an event with no rule id at
+                  // ingest (guardian_ingest.cpp), so a replayed row would be dropped, not
+                  // stored. Ruleless observations never reach the journal (they carry the
+                  // reserved __observation__ id and are not lifecycle records).
 };
 
 /// Validate a record at mint. Returns the FIRST reason it must be refused, or
