@@ -2,8 +2,8 @@
  * test_settings_routes_dex_scoring.cpp -- the DEX Scoring tab's route shell (GET
  * /fragments/dex/scoring and POST /api/settings/dex-scoring/{save,preview,reset}) driven
  * in-process through TestRouteSink with the writer deps and the Apps scorer faked: the read gate
- * and its order, the quiet role test, the unwired and degraded states, the dual htmx / plain
- * answer, row-mapped field errors, stale refusal, preview, reset, the cross-site and audit
+ * and its order, the write gate (the REST twin's Infrastructure:Write, loud on the POSTs and quiet
+ * on the page view), the unwired and degraded states, the dual htmx / plain answer, row-mapped field errors, stale refusal, preview, reset, the cross-site and audit
  * fail-closed paths, and the equivalence of the form and PUT /api/v1/dex/score-policy. No store,
  * no sleeps, no I/O, no [pg].
  */
@@ -24,10 +24,14 @@
 
 #include <cctype>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <optional>
+#include <set>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -111,11 +115,18 @@ struct Harness {
     std::shared_ptr<DexScorePolicyProvider> provider;
 
     // The seams.
-    bool is_admin{true};
-    int admin_calls{0};
-    bool perm_allow{true};
+    bool is_admin{true}; // the session's legacy role; the tab's authority is the grants below
+    int admin_calls{0};  // the legacy admin gate, which the tab must never consult
+    // The two permission seams, as server.cpp wires them. `perm_fn` is the LOUD one
+    // (AuthRoutes::require_permission): a refusal appends the standing denied row. The quiet one
+    // (probe_permission via set_read_perm_fn) writes no row for a cookie session. Each denies the
+    // "Type:Op" pairs in its own set, so a test can allow one and refuse the other.
+    std::set<std::string> loud_denied;
+    std::set<std::string> quiet_denied;
+    std::vector<std::pair<std::string, std::string>> perm_calls;  // loud calls, in order
+    std::vector<std::pair<std::string, std::string>> quiet_calls; // quiet calls, in order
+    std::vector<std::string> denied_rows; // one per LOUD refusal
     std::string auth_source{"local"};
-    std::vector<std::pair<std::string, std::string>> perm_calls;
     std::vector<std::string> events; // "perm" / "read" in the order they happened
     std::vector<Row> rows;           // session-stamped (the writer's rows)
     std::vector<std::string> fn_rows; // re-resolving audit_fn (csrf.denied)
@@ -129,7 +140,7 @@ struct Harness {
     // writer's.
     std::optional<std::string> write_after_first_read;
 
-    explicit Harness(bool wire_writer = true, bool wire_apps = true) {
+    explicit Harness(bool wire_writer = true, bool wire_apps = true, bool wire_audit = true) {
         provider = std::make_shared<DexScorePolicyProvider>(
             [this]() -> std::expected<std::optional<std::string>, std::string> { return stored; },
             [] { return std::int64_t{1'000'000}; }, std::chrono::milliseconds{1});
@@ -151,8 +162,19 @@ struct Harness {
                               const std::string& type, const std::string& op) {
             perm_calls.emplace_back(type, op);
             events.push_back("perm");
-            if (!perm_allow) {
+            if (loud_denied.count(type + ":" + op)) {
                 res.status = 403;
+                denied_rows.push_back("auth.permission_required/" + type + ":" + op);
+                return false;
+            }
+            return true;
+        };
+        auto quiet_perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                                    const std::string& type, const std::string& op) {
+            quiet_calls.emplace_back(type, op);
+            events.push_back("perm");
+            if (quiet_denied.count(type + ":" + op)) {
+                res.status = 403; // no denied row: that is what makes it the page-view probe
                 return false;
             }
             return true;
@@ -163,7 +185,9 @@ struct Harness {
             fn_rows.push_back(action + "/" + result);
             return true;
         };
-        routes.set_audit_as_session_fn(audit_as_session());
+        if (wire_audit)
+            routes.set_audit_as_session_fn(audit_as_session());
+        routes.set_read_perm_fn(quiet_perm_fn);
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve, /*api_token_store=*/nullptr,
                                /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
@@ -259,6 +283,42 @@ struct Harness {
         return res;
     }
     std::string stored_revision() const { return dex_score_policy_revision(stored.value_or("")); }
+    // The grant is refused on both seams (the realistic case: one principal, one RBAC answer).
+    void deny(const std::string& pair) {
+        loud_denied.insert(pair);
+        quiet_denied.insert(pair);
+    }
+};
+
+// Parks inside the provider's commit, holding its writer lock, so a route write meets WriterBusy
+// (the harness provider waits 1 ms for the lock). Bounded: a write that never reaches its commit
+// fails the case instead of hanging it.
+struct WriterHold {
+    std::promise<void> entered_p;
+    std::promise<void> release_p;
+    std::thread t;
+    explicit WriterHold(DexScorePolicyProvider& provider) {
+        auto entered = entered_p.get_future();
+        const auto gate = release_p.get_future().share();
+        t = std::thread([this, &provider, gate] {
+            (void)provider.write(std::nullopt, [this, gate]() -> std::expected<bool, std::string> {
+                entered_p.set_value();
+                gate.wait();
+                return false; // stale: nothing is installed
+            });
+        });
+        if (entered.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+            release_p.set_value();
+            t.join();
+            throw std::runtime_error("the holding write never reached its commit");
+        }
+    }
+    WriterHold(const WriterHold&) = delete;
+    WriterHold& operator=(const WriterHold&) = delete;
+    ~WriterHold() {
+        release_p.set_value();
+        t.join();
+    }
 };
 
 std::vector<std::string> control_tags(const std::string& html) {
@@ -278,18 +338,31 @@ std::size_t count_of(const std::string& hay, const std::string& needle) {
 
 } // namespace
 
-TEST_CASE("scoring GET: an administrator gets the whole form after the read gate, with no admin probe",
+TEST_CASE("scoring GET: a holder of both grants gets the whole editable form, asked quietly",
           "[server][routes][dex][score_policy][scoring]") {
     Harness h;
     SECTION("nothing stored") {
         const auto res = h.get();
         CHECK(res->status == 200);
-        REQUIRE(h.perm_calls.size() == 1);
-        CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"GuaranteedState", "Read"});
-        REQUIRE(h.events.size() >= 2);
-        CHECK(h.events[0] == "perm"); // the gate ran before the store was read
-        CHECK(h.events[1] == "read");
-        CHECK(h.admin_calls == 0); // the quiet role test, no denied-row probe
+        // The page gate, then the quiet write probe; the loud seam and the legacy admin gate are
+        // never consulted for a page view (no denied row).
+        REQUIRE(h.quiet_calls.size() == 2);
+        CHECK(h.quiet_calls[0] == std::pair<std::string, std::string>{"GuaranteedState", "Read"});
+        CHECK(h.quiet_calls[1] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+        CHECK(h.perm_calls.empty());
+        CHECK(h.denied_rows.empty());
+        CHECK(h.admin_calls == 0);
+        REQUIRE(h.events.size() >= 3);
+        CHECK(h.events[0] == "perm"); // the read gate ran before the store was read
+        CHECK(h.events[2] == "read");
+        CHECK_FALSE(has(res->body, "data-denied"));
+        CHECK(h.apps_calls == 1); // the datalist suggestions
+        // The Scoring tab sits before Alerts in the sub-nav.
+        const auto scoring = res->body.find("hx-get=\"/fragments/dex/scoring?window=7d\"");
+        const auto alerts = res->body.find("hx-get=\"/fragments/dex/alerts?window=7d\"");
+        REQUIRE(scoring != std::string::npos);
+        REQUIRE(alerts != std::string::npos);
+        CHECK(scoring < alerts);
         CHECK(has(res->body, "<a class=\"on\" hx-get=\"/fragments/dex/scoring?window=7d\""));
         CHECK(count_of(res->body, "id=\"dex-scoring-section\"") == 1);
         for (const char* name : {"tiers.edges.excellent", "tiers.names.poor", "weights.regression",
@@ -314,30 +387,60 @@ TEST_CASE("scoring GET: an administrator gets the whole form after the read gate
     }
 }
 
-TEST_CASE("scoring GET: a reader without GuaranteedState:Read learns nothing",
+TEST_CASE("scoring GET: a reader without GuaranteedState:Read learns nothing and leaves no denied row",
           "[server][routes][dex][score_policy][scoring]") {
     Harness h;
-    h.perm_allow = false;
+    h.quiet_denied.insert("GuaranteedState:Read");
     const auto res = h.get();
     CHECK(res->status == 403);
     CHECK(h.reads == 0);
     CHECK(h.apps_calls == 0);
+    CHECK(h.denied_rows.empty()); // the page-view probe is quiet by design
+    CHECK(h.perm_calls.empty());
     CHECK_FALSE(has(res->body, "tiers.edges"));
     CHECK_FALSE(has(res->body, "outlook.exe"));
 }
 
-TEST_CASE("scoring GET: a reader who is not an administrator sees every control disabled",
+TEST_CASE("scoring GET: a reader without Infrastructure:Write sees every control disabled",
           "[server][routes][dex][score_policy][scoring]") {
+    // Whatever the legacy role says: the page is editable exactly when PUT /api/v1/dex/score-policy
+    // would admit the caller, and that is asked quietly.
     Harness h;
-    h.is_admin = false;
+    SECTION("an administrator account RBAC has not granted the write to") {
+        h.quiet_denied.insert("Infrastructure:Write");
+    }
+    SECTION("a non-administrator account that was refused the write") {
+        h.is_admin = false;
+        h.quiet_denied.insert("Infrastructure:Write");
+    }
     const auto res = h.get();
     CHECK(res->status == 200);
-    CHECK(has(res->body, "data-denied=\"admin\""));
+    CHECK(has(res->body, "data-denied=\"write\""));
+    CHECK(has(res->body, "needs the Infrastructure:Write permission"));
     const auto tags = control_tags(res->body);
     REQUIRE(tags.size() > 20);
     for (const auto& t : tags) {
         INFO(t);
         CHECK(has(t, " disabled"));
+    }
+    CHECK(h.admin_calls == 0);
+    CHECK(h.perm_calls.empty());
+    CHECK(h.denied_rows.empty()); // a page view never writes a denied row
+    CHECK(h.apps_calls == 0);     // nothing to suggest into: no Apps read for a locked page
+    CHECK_FALSE(has(res->body, "<datalist"));
+}
+
+TEST_CASE("scoring GET: a non-administrator who holds both grants gets the editable form",
+          "[server][routes][dex][score_policy][scoring]") {
+    // The authority is the REST twin's grant, not the legacy Administrator role.
+    Harness h;
+    h.is_admin = false;
+    const auto res = h.get();
+    CHECK(res->status == 200);
+    CHECK_FALSE(has(res->body, "data-denied"));
+    for (const auto& t : control_tags(res->body)) {
+        INFO(t);
+        CHECK_FALSE(has(t, " disabled"));
     }
     CHECK(h.admin_calls == 0);
 }
@@ -381,7 +484,7 @@ TEST_CASE("scoring save: a valid form stores the document, audits it and answers
     CHECK(h.stored == doc_with_excellent(95.0));
     CHECK_FALSE(has(res->body, "id=\"dex-scoring-section\""));
     CHECK(has(res->body, "name=\"if_match\" value=\"" + h.stored_revision() + "\""));
-    CHECK(has(res->get_header_value("HX-Trigger"), "Scoring policy saved"));
+    CHECK(has(res->get_header_value("HX-Trigger"), "Score policy saved"));
     REQUIRE(h.rows.size() == 2);
     for (const auto& r : h.rows) {
         CHECK(r.action == "dex.score_policy.update");
@@ -451,12 +554,15 @@ TEST_CASE("scoring save: a stale revision is refused and never overwrites",
         CHECK(res->status == 200);
         CHECK(has(res->body, "data-refused=\"stale\""));
         CHECK(has(res->body, "changed by someone else"));
-        for (const auto& t : control_tags(res->body)) {
+        const auto tags = control_tags(res->body);
+        REQUIRE(tags.size() > 20); // a body with no controls would pass the loop below vacuously
+        for (const auto& t : tags) {
             if (has(t, "hx-get="))
                 continue; // the Reload button
             INFO(t);
             CHECK(has(t, " disabled"));
         }
+        CHECK(h.apps_calls == 0); // every control is disabled: no suggestions read
     }
     SECTION("plain") {
         CHECK(h.post(kSave, body)->status == 409);
@@ -481,22 +587,24 @@ TEST_CASE("scoring save: a writer failure keeps the edits, with its token and to
     std::string if_match = h.stored_revision();
     std::string token, toast;
     int status = 0;
+    std::optional<WriterHold> hold; // outlives the posts below
     SECTION("a malformed revision") {
         if_match = "zz";
         token = "if_match_malformed";
         toast = "Score policy not saved: reload and try again";
         status = 400;
     }
-    SECTION("the store cannot be read") {
-        h.read_fails = true;
-        token = "store_unavailable";
+    SECTION("another write is still running in this process") {
+        hold.emplace(*h.provider);
+        token = "writer_busy";
         toast = "Score policy not saved: try again shortly";
         status = 503;
     }
     SECTION("the commit fails with a store error, so the outcome is unknown") {
         h.cas_fails = true;
         token = "outcome_unknown";
-        toast = "Score policy not saved: try again shortly";
+        // The writer never says the policy was left as it was, so neither does the toast.
+        toast = "Save not confirmed: reload and check the policy in force";
         status = 503;
     }
     const auto body = form_body(dex_form_values(policy_with_excellent(96.0)), if_match);
@@ -516,11 +624,36 @@ TEST_CASE("scoring save: a writer failure keeps the edits, with its token and to
     CHECK(h.stored == doc_with_excellent(95.0)); // nothing was overwritten
 }
 
+TEST_CASE("scoring save: an unreadable store answers the unavailable note, never 'Shipped defaults'",
+          "[server][routes][dex][score_policy][scoring]") {
+    Harness h;
+    h.stored = doc_with_excellent(95.0);
+    h.read_fails = true;
+    const auto body = form_body(dex_form_values(policy_with_excellent(96.0)), h.stored_revision());
+    const auto hx = h.post(kSave, body, kHx);
+    CHECK(hx->status == 200);
+    CHECK(has(hx->body, "Config store unavailable"));
+    // The pre-apply read failed, so there is no policy to show: a section claiming the shipped
+    // defaults are in force would be a false statement about the store.
+    CHECK_FALSE(has(hx->body, "Shipped defaults"));
+    CHECK_FALSE(has(hx->body, "Policy in force"));
+    CHECK_FALSE(has(hx->body, "<form"));
+    CHECK(has(hx->get_header_value("HX-Trigger"), "Score policy not saved: try again shortly"));
+    const auto plain = h.post(kSave, body);
+    CHECK(plain->status == 503);
+    CHECK(json::parse(plain->body)["error"]["retry_after_ms"].is_number());
+    CHECK(h.cas_calls == 0);
+    CHECK(h.stored == doc_with_excellent(95.0));
+}
+
 TEST_CASE("scoring preview: validates, stores nothing, keeps the edits and the current revision",
           "[server][routes][dex][score_policy][scoring]") {
     Harness h;
     const auto res = h.post(kPreview, form_body(dex_form_values(policy_with_excellent(95.0)), "default"), kHx);
     CHECK(res->status == 200);
+    CHECK(h.apps_calls == 2); // "now" and "would be"; the datalist reuses the "now" model
+    CHECK(has(res->body, "<option value=\"outlook.exe\">"));
+    CHECK(has(res->body, "Based on the 2 applications affecting most devices, last 7 days, all platforms."));
     CHECK(h.cas_calls == 0);
     CHECK_FALSE(h.stored);
     REQUIRE(h.rows.size() == 1);
@@ -592,7 +725,7 @@ TEST_CASE("scoring reset: removes the stored policy through the writer",
         CHECK(h.rows[0].result == "attempted");
         CHECK(h.rows[1].result == "success");
         CHECK(has(res->body, "name=\"if_match\" value=\"default\""));
-        CHECK(has(res->get_header_value("HX-Trigger"), "reset to the shipped defaults"));
+        CHECK(has(res->get_header_value("HX-Trigger"), "Score policy reset to the shipped defaults"));
     }
     SECTION("nothing stored is a no-change") {
         const auto res = h.post(kReset, "if_match=default", kHx);
@@ -605,29 +738,75 @@ TEST_CASE("scoring reset: removes the stored policy through the writer",
 TEST_CASE("scoring POST: every refusal before the writer leaves nothing behind",
           "[server][routes][dex][score_policy][scoring]") {
     const auto body = form_body(dex_form_values(policy_with_excellent(95.0)), "default");
-    SECTION("a non-administrator is refused by admin_fn") {
+    SECTION("a caller refused Infrastructure:Write is refused first, whatever the legacy role says") {
+        // REST's gate, first and loud: an administrator account RBAC has not granted the write to
+        // is refused here exactly where PUT /api/v1/dex/score-policy refuses it.
         Harness h;
-        h.is_admin = false;
+        h.loud_denied.insert("Infrastructure:Write");
         for (const char* path : {kSave, kPreview, kReset})
             CHECK(h.post(path, body, kHx)->status == 403);
+        REQUIRE(h.perm_calls.size() == 3);
+        for (const auto& call : h.perm_calls)
+            CHECK(call == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+        CHECK(h.denied_rows.size() == 3); // one standing denied row per refused attempt
+        CHECK(h.admin_calls == 0);
+        CHECK(h.reads == 0);
+        CHECK(h.apps_calls == 0);
         CHECK(h.rows.empty());
         CHECK(h.cas_calls == 0);
         CHECK_FALSE(h.stored);
     }
-    SECTION("a caller without GuaranteedState:Read is refused first, before the role test or any read") {
+    SECTION("the write gate is the loud seam: a quiet allow cannot admit a loud refusal") {
+        // The page-view probe writes no denied row for a cookie session, so an action route that
+        // used it would refuse silently. Quiet allows everything here; loud refuses the write.
         Harness h;
-        h.perm_allow = false;
+        h.loud_denied.insert("Infrastructure:Write");
+        const auto res = h.post(kSave, body, kHx);
+        CHECK(res->status == 403);
+        CHECK(h.quiet_calls.empty());
+        REQUIRE(h.denied_rows.size() == 1);
+        CHECK(h.denied_rows[0] == "auth.permission_required/Infrastructure:Write");
+        CHECK(h.cas_calls == 0);
+        CHECK(h.rows.empty());
+        CHECK_FALSE(h.stored);
+    }
+    SECTION("a caller with the write but without GuaranteedState:Read is refused second, before any read") {
+        Harness h;
+        h.loud_denied.insert("GuaranteedState:Read");
         for (const char* path : {kSave, kPreview, kReset}) {
             const auto res = h.post(path, body, kHx);
             CHECK(res->status == 403);
             CHECK_FALSE(has(res->body, "outlook.exe")); // no application name leaves with a refusal
         }
-        REQUIRE(h.perm_calls.size() == 3);
-        for (const auto& call : h.perm_calls)
-            CHECK(call == std::pair<std::string, std::string>{"GuaranteedState", "Read"});
+        REQUIRE(h.perm_calls.size() == 6);
+        for (std::size_t i = 0; i < h.perm_calls.size(); i += 2) {
+            CHECK(h.perm_calls[i] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+            CHECK(h.perm_calls[i + 1] == std::pair<std::string, std::string>{"GuaranteedState", "Read"});
+        }
+        CHECK(h.denied_rows.size() == 3);
         CHECK(h.admin_calls == 0);
         CHECK(h.reads == 0);
         CHECK(h.apps_calls == 0);
+        CHECK(h.cas_calls == 0);
+        CHECK(h.rows.empty());
+        CHECK_FALSE(h.stored);
+    }
+    SECTION("a non-administrator account holding both grants saves: the authority is the grant") {
+        Harness h;
+        h.is_admin = false;
+        const auto res = h.post(kSave, body, kHx);
+        CHECK(res->status == 200);
+        CHECK(h.cas_calls == 1);
+        CHECK(h.stored == doc_with_excellent(95.0));
+        CHECK(h.admin_calls == 0); // the legacy admin gate is not part of this surface
+        CHECK(h.denied_rows.empty());
+    }
+    SECTION("an audit identity writer that was never wired is a 500, not audit-off") {
+        Harness h(/*wire_writer=*/true, /*wire_apps=*/true, /*wire_audit=*/false);
+        const auto res = h.post(kSave, body, kHx);
+        CHECK(res->status == 500);
+        CHECK(json::parse(res->body)["error"]["message"] == "audit identity writer not configured");
+        CHECK(h.reads == 0);
         CHECK(h.cas_calls == 0);
         CHECK(h.rows.empty());
         CHECK_FALSE(h.stored);
@@ -654,12 +833,30 @@ TEST_CASE("scoring save: an audit store that refuses the attempted row fails clo
     Harness h;
     h.refuse_result = "attempted";
     const auto body = form_body(dex_form_values(policy_with_excellent(95.0)), "default");
-    CHECK(h.post(kSave, body)->status == 503);
+    const auto plain = h.post(kSave, body);
+    CHECK(plain->status == 503);
+    // The REST twin marks the response; the writer leaves that signal to the handler.
+    CHECK(plain->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(plain->get_header_value_count("Sec-Audit-Failed") == 1);
     const auto res = h.post(kSave, body, kHx);
     CHECK(res->status == 200);
     CHECK(has(res->body, "data-refused=\"audit_unavailable\""));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(h.cas_calls == 0);
     CHECK_FALSE(h.stored);
+}
+
+TEST_CASE("scoring save: a lost outcome row keeps the write and marks the response Sec-Audit-Failed once",
+          "[server][routes][dex][score_policy][scoring]") {
+    Harness h;
+    h.refuse_result = "success";
+    const auto res = h.post(kSave, form_body(dex_form_values(policy_with_excellent(95.0)), "default"), kHx);
+    CHECK(res->status == 200);
+    CHECK(h.stored == doc_with_excellent(95.0)); // the change was applied
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->get_header_value_count("Sec-Audit-Failed") == 1);
+    REQUIRE(h.rows.size() == 1); // only the attempted row stands
+    CHECK(h.rows[0].result == "attempted");
 }
 
 namespace {

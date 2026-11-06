@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the DEX Scoring tab edits the score policy from the dashboard
+
+**What changed.** The DEX page gains a **Scoring** tab that shows the score policy in force and edits all of it: tier edges and names, weights, model parameters and per-application overrides, with a pre-save tier-change preview and a reset to the shipped defaults. It writes through the same function as `PUT` and `DELETE /api/v1/dex/score-policy`, so validation, the `If-Match` revision check and the audit rows are the same, and editing needs the same `Infrastructure:Write` grant (viewing needs `GuaranteedState:Read`). See [DEX](dex.md#scoring).
+
+**The rule.** The version 2 rule above applies to the dashboard too: do not save or reset the policy from the Scoring tab during a rolling upgrade or rollback. The tab does not exist on a server that predates it, so behind a load balancer `GET /fragments/dex/scoring` is a `404` from a replica still on the previous release.
+
+**No action on upgrade.** There is no schema change and no existing setting is reinterpreted.
+
 ## Behaviour change: the Guardian compliance census orders by an event key and says when it cannot (`guaranteed_state_store` schema v4)
 
 **Scope of this note.** A supported deployment starts from a fresh database (see "Fresh deployment only" and "Deployment contract (hard cutover)" in this document), where the v4 migration runs over empty tables and none of the headroom below applies. The procedure below is for a database already at schema v3, such as a development or test deployment; it is not an upgrade path from an earlier build.

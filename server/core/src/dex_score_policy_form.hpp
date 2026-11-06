@@ -51,8 +51,9 @@
 
 namespace yuzu::server {
 
-/// Most name/value pairs one form body may carry; 200 override rows of 17 fields plus the
-/// globals is about 3,500. Above it the form is refused whole (never silently truncated).
+/// Most name/value pairs one form body may carry; 200 override rows of 16 fields (image, Remove,
+/// 3 edges, 4 names, 4 weights, 3 model) plus the globals is about 3,200. Above it the form
+/// is refused whole (never silently truncated).
 inline constexpr std::size_t kDexFormMaxPairs = 8192;
 /// Highest override row index accepted from the wire.
 inline constexpr int kDexFormMaxOverrideIndex = 255;
@@ -99,9 +100,12 @@ using json = nlohmann::json;
 
 /// A JSON number when `text` is wholly one (an integer stays an integer, so the event cap
 /// parses), otherwise the raw text as a bounded JSON string for the parser to refuse by name.
+/// strtod also reads hexadecimal ("0x10") and hex-float ("0x1p3") forms that a JSON body would
+/// refuse, so a text holding x/X/p/P is never offered to it; from_chars<double> would need no
+/// such guard but is not available on Apple Clang 15.
 [[nodiscard]] inline json number_or_string(const std::string& raw) {
     const std::string t = trim(raw);
-    if (!t.empty()) {
+    if (!t.empty() && t.find_first_of("xXpP") == std::string::npos) {
         std::int64_t i = 0;
         const auto [p, ec] = std::from_chars(t.data(), t.data() + t.size(), i);
         if (ec == std::errc{} && p == t.data() + t.size())
@@ -114,7 +118,10 @@ using json = nlohmann::json;
     return t.substr(0, kDexFormMaxBadNumberBytes);
 }
 
-/// `overrides[N].rest` -> {N, rest}; an index too long to be real reads as one past the limit.
+/// `overrides[N].rest` -> {N, rest}. An index of five or more digits is no real row: it reads
+/// as one past kDexFormMaxOverrideIndex, so the form is refused whole rather than the pair being
+/// ignored. A leading zero ("007") is not the canonical spelling of any row (the form looks row 7
+/// up as "overrides[7]."), so such a name is malformed and ignored like any other.
 [[nodiscard]] inline std::optional<std::pair<int, std::string_view>>
 split_override_key(std::string_view name) {
     constexpr std::string_view kPre = "overrides[";
@@ -122,13 +129,19 @@ split_override_key(std::string_view name) {
         return std::nullopt;
     name.remove_prefix(kPre.size());
     const auto close = name.find("].");
-    if (close == std::string_view::npos || close == 0 || close > 4)
+    if (close == std::string_view::npos || close == 0)
         return std::nullopt;
-    int n = 0;
-    for (const char c : name.substr(0, close)) {
+    const std::string_view digits = name.substr(0, close);
+    for (const char c : digits)
         if (c < '0' || c > '9')
             return std::nullopt;
-        n = n * 10 + (c - '0');
+    if (digits.size() > 1 && digits.front() == '0')
+        return std::nullopt;
+    int n = kDexFormMaxOverrideIndex + 1;
+    if (digits.size() <= 4) {
+        n = 0;
+        for (const char c : digits)
+            n = n * 10 + (c - '0');
     }
     return std::make_pair(n, name.substr(close + 2));
 }
@@ -340,6 +353,8 @@ struct DexTierPreview {
     bool degraded{false};     ///< either read could not be completed: no diff is shown
     std::int64_t total{0};    ///< applications scored under both policies
     std::int64_t changed{0};  ///< of those, how many land in a different tier
+    std::int64_t apps_total{0};     ///< applications the current model could see (before its cap)
+    bool apps_truncated{false};     ///< the current model scored only the top of them
     std::vector<DexTierChange> rows; ///< the first kDexPreviewMaxRows of them
 };
 
@@ -355,6 +370,9 @@ struct DexTierPreview {
         out.degraded = true;
         return out;
     }
+    // The model is capped to the applications affecting most devices; the figures say so.
+    out.apps_total = current.apps_total;
+    out.apps_truncated = current.apps_truncated;
     std::unordered_map<std::string, const DexAppStability*> after;
     for (const auto& a : proposed.apps)
         after.emplace(a.subject, &a);
@@ -387,7 +405,7 @@ struct DexScoringView {
     std::string if_match;            ///< hidden precondition; empty = revision
     std::string source{"default"};   ///< default | custom
     std::string fault;               ///< a refused stored document, or empty
-    bool admin{false};
+    bool editable{false}; ///< the caller holds Infrastructure:Write; false = every control disabled
     std::optional<DexFormError> error;
     std::vector<std::string> suggestions; ///< application names for the image datalist
     std::optional<DexTierPreview> preview;
@@ -410,20 +428,21 @@ namespace dex_form_detail {
 class Renderer {
 public:
     Renderer(const DexScoringView& v, std::string target)
-        : v_(v), target_(std::move(target)), locked_(!v.admin || v.refused == "stale") {}
+        : v_(v), target_(std::move(target)), locked_(!v.editable || v.refused == "stale") {}
 
     [[nodiscard]] std::string run() {
         std::string o;
         if (v_.refused == "stale")
             o += "<div class=\"note warn\" data-stale=\"1\" role=\"alert\"><b>This policy was "
                  "changed by someone else.</b> Nothing was saved. Reload to see the current "
-                 "version, then make your change again. <button type=\"button\" class=\"btn "
-                 "btn-secondary\" hx-get=\"/fragments/dex/scoring?window=7d\" "
+                 "version; reloading discards the edits on screen, so note them first. <button "
+                 "type=\"button\" class=\"btn btn-secondary\" hx-get=\"/fragments/dex/scoring?window=7d\" "
                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Reload</button></div>";
-        if (!v_.admin)
-            o += "<div class=\"note\" data-denied=\"admin\"><b>Editing the score policy needs "
-                 "the Administrator role.</b> You can see the policy in force; ask an "
-                 "administrator to change it.</div>";
+        if (!v_.editable)
+            o += "<div class=\"note\" data-denied=\"write\"><b>Editing the score policy needs "
+                 "the Infrastructure:Write permission</b> (Administrator holds it by default), "
+                 "the same grant as PUT /api/v1/dex/score-policy. You can see the policy in "
+                 "force; ask someone who holds it to change it.</div>";
         o += in_force();
         o += "<form class=\"form dxs\" hx-post=\"/api/settings/dex-scoring/save\" "
              "hx-target=\"#dex-scoring-section\" hx-swap=\"innerHTML\" novalidate";
@@ -514,16 +533,21 @@ private:
 
     /// The edges, names, weights and (override or global) model fields under `base`.
     [[nodiscard]] std::string edges(const std::string& base, bool inherit) const {
+        // The validator refuses 0 and 100 (0 < edge < 100) at one decimal, so the extremes a
+        // number input may hold are the first tenth above 0 and the last below 100. The
+        // attribute is a convenience; the validator decides.
+        constexpr double kEdgeMin = 1.0 / kStabilityScoreScale;
+        constexpr double kEdgeMax = 100.0 - 1.0 / kStabilityScoreScale;
         std::string o = group_open(base + "tiers.edges", "Score edges",
-                                   "Lowest displayed score of each tier, 0 to 100 at one "
-                                   "decimal, strictly descending and at least " +
+                                   "Lowest displayed score of each tier, above 0 and below "
+                                   "100 at one decimal, strictly descending and at least " +
                                        num(static_cast<double>(kDexPolicyMinTierGapTenths) /
                                            kStabilityScoreScale) +
                                        " apart. Poor is everything below Fair.") +
                         "<div class=\"row2\">";
-        o += number(base + "tiers.edges.excellent", "Excellent from", 0.0, 100.0, "0.1", inherit);
-        o += number(base + "tiers.edges.good", "Good from", 0.0, 100.0, "0.1", inherit);
-        o += number(base + "tiers.edges.fair", "Fair from", 0.0, 100.0, "0.1", inherit);
+        o += number(base + "tiers.edges.excellent", "Excellent from", kEdgeMin, kEdgeMax, "0.1", inherit);
+        o += number(base + "tiers.edges.good", "Good from", kEdgeMin, kEdgeMax, "0.1", inherit);
+        o += number(base + "tiers.edges.fair", "Fair from", kEdgeMin, kEdgeMax, "0.1", inherit);
         return o + "</div>" + group_close(base + "tiers.edges");
     }
     [[nodiscard]] std::string names(const std::string& base, bool inherit) const {
@@ -617,7 +641,18 @@ private:
     }
 
     [[nodiscard]] std::string overrides_panel() const {
-        const auto rows = override_rows(v_.values);
+        // A refusal re-renders the POSTED rows, and a hand-made body can name thousands of them
+        // (each a collapsed section of ~40 controls). Only rows the form could ever accept are
+        // drawn: an index within kDexFormMaxOverrideIndex and at most kDexPolicyMaxOverrides of
+        // them. dex_form_to_document refuses a form with more, whole, so nothing drawn is lost.
+        const auto posted = override_rows(v_.values);
+        std::vector<int> rows;
+        for (const int r : posted) {
+            if (r > kDexFormMaxOverrideIndex || rows.size() >= kDexPolicyMaxOverrides)
+                break;
+            rows.push_back(r);
+        }
+        const std::size_t hidden = posted.size() - rows.size();
         std::string o = "<section class=\"panel dxs\"><div class=\"hd\"><h2>Application "
                         "overrides</h2></div><div class=\"pb\">" +
                         group_open("overrides", "Per-application policy",
@@ -633,8 +668,14 @@ private:
         }
         for (const int r : rows)
             o += override_row(r, false);
+        if (hidden > 0)
+            o += "<p class=\"hint\" data-hidden=\"" + std::to_string(hidden) + "\">" +
+                 std::to_string(hidden) + " more submitted override rows are not shown: the "
+                 "form carries more than " + std::to_string(kDexPolicyMaxOverrides) +
+                 " rows or a row above " + std::to_string(kDexFormMaxOverrideIndex) +
+                 ", and is refused until they are removed.</p>";
         const int next = rows.empty() ? 0 : rows.back() + 1;
-        if (rows.size() < kDexPolicyMaxOverrides && next <= kDexFormMaxOverrideIndex)
+        if (hidden == 0 && rows.size() < kDexPolicyMaxOverrides && next <= kDexFormMaxOverrideIndex)
             o += override_row(next, true);
         else if (rows.size() >= kDexPolicyMaxOverrides)
             o += "<p class=\"hint\" data-limit=\"reached\">The limit of " +
@@ -666,6 +707,12 @@ private:
                        "policies right now. Nothing was saved.</p></div></section>";
         o += "<p>" + std::to_string(p.changed) + " of " + std::to_string(p.total) +
              " applications change tier. Preview only: nothing was saved.</p>";
+        // The model holds only the applications affecting most devices, so say what this covers.
+        o += "<p class=\"hint\" data-scope=\"1\">Based on the " + std::to_string(p.total) +
+             " applications affecting most devices, last 7 days, all platforms.";
+        if (p.apps_truncated && p.apps_total > p.total)
+            o += " " + std::to_string(p.apps_total - p.total) + " more were not scored.";
+        o += "</p>";
         if (!p.rows.empty()) {
             o += "<table class=\"tbl\"><thead><tr><th>Application</th><th>Now</th><th>Would "
                  "be</th></tr></thead><tbody>";

@@ -2430,8 +2430,12 @@ const char* dex_scoring_refusal_token(DexScorePolicyWriteStatus s) {
 }
 
 // Fixed text only: the toast never carries the validator's message or any submitted value.
+// Every status is listed (no default:), so a tenth one fails the build's -Wswitch rather than
+// silently reading "try again shortly". OutcomeUnknown must not say "not saved": the writer's
+// contract (dex_score_policy_writer.hpp) is that it never claims the policy was left as it was.
 const char* dex_scoring_refusal_toast(DexScorePolicyWriteStatus s) {
     switch (s) {
+    case DexScorePolicyWriteStatus::Ok: return "";
     case DexScorePolicyWriteStatus::Invalid: return "Score policy not saved: fix the marked field";
     case DexScorePolicyWriteStatus::Stale: return "Score policy not saved: changed by someone else";
     case DexScorePolicyWriteStatus::IfMatchMissing:
@@ -2439,8 +2443,22 @@ const char* dex_scoring_refusal_toast(DexScorePolicyWriteStatus s) {
         return "Score policy not saved: reload and try again";
     case DexScorePolicyWriteStatus::AuditUnavailable:
         return "Score policy not saved: audit unavailable, try again shortly";
-    default: return "Score policy not saved: try again shortly";
+    case DexScorePolicyWriteStatus::WriterBusy:
+    case DexScorePolicyWriteStatus::StoreUnavailable:
+        return "Score policy not saved: try again shortly";
+    case DexScorePolicyWriteStatus::OutcomeUnknown:
+        return "Save not confirmed: reload and check the policy in force";
     }
+    return "Score policy not saved: try again shortly";
+}
+
+// The application names a Scoring render offers as image suggestions: none from a degraded model.
+std::vector<std::string> dex_scoring_subjects(const DexAppsModel& m) {
+    std::vector<std::string> out;
+    if (!m.degraded)
+        for (const auto& a : m.apps)
+            out.push_back(a.subject);
+    return out;
 }
 
 std::string dex_scoring_toast(const char* message, const char* level) {
@@ -2450,25 +2468,26 @@ std::string dex_scoring_toast(const char* message, const char* level) {
 } // namespace
 
 std::string SettingsRoutes::render_dex_scoring_section(
-    const DexPolicyInForce& in_force, bool admin, const std::string& if_match,
+    const DexPolicyInForce& in_force, bool editable, const std::string& if_match,
     const DexFormValues* posted, std::optional<DexFormError> error,
-    std::optional<DexTierPreview> preview, const std::string& refused) {
+    std::optional<DexTierPreview> preview, const std::string& refused,
+    const std::vector<std::string>* suggestions) {
     DexScoringView v;
     v.values = posted ? *posted : dex_form_values(in_force.policy);
     v.revision = in_force.revision;
     v.if_match = if_match;
     v.source = in_force.source;
     v.fault = in_force.fault;
-    v.admin = admin;
+    v.editable = editable;
     v.error = std::move(error);
     v.preview = std::move(preview);
     v.refused = refused;
-    if (dex_apps_fn_) {
-        const auto m = dex_apps_fn_(std::nullopt);
-        if (!m.degraded)
-            for (const auto& a : m.apps)
-                v.suggestions.push_back(a.subject);
-    }
+    if (suggestions)
+        v.suggestions = *suggestions;
+    else if (editable && refused != "stale" && dex_apps_fn_)
+        // Suggestions feed an input the page can use; a locked page (read-only, or a stale
+        // refusal that disables every control) has none, so it does not pay an Apps read.
+        v.suggestions = dex_scoring_subjects(dex_apps_fn_(std::nullopt));
     return yuzu::server::render_dex_scoring_section(v);
 }
 
@@ -2484,17 +2503,36 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
                                       DexScorePolicyWriteRequest::Op op, bool dry_run) {
     const bool put = op == DexScorePolicyWriteRequest::Op::Put;
     const char* leaf = dry_run ? "preview" : (put ? "save" : "reset");
-    // The same read gate as GET /fragments/dex/scoring, first: every answer carries the Apps
-    // model's application names (the datalist, the preview table), and the legacy-role test
-    // below does not imply a GuaranteedState:Read grant once RBAC is enforced. A principal who
-    // cannot load the tab cannot save from it.
-    if (!read_perm(req, res, "GuaranteedState", "Read"))
+    // AUTHORITY IS THE REST TWIN'S, exactly: a fragment is a view over the API, not a second
+    // authority (ADR-1005 Decision 4). PUT/DELETE /api/v1/dex/score-policy gate on
+    // Infrastructure:Write, so these POSTs do too, first and in the same order; then
+    // GuaranteedState:Read, because every answer carries the Apps model's application names (the
+    // datalist, the preview table). The legacy-admin test (admin_fn_) is deliberately not used:
+    // it never consults RBAC, so a principal refused by the REST route could write through here.
+    // Both gates are the LOUD perm_fn_: a refused cookie session leaves the standing
+    // auth.permission_required row. read_perm (the quiet probe, which writes no denied row for a
+    // cookie session) is for the GET page view only; an action route must not use it
+    // (auth_routes.hpp).
+    if (!perm_fn_(req, res, "Infrastructure", "Write"))
         return;
-    if (!admin_fn_(req, res))
+    if (!perm_fn_(req, res, "GuaranteedState", "Read"))
         return;
     const auto session = auth_fn_(req, res);
     if (!session)
         return;
+    if (dex_score_policy_writer_ && !audit_as_session_fn_) {
+        // The REST twin answers 500 for an unwired session writer (authenticate_for_session_audit):
+        // an unwired audit identity is a misconfiguration, never "audit off" on a trust-boundary
+        // write. server.cpp wires it unconditionally, so this guards a future caller or a test.
+        spdlog::error("POST /api/settings/dex-scoring/{}: audit identity writer not configured; "
+                      "refusing the request", leaf);
+        res.status = 500;
+        res.set_header("HX-Trigger", dex_scoring_toast("Score policy not saved: audit not configured",
+                                                       "error"));
+        res.set_content(detail::a4_error(res, "audit identity writer not configured"),
+                        "application/json");
+        return;
+    }
     if (refuse_cross_site(req, res, *session, std::string("POST /api/settings/dex-scoring/") + leaf))
         return;
     if (!dex_score_policy_writer_ || !dex_score_policy_writer_->read_stored) {
@@ -2522,10 +2560,14 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
         if (htmx) {
             res.status = 200;
             res.set_header("HX-Trigger", dex_scoring_toast(toast, "error"));
+            // With the pre-apply read failed there is no policy to show: "Shipped defaults"
+            // would be a false statement about the store, so the section is the unavailable note.
             res.set_content(
-                render_dex_scoring_section(shown, true, if_match.value_or(shown.revision), &posted,
-                                           DexFormError{field, std::move(message)}, std::nullopt,
-                                           token),
+                current ? render_dex_scoring_section(shown, true,
+                                                     if_match.value_or(shown.revision), &posted,
+                                                     DexFormError{field, std::move(message)},
+                                                     std::nullopt, token)
+                        : std::string(kDexScoringUnavailable),
                 "text/html; charset=utf-8");
             return;
         }
@@ -2555,18 +2597,22 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
     }
 
     DexScorePolicyWriteDeps deps = *dex_score_policy_writer_;
-    deps.audit = {};
-    if (audit_as_session_fn_) {
-        // Stamped from the session this handler resolved, never re-resolved from the request.
-        // The bool survives: a refused 'attempted' row is the writer's AuditUnavailable 503.
-        deps.audit = [this, &req, &session, role = auth::role_to_string(auth::effective_role(*session))](
-                         std::string_view verb, std::string_view result,
-                         const std::string& detail_json) {
-            return audit_as_session_fn_(req, *session, role, std::string(verb), std::string(result),
-                                        "RuntimeConfig", std::string(kDexScorePolicyKey),
-                                        detail_json);
-        };
-    }
+    // Stamped from the session this handler resolved, never re-resolved from the request. The
+    // bool survives: a refused 'attempted' row is the writer's AuditUnavailable 503. A row that
+    // did not persist also marks the response Sec-Audit-Failed, as the REST twin does through
+    // emit_behavioral_audit (the writer's contract leaves that signal to the handler); has_header
+    // keeps a second failed row from appending a second value.
+    deps.audit = [this, &req, &res, &session,
+                  role = auth::role_to_string(auth::effective_role(*session))](
+                     std::string_view verb, std::string_view result,
+                     const std::string& detail_json) {
+        const bool persisted =
+            audit_as_session_fn_(req, *session, role, std::string(verb), std::string(result),
+                                 "RuntimeConfig", std::string(kDexScorePolicyKey), detail_json);
+        if (!persisted && !res.has_header("Sec-Audit-Failed"))
+            res.set_header("Sec-Audit-Failed", "true");
+        return persisted;
+    };
 
     const auto r = apply_dex_score_policy(rq, deps);
     if (r.status != DexScorePolicyWriteStatus::Ok) {
@@ -2596,23 +2642,31 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
         // Nothing stored: keep the user's edits and the CURRENT revision (the REST ETag rule).
         DexTierPreview preview;
         preview.degraded = true;
+        // The image suggestions come from the "now" model below (the same applications, whatever
+        // the policy), so the render does not read the Apps model a third time.
+        std::vector<std::string> subjects;
+        bool have_subjects = false;
         // "Now" is scored under the revision this handler read (the one the form edits), through
         // the same explicit-policy path as the proposal, never under the provider's cache, which
         // can trail another replica's write by a refresh interval. If that read and the dry run's
         // own disagree, a write landed between them: unavailable is the honest answer.
         if (dex_apps_fn_ && current && current->revision == r.previous_revision) {
             const std::optional<DexPolicyInForce> now{*current};
-            preview = dex_tier_preview(dex_apps_fn_(now), dex_apps_fn_(r.in_force));
+            const auto now_model = dex_apps_fn_(now);
+            preview = dex_tier_preview(now_model, dex_apps_fn_(r.in_force));
+            subjects = dex_scoring_subjects(now_model);
+            have_subjects = true;
         }
         res.set_header("HX-Trigger", dex_scoring_toast("Preview only: nothing saved", "success"));
         res.set_content(render_dex_scoring_section(shown, true, r.previous_revision, &posted,
-                                                   std::nullopt, std::move(preview), ""),
+                                                   std::nullopt, std::move(preview), "",
+                                                   have_subjects ? &subjects : nullptr),
                         "text/html; charset=utf-8");
         return;
     }
     res.set_header("HX-Trigger",
-                   dex_scoring_toast(put ? "Scoring policy saved"
-                                         : "Scoring policy reset to the shipped defaults",
+                   dex_scoring_toast(put ? "Score policy saved"
+                                         : "Score policy reset to the shipped defaults",
                                      "success"));
     res.set_content(render_dex_scoring_section(r.in_force, true, r.in_force.revision, nullptr,
                                                std::nullopt, std::nullopt, ""),
@@ -3764,19 +3818,19 @@ void SettingsRoutes::register_routes(
     // -- AP-3.12: the DEX page's Scoring tab -----------------------------------------
     // Reads gate on GuaranteedState:Read (the quiet probe server.cpp binds, else perm_fn_)
     // BEFORE either the policy or the application names are read, exactly as GET
-    // /api/v1/dex/score-policy and /fragments/dex/apps gate. A reader who is not an
-    // administrator gets the same page with every control disabled (a quiet role test, no
-    // denied row, as the Alerts tab); the three POSTs take the same read gate first, then the
-    // loud admin_fn_.
+    // /api/v1/dex/score-policy and /fragments/dex/apps gate. Whether the page is editable is the
+    // REST write gate (Infrastructure:Write), asked through the same quiet probe into a scratch
+    // response, so a reader without it gets the page with every control disabled and no denied
+    // row for a page view. The three POSTs gate on the loud perm_fn_ for both pairs, the write
+    // first (dex_scoring_post).
     sink.Get("/fragments/dex/scoring", [this](const httplib::Request& req,
                                               httplib::Response& res) {
         if (!read_perm(req, res, "GuaranteedState", "Read"))
             return;
-        const auto session = auth_fn_(req, res);
-        if (!session)
+        if (!auth_fn_(req, res))
             return;
-        const bool admin = session->token_scope_service.empty() && session->mcp_tier.empty() &&
-                           auth::effective_role(*session) == auth::Role::admin;
+        httplib::Response scratch; // the probe's refusal lands here, never on the page
+        const bool editable = read_perm(req, scratch, "Infrastructure", "Write");
         std::string html = dex_subnav("scoring", 7) + dex_alerts_style();
         // #dex-scoring-section is the inner swap target of every POST; the sub-nav above it is
         // never re-rendered.
@@ -3789,7 +3843,7 @@ void SettingsRoutes::register_routes(
                          ::yuzu::log_key_token(in_force.error()));
             html += kDexScoringUnavailable;
         } else {
-            html += render_dex_scoring_section(*in_force, admin, in_force->revision, nullptr,
+            html += render_dex_scoring_section(*in_force, editable, in_force->revision, nullptr,
                                                std::nullopt, std::nullopt, "");
         }
         html += "</div>";

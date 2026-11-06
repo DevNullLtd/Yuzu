@@ -941,6 +941,33 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
+   - **2026-11-06 - DEX Scoring tab (`GET /fragments/dex/scoring`, `POST
+     /api/settings/dex-scoring/{save,preview,reset}`, AP-3.12).** Four
+     dashboard routes that edit the score policy, recorded because one
+     behaviour of the tab has no headless twin.
+     - **A UI over the REST pair.** `GET` reads, `save` writes (`PUT`),
+       `preview` is `PUT ?dry_run=true` and `reset` is `DELETE`
+       `/api/v1/dex/score-policy`. The tab calls the same write function
+       (`apply_dex_score_policy`), gates on the same `Infrastructure:Write`
+       (writes) and `GuaranteedState:Read` (view), and writes the same audit
+       rows, so it is a view over the API and not a second authority. Each route
+       has a `planned:#6087` row in `scripts/ci/api-parity/dex.json` naming its
+       REST twin; the rows flip to twinned when the twins land.
+     - **The one capability with no headless twin: the tier-change diff.** The
+       preview lists which of the top applications would change tier. A REST
+       dry run answers only the validated document and revision, so the diff
+       exists on the dashboard alone; it is computed by scoring the Apps model
+       under the current and the proposed policy, not by a second scorer.
+       This is a recorded exception to Decision 1, not a permanent one: the
+       headless tier-change diff is to join the scope of the twins tracked as
+       **#6087**; **revisit by 2027-01-31**.
+     - **The exception relaxes no control.** The preview stores nothing and
+       writes one `dex.score_policy.validate` row; every refusal, the
+       fail-closed audit and the same-site gate are those of the REST routes.
+     - Wire reference: `docs/user-manual/dex.md`, "Scoring"; audit rows:
+       `docs/user-manual/audit-log.md`.
+     - Recorded by the change author; ADR-owner acceptance pending.
+
    - **2026-11-02 - DEX score policy model parameters on the REST route (#6087).**
      REST-only, still no MCP twin: the `GET`, `PUT` and `DELETE
      /api/v1/dex/score-policy` contract widened (a version 2 document with a
@@ -954,9 +981,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        the same document shape and the one write function
        (`apply_dex_score_policy`), so there is no second validator; both this entry
        and the 2026-10-23 one retire when the #6087 twins merge, and both are
-       then amended. No ledger row is added, as for the
+       then amended. No ledger row is added for the REST routes, as for the
        2026-10-23 entry: the parity ledger admits an `exception:` row for a
-       `/api/v1` route but does not require one.
+       `/api/v1` route but does not require one. The four dashboard routes
+       over them do carry ledger rows (`planned:#6087`; see the 2026-11-06
+       entry).
      - **The exception relaxes no control.** Same gates, `If-Match`, audit-first
        and fail-closed audit, A4 envelope, and discovery in `openapi_spec()` and
        `/api/v1/discover/routes`; the new parameters are validated by the same

@@ -493,9 +493,27 @@ TEST_CASE("resolve_body_cap: the largest legitimate Scoring form fits under its 
     REQUIRE_FALSE(dex_score_policy_fault(p)); // the worst case is a document the validator accepts
 
     auto v = dex_form_values(p); // every field of every row set
+    v["if_match"] = std::string(16, 'f');
+
+    // The same map, as the wire carries it (no Remove ticked), must get through the form parser and
+    // the document builder whole: a legitimate maximal form is never refused by the pair cap or the
+    // index cap, and the document it builds is the policy it was made from.
+    {
+        std::string wire;
+        for (const auto& [k, val] : v)
+            wire += encode(k) + "=" + encode(val) + "&";
+        const auto pairs = dex_form_pairs(wire);
+        CHECK(pairs.size() <= kDexFormMaxPairs);
+        const auto doc = dex_form_to_document(pairs);
+        REQUIRE(doc);
+        CHECK(doc->row_of_override.size() == kDexPolicyMaxOverrides);
+        const auto parsed = dex_score_policy_validate_text(doc->text);
+        REQUIRE(parsed);
+        CHECK(dex_score_policy_canonical(*parsed) == dex_score_policy_canonical(p));
+    }
+
     for (std::size_t i = 0; i < p.overrides.size(); ++i)
         v["overrides[" + std::to_string(i) + "].remove"] = "on"; // a ticked Remove box submits too
-    v["if_match"] = std::string(16, 'f');
     std::size_t bytes = 0;
     for (const auto& [k, val] : v)
         bytes += encode(k).size() + 1 + encode(val).size() + 1; // "k=v&"

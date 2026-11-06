@@ -337,11 +337,16 @@ private:
     std::string render_dex_alerts_fragment();
     /// The DEX Scoring tab body (no wrapper id; GET adds #dex-scoring-section). `posted`
     /// non-null re-renders the submitted values (a refusal or a preview) instead of `in_force`.
-    std::string render_dex_scoring_section(const DexPolicyInForce& in_force, bool admin,
+    /// `editable` = the caller holds Infrastructure:Write (the REST write gate); false renders every
+    /// control disabled. `suggestions` non-null supplies the image suggestions (the preview path
+    /// already holds the "now" model); null reads them, unless the page is locked (read-only or a
+    /// stale refusal), which has no use for them.
+    std::string render_dex_scoring_section(const DexPolicyInForce& in_force, bool editable,
                                            const std::string& if_match, const DexFormValues* posted,
                                            std::optional<DexFormError> error,
                                            std::optional<DexTierPreview> preview,
-                                           const std::string& refused);
+                                           const std::string& refused,
+                                           const std::vector<std::string>* suggestions = nullptr);
     /// POST /api/settings/dex-scoring/{save,preview,reset} share this body.
     void dex_scoring_post(const httplib::Request& req, httplib::Response& res,
                           DexScorePolicyWriteRequest::Op op, bool dry_run);

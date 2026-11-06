@@ -16,10 +16,10 @@ It is reached from the **DEX** entry in the sidebar, or directly at
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
 links* into seven deep pages. A shared sub-nav switches between **Overview ·
 Apps · Catalogue · Health score · Trends · Performance · App Performance ·
-Network · Scoring · Alerts**; the Scoring tab is where the score policy is read
-and edited (see [Scoring](#scoring)) and the Alerts tab is the configuration
-page for DEX alert routing and is for administrators only (anyone else sees a
-role note). The
+Network** (the eight views) and two configuration tabs, **Scoring · Alerts**.
+The Scoring tab is where the score policy is read and edited (see
+[Scoring](#scoring)); the Alerts tab is the configuration page for DEX alert
+routing and is for administrators only (anyone else sees a role note). The
 window selector (below) applies to the signal views (Performance
 and Network are now-views — see below). The Network view also has its own URL,
 `/network`, but it is a DEX sub-view, not a standalone top-level nav item.
@@ -75,28 +75,37 @@ rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
 
 The **Scoring** tab (`/fragments/dex/scoring`) shows the score policy in force and lets an
 administrator edit every parameter of it in one place. Viewing needs the
-**`GuaranteedState:Read`** permission; editing needs the **Administrator** role and the same read
-permission, because every answer carries application names. Anyone who can view and is not an
-administrator sees the same page with every control disabled and a role note.
+**`GuaranteedState:Read`** permission. Editing needs the **`Infrastructure:Write`** permission
+(Administrator holds it by default) and the same read permission, because every answer carries
+application names. `Infrastructure:Write` is the grant `PUT` and `DELETE /api/v1/dex/score-policy`
+require, so the tab can do exactly what the API can for the same account, no more and no less;
+the legacy Administrator role is not what decides it. Anyone who can view without
+`Infrastructure:Write` sees the same page with every control disabled and a note naming the grant.
+If the runtime-config store is not open, the tab shows *Config store unavailable* instead of the
+form.
 
 The tab has these sections:
 
 - **Policy in force** - whether the shipped defaults or a custom policy apply, its revision, and,
   when a stored document was refused, the reason (the shipped defaults then apply until a valid
   policy is saved).
-- **Tiers** - the lowest displayed score of the Excellent, Good and Fair tiers (0 to 100 at one
-  decimal, strictly descending, at least 1.0 point apart; Poor is everything below Fair) and the
-  four tier names (1 to 24 bytes of printable ASCII, none of `< > & "`).
+- **Tiers** - the lowest displayed score of the Excellent, Good and Fair tiers (above 0 and below
+  100 at one decimal, strictly descending, at least 1.0 point apart; Poor is everything below
+  Fair) and the four tier names (1 to 24 bytes of printable ASCII, none of `< > & "`).
 - **Weights** - the four deduction weights (breadth, crashes, hangs, regression), each 0 or more,
   summing to at most 100.
 - **Model** - the per-device event cap (1 to 1000, default 5), the regression start and full ratios
   (1 to 1000, start below full, defaults 1.0 and 3.0) and the interval confidence level (0.5 to
-  0.999, default 0.95; global only).
+  0.999, default 0.95; global only). Do not change a model parameter during a rolling upgrade or
+  rollback (see *Rolling upgrades* at the end of this section).
 - **Application overrides** - up to 200 per-application overrides keyed by the exact image name
   (case is ignored). An override replaces only the fields it sets; a blank field inherits the global
   value. Tick *Remove this override* and save to delete a row; a blank row at the end adds one.
   Typing an image name offers the top applications of the last 7 days as suggestions when the
   signals store is available.
+
+Tier names and image names are saved exactly as typed (a space is a valid character in both);
+numbers have surrounding spaces trimmed.
 
 **Save** validates the whole document with the same validator as `PUT /api/v1/dex/score-policy`
 and writes it through the same function, so the revision check and the audit rows are identical
@@ -107,16 +116,29 @@ that exact field. A field of an override row is marked on the row you submitted,
 rows were removed. An override row that has values but no application image is refused on its image
 field rather than dropped; tick *Remove this override* to delete a row.
 
-**Preview tier changes** is a dry run: it validates the form, stores nothing, and lists how many
-of the top applications of the last 7 days (all platforms) would change tier, with the first
-twenty. It is unavailable, and says so, when the signals store is not present or the applications
-cannot be scored right now.
+**Preview tier changes** is a dry run: it validates the form, stores no policy, and writes one
+`dex.score_policy.validate` audit row. It lists how many of the top applications of the last 7 days
+(all platforms) would change tier, with the first twenty, and says how many applications it covered
+and how many more were not scored when the list was cut to the applications affecting most devices.
+It is unavailable, and says so, when the signals store is not present, the applications cannot be
+scored right now, or the stored policy changed between the two readings it makes.
 
 **Reset to defaults** (after a confirmation) removes the stored policy, and with it every override.
+The store keeps no history of earlier policies: to go back to one, save that document again. Each
+`dex.score_policy.update` audit row (the `attempted` row and the `success` row) records the whole
+document, so an earlier one can be copied from there; see [Audit log](audit-log.md).
 
 If someone else saves while you are editing, your save is refused with *changed by someone else*,
-nothing is overwritten, and a Reload button fetches the current policy. A change reaches every server
-within 5 seconds. Tier names and image names are HTML-escaped wherever they are shown.
+nothing is overwritten, and a Reload button fetches the current policy; reloading discards the
+edits on screen. A change reaches every server typically within 5 seconds. Tier names and image
+names are HTML-escaped wherever they are shown.
+
+**Rolling upgrades.** Do not save or reset the policy during a rolling upgrade or rollback of the
+server. A server on the previous release reads a version 2 document (one that sets a model
+parameter) as `unsupported_version` and scores under the shipped defaults until every server runs
+the same release, and a write made through the API on such a server replaces the whole document. The
+Scoring tab does not exist on a server that predates it: behind a load balancer,
+`GET /fragments/dex/scoring` answers `404` from such a replica. See [Upgrading](upgrading.md).
 
 ### Catalogue
 

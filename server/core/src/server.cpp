@@ -22059,9 +22059,11 @@ private:
                 .provider = dex_score_policy_provider_,
                 .audit = {}};
             // AP-3.12: the DEX Scoring tab calls the SAME apply function over the SAME deps
-            // (its POSTs bind their own session-stamped audit closure). The setters run after
-            // settings_routes_->register_routes (above) and before the listener starts, and the
-            // handlers read the members per request, so the placement is safe.
+            // (its POSTs bind their own session-stamped audit closure). Only the REST setter
+            // below has to precede the REST register_routes call (it captures the deps when it
+            // registers). The Scoring tab's setters need no such order: the Settings routes were
+            // registered long before this point (above) and their handlers read these members per
+            // request, so all that matters is that they are set before the listener starts.
             settings_routes_->set_dex_score_policy_writer(policy_deps);
             rest_api_v1_->set_dex_score_policy_writer(std::move(policy_deps));
             // The suggestions and the pre-save tier-change preview score the Apps model through
