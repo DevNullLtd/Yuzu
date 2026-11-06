@@ -35,7 +35,7 @@ def rest_block(text):
 
 
 def mcp_row(text):
-    m = re.search(r"^\| 205 \| `execute_workflow`.*$", text, re.M)
+    m = re.search(r"^\| \d+ \| `execute_workflow`.*$", text, re.M)
     return m.group(0) if m else ""
 
 
@@ -48,7 +48,7 @@ def problems(hpp_text, rest_text, mcp_text, swept):
     if not block:
         out.append("rest-api.md: the 'Nothing reached `503`' block is missing")
     if not row:
-        out.append("mcp.md: the execute_workflow row (205) is missing")
+        out.append("mcp.md: the execute_workflow row is missing")
     for t in toks:
         if block and t not in REST_ONLY_EXEMPT and f"`{t}`" not in block:
             out.append(f"rest-api.md: zero-reach status `{t}` is not named")
@@ -83,6 +83,13 @@ def main():
     claim = problems(hpp, rest, mcp, {**swept, "x.md": "a step with no `command_id` was never sent"})
     if not any("run_failed" in p for p in drop) or not any("x.md" in p for p in claim):
         found.append("selftest: the gate did not detect an in-memory mutation")
+    # The row is found by its text, not its table number: a renumber must stay green, a dropped
+    # status in that row must not.
+    row = mcp_row(mcp)
+    renum = problems(hpp, rest, mcp.replace(row, re.sub(r"^\| \d+ ", "| 9999 ", row), 1), swept)
+    mdrop = problems(hpp, rest, mcp.replace(row, row.replace("`run_failed`", "`x`")), swept)
+    if renum != found or not any("run_failed" in p for p in mdrop):
+        found.append("selftest: the mcp.md row anchor is tied to its number or misses a dropped status")
 
     for p in found:
         print("FAIL:", p)
