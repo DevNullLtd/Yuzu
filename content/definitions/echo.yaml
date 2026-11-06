@@ -17,11 +17,16 @@ metadata:
     network_capture_method and the network_capture_method_effective (the
     mechanism actually collecting — always polling today), so status never
     misrepresents the active capture mechanism. On the healthy path the FIRST
-    line is storage_state|ok. Offline means a wedged rollback closed the Echo
-    database, so collection and retention are both stopped until the agent
-    restarts and every other field is withheld -- the reply is then just an
-    error| line followed by storage_state|offline, and the action exits
-    non-zero. The order is REVERSED on that path: error| comes FIRST, because
+    line is storage_state|ok. Offline means collection and retention are both
+    stopped until the agent restarts and every other field is withheld -- the
+    reply is then just an error| line followed by storage_state|offline (a
+    wedged rollback closed the Echo database) or
+    storage_state|offline|free_space (the roll-up migration was refused at
+    start because the volume held less than twice the database file plus its write-ahead log free, or
+    its free space could not be read; the file is untouched and Echo loads
+    without its database until a restart with the space freed), and the
+    action exits non-zero. The order is REVERSED on that path: error| comes
+    FIRST, because
     server and dashboard consumers key off the output starting with error|, so
     do not assume storage_state is always the first line. Historical data
     NORMALLY stays queryable via echo sql, but only when the read-only query
@@ -45,8 +50,9 @@ metadata:
     cannot be read; above 0 while an echo.sql read pins the log, after an
     eviction pass that failed or was skipped, while a catch-up is still
     draining, or when only exempt rows remain),
-    budget_evicted_raw_rows_total and budget_evicted_hourly_rows_total
-    (cumulative rows the budget removed), and db_auto_vacuum (incremental;
+    budget_evicted_hourly_rows_total (cumulative hourly rows the budget
+    removed; budget_evicted_raw_rows_total is retired, no longer written, and
+    prints its last value for one release), and db_auto_vacuum (incremental;
     none; or deferred once a one-off conversion was wanted and could not run,
     for too little free disk space or a failed VACUUM, which stays until a
     conversion succeeds).
@@ -416,11 +422,11 @@ spec:
           whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB).
           A value below the minimum, or one that is not a whole number, is
           refused with an error| line and nothing changes. When the database
-          is over budget the maintenance pass removes hourly rows, oldest
-          first, never those newer than 48 hours (5 days for procperf), even
-          inside their retention window. Daily and monthly rows are never
-          removed, nor are the usage tables, or paused or errored sources (an
-          unreadable <source>_enabled counts as errored). Requires an agent newer than v0.15.0; an older agent
+          is over budget the maintenance pass removes hourly rows older than
+          48 hours (5 days for procperf), oldest first. Daily and
+          monthly rows are never removed, nor are the usage tables,
+          or paused or errored sources (an unreadable <source>_enabled counts
+          as errored). Requires an agent newer than v0.15.0; an older agent
           ignores this key beside other keys and refuses it alone
           (error|no valid configuration parameters provided). Lowering it
           permanently deletes the oldest eligible history within 15 minutes,
@@ -666,7 +672,8 @@ spec:
         description: >
           Enable or disable the sleep/wake/AC-power transition source (power →
           $Power_Hourly, cursor-model seam). **ON by default ("true")**, like every
-          other capture source. The TIMING of sleep/wake
+          other capture source. The SOC 2 data inventory classifies $Power_Hourly as
+          usage-class / behavioral-adjacent, because the TIMING of sleep/wake
           and AC events is a presence and working-hours proxy. Treat it as
           co-determination-relevant and use power_lookback_seconds=0 where a
           retrospective read is not lawful.
@@ -703,8 +710,9 @@ spec:
           (removable → $Removable_Hourly, cursor-model seam), including
           exec_from_removable correlation (a process observed running from a
           removable volume). **ON by default ("true")**, like every other
-          capture source. This is the MORE sensitive of power and removable. It
-          records device vendor, product and SERIAL, plus the executed
+          capture source. This is the MORE sensitive of power and removable. The SOC 2
+          data inventory classifies $Removable_Hourly as usage/identity-class:
+          it records device vendor, product and SERIAL, plus the executed
           binary path and pid of any process running from a removable volume.
           Treat it as co-determination-relevant and set
           removable_lookback_seconds=0 where a retrospective read of OS-retained
@@ -737,7 +745,8 @@ spec:
         displayName: Registry Change Capture Enabled
         description: >
           Enable or disable the Windows registry change source (registry →
-          $Registry_Hourly, cursor-model seam). **ON by default ("true")**, like
+          $Registry_Hourly and $Registry_Daily; $Registry_Live is an empty view;
+          cursor-model seam). **ON by default ("true")**, like
           every other capture source. Windows only; on Linux and macOS the source
           is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
           Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and
@@ -745,14 +754,15 @@ spec:
           user profile hive the agent can resolve a path for, loaded or unloaded: an
           unloaded hive is found through the profile list, which is walked up to 512
           entries) is watched for changes; each added or changed value
-          is recorded with its new value (up to 512 bytes of text), a removed
-          value by its name, and a changed or removed value also carries the
-          type and size of its old value, never the old value itself.
-          VALUES ARE STORED UNMASKED: the new value of every value added or
-          changed under a watched key is readable through echo.sql in
-          $Registry_Hourly (its last_data column holds the latest value of each
-          hourly bucket; for example a Winlogon autologon DefaultPassword when
-          it changes). A value that has not changed is not: the per-key baseline
+          is recorded with its new value (up to 512 bytes of text) and its
+          type, a removed value by its name, and each row carries the image
+          of the process that wrote it when attribution succeeded; the old
+          value is not kept, neither its text nor its type or size.
+          VALUES ARE STORED UNMASKED: the newest value of every value added or
+          changed under a watched key is readable through echo.sql as last_data
+          in $Registry_Hourly and $Registry_Daily, for the tier's retention (for
+          example a Winlogon autologon DefaultPassword when it changes); $Registry_Live
+          answers no rows. A value that has not changed is not: the per-key baseline
           in echo_state holds only its type, size and an unsalted hash. The
           source's cursor row (echo_cursor) holds the new value of a change still
           waiting for its writer. A baseline written by an older build also holds
@@ -763,32 +773,38 @@ spec:
           three accordingly, or set "false" to opt out. The acting
           process is CORRELATED to each change from a write-only Kernel-Registry
           ETW session (value writes, value deletions and key deletions) by value
-          name, type, size and time window: actor_pid and actor_image name the
-          single process that made a matching write, which is a lead to verify
-          against $Process_Hourly, not proof, and detail says attr:corr,
-          attr:ambiguous, attr:none, attr:degraded, attr:off, attr:lost-restart
-          or attr:offline.
-          The ETW session needs an elevated agent; without one rows say attr:off
+          name, type, size and time window: the collector names the single
+          process that made a matching write, which is a lead to verify
+          against $Process_Hourly, not proof, and the tier keeps its image as
+          last_actor_image. How the writer was settled (correlated, ambiguous,
+          none, degraded, no session, lost across a restart, or read offline) and
+          the writer's process id are not stored.
+          The ETW session needs an elevated agent; without one no writer is named
           and the key watch alone runs. The roots of a logged-off user's unloaded
           hive have no watch: they are read on the hourly tick (every 12 slow ticks,
           hourly at the default 300 s; sooner on first sight, after a re-enable and
           every tick while a read is capped or owed a retry) through the guarded
-          offline-hive mount,
-          and their rows say source=offline and attr:offline, never naming
-          a process; such a change may predate the read or the logoff. A change is read at the slow tick that
+          offline-hive mount, never naming a process. A change found there is
+          counted in $Registry_Hourly and $Registry_Daily like one from a loaded
+          hive; that it came from an offline read is not retained, and it may
+          predate the read or the logoff. A change is read at the slow tick that
           sees it (every slow_interval, 300 s by default) and its row lands in
           that tick once its writer is settled, or in the next one when the
           write was within a few seconds of the tick or was found by the full
           re-read of every watched key (every 12 slow ticks, hourly at the
-          default). A change whose marker cannot depend on a later event
-          (attr:off, attr:lost-restart, attr:offline) is written in the tick that
+          default). A change whose writer cannot depend on a later event (no
+          ETW session, a restart, an offline read) is written in the tick that
           sees it, never held. A value written and reverted between two reads is not
           recorded. A key is baselined silently at its first read, so for a user
           hive first seen at logon anything written to its watched keys before
           that first read is not a row; a user's baseline carries across logoff
           and logon, so a change made while they were logged off is reported by
           the next read.
-          Retention is by age, set per tier. Setting "false" pauses capture
+          Rows live in $Registry_Hourly and $Registry_Daily ($Registry_Live
+          is an empty view): the newest value of each changed value is
+          readable there as last_data, unmasked, for the tier's retention
+          (90 days hourly, 180 days daily by default; time-based, not a row
+          count). Setting "false" pauses capture
           and a later "true" re-baselines every watched key (no row is invented
           for what changed while paused). Requires an agent newer than v0.14.1;
           older agents silently ignore. Valid: "true" | "false".

@@ -331,7 +331,8 @@ TEST_CASE("GET /api/v1/settings/data-retention carries the Echo tier defaults an
     CHECK(data.at("echo").at("db_budget_bytes").get<long long>() == yuzu::kEchoDbBudgetBytesDefault);
     bool found = false;
     for (const auto& t : tiers) {
-        found = found || (t.at("source") == "process" && t.at("tier") == "daily");
+        found = found || (t.at("source") == "process" && t.at("tier") == "hourly" &&
+                          t.at("limit").get<long long>() == 7776000);
         CHECK(t.contains("budget_dependent"));
     }
     CHECK(found);

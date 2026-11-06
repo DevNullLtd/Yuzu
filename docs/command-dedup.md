@@ -111,8 +111,39 @@ claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
 ## Two further contracts
 
 - `record_terminal` is **FIRST-WRITE-WINS** (in-flight → terminal only).
-- **The dedup window (`kMaxDedupRows`) MUST exceed the server's max retry/outbox horizon** (WS-1 /
-  WS-3).
+- **The dedup window (`kMaxDedupRows`) MUST exceed the server's outbox redelivery horizon** (#3678).
+  The relationship between the two constants is a compile-time check, not prose: `kMaxDedupRows` is
+  `yuzu::kAgentDedupRingRows` and `kMaxOutboxRedeliveryHorizonCommands` is `static_assert`ed to at
+  most half of it, both in `common/include/yuzu/command_replay_horizon.hpp`. What the horizon
+  actually measures at run time is an ESTIMATE, and it is not a proof.
+  The WS-3 command outbox (`command_outbox_delivery.cpp`) records the dispatch counters
+  (`ExecutionTracker::current_dispatch_position`: the shared `dispatch_seq`, plus this process's own
+  count of dispatches whose record write failed) and the leader epoch on a row before its first
+  attempt. A redrive's elapsed estimate is the shared delta plus the unrecorded delta: the exact
+  local difference when the same leadership term reads it again, and the reader's whole local count
+  when a different term does. The shared and local terms are never added into one stored number,
+  because they are on different scales. A redrive whose estimate reaches the horizon is
+  dead-lettered `redelivery_horizon_exceeded`; a shared sequence that went backwards (a restore or a
+  lost-WAL failover) is dead-lettered `redelivery_sequence_regressed`.
+  **It errs both ways.** It OVER-counts (safe: a row is dead-lettered early and a scheduled fire is
+  lost, audited): the sequence is fleet-wide; a per-target push (Guardian, asset-tag, sync) counts
+  once per target although each agent receives one command; `__guard__` counts although it takes no
+  ring slot; every redrive that re-records its own id advances it, so rows stuck in a long
+  gateway-directory outage age each other; and a reader in another leadership term charges its whole
+  unrecorded count, which never decays inside a process (after about 10,000 such dispatches every
+  later leadership change dead-letters every waiting row until a restart). It can UNDER-count
+  (unsafe: a redrive after the agent evicted the id): a record-write failure on a replica other than
+  the one reading the position is not counted, and neither are the failures an EARLIER PROCESS
+  LIFETIME of the same replica made after the stamp (a restart or a leadership change; a restart
+  resets the count to zero and cannot make the shared sequence go backwards, so it is NOT a safe
+  `redelivery_sequence_regressed` refusal); a shared sequence restored to a value still above a
+  row's stamp reads as small progress; a replica acting on a stale snapshot can still send a row a
+  peer has just dead-lettered, because the send precedes the fenced bookkeeping write; and a command
+  dispatched before the stamp but delivered to the agent after it takes a ring slot the count never
+  saw. The 2x margin absorbs the race between the check and the agent's
+  claim; it is not sized for a sustained uncounted outage. The sound close, which makes the agent
+  refuse an id older than its own ring, needs a wire change and is not part of this change (tracked as #7204). No test
+  observes a real agent at the production ring size.
 
 ## Related
 

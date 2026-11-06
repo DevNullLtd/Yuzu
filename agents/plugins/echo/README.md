@@ -15,10 +15,10 @@
 ## How it works
 
 Echo is the agent's local telemetry warehouse. Each capture source has a collector that reads current
-OS state on a timer, compares it with the baseline saved at the previous tick and appends only the
-differences, as change events, to a SQLite database (`echo.db`) on the device. Four interval triggers
-run the collectors and a fifth rolls the raw capture rows up into hourly, daily and monthly tiers,
-trims every tier to its limit and then holds the database to its byte budget. Three sources (`power`, `removable`, `registry`) do not diff a
+OS state on a timer, compares it with the baseline saved at the previous tick and folds only the
+differences, as change events, into hourly, daily and monthly roll-up tiers in a SQLite database
+(`echo.db`) on the device. Four interval triggers run the collectors and a fifth trims every tier to
+its limit, holds the database to its byte budget and sweeps the string dictionary. Three sources (`power`, `removable`, `registry`) do not diff a
 snapshot: they follow a saved position in an OS log or callback stream, and when that position is
 lost they record a `capture_gap` row and start again from the log's current end instead of replaying
 history. All 17 sources are on by default on every OS (`default_enabled` in `echo_schema_registry.cpp`,
@@ -27,6 +27,24 @@ and keeps the rows already stored; `purge_source` then deletes that source's row
 demand and local: `status`, `query`, `export` and `sql` read `echo.db`, `snapshot` forces an
 out-of-cycle collection, and `fleet_snapshot` re-enumerates processes and connections without
 touching `echo.db`.
+
+Storage model: roll-up is the only one, and no setting, flag or mode selects another. Every event is
+folded, in one transaction with its baseline, into an interned string dictionary (`echo_dict`) and
+one physical table per source and tier (`<source>_<tier>_r`), read through a view of the tier's own
+name (`process_hourly`, `tcp_daily`, ...). Counts and sums add, maxima and minima keep the extreme,
+and a "last" value keeps the newest. The usage fold rides the process fold's transaction, so a
+failure of either rolls back both. Raw capture rows are not kept: what an event leaves behind is the
+keys and measures its tier declares, so a per-event pid, command line or timestamp cannot be read
+back. `echo.sql` reads the tiers directly; `echo.query` and `echo.export` return the hourly buckets
+as rows of the old shape. The retired raw names (`$Process_Live`
+and the other fifteen `<source>_live`) stay answerable as empty views with their old columns, so a
+stored query returns no rows instead of an error. A database written by an earlier build is migrated
+once, in a single transaction, on the first open (schema v10; see "Upgrading an existing
+database"): the volume must hold twice the database file plus its write-ahead log free, or the open is refused with the
+retired tables intact and Echo stays offline (`status` reports `storage_state|offline|free_space`)
+until space is freed and the agent restarts. `sql` refuses common table expressions (`WITH`; a query that starts with `WITH` gets
+`only SELECT queries are allowed`), `NATURAL` / `USING` joins (write joins with `ON`) and
+bound-parameter markers, and reads only through the tables and views the schema lists.
 
 Deliberately not: Echo does not stream events to the server in real time (everything lands in the
 local warehouse first and is pulled by a read action), it does not replay history from zero when a
@@ -39,7 +57,7 @@ reports `planned`, not a guessed read).
 | `echo.slow` | 300 s (30-7200) | `collect_slow` | `service`, `user`, `netconn`, `mapdrive` and the cursor sources `power`, `removable`, `registry` |
 | `echo.perf` | 30 s | `collect_perf` | `perf`, `procperf` (device and per-application counters, sampled rather than diffed) |
 | `echo.software` | 3600 s (0 removes the trigger, otherwise 300-86400) | `collect_software` | `software` |
-| `echo.rollup` | 900 s | `rollup` | aggregation into hourly, daily and monthly tiers, then retention, then the byte budget and file hygiene |
+| `echo.rollup` | 900 s | `rollup` | retention of the tiers, then the byte budget and file hygiene, then the weekly dictionary sweep |
 
 The fast interval must stay below the slow interval. A diffed source's first tick records its baseline and
 no events, so a quiet first tick is not evidence about the past.
@@ -54,8 +72,8 @@ no events, so a quiet first tick is not evidence about the past.
 | Who talked to this address, and what is listening? | `connections_to_ip`, `tcp_by_process`, `listening_ports`, `daily_connection_summary` | Polled connection tables on every OS; a connection that opens and closes inside one interval is not seen. macOS sees every flow only with root. |
 | Did a service change state, who logged on? | `service_state_changes`, `user_sessions` | Windows is complete. Linux and macOS are constrained: no start type, and `utmp` or `utmpx` can miss GUI logins and containers without them. |
 | Which software was installed or removed? | `query type=software` | Windows only (machine-wide Uninstall keys). Empty on Linux and macOS means not collected. |
-| Did a persistence or policy registry value change? | `sql` over `$Registry_Hourly` | Windows only. Per hour and key: the change count and the newest value (up to 512 bytes, unmasked) with its type. A loaded-hive change names the writer when one process can be correlated to it (a lead, not proof); a logged-off user's change never does. |
-| Did the device sleep, wake, change power source, or have media attached? | `sql` over `$Power_Hourly`, `$Removable_Hourly` | Per hour and action: the event count and the newest event's time. A `capture_gap` row marks any stretch the agent could not see. |
+| Did a persistence or policy registry value change? | `sql` over `$Registry_Hourly` (`$Registry_Live` answers no rows) | Windows only. The newest data of each changed value (up to 512 bytes, unmasked, as `last_data`), its type and the image of the writing process when attributed (`last_actor_image`); the old value is not kept. A logged-off user's change is counted in the same tiers and never names a writer. |
+| Did the device sleep, wake, change power source, or have media attached? | `sql` over `$Power_Hourly`, `$Removable_Hourly` | `capture_gap` rows mark any stretch the agent could not see. |
 | Who is on the network segment, what did it resolve, which shares are mapped? | `recent_arp`, `recent_dns`, `recent_mapdrive`, or `query` with type arp, dns or mapdrive | `dns` is Windows only; `mapdrive` outbound live only on macOS. These are device-state sources: they are never part of the default `query` feed. |
 | Anything else in the warehouse | `sql` | A single SELECT against `$`-prefixed tables, validated by `validate_and_translate_sql` and run through the read-only `execute_user_query`. The `usage` tables are not queryable here. |
 | Pull a time range out for another tool | `export` | JSON array of events, same filters as `query`. `limit` defaults to 1000; a value above 10000 (or zero or less) falls back to 1000. |
@@ -109,21 +127,20 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
 
 ### Source notes
 
-- **Retention.** Live tables are row-count capped; the hourly, daily and monthly tiers are
-  time-based (typically 24 hours, 31 days and about a year; a few tiers differ). Each pass deletes at
-  most 5000 rows per table, and a disabled source's rows are never pruned.
+- **Retention.** The roll-up tiers are time-based, cut by bucket start: 90 days hourly, 180 days
+  daily and a year monthly (`usage_daily` keeps 31 days); `netqual_boot` and `usage_live` are
+  row-count capped. Each pass deletes at most 5000 rows per table, and a disabled source's rows are
+  never pruned.
 - **Byte budget.** `db_budget_bytes` (default 250 MiB, minimum 32 MiB) caps used pages plus the
   write-ahead log. Lowering it deletes history on the next maintenance pass (within 15 minutes) and
   cannot be undone: it permanently deletes the oldest eligible history before its tier's retention
   limit, and raising it again does not restore it. The setting is reversible and gated like every
   other `configure` key; the deletion is the maintenance pass's, which is classified destructive. It applies to an existing `echo.db` on upgrade too (the user manual,
-  "Upgrading an existing database"). Over budget, the rollup pass removes raw capture rows that
-  their first summary tier has already passed (hourly, or daily for `user` and `software`; largest
-  table first, oldest first, never the newest 24 hours, and for `process` only rows the usage fold
-  has read), then hourly rows older than 48 hours (5 days for `procperf`). Daily and monthly rows,
-  the `usage` tables, paused or errored sources (an unreadable `<source>_enabled` counts as
-  errored) and the sources with no summary tier (`netconn`, `netqual`, `power`, `removable`,
-  `registry`) are never removed. A pass is batches of 1,000 rows, each in one transaction with its
+  "Upgrading an existing database"). Over budget, the rollup pass removes hourly rows older than
+  48 hours (5 days for `procperf`), largest table first, oldest bucket first. There is no raw tier
+  to take first. Daily and monthly rows, the `usage` tables, `netqual_boot`, paused or errored
+  sources (an unreadable `<source>_enabled` counts as errored) and an unusable `db_budget_bytes`
+  value (read as unknown, never as the default) are never touched. A pass is batches of 1,000 rows, each in one transaction with its
   persisted counter, and stops after 2 seconds; while still over budget each fast tick runs another
   slice. The budget is hard for eligible data pages (the pass stops only at the target) and soft for
   the log: a long `sql` read pins the log, exempt rows can hold used pages above the target, and
@@ -133,14 +150,18 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
   (the budget less the 16 MiB log allowance), or once eviction has nothing left to take, and the free
   pages are at least 32 MiB and a quarter of the file; it needs twice the used size free on the
   volume and otherwise reports `db_auto_vacuum|deferred`, retried at most daily.
-- **Raw capture row volume.** `tcp`: a socket first seen already closing is one row per process and
-  remote per hour; for outbound connections the hourly `connect_count` for these sockets is
-  distinct remotes per process per hour, and an inbound socket first seen closing is one row per
-  client socket per hour, because the remote port is the client's ephemeral port. `module` (Windows): unloads are not stored, risky loads always are, and every other load
-  is stored once per hour per loader, module and folder, so `load_count` is distinct combinations
-  for ordinary modules; an image with no embedded signature is looked up in the system catalogs
-  (a lookup error reads `unknown`, never risky). `registry`: 512-byte values, the old value is not
-  stored, `bam\State` is excluded and a row's time is the key's last-write time. `echo_state` is
+- **What a tier counts.** `tcp`: a socket first seen already closing counts as one connection per
+  process and remote per hour; for outbound connections the hourly `connect_count` for these sockets
+  is distinct remotes per process per hour, and an inbound socket first seen closing counts once per
+  client socket per hour, because the remote port is the client's ephemeral port. A connection
+  attempt that vanishes while its last observed state is `SYN_SENT` counts as `failed`, which can
+  over-count a very short-lived connection a poll never saw established; a listening socket counts as
+  `listen_open` / `listen_close` under `remote_addr='*'`, never as a connection. `module` (Windows):
+  unloads are not counted, risky loads always are, and every other load is counted once per hour per
+  loader, module and folder, so `load_count` is distinct combinations for ordinary modules; an image
+  with no embedded signature is looked up in the system catalogs (a lookup error reads `unknown`,
+  never risky). `registry`: the last value keeps its first 512 bytes, the old value is not kept,
+  `bam\State` is excluded and the last-write time of the key is the event time. `echo_state` is
   rewritten only when a baseline changed.
 - **`netconn` and `power`/`removable` history.** On first enablement the read can reach back into
   OS-retained history, bounded by `netconn_lookback_seconds`, `power_lookback_seconds` (effective on
@@ -156,7 +177,8 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
   pinned in memory before the first mount; if the pin fails no hive is read, and while a stuck
   mount is still running later runs do not start new mounts. `purge_source mapdrive` also clears the
   pending-retry list so a retry cannot re-insert purged rows.
-- **`registry`.** Values are stored unmasked, and a loaded-hive row names a correlated writer where one is found (a lead, not proof). The hives of logged-off users whose profile path the walk can resolve are read on the hourly tick (every 12 slow ticks: hourly at the default 300 s, between 6 minutes and 24 hours as `slow_interval` varies; a hive that is capped, deferred or owed a retry is mounted again on the next tick) through the guarded offline-hive mount: one mount per hive, loaded roots first and the hives in the budget that is left (the tail of a long list is read over the following ticks, visible as `registry_offline_roots_deferred`), rows `attr:offline` and never attributed, one `gap:unreadable` row per root (up to five per hive) for a refused or failed mount. Discovery walks the profile list with its 512-entry cap: beyond it the profiles the walk reaches are read and `registry_offline_discovery_incomplete` stays `1`. See Caveats.
+- **`registry`.** The last value is kept unmasked, with its type and the last writer's image; the
+  writer's pid and the attribution detail are not kept in the tier; see Caveats. The hives of logged-off users whose profile path the walk can resolve are read on the hourly tick (every 12 slow ticks: hourly at the default 300 s, between 6 minutes and 24 hours as `slow_interval` varies; a hive that is capped, deferred or owed a retry is mounted again on the next tick) through the guarded offline-hive mount: one mount per hive, loaded roots first and the hives in the budget that is left (the tail of a long list is read over the following ticks, visible as `registry_offline_roots_deferred`). A change found there is counted in the same tiers as a loaded hive's and never names a writer; the offline marker is not retained. A refused or failed mount counts one gap event per root (up to five per hive). Discovery walks the profile list with its 512-entry cap: beyond it the profiles the walk reaches are read and `registry_offline_discovery_incomplete` stays `1`. See Caveats.
 
 ### Diagrams
 
@@ -188,34 +210,34 @@ flowchart TD
   G -->|"no"| SK["Skip the tick: rows and baseline are kept"]
   G -->|"yes"| E["Enumerate current OS state"]
   E --> D["Diff against the baseline in echo_state, first tick records the baseline only"]
-  D --> L[("Live tables in echo.db")]
-  R["echo.rollup every 900 s"] --> A["run_aggregation: live to hourly to daily to monthly"]
-  L --> A
-  A --> H[("Hourly, daily and monthly tables")]
-  A --> C{"run_retention: clock guard on time-based tiers"}
+  D --> F["Fold: one transaction with the baseline writes the hourly, daily and monthly tiers"]
+  F --> H[("Roll-up tiers in echo.db")]
+  R["echo.rollup every 900 s"] --> C{"run_retention: clock guard on time-based tiers"}
+  H --> C
   C -->|"plausible clock"| X["Delete aged rows, at most 5000 per table per pass"]
   C -->|"anomaly, first time seen"| N["Decline that table and count it in status"]
   C -->|"same anomaly seen again"| X
   X --> B{"run_budget: data over db_budget_bytes less the 16 MiB log allowance?"}
   N --> S["Skip this budget pass, count it as retention_guard __budget__ in status"]
-  B -->|"yes"| Y["Evict summarised raw capture rows, then hourly rows older than 48 h (5 d for procperf), in 1000-row batches for at most 2 s"]
+  B -->|"yes"| Y["Evict hourly rows older than 48 h (5 d for procperf), largest table first, in 1000-row batches for at most 2 s"]
   B -->|"no"| Z["Return free pages, checkpoint the log, report budget_over_bytes"]
   Y --> Z
   S --> Z
 ```
 
-Collectors write only the difference from the last complete snapshot, and a failed or partial read
-keeps the old baseline rather than inventing events. Aggregation always runs before retention so each
-tier is consumed before the tier below it can be trimmed. The clock guard declines a time-based pass
+Collectors fold only the difference from the last complete snapshot, and a failed or partial read
+keeps the old baseline rather than inventing events. Every tier is written as the event arrives, so
+retention trims each tier independently. The clock guard declines a time-based pass
 that looks like a wall-clock jump (a pass that would wipe a table, more than 30 days since the last
 pass, a stored reading ahead of now, or no stored reading) and counts it in
 `retention_guard_declines_total`. It declines once per distinct anomaly: while the same anomaly
 persists, later passes delete again but never more than 5000 rows per table per pass. Row-count
 trimming needs no clock and is not clock-guarded, though it has the same per-pass cap. The byte budget
 runs after retention: it is size-triggered, not clock-triggered, it is skipped for a pass on which the
-clock guard declined or failed, and it only takes rows their first summary tier has already passed. Its 24 h and 48 h (5 days for `procperf`) floors do move with a clock error (a clock set forward admits
-more rows); what bounds what it deletes is the measured size overage, since the pass stops at the target
-(`docs/clock-guarded-retention.md`).
+clock guard declined or failed, and it only takes hourly rows. Its 48 h (5 days for `procperf`) floor
+does move with a clock error (a clock set forward admits more rows); what bounds what it deletes is the
+measured size overage, since the pass stops at the target. A catch-up slice that finds the clock stepped
+back below the reading it was admitted with stops instead of deleting (`docs/clock-guarded-retention.md`).
 
 #### Disable, then purge a source
 
@@ -325,7 +347,7 @@ Windows runs an ETW session on provider `Microsoft-Windows-Kernel-Process`
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
 | `crossplatform.echo.configure` | `retention_days` | string | no | - | pattern: ^[0-9]+$ | Number of days to retain Echo events before automatic purging. Valid range: 1-365. Default: 7. |
-| `crossplatform.echo.configure` | `db_budget_bytes` | string | no | - | pattern: ^[0-9]+$ | Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB). A value below the minimum, or one that is not a whole number, is refused with an error\| line and nothing changes. When the database is over budget the maintenance pass removes hourly rows, oldest first, never those newer than 48 hours (5 days for procperf), even inside their retention window. Daily and monthly rows are never removed, nor are the usage tables, or paused or errored sources (an unreadable <source>_enabled counts as errored). Requires an agent newer than v0.15.0; an older agent ignores this key beside other keys and refuses it alone (error\|no valid configuration parameters provided). Lowering it permanently deletes the oldest eligible history within 15 minutes, before its tier's retention limit; raising it again does not restore it. |
+| `crossplatform.echo.configure` | `db_budget_bytes` | string | no | - | pattern: ^[0-9]+$ | Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB). A value below the minimum, or one that is not a whole number, is refused with an error\| line and nothing changes. When the database is over budget the maintenance pass removes hourly rows older than 48 hours (5 days for procperf), oldest first. Daily and monthly rows are never removed, nor are the usage tables, or paused or errored sources (an unreadable <source>_enabled counts as errored). Requires an agent newer than v0.15.0; an older agent ignores this key beside other keys and refuses it alone (error\|no valid configuration parameters provided). Lowering it permanently deletes the oldest eligible history within 15 minutes, before its tier's retention limit; raising it again does not restore it. |
 | `crossplatform.echo.configure` | `fast_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for process and network collection. Valid range: 10-3600. Default: 60. |
 | `crossplatform.echo.configure` | `slow_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for service and user session collection. Valid range: 30-7200. Default: 300. |
 | `crossplatform.echo.configure` | `redaction_patterns` | string | no | - | - | JSON array of case-insensitive SUBSTRING patterns (not glob) for command-line redaction. Leading/trailing `*` are stripped; `?` and `[abc]` are literals. Any process command line containing a pattern has its cmdline replaced with "[REDACTED by Echo]". At most 256 elements of at most 256 characters each; over-cap elements are dropped at load. Default patterns: ["*password*", "*secret*", "*token*", "*api_key*", "*credential*"]. These defaults are ALWAYS MERGED IN — your patterns are ADDED to them, never replace them, so an empty or all-invalid array cannot disable the baseline redaction. |
@@ -344,11 +366,11 @@ Windows runs an ETW session on provider `Microsoft-Windows-Kernel-Process`
 | `crossplatform.echo.configure` | `arp_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the ARP / neighbour-table capture source (ADR-0015). **On by default.** See process_enabled for semantics. Native on every OS today: GetIpNetTable2 on Windows, /proc/net/arp on Linux, and a route_sysctl dump on macOS (constrained there -- entry_type always reports "unknown"). Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
 | `crossplatform.echo.configure` | `dns_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the DNS resolver-cache capture source (ADR-0015). **On by default** — the DNS cache reveals visited domains. Windows-only collector today (Linux/macOS planned). Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
 | `crossplatform.echo.configure` | `mapdrive_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the mapped-drive capture source (capability-map §3.8, mapdrive → $MapDrive_*). Records network-share mappings in BOTH directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal). **On by default** — rows expose usernames and remote share paths. Windows + Linux (macOS planned); inbound needs local-admin / Server-Operator on Windows and Samba on Linux and degrades to empty otherwise. NOTE: the HISTORICAL backfill (all PREVIOUSLY mapped drives, from the registry / fstab / event logs) runs its first pass at agent init, so it materializes on the first agent restart AFTER you enable this; any profile whose hive could not be read on that first pass (including a logged-out profile the offline hive-file guard refuses) is retried individually, bounded at 7 attempts per profile 24 hours apart, until it resolves or is abandoned. See software_enabled for disable semantics (same opt-in posture; disabling leaves existing rows queryable). Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
-| `crossplatform.echo.configure` | `power_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the sleep/wake/AC-power transition source (power → $Power_Hourly, cursor-model seam). **ON by default ("true")**, like every other capture source. The TIMING of sleep/wake and AC events is a presence and working-hours proxy. Treat it as co-determination-relevant and use power_lookback_seconds=0 where a retrospective read is not lawful. The source WILL use a durable log-position cursor (not a snapshot diff), so a restart will resume from where it left off rather than re-scanning; a lost/invalid cursor or a wrapped OS event log will re-baseline forward and record a capture_gap rather than replaying from the beginning. Set to "false" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
+| `crossplatform.echo.configure` | `power_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the sleep/wake/AC-power transition source (power → $Power_Hourly, cursor-model seam). **ON by default ("true")**, like every other capture source. The SOC 2 data inventory classifies $Power_Hourly as usage-class / behavioral-adjacent, because the TIMING of sleep/wake and AC events is a presence and working-hours proxy. Treat it as co-determination-relevant and use power_lookback_seconds=0 where a retrospective read is not lawful. The source WILL use a durable log-position cursor (not a snapshot diff), so a restart will resume from where it left off rather than re-scanning; a lost/invalid cursor or a wrapped OS event log will re-baseline forward and record a capture_gap rather than replaying from the beginning. Set to "false" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
 | `crossplatform.echo.configure` | `power_lookback_seconds` | string | no | - | pattern: ^[0-9]+$ | How far BEFORE enablement the power source's first read may reach into OS-retained sleep/wake/AC-power history (same shape as netconn_lookback_seconds, ADR-0020). Set to "0" to disable the pre-enablement read entirely (forward-only from the moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7 days). Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. Effective on macOS only — Windows and Linux have no power-history API, so their first read is always forward-only regardless of this value. Requires agent v0.12.0+. |
-| `crossplatform.echo.configure` | `removable_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the removable-media attach/detach source (removable → $Removable_Hourly, cursor-model seam), including exec_from_removable correlation (a process observed running from a removable volume). **ON by default ("true")**, like every other capture source. This is the MORE sensitive of power and removable. It records device vendor, product and SERIAL, plus the executed binary path and pid of any process running from a removable volume. Treat it as co-determination-relevant and set removable_lookback_seconds=0 where a retrospective read of OS-retained removable history is not lawful. The source WILL use the same durable log-position cursor model as power (see power_enabled) — a lost/invalid cursor will re-baseline forward and record a capture_gap rather than replaying history. Queried via echo.sql only ($Removable_Hourly); the legacy echo.query / echo.export actions do not surface removable. Set to "false" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
+| `crossplatform.echo.configure` | `removable_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the removable-media attach/detach source (removable → $Removable_Hourly, cursor-model seam), including exec_from_removable correlation (a process observed running from a removable volume). **ON by default ("true")**, like every other capture source. This is the MORE sensitive of power and removable. The SOC 2 data inventory classifies $Removable_Hourly as usage/identity-class: it records device vendor, product and SERIAL, plus the executed binary path and pid of any process running from a removable volume. Treat it as co-determination-relevant and set removable_lookback_seconds=0 where a retrospective read of OS-retained removable history is not lawful. The source WILL use the same durable log-position cursor model as power (see power_enabled) — a lost/invalid cursor will re-baseline forward and record a capture_gap rather than replaying history. Queried via echo.sql only ($Removable_Hourly); the legacy echo.query / echo.export actions do not surface removable. Set to "false" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
 | `crossplatform.echo.configure` | `removable_lookback_seconds` | string | no | - | pattern: ^[0-9]+$ | How far BEFORE enablement the removable source's first read may reach into OS-retained device-attach history (same shape as netconn_lookback_seconds / power_lookback_seconds above). Set to "0" to disable the pre-enablement read entirely (forward-only from the moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7 days). Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. Requires agent v0.12.0+. |
-| `crossplatform.echo.configure` | `registry_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the Windows registry change source (registry → $Registry_Hourly, cursor-model seam). **ON by default ("true")**, like every other capture source. Windows only; on Linux and macOS the source is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services, Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under each user profile hive the agent can resolve a path for, loaded or unloaded: an unloaded hive is found through the profile list, which is walked up to 512 entries) is watched for changes; each added or changed value is recorded with its new value (up to 512 bytes of text), a removed value by its name, and a changed or removed value also carries the type and size of its old value, never the old value itself. VALUES ARE STORED UNMASKED: the new value of every value added or changed under a watched key is readable through echo.sql in $Registry_Hourly (its last_data column holds the latest value of each hourly bucket; for example a Winlogon autologon DefaultPassword when it changes). A value that has not changed is not: the per-key baseline in echo_state holds only its type, size and an unsalted hash. The source's cursor row (echo_cursor) holds the new value of a change still waiting for its writer. A baseline written by an older build also holds up to 512 bytes of each value it saw until a complete read of that root rewrites it (a key under a subtree the read could not open keeps its earlier entry), and a cursor row built from one also holds the old value until that change is written (the next slow tick at most). Treat all three accordingly, or set "false" to opt out. The acting process is CORRELATED to each change from a write-only Kernel-Registry ETW session (value writes, value deletions and key deletions) by value name, type, size and time window: actor_pid and actor_image name the single process that made a matching write, which is a lead to verify against $Process_Hourly, not proof, and detail says attr:corr, attr:ambiguous, attr:none, attr:degraded, attr:off, attr:lost-restart or attr:offline. The ETW session needs an elevated agent; without one rows say attr:off and the key watch alone runs. The roots of a logged-off user's unloaded hive have no watch: they are read on the hourly tick (every 12 slow ticks, hourly at the default 300 s; sooner on first sight, after a re-enable and every tick while a read is capped or owed a retry) through the guarded offline-hive mount, and their rows say source=offline and attr:offline, never naming a process; such a change may predate the read or the logoff. A change is read at the slow tick that sees it (every slow_interval, 300 s by default) and its row lands in that tick once its writer is settled, or in the next one when the write was within a few seconds of the tick or was found by the full re-read of every watched key (every 12 slow ticks, hourly at the default). A change whose marker cannot depend on a later event (attr:off, attr:lost-restart, attr:offline) is written in the tick that sees it, never held. A value written and reverted between two reads is not recorded. A key is baselined silently at its first read, so for a user hive first seen at logon anything written to its watched keys before that first read is not a row; a user's baseline carries across logoff and logon, so a change made while they were logged off is reported by the next read. Retention is by age, set per tier. Setting "false" pauses capture and a later "true" re-baselines every watched key (no row is invented for what changed while paused). Requires an agent newer than v0.14.1; older agents silently ignore. Valid: "true" \| "false". |
+| `crossplatform.echo.configure` | `registry_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the Windows registry change source (registry → $Registry_Hourly and $Registry_Daily; $Registry_Live is an empty view; cursor-model seam). **ON by default ("true")**, like every other capture source. Windows only; on Linux and macOS the source is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services, Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under each user profile hive the agent can resolve a path for, loaded or unloaded: an unloaded hive is found through the profile list, which is walked up to 512 entries) is watched for changes; each added or changed value is recorded with its new value (up to 512 bytes of text) and its type, a removed value by its name, and each row carries the image of the process that wrote it when attribution succeeded; the old value is not kept, neither its text nor its type or size. VALUES ARE STORED UNMASKED: the newest value of every value added or changed under a watched key is readable through echo.sql as last_data in $Registry_Hourly and $Registry_Daily, for the tier's retention (for example a Winlogon autologon DefaultPassword when it changes); $Registry_Live answers no rows. A value that has not changed is not: the per-key baseline in echo_state holds only its type, size and an unsalted hash. The source's cursor row (echo_cursor) holds the new value of a change still waiting for its writer. A baseline written by an older build also holds up to 512 bytes of each value it saw until a complete read of that root rewrites it (a key under a subtree the read could not open keeps its earlier entry), and a cursor row built from one also holds the old value until that change is written (the next slow tick at most). Treat all three accordingly, or set "false" to opt out. The acting process is CORRELATED to each change from a write-only Kernel-Registry ETW session (value writes, value deletions and key deletions) by value name, type, size and time window: the collector names the single process that made a matching write, which is a lead to verify against $Process_Hourly, not proof, and the tier keeps its image as last_actor_image. How the writer was settled (correlated, ambiguous, none, degraded, no session, lost across a restart, or read offline) and the writer's process id are not stored. The ETW session needs an elevated agent; without one no writer is named and the key watch alone runs. The roots of a logged-off user's unloaded hive have no watch: they are read on the hourly tick (every 12 slow ticks, hourly at the default 300 s; sooner on first sight, after a re-enable and every tick while a read is capped or owed a retry) through the guarded offline-hive mount, never naming a process. A change found there is counted in $Registry_Hourly and $Registry_Daily like one from a loaded hive; that it came from an offline read is not retained, and it may predate the read or the logoff. A change is read at the slow tick that sees it (every slow_interval, 300 s by default) and its row lands in that tick once its writer is settled, or in the next one when the write was within a few seconds of the tick or was found by the full re-read of every watched key (every 12 slow ticks, hourly at the default). A change whose writer cannot depend on a later event (no ETW session, a restart, an offline read) is written in the tick that sees it, never held. A value written and reverted between two reads is not recorded. A key is baselined silently at its first read, so for a user hive first seen at logon anything written to its watched keys before that first read is not a row; a user's baseline carries across logoff and logon, so a change made while they were logged off is reported by the next read. Rows live in $Registry_Hourly and $Registry_Daily ($Registry_Live is an empty view): the newest value of each changed value is readable there as last_data, unmasked, for the tier's retention (90 days hourly, 180 days daily by default; time-based, not a row count). Setting "false" pauses capture and a later "true" re-baselines every watched key (no row is invented for what changed while paused). Requires an agent newer than v0.14.1; older agents silently ignore. Valid: "true" \| "false". |
 | `crossplatform.echo.configure` | `usage_enabled` | string | no | - | pattern: ^(true\|false)$ | Enable or disable the `usage` derived fold (usage → the open-run table usage_live and $Usage_Daily), a checked_transaction-based pairing of the process source's started/stopped events into per-executable run/duration aggregates plus a per-day distinct-user count. **ON by default ("true")**, like every other capture source. usage_live persists the owning pid and user for each open run, and the per-day username membership (queryable via echo.sql) reveals which applications run on a device, when, and by whom. Treat as co-determination-relevant, same basis as power/removable. Forward-only, no retrospective backfill: disabling and later re-enabling always re-baselines from the moment of re-enable, never a retrospective fold over whatever process history accrued during the disabled window — this is a lifecycle-state-machine property, not a best-effort marker check. Set to "false" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: "true" \| "false". |
 | `crossplatform.echo.configure` | `network_capture_method` | string | no | - | - | TCP capture mechanism. "polling" (always accepted) drives the collector via the platform polling API at fast_interval cadence and is the only mechanism wired today. Validation is OS-AWARE and scoped to the NETWORK (tcp) source: besides "polling", only the tcp-source method valid on the RUNNING host's OS is accepted — iphlpapi on Windows, procfs on Linux, proc_pidfdinfo on macOS (run the `compatibility` action for the live list). Process-source methods such as "etw" / "endpoint_security" are NOT network_capture_method values and are rejected even on their own OS. A method belonging to a DIFFERENT OS is also rejected, so a Linux agent can no longer store "iphlpapi". A host-valid future method is accepted for pre-staging; the agent emits a warn line and continues polling until that collector lands. The mechanism actually in force is observable via network_capture_method_effective in the status action (always polling today). Requires agent v0.12.0+. |
 | `crossplatform.echo.configure` | `process_stabilization_exclusions` | string | no | - | - | JSON array of case-insensitive substring patterns matched against the process name. Any process whose name contains a pattern is dropped before the diff so noisy short-lived helpers do not dwarf real activity. Trade-off: forensic completeness — anything matching is invisible to Echo. Leading and trailing `*` are stripped (so `*-helper*` is the same as `-helper`). NOT real glob — `?` and `[abc]` are treated as literals. At most 256 elements of at most 256 characters each, and the EFFECTIVE substring (after stripping `*`) must be at least 3 characters — a shorter core like "a" or "*a*" would match almost every process and is rejected at configure AND dropped at load. Requires agent v0.12.0+. Example: '["chrome-helper","ms-edge-helper"]'. |
@@ -514,7 +536,7 @@ their declared columns at all; see Caveats.
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `status` | string | - | all | `-` | Declared as a literal status token; the plugin's actual response line is `echo\|rollup\|<n>\|rows_aggregated` (a single positional line, not a status/rows_aggregated pair), so this column is not populated by the current wire format — see Caveats and known gaps. Values: not emitted by the current wire format. |
-| `rows_aggregated` | int32 | - | Windows, Linux, macOS | `-` | Count carried as the third field of the `echo\|rollup\|<n>\|rows_aggregated` line rather than a named column. Values: non-negative integer. |
+| `rows_aggregated` | int32 | - | Windows, Linux, macOS | `-` | Always 0: Echo folds every event into the hourly, daily and monthly tiers as it arrives, so there is no aggregation pass to count. The field stays in the reply shape so a stored client that parses it keeps working; it is the third field of the `echo\|rollup\|<n>\|rows_aggregated` line rather than a named column. Values: 0. |
 
 **`crossplatform.echo.service_state_changes` — `output`**
 
@@ -561,8 +583,19 @@ their declared columns at all; see Caveats.
 **Actions without a definition.** `collect_perf` writes `echo\|collect_perf\|<n>\|<token>`, the same
 shape as `collect_fast`/`collect_slow` (see `do_collect_perf` in `echo_plugin.cpp`). `collect_software` follows the
 same convention. A failed perf/procperf counter read reports `counters_unavailable` where the registry lists the OS as supported and `unsupported_platform` where it has no perf collector. `status` additionally emits `db_budget_bytes|<n|unknown>` (`unknown`: the setting could not be read, so that pass is skipped and retried), `budget_over_bytes|<n|unknown>` (measured when `status` runs, not cached from the last pass; `unknown` when the size or the setting cannot be read), `budget_evicted_raw_rows_total|<n>`, `budget_evicted_hourly_rows_total|<n>`, `db_auto_vacuum|<incremental|none|deferred>`, `module_dedup_overflow_total|<n>`, `tcp_closing_dedup_overflow_total|<n>`, `db_health|<ok|quarantined>|<epoch>`, `config|perf_capture_method|<m>`, `config|procperf_procs_seen|<n>` and, per capture source, `config|<src>_last_status|<token>`, `config|<src>_consecutive_failures|<n>` and `config|<src>_last_status_at|<epoch>` (process memory only; see the user manual). A failed baseline-only save emits `error|<source> state_save_failed`. `retention_guard|__budget__|<n>` is not a table: the byte-budget pass was skipped because the retention clock guard refused this pass's clock; it is counted in neither `retention_guard_declines_total` nor `retention_guard_failures_total`. An exception inside any action ends the reply with a fixed `error|internal` line and exit code 1; it can follow lines already written, so a consumer must not assume `error|` is first on that path; the cause is in the agent log. `purge_source` writes a single JSON line,
-`{"source":"<name>","rows_deleted":<n>,"status":"purged"}` (see `do_purge_source` in `echo_plugin.cpp`), or an
+`{"source":"<name>","rows_deleted":<n>,"status":"purged","dictionary_pending":<true|false>}` (see `do_purge_source` in `echo_plugin.cpp`), or an
 `error|` line if the named source is unknown, still enabled, or its enable flag cannot be read (`config_unreadable`).
+`dictionary_pending` is `true` when the dictionary sweep that follows the row delete (the interned strings only the
+purged rows referenced: process names, users, key paths) ran out of its 60 s deadline or failed: the rows are gone,
+the strings stay until the weekly sweep or a rerun of the purge (the rerun is idempotent and finishes the sweep), the
+reply carries a `constrained` result status (`echo:purge_dictionary_pending`) and `dict_gc_starved_total` is
+incremented, so the response record never claims a complete erasure the dictionary sweep has not finished: a pending
+result is not a complete erasure. Two limits: the server's `echo.source.purge` audit row is written at dispatch and
+carries no agent reply (the reply is in the command's response record), and a write-ahead-log checkpoint that finds
+the file busy after the purge still replies `purged` while the deleted pages stay in the log until the next
+checkpoint (a warning is logged). A query over a retired `$<Source>_Live` name (`sql`) answers no rows with a
+`constrained` result status, so an empty answer is not mistaken for "nothing happened"; only the status enum reaches
+the server, and the retired table's name (`retired_table:<name>`) is in the agent's command log line.
 
 **Empty-result / not-yet-collected convention.** A `planned` leg (see Capture sources by OS) ships
 its schema and config key with no collector, so its `$..._*` tables stay queryable and empty,
@@ -572,17 +605,22 @@ the Windows registry does not exist there, so it records nothing and `compatibil
 
 ### Result status
 
-Echo sets a typed `plugin_result_status` in exactly one place in the whole plugin: `do_snapshot`
-calls `ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+Echo sets a typed `plugin_result_status` in three places: `do_snapshot` calls
+`ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
 "echo:snapshot_skipped_sources")` when any capture source retained a stale baseline instead of
-collecting during a forced snapshot. No other action — including
-`status`, `query`, `sql`, `rollup`, `collect_fast`/`collect_slow`, and the early `db_` guard that
-every action shares — ever calls the setter, so the agent records the default `UNDECLARED` /
-`UNKNOWN` for everything else, exactly as every sample below shows.
+collecting during a forced snapshot; `do_purge_source` sets the same status with
+`echo:purge_dictionary_pending` when the rows are gone but the dictionary sweep after them did not
+finish; and `do_sql` sets it with `retired_table:<name>` (several names comma-joined) when the
+translated query mentions a retired `<source>_live` shim view, whose answer is always empty. No other
+action — including `status`, `query`, `rollup`, `collect_fast`/`collect_slow`, and the early `db_`
+guard that every action shares — ever calls the setter, so the agent records the default
+`UNDECLARED` / `UNKNOWN` for everything else, exactly as every sample below shows.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `CONSTRAINED` | `PARTIAL` | `echo:snapshot_skipped_sources` | `snapshot` only, when `collect_or_retain` skipped at least one enabled source this pass. |
+| `CONSTRAINED` | `PARTIAL` | `echo:purge_dictionary_pending` | `purge_source` only, when the dictionary sweep after the row delete ran out of its deadline or failed: the rows are deleted, the strings of the purged rows stay until the weekly sweep, `dictionary_pending` is `true` in the JSON line and `dict_gc_starved_total` is incremented. |
+| `CONSTRAINED` | `PARTIAL` | `retired_table:<name>` | `sql` only, when the translated query names a retired `<source>_live` shim view in any spelling SQLite accepts (an empty relation kept so a stored query does not error): the rows and the `__total__\|0` line are unchanged; the status is what tells a schedule or result set that the table is retired rather than empty. Only the status enum reaches the server; the name is in the agent's command log line. |
 | `UNDECLARED` (default) | `UNKNOWN` | *(empty)* | Every other action and every early-return path, including the `db_`-not-open guard. |
 | *(not a `set_result_status` call)* | *(n/a)* | `linux:netlink:remove:` | Not an action-level result status — the literal prefix of the per-row `evidence` column the Linux `removable` cursor-source writes on a normal `detached` device event (udev netlink), followed by the device name; the event itself is a successful capture, not a degraded read (`echo_removable_collector.cpp`). |
 | *(not a `set_result_status` call)* | *(n/a)* | `macos:diskarbitration:` | Same, on macOS: the literal prefix of `evidence` the DiskArbitration `removable` cursor-source writes on a normal `attached`/`detached` device event, followed by the BSD device name (`echo_removable_collector.cpp`). |
@@ -595,7 +633,7 @@ every action shares — ever calls the setter, so the agent records the default 
   (`docs/echo-dashboard.md`, `docs/echo-implementer.md`).
 - **`fleet_snapshot`** feeds the server-side `FleetTopologyStore` on a cache miss, assembling the
   3D `/viz/fleet` topology view (the `fleet_snapshot` definition in `echo.yaml`); it is not itself a warehouse read.
-- **`rollup`/`purge_source`** mutate `echo.db` directly (aggregation, retention, source purge) — their
+- **`rollup`/`purge_source`** mutate `echo.db` directly (retention, byte budget, dictionary sweep, source purge) — their
   effect is visible through later `status`/`query`/`sql` reads, not a separate sink.
 - **Not consumed by** daily-sync inventory, DEX, or metrics — Echo has no `/metrics` endpoint;
   `status`'s retention-guard counters are the plugin's only fleet-readable health signal
@@ -607,8 +645,8 @@ every action shares — ever calls the setter, so the agent records the default 
   (name/publisher/version) reachable via `query type=software`/`sql`; `dns`/`mapdrive` add
   resolved hostnames and mapped-drive usernames/remote hosts; `removable` events name an
   attached device's vendor/product/serial and its BSD/udev device name; `registry` rows hold the
-  new data (first 512 bytes) of every added or changed watched value, unmasked, and the old value's
-  type and size but not the old value.
+  new data (first 512 bytes) of every added or changed watched value, unmasked, with its type and
+  the image of the writing process when attributed; the old value is not kept.
 - **Siblings:** `crossplatform.echo.*` (this plugin) is standalone; the `installed_software`
   daily-sync source (ADR-0016) is a separate, machine-scope inventory feed, distinct from Echo's
   `software` capture source.
@@ -837,15 +875,16 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    `init()` (through `EchoDatabase::open`), which the `plugin-capture` driver never calls. Every
    action in the samples above, including `compatibility` which needs no database, fails at that
    one guard, so the samples show only that the plugin loads.
-2. **`rollup` is Destructive/Irreversible and its output is positional.** `do_rollup` always runs
-   `run_aggregation()` before `run_retention()`, which permanently deletes aged rows. Its response
-   is the single line `echo|rollup|<n>|rows_aggregated`, so the declared `status` column is never
+2. **`rollup` is Destructive/Irreversible and its output is positional.** `do_rollup` runs
+   `run_retention()`, which permanently deletes aged rows, then the byte budget. Its response
+   is the single line `echo|rollup|0|rows_aggregated` (the count stays for stored clients; nothing is
+   aggregated any more), so the declared `status` column is never
    populated, and `snapshot` has the same gap (`echo|snapshot|complete` or `partial|<sources>`
    carries no event count).
 3. **`retention_days` does not set how long data is kept.** The setting is validated, stored and
    echoed by `status`, but `run_retention` prunes each tier against the window in the schema
-   registry (row-count caps on live tables, typically 24 hours for hourly, 31 days for daily and
-   about a year for monthly). Changing it alters nothing that is deleted.
+   registry (90 days for hourly, 180 days for daily and a year for monthly; row-count caps on
+   `netqual_boot` and `usage_live`). Changing it alters nothing that is deleted.
 4. **Several legs are declared but have no collector.** `perf` and `procperf` on macOS,
    `software` on Linux and macOS, `module` on Linux and macOS, and `dns` and `netconn` on Linux and
    macOS are `planned`: no code path exists for them (confirmed absent in `echo_perf.cpp`,
@@ -857,13 +896,13 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    `echo_state` holds only each value's type, size and an unsalted hash, and the old value is not
    stored (a baseline written by an older build also holds a rendered prefix of each value until a
    complete read of that root rewrites it; a key under a subtree the read could not open keeps its
-   earlier entry, and rows an older build wrote keep their old values until retention trims them or
-   `purge_source` runs on the paused source). A row's time is the key's last-write time when the
-   read saw a plausible one (a logged-off hive's too), else the end of the read. A loaded-hive row names the
-   writer only when exactly one process can be correlated to the change; offline rows never do.
-   A value written and reverted between two reads is not recorded, and a profile first seen (at
-   its first logon, or as a logged-off profile first found after an upgrade) is baselined silently
-   at its first read: the upgrade date is the start of offline coverage. A logged-off user's hive is
+   earlier entry, and rows an older build wrote were folded by the schema migration, which keeps no old
+   value). The tier keeps the last writer's image when the
+   Kernel-Registry ETW correlation named one; the writer's pid and the attribution detail are not
+   kept (a roll-up has no per-event row to hold them). A value written and reverted between
+   two reads is not recorded, and a profile first seen (at its first logon, or as a logged-off
+   profile first found after an upgrade) is baselined silently at its first read: the upgrade date
+   is the start of offline coverage. A logged-off user's hive is
    read on the hourly tick (every 12 slow ticks, hourly at the default 300 s; 6 minutes to 24 hours
    as `slow_interval` varies), unmasked, through the guarded offline-hive mount, for each profile
    the profile-list walk can resolve a path for (the walk reads at most 512 entries; beyond that the
@@ -876,10 +915,11 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    entry still pathless is counted by `registry_offline_roots_deferred`; a sid first seen beside a
    stale leftover is reported by nothing while the leftover exists). A path first learned or changed
    for a known profile is taken only when a second walk in the same tick lists the same path. A change in
-   such a hive is recorded when it is next read, so it may predate the read or the logoff, and it is
-   never attributed (`attr:offline`): a write the user made just before logging off, and Yuzu's own
-   audited `registry.set_user_value`, look the same. A refused or failed mount keeps the baseline and
-   writes one gap row per root (up to five per hive) naming the reason. The mount holds the profile's
+   such a hive is recorded when it is next read, so it may predate the read or the logoff, and it
+   never names a writer: a write the user made just before logging off, and Yuzu's own audited
+   `registry.set_user_value`, look the same, and the tier does not keep the offline marker that
+   would tell the change from a loaded hive's. A refused or failed mount keeps the baseline and
+   counts one gap event per root (up to five per hive); the reason is not stored. The mount holds the profile's
    `NTUSER.DAT` exclusively for its duration, expected to be short but not measured, and enables the
    backup and restore privileges, which can fail a logon that races it (the profile may load as a
    temporary one); a mount that cannot be unloaded leaves the hive locked until it is released
@@ -891,10 +931,10 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/echo/src/echo_aggregator.cpp` · `agents/plugins/echo/src/echo_aggregator.hpp` · `agents/plugins/echo/src/echo_arp_collector.cpp` · `agents/plugins/echo/src/echo_arp_parsers.hpp` · `agents/plugins/echo/src/echo_capture_status.hpp` · `agents/plugins/echo/src/echo_collectors.hpp` · `agents/plugins/echo/src/echo_cursor.hpp` · `agents/plugins/echo/src/echo_cursor_sources.cpp` · `agents/plugins/echo/src/echo_db.cpp` · `agents/plugins/echo/src/echo_db.hpp` · `agents/plugins/echo/src/echo_diff.cpp` · `agents/plugins/echo/src/echo_dns_collector.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.hpp` · `agents/plugins/echo/src/echo_hive_mount_gate.hpp` · `agents/plugins/echo/src/echo_hour_dedup.hpp` · `agents/plugins/echo/src/echo_local_image_path.hpp` · `agents/plugins/echo/src/echo_mapdrive_backfill.hpp` · `agents/plugins/echo/src/echo_mapdrive_collector.cpp` · `agents/plugins/echo/src/echo_mapdrive_macos_parsers.hpp` · `agents/plugins/echo/src/echo_module_etw.cpp` · `agents/plugins/echo/src/echo_module_etw.hpp` · `agents/plugins/echo/src/echo_module_stream.cpp` · `agents/plugins/echo/src/echo_module_stream.hpp` · `agents/plugins/echo/src/echo_netconn.hpp` · `agents/plugins/echo/src/echo_netconn_win.cpp` · `agents/plugins/echo/src/echo_netqual.hpp` · `agents/plugins/echo/src/echo_netqual_boot.cpp` · `agents/plugins/echo/src/echo_netqual_boot.hpp` · `agents/plugins/echo/src/echo_netqual_nstat.cpp` · `agents/plugins/echo/src/echo_netqual_nstat.hpp` · `agents/plugins/echo/src/echo_network_collector.cpp` · `agents/plugins/echo/src/echo_perf.cpp` · `agents/plugins/echo/src/echo_perf.hpp` · `agents/plugins/echo/src/echo_plugin.cpp` · `agents/plugins/echo/src/echo_power_collector.cpp` · `agents/plugins/echo/src/echo_power_parsers.hpp` · `agents/plugins/echo/src/echo_proc_es.cpp` · `agents/plugins/echo/src/echo_proc_es.hpp` · `agents/plugins/echo/src/echo_proc_etw.cpp` · `agents/plugins/echo/src/echo_proc_etw.hpp` · `agents/plugins/echo/src/echo_proc_perf.cpp` · `agents/plugins/echo/src/echo_proc_perf.hpp` · `agents/plugins/echo/src/echo_proc_stream.cpp` · `agents/plugins/echo/src/echo_proc_stream.hpp` · `agents/plugins/echo/src/echo_registry_parsers.hpp` · `agents/plugins/echo/src/echo_registry_source.cpp` · `agents/plugins/echo/src/echo_registry_source.hpp` · `agents/plugins/echo/src/echo_removable_collector.cpp` · `agents/plugins/echo/src/echo_removable_diskarb.mm` · `agents/plugins/echo/src/echo_removable_parsers.hpp` · `agents/plugins/echo/src/echo_schema_registry.cpp` · `agents/plugins/echo/src/echo_schema_registry.hpp` · `agents/plugins/echo/src/echo_service_collector.cpp` · `agents/plugins/echo/src/echo_service_parsers.hpp` · `agents/plugins/echo/src/echo_software_collector.cpp` · `agents/plugins/echo/src/echo_software_core.cpp` · `agents/plugins/echo/src/echo_software_core.hpp` · `agents/plugins/echo/src/echo_source_health.hpp` · `agents/plugins/echo/src/echo_sql_executor.cpp` · `agents/plugins/echo/src/echo_sql_executor.hpp` · `agents/plugins/echo/src/echo_status_format.hpp` · `agents/plugins/echo/src/echo_usage.cpp` · `agents/plugins/echo/src/echo_usage.hpp` · `agents/plugins/echo/src/echo_user_collector.cpp` · `agents/plugins/echo/src/echo_version.hpp` · `agents/plugins/echo/src/echo_win_process_name.hpp` · `agents/plugins/echo/src/echo_win_raii_guards.hpp`
+- Plugin: `agents/plugins/echo/src/echo_aggregator.cpp` · `agents/plugins/echo/src/echo_aggregator.hpp` · `agents/plugins/echo/src/echo_arp_collector.cpp` · `agents/plugins/echo/src/echo_arp_parsers.hpp` · `agents/plugins/echo/src/echo_capture_status.hpp` · `agents/plugins/echo/src/echo_collectors.hpp` · `agents/plugins/echo/src/echo_cursor.hpp` · `agents/plugins/echo/src/echo_cursor_sources.cpp` · `agents/plugins/echo/src/echo_db.cpp` · `agents/plugins/echo/src/echo_db.hpp` · `agents/plugins/echo/src/echo_db_v10_migration.cpp` · `agents/plugins/echo/src/echo_diff.cpp` · `agents/plugins/echo/src/echo_dns_collector.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.hpp` · `agents/plugins/echo/src/echo_fold.cpp` · `agents/plugins/echo/src/echo_fold.hpp` · `agents/plugins/echo/src/echo_fold_schema.cpp` · `agents/plugins/echo/src/echo_fold_schema.hpp` · `agents/plugins/echo/src/echo_hive_mount_gate.hpp` · `agents/plugins/echo/src/echo_hour_dedup.hpp` · `agents/plugins/echo/src/echo_local_image_path.hpp` · `agents/plugins/echo/src/echo_mapdrive_backfill.hpp` · `agents/plugins/echo/src/echo_mapdrive_collector.cpp` · `agents/plugins/echo/src/echo_mapdrive_macos_parsers.hpp` · `agents/plugins/echo/src/echo_module_etw.cpp` · `agents/plugins/echo/src/echo_module_etw.hpp` · `agents/plugins/echo/src/echo_module_stream.cpp` · `agents/plugins/echo/src/echo_module_stream.hpp` · `agents/plugins/echo/src/echo_netconn.hpp` · `agents/plugins/echo/src/echo_netconn_win.cpp` · `agents/plugins/echo/src/echo_netqual.hpp` · `agents/plugins/echo/src/echo_netqual_boot.cpp` · `agents/plugins/echo/src/echo_netqual_boot.hpp` · `agents/plugins/echo/src/echo_netqual_nstat.cpp` · `agents/plugins/echo/src/echo_netqual_nstat.hpp` · `agents/plugins/echo/src/echo_network_collector.cpp` · `agents/plugins/echo/src/echo_perf.cpp` · `agents/plugins/echo/src/echo_perf.hpp` · `agents/plugins/echo/src/echo_plugin.cpp` · `agents/plugins/echo/src/echo_power_collector.cpp` · `agents/plugins/echo/src/echo_power_parsers.hpp` · `agents/plugins/echo/src/echo_proc_es.cpp` · `agents/plugins/echo/src/echo_proc_es.hpp` · `agents/plugins/echo/src/echo_proc_etw.cpp` · `agents/plugins/echo/src/echo_proc_etw.hpp` · `agents/plugins/echo/src/echo_proc_perf.cpp` · `agents/plugins/echo/src/echo_proc_perf.hpp` · `agents/plugins/echo/src/echo_proc_stream.cpp` · `agents/plugins/echo/src/echo_proc_stream.hpp` · `agents/plugins/echo/src/echo_registry_parsers.hpp` · `agents/plugins/echo/src/echo_registry_source.cpp` · `agents/plugins/echo/src/echo_registry_source.hpp` · `agents/plugins/echo/src/echo_removable_collector.cpp` · `agents/plugins/echo/src/echo_removable_diskarb.mm` · `agents/plugins/echo/src/echo_removable_parsers.hpp` · `agents/plugins/echo/src/echo_schema_registry.cpp` · `agents/plugins/echo/src/echo_schema_registry.hpp` · `agents/plugins/echo/src/echo_service_collector.cpp` · `agents/plugins/echo/src/echo_service_parsers.hpp` · `agents/plugins/echo/src/echo_software_collector.cpp` · `agents/plugins/echo/src/echo_software_core.cpp` · `agents/plugins/echo/src/echo_software_core.hpp` · `agents/plugins/echo/src/echo_source_health.hpp` · `agents/plugins/echo/src/echo_sql_executor.cpp` · `agents/plugins/echo/src/echo_sql_executor.hpp` · `agents/plugins/echo/src/echo_status_format.hpp` · `agents/plugins/echo/src/echo_usage.cpp` · `agents/plugins/echo/src/echo_usage.hpp` · `agents/plugins/echo/src/echo_user_collector.cpp` · `agents/plugins/echo/src/echo_version.hpp` · `agents/plugins/echo/src/echo_win_process_name.hpp` · `agents/plugins/echo/src/echo_win_raii_guards.hpp`
 - Definitions: `content/definitions/echo.yaml` · `content/definitions/echo_warehouse.yaml`
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: `tests/test_echo_adoption_wiring_lexical.py` · `tests/test_echo_mapdrive_pin_lexical.py` · `tests/test_echo_timeline_script_behaviour.py` · `tests/unit/server/test_echo_process_tree.cpp` · `tests/unit/server/test_echo_rename_migration_pg.cpp` · `tests/unit/server/test_echo_retention_tiers.cpp` · `tests/unit/server/test_echo_timeline_page.cpp` · `tests/unit/server/test_echo_timeline_render.cpp` · `tests/unit/server/test_echo_tree_routes.cpp` · `tests/unit/test_echo_aggregator.cpp` · `tests/unit/test_echo_arp.cpp` · `tests/unit/test_echo_capability_table.cpp` · `tests/unit/test_echo_capture_status.cpp` · `tests/unit/test_echo_cursor.cpp` · `tests/unit/test_echo_diff.cpp` · `tests/unit/test_echo_local_dispatcher.cpp` · `tests/unit/test_echo_mapdrive.cpp` · `tests/unit/test_echo_module_etw.cpp` · `tests/unit/test_echo_module_stream.cpp` · `tests/unit/test_echo_netconn.cpp` · `tests/unit/test_echo_netqual_nstat.cpp` · `tests/unit/test_echo_perf.cpp` · `tests/unit/test_echo_power.cpp` · `tests/unit/test_echo_proc_es.cpp` · `tests/unit/test_echo_proc_etw.cpp` · `tests/unit/test_echo_proc_perf.cpp` · `tests/unit/test_echo_registry_source.cpp` · `tests/unit/test_echo_removable.cpp` · `tests/unit/test_echo_retention_tiers_table.cpp` · `tests/unit/test_echo_schema_registry.cpp` · `tests/unit/test_echo_service.cpp` · `tests/unit/test_echo_software.cpp` · `tests/unit/test_echo_source_health.cpp` · `tests/unit/test_echo_store.cpp` · `tests/unit/test_echo_usage.cpp` · `tests/unit/test_echo_warehouse.cpp` · `tests/unit/test_echo_win_raii_guards.cpp`
+- Tests: `tests/test_echo_adoption_wiring_lexical.py` · `tests/test_echo_mapdrive_pin_lexical.py` · `tests/test_echo_timeline_script_behaviour.py` · `tests/unit/server/test_echo_process_tree.cpp` · `tests/unit/server/test_echo_rename_migration_pg.cpp` · `tests/unit/server/test_echo_retention_tiers.cpp` · `tests/unit/server/test_echo_timeline_page.cpp` · `tests/unit/server/test_echo_timeline_render.cpp` · `tests/unit/server/test_echo_tree_routes.cpp` · `tests/unit/test_echo_aggregator.cpp` · `tests/unit/test_echo_arp.cpp` · `tests/unit/test_echo_capability_table.cpp` · `tests/unit/test_echo_capture_status.cpp` · `tests/unit/test_echo_cursor.cpp` · `tests/unit/test_echo_diff.cpp` · `tests/unit/test_echo_fold.cpp` · `tests/unit/test_echo_fold_sizing.cpp` · `tests/unit/test_echo_local_dispatcher.cpp` · `tests/unit/test_echo_mapdrive.cpp` · `tests/unit/test_echo_module_etw.cpp` · `tests/unit/test_echo_module_stream.cpp` · `tests/unit/test_echo_netconn.cpp` · `tests/unit/test_echo_netqual_nstat.cpp` · `tests/unit/test_echo_perf.cpp` · `tests/unit/test_echo_power.cpp` · `tests/unit/test_echo_proc_es.cpp` · `tests/unit/test_echo_proc_etw.cpp` · `tests/unit/test_echo_proc_perf.cpp` · `tests/unit/test_echo_registry_source.cpp` · `tests/unit/test_echo_removable.cpp` · `tests/unit/test_echo_retention_tiers_table.cpp` · `tests/unit/test_echo_schema_registry.cpp` · `tests/unit/test_echo_service.cpp` · `tests/unit/test_echo_software.cpp` · `tests/unit/test_echo_source_health.cpp` · `tests/unit/test_echo_store.cpp` · `tests/unit/test_echo_usage.cpp` · `tests/unit/test_echo_v10_migration.cpp` · `tests/unit/test_echo_warehouse.cpp` · `tests/unit/test_echo_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/2026-11-03-echo-rollup-only-server.changed.md`
+- Changelog: `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/2026-11-03-echo-rollup-only-server.changed.md` · `changelog.d/7037-echo-rollup-only-v10.changed.md`
 <!-- END GENERATED -->

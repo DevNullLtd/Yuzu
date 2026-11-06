@@ -68,8 +68,11 @@ constexpr std::string_view kProductPacks[] = {"list_product_packs", "get_product
 constexpr std::string_view kResponses[] = {"query_responses", "aggregate_responses"};
 // #2146 A2-R1: get_execution_children joins the family - same securable
 // (Execution:Read), same domain as get_execution_status/list_executions.
+// #2146 batch B: cancel_execution and record_execution_rerun join the family - same securable
+// pair (Execution:Execute) as dispatch, but tracker-record-only: neither sends anything to a device.
 constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "get_execution_children",
-                                                 "list_executions", "query_audit_log"};
+                                                 "list_executions", "query_audit_log",
+                                                 "cancel_execution", "record_execution_rerun"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
                                            "query_software_licenses", "get_agent_app_usage",
@@ -113,8 +116,9 @@ constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_c
                                          "get_dex_device_app_perf"};
 constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices",
                                         "list_discovered_devices"};
-constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
-                                           "get_bundle_result", "sync_hardware_software"};
+constexpr std::string_view kExecution[] = {"execute_instruction", "execute_instruction_definition",
+                                           "execute_bundle", "get_bundle_result",
+                                           "sync_hardware_software"};
 constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
@@ -179,6 +183,9 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // views; list_guardian_events is the __observation__/enforcement event feed
 // (confined, not denied — see its kToolSecurityRows comment);
 // get_guardian_device_guards is the per-device all-guards census.
+// #5690: get_guardian_status, get_guardian_agent_status, get_guardian_rule_status and
+// get_guardian_device_guards report order_uncertain / projection_pending per row and
+// uncertain_rules per rollup; a clean value never proves freshness or completeness.
 // #2146 Batch B1 extends this family with the rule CRUD/push mutations
 // (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
 // per-agent reads #4037 deliberately deferred (get_guardian_agent_status,
@@ -321,7 +328,9 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
      kDefinitions},
     {"Product packs", "installed bundles of instruction/policy/workflow content", kProductPacks},
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
-    {"Executions & audit", "execution status/history and the who-did-what audit log",
+    {"Executions & audit",
+     "execution status/history, cancelling an execution record or recording a rerun (neither "
+     "sends anything to a device), and the who-did-what audit log",
      kExecutionsAudit},
     {"Inventory & software",
      "collected inventory tables, installed software, hardware CI records, and licenses",

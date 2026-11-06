@@ -144,6 +144,16 @@ Recommended order for a fresh install:
 > body carries the same text for every caller, but htmx does not display it for this form). The store-degraded case above answers `503`
 > with its own error toast ("Agent count unavailable. The response store could not be read. Nothing
 > was created. Retry shortly.") on the same channel, and also creates nothing.
+> When the `group.create_from_results` `attempted` audit row cannot be stored (#3619, ADR-0033
+> §9: the row is written after every check above and before the group is created),
+> `group-from-results` answers `503` with `Sec-Audit-Failed: true` and the toast "The audit record
+> could not be stored. Nothing was created. Retry once the audit store recovers.", and creates
+> nothing. Because that write can wait on the audit store, the session, `ManagementGroup:Write`
+> and the visible agent set are decided again after it: a session that is gone answers `401`, a
+> withdrawn `ManagementGroup:Write` grant the permission gate's refusal (normally `403`),
+> and a visible set that no longer holds any matched
+> agent the `422` above; each creates nothing and records `group.create_from_results` `failure`
+> (`session_revoked`, `permission_revoked name=<group name>`, `scope_revoked`).
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat
@@ -654,7 +664,7 @@ Eight roles are created automatically and cannot be deleted:
 | **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
 | **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes 20 of the 38 securable types, including UserManagement, Security, ApiToken, AccessReview and EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 24 securable types (24 permissions) — an explicit allow-list in `rbac_store.cpp`'s seed, *not* “everything except” | Helpdesk staff, auditors, read-only dashboards |
-| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant |
+| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant. A reviewer cannot decide a `user` grant held under their own username, or an engine principal they owned when the campaign opened, and a recorded decision is final. Group grants, a person's other accounts and later ownership changes are not checked, and the control needs at least two people able to attest (see `docs/auth-architecture.md` "Periodic access reviews", Known limits) |
 | **ForensicsAnalyst** | Read on Forensics, Response, Execution and Inventory (4 permissions). No Execute and no write of any kind | Read-only analysts of Forensics-tier response rows. Fleet-wide assignable only; cannot dispatch; not part of any other role |
 
 ### The ForensicsAnalyst role
@@ -751,7 +761,7 @@ The 8 routes/tools in this family authorize on `owner_principal == session.usern
 | `Execute` | Run an instruction against devices |
 | `Approve` | Approve or reject a pending approval request. Holding `Approval:Approve` is necessary but not sufficient: the reviewer must also be on an interactive cookie session (local or OIDC), must have an **enrolled MFA factor with a fresh proof** (#6079, at most 300 seconds old and tighter if `--mfa-step-up-window-secs` is set between `1` and `299`), and must not be an API-token, MCP-token or engine session, a SAML session, or the submitter (see `instructions.md`, "Who can approve", and `authentication.md`, "Approver MFA requirement"). A local account with no enrolled factor is refused `mfa_not_enrolled`; an OIDC session whose sign-in carried no MFA `amr` is refused `403` `mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not protect the role), whereas a proof older than the window gets the `401` step-up with `challenge_url=/auth/oidc/start`; a live session whose account is deleted, deactivated or has an invalid username is refused (typed `account_unavailable` only with `--mfa-step-up-window-secs=0` or when the account is removed in the middle of the request; with step-up on, the central check normally answers `401` `MFA step-up required` first). The seeded `Operator` role holds `Approval:Approve`, and a non-admin cannot enrol itself under `--mfa-enforcement=optional` or `admin-only`, so an administrator must enrol each non-admin approver first (see [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)). `--mfa-enforcement` and `--mfa-step-up-window-secs` do not weaken this (the window is `min(setting, 300)`, and 300 when the setting is `0`). |
 | `Push` | Distribute an existing rule set to scoped agents. Consumed **only** by `GuaranteedState` REST handlers and seeded **only** on `GuaranteedState` — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on `GuaranteedState` alone. |
-| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog` (see "The authorization topology floor" below). |
+| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog`; a holder cannot attest a `user` grant held under their own username or an engine principal they owned when the campaign opened, and the application refuses to change a recorded decision (the limits are listed in `docs/auth-architecture.md` "Periodic access reviews") (see "The authorization topology floor" below). |
 | `Rotate` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a human-owned API token. Consumed **only** by `ApiToken` REST/MCP handlers and seeded **only** on `ApiToken`, to the same two roles that already hold `ApiToken:Write` (`Administrator`, `ApiTokenManager`) — deliberately a separate operation from `Write` so a narrower MCP-tier allowance can be granted for rotation without also widening token-mint access. |
 
 ## Permission Resolution

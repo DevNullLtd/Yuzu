@@ -26,6 +26,7 @@
 /// Wave-4 SQLite components — `InstructionDbPool` is deleted once this
 /// store moves.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -34,6 +35,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "dispatch_position.hpp"    // DispatchPosition (#3678)
 #include "response_provenance.hpp" // CommandRecord
 
 namespace yuzu::server::pg {
@@ -518,8 +520,28 @@ public:
     /// return would reintroduce the exact bug this fix closes.
     [[nodiscard]] bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
+    /// LEGACY rerun (`/api/executions/{id}/rerun`). Reads the original with the UNCHECKED
+    /// `get_execution` / `get_agent_statuses`, so a degraded store collapses into "original
+    /// execution not found" (and `failed_only` into a zero-device record). That behaviour is
+    /// kept for the legacy handler, whose text the source tripwires pin; every NEW caller uses
+    /// `create_rerun_checked`, which cannot mask a storage fault.
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
+
+    /// Why `create_rerun_checked` produced no record. A closed enum, so a caller maps it with a
+    /// `switch` rather than by comparing error text.
+    enum class RerunError {
+        kOriginalNotFound, ///< the original was read successfully and does not exist.
+        kStoreDegraded,    ///< the original (or, for `failed_only`, its agent rows) could not be
+                           ///< READ: pool exhausted, tracker not open, query failed. Unknown
+                           ///< whether the original exists; nothing was written.
+        kWriteFailed,      ///< the reads succeeded but inserting the new record failed.
+    };
+    /// Same record `create_rerun` creates, but every read goes through the degrade-aware
+    /// `get_execution_checked` / `get_agent_statuses_checked`, so an unreadable store is
+    /// `kStoreDegraded`, never a not-found and never a silently zero-sized `failed_only` record.
+    [[nodiscard]] std::expected<std::string, RerunError>
+    create_rerun_checked(const std::string& original_id, const std::string& user, bool failed_only);
 
     /// Returns false on a pool/query failure (governance PR review,
     /// 2026-08-31) — the execution was NOT actually cancelled; callers must
@@ -622,6 +644,30 @@ public:
     [[nodiscard]] bool record_command_dispatch(
         const std::string& command_id, const std::string& plugin, const std::string& execution_id,
         std::optional<std::chrono::milliseconds> lease_timeout = std::nullopt);
+
+    /// #3678: the two counters the WS-3 command outbox measures its redelivery horizon on
+    /// (`dispatch_position.hpp`): the SHARED `dispatch_seq` (advanced once per recorded dispatch
+    /// call; common to every replica) and this process's own count of dispatches whose record was
+    /// NOT written (`note_unrecorded_dispatch`). They are returned separately because they are on
+    /// different scales: only readings taken by the SAME process can be differenced on the local
+    /// term. The shared term can move BACKWARD on a restore or a lost-WAL failover, and the outbox
+    /// dead-letters on that.
+    ///
+    /// Returns nullopt when the store is closed or the read degraded. NEVER treat nullopt as zero:
+    /// the outbox refuses to send on an unreadable position. Failures on a replica other than the
+    /// one reading, or in an earlier process lifetime of the same one, are not counted (that is
+    /// the first of several under-count cases): see `common/include/yuzu/command_replay_horizon.hpp`.
+    [[nodiscard]] std::optional<DispatchPosition> current_dispatch_position() const;
+
+    /// #3678: count one dispatch whose `record_command_dispatch` write did not happen -- failed,
+    /// refused, or skipped by a tripped `DispatchRecordLatch`. The command was still sent, so it
+    /// may have consumed an agent dedup-ring slot. (A dispatch made while NO tracker is wired is
+    /// not counted: there is nothing to count into, and the outbox's reader is then unreadable, so
+    /// the outbox holds.) Lock-free; called from the dispatch path. Over-counting is the safe
+    /// direction.
+    void note_unrecorded_dispatch() noexcept {
+        unrecorded_dispatches_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     /// Resolves a previously recorded dispatch. Returns nullopt for an unknown command id (a
     /// forged or never-issued id, a failed record write, a reaped record) AND for a degraded read;
@@ -1052,6 +1098,10 @@ private:
 
     pg::PgPool& pool_;
     bool open_{false};
+    /// #3678: dispatches this process sent without a recorded `dispatch_seq` advance (see
+    /// `note_unrecorded_dispatch`). Process-local on purpose: it exists only for the failure case
+    /// where the shared database cannot be written.
+    std::atomic<std::int64_t> unrecorded_dispatches_{0};
     /// HA WS-2a-2: this process's outbox instance identity (a boot-time random
     /// hex string). Stamped as `origin_replica` on every durable append so the
     /// cross-replica poll loop can SKIP this replica's own rows (already

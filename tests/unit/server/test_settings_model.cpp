@@ -457,13 +457,15 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
     const auto* hourly = find("process", "hourly");
     REQUIRE(hourly);
     CHECK(hourly->at("limit_kind") == "seconds");
+    CHECK(hourly->at("limit").get<long long>() == 7776000);
     CHECK(hourly->at("bucket_seconds").get<long long>() == 3600);
     CHECK(hourly->at("guaranteed_depth_seconds").get<long long>() ==
           hourly->at("limit").get<long long>() - 3600);
     CHECK(hourly->at("budget_dependent").get<bool>());
     const auto* daily = find("process", "daily");
     REQUIRE(daily);
-    CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 2592000);
+    CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 15465600);
+    CHECK(find("process", "live") == nullptr); // the raw tier is gone
 }
 
 TEST_CASE("build_data_retention_settings emits echo:null when no table is available",
@@ -513,7 +515,7 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     // and the live-row cells (100,000 rows, Row count only, 1 day, 7 days) belong to the renderer
     // and the table contents, which other changes own.
     for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Boot</th>",
-                          "<th>Look again after</th>", ">process<", ">31 days<", ">12 months<",
+                          "<th>Look again after</th>", ">process<", ">3 months<", ">6 months<", ">31 days<", ">12 months<",
                           ">11 months<", "400 rows", ">30 days<", "every 900 s", "never pruned",
                           "not per-device"})
         CHECK(has(w, n));

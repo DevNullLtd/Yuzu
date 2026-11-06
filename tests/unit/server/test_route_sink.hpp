@@ -16,14 +16,15 @@
 // It reproduces httplib::Server's REQUEST PARSING for the handful of fields
 // handlers actually read: the path, the query string, an
 // `application/x-www-form-urlencoded` body (both into the same `req.params`
-// multimap, query first so query values win — httplib's own precedence),
+// ordered multimap, query first so query values win — httplib's own precedence),
 // headers, and the regex captures in `req.matches`. Anything else is NOT
 // modelled, and a test must not be read as evidence about it:
 //   - no percent-decoding of the path (httplib routes on
 //     `decode_path_component`), so `%2E`-encoded paths behave differently;
 //   - no multipart and no chunked transfer-encoding;
-//   - `extra_headers` is a map, so DUPLICATE headers (the classic
-//     `Origin:`-twice CSRF desync probe) cannot be synthesized at all, and
+//   - no 256-byte path limit for regex routes (httplib 0.59 answers 404 for a longer path);
+//   - `extra_headers` is a map, so it cannot carry DUPLICATE headers (the classic
+//     `Origin:`-twice CSRF desync probe); `repeated_headers` can, and
 //     `Request::set_header` SILENTLY DROPS any value failing `is_field_value`
 //     (e.g. one padded with whitespace, which httplib trims on the wire before
 //     it ever reaches set_header) — so a header a test sets may simply not be
@@ -31,7 +32,12 @@
 //   - none of the request PIPELINE runs — no pre-routing chokepoint
 //     (on-behalf-of rejection, quotas, rate limiting), no post-routing
 //     handler (security headers). A gate that moves into pre-routing will
-//     leave every sink test green while the route-level gate is gone.
+//     leave every sink test green while the route-level gate is gone;
+//   - no post-read stage: this sink never consults `PostReadStageRegistry`,
+//     never records into `RouteInventory`, and never refuses an unclassified
+//     route once sealed, so the body cap, the step-up chokepoint and the
+//     fail-closed registration refusal are all absent here (a socket test
+//     with `PostReadStageScope`, post_read_stage_test_support.hpp, covers them).
 // A fixture that needs any of the above needs a live socket, not this sink.
 //
 // TWO INVARIANTS FOR FIXTURES USING THIS SINK:
@@ -48,7 +54,7 @@
 //     branch. That is exactly the false-green #1786 fixed; it is re-armable
 //     by omitting the argument.
 //
-// `httplib::detail::` is an INTERNAL httplib API (pinned to 0.37.x here:
+// `httplib::detail::` is an INTERNAL httplib API (compiled against 0.59.0 here:
 // `parse_query_text`, `extract_media_type`). That dependency predates this
 // file's current form and is deliberate — no public equivalent exists, and
 // the failure mode of an httplib bump is a loud compile error in a test-only
@@ -135,9 +141,8 @@ public:
             // Inject test-supplied headers. Done AFTER Content-Type so a
             // test that explicitly overrides Content-Type via the map
             // wins (rare, but a valid scenario).
-            // httplib keeps header duplicates (an unordered_multimap) and a read returns
-            // the first one, whose order differs between standard libraries: erase the
-            // existing value so the per-call header wins everywhere.
+            // httplib keeps header duplicates (an insertion-ordered multimap) and a read
+            // returns the first one: erase the existing value so the per-call header wins.
             for (const auto& [name, value] : extra_headers) {
                 req.headers.erase(name);
                 req.set_header(name, value);

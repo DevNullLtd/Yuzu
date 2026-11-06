@@ -227,7 +227,7 @@ inline constexpr std::array<UnitOsRow, 244> kUnitOs{{
     {"hardware", "disks", kWin | kLin | kMac},
     {"hardware", "drivers", kWin | kLin},
     {"hardware", "system", kWin | kLin | kMac},
-    // chassis/baseboard/swap/machine_id: planned on every leg (applicable).
+    // chassis/baseboard/swap/machine_id: applicable on every leg (read on Windows, planned on Linux/macOS).
     {"hardware", "chassis", kWin | kLin | kMac},
     {"hardware", "baseboard", kWin | kLin | kMac},
     {"hardware", "swap", kWin | kLin | kMac},

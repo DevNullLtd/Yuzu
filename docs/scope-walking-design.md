@@ -285,10 +285,13 @@ The DSL must make scope-walking *obvious*, not a footnote. Every place that take
 ```yaml
 spec:
   scope:
-    fromResultSet: "rs_01HXYZ..."         # by ID
-    # OR
-    fromResultSet: "windows-chrome-suspects"  # by per-operator alias
+    # by ID:
+    fromResultSet: "rs_01HXYZ..."
+    # OR by per-operator alias:
+    fromResultSet: "windows-chrome-suspects"
 ```
+
+(A comment on the same line as a value is read as part of the value and fails the scope-ident charset — see `docs/yaml-dsl-spec.md` §9.3 rule 6.)
 
 Coupled with the existing `selector:` form for refinement:
 

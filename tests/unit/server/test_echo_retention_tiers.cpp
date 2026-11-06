@@ -157,7 +157,7 @@ TEST_CASE("the embedded Echo retention table parses", "[echo][retention]") {
     const auto* hourly = find(*r, "process", "hourly");
     REQUIRE(hourly);
     CHECK_FALSE(hourly->row_count);
-    CHECK(hourly->limit > 0);
+    CHECK(hourly->limit == 7776000);
     CHECK(find(*r, "process", "daily"));
     CHECK(find(*r, "process", "monthly"));
 }
@@ -192,16 +192,20 @@ TEST_CASE("worked ages for the process source", "[echo][retention]") {
         REQUIRE(d.has_value());
         return age_days * kDay < *d;
     };
-    // 3 days: hourly gone, daily and monthly hold.
-    CHECK_FALSE(holds("hourly", 3));
+    // 3 days: all three tiers hold.
+    CHECK(holds("hourly", 3));
     CHECK(holds("daily", 3));
     CHECK(holds("monthly", 3));
-    // Exactly on the boundary does not hold (strict <): daily depth is 30 d.
-    CHECK_FALSE(holds("daily", 30));
-    // 6 weeks: hourly and daily gone, monthly holds.
-    CHECK_FALSE(holds("hourly", 42));
-    CHECK_FALSE(holds("daily", 42));
-    CHECK(holds("monthly", 42));
+    // Hourly keeps 90 days less one bucket: 89 days hold, exactly 90 does not (strict <).
+    CHECK(holds("hourly", 89));
+    CHECK_FALSE(holds("hourly", 90));
+    // Daily depth is 179 d (180 less a day): the boundary does not hold.
+    CHECK(holds("daily", 178));
+    CHECK_FALSE(holds("daily", 179));
+    // 6 months (200 d): hourly and daily gone, monthly holds.
+    CHECK_FALSE(holds("hourly", 200));
+    CHECK_FALSE(holds("daily", 200));
+    CHECK(holds("monthly", 200));
     // 10 months: only monthly holds.
     CHECK_FALSE(holds("hourly", 304));
     CHECK_FALSE(holds("daily", 304));

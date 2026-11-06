@@ -43,6 +43,28 @@ TestDb make_db() {
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }
+
+// One procperf hourly row written the way the fold writes it: dictionary-interned keys, and the
+// sums the generated *_avg columns divide by (cpu_avg = cpu_sum / samples, ws_avg_bytes =
+// ws_sum / samples), so a seed reads back as the averages the caller names.
+void seed_procperf_hour(EchoDatabase& db, std::int64_t hour_ts, const std::string& name,
+                        const std::string& version, int is_kthread, int samples,
+                        int instances_max, double cpu_avg, double cpu_max, std::int64_t ws_avg,
+                        std::int64_t ws_max) {
+    REQUIRE(db.execute_sql("INSERT OR IGNORE INTO echo_dict (text) VALUES ('" + name + "'), ('" +
+                           version + "')"));
+    const auto id_of = [](const std::string& text) {
+        return "(SELECT id FROM echo_dict WHERE text = '" + text + "')";
+    };
+    REQUIRE(db.execute_sql(
+        "INSERT INTO procperf_hourly_r (hour_ts, name_id, version_id, is_kthread, samples, "
+        "instances_max, cpu_sum, cpu_max, ws_sum, ws_max_bytes) VALUES (" +
+        std::to_string(hour_ts) + ", " + id_of(name) + ", " + id_of(version) + ", " +
+        std::to_string(is_kthread) + ", " + std::to_string(samples) + ", " +
+        std::to_string(instances_max) + ", " + std::to_string(cpu_avg * samples) + ", " +
+        std::to_string(cpu_max) + ", " + std::to_string(ws_avg * samples) + ", " +
+        std::to_string(ws_max) + ")"));
+}
 } // namespace
 
 TEST_CASE("app_perf rollup query survives the real Echo sql path", "[echo][app_perf]") {
@@ -54,16 +76,9 @@ TEST_CASE("app_perf rollup query survives the real Echo sql path", "[echo][app_p
     const std::int64_t today_start = day_start + 86400; // half-open [day_start, +1d)
 
     // Seed two procperf_hourly rows: same (name, version), two hours of the same
-    // UTC day (trusted DML seed — what the rollup would have written).
-    REQUIRE(t.db.execute_sql(
-        "INSERT INTO procperf_hourly "
-        "(hour_ts, name, version, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, "
-        " ws_max_bytes) VALUES "
-        "(" +
-        std::to_string(day_start) +
-        ", 'chrome.exe', '119.0.0.0', 10, 2, 90.0, 95.0, 100, 200),"
-        "(" +
-        std::to_string(day_start + 3600) + ", 'chrome.exe', '119.0.0.0', 30, 5, 10.0, 20.0, 300, 400)"));
+    // UTC day (what the fold would have written).
+    seed_procperf_hour(t.db, day_start, "chrome.exe", "119.0.0.0", 0, 10, 2, 90.0, 95.0, 100, 200);
+    seed_procperf_hour(t.db, day_start + 3600, "chrome.exe", "119.0.0.0", 0, 30, 5, 10.0, 20.0, 300, 400);
 
     const std::string sql = build_app_perf_query(window_start, today_start);
 
@@ -106,16 +121,8 @@ TEST_CASE("app_perf rollup query excludes is_kthread rows, keeps normal processe
     const std::int64_t window_start = day_start;
     const std::int64_t today_start = day_start + 86400;
 
-    REQUIRE(t.db.execute_sql(
-        "INSERT INTO procperf_hourly "
-        "(hour_ts, name, version, is_kthread, samples, instances_max, cpu_avg, cpu_max, "
-        " ws_avg_bytes, ws_max_bytes) VALUES "
-        "(" +
-        std::to_string(day_start) +
-        ", 'kworker/0:1', '', 1, 10, 1, 5.0, 8.0, 0, 0)," // kernel thread — excluded
-        "(" +
-        std::to_string(day_start) +
-        ", 'normal.exe', '1.0.0.0', 0, 10, 2, 12.5, 20.0, 1024, 2048)")); // normal — included
+    seed_procperf_hour(t.db, day_start, "kworker/0:1", "", 1, 10, 1, 5.0, 8.0, 0, 0); // kernel thread: excluded
+    seed_procperf_hour(t.db, day_start, "normal.exe", "1.0.0.0", 0, 10, 2, 12.5, 20.0, 1024, 2048); // included
 
     const std::string sql = build_app_perf_query(window_start, today_start);
     auto validated = yuzu::echo::validate_and_translate_sql(sql);

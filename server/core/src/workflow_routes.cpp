@@ -1,4 +1,5 @@
 #include "workflow_routes.hpp"
+#include "model_param_helpers.hpp"
 
 #include "command_capability.hpp"        // CommandCapability / ClassificationError / CommandCapabilityRegistry
 #include "compliance_eval.hpp"
@@ -146,9 +147,12 @@ void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
                      "(HTTP 400). reason=schema_invalid: the stored schema cannot be prepared, so "
                      "the call fails closed (HTTP 500).",
                      "counter");
-    for (const char* reason : kParamRejectReasons)
-        metrics.counter("yuzu_server_instruction_param_rejected_total",
-                        {{"route", kParamRejectRoute}, {"reason", reason}});
+    // The v1 REST twin shares the legacy route's label (same capability); the MCP twin
+    // (execute_instruction_definition) uses the `mcp` label. See instruction_execute.hpp.
+    for (const char* route : {kParamRejectRoute, "mcp"})
+        for (const char* reason : kParamRejectReasons)
+            metrics.counter("yuzu_server_instruction_param_rejected_total",
+                            {{"route", route}, {"reason", reason}});
 }
 
 // #4029: `product_pack_error_status`/`product_pack_client_message` moved to
@@ -1971,7 +1975,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                       "latest_per_workflow"};
         std::vector<RawParam> raw;
         raw.reserve(req.params.size());
-        for (const auto& kv : req.params) {
+        for (const auto& kv : model_detail::to_params(req.params)) {
             if (std::find(std::begin(kKnown), std::end(kKnown), kv.first) == std::end(kKnown)) {
                 run_note(res, "invalid", operate_pages::kRunsInvalidNote);
                 return;
@@ -3093,7 +3097,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 auto gate = fleet_read_fn(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                std::vector<RawParam> raw(req.params.begin(), req.params.end());
+                const auto sorted_params = model_detail::to_params(req.params);
+                std::vector<RawParam> raw(sorted_params.begin(), sorted_params.end());
                 auto query = parse_workflow_execution_list_params(raw);
                 if (!query) {
                     res.status = 400;

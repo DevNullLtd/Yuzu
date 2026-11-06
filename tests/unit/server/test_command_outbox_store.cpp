@@ -171,15 +171,19 @@ TEST_CASE("CommandOutboxStore[pg]: opens and migrates", "[command_outbox][pg][st
 TEST_CASE("CommandOutboxStore: the v2 migration carries the 300 s statement timeout (#6096)",
           "[command_outbox][store][migration][6096]") {
     const auto& migs = CommandOutboxStore::migrations();
-    REQUIRE(migs.size() == 3);
+    REQUIRE(migs.size() == 4);
     CHECK(migs[1].version == 2);
     CHECK(migs[1].sql.rfind("SET LOCAL statement_timeout = '300s';", 0) == 0);
     CHECK(migs[1].sql.find("outbox_approval_idx") != std::string::npos);
     CHECK(migs.front().version == 1);
     // v3 is the Echo rename's one-line plugin-name rewrite (idempotent, scan lifted off the cap).
-    CHECK(migs.back().version == 3);
-    CHECK(migs.back().sql.rfind("SET LOCAL statement_timeout = 0;", 0) == 0);
-    CHECK(migs.back().sql.find("plugin = 'echo' WHERE plugin = 'tar'") != std::string::npos);
+    CHECK(migs[2].version == 3);
+    CHECK(migs[2].sql.rfind("SET LOCAL statement_timeout = 0;", 0) == 0);
+    CHECK(migs[2].sql.find("plugin = 'echo' WHERE plugin = 'tar'") != std::string::npos);
+    // v4 (#3678) is a metadata-only nullable column: no table rewrite, so no timeout lift.
+    CHECK(migs.back().version == 4);
+    CHECK(migs.back().sql.find("dispatch_seq_first_sent BIGINT") != std::string::npos);
+    CHECK(migs.back().sql.find("statement_timeout") == std::string::npos);
 }
 
 // #6096: the schedule runner's spent-ticket ledger reads.
@@ -272,7 +276,16 @@ TEST_CASE("CommandOutboxStore[pg]: the v2 migration adds the approval index to a
     yuzu::server::pg::PgResult ver{PQexec(
         conn.get(), "SELECT version FROM public.schema_meta WHERE store = 'command_outbox_store'")};
     REQUIRE(ver.status() == PGRES_TUPLES_OK);
-    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "3"); // the ladder runs on through v3
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4"); // the ladder runs on through v4
+
+    // v4 (#3678): the nullable stamp column is added without a rewrite, and a row that was
+    // that existed before this migration reads as UNSTAMPED (NULL), not as sequence 0.
+    yuzu::server::pg::PgResult stamp{PQexec(
+        conn.get(), "SELECT count(*) FILTER (WHERE dispatch_seq_first_sent IS NULL), count(*) "
+                    "FROM command_outbox_store.outbox")};
+    REQUIRE(stamp.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(stamp.get(), 0, 0)) == "2");
+    CHECK(std::string(PQgetvalue(stamp.get(), 0, 1)) == "2");
 
     // Echo rename v3: the legacy `tar` row is rewritten, the control row is untouched.
     yuzu::server::pg::PgResult plug{PQexec(

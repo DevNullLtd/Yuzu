@@ -7,7 +7,7 @@
 #include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
-#include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
+#include "rest_audit.hpp" // detail::try_persist_audit / emit_behavioral_audit (#3619)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "echo_tree_routes.hpp" // EchoRetentionPausedScan/EchoPausedSourceRow/echo_retention_paused_json (#4027)
 
@@ -136,6 +136,18 @@ static std::string refusal_toast_header(const char* message) {
     return trigger.dump(-1, ' ', true, nlohmann::ordered_json::error_handler_t::replace);
 }
 
+/// The Echo re-enable/purge refusal when the `attempted` audit row cannot be stored (#3619): the
+/// body text and the toast (htmx does not swap a 5xx body on the Echo page, so the toast is what
+/// the operator sees).
+static constexpr const char* kEchoAuditRefusal =
+    "The audit record could not be stored, so nothing was sent. Retry once the audit store "
+    "recovers.";
+
+/// The toast when create_group itself fails (a store error, or a same-name group created
+/// concurrently after the duplicate check). Constant text: no store or caller data.
+static constexpr const char* kGroupCreateFailed =
+    "The group could not be created. Nothing was created. Retry shortly.";
+
 /// The refusal sentence for a group set cut by the read cap (toast and body say the same thing).
 static constexpr const char* kGroupPartialRefusal =
     "The result set was cut by the read cap, so the agent list is partial. "
@@ -226,14 +238,40 @@ bool DashboardRoutes::refuse_cross_site_write(const httplib::Request& req,
                                      req.get_header_value("Origin"),
                                      req.get_header_value("Referer"), csrf_trusted_origins_))
         return false;
-    audit_fn_(req, "csrf.denied", "denied", "Endpoint", "dashboard",
-              "cross-site or header-less browser write refused");
+    audit_or_flag(req, res, "csrf.denied", "denied", "Endpoint", "dashboard",
+                  "cross-site or header-less browser write refused");
     res.status = 403;
     res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                     " class=\"result-context is-error\" data-reason=\"csrf_cross_origin\">"
                     "Cross-site request refused. Nothing was sent.</span>",
                     "text/html; charset=utf-8");
     return true;
+}
+
+bool DashboardRoutes::audit_attempted(const httplib::Request& req, httplib::Response& res,
+                                      const std::string& action, const std::string& target_type,
+                                      const std::string& target_id, const std::string& detail_text,
+                                      const std::string& refusal_html, const char* toast) const {
+    // `persist_audit_fn_ &&` first: an unwired sink is a refusal here, never audit-off (the
+    // kernel alone would read an empty sink as "audit disabled, proceed").
+    if (persist_audit_fn_ && detail::try_persist_audit(persist_audit_fn_, req, action, "attempted",
+                                                       target_type, target_id, detail_text))
+        return true;
+    res.status = 503;
+    if (!res.has_header("Sec-Audit-Failed")) // a set-and-proceed row may already have set it
+        res.set_header("Sec-Audit-Failed", "true");
+    if (toast)
+        res.set_header("HX-Trigger", refusal_toast_header(toast));
+    res.set_content(refusal_html, "text/html; charset=utf-8");
+    return false;
+}
+
+void DashboardRoutes::audit_or_flag(const httplib::Request& req, httplib::Response& res,
+                                    const std::string& action, const std::string& result,
+                                    const std::string& target_type, const std::string& target_id,
+                                    const std::string& detail_text) const {
+    (void)detail::emit_behavioral_audit(audit_fn_, req, res, action, result, target_type,
+                                        target_id, detail_text);
 }
 
 bool DashboardRoutes::admit_search_read(const httplib::Request& req,
@@ -334,12 +372,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
         metrics_->describe(
             "yuzu_echo_source_reenable_total",
             "Operator-triggered Echo source re-enable attempts by result "
-            "(success / scope_violation / agent_not_connected / denied / invalid_input).",
+            "(success / scope_violation / agent_not_connected / denied / invalid_input / "
+            "audit_unavailable).",
             "counter");
         metrics_->describe(
             "yuzu_echo_source_purge_total",
             "Operator-triggered Echo retention-paused source purge (destructive) attempts by "
-            "result (success / scope_violation / agent_not_connected / denied / invalid_input). "
+            "result (success / scope_violation / agent_not_connected / denied / invalid_input / "
+            "audit_unavailable). "
             "Counts DISPATCH outcomes; the agent's rows_deleted / source_not_paused outcome is in "
             "the command response record.",
             "counter");
@@ -754,8 +794,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "group.create_from_results", "denied",
-                                   "ManagementGroup", "", "csrf_cross_origin");
+                         audit_or_flag(req, res, "group.create_from_results", "denied",
+                                       "ManagementGroup", "", "csrf_cross_origin");
                          res.status = 403;
                          res.set_header("HX-Retarget", "#group-form-slot");
                          res.set_content(
@@ -876,9 +916,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // denied-row convention (server.cpp's aggregate surface), not
                      // "Response" — so SIEM rules filtering on the established
                      // taxonomy see this row too.
-                     audit_fn_(req, "response.read", "denied", "Execution", command_id,
-                               "scope_dropped=" + std::to_string(dropped) +
-                                   " surface=group_from_results");
+                     audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
+                                   "scope_dropped=" + std::to_string(dropped) +
+                                       " surface=group_from_results");
                  }
 
                  if (agent_ids.empty()) {
@@ -913,16 +953,78 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
+                 // ADR-0033 section 9, "no audit row, no mutation" (#3619): materialising a
+                 // group is a mutation, so its `attempted` row is stored before create_group and
+                 // every refusal above returned first (none burns a row). The form is
+                 // hx-swap="none", so the toast is the operator's only view of a refusal.
+                 static constexpr const char* kGroupAuditRefusal =
+                     "The audit record could not be stored. Nothing was created. Retry once the "
+                     "audit store recovers.";
+                 if (!audit_attempted(req, res, "group.create_from_results", "ManagementGroup", "",
+                                      group_name + " (" + std::to_string(agent_ids.size()) +
+                                          " agents from " + command_id + ")" +
+                                          (text_query.empty() ? "" : " text_query=1"),
+                                      std::string("<span class=\"feedback-error\" "
+                                                  "data-reason=\"audit_unavailable\">") +
+                                          kGroupAuditRefusal + "</span>",
+                                      kGroupAuditRefusal))
+                     return;
+
+                 // UP-5 (#3619): the attempted row can wait on the audit pool, so the session is
+                 // authenticated again (a revoked elevation or an invalidated session must not
+                 // survive in the copy taken before the wait) and visibility is resolved from
+                 // it, narrowing the set to what the caller may see NOW.
+                 const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
+                 if (!fresh_session) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "session_revoked");
+                     return;
+                 }
+                 // The flat ManagementGroup:Write admission above ran before the wait too, so it
+                 // is decided again for the re-authenticated session: a grant revoked during the
+                 // wait creates nothing (#3619 review). The gate writes its own 403.
+                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "permission_revoked name=" + group_name);
+                     return;
+                 }
+                 agent_scope = resolve_visible_scope(*fresh_session);
+                 if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
+                     audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
+                                   "scope_dropped=" + std::to_string(dropped) +
+                                       " surface=group_from_results phase=post_attempted");
+                 }
+                 if (agent_ids.empty()) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "scope_revoked");
+                     res.status = 422;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "No agents match the current filters. Nothing was created."));
+                     res.set_content("<span class=\"feedback-error\">"
+                                     "No agents match the current filters.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
                  // Create the static group
                  ManagementGroup mg;
                  mg.name = group_name;
                  mg.description = "Created from filtered results (command " +
                                   command_id + ")";
                  mg.membership_type = "static";
-                 mg.created_by = session->username;
+                 mg.created_by = fresh_session->username;
                  auto group_result = mgmt_group_store_->create_group(mg);
                  if (!group_result) {
+                     // The attempted row above is stored, so it gets an outcome (#3619). It
+                     // names the group: there is no group id to pair it by (Gate 8 UP-13).
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "create_failed name=" + group_name);
                      res.status = 500;
+                     // The form is hx-swap="none": without the toast the operator sees nothing
+                     // (a same-name race lost to a concurrent create lands here).
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(kGroupCreateFailed));
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "Failed to create group: " +
@@ -948,10 +1050,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  if (failed > 0) {
-                     audit_fn_(req, "group.create_from_results", "failure",
-                              "ManagementGroup", group_id,
-                              "partial_materialisation added=" + std::to_string(added) +
-                                  " failed=" + std::to_string(failed));
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", group_id,
+                                   "partial_materialisation added=" + std::to_string(added) +
+                                       " failed=" + std::to_string(failed));
                      res.status = 500;
                      res.set_header("HX-Retarget", "#group-form-slot");
                      res.set_content(
@@ -964,11 +1066,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 audit_fn_(req, "group.create_from_results", "success",
-                          "ManagementGroup", group_id,
-                          group_name + " (" + std::to_string(agent_ids.size()) +
-                              " agents from " + command_id + ")" +
-                              (text_query.empty() ? "" : " text_query=1"));
+                 audit_or_flag(req, res, "group.create_from_results", "success",
+                               "ManagementGroup", group_id,
+                               group_name + " (" + std::to_string(agent_ids.size()) +
+                                   " agents from " + command_id + ")" +
+                                   (text_query.empty() ? "" : " text_query=1"));
 
                  // Response: no body, side-effects via HX-Trigger headers
                  // The header is built with the JSON library, never by concatenation: the
@@ -1046,8 +1148,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // A refusal is a 400 (htmx surfaces it through htmx:responseError) that
                      // names its reason and writes one denied audit row. Nothing dispatches.
                      auto refuse_expression = [&](const char* reason, const std::string& text) {
-                         audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   std::string("reason=") + reason);
+                         audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                       std::string("reason=") + reason);
                          res.status = 400;
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1301,10 +1403,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        "refusing dispatch of {}:{} (Destructive targeting "
                                        "cannot be decided)",
                                        plugin, action);
-                         audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   "reason=classifier_unavailable " +
-                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                       onbehalf::sanitize_for_log(action, 128));
+                         audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                       "reason=classifier_unavailable " +
+                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                           onbehalf::sanitize_for_log(action, 128));
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
                              " class=\"result-context is-error\">"
@@ -1374,10 +1476,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // Audited under this surface's own command.dispatch
                          // verb, with the same `reason=` detail prefix
                          // /api/command's twin refusal writes.
-                         audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   "reason=" + std::string(gate.refusal_reason) + " " +
-                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                       onbehalf::sanitize_for_log(action, 128));
+                         audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                       "reason=" + std::string(gate.refusal_reason) + " " +
+                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                           onbehalf::sanitize_for_log(action, 128));
                          // In-surface denial shape: every other refusal in this
                          // handler is a 200 carrying an OOB result-context
                          // span, because the caller is htmx swapping fragments
@@ -1451,10 +1553,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                  "requested agents [{}] are in the caller's visible set",
                                  onbehalf::sanitize_for_log(plugin, 128),
                                  onbehalf::sanitize_for_log(action, 128), requested);
-                             audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                       "reason=scope_violation " +
-                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                           onbehalf::sanitize_for_log(action, 128));
+                             audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                           "reason=scope_violation " +
+                                               onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                               onbehalf::sanitize_for_log(action, 128));
                              res.set_content(
                                  "<span id=\"result-context\" hx-swap-oob=\"true\""
                                  " class=\"result-context is-error\">" +
@@ -1471,32 +1573,52 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
-                 // ADR-0033 section 9, "no audit row, no mutation": an expression-targeted
-                 // send is a new fan-out surface, so its `attempted` row is stored BEFORE the
-                 // dispatch and a row that is not stored (or a sink that is not wired) refuses
-                 // the send with a 503 and dispatches nothing. Every refusal above returned
-                 // before this point, so a rejected request burns no `attempted` row. The
-                 // outcome row ("success"/"failure") follows the dispatch.
-                 if (expression_supplied) {
-                     const bool stored =
-                         persist_audit_fn_ &&
-                         yuzu::server::detail::try_persist_audit(
-                             persist_audit_fn_, req, "command.dispatch", "attempted", "command",
-                             "",
-                             plugin + ":" + action + " scope_expression=" +
-                                 onbehalf::sanitize_for_log(target_expression, 256));
-                     if (!stored) {
-                         res.status = 503;
-                         res.set_header("Sec-Audit-Failed", "true");
-                         res.set_content(
+                 // ADR-0033 section 9, "no audit row, no mutation": EVERY console send stores
+                 // its `attempted` row BEFORE the dispatch (#3619; the expression-targeted send
+                 // was the first), and a row that is not stored (or a sink that is not wired)
+                 // refuses the send with a 503 and dispatches nothing. Every refusal above
+                 // returned before this point, so a rejected request burns no `attempted` row.
+                 // The outcome row ("success"/"failure") follows the dispatch.
+                 {
+                     std::string attempted = plugin + ":" + action;
+                     if (expression_supplied)
+                         attempted += " scope_expression=" +
+                                      onbehalf::sanitize_for_log(target_expression, 256);
+                     else if (!agent_ids.empty())
+                         attempted += " agents=" + std::to_string(agent_ids.size());
+                     else if (!scope_expr.empty())
+                         attempted += " scope=" + onbehalf::sanitize_for_log(scope_expr, 256);
+                     else // no `scope` field at all: the fleet by omission
+                         attempted += " scope=" + std::string(yuzu::server::kBroadcastScope);
+                     if (!audit_attempted(
+                             req, res, "command.dispatch", "command", "", attempted,
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
                              " class=\"result-context is-error\""
                              " data-reason=\"audit_unavailable\">The audit record could not "
                              "be stored, so nothing was sent. Retry once the audit store "
-                             "recovers.</span>",
-                             "text/html; charset=utf-8");
+                             "recovers.</span>"))
                          return;
-                     }
+                 }
+                 // The Execution:Execute admission above ran before the wait too. With RBAC off
+                 // the dispatch seam admits every human principal, so a JIT elevation that
+                 // lapsed during the wait is caught only here (#3619 review). The gate writes
+                 // its own refusal.
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     audit_or_flag(req, res, "command.dispatch", "failure", "command", "",
+                                   "reason=permission_revoked " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
+                     return;
+                 }
+                 // UP-5 (#3619): the attempted row can wait on the audit pool, so the caller's
+                 // authority is resolved again here and the dispatch confines to what the
+                 // caller may reach NOW; a revocation during the wait narrows the send. The
+                 // gates above used the earlier resolution and only ever refuse.
+                 if (caller_fn_) {
+                     caller = caller_fn_(req);
+                 } else {
+                     caller = yuzu::server::DispatchCaller{};
+                     caller.exec_visible = yuzu::server::authz::deny_all(); // unwired: fail CLOSED
                  }
 
                  auto dispatch_outcome =
@@ -1504,10 +1626,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
                  if (sent == 0) {
-                     if (expression_supplied)
-                         audit_fn_(req, "command.dispatch", "failure", "command", command_id,
-                                   "reason=no_agents_reached scope_expression=" +
-                                       onbehalf::sanitize_for_log(target_expression, 256));
+                     // Every send now has an `attempted` row (#3619), so every zero-reach send
+                     // records its outcome, not only an expression-targeted one.
+                     audit_or_flag(req, res, "command.dispatch", "failure", "command", command_id,
+                                   expression_supplied
+                                       ? "reason=no_agents_reached scope_expression=" +
+                                             onbehalf::sanitize_for_log(target_expression, 256)
+                                       : std::string("reason=no_agents_reached"));
                      // #3424/#3511: don't blame connectivity for a fail-closed
                      // containment gate, a quarantine denial, or a withheld
                      // plugin-absent dispatch — same discrimination /api/command
@@ -1665,7 +1790,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      detail += " definition_id=" + def_id;
                  if (expression_supplied)
                      detail += " scope_expression=" + onbehalf::sanitize_for_log(target_expression, 256);
-                 audit_fn_(req, "command.dispatch", "success", "command", command_id, detail);
+                 audit_or_flag(req, res, "command.dispatch", "success", "command", command_id,
+                               detail);
 
                  res.set_content(html, "text/html; charset=utf-8");
              });
@@ -1797,8 +1923,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      std::to_string(sent) +
                      " agent(s)\",\"level\":\"success\"}}");
 
-                 audit_fn_(req, "echo.sql", "success", "command", command_id,
-                          "Echo SQL -> " + std::to_string(sent) + " agent(s)");
+                 audit_or_flag(req, res, "echo.sql", "success", "command", command_id,
+                               "Echo SQL -> " + std::to_string(sent) + " agent(s)");
 
                  res.set_content(html, "text/html; charset=utf-8");
              });
@@ -1917,8 +2043,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                             res, 403,
                             "service-scoped tokens may not read the fleet-wide retention scan"),
                         "application/json");
-                    audit_fn_(req, "echo.retention_paused.view", "denied", "Infrastructure", "",
-                             "service-scoped token denied fleet-wide retention scan read");
+                    audit_or_flag(req, res, "echo.retention_paused.view", "denied",
+                                  "Infrastructure", "",
+                                  "service-scoped token denied fleet-wide retention scan read");
                     if (metrics_) {
                         metrics_->counter("yuzu_echo_dashboard_view_total",
                                           {{"frame", "retention_rest"},
@@ -1970,8 +2097,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // Compliance F1: emit a denied audit row so SIEM rules
                      // alerting on RBAC-rejection probing have a data source.
                      // Without this, the audit catalog overclaims coverage.
-                     audit_fn_(req, "echo.status.scan", "denied", "command",
-                              "", "rbac_denied");
+                     audit_or_flag(req, res, "echo.status.scan", "denied", "command",
+                                   "", "rbac_denied");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_scan_dispatched_total",
                                            {{"result", "denied"}}).increment();
@@ -2010,10 +2137,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                  kScanCooldownSec - since,
                                  (kScanCooldownSec - since) == 1 ? "" : "s"),
                                  "text/html; charset=utf-8");
-                             audit_fn_(req, "echo.status.scan", "denied",
-                                      "command", "",
-                                      std::format("rate_limited cooldown={}s",
-                                                   kScanCooldownSec - since));
+                             audit_or_flag(req, res, "echo.status.scan", "denied",
+                                           "command", "",
+                                           std::format("rate_limited cooldown={}s",
+                                                        kScanCooldownSec - since));
                              if (metrics_) {
                                  metrics_->counter(
                                      "yuzu_echo_scan_dispatched_total",
@@ -2087,10 +2214,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      st.dispatched_at = now_epoch();
                  }
 
-                 audit_fn_(req, "echo.status.scan", "success", "command",
-                          command_id,
-                          std::format("dispatched to {} agent(s) in scope",
-                                       sent));
+                 audit_or_flag(req, res, "echo.status.scan", "success", "command",
+                               command_id,
+                               std::format("dispatched to {} agent(s) in scope",
+                                            sent));
 
                  std::string body;
                  if (sent == 0) {
@@ -2154,8 +2281,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) {
                      // Compliance F1: denied audit on RBAC rejection.
-                     audit_fn_(req, "echo.source.reenable", "denied",
-                              "command", "", "rbac_denied");
+                     audit_or_flag(req, res, "echo.source.reenable", "denied",
+                                   "command", "", "rbac_denied");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "denied"}}).increment();
@@ -2174,8 +2301,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "echo.source.reenable", "denied", "command", "",
-                                   "csrf_cross_origin");
+                         audit_or_flag(req, res, "echo.source.reenable", "denied", "command", "",
+                                       "csrf_cross_origin");
                          if (metrics_) {
                              metrics_->counter("yuzu_echo_source_reenable_total",
                                                {{"result", "denied"}})
@@ -2248,10 +2375,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  if (!visible) {
-                     audit_fn_(req, "echo.source.reenable", "failure",
-                              "command", "",
-                              std::format("scope_violation source={}",
-                                           source));
+                     audit_or_flag(req, res, "echo.source.reenable", "failure",
+                                   "command", "",
+                                   std::format("scope_violation source={}",
+                                                source));
                      res.status = 404;
                      res.set_content("<span class=\"echo-row-error\">"
                                      "Agent not reachable.</span>",
@@ -2259,6 +2386,37 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "scope_violation"}}).increment();
+                     }
+                     return;
+                 }
+
+                 // ADR-0033 section 9, "no audit row, no mutation" (#3619): re-enabling
+                 // capture changes the device's state, so the `attempted` row is stored before
+                 // the dispatch; every refusal above returned first (none burns a row).
+                 if (!audit_attempted(req, res, "echo.source.reenable", "command", "",
+                                      std::format("device={} source={}", device_id, source),
+                                      std::string("<span class=\"echo-row-error\""
+                                                  " data-reason=\"audit_unavailable\">") +
+                                          kEchoAuditRefusal + "</span>",
+                                      kEchoAuditRefusal)) {
+                     // A counted exit like every other one here, under its own value: this
+                     // is an audit outage, not an RBAC refusal (`denied`).
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_reenable_total",
+                                           {{"result", "audit_unavailable"}}).increment();
+                     }
+                     return;
+                 }
+                 // Execution:Execute was admitted before the wait; decide it again so a grant
+                 // withdrawn during the wait dispatches nothing (#3619 review). The gate writes
+                 // its own refusal; counted as the RBAC refusal it is.
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
+                                   std::format("permission_revoked device={} source={}", device_id,
+                                               source));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_reenable_total",
+                                           {{"result", "denied"}}).increment();
                      }
                      return;
                  }
@@ -2281,10 +2439,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
-                     audit_fn_(req, "echo.source.reenable", "failure",
-                              "command", "",
-                              std::format("agent_not_connected source={}",
-                                           source));
+                     audit_or_flag(req, res, "echo.source.reenable", "failure",
+                                   "command", "",
+                                   std::format("agent_not_connected source={}",
+                                                source));
                      res.status = 404;
                      res.set_content("<span class=\"echo-row-error\">"
                                      "Agent not reachable.</span>",
@@ -2296,10 +2454,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 audit_fn_(req, "echo.source.reenable", "success",
-                          "command", command_id,
-                          std::format("device={} source={}",
-                                       device_id, source));
+                 audit_or_flag(req, res, "echo.source.reenable", "success",
+                               "command", command_id,
+                               std::format("device={} source={}",
+                                            device_id, source));
                  if (metrics_) {
                      metrics_->counter("yuzu_echo_source_reenable_total",
                                        {{"result", "success"}}).increment();
@@ -2328,7 +2486,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Post("/fragments/echo/retention-paused/purge",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
-                     audit_fn_(req, "echo.source.purge", "denied", "command", "", "rbac_denied");
+                     audit_or_flag(req, res, "echo.source.purge", "denied", "command", "",
+                                   "rbac_denied");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                              .increment();
@@ -2352,8 +2511,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "echo.source.purge", "denied", "command", "",
-                                   "csrf_cross_origin");
+                         audit_or_flag(req, res, "echo.source.purge", "denied", "command", "",
+                                       "csrf_cross_origin");
                          if (metrics_) {
                              metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                                  .increment();
@@ -2419,14 +2578,47 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
                  if (!visible) {
-                     audit_fn_(req, "echo.source.purge", "failure", "command", "",
-                              std::format("scope_violation source={}", source));
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("scope_violation source={}", source));
                      res.status = 404;
                      res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total",
                                            {{"result", "scope_violation"}})
+                             .increment();
+                     }
+                     return;
+                 }
+
+                 // ADR-0033 section 9, "no audit row, no mutation" (#3619): purge is
+                 // Destructive (it drops the device's Echo data), so the `attempted` row is
+                 // stored before the dispatch; every refusal above returned first (none burns
+                 // a row).
+                 if (!audit_attempted(req, res, "echo.source.purge", "command", "",
+                                      std::format("device={} source={}", device_id, source),
+                                      std::string("<span class=\"echo-row-error\""
+                                                  " data-reason=\"audit_unavailable\">") +
+                                          kEchoAuditRefusal + "</span>",
+                                      kEchoAuditRefusal)) {
+                     // A counted exit like every other one here, under its own value: this
+                     // is an audit outage, not an RBAC refusal (`denied`).
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_purge_total",
+                                           {{"result", "audit_unavailable"}}).increment();
+                     }
+                     return;
+                 }
+                 // Infrastructure:Delete was admitted before the wait. With RBAC off the
+                 // dispatch seam admits every human principal and echo.purge_source carries no
+                 // ExecuteGate, so a JIT elevation that lapsed during the wait is caught only
+                 // here (#3619 review). The gate writes its own refusal.
+                 if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("permission_revoked device={} source={}", device_id,
+                                               source));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                              .increment();
                      }
                      return;
@@ -2451,8 +2643,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
-                     audit_fn_(req, "echo.source.purge", "failure", "command", "",
-                              std::format("agent_not_connected source={}", source));
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("agent_not_connected source={}", source));
                      res.status = 404;
                      res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
@@ -2464,8 +2656,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 audit_fn_(req, "echo.source.purge", "success", "command", command_id,
-                          std::format("device={} source={}", device_id, source));
+                 audit_or_flag(req, res, "echo.source.purge", "success", "command", command_id,
+                               std::format("device={} source={}", device_id, source));
                  if (metrics_) {
                      metrics_->counter("yuzu_echo_source_purge_total", {{"result", "success"}})
                          .increment();
