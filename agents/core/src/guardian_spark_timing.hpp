@@ -120,7 +120,7 @@
  *     T_detect line.
  *   - T_server (server log) fields: recv_ns and committed_ns are wall-clock instants on the
  *     SERVER; agent_ns is the event's own AGENT-side timestamp (on the Spark path the outbox
- *     entry's enqueue stamp; whole seconds on the legacy path), so arithmetic between
+ *     entry's enqueue stamp; milliseconds on the legacy path since #5690), so arithmetic between
  *     agent_ns and the server's instants includes any agent/server clock skew; store_ms is
  *     the elapsed time of the whole store call, including work after the commit, so it is
  *     not committed_ns - recv_ns; agent_ns=-1 marks an ABSENT or invalid wire timestamp. It

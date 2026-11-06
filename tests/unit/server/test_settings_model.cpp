@@ -448,15 +448,24 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
                 return &t;
         return nullptr;
     };
-    const auto* live = find("process", "live");
+    // The one row-count tier left among the sources: usage keeps its own live table.
+    const auto* live = find("usage", "live");
     REQUIRE(live);
     CHECK(live->at("limit_kind") == "rows");
-    CHECK(live->at("limit").get<long long>() == 100000);
+    CHECK(live->at("limit").get<long long>() == 200000);
     CHECK(live->at("bucket_seconds").get<long long>() == 0);
     CHECK(live->at("guaranteed_depth_seconds").is_null());
+    // A roll-up tier: 90 days hourly, a bucket START cut, so the depth is the limit less a bucket.
+    const auto* hourly = find("perf", "hourly");
+    REQUIRE(hourly);
+    CHECK(hourly->at("limit_kind") == "seconds");
+    CHECK(hourly->at("limit").get<long long>() == 7776000);
+    CHECK(hourly->at("bucket_seconds").get<long long>() == 3600);
+    CHECK(hourly->at("guaranteed_depth_seconds").get<long long>() == 7772400);
     const auto* daily = find("process", "daily");
     REQUIRE(daily);
-    CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 2592000);
+    CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 15465600);
+    CHECK(find("process", "live") == nullptr); // the raw tier is gone
 }
 
 TEST_CASE("build_data_retention_settings emits echo:null when no table is available",
@@ -502,10 +511,12 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     const auto wo = sm::render_retention_table(without);
     CHECK(w.compare(0, wo.size(), wo) == 0);
     CHECK_FALSE(has(wo, "Echo capture sources"));
+    // 90 days hourly, 180 days daily, a year monthly; usage keeps its own live rows and a 31-day
+    // daily tier; the look-again figure is the monthly depth.
     for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
-                          "<th>Look again after</th>", ">process<", "100,000 rows", ">1 day<",
-                          ">31 days<", ">12 months<", ">11 months<", "400 rows", "Row count only",
-                          ">7 days<", ">30 days<", "every 900 s", "never pruned", "not per-device"})
+                          "<th>Look again after</th>", ">process<", "200,000 rows", ">3 months<",
+                          ">6 months<", ">31 days<", ">12 months<", ">11 months<", "400 rows",
+                          ">30 days<", "every 900 s", "never pruned", "not per-device"})
         CHECK(has(w, n));
     const auto cap = w.find("<caption");
     REQUIRE(cap != std::string::npos);
