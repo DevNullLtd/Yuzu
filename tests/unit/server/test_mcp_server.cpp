@@ -25,6 +25,7 @@
 #include "mcp_stream_bridge.hpp"   // 2f PR 3a
 
 #include "agent_registry.hpp"
+#include "guardian_backend_fleet_tags.hpp" // #2240: the closed token table the device schema enums mirror
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError for classify_fn_for_test
@@ -6128,6 +6129,13 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(sc["agents"][1]["agent_id"] == "agent-002");
     CHECK(sc["agents"] == agents); // same rows, just wrapped
 
+    // #2240: guardian_backend is ALWAYS present on a row; the fixture rows carry no heartbeat
+    // tag, so it reads JSON null (never "legacy") in both content and structuredContent.
+    for (const auto& a : agents) {
+        REQUIRE(a.contains("guardian_backend"));
+        CHECK(a["guardian_backend"].is_null());
+    }
+
     // Verify audit was recorded
     REQUIRE(ts.audit_log.size() >= 1);
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
@@ -6309,6 +6317,55 @@ TEST_CASE("MCP list_agents (#4041): tools/list states the scope contract",
     CHECK(description.find("scope_basis") != std::string::npos);
     CHECK(description.find("never disclosed") != std::string::npos);
     CHECK((*tool)["outputSchema"]["properties"].contains("scope_basis"));
+}
+
+TEST_CASE("MCP list_agents / get_agent_details (#2240): tools/list types guardian_backend as a "
+          "nullable closed enum and requires it",
+          "[mcp][integration][a5][guardian_backend]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2240})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    nlohmann::json expected_enum = nlohmann::json::array();
+    for (const char* t : yuzu::server::detail::kGuardianBackendTokens)
+        expected_enum.push_back(t);
+    expected_enum.push_back(nullptr);
+
+    auto find_tool = [&](const char* name) -> const nlohmann::json* {
+        for (const auto& t : body["result"]["tools"])
+            if (t["name"] == name)
+                return &t;
+        return nullptr;
+    };
+    auto field_schema = [&](const nlohmann::json& tool) -> const nlohmann::json& {
+        const auto& schema = tool["outputSchema"];
+        // list_agents nests the row schema under agents.items; get_agent_details is the row.
+        if (schema["properties"].contains("agents"))
+            return schema["properties"]["agents"]["items"];
+        return schema;
+    };
+
+    for (const char* name : {"list_agents", "get_agent_details"}) {
+        INFO("tool: " << name);
+        const auto* tool = find_tool(name);
+        REQUIRE(tool != nullptr);
+        const auto& row = field_schema(*tool);
+        REQUIRE(row["properties"].contains("guardian_backend"));
+        const auto& prop = row["properties"]["guardian_backend"];
+        // JSON Schema (not OpenAPI 3.0): a type array carries the null.
+        CHECK(prop["type"] == nlohmann::json::array({"string", "null"}));
+        CHECK(prop["enum"] == expected_enum);
+        bool required = false;
+        for (const auto& r : row["required"])
+            required = required || r == "guardian_backend";
+        CHECK(required);
+        // A5 item 2: the description must say what the field and null mean.
+        const auto desc = (*tool)["description"].get<std::string>();
+        CHECK(desc.find("guardian_backend") != std::string::npos);
+    }
 }
 
 TEST_CASE("MCP fleet_overview (#4041): the prompt does not read a confined list as the fleet",
@@ -17034,6 +17091,9 @@ TEST_CASE("MCP Integration: tools/call get_agent_details", "[mcp][integration]")
     CHECK(text["agent_id"] == "agent-001");
     CHECK(text["hostname"] == "web-01");
     CHECK(text["os"] == "linux");
+    // #2240: the key is always present; no heartbeat tag in the fixture, so null.
+    REQUIRE(text.contains("guardian_backend"));
+    CHECK(text["guardian_backend"].is_null());
 
     // #2712: this tool already returned a flat object pre-#2712 (no bare-
     // array wire-format concern), so structuredContent is just the SAME

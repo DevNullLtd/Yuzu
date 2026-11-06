@@ -228,7 +228,7 @@ TEST_CASE("GET /api/v1/devices — gate denial forwards the gate's own status, n
     CHECK(res->status == 403);
 }
 
-TEST_CASE("GET /api/v1/devices — admitted + unfiltered scope returns every agent, 5-field rows",
+TEST_CASE("GET /api/v1/devices — admitted + unfiltered scope returns every agent, 6-field rows",
           "[rest][devices]") {
     DeviceRestHarness h;
     h.fleet_scope = std::nullopt; // TOP
@@ -242,12 +242,17 @@ TEST_CASE("GET /api/v1/devices — admitted + unfiltered scope returns every age
     REQUIRE(devices.size() == 2);
     CHECK(body["data"]["count"].get<int64_t>() == 2);
     CHECK(body["data"]["devices_omitted"].get<int64_t>() == 0);
-    // Row shape: exactly the 5 list_agents fields.
+    // Row shape: the 5 original list_agents fields plus guardian_backend (#2240). The key is
+    // ALWAYS present; a device that has not reported the heartbeat tag reads JSON null, never
+    // "legacy" (the fixture's rows carry no backend).
     CHECK(devices[0]["agent_id"] == "a1");
     CHECK(devices[0]["hostname"] == "host1");
     CHECK(devices[0]["os"] == "linux");
     CHECK(devices[0]["arch"] == "x86_64");
     CHECK(devices[0]["agent_version"] == "1.0.0");
+    REQUIRE(devices[0].contains("guardian_backend"));
+    CHECK(devices[0]["guardian_backend"].is_null());
+    CHECK(devices[0].size() == 6);
     CHECK_FALSE(devices[0].contains("tags"));
     CHECK_FALSE(devices[0].contains("online"));
 }
@@ -348,7 +353,8 @@ TEST_CASE("GET /api/v1/devices/{id} — in-scope degraded tag-store read is a 50
 // see device_routes.hpp's doc comment on device_agent_detail_json for why
 // this is a deliberate, already-committed (wave 1) seam decision.
 
-TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields", "[devices][pure]") {
+TEST_CASE("device_agent_row_json: the 5 list_agents fields plus a nullable guardian_backend",
+          "[devices][pure]") {
     DeviceListRow agent{.agent_id = "a1", .hostname = "host1", .os = "linux", .arch = "x86_64",
                        .agent_version = "1.0.0"};
     auto row = device_agent_row_json(agent);
@@ -357,7 +363,10 @@ TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields", "[devices][
     CHECK(row["os"] == "linux");
     CHECK(row["arch"] == "x86_64");
     CHECK(row["agent_version"] == "1.0.0");
-    CHECK(row.size() == 5);
+    // #2240: sixth field, key always present, null when the device has not reported the tag.
+    REQUIRE(row.contains("guardian_backend"));
+    CHECK(row["guardian_backend"].is_null());
+    CHECK(row.size() == 6);
 }
 
 TEST_CASE("device_agent_row_json: a default-constructed row degrades to empty fields",

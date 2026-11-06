@@ -44,6 +44,7 @@
 #include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
 #include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
+#include "guardian_backend_fleet_tags.hpp" // #2240: the closed backend token table the device enum mirrors
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -2417,4 +2418,40 @@ TEST_CASE("openapi documents: the response status set of the ten hand-checked op
             CHECK(declared == row.statuses);
         }
     }
+}
+
+TEST_CASE("openapi_spec_json(): DevicesListRow carries a nullable guardian_backend pinned to the token table",
+          "[openapi][devices][guardian_backend]") {
+    // #2240. OpenAPI 3.0.3 has no `type: [string, null]`: a nullable enum needs BOTH
+    // `nullable: true` and `null` among the enum values. The enum is compared against the
+    // server's own closed token table, so a fifth token is a red test here, not a client that
+    // silently rejects it.
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& row = spec["components"]["schemas"]["DevicesListRow"];
+    REQUIRE(row["properties"].contains("guardian_backend"));
+    const auto& prop = row["properties"]["guardian_backend"];
+    CHECK(prop["type"] == "string");
+    CHECK(prop["nullable"] == true);
+
+    json expected = json::array();
+    for (const char* t : yuzu::server::detail::kGuardianBackendTokens)
+        expected.push_back(t);
+    expected.push_back(nullptr);
+    CHECK(prop["enum"] == expected);
+
+    // The key is always present in the response, so it is a required property.
+    bool required = false;
+    for (const auto& r : row["required"])
+        required = required || r == "guardian_backend";
+    CHECK(required);
+
+    // The detail schema inherits the row via allOf, so it carries the field too.
+    CHECK(spec["components"]["schemas"]["DevicesDetail"].dump().find("DevicesListRow") !=
+          std::string::npos);
+
+    // The prose that used to say "5 fields" must not.
+    const auto desc = spec["paths"]["/devices"]["get"]["description"].get<std::string>();
+    CHECK(desc.find("5 fields") == std::string::npos);
+    CHECK(desc.find("guardian_backend") != std::string::npos);
 }
