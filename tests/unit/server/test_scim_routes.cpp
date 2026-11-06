@@ -1209,6 +1209,21 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
     CHECK_FALSE(f.auth_db->get_user("dana").has_value());
 }
 
+namespace {
+
+/// Durable session rows held by `username` (the surviving-row evidence for #4772).
+int durable_session_rows(Fixture& f, const std::string& username) {
+    auto lease = f.auth_db.pool().acquire();
+    REQUIRE(lease);
+    yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT 1 FROM session_store.sessions WHERE username = $1",
+        std::vector<std::string>{username});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return PQntuples(r.get());
+}
+
+} // namespace
+
 // ── ADR-2001 Task 3: deprovision credential revoke ──────────────────────────
 //
 // The principal-set resolver (`resolve_deprovision_principals`,
@@ -1517,6 +1532,50 @@ TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY
     CHECK_FALSE(f.token_store->validate_token(*oidc_token).has_value());
     CHECK_FALSE(f.auth_mgr.validate_session(slug_session).has_value());
     CHECK_FALSE(f.auth_mgr.validate_session(oidc_session).has_value());
+}
+
+// #4772: `sessions_persisted` carries `invalidate_user_sessions(...).db_persisted` out of the
+// orchestrator. Before the fix the flag was dropped, so a durable DELETE that failed was
+// indistinguishable from a clean revoke.
+TEST_CASE("revoke_deprovision_credentials: reports sessions_persisted from the durable session "
+          "delete, and keeps revoking every principal after a failure (#4772)",
+          "[pg][scim][adr2001][orchestrator][sessions-persisted]") {
+    Fixture f;
+    f.use_session_store();
+    REQUIRE(f.auth_mgr.upsert_user("yolanda", "yolandapassword1", auth::Role::user));
+    REQUIRE(f.auth_mgr.upsert_user("zed", "zedpassword12345", auth::Role::user));
+    auto yolanda_token = f.token_store->create_token("t1", "yolanda");
+    auto zed_token = f.token_store->create_token("t2", "zed");
+    REQUIRE(yolanda_token.has_value());
+    REQUIRE(zed_token.has_value());
+    REQUIRE_FALSE(
+        f.auth_mgr.create_local_session_for_test("yolanda", auth::Role::user, true).empty());
+    REQUIRE_FALSE(f.auth_mgr.create_local_session_for_test("zed", auth::Role::user, true).empty());
+
+    SECTION("healthy store: both legs persist") {
+        auto result = revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
+        CHECK(result.api_tokens_persisted);
+        CHECK(result.sessions_persisted);
+        CHECK(result.api_tokens_revoked == 2);
+        CHECK(result.sessions_revoked == 2);
+        CHECK(durable_session_rows(f, "yolanda") == 0);
+        CHECK(durable_session_rows(f, "zed") == 0);
+    }
+
+    SECTION("durable session delete fails: reported, tokens still revoked for every principal") {
+        f.wipe_fault.arm();
+        auto result = revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
+        f.wipe_fault.repair();
+        CHECK_FALSE(result.sessions_persisted);
+        // The token leg is independent and unaffected; both principals were still processed.
+        CHECK(result.api_tokens_persisted);
+        CHECK(result.api_tokens_revoked == 2);
+        CHECK_FALSE(f.token_store->validate_token(*yolanda_token).has_value());
+        CHECK_FALSE(f.token_store->validate_token(*zed_token).has_value());
+        // The evidence the flag exists for: the durable rows SURVIVED the "revoke".
+        CHECK(durable_session_rows(f, "yolanda") == 1);
+        CHECK(durable_session_rows(f, "zed") == 1);
+    }
 }
 
 TEST_CASE("ScimRoutes: PATCH active=false revokes API tokens AND sessions for BOTH the slug "
@@ -5348,6 +5407,70 @@ TEST_CASE("ScimRoutes: a StoreFailure from the guarded deactivation is a retryab
     }
 }
 
+// #4772: the credentials-first revoke holds the durable session DELETE to the same fail-closed
+// contract as the token revoke. A row that did not delete survives, and any other replica (or this
+// one after a restart) rehydrates a valid session from it, so a "clean" deprovision would leave the
+// principal signed in. The account must stay active so the IdP / operator can retry.
+TEST_CASE("ScimRoutes: deprovision fails closed when the durable session delete does not persist "
+          "(#4772)",
+          "[pg][scim][routes][adr2001][deprovision][sessions-persisted]") {
+    Fixture f;
+    f.use_session_store();
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "sdp"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE_FALSE(f.auth_mgr.create_local_session_for_test("sdp", auth::Role::user, false).empty());
+    REQUIRE(durable_session_rows(f, "sdp") == 1);
+    auto token = f.token_store->create_token("sdp-token", "sdp");
+    REQUIRE(token.has_value());
+    f.wipe_fault.arm();
+
+    std::unique_ptr<httplib::Response> res;
+    std::string audit_action;
+    std::function<std::unique_ptr<httplib::Response>()> retry;
+    SECTION("PATCH active:false") {
+        audit_action = "scim.user.deactivated";
+        res = f.patch("/scim/v2/Users/" + id, deactivate_ops());
+        retry = [&] { return f.patch("/scim/v2/Users/" + id, deactivate_ops()); };
+    }
+    SECTION("PUT active:false") {
+        audit_action = "scim.user.deactivated";
+        const json body{{"userName", "sdp"}, {"active", false}};
+        res = f.put("/scim/v2/Users/" + id, body);
+        retry = [&, body] { return f.put("/scim/v2/Users/" + id, body); };
+    }
+    SECTION("DELETE") {
+        audit_action = "scim.user.deleted";
+        res = f.del("/scim/v2/Users/" + id);
+        retry = [&] { return f.del("/scim/v2/Users/" + id); };
+    }
+    REQUIRE(res);
+    CHECK(res->status == 500);
+
+    // NOT a clean success: the account is still live and was never marked inactive.
+    CHECK(f.auth_mgr.get_user_role("sdp").has_value());
+    auto stored = f.scim_store->get_by_scim_id(id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->active);
+    // Credentials-first still applied what it could: the token is gone.
+    CHECK_FALSE(f.token_store->validate_token(*token).has_value());
+
+    const auto rows = audit_rows(f, audit_action, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "partial");
+    CHECK(rows[0].detail.find("sessions_db_error=true") != std::string::npos);
+    CHECK(rows[0].detail.find("api_tokens_db_error=true") == std::string::npos);
+
+    // Once the store is healthy the retry converges: the durable row is deleted and the account
+    // is deprovisioned. The surviving row is exactly what the failed attempt left behind.
+    f.wipe_fault.repair();
+    CHECK(durable_session_rows(f, "sdp") == 1);
+    auto again = retry();
+    REQUIRE(again);
+    CHECK(again->status / 100 == 2);
+    CHECK(durable_session_rows(f, "sdp") == 0);
+    CHECK_FALSE(f.auth_mgr.get_user_role("sdp").has_value());
+}
+
 TEST_CASE("ScimRoutes: a failed durable session wipe after the deactivation is a 500 that says "
           "the account IS deactivated (#4966)",
           "[pg][scim][routes][lastadmin][wipefailed]") {
@@ -5355,7 +5478,9 @@ TEST_CASE("ScimRoutes: a failed durable session wipe after the deactivation is a
     f.use_session_store();
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "wfa"}})->body);
     const auto id = created["id"].get<std::string>();
-    f.wipe_fault.arm();
+    // Armed to fire AFTER the deactivation commits: the #4772 revoke leg must still succeed.
+    yuzu::test::SessionWipeFaultAfterDeactivation fault{f.auth_db.pool()};
+    fault.arm();
 
     std::unique_ptr<httplib::Response> res;
     std::string audit_action;
@@ -5388,7 +5513,8 @@ TEST_CASE("ScimRoutes: a failed durable session wipe on POST active:false is the
           "[pg][scim][routes][lastadmin][wipefailed]") {
     Fixture f;
     f.use_session_store();
-    f.wipe_fault.arm();
+    yuzu::test::SessionWipeFaultAfterDeactivation fault{f.auth_db.pool()}; // fires after the deactivation
+    fault.arm();
     auto res = f.post("/scim/v2/Users", {{"userName", "wfp"}, {"active", false}});
     REQUIRE(res);
     CHECK(res->status == 500);

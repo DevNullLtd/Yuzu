@@ -4874,22 +4874,32 @@ void SettingsRoutes::register_routes(
                 // principal strings, not just the count — mirrors the SCIM
                 // seam's `revoke_linked_credentials_or_fail`.
                 enumerate_principals_for_audit(*principals);
-            if (!revoke_result.api_tokens_persisted) {
-                revoke_detail += " api_tokens_db_error=true";
-                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
-                             "persist for one or more principals linked to '{}' — refusing to "
-                             "report a clean delete (ADR-2001 §3 fail-closed)",
+            if (!revoke_result.api_tokens_persisted || !revoke_result.sessions_persisted) {
+                // #4772: the durable session DELETE is held to the same fail-closed contract
+                // as the token revoke (a surviving session row is rehydrated by another
+                // replica or after a restart).
+                if (!revoke_result.api_tokens_persisted)
+                    revoke_detail += " api_tokens_db_error=true";
+                if (!revoke_result.sessions_persisted)
+                    revoke_detail += " sessions_db_error=true";
+                spdlog::error("DELETE /api/settings/users: the credential revoke did not "
+                             "persist (api_tokens={}, sessions={}) for one or more principals "
+                             "linked to '{}' — refusing to report a clean delete (ADR-2001 §3 "
+                             "fail-closed)",
+                             revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                              username);
                 audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                const std::string what = !revoke_result.api_tokens_persisted ? "API tokens"
+                                                                              : "sessions";
                 res.status = 500;
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
-                    R"(linked identities — try again","level":"error"}})");
-                res.set_content(
-                    detail::a4_error(res, "Failed to revoke API tokens for one or more linked "
-                                           "identities — try again"),
-                    "application/json");
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Failed to revoke )" + what +
+                                   R"( for one or more linked identities — try again",)"
+                                   R"("level":"error"}})");
+                res.set_content(detail::a4_error(res, "Failed to revoke " + what +
+                                                          " for one or more linked "
+                                                          "identities — try again"),
+                                "application/json");
                 return;
             }
             erase_principals = std::move(*principals);

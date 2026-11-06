@@ -2881,7 +2881,17 @@ cache bounded by the 1 s generation refresh (`kSessionGenRefreshMs`) and
 widening to the 30 s stale-serve ceiling (`kSessionGenStaleServeBoundMs`) for
 as long as a Postgres brownout blocks refreshes. The honest guarantee is
 **"revoked within ~60s of the deprovision reaching Yuzu,"** not instant —
-do not describe this as instantaneous revocation.
+do not describe this as instantaneous revocation. **That bound holds only
+once the durable session delete has persisted** (#4772), exactly as the
+token sentence above holds only after `revoke_for_principal` has persisted:
+`revoke_deprovision_credentials` folds every principal's
+`invalidate_user_sessions(...).db_persisted` into
+`DeprovisionRevokeResult::sessions_persisted`, and a `false` there fails the
+deprovision closed like a non-persisted token revoke (SCIM 500 so the IdP
+retries; the dashboard delete 500s without deleting the account; audit
+`partial` with `sessions_db_error=true`). Without that, a failed delete
+leaves the durable row for another replica, or this one after a restart, to
+rehydrate.
 
 **D1 — a SCIM slug elevated to admin outside SCIM (the #2021 guard
 interaction).** `deprovision_role_ok` still refuses (404, per the
@@ -3037,7 +3047,8 @@ The existing `scim.user.deactivated`/`.deleted` rows (see Audit actions
 above) now also carry `api_tokens_revoked=N sessions_revoked=N
 principals=N` in `detail` on success, and `partial` is now a possible
 `result` for those two actions specifically (a non-persisted credential
-revoke — see "Deprovision-time revoke" above), in addition to the existing
+revoke, detail `api_tokens_db_error=true` and/or `sessions_db_error=true` —
+see "Deprovision-time revoke" above), in addition to the existing
 `success`/`failure`. When the detail lists the revoked principals
 (`revoked_principals=a,b,c`), each principal string is tokenized before it is
 written (#4966, CWE-117): `,`, space, `=`, control bytes and every byte

@@ -287,6 +287,37 @@ public:
                    "ALTER TABLE session_store.sessions_gone RENAME TO sessions") {}
 };
 
+/// A ONE-SHOT flap of the durable session table: `session_store.sessions` is renamed away when the
+/// transaction that DEACTIVATES an account commits (a deferred constraint trigger, the
+/// `ProvenanceFaultAfterDeactivation` pattern). The credentials-first session revoke that precedes
+/// the deactivation therefore PERSISTS (#4772 fails a deprovision closed before that point), and
+/// only the post-commit wipe inside `remove_user_checked` faults: the `RemovedSessionWipeFailed`
+/// window. A plain `SessionWipeFault` breaks the earlier revoke as well. Inert for every other
+/// statement. Needs a SessionStore wired (`Fixture::use_session_store()`).
+class SessionWipeFaultAfterDeactivation : public SqlFault {
+public:
+    explicit SessionWipeFaultAfterDeactivation(yuzu::server::pg::PgPool& pool)
+        : SqlFault(
+              pool,
+              "DO $do$ BEGIN "
+              "EXECUTE $f$CREATE OR REPLACE FUNCTION public.yuzu_test_wipe_after_deactivation() "
+              "RETURNS trigger LANGUAGE plpgsql AS $b$ BEGIN "
+              "EXECUTE 'ALTER TABLE session_store.sessions RENAME TO sessions_gone'; "
+              "RETURN NULL; END $b$$f$; "
+              "EXECUTE $f$CREATE CONSTRAINT TRIGGER yuzu_test_wipe_after_deactivation AFTER "
+              "UPDATE ON auth.users DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+              "WHEN (OLD.is_active AND NOT NEW.is_active) "
+              "EXECUTE FUNCTION public.yuzu_test_wipe_after_deactivation()$f$; "
+              "END $do$",
+              "DO $do$ BEGIN "
+              "DROP TRIGGER IF EXISTS yuzu_test_wipe_after_deactivation ON auth.users; "
+              "DROP FUNCTION IF EXISTS public.yuzu_test_wipe_after_deactivation(); "
+              "IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = "
+              "'session_store' AND table_name = 'sessions_gone') THEN "
+              "ALTER TABLE session_store.sessions_gone RENAME TO sessions; "
+              "END IF; END $do$") {}
+};
+
 /// `rbac_store.principal_roles` moved aside: every RbacStore grant read fails (the SCIM
 /// pre-provisioning Administrator-grant read answers "could not confirm").
 class GrantReadFault : public SqlFault {

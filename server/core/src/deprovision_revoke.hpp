@@ -105,19 +105,31 @@ struct DeprovisionRevokeResult {
     /// dashboard delete reports the same failure without proceeding to
     /// `remove_user`.
     bool api_tokens_persisted{true};
-    /// Sum of in-memory session counts erased (`AuthManager::RevokeResult::
-    /// count`) across every principal.
+    /// Sum of `AuthManager::RevokeResult::count` across every principal. For a
+    /// principal whose durable delete did not persist this is only the count
+    /// erased from THIS replica's cache, not the fleet-wide total.
     std::size_t sessions_revoked{0};
+    /// False iff `AuthManager::invalidate_user_sessions` reported
+    /// `db_persisted == false` for AT LEAST ONE principal in the set (the
+    /// durable `SessionStore` DELETE failed; the local cache was still wiped).
+    /// The durable row survives and another replica, or this one after a
+    /// restart, rehydrates a valid session from it. The caller MUST NOT report
+    /// a clean deprovision success when this is false — same contract as
+    /// `api_tokens_persisted` (#4772): SCIM 500s so the IdP retries, the
+    /// dashboard delete reports the failure without proceeding to
+    /// `remove_user`.
+    bool sessions_persisted{true};
 };
 
 /// ADR-2001 §3 — the credentials-FIRST orchestrator. For EACH principal in
 /// `principals` (in order): revoke its API tokens, then its sessions — never
 /// the reverse, and never two stores' leases held simultaneously (see the
 /// lock/pool discipline note above). Continues through every principal even
-/// after a non-persisted token revoke — best-effort, maximises what actually
-/// gets revoked — but records the failure in the returned result so the
-/// caller fails closed on the OVERALL outcome rather than reporting a clean
-/// success.
+/// after a non-persisted token revoke or session delete — best-effort,
+/// maximises what actually gets revoked — but records each failure
+/// (`api_tokens_persisted`, `sessions_persisted`) in the returned result so
+/// the caller fails closed on the OVERALL outcome rather than reporting a
+/// clean success.
 DeprovisionRevokeResult
 revoke_deprovision_credentials(ApiTokenStore& token_store, auth::AuthManager& auth_mgr,
                                const std::vector<std::string>& principals);

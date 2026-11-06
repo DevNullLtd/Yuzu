@@ -1755,13 +1755,23 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
                 // principal strings, not just the count, so the audit row is
                 // self-contained CC6.8 evidence.
                 enumerate_principals_for_audit(*principals);
-    if (!revoke_result.api_tokens_persisted) {
-        detail_out += " api_tokens_db_error=true";
-        spdlog::error("ScimRoutes: revoke_for_principal did not persist for one or more "
-                     "principals linked to '{}' (scim_id={}) — refusing to report a clean "
-                     "deprovision (ADR-2001 §3 fail-closed)",
+    if (!revoke_result.api_tokens_persisted || !revoke_result.sessions_persisted) {
+        // #4772: the durable session DELETE is held to the same fail-closed contract as the
+        // token revoke. A session row that did not delete survives and is rehydrated by another
+        // replica (or after a restart), so the principal would stay signed in.
+        if (!revoke_result.api_tokens_persisted)
+            detail_out += " api_tokens_db_error=true";
+        if (!revoke_result.sessions_persisted)
+            detail_out += " sessions_db_error=true";
+        spdlog::error("ScimRoutes: the credential revoke did not persist (api_tokens={}, "
+                     "sessions={}) for one or more principals linked to '{}' (scim_id={}) — "
+                     "refusing to report a clean deprovision (ADR-2001 §3 fail-closed)",
+                     revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                      resource.username, resource.scim_id);
-        send_scim_error(res, 500, "failed to revoke API tokens for one or more linked identities");
+        send_scim_error(res, 500,
+                        !revoke_result.api_tokens_persisted
+                            ? "failed to revoke API tokens for one or more linked identities"
+                            : "failed to revoke sessions for one or more linked identities");
         audit(auth_mgr, audit_store, req, audit_action, "partial", resource.scim_id, detail_out);
         return false;
     }
