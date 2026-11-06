@@ -419,8 +419,58 @@ struct ContainerVerdict {
 
 namespace detail {
 
-inline constexpr std::array<std::string_view, 5> kContainerCgroupTokens{
-    "docker", "containerd", "kubepods", "lxc", "podman"};
+/// 64 lowercase hex digits: a container id. The id is what separates a runtime's own cgroup
+/// from a host unit that merely contains a runtime's name (`docker-host.slice`,
+/// `yuzu-podman-monitor.service`, `containerd.service`).
+inline bool is_container_id(std::string_view s) {
+    return s.size() == 64 && std::all_of(s.begin(), s.end(), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+/// `<prefix><64 hex>` with an optional `.scope`, the systemd scope unit a runtime names a container.
+inline bool is_id_unit(std::string_view seg, std::string_view prefix) {
+    if (!seg.starts_with(prefix))
+        return false;
+    std::string_view id = seg.substr(prefix.size());
+    if (id.ends_with(".scope"))
+        id.remove_suffix(6);
+    return is_container_id(id);
+}
+
+/// The runtime a cgroup path names, or empty. Whole path segments in each runtime's own
+/// (lowercase) form, never a substring: docker `/docker/<id>` and `docker-<id>[.scope]`; kubernetes
+/// `kubepods`, `kubepods.slice` and `kubepods-*.slice`; containerd `cri-containerd-<id>[.scope]`;
+/// podman `libpod-<id>[.scope]`; lxc `/lxc/<name>` and `lxc.payload.<name>`. The leftmost
+/// matching segment wins.
+inline std::string_view cgroup_runtime(std::string_view path) {
+    constexpr std::string_view kLxcPayload = "lxc.payload.";
+    std::vector<std::string_view> seg;
+    for (size_t pos = 0; pos <= path.size();) {
+        size_t slash = path.find('/', pos);
+        if (slash == std::string_view::npos)
+            slash = path.size();
+        seg.push_back(path.substr(pos, slash - pos));
+        pos = slash + 1;
+    }
+    for (size_t i = 0; i < seg.size(); ++i) {
+        const std::string_view s = seg[i];
+        const std::string_view next = i + 1 < seg.size() ? seg[i + 1] : std::string_view{};
+        if ((s == "docker" && is_container_id(next)) || is_id_unit(s, "docker-"))
+            return "docker";
+        if (s == "kubepods" || s == "kubepods.slice" ||
+            (s.starts_with("kubepods-") && s.ends_with(".slice")))
+            return "kubepods";
+        if (is_id_unit(s, "cri-containerd-"))
+            return "containerd";
+        if (is_id_unit(s, "libpod-"))
+            return "podman";
+        if ((s == "lxc" && !next.empty()) ||
+            (s.starts_with(kLxcPayload) && s.size() > kLxcPayload.size()))
+            return "lxc";
+    }
+    return {};
+}
 
 /// Splits /proc/self/cgroup into the path of each `hier:controllers:path` line.
 inline std::vector<std::string> cgroup_paths(std::string_view text) {
@@ -469,13 +519,11 @@ inline ContainerVerdict classify_container(const Facts& f) {
     if (in.cgroup) {
         paths = detail::cgroup_paths(*in.cgroup);
         for (const auto& p : paths) {
-            const std::string lp = detail::lower(p);
-            for (const auto tok : detail::kContainerCgroupTokens) {
-                if (lp.find(tok) != std::string::npos) {
-                    v.value = Tri::yes;
-                    v.evidence = "cgroup:" + std::string{tok};
-                    return v;
-                }
+            const std::string_view runtime = detail::cgroup_runtime(p);
+            if (!runtime.empty()) {
+                v.value = Tri::yes;
+                v.evidence = "cgroup:" + std::string{runtime};
+                return v;
             }
         }
     }

@@ -689,14 +689,62 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         CHECK(verdict(true, false, "0::/\n").evidence == "/.dockerenv");
         CHECK(verdict(false, true, "0::/\n").evidence == "/run/.containerenv");
     }
-    SECTION("a container token in a cgroup path") {
-        for (const char* tok : {"docker", "containerd", "kubepods", "lxc", "podman"}) {
-            const auto v = verdict(false, false, std::string{"12:cpu:/"} + tok + "/abc123\n");
-            INFO(tok);
+    SECTION("a cgroup path in a runtime's own form") {
+        // Each runtime's real shape, one fixture per form (lowercase 64-hex container id).
+        const std::string hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        struct Form {
+            std::string path;
+            const char* runtime;
+        };
+        const std::vector<Form> forms{
+            {"12:cpu:/docker/" + hex + "\n", "docker"},
+            {"0::/system.slice/docker-" + hex + ".scope\n", "docker"},
+            {"0::/docker-" + hex + "\n", "docker"},
+            {"12:cpu:/kubepods/burstable/pod1/" + hex + "\n", "kubepods"},
+            {"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-" +
+                 hex + ".scope\n",
+             "kubepods"},
+            {"0::/kubepods-besteffort-pod1.slice\n", "kubepods"},
+            {"0::/system.slice/cri-containerd-" + hex + ".scope\n", "containerd"},
+            {"0::/machine.slice/libpod-" + hex + ".scope\n", "podman"},
+            {"12:cpu:/lxc/mycontainer\n", "lxc"},
+            {"0::/lxc.payload.mycontainer/init.scope\n", "lxc"},
+        };
+        for (const auto& form : forms) {
+            INFO(form.path);
+            const auto v = verdict(false, false, form.path);
             CHECK(v.value == Tri::yes);
-            CHECK(v.evidence == std::string{"cgroup:"} + tok);
+            CHECK(v.evidence == std::string{"cgroup:"} + form.runtime);
         }
         CHECK(verdict(false, false, "0::/kubepods.slice/pod1/cri-containerd-x.scope\n").value == Tri::yes);
+    }
+    SECTION("a host unit that merely contains a runtime's name is not a container") {
+        const std::string hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const std::vector<std::string> negatives{
+            "0::/docker-host.slice/yuzu-agent.service\n",
+            "0::/system.slice/yuzu-podman-monitor.service\n",
+            "0::/dockerdata.slice/x\n",
+            "0::/machine.slice/podman-storage.scope\n",
+            "0::/system.slice/docker.service\n",
+            "0::/system.slice/containerd.service\n",
+            "0::/system.slice/lxcfs.service\n",
+            // runtime directory names without a real container id behind them
+            "12:cpu:/containerd/abc123\n",
+            "12:cpu:/podman/abc123\n",
+            "12:cpu:/docker/abc123\n",
+            "0::/system.slice/docker-abc123.scope\n",
+            // a 63- and a 65-digit id, a non-hex one and an uppercase one are not ids
+            "0::/docker/" + hex.substr(1) + "\n",
+            "0::/docker/" + hex + "0\n",
+            "0::/system.slice/libpod-" + std::string(64, 'g') + ".scope\n",
+            "0::/system.slice/libpod-" + std::string(64, 'A') + ".scope\n",
+        };
+        for (const auto& path : negatives) {
+            INFO(path);
+            const auto v = verdict(false, false, path);
+            CHECK(v.value == Tri::no);
+            CHECK(v.evidence == "linux:no_container_marker");
+        }
     }
     SECTION("a cgroup-v2 namespace-obscured root is unknown not no") {
         const auto v = verdict(false, false, "0::/\n");
