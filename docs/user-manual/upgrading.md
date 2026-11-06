@@ -2,6 +2,39 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: an access-review decision is final, and a reviewer cannot decide their own grant (#4752)
+
+**What changed.** `POST /api/v1/access-reviews/{id}/attestations` and the MCP tool `record_attestation` used to overwrite: a second call for the same grant returned `200` and replaced the earlier decision, and a reviewer could attest or flag a grant held under their own username. Now:
+
+- The first `attested` or `flagged_revoke` recorded for a grant stays. A second call, by anyone, returns `409` (MCP: invalid-params) and changes nothing. The message names the decision already recorded.
+- A reviewer who is the subject of a `user` grant, or the owner of an `engine` principal as recorded when the campaign opened, gets `403` (MCP: permission-denied). Another reviewer must decide it.
+- An identifier (`campaign_id`, `principal_id`, `role_name`) containing a NUL byte or longer than 512 bytes, or a `justification` containing a NUL byte or longer than 8192 bytes, gets `400`. Nothing is truncated.
+- A decision can no longer land in a campaign that is being closed at the same moment.
+
+Both refusals write `result=denied` under the existing `access_review.attested` / `access_review.flagged` actions (details `self_attestation_blocked` and `already_decided`), see [`audit-log.md`](audit-log.md). There is no schema change and no data migration.
+
+**Who is affected.** Scripts, MCP agents and CI jobs that re-send, correct or flip a decision, or that attest a grant of the account they run as: they now get `409` or `403`. **A retry after a lost response now gets `409`:** the first call was recorded, so read the decision named in the message (or `GET /api/v1/access-reviews/{id}`) and do not answer the `409` by flipping the decision. SIEM or alert rules keyed on the verb `access_review.attested` or `access_review.flagged` alone now also see the `denied` rows; filter on `result`. A one-administrator deployment cannot decide that administrator's own grants (see [`rbac.md`](rbac.md)): assign the `Reviewer` role to a second person.
+
+**What to do.**
+
+- **Upgrade every server replica before you open or decide campaigns.** The two rules are enforced inside the database write, so a replica still running the old build keeps overwriting and keeps accepting self-attestation. Treat any campaign decided while old and new replicas were both serving as unverified and re-check it with the query below.
+- **Decisions already recorded are not invalidated, and are now final.** That includes any self-attested decision from before the upgrade. An open campaign cannot correct them: open a new campaign to review the grant again. Find earlier self-attestations on `user` and `engine` grants (this compares the reviewer with the grant's own principal and the engine owner recorded at campaign open; it does not cover group grants or a person's other accounts):
+
+  ```sql
+  SELECT c.campaign_id, c.status, a.principal_type, a.principal_id, a.role_name, a.decision, a.reviewer
+  FROM access_review_store.access_review_attestation a
+  JOIN access_review_store.access_review_campaign c USING (campaign_id)
+  WHERE a.decision <> 'pending' AND a.reviewer <> ''
+    AND ((a.principal_type = 'user' AND a.principal_id = a.reviewer)
+      OR (a.principal_type = 'engine'
+          AND COALESCE(CASE WHEN pg_input_is_valid(a.grant_snapshot, 'jsonb')
+                            THEN (a.grant_snapshot::jsonb)->>'owner_or_email' END, '') = a.reviewer));
+  ```
+
+  A decision that was **overwritten** before the upgrade cannot be seen in this table, which keeps only the last decision. The only trace is the audit log: more than one `access_review.attested` or `access_review.flagged` row with `result=success` for the same `target_id` (inside the audit retention, 365 days by default).
+- **PostgreSQL 16 or newer is required** (the documented minimum): the attestation write uses `pg_input_is_valid`. On an older server the first attestation answers `503` and the server log shows SQLSTATE `42883`.
+- **Rolling back** restores the old overwrite behaviour. Nothing is stored differently, so decisions recorded under the new rules stay valid and nothing needs converting.
+
 ## Behaviour change: installed-software schema v10 (the server accepts the sectioned report)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.

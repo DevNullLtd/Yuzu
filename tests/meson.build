@@ -1039,7 +1039,9 @@ endif
 # case in no shard, in two shards, or outside the reference set
 # `~[.]~[tsan-heavy]~[flaky-4086]`. It prints per-shard case counts as an
 # informational notice only: count is not time, so there is no ratio gate. The
-# drift signal is flake-retry.py's 80%-of-budget table (#2092/#2093).
+# drift signal is flake-retry.py's 80%-of-budget table (#2092/#2093); while the
+# #7135 stopgap stands, shard C's mark is 384s, not 192s, so it is a late warning
+# until #7177 rebalances C.
 #
 # MEASURED BALANCE (2026-10-01, case-sum predictions from per-case durations
 # joined to tags, not CI measurements): Linux ~[30.6, 29.4, 29.9]s, Windows
@@ -1142,20 +1144,34 @@ agent_shard_specs = {
   'C': _agent_a_excl + _agent_b_excl + agent_shard_suffix,
 }
 agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin]
+# Per-shard meson timeouts. Only shard C is raised (#7135); A and B keep the old single
+# entry's 240s, because only C was measured to need more.
+#
+# SHARD C's 480s IS A DELIBERATE, TEMPORARY EXCEPTION to docs/testing/unit-test-conventions.md
+# ("an entry past 50% of its timeout is ported, split or host-gated, never given more time"),
+# in the same shape as the #3582 shard bump (docs/ci-architecture.md): the split is tracked as
+# #7177 and this value comes back down when it lands. Measured on the Windows MSVC debug leg:
+# shard C ran 184.87s (run 41919798385 attempt 5; its echo entry passed in 51.04s), 211.54s,
+# 210.55s and 206.28s (runs 42040619981, 42049202343, 42056811785: all three are jobs that
+# FAILED, on the echo ETW case, so those are shard C passing inside a failed job), and it hit
+# the 240s limit at 240.09s in the same job where echo hit its 90s limit (run 41919798385
+# attempt 4, job 126911227871); both passed on the rerun with no code change, so the box was
+# loaded, not hung. #7135 records ~222s for C alone on a 16-thread host. The worst case is at
+# least 240s (a timeout is a floor, not a measurement) and the limit is 2x that. Shards A
+# (98-102s) and B (70s) are well under. Do not shorten tests to fit; split the shard instead
+# (#7177). Side effect to know about: flake-retry.py's 80%-of-timeout warning mark for C moves
+# from 192s to 384s, so C can grow ~80% before it warns; #7177 restores an early warning. The
+# one other measured contention figure is for SERVER `~[pg]` (c0 289s -> c4 603s, ~2.1x,
+# across jobs, on the pre-#3443 combined step; docs/ci-architecture.md "Windows test-phase
+# concurrency gate"). A real hang is also bounded by the job-level timeouts.
+agent_shard_timeouts = {'A': 240, 'B': 240, 'C': 480}
 foreach shard, spec : agent_shard_specs
   test(
     'agent unit tests shard ' + shard,
     agent_test_exe,
     args: [spec, '--allow-running-no-tests', '--durations=yes'],
     suite: ['agent', 'agent-shard'],
-    # 240s per shard, unchanged from the old single entry; treat it as conservative
-    # headroom, not a measured need. Uncontended Windows is ~75s (a case-sum
-    # prediction), ~3x under 240s. The only measured contention figure is for SERVER
-    # `~[pg]` (c0 289s -> c4 603s, ~2.1x, across jobs, on the pre-#3443 combined step;
-    # docs/ci-architecture.md "Windows test-phase concurrency gate"); it has NOT been
-    # re-measured for agent shards, so do not size or lower this timeout from it. A
-    # real hang is also bounded by the job-level timeouts.
-    timeout: 240,
+    timeout: agent_shard_timeouts[shard],
     depends: agent_shard_deps,
   )
 endforeach
@@ -1418,11 +1434,21 @@ echo_test_exe = executable(
 )
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
+# 180s (#7135; was 90s). Unlike agent shard C above this is not an exception to the budget rule in
+# docs/testing/unit-test-conventions.md: no split is planned, and at 180s the measured passing runs
+# sit under the rule's 50% line. It took 51.04s on a Windows CI runner when
+# it passed (run 41919798385 attempt 5, 28% of 180s) and 82s on a standalone Windows host (#7135
+# comment, 46%), and it timed out at 90.09s on a loaded runner (attempt 4, job 126911227871) in
+# the same job where agent shard C also timed out; both passed on the rerun, so that was load,
+# not a hang. A timeout is a floor, not a measurement: the limit is 2x that floor, and the
+# deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
+# live-registry case adds its own 15s waits on top. Revisit the value once #7173/#7135 settle; there
+# is no commitment to lower it, because the 50% rule is met at 180s.
 # The schema-v10 migration cases ([v10]: a seeded v9 database folded over all 17 sources, chunked
 # folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
 # run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
 # third test() too. Together the three filters cover every case exactly once.
-test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 90)
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 test('echo v10 migration', echo_test_exe, args: ['[v10]~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
@@ -1582,6 +1608,7 @@ if build_server
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
+      'unit/server/test_command_replay_horizon.cpp', # #3678: outbox redelivery horizon < agent dedup ring (compile-time cross-component pin)
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
@@ -3802,10 +3829,11 @@ test('plugin readme gate',
 #
 # TIMEOUT (#2340 PR-4): the harness now runs TWO full gates per invocation -
 # the shipped RULES/TESTS pair, then the marker-extracted yuzu-guardian-journal
-# group (CH-2 + CH-5-PROM) - each up to 4x120s (check + test + the canary's own
-# test + check) = 480s worst case, plus ~225s for the docker daemon probe and
-# pull ladder under the opt-in (0 under a native promtool). Worst case is
-# 225 + 480x2 = 1185s; 1500 keeps ~300s of margin over that, the same
+# group (CH-2 + CH-5-PROM) - each up to 120 + 240 + 240 + 120 (check + test +
+# the canary's own test + check; the two test calls were 120s until #7191)
+# = 720s worst case, plus ~225s for the docker daemon probe and pull ladder
+# under the opt-in (0 under a native promtool). Worst case is
+# 225 + 720x2 = 1665s; 2000 keeps ~335s of margin over that, the same
 # methodology run_promtool_tests.py's own pull_with_retry() comment uses for
 # its ladder ("must fit inside the timeouts that enclose it") - see that
 # comment for the full arithmetic and how it composes with the CI job's own
@@ -3814,7 +3842,7 @@ test('prometheus alert rules',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py')],
   suite: 'docs',
-  timeout: 1500,
+  timeout: 2000,
 )
 
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv
@@ -3875,7 +3903,8 @@ test('gateway private epmd selftest',
 # Timeout sized to the sweep's own worst-case ceiling, not typical runtime:
 # with both scenarios' alerts shipped (#2854 rung D) all 6 (scenario,
 # interval) measure() calls run for real -- pull ladder ~195s plus 6 x
-# (30s check + 90s test) = ~915s -- so 1200 keeps a real margin over that.
+# (30s check + 90s test) + the ~30s daemon probe = ~945s -- so 1200 keeps a
+# real margin over that.
 # A third sweep scenario adds another ~360s: re-derive, don't inherit.
 test('audit retention alert coverage manifest',
   _python3_test,
@@ -4205,6 +4234,14 @@ test('sso-only runtime wiring lexical gate',
   args: [files('test_sso_runtime_wiring_lexical.py')],
   suite: 'docs',
   timeout: 60,
+)
+# #7175: pins the Windows job's wiring of scripts/ci/stop-dead-etw-sessions.ps1 (step order, the post-test
+# step's always(), pwsh, and that the script can never fail the job); source-text only, so Python.
+test('windows etw cleanup wiring lexical gate',
+  _python3_test,
+  args: [files('test_etw_cleanup_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 test('same-site gate production wiring lexical selftest',
   _python3_test,

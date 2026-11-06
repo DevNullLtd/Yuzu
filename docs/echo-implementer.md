@@ -979,7 +979,8 @@ cursor.** What it adds to the pattern:
   session name is salted with the agent's pid, so a crash leaks the session until
   the host restarts and only a successor with the same pid stops it (the
   `ERROR_ALREADY_EXISTS` retry); the sibling `YuzuEchoProcEtw` and `YuzuEchoModuleEtw`
-  sessions leak the same way and nothing sweeps `YuzuTar*` sessions at start. The
+  sessions leak the same way and the agent sweeps no session of another pid at start (the Windows CI runners
+  stop dead-pid `Yuzu*Etw-<pid>` sessions themselves, #7175). The
   operator runbook (`logman query -ets`, `logman stop <name> -ets`) is in the
   manual's Health bullet.
 - **Windows warehouse columns are NOT NULL.** "Not applicable" is `''`/`0`, and an
