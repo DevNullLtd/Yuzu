@@ -18444,6 +18444,14 @@ private:
                                                                    plugin, action);
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+                // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
+                // measured on. An unwired tracker reads as unreadable, which HOLDS every
+                // occurrence (fail closed) -- never as 0.
+                .dispatch_seq_fn = [this]() -> std::optional<DispatchPosition> {
+                    if (!execution_tracker_)
+                        return std::nullopt;
+                    return execution_tracker_->current_dispatch_position();
+                },
             });
         schedule_tick_thread_ = std::thread([this]() {
             spdlog::info("Schedule runner thread started (schedule eval 30s, outbox delivery 5s)");
