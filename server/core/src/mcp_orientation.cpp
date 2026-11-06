@@ -265,8 +265,10 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // whole catalog + role grid) and from Engine principals' assign/unassign/
 // list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
 // GET /api/v1/me) joins it: the same kind of read, a self-description of the
-// CALLING principal that cannot name another one.
-constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
+// CALLING principal that cannot name another one. get_rbac_enforcement (twin of
+// GET /api/v1/rbac/enforcement, #6033) does too: whether enforcement is on and whether the
+// caller could administer RBAC, again about the caller alone.
+constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me", "get_rbac_enforcement"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring
 // action) and from Engine principals' assign/unassign_engine_role (a
@@ -410,8 +412,9 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
-                        "permission, and describe the calling session (identity, role, tier, "
-                        "direct RBAC role names)",
+                        "permission, describe the calling session (identity, role, tier, "
+                        "direct RBAC role names), and read whether RBAC enforcement is on and "
+                        "whether the caller could administer it",
      kRbacCheck},
     {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "
