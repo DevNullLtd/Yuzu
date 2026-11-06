@@ -23722,9 +23722,11 @@ private:
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device
-    /// guardian_backend read). DECLARED HERE, beside `registry_` and BEFORE every holder of the
-    /// device API (`rest_api_v1_`, `mcp_server_`, `device_routes_`, `crypto_device_api_`), on
-    /// purpose (#2240): `LocalDeviceApi` holds a `const AgentHealthStore&`, and members destruct
+    /// guardian_backend read). DECLARED HERE, beside `registry_` and BEFORE every borrower: the
+    /// holders of the device API (`rest_api_v1_`, `mcp_server_`, `device_routes_`,
+    /// `crypto_device_api_`) and the direct borrowers (`agent_service_`, `gateway_service_`,
+    /// `network_routes_`, `heartbeat_ingestion_`; tests/test_guardian_backend_wiring_lexical.py
+    /// pins the order), on purpose (#2240): `LocalDeviceApi` holds a `const AgentHealthStore&`, and members destruct
     /// in reverse declaration order, so this store must outlive all of them by construction
     /// instead of relying only on stop() having quiesced their callers. `heartbeat_ingestion_`
     /// (declared far below) borrows it and must stay below this line. It has no constructor

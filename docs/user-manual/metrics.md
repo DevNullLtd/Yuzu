@@ -2270,7 +2270,7 @@ Read it with these limits in mind:
   agent.
 - **No alert ships.** A rule such as `yuzu_fleet_guardian_backend{backend=~"spark_failed|unwired"} > 0`
   becomes meaningful only after the flip. No shipped alert rule reads this family, and `unwired` is a
-  state no existing alert covers, so an alert for it should exist before the flip.
+  state no existing alert covers.
 
 | Metric | Type | Description |
 |---|---|---|
