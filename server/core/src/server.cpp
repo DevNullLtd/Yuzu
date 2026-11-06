@@ -1625,7 +1625,8 @@ public:
         metrics_.describe(yuzu::server::kWorkflowRunRefusedMetric,
                           "Workflow runs (POST /api/v1/workflows/{id}/execute, MCP "
                           "execute_workflow, and the legacy POST /api/workflows/{id}/execute) "
-                          "refused before anything was read or sent, by reason: "
+                          "refused before any workflow or instruction was read and before "
+                          "anything was sent, by reason: "
                           "global_stream_cap (the shared held-open budget is full; HTTP 429, MCP "
                           "-32012), per_principal_stream_cap (this principal already has 2 runs in "
                           "progress; 429), draining (the server is shutting down; HTTP 503, MCP "
@@ -1666,9 +1667,11 @@ public:
                           "no_agents_reached, quarantined, plugin_not_found, kill_switched_os), "
                           "run_failed (the engine ended the run before any dispatch), "
                           "dispatch_exception (the run threw after its requested audit row; steps "
-                          "may have been sent), or none. A run killed with the process, or whose "
-                          "final status write failed (yuzu_server_workflow_finalize_failed_total), "
-                          "is never counted here.",
+                          "may have been sent), or none. A run killed with the process never "
+                          "answers and is never counted here; a run whose final status write "
+                          "failed (yuzu_server_workflow_finalize_failed_total) is counted when "
+                          "its call is answered, as partial if something was sent and failed if "
+                          "not.",
                           "counter");
         yuzu::server::seed_workflow_run_metrics(metrics_);
         // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed

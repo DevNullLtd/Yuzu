@@ -5689,9 +5689,14 @@ What a run row holds, and how to treat it:
   in your data inventory and in any works-council or subject-access process. There is no per-row
   delete route, and deactivating or deleting an account does not touch its rows. Audit rows for the
   same calls follow `--audit-retention-days` (365 by default); the run rows outlive them.
-- **Who can read it.** No REST or MCP read returns `principal`, `idempotency_key`,
-  `request_fingerprint` or `correlation_id`; they are readable only in the database. The run detail
-  returns `agent_ids` (narrowed to the caller's visible devices for a confined caller) and the step
+- **Who can read it.** No REST or MCP read of the run returns the row's `principal`,
+  `idempotency_key`, `request_fingerprint` or `correlation_id` columns; the columns are readable in
+  the database. Some of the values are not confined to the database: the call's `workflow.execute`
+  audit rows carry the `idempotency_key` (neutralised and clipped) and the `correlation_id`, and
+  each audit row names the calling principal, so every `AuditLog:Read` holder can read them for as
+  long as the audit log keeps them (365 days by default). A key is a string the client chooses, so
+  tell your clients not to put a secret or personal data in one. The run detail returns
+  `agent_ids` (narrowed to the caller's visible devices for a confined caller) and the step
   results. A repeat of a key with a different request returns the bound run's `execution_id` to the
   same principal.
 - **A recreated account inherits its keys.** A key belongs to the principal NAME. If an account is
@@ -5722,8 +5727,11 @@ GET /api/v1/workflow-executions?status=running&until=<now minus 180, epoch secon
 
 MCP: `list_workflow_executions` with `status` `running` and `until`. `until` is exclusive and
 matches `started_at`. 180 seconds is the age at which the server itself calls a repeat of that
-row's key `indeterminate`; a live run cannot be older, because a run is bounded to 60 seconds and
-a shutdown waits at most 30 seconds for runs. Use an account that is not confined to a management
+row's key `indeterminate`; a live run normally is not older, because a run is bounded to 60 seconds
+and a shutdown waits at most 30 seconds for runs (a send already in flight is not interrupted, so a
+hung send can in principle outlast the bound). Search the server log for the execution id first:
+`execution <id> was NOT finalized` at `error` confirms the first cause above. Use an account that
+is not confined to a management
 group: a confined caller sees only runs with a device in its scope, so the list can be short.
 Then read each with `GET /api/v1/workflow-executions/{id}`.
 
@@ -5747,7 +5755,8 @@ UPDATE workflow_engine.workflow_executions
 ```
 
 That changes the row's status and nothing else: it recalls nothing that was sent and does not
-touch the step rows.
+touch the step rows. If a run is somehow still driving the row, the engine stops dispatching its
+remaining steps once it finds the row no longer `running`.
 
 **The key stays bound.** Closing the row does not release its idempotency key, and a repeat of the
 key still sends nothing. The replay is then a terminal answer from the stored step rows, never

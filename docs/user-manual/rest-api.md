@@ -6917,7 +6917,7 @@ an agent) and `run_failed` (the engine ended the run without a single dispatch a
 state could not be read).
 
 *With an `Idempotency-Key`* the key was bound to the run when it started, so a repeat of the call
-replays this `failed` run (`202`, `data.status: "failed"`) and never runs again: every one of these
+replays this run (`202`; `data.status` is `failed`, or `aborted` when the stored steps show a deadline stop (`deadline_exceeded`) or a send-time refusal (`late_denied`)) and never runs again: every one of these
 answers has `retry_after_ms: null`, no `Retry-After` header and `error.remediation` naming the way
 forward (use a new idempotency key). Read the run with `GET /api/v1/workflow-executions/{id}`, then
 start another under a new key.

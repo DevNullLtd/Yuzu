@@ -1267,7 +1267,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Known residuals of this change (recorded by the change author; ADR-owner
        acceptance pending).** Each was checked against the code at the commit that
        wrote this paragraph. Only the token-cache lag in residual 3 has a tracking
-       reference (`AuthRoutes::revalidate_stream` cites #2447); no issue is filed
+       reference (#4766, token revocation and expiry without the durable-generation
+       discipline sessions have; `AuthRoutes::revalidate_stream` cites #2447, which is
+       the separate stream grace-clock point); no issue is filed
        for the rest yet (file each and update its line with the number). The date
        is the latest the residual is re-read, not a promise it is fixed by then.
        1. *Write-ahead command id (revisit by 2026-12-15).* A step's command id is
@@ -1314,7 +1316,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        9. *Audit coverage (revisit by 2027-01-15).* A cap or drain refusal writes no
           audit row (the counter is its record). Each terminal idempotent replay
           writes one `success` row and replays are not capped, because they take no
-          slot.
+          slot. An unwired audit sink fails closed on REST (503 `audit_unavailable`)
+          but not on MCP, where the call proceeds and writes no row; on MCP, an
+          unknown argument and a missing or empty `workflow_id` also write no row.
        10. *Stored attempt number (revisit by 2027-01-15).* The engine writes a
            step's `attempt` after a failed attempt only, so a step retried to
            success shows its last failed attempt's number.
