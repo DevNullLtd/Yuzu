@@ -184,6 +184,109 @@ TEST_CASE("collection settings resolve: priority is cross-branch only",
     }
 }
 
+// Branches are MEMBERSHIP groups, not documents: a membership group that is an ancestor of
+// another membership group is dropped (the nearer one stands for that branch); each remaining
+// membership group's branch winner is the nearest group with a document (itself first, root
+// excluded); the branch winners compete by priority, depth, created_at, id.
+TEST_CASE("collection settings resolve: membership branches", "[collection_settings][resolve]") {
+    SECTION("sibling memberships under one ancestor: the ancestor's document competes for its "
+            "own branch") {
+        // X has a document (900); member of G1 (no document) and G2 (document, 0). G1's branch
+        // winner is X, G2's is G2: X outranks G2.
+        const std::vector<cs::GroupNode> tree{node("xx", "", 1), node("g1", "xx", 2),
+                                              node("g2", "xx", 3)};
+        const auto r = cs::resolve({"g1", "g2"}, tree,
+                                   {doc("xx", make(7200, std::nullopt, 900)),
+                                    doc("g2", make(10800, std::nullopt, 0))},
+                                   kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == "xx");
+        CHECK(r->effective.interval_s == 7200);
+    }
+    SECTION("sibling memberships under one ancestor: a higher-priority sibling still wins") {
+        const std::vector<cs::GroupNode> tree{node("xx", "", 1), node("g1", "xx", 2),
+                                              node("g2", "xx", 3)};
+        const auto r = cs::resolve({"g1", "g2"}, tree,
+                                   {doc("xx", make(7200, std::nullopt, 0)),
+                                    doc("g2", make(10800, std::nullopt, 5))},
+                                   kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == "g2");
+    }
+    SECTION("sibling memberships under one ancestor: equal priority, the deeper document wins") {
+        const std::vector<cs::GroupNode> tree{node("xx", "", 1), node("g1", "xx", 2),
+                                              node("g2", "xx", 3)};
+        const auto r = cs::resolve({"g1", "g2"}, tree,
+                                   {doc("xx", make(7200)), doc("g2", make(10800))}, kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == "g2");
+    }
+    SECTION("member of P and its descendant C: C's branch decides whatever the priorities") {
+        const std::vector<cs::GroupNode> tree{node("pp", "", 1), node("cc", "pp", 2)};
+        const auto r = cs::resolve({"pp", "cc"}, tree,
+                                   {doc("pp", make(7200, std::nullopt, 1000)),
+                                    doc("cc", make(10800, std::nullopt, 0))},
+                                   kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == "cc");
+        // C without a document inherits P's through the same single branch.
+        const auto inherit = cs::resolve({"pp", "cc"}, tree,
+                                         {doc("pp", make(7200, std::nullopt, 1000))}, kNoKills);
+        REQUIRE(inherit.has_value());
+        CHECK(inherit->source_group_id == "pp");
+    }
+    SECTION("a chain with documents at several depths: the nearest document wins its branch") {
+        const std::vector<cs::GroupNode> tree{node("d0", "", 1), node("d1", "d0", 2),
+                                              node("d2", "d1", 3), node("d3", "d2", 4)};
+        const auto r = cs::resolve({"d3"}, tree,
+                                   {doc("d0", make(7200, std::nullopt, 1000)),
+                                    doc("d1", make(10800, std::nullopt, 500)),
+                                    doc("d2", make(14400, std::nullopt, 1))},
+                                   kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == "d2");
+        CHECK(r->effective.interval_s == 14400);
+        // A membership at every depth collapses to the deepest one.
+        const auto all = cs::resolve({"d0", "d1", "d3", "d2"}, tree,
+                                     {doc("d0", make(7200, std::nullopt, 1000)),
+                                      doc("d1", make(10800, std::nullopt, 500)),
+                                      doc("d2", make(14400, std::nullopt, 1))},
+                                     kNoKills);
+        REQUIRE(all.has_value());
+        CHECK(all->source_group_id == "d2");
+    }
+    SECTION("two branches reaching one ancestor's document compete once") {
+        const std::vector<cs::GroupNode> tree{node("xx", "", 1), node("g1", "xx", 2),
+                                              node("g2", "xx", 3), node("t2", "", 4)};
+        const auto r = cs::resolve({"g1", "g2", "t2"}, tree,
+                                   {doc("xx", make(7200, std::nullopt, 3)),
+                                    doc("t2", make(10800, std::nullopt, 2))},
+                                   kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == "xx");
+    }
+    SECTION("no membership: the root document, else the built-in default") {
+        const std::vector<cs::GroupNode> tree{node(kRoot, "", 1), node("aa", "", 2)};
+        const auto with_root =
+            cs::resolve({}, tree, {doc(kRoot, make(7200)), doc("aa", make(10800))}, kNoKills);
+        REQUIRE(with_root.has_value());
+        CHECK(with_root->source_group_id == kRoot);
+        const auto none = cs::resolve({}, tree, {doc("aa", make(10800))}, kNoKills);
+        REQUIRE(none.has_value());
+        CHECK(none->source_group_id.empty());
+        CHECK(none->effective == cs::kFleetDefault.effective());
+    }
+    SECTION("memberships in a parent cycle both stand") {
+        const std::vector<cs::GroupNode> tree{node("aa", "bb", 1), node("bb", "aa", 2)};
+        const auto r = cs::resolve({"aa", "bb"}, tree,
+                                   {doc("aa", make(7200, std::nullopt, 1)),
+                                    doc("bb", make(10800, std::nullopt, 2))},
+                                   kNoKills);
+        REQUIRE(r.has_value());
+        CHECK(r->source_group_id == "bb");
+    }
+}
+
 TEST_CASE("collection settings resolve: tie-break chain", "[collection_settings][resolve]") {
     SECTION("equal priority: deeper wins") {
         const std::vector<cs::GroupNode> tree{node("t1", "", 1), node("t2", "", 1),

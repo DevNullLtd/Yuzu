@@ -11,12 +11,15 @@
 ///     device is a member of the root group and groups created without a parent sit beside it at
 ///     depth 0, so a competing root document would otherwise win every created_at tie against a
 ///     top-level group;
-///   - for each group the device belongs to, the nearest group (itself, then its ancestors,
-///     excluding root) that carries a document is a candidate;
-///   - a candidate whose group is an ancestor of another candidate's group is dropped (nearest
-///     wins inside a branch), so priority only decides between unrelated branches;
-///   - the survivor is chosen by priority (higher wins), depth (deeper wins), group created_at
-///     (older wins), group id (smaller wins);
+///   - a BRANCH is a membership group, not a document: a membership group that is an ancestor of
+///     another membership group the device belongs to is dropped (the nearer one stands for that
+///     branch), so a device in P and in its descendant C resolves through C whatever the
+///     priorities;
+///   - each remaining membership group's branch winner is the nearest group (itself, then its
+///     ancestors, excluding root) that carries a document; two branches may share one winner,
+///     and an ancestor's document competes for a sibling branch that has none of its own;
+///   - the branch winners are chosen between by priority (higher wins), depth (deeper wins), group
+///     created_at (older wins), group id (smaller wins);
 ///   - no candidate: the root document if one exists, else the built-in fleet default;
 ///   - the kill-switch snapshot is applied last as an overlay that always wins, and the registered
 ///     apps collector is on unless it is itself kill-switched.
@@ -251,56 +254,71 @@ resolve(const std::vector<std::string>& member_group_ids, const std::vector<Grou
         return depth;
     };
 
+    // Ancestors of a group, nearest first, bounded (a parent cycle ends at the hop cap).
+    const auto ancestors_of = [&](const std::string& id) {
+        std::vector<std::string> out;
+        const GroupNode* cur = parent_of(id);
+        for (int hops = 0; cur != nullptr && hops < kMaxHops; ++hops) {
+            out.push_back(cur->id);
+            cur = parent_of(cur->id);
+        }
+        return out;
+    };
+
+    // (a) Branches are membership groups. One that is an ancestor of another membership group is
+    // dropped: the nearer one stands for that branch. In a parent cycle each is the other's
+    // ancestor, so both stand.
+    std::map<std::string, std::vector<std::string>> branches; // membership group -> ancestors
+    for (const auto& member : member_group_ids) {
+        if (member != kRootGroupId && nodes.contains(member))
+            branches.emplace(member, ancestors_of(member));
+    }
+    const auto is_ancestor = [&](const std::string& a, const std::string& of) {
+        return std::ranges::find(branches.at(of), a) != branches.at(of).end();
+    };
+    std::set<std::string> dropped;
+    for (const auto& [m1, anc1] : branches) {
+        (void)anc1;
+        for (const auto& [m2, anc2] : branches) {
+            (void)anc2;
+            if (m1 != m2 && is_ancestor(m1, m2) && !is_ancestor(m2, m1))
+                dropped.insert(m1);
+        }
+    }
+
+    // (b) Each remaining branch's winner is the nearest group with a document, itself first,
+    // root excluded. (c) The winners compete: priority desc, depth desc, created_at asc, id asc.
     struct Candidate {
         const StoredDocument* doc;
         const GroupNode* group;
         int depth;
     };
-    std::map<std::string, Candidate> candidates; // keyed by group id: one entry per document
-    for (const auto& member : member_group_ids) {
-        if (member == kRootGroupId || !nodes.contains(member))
+    const auto key = [](const Candidate& x) {
+        return std::make_tuple(-x.doc->settings.priority, -x.depth, x.group->created_at,
+                               x.group->id);
+    };
+    std::optional<Candidate> best;
+    for (const auto& [member, ancestors] : branches) {
+        if (dropped.contains(member))
             continue;
-        const GroupNode* cur = nodes.at(member);
-        for (int hops = 0; cur != nullptr && cur->id != kRootGroupId && hops <= kMaxHops; ++hops) {
-            if (const auto d = by_group.find(cur->id); d != by_group.end()) {
-                candidates.emplace(cur->id, Candidate{d->second, cur, depth_of(cur->id)});
+        std::vector<std::string> chain{member};
+        chain.insert(chain.end(), ancestors.begin(), ancestors.end());
+        for (const auto& id : chain) {
+            if (id == kRootGroupId)
                 break;
-            }
-            cur = parent_of(cur->id);
+            const auto d = by_group.find(id);
+            if (d == by_group.end())
+                continue;
+            const Candidate c{d->second, nodes.at(id), depth_of(id)};
+            if (!best || key(c) < key(*best))
+                best = c;
+            break;
         }
-    }
-
-    // Drop a candidate whose group is an ancestor of another candidate's group.
-    std::set<std::string> pruned;
-    for (const auto& [id, c] : candidates) {
-        const GroupNode* cur = parent_of(id);
-        for (int hops = 0; cur != nullptr && hops < kMaxHops; ++hops) {
-            if (cur->id != id && candidates.contains(cur->id))
-                pruned.insert(cur->id);
-            cur = parent_of(cur->id);
-        }
-    }
-
-    const Candidate* best = nullptr;
-    for (const auto& [id, c] : candidates) {
-        if (pruned.contains(id))
-            continue;
-        if (best == nullptr) {
-            best = &c;
-            continue;
-        }
-        // priority desc, depth desc, created_at asc, id asc
-        const auto key = [](const Candidate& x) {
-            return std::make_tuple(-x.doc->settings.priority, -x.depth, x.group->created_at,
-                                   x.group->id);
-        };
-        if (key(c) < key(*best))
-            best = &c;
     }
 
     const CollectionSettings* chosen = &kFleetDefault;
     std::string source;
-    if (best != nullptr) {
+    if (best) {
         chosen = &best->doc->settings;
         source = best->group->id;
     } else if (const auto r = by_group.find(std::string{kRootGroupId}); r != by_group.end()) {

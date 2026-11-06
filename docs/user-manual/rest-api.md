@@ -8165,7 +8165,7 @@ The settings that apply to one device, resolved across every management group it
  "meta": {"api_version": "v1"}}
 ```
 
-- In each group the device belongs to, the nearest group (itself, then its ancestors) with a document is a candidate. A candidate whose group is an ancestor of another candidate's group is dropped, so priority decides only between unrelated branches. The winner is chosen by priority (higher wins), then depth (deeper wins), then group creation time (older wins), then group id.
+- Each group the device belongs to is a branch, except a group that is an ancestor of another group the device belongs to: the nearer group stands for that branch, so a device in a group and in its descendant resolves through the descendant whatever the priorities. In each branch the nearest group (itself, then its ancestors) with a document is the branch winner; an ancestor's document therefore competes for a sibling branch that has none of its own. Priority decides only between branch winners. The winner is chosen by priority (higher wins), then depth (deeper wins), then group creation time (older wins), then group id.
 - The root group's document is the fleet default layer: it applies to a device with no other candidate and never competes with a group's document.
 - The plugin kill switches always win: a killed collector is `false` in `effective.plugins` and listed in `kill_switched`. Registered apps collection (`installed_apps`) is on unless it is itself kill-switched. Only the all-OS kill-switch layer is read.
 - `version` is the SHA-256 of the effective fields only (interval, window, zone, sorted switches): no priority, source group or timestamps.

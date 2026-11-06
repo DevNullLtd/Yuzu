@@ -1197,11 +1197,14 @@ collection settings".
 - **Resolution** (pure, `collection_settings_resolve.hpp`). The root group's document is the fleet
   default layer and never a competing candidate: every device is a member of the root group and groups
   created without a parent sit beside it at depth 0, so a competing root document would win every
-  creation-time tie against a top-level group. For each group the device belongs to, the nearest group
-  (itself, then its ancestors, excluding root) with a document is a candidate. A candidate whose
-  group is an ancestor of another candidate's group is dropped, so priority decides only between
-  unrelated branches. The winner is chosen by priority (higher wins), depth (deeper wins), group
-  creation time (older wins), group id (smaller wins). The kill-switch snapshot is applied last and
+  creation-time tie against a top-level group. A branch is a group the device belongs to, not a
+  document: a membership group that is an ancestor of another membership group is dropped, so a
+  device in a group and in its descendant resolves through the descendant whatever the priorities.
+  Each remaining branch's winner is the nearest group (itself, then its ancestors, excluding root)
+  with a document; an ancestor's document therefore competes for a sibling branch that has none of
+  its own (a device in G1 and G2, both children of X, with a document on X and on G2, compares X
+  against G2). The branch winners are chosen between by priority (higher wins), depth (deeper
+  wins), group creation time (older wins), group id (smaller wins). The kill-switch snapshot is applied last and
   always wins; the host route reads the all-OS layer only, and a degraded kill-switch read is a `503`,
   never a document with collectors off. The per-OS withheld set belongs to the settings push, which
   knows the target OS.

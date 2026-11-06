@@ -430,9 +430,10 @@ a switch per collector and a priority), written through
 ([REST API](rest-api.md#software-collection-settings)).
 
 A device belongs to many groups, so the server resolves one document for it:
-the nearest group with a document wins inside a branch, priority decides between
-unrelated branches, and the root group's document is the fleet-wide default
-layer. The plugin kill switches always win over a document, and registered apps
+each group the device belongs to is a branch (a group that is an ancestor of
+another of its groups gives way to the nearer one), the nearest group with a
+document wins inside a branch, priority decides between branches, and the root
+group's document is the fleet-wide default layer. The plugin kill switches always win over a document, and registered apps
 collection cannot be turned off by a document. A window needs a whole-day
 interval because the agent fires a window once per local day.
 
