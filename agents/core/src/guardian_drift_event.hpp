@@ -15,6 +15,11 @@
 // It sets ONLY the drift-derived fields. Each caller stamps the idempotency- and
 // host-specific parts itself: event_id, rule_id, guard_category, timestamp, platform.
 // Pure and I/O-free.
+//
+// Also home to guardian_event_refused_by_server, the one agent-side mirror of a server ingest
+// refusal (an empty rule_id). It is not a drift mapping; it lives here only because both Guardian
+// wire senders already include this header. The server is the authority for the rule
+// (guardian_ingest.cpp); change the two together.
 
 #include <yuzu/plugin.h>        // YUZU_EXPORT
 #include <yuzu/agent/guard.hpp> // GuardDrift

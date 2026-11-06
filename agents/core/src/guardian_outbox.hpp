@@ -167,7 +167,7 @@ struct OutboxEntry {
 /// What a send attempt reported. Retain and Failed are equivalent to the drain
 /// (both stop it and keep the entry); they read differently at the call site.
 enum class SendResult {
-    Sent,   ///< delivered; remove the entry
+    Sent,   ///< delivered, or disposed by design as unsendable (no Write); remove the entry
     Retain, ///< stream down / Write()==false; keep the entry and stop draining
 };
 

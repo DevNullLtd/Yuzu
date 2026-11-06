@@ -4113,7 +4113,9 @@ private:
     // sink and the (ruleless) DEX signal observer. Drops the event if the link is
     // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
     // Returns the delivery outcome (LegacySendOutcome, #4783: LinkDown when the
-    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise)
+    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise, which
+    // includes an event refused locally as unsendable: that returns Sent WITHOUT a Write, see
+    // refuse_unsendable_guardian_event)
     // so a caller can distinguish those two failure shapes and log it (#4606
     // criterion-10 T_wire) — deliberately instrumented ONLY at the drift-sink call
     // site (set_event_sink's lambda), never here and never at the DEX observer's
@@ -4140,10 +4142,15 @@ private:
     // True (and logged) when `ev` is one the server drops at ingest for want of a rule id
     // (guardian_event_refused_by_server). The server answers an ingest refusal with nothing, so
     // this is the only place the agent can see it. Callers then skip the Write and report the
-    // event as Sent: a retry could never succeed, and Retain/WriteFailed would respectively wedge
-    // the outbox head or record a gap against an empty rule id. No producer reaches this today
-    // (the journal mint and replay gates reject an empty rule_id first); it is the last line.
-    // Logged on the first occurrence and then every 1024th, so a bad producer cannot flood.
+    // event as Sent, meaning "disposed by design", not "delivered": a retry could never succeed,
+    // and Retain/WriteFailed would respectively wedge the outbox head or record a gap against an
+    // empty rule id. No producer reaches this today: json_to_rule rejects an empty rule id before
+    // any rule arms (legacy and Spark), and DEX observations carry the `__observation__`
+    // sentinel. On the Spark path the journal mint gate only keeps such a record out of the
+    // journal (the live entry is still enqueued), so this refusal is what stops it reaching the
+    // wire; it is the last line. Logged on the first occurrence and then every 1024th, so a bad
+    // producer cannot flood; the counter exists only to set that cadence and is not exported.
+    // The legacy drift-sink lambda still writes a T_wire line with sent=1 for a refused event.
     bool refuse_unsendable_guardian_event(const gpb::GuaranteedStateEvent& ev,
                                           std::string_view path) {
         if (!guardian_event_refused_by_server(ev))
@@ -4151,7 +4158,7 @@ private:
         const auto n = guardian_unsendable_events_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n == 1 || n % 1024 == 0) {
             try {
-                spdlog::warn("Guardian {} sender: not sending event {} with an empty rule_id, the "
+                spdlog::warn("Guardian {} path: not sending event {}: its rule_id is empty and the "
                              "server would drop it (refused so far: {})",
                              path, ev.event_id(), n);
             } catch (...) { // best-effort diagnostic; never propagate onto a send worker
@@ -4164,7 +4171,8 @@ private:
     // maps one buffered OutboxEntry to the wire event and writes it over the current
     // Subscribe stream, mirroring emit_guardian_event but returning a SendResult so
     // the drain can retain-and-retry: Retain when the stream is down (pre-network arm
-    // or a reconnect gap) or the Write fails, Sent on a successful Write. Capturing
+    // or a reconnect gap) or the Write fails, Sent on a successful Write or when the event is
+    // refused locally as unsendable (no Write, see refuse_unsendable_guardian_event). Capturing
     // `this` is lifetime-safe, but NOT via a synchronous join (#2233 item 4, revised):
     // this callback runs on GuardianOutboxSendExecutor's DETACHED worker
     // (guardian_outbox_send_executor.hpp), which guardian_->stop() does NOT join. Safety

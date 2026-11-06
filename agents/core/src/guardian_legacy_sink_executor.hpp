@@ -235,7 +235,9 @@
 
 namespace yuzu::agent {
 
-/// Outcome of one delivery attempt, reported by the injected send function.
+/// Outcome of one delivery attempt, reported by the injected send function. Sent means the
+/// event left the queue for good: written, or refused locally as unsendable (an empty rule_id,
+/// see AgentImpl::refuse_unsendable_guardian_event) without a Write.
 enum class LegacySendOutcome : std::uint8_t { Sent, LinkDown, WriteFailed };
 
 /**
