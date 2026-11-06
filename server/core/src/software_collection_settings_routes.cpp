@@ -31,6 +31,7 @@ static_assert(std::string_view{ManagementGroupStore::kRootGroupId} == cs::kRootG
 namespace {
 
 constexpr const char* kVerbUpdate = "software_estate.collection_settings.update";
+constexpr const char* kVerbRead = "software_estate.collection_settings.read"; // refusals only
 constexpr const char* kGroupTargetType = "ManagementGroup";
 
 std::string ok_body(json data) {
@@ -286,6 +287,11 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                  case Authority::Degraded:
                      return;
                  case Authority::Deny:
+                     // The quiet probe withholds its row for a cookie session, so the refusal
+                     // writes its own.
+                     (void)detail::try_persist_audit(deps.audit_fn, req, kVerbRead, "denied",
+                                                     kGroupTargetType, group_id,
+                                                     "not authorised to read this group");
                      fail(res, 403, "forbidden");
                      return;
                  }

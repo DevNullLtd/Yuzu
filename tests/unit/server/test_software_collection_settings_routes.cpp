@@ -745,9 +745,22 @@ TEST_CASE("collection settings GET: list and per-group reads", "[pg][routes][col
         CHECK(rig.call("GET", list_path, owner)->status == 403);
     }
     SECTION("a group owner reads the branch they govern, an outsider does not") {
+        rig.audit.clear();
         CHECK(rig.call("GET", rig.doc_path(rig.group_p), owner)->status == 200);
+        CHECK(rig.audit.empty()); // a served read writes no row
         CHECK(rig.call("GET", rig.doc_path(rig.group_s), owner)->status == 403);
         CHECK(rig.call("GET", rig.doc_path(rig.group_p), rig.cookie("nobody"))->status == 403);
+        // Each cookie-session refusal leaves the route's own denied row (the quiet probe
+        // withholds its row for a cookie session).
+        REQUIRE(rig.audit.size() == 2);
+        for (const auto& a : rig.audit) {
+            CHECK(a.action == "software_estate.collection_settings.read");
+            CHECK(a.result == "denied");
+            CHECK(a.target_type == "ManagementGroup");
+            CHECK(a.detail == "not authorised to read this group");
+        }
+        CHECK(rig.audit[0].target_id == rig.group_s);
+        CHECK(rig.audit[1].target_id == rig.group_p);
         // A governed group with no document is a 404, not an empty 200.
         CHECK(rig.call("GET", rig.doc_path(rig.group_c), owner)->status == 404);
         // An unknown group the caller is globally entitled to read is a 404.

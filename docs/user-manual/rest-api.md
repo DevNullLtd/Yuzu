@@ -8148,7 +8148,7 @@ Every stored document and the built-in fleet default (24 hours, 01:00 to 05:00, 
 
 #### `GET /api/v1/inventory/software/collection-settings/{group_id}`
 
-The group's own stored document (`group_id`, `interval_s`, `window`, `timezone`, `plugins`, `priority`, `version`, `updated_at`, `updated_by`), not the resolved result for any device. `404` when the group does not exist or has no document.
+The group's own stored document (`group_id`, `interval_s`, `window`, `timezone`, `plugins`, `priority`, `version`, `updated_at`, `updated_by`), not the resolved result for any device. `404` when the group does not exist or has no document. A refused read (`403`) is audited as `software_estate.collection_settings.read` with `result=denied`; a served read is not audited (see [audit-log.md](audit-log.md)).
 
 #### `PUT /api/v1/inventory/software/collection-settings/{group_id}`
 
