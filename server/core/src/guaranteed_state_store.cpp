@@ -3613,6 +3613,9 @@ std::expected<UnrepresentedPendingSummary, UnrepresentedPendingError>
 GuaranteedStateStore::unrepresented_pending_for_agent(
     const std::string& agent_id, const std::optional<std::vector<std::string>>& rule_filter) const {
     static DegradeSampler sampler;
+    // Its own sampler, so a recent pool-timeout episode cannot suppress the first 'statement timeout'
+    // warning (the Apps `budget_sampler` is the precedent). The counter increments either way.
+    static DegradeSampler timeout_sampler;
     // Engaged-empty filter: nothing can qualify, so no lease and no seam call (ADR-0017 INV-2).
     if (rule_filter && rule_filter->empty())
         return UnrepresentedPendingSummary{};
@@ -3696,7 +3699,8 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
         if (state && std::string_view(state) == "57014") {
             // Count first, then log: the counter is the signal that must never be skipped.
             if (const auto d =
-                    note_read_degrade(metrics_, kReasonStatementTimeout, kDegradeSourceCensusDevice, sampler);
+                    note_read_degrade(metrics_, kReasonStatementTimeout, kDegradeSourceCensusDevice,
+                                      timeout_sampler);
                 d.should_log)
                 spdlog::warn("GuaranteedStateStore::unrepresented_pending_for_agent: statement timeout "
                              "after {} ms: most likely the retained pending backlog is too large for this "

@@ -2252,6 +2252,16 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
         const std::string cdesc = cget.value("description", "");
         CHECK(cdesc.find("do not report ordering uncertainty") == std::string::npos);
         CHECK(cdesc.find("unrepresented_pending_guards") != std::string::npos);
+        // A5 machine metadata (#7217 gate 8, CA-7): the consumer rule lives on the `assessable`
+        // property, and the per-agent status route points at the per-device reads.
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "Never render a clean state") != std::string::npos);
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "unrepresented_pending_guards") != std::string::npos);
+        const std::string sdesc =
+            spec["paths"].at("/guaranteed-state/status/{agent_id}").at("get").value("description", "");
+        CHECK(sdesc.find("reads all-zero here") != std::string::npos);
+        CHECK(sdesc.find("unrepresented_pending_guards") != std::string::npos);
 
         // all-guards: the inline schema.
         const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");

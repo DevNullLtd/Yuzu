@@ -48809,3 +48809,36 @@ TEST_CASE("MCP result-set producers: a supervised token without Execution:Execut
         CHECK(row_has_cid);
     }
 }
+
+// #7217 gate 8 (CA-7, A5): the consumer rule and the pointer from the status reads to the
+// per-device reads are machine metadata on the tools, not only prose in the manual.
+TEST_CASE("MCP Guardian: tool descriptions carry the never-render-clean rule and the status "
+          "pointer to the per-device reads (#7217)",
+          "[mcp][guardian][7217][metadata]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int seen = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "get_guardian_device_compliance" && name != "get_guardian_agent_status" &&
+            name != "get_guardian_status")
+            continue;
+        ++seen;
+        const auto desc = t["description"].get<std::string>();
+        INFO(name);
+        CHECK(desc.size() < 4096);
+        if (name == "get_guardian_device_compliance") {
+            CHECK(desc.find("Never render a clean state") != std::string::npos);
+            CHECK(desc.find("unrepresented_pending_guards") != std::string::npos);
+        } else {
+            CHECK(desc.find("unrepresented_pending_guards") != std::string::npos);
+            CHECK(desc.find("get_guardian_device_guards") != std::string::npos);
+        }
+        if (name == "get_guardian_agent_status")
+            CHECK(desc.find("reads all-zero here") != std::string::npos);
+    }
+    CHECK(seen == 3);
+}

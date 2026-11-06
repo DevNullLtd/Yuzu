@@ -1628,7 +1628,9 @@ static const ToolDef kTools[] = {
      "one reported (agent, rule) pair whose census ordering cannot be proven (order_uncertain) or "
      "whose retained event is not yet reflected (projection_pending), within the caller's scope; "
      "0 does NOT prove the census is fresh or complete, since an event that never arrived leaves "
-     "no trace, and a pending event whose pair has no census row is not counted. A service-scoped "
+     "no trace, and a pending event whose pair has no census row is not counted (the per-device "
+     "reads get_guardian_device_guards and get_guardian_device_compliance report those as "
+     "unrepresented_pending_guards). A service-scoped "
      "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
      "to).",
      R"({"type":"object","properties":{}})",
@@ -1862,7 +1864,10 @@ static const ToolDef kTools[] = {
      "the SAME gate get_guardian_device_guards uses; a service-scoped API token is confined "
      "to its own service's agents rather than denied outright. uncertain_rules counts this "
      "device's rules whose row is order_uncertain or projection_pending; 0 does not prove "
-     "freshness.",
+     "freshness. This rollup counts only pairs that have a census row; a device whose only "
+     "evidence is pending events with no census row reads all-zero here. Read "
+     "get_guardian_device_guards (GET /guaranteed-state/agents/{agent_id}/rules) or "
+     "get_guardian_device_compliance for unrepresented_pending_guards.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"note":{"type":"string"},"audit_persisted":{"type":"boolean"}},"required":["agent_id","total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules"]})j"},
 
@@ -1872,7 +1877,9 @@ static const ToolDef kTools[] = {
      "last reported verdict. Mirrors GET /api/v1/guaranteed-state/device-compliance exactly, "
      "same baseline + guaranteed-state store reads. assessable is false when there is no "
      "compliance signal to act on (draft Baseline, or nothing reported yet) — do not compute "
-     "a percentage when false. Per-device behavioral read — every call is audit-logged "
+     "a percentage when false. Never render a clean state or a compliance percentage while "
+     "uncertain_guards or unrepresented_pending_guards is nonzero, even when assessable is "
+     "true. Per-device behavioral read — every call is audit-logged "
      "(guardian.device.view). Per-device scoped (management-group aware) via the SAME gate "
      "get_guardian_agent_status uses. Counts and states cover REPRESENTED pairs only (pairs with a "
      "census row for this device). Each guards[] row carries order_uncertain (sticky: the "

@@ -4661,8 +4661,9 @@ groups:
             read ran past its 5 s budget, most likely because the retained
             pending backlog is large (a lock wait, a loaded database or an
             administrator cancel is reported the same way), the REST 503
-            carries no retry_after_ms and the MCP error is non-retryable, so
-            a retry usually fails identically until the cause clears; compare
+            carries retry_after_ms null and the MCP error is non-retryable, and
+            the remediation in both says a retry usually fails identically
+            until the cause clears; compare
             max(yuzu_server_guardian_census_pending_events) and see "When a
             verdict is flagged or does not move", step 5, in the Guaranteed
             State guide.

@@ -1232,8 +1232,8 @@ all-guards read) report such pairs as `unrepresented_pending_guards` and a bound
 list (first 50 in ascending byte order of the rule id; the ids are agent-reported identifiers), and they are also
 counted on `yuzu_server_guardian_census_pending_events`. The count is read before the census rows and the two are
 non-atomic observations: a pair repaired between them can appear in both the guards list and the unrepresented list
-for one request, never in neither. The count read runs under a 5 s statement timeout; its expiry (a large retained
-pending backlog) is a non-transient failure, reported separately from an ordinary store degrade and counted on the
+for one request, never in neither. The count read runs under a 5 s statement timeout; its expiry (most likely a large
+retained pending backlog; a lock wait, a loaded database or an administrator cancel is reported the same way) is a non-transient failure, reported separately from an ordinary store degrade and counted on the
 `guardian_census_device` source of `yuzu_server_guardian_read_degrade_total`. See the user manual's Compliance
 overview for the operator-facing contract.
 
