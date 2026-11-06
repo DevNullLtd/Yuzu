@@ -818,10 +818,11 @@ struct RestGsHarness {
     // (insert_event → project_rule_status). event_type maps to state per
     // event_state_from_type: guard.compliant/drift.remediated→compliant,
     // drift.detected→drifted, remediation.failed/guard.unhealthy/guard.errored→errored.
-    // NOTE: the upsert keeps the row only when excluded.updated_at >= the existing
-    // updated_at, so re-seeding the same (agent, rule_id) with an EARLIER timestamp is
-    // silently dropped, while an EQUAL timestamp overwrites (the later arrival wins);
-    // use strictly increasing ts when overwriting a verdict to keep the result obvious.
+    // NOTE: the census keeps the verdict with the greatest ordering key, and the key is the
+    // agent stamp this helper derives from `ts` (whole seconds). Re-seeding the same (agent,
+    // rule_id) with an EARLIER ts leaves the verdict and flags the row order_uncertain; an EQUAL
+    // ts is a tie that the later arrival wins; use strictly increasing ts to overwrite a verdict
+    // and keep the row unflagged.
     void seed_status(const std::string& event_id, const std::string& agent,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts) {
@@ -832,6 +833,7 @@ struct RestGsHarness {
         e.event_type = event_type;
         e.severity = "info";
         e.timestamp = ts;
+        e.agent_ns = yuzu::test::iso8601_to_ns(ts);
         REQUIRE(store->insert_event(e).has_value());
     }
 
@@ -3013,7 +3015,7 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
 
     // Additive per-application and per-version figures.
     CHECK(j["data"]["population"].is_number_integer());
-    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["population_basis"] == "all_online"); // the default scope
     CHECK(j["data"]["apps_total"] == 2);
     CHECK(j["data"]["apps_truncated"] == false);
     CHECK_FALSE(j["data"].contains("stat_failures"));
@@ -3023,6 +3025,9 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
         CHECK(first.contains(k));
     CHECK(first["profile"] == "default");
     CHECK(first["versions"].is_array());
+    CHECK(j["data"]["crash_source_coverage"].size() == 3);
+    for (const char* k : {"windows", "linux", "macos"})
+        CHECK(j["data"]["crash_source_coverage"].contains(k));
     CHECK(res->body.find("below_floor") == std::string::npos);
 
     // The policy every figure was scored under is named on the payload.
@@ -3045,7 +3050,7 @@ TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not
     auto j = nlohmann::json::parse(res->body);
     REQUIRE(j["data"]["apps"].is_array());
     CHECK(j["data"]["apps"].empty());
-    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["population_basis"] == "all_online"); // the default scope
     CHECK(res->body.find("retry_after_ms") == std::string::npos);
 }
 
@@ -3110,6 +3115,73 @@ TEST_CASE("REST dex/apps: an off-enum window is a 400, never a silent default",
     auto res = h.sink.Get("/api/v1/dex/apps?window=bogus");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+TEST_CASE("REST dex/apps: an unknown platform is a 400 with no retry hint",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    // The token match is exact: an unshipped spelling, empty and any non-lowercase form all refuse.
+    for (const char* bad : {"darwin", "", "Windows", "ALL"}) {
+        CAPTURE(bad);
+        auto res = h.sink.Get(std::string{"/api/v1/dex/apps?platform="} + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["message"] == "invalid platform (expected all|windows|macos|linux)");
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(res->get_header_value("Retry-After").empty());
+    }
+}
+
+TEST_CASE("REST dex/apps: the platform scope selects the population and the coverage",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    h.dex_fleet_override_.connected_agents = {{"w1", "windows"}, {"w2", "windows"}, {"l1", "linux"},
+                                              {"m1", "macos"}};
+    h.dex_fleet_override_.total_online = 4;
+    // The same subject on two operating systems: one merged row under `all`, one row per scope otherwise.
+    h.seed_obs("b1", "w1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("b2", "l1", "process.crashed", "chrome.exe", "linux", "2026-06-10T10:00:00Z");
+    const auto get = [&](const char* q) {
+        auto res = h.sink.Get(q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+    const auto none = get("/api/v1/dex/apps?window=all");
+    CHECK(none["population_basis"] == "all_online");
+    CHECK(none["population"] == 4);
+    REQUIRE(none["apps"].size() == 1);
+    CHECK(none["apps"][0]["subject"] == "chrome.exe");
+    CHECK(none["apps"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["distinct_devices"] == 2);
+    // The per-version rows merge across operating systems the same way (one unversioned bucket).
+    REQUIRE(none["apps"][0]["versions"].size() == 1);
+    CHECK(none["apps"][0]["versions"][0]["version"] == "");
+    CHECK(none["apps"][0]["versions"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["versions"][0]["distinct_devices"] == 2);
+    const auto win = get("/api/v1/dex/apps?window=all&platform=windows");
+    CHECK(win["population_basis"] == "windows_online");
+    CHECK(win["population"] == 2);
+    REQUIRE(win["apps"].size() == 1);
+    CHECK(win["apps"][0]["crashes"] == 1);
+    CHECK(win["apps"][0]["distinct_devices"] == 1);
+    CHECK(win["crash_source_coverage"] == nlohmann::json{{"windows", "complete"}});
+    const auto lin = get("/api/v1/dex/apps?window=all&platform=linux");
+    CHECK(lin["population_basis"] == "linux_online");
+    CHECK(lin["population"] == 1);
+    REQUIRE(lin["apps"].size() == 1);
+    CHECK(lin["apps"][0]["crashes"] == 1);
+    CHECK(lin["apps"][0]["distinct_devices"] == 1);
+    CHECK(lin["crash_source_coverage"] == nlohmann::json{{"linux", "partial"}});
+    // The two published values the cases above do not send: an explicit `all` is the default, and
+    // `macos` selects the macOS population (one online device, no observation seeded for it).
+    CHECK(get("/api/v1/dex/apps?window=all&platform=all") == none);
+    const auto mac = get("/api/v1/dex/apps?window=all&platform=macos");
+    CHECK(mac["population_basis"] == "macos_online");
+    CHECK(mac["population"] == 1);
+    CHECK(mac["apps"].empty());
+    CHECK(mac["crash_source_coverage"] == nlohmann::json{{"macos", "partial"}});
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
@@ -5968,4 +6040,117 @@ TEST_CASE("REST dex/signals, dex/scope and dex/signals/{obs_type}: a window outs
             CHECK(res->status == 200);
         }
     }
+}
+
+TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the row routes and "
+          "uncertain_rules on the rollups (#5690)",
+          "[pg][rest][guaranteed_state][ordering]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    h.seed_rule("r2", "rule-2");
+    h.seed_rule("r3", "rule-3");
+    // A census trigger that refuses the projection of one verdict (identified by its timestamp)
+    // leaves that event stored with pending evidence and the row at its previous state.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE FUNCTION guaranteed_state_store.yuzu_test_fail_marked() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN IF NEW.updated_at = '2026-06-20T10:02:00Z' THEN "
+            "RAISE EXCEPTION 'forced census failure' USING ERRCODE = 'XX000'; END IF; "
+            "RETURN NEW; END $$; "
+            "CREATE TRIGGER yuzu_test_fail_marked BEFORE INSERT OR UPDATE ON "
+            "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION "
+            "guaranteed_state_store.yuzu_test_fail_marked()")};
+        REQUIRE(r.ok());
+    }
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("a2", "WS-1", "r1", "drift.detected",
+                  "2026-06-20T10:00:00Z"); // older key, later arrival
+    h.seed_status("b1", "WS-1", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("b2", "WS-2", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("b3", "WS-2", "r2", "drift.detected",
+                  "2026-06-20T10:02:00Z"); // projection fails: pending
+    h.seed_status("c1", "WS-1", "r3", "guard.compliant", "2026-06-20T10:01:00Z");
+
+    const auto get = [&](const std::string& path, bool with_headers) {
+        auto res = with_headers ? h.sink.Get(path, h.status_route_headers()) : h.sink.Get(path);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto row_for = [](const nlohmann::json& rows, const char* agent) {
+        for (const auto& x : rows)
+            if (x["agent_id"].get<std::string>() == agent)
+                return x;
+        FAIL("no row for " << agent);
+        return nlohmann::json{};
+    };
+
+    const auto r1 = get("/api/v1/guaranteed-state/rules/r1/status", true);
+    const auto r1_ws1 = row_for(r1["data"], "WS-1");
+    CHECK(r1_ws1["order_uncertain"].get<bool>());
+    CHECK_FALSE(r1_ws1["projection_pending"].get<bool>());
+    CHECK(r1_ws1["state"].get<std::string>() == "compliant"); // the older verdict did not win
+
+    const auto r2 = get("/api/v1/guaranteed-state/rules/r2/status", true);
+    CHECK_FALSE(row_for(r2["data"], "WS-1")["projection_pending"].get<bool>());
+    CHECK(row_for(r2["data"], "WS-2")["projection_pending"].get<bool>());
+    CHECK_FALSE(row_for(r2["data"], "WS-2")["order_uncertain"].get<bool>());
+
+    const auto fleet = get("/api/v1/guaranteed-state/status", true);
+    CHECK(fleet["data"]["total_rules"].get<int>() == 3);
+    CHECK(fleet["data"]["uncertain_rules"].get<int>() == 2); // r1 (flag) and r2 (pending); r3 clean
+    // The notes say what uncertain_rules counts (reverting the wording must turn this red).
+    CHECK(fleet["data"]["note"].get<std::string>().find("uncertain_rules counts live rules") !=
+          std::string::npos);
+    CHECK(
+        get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["note"].get<std::string>().find(
+            "uncertain_rules counts this device's rules") != std::string::npos);
+    CHECK(
+        get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["uncertain_rules"].get<int>() ==
+        1);
+    CHECK(
+        get("/api/v1/guaranteed-state/status/WS-2", false)["data"]["uncertain_rules"].get<int>() ==
+        1);
+
+    CHECK(get("/api/v1/guaranteed-state/agents/WS-2/rules",
+              false)["data"]["guards"][0]["projection_pending"]
+              .get<bool>());
+    int uncertain_guards = 0;
+    for (const auto& g : get("/api/v1/guaranteed-state/agents/WS-1/rules", false)["data"]["guards"])
+        if (g["order_uncertain"].get<bool>())
+            ++uncertain_guards;
+    CHECK(uncertain_guards == 1);
+
+    // A later verdict that dominates the pending event retires it: only r1 stays uncertain.
+    h.seed_status("b4", "WS-2", "r2", "guard.compliant", "2026-06-20T10:05:00Z");
+    CHECK(get("/api/v1/guaranteed-state/status", true)["data"]["uncertain_rules"].get<int>() == 1);
+}
+
+TEST_CASE("REST gs.rules: a store fault on delete answers 404 but is audited as failure (#5690)",
+          "[pg][rest][guaranteed_state][ordering]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    // A trigger that refuses the rule delete makes the store return "delete failed: ...", which is
+    // not the "not found" refusal the audit classifier maps to `denied`.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE FUNCTION guaranteed_state_store.yuzu_test_refuse_delete() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced delete failure' USING ERRCODE = "
+            "'XX000'; END $$; "
+            "CREATE TRIGGER yuzu_test_refuse_delete BEFORE DELETE ON "
+            "guaranteed_state_store.guaranteed_state_rules FOR EACH ROW EXECUTE FUNCTION "
+            "guaranteed_state_store.yuzu_test_refuse_delete()")};
+        REQUIRE(r.ok());
+    }
+    auto del = h.sink.Delete("/api/v1/guaranteed-state/rules/r1");
+    REQUIRE(del);
+    CHECK(del->status == 404); // documented: any delete failure answers 404
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "failure");
 }

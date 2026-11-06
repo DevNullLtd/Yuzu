@@ -31,7 +31,12 @@
 //   - none of the request PIPELINE runs — no pre-routing chokepoint
 //     (on-behalf-of rejection, quotas, rate limiting), no post-routing
 //     handler (security headers). A gate that moves into pre-routing will
-//     leave every sink test green while the route-level gate is gone.
+//     leave every sink test green while the route-level gate is gone;
+//   - no post-read stage: this sink never consults `PostReadStageRegistry`,
+//     never records into `RouteInventory`, and never refuses an unclassified
+//     route once sealed, so the body cap, the step-up chokepoint and the
+//     fail-closed registration refusal are all absent here (a socket test
+//     with `PostReadStageScope`, post_read_stage_test_support.hpp, covers them).
 // A fixture that needs any of the above needs a live socket, not this sink.
 //
 // TWO INVARIANTS FOR FIXTURES USING THIS SINK:
@@ -142,6 +147,11 @@ public:
                 req.headers.erase(name);
                 req.set_header(name, value);
             }
+            // Repeated field lines, which the map above cannot carry: each pair is added as
+            // another occurrence, in order, as a client sending the header twice would.
+            for (const auto& [name, value] : repeated_headers) {
+                req.headers.emplace(name, value);
+            }
 
             // httplib::Server parses an `application/x-www-form-urlencoded` body
             // into `req.params` — the same multimap as the query string, and after
@@ -181,6 +191,11 @@ public:
 
     /// Sent with every dispatch before per-call headers (which override by name).
     std::unordered_map<std::string, std::string> default_headers;
+
+    /// Request header lines added to every dispatch AFTER the per-call headers, one occurrence
+    /// per pair and never replacing one already set, so a test can send the same field twice.
+    /// Clear it when the case is done.
+    std::vector<std::pair<std::string, std::string>> repeated_headers;
 
     /// Convenience wrappers for common verbs.
     auto Get(const std::string& path) { return dispatch("GET", path); }

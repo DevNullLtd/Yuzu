@@ -14,6 +14,7 @@
  */
 
 #include "echo_db.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 
 #include <sqlite3.h>
@@ -52,6 +53,10 @@
 namespace yuzu::echo {
 
 namespace {
+
+// Busy timeout of the main and read-only connections; checkpoint() drops the main one to 0 for
+// the call and restores it from here.
+constexpr int kBusyTimeoutMs = 5000;
 
 int64_t now_epoch_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -117,7 +122,7 @@ bool ascii_iequals(const char* a, const char* b) noexcept {
 // is_queryable_table's allocation) must never unwind through them — that would be
 // UB. Any exception fails closed (SQLITE_DENY).
 int echo_query_authorizer(void* /*ctx*/, int action, const char* arg1, const char* arg2,
-                         const char* /*db_name*/, const char* /*inner_trigger_or_view*/) noexcept {
+                         const char* /*db_name*/, const char* inner_trigger_or_view) noexcept {
     try {
         switch (action) {
         case SQLITE_SELECT:
@@ -129,7 +134,28 @@ int echo_query_authorizer(void* /*ctx*/, int action, const char* arg1, const cha
                 return SQLITE_DENY;
             return SQLITE_OK;
         case SQLITE_READ:
-            return (arg1 && is_queryable_table(arg1)) ? SQLITE_OK : SQLITE_DENY;
+            if (!arg1)
+                return SQLITE_DENY;
+            if (is_queryable_table(arg1) || is_fold_view(arg1))
+                return SQLITE_OK;
+            // The roll-up views read echo_dict and their `_r` tables; operator SQL may
+            // reach those ONLY through a roll-up view, never by name. The inner-most
+            // view argument names a SQL context, not a persisted view: a CTE of that
+            // name is reported the same way. This rule is sound ONLY because
+            // validate_and_translate_sql rejects WITH, so no CTE can shadow a view
+            // name. It is defence in depth behind that validator, not the closure.
+            if (inner_trigger_or_view && is_fold_internal_table(arg1) &&
+                is_fold_view(inner_trigger_or_view))
+                return SQLITE_OK;
+            // `SELECT COUNT(*) FROM <view>` is reported as a column-less read of the table
+            // behind the view with no view context. Allow that for the row tables only: it
+            // exposes a row count the view already exposes, never a column. The dictionary
+            // and the replay ring stay denied outright. Sound only while every roll-up view
+            // is a WHERE-less single-table projection (generate_fold_ddl, pinned by test);
+            // a filter or JOIN in a view turns this count into an oracle.
+            if (is_fold_row_table(arg1) && (!arg2 || *arg2 == '\0'))
+                return SQLITE_OK;
+            return SQLITE_DENY;
         default:
             return SQLITE_DENY;
         }
@@ -798,6 +824,16 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         }
     }
 
+    // Incremental auto_vacuum, BEFORE journal_mode=WAL: SQLite fixes the mode when the first
+    // table is created, and the WAL switch writes page 1 of an empty file. On a database that
+    // already has tables this is a no-op until a VACUUM converts it (vacuum_to_incremental).
+    // Best effort -- the byte budget works without it, only the file shrinks more slowly.
+    SqliteErrMsg pragma_err;
+    rc = sqlite3_exec(raw_db, "PRAGMA auto_vacuum=INCREMENTAL", nullptr, nullptr,
+                      pragma_err.addr());
+    if (rc != SQLITE_OK)
+        spdlog::warn("EchoDatabase: PRAGMA auto_vacuum=INCREMENTAL failed: {}", pragma_err.text());
+
     // WAL mode for concurrent read performance -- required for correctness
     char* err_msg = nullptr;
     rc = sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg);
@@ -810,7 +846,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     sqlite3_free(err_msg);
 
     // Busy timeout for concurrent access
-    sqlite3_busy_timeout(raw_db, 5000);
+    sqlite3_busy_timeout(raw_db, kBusyTimeoutMs);
 
     // Secure delete -- zeroes deleted content; required for security
     err_msg = nullptr;
@@ -822,6 +858,15 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         return std::unexpected(std::format("failed to enable secure_delete: {}", err));
     }
     sqlite3_free(err_msg);
+
+    // Cap the WAL file left behind after a checkpoint resets it. Without a limit a one-off
+    // burst (a backlog drain, a large eviction) leaves the -wal file at its high-water mark
+    // forever. Only bites when a checkpoint resets the WAL; a pinned reader defers it.
+    rc = sqlite3_exec(raw_db,
+                      std::format("PRAGMA journal_size_limit={}", kEchoWalAllowanceBytes).c_str(),
+                      nullptr, nullptr, pragma_err.addr());
+    if (rc != SQLITE_OK)
+        spdlog::warn("EchoDatabase: PRAGMA journal_size_limit failed: {}", pragma_err.text());
 
     // Schema v9: the base tables were renamed tar_* -> echo_*. This must run BEFORE the base
     // schema below, which would otherwise create empty echo_* tables beside the populated tar_*
@@ -1265,13 +1310,14 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         int rrc = sqlite3_open_v2(path.string().c_str(), &ro,
                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
         if (rrc == SQLITE_OK) {
-            sqlite3_busy_timeout(ro, 5000);
+            sqlite3_busy_timeout(ro, kBusyTimeoutMs);
             sqlite3_db_config(ro, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, nullptr);
             sqlite3_set_authorizer(ro, &echo_query_authorizer, nullptr);
             // Force the is_queryable_table allowlist's one-time static init now,
             // on a normal C++ stack — never lazily inside the authorizer callback
             // while it runs in SQLite's C prepare frames.
             (void)is_queryable_table("");
+            (void)is_fold_view(""); // the view set; the fold-internal checks derive from it
             db.query_db_ = ro;
         } else {
             spdlog::warn("EchoDatabase: read-only query connection unavailable ({}); "
@@ -1366,16 +1412,10 @@ EchoStats EchoDatabase::stats() {
         }
     }
 
-    // DB size (page_count * page_size)
+    // DB size: used pages (free pages are reusable) plus the WAL file.
     {
-        const char* sql =
-            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()";
-        sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) == SQLITE_ROW)
-                s.db_size_bytes = sqlite3_column_int64(stmt.get(), 0);
-        }
+        const StorageBytes sb = storage_bytes_locked();
+        s.db_size_bytes = sb.data_bytes() + sb.wal_bytes;
     }
 
     // Retention days from config
@@ -1462,9 +1502,23 @@ EchoDatabase::try_get_state(const std::string& collector) {
     return std::optional<std::string>{}; // succeeded, no row
 }
 
+// A standalone (non-transactional) write must not join a transaction that an exception unwound
+// past on this connection: it would report success and then be discarded by the ROLLBACK that
+// EchoPlugin::fail_internal runs once it re-takes mu_. Every BEGIN site holds mu_ for its whole
+// span, so an open transaction seen by a caller that has just taken mu_ is abandoned by
+// definition. Refuse; the caller reports the failure and the next attempt lands.
+bool EchoDatabase::refuse_open_transaction_locked(const char* what) const {
+    if (sqlite3_get_autocommit(db_) != 0)
+        return false;
+    spdlog::warn("EchoDatabase::{} refused: a transaction left open on the write connection is "
+                 "about to be rolled back",
+                 what);
+    return true;
+}
+
 bool EchoDatabase::set_state(const std::string& collector, const std::string& json) {
     std::lock_guard lock(mu_);
-    if (!db_)
+    if (!db_ || refuse_open_transaction_locked("set_state"))
         return false;
     return upsert_state_locked(db_, collector, json);
 }
@@ -1476,7 +1530,10 @@ bool EchoDatabase::upsert_state_locked(sqlite3* db, const std::string& collector
         VALUES (?, ?, ?)
         ON CONFLICT(collector) DO UPDATE SET state_json = excluded.state_json,
                                              updated_at = excluded.updated_at
+        WHERE echo_state.state_json IS NOT excluded.state_json
     )";
+    // The WHERE makes an identical snapshot a true no-op: no page is dirtied, so a quiet
+    // source stops writing a WAL frame per tick. Nothing reads updated_at.
 
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr);
@@ -2100,6 +2157,8 @@ std::string EchoDatabase::get_config(const std::string& key, const std::string& 
 
 bool EchoDatabase::set_config(const std::string& key, const std::string& value) {
     std::lock_guard lock(mu_);
+    if (!db_ || refuse_open_transaction_locked("set_config"))
+        return false;
     return set_config_locked(key, value);
 }
 
@@ -2224,8 +2283,9 @@ std::expected<int, std::string> EchoDatabase::purge_source(const std::string& so
 
     // registry (PR11.8): registry_live is not the only place the source keeps
     // captured content. Each root's BASELINE (`registry:<root>` echo_state rows)
-    // holds rendered values, and the CURSOR row holds the rendered old and new values
-    // of changes still waiting for their attribution to settle. Erase them all in THIS
+    // holds each value's type, size and hash (an older build also kept a rendered prefix),
+    // and the CURSOR row holds the rendered new value of changes still waiting for their
+    // attribution to settle. Erase them all in THIS
     // transaction, or a purge that the operator expects to be permanent leaves the very
     // values it removed. The cursor erase also means the next collect is a fresh
     // Baseline (zero rows), never a diff against a baseline that no longer exists.
@@ -3553,6 +3613,164 @@ bool EchoDatabase::execute_sql_range(const std::string& sql, int64_t from, int64
         return false;
     }
     return true;
+}
+
+// ── Storage budget primitives ───────────────────────────────────────────────
+
+StorageBytes EchoDatabase::storage_bytes() {
+    std::lock_guard lock(mu_);
+    return storage_bytes_locked();
+}
+
+StorageBytes EchoDatabase::storage_bytes_locked() {
+    StorageBytes out{};
+    if (!db_)
+        return out;
+
+    const char* sql = "SELECT (SELECT page_count FROM pragma_page_count()), "
+                      "(SELECT freelist_count FROM pragma_freelist_count()), "
+                      "(SELECT page_size FROM pragma_page_size()), "
+                      "(SELECT auto_vacuum FROM pragma_auto_vacuum())";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
+        StmtPtr stmt(raw_stmt);
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            out.page_count = sqlite3_column_int64(stmt.get(), 0);
+            out.freelist_count = sqlite3_column_int64(stmt.get(), 1);
+            out.page_size = sqlite3_column_int64(stmt.get(), 2);
+            out.auto_vacuum = sqlite3_column_int64(stmt.get(), 3);
+            out.ok = true;
+        }
+    }
+
+    // The WAL file lives beside the main file; sqlite3_db_filename names the main file only.
+    if (const char* main_file = sqlite3_db_filename(db_, "main"); main_file && *main_file) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(std::string(main_file) + "-wal", ec);
+        if (!ec)
+            out.wal_bytes = static_cast<int64_t>(size);
+    }
+    return out;
+}
+
+std::expected<int64_t, std::string> EchoDatabase::delete_counted(const std::string& sql,
+                                                                 std::string_view counter_key) {
+    int64_t deleted = 0;
+    const auto result = checked_transaction(
+        [&](TransactionHandle& h) -> std::expected<void, std::string> {
+            sqlite3_stmt* raw_stmt = nullptr;
+            if (sqlite3_prepare_v2(h.raw(), sql.c_str(), -1, &raw_stmt, nullptr) != SQLITE_OK) {
+                h.fail(sqlite3_errmsg(h.raw()));
+                return std::unexpected(h.error());
+            }
+            StmtPtr stmt(raw_stmt);
+            // RETURNING rows are the count (never sqlite3_changes(), #1033).
+            int64_t rows = 0;
+            int rc = SQLITE_OK;
+            while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW)
+                ++rows;
+            if (rc != SQLITE_DONE) {
+                h.fail(sqlite3_errmsg(h.raw()));
+                return std::unexpected(h.error());
+            }
+            stmt.reset(); // finalize before the bump so no statement is pending at COMMIT
+
+            if (rows > 0) {
+                const std::string n = std::to_string(rows);
+                const std::string key{counter_key};
+                sqlite3_stmt* raw_bump = nullptr;
+                if (sqlite3_prepare_v2(
+                        h.raw(),
+                        "INSERT INTO echo_config (key, value) VALUES (?1, ?2) "
+                        "ON CONFLICT(key) DO UPDATE SET "
+                        "value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)",
+                        -1, &raw_bump, nullptr) != SQLITE_OK) {
+                    h.fail(sqlite3_errmsg(h.raw()));
+                    return std::unexpected(h.error());
+                }
+                StmtPtr bump(raw_bump);
+                sqlite3_bind_text(bump.get(), 1, key.c_str(), static_cast<int>(key.size()),
+                                  SQLITE_STATIC);
+                sqlite3_bind_text(bump.get(), 2, n.c_str(), static_cast<int>(n.size()),
+                                  SQLITE_STATIC);
+                if (sqlite3_step(bump.get()) != SQLITE_DONE) {
+                    h.fail(sqlite3_errmsg(h.raw()));
+                    return std::unexpected(h.error());
+                }
+            }
+            deleted = rows;
+            return {};
+        });
+    if (!result)
+        return std::unexpected(result.error());
+    return deleted;
+}
+
+bool EchoDatabase::incremental_vacuum(int pages) {
+    std::lock_guard lock(mu_);
+    if (!db_ || pages <= 0)
+        return false;
+    SqliteErrMsg err;
+    if (sqlite3_exec(db_, std::format("PRAGMA incremental_vacuum({})", pages).c_str(), nullptr,
+                     nullptr, err.addr()) != SQLITE_OK) {
+        spdlog::warn("EchoDatabase: incremental_vacuum failed: {}", err.text());
+        return false;
+    }
+    return true;
+}
+
+CheckpointResult EchoDatabase::checkpoint(CheckpointMode mode) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return CheckpointResult::kError;
+    // Busy timeout 0 for this call: a TRUNCATE checkpoint that cannot restart the WAL because
+    // a reader (the read-only echo.sql connection) pins it would otherwise sleep for the whole
+    // 5 s timeout with mu_ held, stalling every collector. The caller retries next pass.
+    sqlite3_busy_timeout(db_, 0);
+    const int rc = sqlite3_wal_checkpoint_v2(
+        db_, nullptr,
+        mode == CheckpointMode::kTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE,
+        nullptr, nullptr);
+    sqlite3_busy_timeout(db_, kBusyTimeoutMs);
+    if (rc == SQLITE_OK)
+        return CheckpointResult::kOk;
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED)
+        return CheckpointResult::kBusy;
+    spdlog::warn("EchoDatabase: WAL checkpoint returned {}", rc);
+    return CheckpointResult::kError;
+}
+
+bool EchoDatabase::vacuum_to_incremental() {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return false;
+    SqliteErrMsg err;
+    if (sqlite3_exec(db_, "PRAGMA auto_vacuum=INCREMENTAL", nullptr, nullptr, err.addr()) !=
+        SQLITE_OK) {
+        spdlog::warn("EchoDatabase: VACUUM conversion: auto_vacuum pragma failed: {}", err.text());
+        return false;
+    }
+    if (sqlite3_exec(db_, "VACUUM", nullptr, nullptr, err.addr()) != SQLITE_OK) {
+        spdlog::warn("EchoDatabase: VACUUM failed: {}", err.text());
+        return false;
+    }
+    return true;
+}
+
+void EchoDatabase::rollback_open_transaction() noexcept {
+    try {
+        std::lock_guard lock(mu_);
+        sqlite3* db = db_;
+        if (!db || sqlite3_get_autocommit(db) != 0)
+            return;
+        const int rc = sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (rc == SQLITE_OK)
+            spdlog::warn("EchoDatabase: rolled back a transaction left open by an exception");
+        else
+            spdlog::warn("EchoDatabase: ROLLBACK after an exception failed (rc={})", rc);
+    } catch (...) {
+        // noexcept containment: a failed lock or log must not escape the catch handler.
+    }
 }
 
 } // namespace yuzu::echo

@@ -1270,16 +1270,38 @@ CREATE TABLE guardian_agent_rule_status (
     agent_id TEXT NOT NULL,
     rule_id TEXT NOT NULL REFERENCES guaranteed_state_rules(rule_id) ON DELETE CASCADE,
     state TEXT NOT NULL, updated_at TEXT NOT NULL,
+    -- schema v4 (#5690): the ordering tuple of the applied event, the high-water mark of
+    -- the keys seen, the highest arrival sequence processed (seq_hwm, including events retired as seen), the database time at which the mark last rose (hwm_recv_ns, which bounds a clock-behind freeze to one hour), and the sticky flag. NULL key_ns / ingest_seq = a row written before v4.
+    key_ns BIGINT, ingest_seq BIGINT, ts_hwm BIGINT, seq_hwm BIGINT, hwm_recv_ns BIGINT,
+    order_uncertain BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (agent_id, rule_id)
 );
 CREATE INDEX idx_gars_rule ON guardian_agent_rule_status(rule_id);
+
+-- guaranteed_state_events gains (schema v4): ingest_seq BIGINT GENERATED ALWAYS AS IDENTITY
+-- (CACHE 1 NO CYCLE) with a UNIQUE index idx_gse_ingest_seq; proj_key BIGINT (NULL = pre-v4
+-- event, 0 = unusable key); proj_key_capped BOOLEAN; projection_pending BOOLEAN. The partial
+-- index idx_gse_pending ON (rule_id, agent_id) WHERE projection_pending serves the pair lock,
+-- the readers and delete_rule.
 ```
 
 The census row is written in the same transaction as the event that causes it, under its own
 savepoint (`census_upsert`). A refused write (rule deleted) or a failed write rolls back to that
 savepoint and neither failure discards the event; a failed write other than the foreign-key refusal
-is counted on `yuzu_server_guardian_census_proj_failures_total`. Redelivery of an event that is already stored
-returns before the census write and does not repair the census.
+is counted on `yuzu_server_guardian_census_proj_failures_total`. The row keeps the verdict with the greatest
+ordering tuple `(key, ingest_seq)`, the key being the agent stamp limited to receipt plus 300 s (one flagged
+exception: a later arrival with a usable key below the high-water mark takes the row once the mark has been
+stale for an hour of database time); an event whose
+census write failed stays stored with `projection_pending`, and a redelivery of it repairs the census from its
+stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Under one `census_upsert`
+savepoint a writer locks every pending event of the pair in `ingest_seq` order in one statement, then the census
+row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
+event-row waits of single-event ingest, repair and `delete_rule` are acyclic; the batch path (no production
+caller) carries no such guarantee. Every census read that returns per-pair state, or a rollup of it, discloses
+`order_uncertain` and `projection_pending` (or `uncertain_rules`), with one named exception: the device-compliance
+read covers represented pairs only and does not yet report them. A pending event whose pair has no census row is
+visible only on `yuzu_server_guardian_census_pending_events`. See the user manual's Compliance overview for the
+operator-facing contract.
 
 ### 9.2 REST API endpoints
 
@@ -3084,7 +3106,7 @@ heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 | lifecycle backpressure drop | a lifecycle entry was rejected at outbox enqueue for capacity (a staging loss, distinct from `stage_dropped`) | `guardian_journal_backpressure_drops` | integrity gap, alert |
 | drain/send exception | a per-entry drain send threw; the head is retained and that log's drain stops | `guardian_drain_exceptions` / `guardian_send_exceptions` | integrity gap, alert |
 | send stall / orphan-exception (#3953) | a `GuardianOutboxSendExecutor` send (either lane) exceeded its stall threshold before completing/reclaiming, or a reclaimed orphan's result was a thrown exception discarded for lack of anywhere correct to attribute it | `guardian_send_stalls` / `guardian_send_orphan_exceptions` | monitor (stall); diagnostic, not a loss (orphan-exception) |
-| cross-lane order-hold release (#3972) | a lane held behind the other lane's older entry waited out the hold and was permitted to overtake a bounded number of entries; events may have reached the stream out of enqueue order (counted at hold expiry, even if the call launches nothing) | `guardian_send_order_hold_releases` | monitor (not a loss; the data-integrity risk, a false server-side `compliant` via the same-second tie, is #5690, open) |
+| cross-lane order-hold release (#3972) | a lane held behind the other lane's older entry waited out the hold and was permitted to overtake a bounded number of entries; events may have reached the stream out of enqueue order (counted at hold expiry, even if the call launches nothing) | `guardian_send_order_hold_releases` | monitor (not a loss; the data-integrity risk, a false server-side `compliant` via the same-second tie, is #5690: the census now flags such a pair `order_uncertain`) |
 
 Two related counters are reported alongside but are **not** journal loss channels:
 `guardian_sweep_exceptions` (a firewalled convergence-sweep throw — drift

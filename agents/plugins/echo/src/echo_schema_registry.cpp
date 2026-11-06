@@ -111,10 +111,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "GetExtendedTcpTable / GetExtendedUdpTable — polled at the "
                  "fast collector interval. ETW Microsoft-Windows-Kernel-Network "
                  "is planned (capture_method='etw') for sub-second connect/close "
-                 "fidelity; not yet wired."},
+                 "fidelity; not yet wired. Sockets first seen already closing "
+                 "(TIME_WAIT and the like) are recorded once per hour per "
+                 "process/remote."},
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/net/{tcp,tcp6,udp,udp6}. Connection lifetime "
-                 "below the fast interval may be missed."},
+                 "below the fast interval may be missed. Sockets first seen "
+                 "already closing (TIME_WAIT and the like) are recorded once "
+                 "per hour per process/remote."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "nstat",
                  "PRIMARY tcp-lifecycle source: com.apple.network.statistics "
                  "kctl (nstat) SRC_ADDED/SRC_REMOVED, the same client the "
@@ -260,10 +264,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "is the recommended successor for new code but is not yet wired."},
                 {"linux",   OsSupportStatus::kSupportedConstrained, "utmp",
                  "Reads /var/run/utmp via getutent. Containers running with "
-                 "no /var/run/utmp produce no events. logon_type is inferred "
-                 "from tty name (pts/* -> remote)."},
+                 "no /var/run/utmp produce no events. logon_type is remote "
+                 "when ut_host is set and is not an X display (:...)."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "utmpx",
-                 "getutxent. logon_type inferred from tty (ttys* -> remote). "
+                 "getutxent. logon_type is remote when ut_host is set and is "
+                 "not an X display (:...). "
                  "GUI logins are not always reflected in utmpx."},
             },
             .granularities = {
@@ -539,8 +544,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "keyword 0x40, events 5/6) on a dedicated ETW session; driver "
                  "loads surface as kernel image-loads (System pid). Signing is "
                  "verified out-of-band at drain on a no-reparse handle (WinVerifyTrust "
-                 "+ the verification-chain signer, cached); an image on a network path "
-                 "or behind a symlink/junction is never verified and reads unknown. "
+                 "+ the verification-chain signer, cached; catalog lookup "
+                 "(CryptCATAdmin) when there is no embedded signature); an image on a "
+                 "network path or behind a symlink/junction is never verified and reads "
+                 "unknown. Ordinary loads are stored once per hour per "
+                 "loader/module/folder; unloads are not stored. "
                  "module_dir is scrubbed of user-profile prefixes "
                  "before storage. CodeIntegrity/Operational (3033/3034) blocked-load "
                  "overlay is M3."},
@@ -945,7 +953,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
         },
 
         // ── power (cursor-model seam, echo_cursor.hpp) — sleep/wake/AC-power
-        // transitions. LIVE TIER ONLY, no rollups (P-008 — a mirror/aggregate
+        // transitions. RAW CAPTURE ROWS ONLY, no rollups (P-008 — a mirror/aggregate
         // shape was contradictory for a low-volume host-lifecycle source;
         // netconn's live-only shape is the precedent). Replay idempotence via
         // the UNIQUE record_key index below (echo_cursor.hpp rule 3), not
@@ -999,7 +1007,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
 
         // ── removable (cursor-model seam, echo_cursor.hpp) — removable-media
         // attach/detach transitions, plus exec_from_removable correlation
-        // (process_enum.hpp's ProcessInfo::exec_path, P-004). LIVE TIER ONLY,
+        // (process_enum.hpp's ProcessInfo::exec_path, P-004). RAW CAPTURE ROWS ONLY,
         // no rollups (P-008, same rationale as power above). `image_path` +
         // `pid` are typed identity-adjacent columns (P-004) — `evidence` and
         // `record_key` are forensic/value fields only, never identity
@@ -1060,16 +1068,21 @@ const std::vector<CaptureSourceDef>& build_sources() {
         },
         // ── registry (cursor-model seam, echo_cursor.hpp) — registry value and key
         // changes under a curated persistence/policy watch list (HKLM and each
-        // loaded HKU hive): what changed, with its old and new value. LIVE TIER
-        // ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
-        // RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
+        // profile hive, loaded or not): what changed, with its new value and the old value's type
+        // and size. Raw capture rows only, no rollups (P-008, same rationale as power above).
+        // Mechanism: a RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
         // (echo_state `registry:<root>`) say WHAT changed; a write-only
         // Kernel-Registry ETW session says WHO, by correlation on value name, type,
         // size and time window. actor_pid / actor_image hold the correlated writer
         // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
-        // says why (attr:corr | ambiguous | none | degraded | off | lost-restart).
-        // Values are stored UNMASKED: `data`/`prev_data` are readable through
-        // echo.sql. Retention is a row count.
+        // says why (attr:corr | ambiguous | none | degraded | off | lost-restart | offline).
+        // A logged-off user's hive is mounted through the guarded offline-hive ladder and
+        // read on the hourly tick (every 12 slow ticks: hourly at the default 300 s; also on
+        // first sight, after a re-enable, and while a read is capped or owed a retry): those
+        // rows carry source=offline and attr:offline, never a writer.
+        // Values are stored UNMASKED: `data` (the new value) is readable through echo.sql;
+        // `prev_data` is empty, the old value's type and size are kept instead. Retention is
+        // a row count.
         // Replay idempotence via the UNIQUE record_key index below.
         {
             .name = "registry",
@@ -1078,10 +1091,15 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .unique_key_column = "record_key",
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "regnotify+etw",
-                 "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed, old/new "
-                 "value) and a write-only Kernel-Registry ETW session that names the writing "
+                 "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed: the new "
+                 "value up to 512 bytes, and the old value's type and size) and a write-only "
+                 "Kernel-Registry ETW session that names the writing "
                  "process by correlation; cursor-model (echo_cursor.hpp). Without an elevated "
-                 "agent the session cannot open and rows carry attr:off."},
+                 "agent the session cannot open and rows carry attr:off. The per-user roots of "
+                 "logged-off users' unloaded hives are read on the hourly tick (every 12 slow "
+                 "ticks: hourly at the default 300 s), and sooner on first sight, after a "
+                 "re-enable or while a read is capped or owed a retry, through the guarded "
+                 "offline-hive ladder (rows attr:offline)."},
                 {"linux",   OsSupportStatus::kUnsupported, "",
                  "The Windows registry does not exist on this platform."},
                 {"macos",   OsSupportStatus::kUnsupported, "",
@@ -1110,7 +1128,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"prev_data_truncated", "INTEGER"},
                         {"actor_pid",           "INTEGER"}, // 0 = no writer named (see detail)
                         {"actor_image",         "TEXT"},    // '' when no writer is named
-                        {"source",              "TEXT"},    // notify | reconcile
+                        {"source",              "TEXT"},    // notify | reconcile | offline
                         {"observed_at",         "INTEGER"}, // unix ms the read saw it
                         {"detail",              "TEXT"},    // attr:* on a change row; the gap text on a gap
                         {"record_key",          "TEXT"},    // UNIQUE — replay idempotence
@@ -1469,11 +1487,15 @@ bool is_queryable_table(std::string_view real_table_name) {
         // deleting echo.db, which destroys every OTHER source's history too.
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content --
-        // with one exception: the registry cursor row holds, for about one tick, the
-        // rendered old and new values of changes whose writer is not settled yet.
-        // echo_state carries the registry baselines (`registry:<root>`, rendered
-        // values), readable here consistently with registry_live's own unmasked
-        // values; purge_source("registry") erases the table, the cursor row and
+        // with two exceptions: the registry cursor row holds, for about one tick, the
+        // rendered new value of changes whose writer is not settled yet (and the old
+        // value only when the baseline came from an older build), and its
+        // `offline` list holds [sid, ProfileImagePath] (the path names the user) for every
+        // logged-off profile.
+        // echo_state carries the registry baselines (`registry:<root>`: type, size and
+        // a hash per value; an older build also wrote a rendered prefix), readable here
+        // consistently with registry_live's own unmasked values;
+        // purge_source("registry") erases the table, the cursor row and
         // every `registry:%` state row in one transaction.
         std::unordered_set<std::string> s{"echo_state", "echo_config", "echo_cursor"};
         for (const auto& [real, ref] : table_ref_map())

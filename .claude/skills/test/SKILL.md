@@ -51,7 +51,7 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
 - Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
-Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
+Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer/browser-smoke, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
 
 ## Workflow summary
 
@@ -70,7 +70,8 @@ Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
                                  stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / synthetic UAT /
-                                 puppeteer / instructions; e2e-security runs
+                                 puppeteer / browser-smoke /
+                                 instructions; e2e-security runs
                                  alone after the fan-out)
 Phase 6 — Sanitizers            (--full only — dispatched to yuzu-bigtam-linux pool)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
@@ -489,6 +490,22 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
             --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
     fi
 ) &
+
+# Browser smoke — unlike the legacy Puppeteer block above, a failure here is FAIL, not WARN:
+# the script is deterministic (no sleeps; stubbed writes, nothing reaches the stack). It
+# first runs --selftest (a local fixture, no stack: proves each crawl/overflow check can
+# fail; a failing selftest fails the gate), then crawls the shell nav (200 + CSP + no page
+# errors), checks submit-control bounds and runs the stubbed write scenarios. Same SKIP
+# when puppeteer is not installed.
+if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 5 --gate "Browser smoke" \
+        --status SKIP --duration 0 \
+        --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)" &
+else
+    gate_run "Browser smoke" "browser-smoke.log" \
+        "node tests/puppeteer/ui-smoke.mjs --selftest && node tests/puppeteer/ui-smoke.mjs"
+fi
 
 # Instructions content-suite gate — schema-driven REST exerciser.
 # Drives every default-risk (safe + mutating) InstructionDefinition and

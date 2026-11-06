@@ -29,7 +29,8 @@
 #       --tls also covers the OTHER hop, server -> gateway (the privileged command
 #       plane, #5175): the gateway's management listener runs in the production
 #       posture (strict mutual TLS, auth_fun yuzu_gw_authz:check_mgmt_peer/1, and
-#       mgmt_peer_pins naming the server's default leaf), the server is pointed at
+#       mgmt_peer_auth_mode identity with no pin: the server is admitted by the
+#       identity its default leaf carries), the server is pointed at
 #       it with --gateway-command-addr, and the script dispatches commands to the
 #       real agent through the server's REST API: one round trip, then a burst
 #       multiplexed over the server's single management connection. It asserts
@@ -489,7 +490,8 @@ if $USE_TLS; then
     TLS_AGENT_FLAGS="--ca-cert $CA_DIR/default-ca.pem"
     # The command plane: the server forwards every gateway-routed command to the
     # gateway's management listener over mutual TLS, presenting its own default
-    # leaf, which the gateway pins (mgmt_peer_pins, below).
+    # leaf, which the gateway admits by the identity it carries (mgmt_peer_auth_mode,
+    # below; no pin unless YUZU_GW_MGMT_AUTH_MODE=identity_or_pin).
     #
     # The REST per-IP limit (100 requests/s by default) is raised: the burst below
     # is the load under test, and with the default the limiter answers 429 for
@@ -643,6 +645,14 @@ log "Starting Erlang gateway (agents=$GW_AGENT_PORT, upstream=127.0.0.1:$SERVER_
 
 # The sys.config below replaces the release's own (RELX_CONFIG_PATH).
 GW_SYS_CONFIG="$WORK_DIR/gw_sys.config"
+# The management listener's peer authorization (#6016): the shipped mode, identity
+# with no pin, unless the caller asks for the transition mode.
+GW_MGMT_AUTH_MODE="${YUZU_GW_MGMT_AUTH_MODE:-identity}"
+case "$GW_MGMT_AUTH_MODE" in
+    identity)        GW_MGMT_PINS='[]' ;;
+    identity_or_pin) GW_MGMT_PINS="[{cert_file, \"$CA_DIR/default-server.pem\"}]" ;;
+    *) echo "YUZU_GW_MGMT_AUTH_MODE must be identity or identity_or_pin" >&2; exit 2 ;;
+esac
 # Keys shared by both modes.
 GW_COMMON_CFG="
         {upstream_addr, \"127.0.0.1\"},
@@ -663,18 +673,19 @@ if $USE_TLS; then
     # deploy/docker/reference-gateway-sys.config): strict mutual TLS (verify and
     # fail_if_no_peer_cert left at their defaults, which the boot guard requires to
     # be verify_peer / true), auth_fun yuzu_gw_authz:check_mgmt_peer/1, and
-    # mgmt_peer_pins naming the SERVER's default leaf as a `cert_file' pin, the
-    # shipped form: the gateway pins that leaf's SPKI and requires serverAuth. The
-    # gateway's own leaf (a valid certificate of the same CA, serverAuth included)
-    # is therefore NOT admitted on it, which the Common Test suite checks. The mode is the
-    # opt-in transition one (#6016; the shipped configs stay on pin): the server is admitted by the identity its leaf
-    # carries, derived here from the single-certificate default-ca.pem, or by that pin.
+    # the shipped mode (#6016, release N+1): `identity', with NO pin. The server is
+    # admitted by the identity its leaf carries, derived here from the
+    # single-certificate default-ca.pem, and requires serverAuth. The gateway's own
+    # leaf (a valid certificate of the same CA, serverAuth included) carries no such
+    # identity and is therefore NOT admitted on it, which the Common Test suite
+    # checks. YUZU_GW_MGMT_AUTH_MODE=identity_or_pin runs the transition mode
+    # instead, with the SERVER's default leaf also pinned as a `cert_file' pin.
     # It binds loopback; the limits and http2 values are the shipped ones.
     cat > "$GW_SYS_CONFIG" << ERLCFG
 [
     {yuzu_gw, [$GW_COMMON_CFG
-        {mgmt_peer_auth_mode, identity_or_pin},
-        {mgmt_peer_pins, [{cert_file, "$CA_DIR/default-server.pem"}]},
+        {mgmt_peer_auth_mode, $GW_MGMT_AUTH_MODE},
+        {mgmt_peer_pins, $GW_MGMT_PINS},
         {grpc_listeners, [
             #{name => agent,
               service_protos => [agent_pb],
@@ -1226,7 +1237,7 @@ fi
 #   [info] crash: class=exit exception={noproc,{gen_server,call,[yuzu_gw_upstream,...]}}
 # which the gateway emits via its own diagnostic logger when an agent's
 # first registration attempt races the upstream gen_server startup (the
-# agent's retry backoff resolves it cleanly within ~6s). Real Erlang
+# agent's retry backoff resolves it cleanly within seconds: 1-3 s per retry). Real Erlang
 # crashes always emit a `CRASH REPORT` or `=ERROR REPORT` header, or a
 # `Supervisor: ... terminating` line; we match only those, plus any
 # explicit SIGTERM at [error] level.
@@ -1339,8 +1350,8 @@ fi
 # The server dials the gateway's management listener for every command it routes
 # to a gateway-connected agent. That listener is the privileged command plane, so
 # it runs here in the production posture (see the gateway sys.config above):
-# strict mutual TLS, and the server admitted by its identity or its SPKI pin
-# (this rig opts in to identity_or_pin; the shipped configs stay on pin). #5175 was an h2 stream
+# strict mutual TLS, and the server admitted by its identity (no pin: the shipped
+# configs' form; YUZU_GW_MGMT_AUTH_MODE=identity_or_pin adds a pin). #5175 was an h2 stream
 # crash on exactly this call (every SendCommand reached the server as 'Socket
 # closed' with no gRPC status). The commands below go through the server's REST
 # API, so the real server's real gRPC client makes the calls: one round trip, then
@@ -1352,14 +1363,14 @@ MGMT_BURST=300
 MGMT_CONCURRENCY=16
 if $USE_TLS && ! $REUSE_STACK; then
     log ""
-    log "Test Category: server -> gateway management hop (pinned mutual TLS)"
+    log "Test Category: server -> gateway management hop (mutual TLS + peer authorization)"
 
     # Boot facts: the server forwards over mutual TLS to the address it was given,
     # and the gateway's management listener came up with TLS and the pin hook.
     assert_contains "Server forwards commands to the gateway over mutual TLS" \
         "Gateway command forwarding enabled: 127.0.0.1:$GW_MGMT_PORT (mutual TLS)" \
         "$(cat "$SERVER_LOG_PATH" 2>/dev/null || true)"
-    assert_contains "Gateway management listener is up with TLS and the pin auth_fun" \
+    assert_contains "Gateway management listener is up with TLS and the peer-authorization auth_fun" \
         "grpc listener mgmt up on port $GW_MGMT_PORT (tls=true, auth_fun=true" \
         "$(cat "$GATEWAY_LOG_PATH" 2>/dev/null || true)"
     GW_METRICS_BEFORE=$(curl -sf --max-time 5 "http://127.0.0.1:$GW_METRICS_PORT/metrics" 2>/dev/null || echo "")
@@ -1523,7 +1534,7 @@ MGMTPY
         "yuzu_gw_mgmt_auth_rejected_total" "$GW_METRICS_AFTER"
     GW_REJECTED=$(awk '/^yuzu_gw_mgmt_auth_rejected_total/ { sum += $NF } END { print sum + 0 }' \
         <<< "$GW_METRICS_AFTER")
-    assert_eq "Gateway rejected no management call from the pinned server" "0" "${GW_REJECTED%.*}"
+    assert_eq "Gateway rejected no management call from the server" "0" "${GW_REJECTED%.*}"
     # #6016: the gateway admits the server by the identity the C++ server minted onto its leaf
     # (the gateway derives it from the single-certificate CA file). The identity is checked
     # before the pin, so a derivation that differed by a byte would still pass every command
@@ -1542,7 +1553,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════
 # yuzu_gw_real_upstream_SUITE drives the gateway's own upstream modules and gRPC
 # client against THIS stack's server, over the same wire the gateway release
-# uses: pinned mutual TLS under --tls (it presents the gateway leaf, and a
+# uses: authorized mutual TLS under --tls (it presents the gateway leaf, and a
 # non-pinned leaf of the same CA must be refused), plaintext otherwise. It pairs
 # every upstream call site with the real client (#5652) and checks that a
 # registration replay makes the server adopt the existing session (#5653).
@@ -1581,6 +1592,7 @@ if $RUN_GATEWAY_CT; then
         CT_SUITES="$CT_SUITES,yuzu_gw_real_mgmt_SUITE"
         CT_ENV+=(
             "YUZU_REAL_MGMT_STRICT=1"
+            "YUZU_MGMT_AUTH_MODE=$GW_MGMT_AUTH_MODE"
             "YUZU_MGMT_HOST=127.0.0.1"
             "YUZU_MGMT_PORT=$GW_MGMT_PORT"
             "YUZU_MGMT_CACERT=$CA_DIR/default-ca.pem"

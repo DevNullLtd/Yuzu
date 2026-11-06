@@ -9,7 +9,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dylib`); there is no alias, and the agent rejects a leftover `tar` plugin file. See the Echo section of [Upgrading](upgrading.md).
 
 <!-- BEGIN GENERATED: plugin-doc-gen index -->
-71 of 71 plugins document themselves this way; the rest are described in the prose below until their README lands.
+72 of 72 plugins document themselves this way; the rest are described in the prose below until their README lands.
 
 | Plugin | Platforms | What it does | Docs |
 |---|---|---|---|
@@ -47,6 +47,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `license_scan` | ✅ ✅ 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
 | `local_security_policy` | 🟡 🟡 🟡 | Reports local password, lockout and audit policy posture and sudoers content | [README](../../agents/plugins/local_security_policy/README.md) |
 | `mgmt_posture` | 🟡 ✅ 🟡 | Management-plane posture: which plane controls the device (facts only) | [README](../../agents/plugins/mgmt_posture/README.md) |
+| `middleware` | 🟡 🟡 ✅ | Installed middleware inventory from installer metadata (table-driven; IBM MQ) | [README](../../agents/plugins/middleware/README.md) |
 | `msi_packages` | ✅ ✅ ⛔ | Enumerates installed packages and product codes (Windows MSI / macOS pkgutil) | [README](../../agents/plugins/msi_packages/README.md) |
 | `netprobe` | ✅ ✅ ✅ | Active network measurement: ICMP/TCP round-trip time, jitter, loss, and DNS resolution timing to operator-chosen targets | [README](../../agents/plugins/netprobe/README.md) |
 | `netstat` | ✅ ✅ ✅ | Enumerates active network connections and listening sockets | [README](../../agents/plugins/netstat/README.md) |
@@ -66,11 +67,11 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `rdp_control` | ✅ ⛔ ⛔ | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) | [README](../../agents/plugins/rdp_control/README.md) |
 | `registry` | ✅ 🟡 🟡 | Windows Registry -- get, set (six types, verified), delete value, delete key (optionally recursive), enumerate, per-user reads and writes, bulk apply with an undo manifest | [README](../../agents/plugins/registry/README.md) |
 | `remote_access_audit` | 🟡 ✅ 🟡 | SSH inbound-access audit: sshd_config as written, per-account authorized_keys fingerprints, sshd service state; never key comments, option values or paths | [README](../../agents/plugins/remote_access_audit/README.md) |
-| `runtimes` | 🟡 🟡 ✅ | Installed .NET and JVM runtime inventory | [README](../../agents/plugins/runtimes/README.md) |
+| `runtimes` | ✅ ✅ ✅ | Installed .NET, JVM and Python runtime inventory | [README](../../agents/plugins/runtimes/README.md) |
 | `sccm` | ✅ ⛔ ⛔ | Reports SCCM/ConfigMgr client status, version, and site assignment | [README](../../agents/plugins/sccm/README.md) |
 | `script_exec` | ✅ ✅ ✅ | Executes commands and scripts with streaming output (admin-only) | [README](../../agents/plugins/script_exec/README.md) |
 | `services` | ✅ ✅ ✅ | System services — enumerate, query, and configure service startup types | [README](../../agents/plugins/services/README.md) |
-| `shares` | ✅ 🟡 ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
+| `shares` | ✅ ✅ ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
 | `software_actions` | ✅ ✅ ✅ | Lists upgradable packages and counts installed software | [README](../../agents/plugins/software_actions/README.md) |
 | `status` | ✅ ✅ ✅ | Reports agent version, system info, health, modules, connection, switch, and config | [README](../../agents/plugins/status/README.md) |
 | `storage` | ✅ ✅ ✅ | Persistent key-value storage — set, get, delete, list, clear | [README](../../agents/plugins/storage/README.md) |

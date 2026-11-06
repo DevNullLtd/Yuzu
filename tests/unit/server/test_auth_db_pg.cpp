@@ -153,6 +153,20 @@ TEST_CASE("is_store_unavailable classifies StoreBusy as unavailable (#2396)",
     CHECK(is_store_unavailable(AuthDBError::QueryFailed));
     CHECK(is_store_unavailable(AuthDBError::WriteFailed));
     CHECK(is_store_unavailable(AuthDBError::SecretUnavailable));
+    // #6995: a CSPRNG fault keeps its fail-closed 503 mapping. Dropping it from the
+    // helper would turn an MFA enrolment/regeneration entropy fault into a 500 or a
+    // "code rejected" response.
+    CHECK(is_store_unavailable(AuthDBError::EntropyUnavailable));
+    // #6995: the two named predicates split that set. Entropy is the one value that is
+    // fail-closed (is_store_unavailable) but NOT a store fault, so a site that counts store
+    // outages cannot misattribute it.
+    CHECK(yuzu::server::is_entropy_failure(AuthDBError::EntropyUnavailable));
+    CHECK_FALSE(yuzu::server::is_store_fault(AuthDBError::EntropyUnavailable));
+    for (const auto e : {AuthDBError::StoreBusy, AuthDBError::QueryFailed, AuthDBError::WriteFailed,
+                         AuthDBError::SecretUnavailable}) {
+        CHECK(yuzu::server::is_store_fault(e));
+        CHECK_FALSE(yuzu::server::is_entropy_failure(e));
+    }
     // ...and that genuine business outcomes stay OUT of it (never a 503).
     CHECK_FALSE(is_store_unavailable(AuthDBError::UserNotFound));
     CHECK_FALSE(is_store_unavailable(AuthDBError::InvalidCredentials));
@@ -1737,6 +1751,46 @@ TEST_CASE("AuthDB MFA: regenerate refuses a deactivated account (no live codes)"
     // mfa_status on a deactivated account also returns UserNotFound — there is no
     // active row to carry recovery codes, so none were (or could be) reissued.
     CHECK_FALSE(h.db.mfa_status("gone").has_value());
+}
+
+// #4058 residual: a deactivated account's recovery code must not be consumable.
+// remove_user() DELETEs the codes, which would hide the gap, so this deactivates
+// by raw UPDATE and leaves the code rows in place — the out-of-band state the
+// `is_active` guard exists for. The SELECT and the UPDATE both carry the
+// guard; this end-to-end case cannot tell which one acted (the UPDATE-side window
+// between them is not deterministically reachable from a unit test).
+TEST_CASE("AuthDB MFA: recovery code is not consumable on an inactive account (#4058)",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("deadrec", "h", "s", yuzu::server::auth::Role::user).has_value());
+    auto codes = h.db.mfa_regenerate_recovery_codes("deadrec");
+    REQUIRE(codes.has_value());
+    REQUIRE(codes->size() == 10);
+
+    const char* v[] = {"deadrec"};
+    auto exec = [&](const char* sql) {
+        PgResult r{PQexecParams(h.conn.get(), sql, 1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.ok());
+        return r;
+    };
+    exec("UPDATE auth.users SET is_active = FALSE WHERE username = $1");
+
+    // Inactive: a valid, unconsumed code is refused as "no match" (not an error).
+    auto refused = h.db.mfa_consume_recovery_code("deadrec", codes->front());
+    REQUIRE(refused.has_value());
+    CHECK_FALSE(*refused);
+
+    // ...and the row was not burned.
+    auto unconsumed = exec("SELECT COUNT(*) FROM auth.mfa_recovery_codes "
+                           "WHERE username = $1 AND consumed_at IS NULL");
+    CHECK(std::string(PQgetvalue(unconsumed.get(), 0, 0)) == "10");
+
+    // Reactivated: the same code works again (the guard keys on is_active, nothing else).
+    exec("UPDATE auth.users SET is_active = TRUE WHERE username = $1");
+    auto accepted = h.db.mfa_consume_recovery_code("deadrec", codes->front());
+    REQUIRE(accepted.has_value());
+    CHECK(*accepted);
 }
 
 // ── MFA enroll -> verify round trip THROUGH SecretCodec ──────────────────

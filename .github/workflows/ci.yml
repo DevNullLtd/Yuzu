@@ -1627,7 +1627,7 @@ jobs:
       #
       # The OTHER hop, server -> gateway management listener (the privileged command plane, #5175), is
       # covered too, in the production posture: strict mutual TLS, auth_fun
-      # yuzu_gw_authz:check_mgmt_peer/1 and mgmt_peer_pins = the server's default leaf, the server
+      # yuzu_gw_authz:check_mgmt_peer/1 and the server admitted by its identity (mgmt_peer_auth_mode identity, no pin), the server
       # pointed at it with --gateway-command-addr. The script dispatches commands to the real agent
       # through the server's REST API (one round trip, then a 300-command burst over the server's one
       # management connection, each required to return the agent's SUCCESS), and
@@ -1689,6 +1689,21 @@ jobs:
           YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
           YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
         run: bash scripts/test/agent-shutdown-smoke.sh
+
+      # Installs the shipped agent unit under unique runtime names and reads the kernel's
+      # view of the capabilities a process under it holds (needs systemd as PID 1 and
+      # passwordless sudo; a missing precondition fails the step, it never skips). Covers the
+      # ambient CAP_DAC_READ_SEARCH grant, the agent clearing inheritable/ambient so exec'd
+      # children get nothing, and the DMI snapshot helper. Prints no firmware bytes. One leg
+      # is enough: the unit and the agent's capability handling do not vary by compiler or
+      # build type.
+      - name: Agent systemd unit capability check
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        timeout-minutes: 5
+        env:
+          YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
+          YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
+        run: bash scripts/test/agent-unit-capcheck.sh
 
       # Mirror the windows job's upload step so a Linux test failure is
       # diagnosable. meson `--print-errorlogs` truncates per-test output to
@@ -2139,6 +2154,28 @@ jobs:
           Write-Host 'registry leftover check self-test: both decisions hold'
           exit 0
 
+      # #7175: the echo plugin's registry source starts a system-wide real-time ETW session named
+      # YuzuEchoRegistryEtw-<pid>, and a real-time session outlives its process until something stops it, so a test
+      # process that is killed (a meson timeout), crashes or is cancelled leaves one behind. The four runner agents on
+      # this box share one OS identity, so a leaked session is shared state nothing else cleans up. On 2026-11-05 one
+      # for a dead pid was on this box while `echo unit tests` failed on every run (#7173, #7135). This step logs the
+      # session count (the system limit is 64) and stops sessions named Yuzu<letters>Etw-<digits> whose pid is NOT
+      # running, by exact name, so a live job on another runner slot keeps its session. The script never fails the job
+      # (a listing or stop error is a ::warning; a successful stop is annotated too, on purpose, so a leak shows on the
+      # job). Every logman call inside it is killed after 45 s within a 180 s budget, and each step is capped at 5
+      # minutes as a backstop, so a wedged logman cannot hold the runner. The self-test step, by contrast, is allowed to
+      # fail the job: a broken guard should be loud. It proves the decisions without touching a real session. See
+      # scripts/ci/stop-dead-etw-sessions.ps1 and "Leaked ETW sessions" in docs/ci-architecture.md.
+      - name: Self-test the ETW leaked-session cleanup
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./scripts/ci/stop-dead-etw-sessions.ps1 -SelfTest
+
+      - name: Stop ETW sessions leaked by dead Yuzu test processes (pre-test)
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase pre-test
+
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
       # "PG coverage by platform" for the full rationale and the measured
@@ -2225,6 +2262,15 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/ci/check-registry-test-leftovers.ps1 -Scope $env:YUZU_TEST_REGISTRY_SCOPE
+
+      # #7175: the same cleanup after the suite, so a session leaked by THIS job's killed or crashed test process is
+      # stopped now and logged against this job, not left for the next one. always(): a cancelled job still runs it.
+      # Dead-pid sessions only, so a concurrent job's live session is untouched; never fails the job.
+      - name: Stop ETW sessions leaked by dead Yuzu test processes (post-test)
+        if: always()
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase post-test
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
       # debug-only (exclude: above), so PR coverage is unaffected. k=2 was

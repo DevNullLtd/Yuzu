@@ -87,7 +87,8 @@
 # non-ASCII character in a scanned HELP literal, or a scan error (a missing or
 # unreadable scan target, an unsupported Erlang construct, no gateway
 # {help, ...} tuple found) -- or the selftest failed; 2 = usage error, or no
-# working python interpreter.
+# working python interpreter. An uncaught Python exception (a traceback) also
+# exits 1, so a red run with a traceback is a bug in the lint, not a finding.
 
 set -euo pipefail
 

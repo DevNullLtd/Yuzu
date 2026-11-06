@@ -36,7 +36,12 @@
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_forced_csprng_failure.hpp"
+#include "test_pg_fault_triggers.hpp"
+#include "source_scan.hpp"
+#include "../../../server/core/src/mfa_entropy_signal.hpp"
 #include "pg/pg_raii.hpp"
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -46,15 +51,19 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -102,6 +111,9 @@ struct AuthRoutesHarness {
     // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
     // closed without it), built on the same pool: the production composition.
     std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
+    // #6995: the registry the MFA counters land in. Declared BEFORE auth_mgr, which holds a raw
+    // pointer to it, so it is destroyed after.
+    yuzu::MetricsRegistry metrics;
     // Declared AFTER auth_db and rbac_guard on purpose: it borrows both, so it must be destroyed
     // first (members are destroyed in reverse order of declaration).
     auth::AuthManager auth_mgr{};
@@ -138,6 +150,7 @@ struct AuthRoutesHarness {
         cfg.https_enabled = false; // no Secure cookie suffix
 
         auth_mgr.load_config(cfg.auth_config_path);
+        auth_mgr.set_metrics_registry(&metrics);
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
         REQUIRE(auth_mgr.upsert_user("alice", "alicepassword1", auth::Role::user));
         // Mirror users into AuthDB so verify_password's "still active in
@@ -365,8 +378,9 @@ TEST_CASE("POST /login for an ENROLLED user with an unreadable MFA secret fails 
     // backoff hint — a Retry-After header AND a retry_after_ms body field — so
     // a client/LB backs off instead of hammering a degraded store. (The
     // reason-labelled yuzu_auth_read_degrade_total counter is exercised at the
-    // store layer + server metric wiring; this harness wires no
-    // MetricsRegistry, so the handler's null-guarded increment is inert here.)
+    // store layer + server metric wiring; since #6995 this harness does wire a
+    // MetricsRegistry, and the enrolment-path counters are asserted at the end of
+    // this file.)
     CHECK(res->get_header_value("Retry-After") == "2");
     CHECK(res->body.find(R"("retry_after_ms":2000)") != std::string::npos);
     // No session was minted on ANY path — the terminal auth.login row never
@@ -1851,3 +1865,319 @@ TEST_CASE("POST /login/mfa: an old-password login challenge cannot complete afte
     REQUIRE(fresh);
     CHECK(fresh->status == 202);
 }
+
+// ── #6995: an MFA CSPRNG fault is its own signal, not a store outage ─────────
+//
+// #4763 made these faults fail closed; #6995 makes them countable. AuthDB reports
+// `EntropyUnavailable`, the routes keep the 503 and count
+// `yuzu_secure_random_failure_total{reason=prng_failure,site}` INSTEAD of
+// `yuzu_auth_secret_unavailable_total` / `yuzu_auth_read_degrade_total` (no query failed).
+namespace {
+
+double prng_failures(AuthRoutesHarness& h, const char* site) {
+    return h.metrics
+        .counter("yuzu_secure_random_failure_total", {{"reason", "prng_failure"}, {"site", site}})
+        .value();
+}
+
+double secret_unavailable(AuthRoutesHarness& h, const char* route) {
+    return h.metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", route}}).value();
+}
+
+double read_degrade(AuthRoutesHarness& h, const char* route, const char* reason) {
+    return h.metrics
+        .counter("yuzu_auth_read_degrade_total", {{"route", route}, {"reason", reason}})
+        .value();
+}
+
+} // namespace
+
+TEST_CASE("POST /login enrol-init on a CSPRNG fault: 503, counted as mfa_enroll prng_failure, "
+          "not as a store outage (#6995)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto res = [&] {
+        yuzu::test::ForcedCsprngFailure forced;
+        auto r = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+        // Proves the TOTP-secret draw was reached and consumed the hook, so the 503 below is
+        // the CSPRNG path and not an unrelated earlier failure.
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(res->body.find(R"("otpauth_uri")") == std::string::npos);
+    CHECK(h.count_audits("mfa.enroll.required", "alice") >= 1);
+
+    CHECK(prng_failures(h, "mfa_enroll") == 1.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+    // The misattribution being removed: no store-outage counter moves.
+    CHECK(secret_unavailable(h, "login") == 0.0);
+    CHECK(read_degrade(h, "login", "query_error") == 0.0);
+
+    // Nothing was written: the retry enrols normally.
+    auto retry = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(retry);
+    CHECK(retry->status == 202);
+    CHECK(prng_failures(h, "mfa_enroll") == 1.0);
+}
+
+TEST_CASE("POST /login/mfa/enroll on a recovery-code CSPRNG fault: 503, enrolment rolled back, "
+          "counted as mfa_recovery prng_failure (#6995)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const std::string secret = body.at("secret_base32");
+    const auto code = h.totp_at(secret, 0);
+
+    auto step2 = [&] {
+        yuzu::test::ForcedCsprngFailure forced;
+        auto r = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE(step2);
+    CHECK(step2->status == 503);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") >= 1);
+    CHECK(h.count_audits("auth.login", "alice") == 0);
+
+    CHECK(prng_failures(h, "mfa_recovery") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 0.0);
+
+    // Rolled back: still not enrolled, no recovery codes.
+    auto status = h.auth_db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+    CHECK(status->recovery_codes_remaining == 0);
+}
+
+TEST_CASE("POST /login/mfa/enroll on a store write fault still counts as a store outage, not a "
+          "CSPRNG fault (#6995 control)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const auto code = h.totp_at(body.at("secret_base32"), 0);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult fn{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION test_block_users_update() RETURNS trigger AS $$ "
+            "BEGIN RAISE EXCEPTION 'test-induced write failure'; END; $$ LANGUAGE plpgsql")};
+        REQUIRE(fn.ok());
+        yuzu::server::pg::PgResult trg{PQexec(
+            conn.get(), "CREATE TRIGGER test_block_users_update_trg BEFORE UPDATE ON auth.users "
+                       "FOR EACH ROW EXECUTE FUNCTION test_block_users_update()")};
+        REQUIRE(trg.ok());
+    }
+
+    auto step2 = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 503);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+}
+
+// #6995: the new series must exist from boot (a first scrape and absent() alerts see 0, not a
+// missing series). The harness above creates counters on first use, so it cannot prove this;
+// pin the registration in server.cpp the way the `route="approval"` seed is pinned.
+TEST_CASE("server.cpp pre-seeds the MFA CSPRNG-failure series and route=\"mfa_recovery\" at boot "
+          "(#6995)",
+          "[mfa][routes][auth_routes][wiring]") {
+    // The site and metric names are the wire contract the docs and alerts quote.
+    CHECK(yuzu::server::mfa_entropy::kMetric == "yuzu_secure_random_failure_total");
+    CHECK(yuzu::server::mfa_entropy::kReason == "prng_failure");
+    CHECK(yuzu::server::mfa_entropy::kSiteEnroll == "mfa_enroll");
+    CHECK(yuzu::server::mfa_entropy::kSiteRecovery == "mfa_recovery");
+    // The pre-seed covers EVERY site, not only the two MFA ones (SRE-1): a series first created at
+    // its first fault starts at 1 with no earlier sample, so a lone first fault would not trip
+    // rate(...[5m]) > 0.
+    {
+        const auto& all = yuzu::server::mfa_entropy::kAllSites;
+        CHECK(all.size() == 6);
+        for (const std::string_view want : {"api_token", "api_token_htmx", "device_token",
+                                            "engine_principal", "mfa_enroll", "mfa_recovery"}) {
+            INFO(want);
+            CHECK(std::find(all.begin(), all.end(), want) != all.end());
+        }
+    }
+
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
+
+    // (a) a seeding loop over BOTH sites, using the one header's names.
+    const auto describe = src.find("metrics_.describe(\"yuzu_secure_random_failure_total\"");
+    REQUIRE(describe != std::string::npos);
+    const auto loop = src.find("for (auto site :", describe);
+    REQUIRE(loop != std::string::npos);
+    const auto counter = src.find("metrics_.counter(std::string{mfa_entropy::kMetric}", loop);
+    REQUIRE(counter != std::string::npos);
+    const std::string seeded = src.substr(loop, counter - loop);
+    CHECK(seeded.find("mfa_entropy::kAllSites") != std::string::npos);
+    // The seed carries the reason the handlers count under; a mismatch seeds a different series.
+    const auto seed_end = src.find(");", counter);
+    REQUIRE(seed_end != std::string::npos);
+    CHECK(src.substr(counter, seed_end - counter).find("mfa_entropy::kReason") !=
+          std::string::npos);
+
+    // (b) route="mfa_recovery" is in the secret_unavailable seed loop.
+    const auto su_describe = src.find("metrics_.describe(\"yuzu_auth_secret_unavailable_total\"");
+    REQUIRE(su_describe != std::string::npos);
+    const auto su_loop = src.find("for (auto route :", su_describe);
+    REQUIRE(su_loop != std::string::npos);
+    const auto su_counter =
+        src.find("metrics_.counter(\"yuzu_auth_secret_unavailable_total\"", su_loop);
+    REQUIRE(su_counter != std::string::npos);
+    CHECK(src.substr(su_loop, su_counter - su_loop).find("\"mfa_recovery\"") !=
+          std::string::npos);
+}
+
+// The four token sites still count this metric INLINE (not through mfa_entropy::count), so the
+// kAllSites entries for them are only as good as the call sites. `labels_key` is ORDER-sensitive
+// (Labels is a vector of pairs), so a site rewritten as {site, reason} would silently create a second
+// series next to the pre-seeded one. Pin the ADJACENT `{reason, site}` text, not just the site literal.
+TEST_CASE("every pre-seeded yuzu_secure_random_failure_total token site is still emitted with the "
+          "pre-seeded label order at its call site (#6995)",
+          "[mfa][routes][auth_routes][wiring]") {
+    using yuzu::test::source_scan::comment_free_source;
+    const std::pair<const char*, const char*> kSiteFile[] = {
+        {"rest_api_v1.cpp", "api_token"},        {"mcp_server.cpp", "api_token"},
+        {"rest_api_v1.cpp", "engine_principal"}, {"rest_api_v1.cpp", "device_token"},
+        {"settings_routes.cpp", "api_token_htmx"},
+    };
+    for (const auto& [file, site] : kSiteFile) {
+        INFO(file << " " << site);
+        const std::string needle =
+            std::string("{\"reason\", \"prng_failure\"}, {\"site\", \"") + site + "\"}";
+        CHECK(comment_free_source(file).find(needle) != std::string::npos);
+    }
+}
+
+// The REVERSE direction: a fifth inline site added without touching mfa_entropy_signal.hpp would start
+// at 1 with no earlier sample, reopening the first-fault gap the pre-seed closes (SRE-1). Find EVERY
+// inline `{"reason", "prng_failure"}, {"site", "<x>"}` in server/core/src and require `<x>` to be listed
+// in kAllSites.
+TEST_CASE("every inline yuzu_secure_random_failure_total site in server/core/src is in kAllSites "
+          "(#6995)",
+          "[mfa][routes][auth_routes][wiring]") {
+    namespace fs = std::filesystem;
+    const std::string marker = "{\"reason\", \"prng_failure\"}, {\"site\", \"";
+    const auto& all = yuzu::server::mfa_entropy::kAllSites;
+    std::size_t found = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(YUZU_SERVER_SRC_DIR)) {
+        if (!entry.is_regular_file())
+            continue;
+        const auto ext = entry.path().extension().string();
+        if (ext != ".cpp" && ext != ".hpp")
+            continue;
+        // Cheap prefilter on the raw bytes: only a file that mentions the reason can hold a site.
+        {
+            std::ifstream in(entry.path(), std::ios::binary);
+            std::ostringstream raw;
+            raw << in.rdbuf();
+            if (raw.str().find("prng_failure") == std::string::npos)
+                continue;
+        }
+        const auto rel = fs::relative(entry.path(), YUZU_SERVER_SRC_DIR).generic_string();
+        const std::string& src = yuzu::test::source_scan::comment_free_source(rel);
+        for (auto pos = src.find(marker); pos != std::string::npos;
+             pos = src.find(marker, pos + marker.size())) {
+            const auto start = pos + marker.size();
+            const auto end = src.find('"', start);
+            REQUIRE(end != std::string::npos);
+            const std::string_view site{src.data() + start, end - start};
+            INFO(rel << ": site \"" << site << "\"");
+            CHECK(std::find(all.begin(), all.end(), site) != all.end());
+            ++found;
+        }
+    }
+    // The four token sites (five literals across rest_api_v1.cpp, mcp_server.cpp, settings_routes.cpp
+    // = api_token x2, engine_principal, device_token, api_token_htmx). Guards against the scan going
+    // silent (e.g. the directory macro pointing somewhere empty).
+    CHECK(found >= 5);
+}
+
+TEST_CASE("POST /login enrol-init on a STORE write fault counts a store outage, not a CSPRNG fault "
+          "(#6995 control)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    // Only the TOTP-secret mint changes mfa_totp_secret, so login bookkeeping is unaffected.
+    yuzu::test::block_users_update_when(h.auth_db.dsn(), "NEW.mfa_totp_secret IS DISTINCT FROM OLD.mfa_totp_secret");
+
+    auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    // A real store fault keeps BOTH store counters, exactly as before #6995 ...
+    CHECK(secret_unavailable(h, "login") == 1.0);
+    CHECK(read_degrade(h, "login", "query_error") == 1.0);
+    // ... and never moves the entropy counter. This is the mutation that mattered: if the entropy
+    // test were widened to "any store-unavailable error", a database outage would page as an RNG
+    // failure.
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+}
+
+#ifndef _WIN32
+TEST_CASE("POST /login/mfa/enroll on a recovery-code SALT-draw failure: 503, audited, counted as "
+          "mfa_recovery prng_failure, enrolment rolled back (#6995, was a bare 500)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const auto code = h.totp_at(body.at("secret_base32"), 0);
+
+    auto step2 = [&] {
+        yuzu::test::FailNthSaltDraw fail{1}; // the first recovery code's salt
+        auto r = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(fail.fired());
+        return r;
+    }();
+    // Before the catch in regenerate_recovery_codes_locked the exception escaped to httplib: a bare
+    // 500 with no body, no audit row, no event and no counter.
+    REQUIRE(step2);
+    CHECK(step2->status == 503);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    CHECK_FALSE(step2->body.empty());
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") >= 1);
+    CHECK(h.count_audits("auth.login", "alice") == 0);
+
+    CHECK(prng_failures(h, "mfa_recovery") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 0.0);
+
+    auto status = h.auth_db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+    CHECK(status->recovery_codes_remaining == 0);
+}
+#endif // !_WIN32

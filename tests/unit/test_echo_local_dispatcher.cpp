@@ -14,10 +14,27 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#ifdef _WIN32
+// Before anything that can pull in <windows.h> (it would drag in the old winsock.h): the
+// loopback socket pair in the process-name case below is real Winsock.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <sqlite3.h>
 
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/process_enum.hpp>
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
@@ -25,7 +42,10 @@
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -134,6 +154,39 @@ void make_config_key_unreadable(const fs::path& db_path, const std::string& key)
                     "ELSE value_raw END) VIRTUAL;",
                     key);
     REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+// Run `sql` on a fresh raw connection to the plugin's echo.db (no plugin code) and return the
+// rows as text, NULL as "" (empty for a statement that returns none: the seeding writes below
+// use it too). A second connection to a WAL database sees what the plugin committed.
+std::vector<std::vector<std::string>> raw_sql(const fs::path& db_path, const std::string& sql) {
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &owner.db) == SQLITE_OK);
+    sqlite3_busy_timeout(owner.db, 5000);
+    std::vector<std::vector<std::string>> rows;
+    REQUIRE(sqlite3_exec(
+                owner.db, sql.c_str(),
+                [](void* out, int n, char** vals, char**) {
+                    std::vector<std::string> row;
+                    for (int i = 0; i < n; ++i)
+                        row.emplace_back(vals[i] ? vals[i] : "");
+                    static_cast<std::vector<std::vector<std::string>>*>(out)->push_back(
+                        std::move(row));
+                    return 0;
+                },
+                &rows, nullptr) == SQLITE_OK);
+    return rows;
+}
+
+// `<key>|<value>` line of the plugin's `status` action.
+std::optional<std::string> plugin_status_value(yuzu::agent::LocalDispatcher& d,
+                                               const YuzuPluginDescriptor* desc,
+                                               const std::string& key) {
+    const auto rows = rows_of(d.run(desc, "status").captured);
+    const auto line = row_with_prefix(rows, key + "|");
+    if (!line)
+        return std::nullopt;
+    return line->substr(key.size() + 1);
 }
 
 } // namespace
@@ -419,14 +472,17 @@ TEST_CASE("echo plugin: every source is enabled by default with no stored flag; 
         }
         CHECK(count_containing(rows, "source_disabled") == 0);
 
-        // The registry source's eleven health keys are always present, at their "not
+        // The registry source's fifteen health keys are always present, at their "not
         // running" defaults before any tick has written them.
         for (const char* kv : {"registry_capture_method|none", "registry_watch_roots|0",
                                "registry_watch_roots_unarmed|0", "registry_roots_unreadable|0",
                                "registry_roots_capped|0", "registry_etw_events|0",
                                "registry_etw_dropped|0", "registry_etw_lost|0",
                                "registry_attr_attributed|0", "registry_attr_ambiguous|0",
-                               "registry_attr_none|0"}) {
+                               "registry_attr_none|0", "registry_offline_roots|0",
+                               "registry_offline_roots_unreadable|0",
+                               "registry_offline_roots_deferred|0",
+                               "registry_offline_discovery_incomplete|0"}) {
             INFO("key=" << kv);
             const auto expected = std::format("config|{}", kv);
             CHECK(row_with_prefix(rows, expected) == std::optional<std::string>{expected});
@@ -471,4 +527,574 @@ TEST_CASE("echo plugin: every source is enabled by default with no stored flag; 
     }
 
     desc->shutdown(ctx.get());
+}
+
+TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status with the budget counters",
+          "[echo][local_dispatcher][budget]") {
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_local_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher d;
+    // Scope-exit: the loaded plugin is a process singleton, so a failed REQUIRE below must not
+    // leave it initialised over a directory the guard is about to remove.
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
+
+    const auto status_value = [&](const std::string& key) {
+        return plugin_status_value(d, desc, key);
+    };
+
+    SECTION("a fresh database reports the default budget and zeroed counters") {
+        CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"262144000"});
+        CHECK(status_value("budget_over_bytes") == std::optional<std::string>{"0"});
+        CHECK(status_value("budget_evicted_raw_rows_total") == std::optional<std::string>{"0"});
+        CHECK(status_value("budget_evicted_hourly_rows_total") == std::optional<std::string>{"0"});
+        CHECK(status_value("db_auto_vacuum") == std::optional<std::string>{"incremental"});
+        CHECK(status_value("module_dedup_overflow_total") == std::optional<std::string>{"0"});
+        CHECK(status_value("tcp_closing_dedup_overflow_total") == std::optional<std::string>{"0"});
+        // db_size_bytes is now used pages + WAL, never zero for an initialised database.
+        const auto size = status_value("db_size_bytes");
+        REQUIRE(size.has_value());
+        CHECK(std::stoll(*size) > 0);
+    }
+
+    SECTION("a value below the minimum or not a whole number is refused and changes nothing") {
+        for (const char* bad : {"33554431", "abc", "-1", "1e9", "32MiB", "0"}) {
+            INFO("value=" << bad);
+            const YuzuParam params[] = {{"db_budget_bytes", bad}};
+            const auto r = d.run(desc, "configure", params);
+            CHECK(r.rc == 1);
+            CHECK(r.captured.find("error|db_budget_bytes must be a whole number of bytes >= 33554432") !=
+                  std::string::npos);
+            CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"262144000"});
+        }
+    }
+
+    SECTION("the minimum is accepted, applied and reported") {
+        const YuzuParam params[] = {{"db_budget_bytes", "33554432"}};
+        const auto r = d.run(desc, "configure", params);
+        CHECK(r.rc == 0);
+        CHECK(r.captured.find("config|db_budget_bytes|33554432") != std::string::npos);
+        CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"33554432"});
+    }
+
+    SECTION("an invalid budget in a request with a valid change rejects the whole request") {
+        const YuzuParam params[] = {{"retention_days", "30"}, {"db_budget_bytes", "5"}};
+        const auto r = d.run(desc, "configure", params);
+        CHECK(r.rc == 1);
+        CHECK(status_value("retention_days") == std::optional<std::string>{"7"}); // nothing written
+    }
+
+    SECTION("a maintenance pass on a small database is a clean no-op for the budget") {
+        const auto r = d.run(desc, "rollup");
+        CHECK(r.rc == 0);
+        CHECK(status_value("budget_over_bytes") == std::optional<std::string>{"0"});
+        CHECK(status_value("budget_evicted_raw_rows_total") == std::optional<std::string>{"0"});
+    }
+
+    SECTION("an unreadable budget setting reads as unknown, not as the default, and the pass is "
+            "skipped") {
+        // An unreadable setting is not "within budget" and not the 250 MiB default: status says
+        // `unknown` for both figures it feeds, and a rollup still succeeds without evicting.
+        make_config_key_unreadable(dir_guard.path / "echo.db", "db_budget_bytes");
+        CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"unknown"});
+        CHECK(status_value("budget_over_bytes") == std::optional<std::string>{"unknown"});
+        const auto r = d.run(desc, "rollup");
+        CHECK(r.rc == 0);
+        CHECK(status_value("budget_evicted_raw_rows_total") == std::optional<std::string>{"0"});
+    }
+}
+
+
+TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts to the byte target, "
+          "converts it to incremental auto_vacuum and publishes the result",
+          "[echo][local_dispatcher][budget]") {
+    // The public-path proof of the plugin-owned budget lifecycle (enforce_budget, the conversion
+    // gate and the post-pass hygiene that do_rollup runs), which the run_budget cases cannot
+    // reach. The loaded plugin is driven through the frozen C ABI, so a test has no seam to shrink
+    // the thresholds: this uses the production constants (a 32 MiB budget leaves a 16 MiB data
+    // target; the conversion wants a 32 MiB freelist) and pays for it in disk, about 55 MiB in the
+    // temp directory. The data is sized past the 32 MiB budget itself (not only its 16 MiB data
+    // target) so that `budget_over_bytes` is non-zero before any pass has run. No clock or timing
+    // assertion, no process. Measured at 0.54 s with `yuzu_agent_tests --durations=yes` on an
+    // Apple M4 (the writes are page-sized zeroblobs on one WAL connection, and three passes run:
+    // one that can evict nothing, one the retention clock guard skips, then the evicting one that
+    // also runs the conversion VACUUM); at
+    // the 3-6x I/O amplification the shared CI runners show under load that is two to three
+    // seconds.
+    constexpr std::int64_t kMiB = 1024 * 1024;
+    constexpr std::int64_t kMinBudget = 32 * kMiB;
+
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_budget_rollup_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    const auto db_path = dir_guard.path / "echo.db";
+
+    // A database as an older build left it: auto_vacuum none, and 16 MiB of pages the plugin will
+    // find free once the pad rows are deleted below (the evicted rows add to them).
+    (void)raw_sql(db_path,
+                  "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
+                  "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 16) "
+                  "INSERT INTO yuzu_test_pad SELECT zeroblob(1048576) FROM n;");
+
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher d;
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
+
+    // Thirty-four ~1 MiB raw tcp rows, 25 to 58 hours old, all below the rollup mark (set to now,
+    // so the preservation contract admits them whatever the clock clamp does): 34 MiB of data,
+    // over the 32 MiB budget and the 16 MiB target. Plus one small row 23 hours old, which the
+    // 24 h floor must keep whatever the mark says. Then free the pad, so the file is mostly
+    // free pages.
+    const auto now = static_cast<std::int64_t>(std::time(nullptr));
+    (void)raw_sql(
+        db_path,
+        std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 33) "
+                    "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,"
+                    "remote_addr,remote_host,remote_port,state,pid,process_name) "
+                    "SELECT {0} - 25 * 3600 - i * 3600, 1, 'connected', 'tcp', '10.0.0.1', i, "
+                    "'203.0.113.1', hex(zeroblob(524288)), 443, 'ESTABLISHED', 1, 'curl' FROM n;"
+                    "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,"
+                    "remote_addr,remote_host,remote_port,state,pid,process_name) "
+                    "VALUES ({0} - 23 * 3600, 1, 'connected', 'tcp', '10.0.0.1', 99, "
+                    "'203.0.113.2', '', 443, 'ESTABLISHED', 1, 'curl');"
+                    "INSERT INTO echo_config (key, value) VALUES ('rollup_tcp_hourly_at', '{0}') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
+                    "DELETE FROM yuzu_test_pad;",
+                    now));
+
+    const std::string budget_text = std::to_string(kMinBudget);
+    const YuzuParam budget_param[] = {{"db_budget_bytes", budget_text.c_str()}};
+    REQUIRE(d.run(desc, "configure", budget_param).rc == 0);
+
+    // Before the pass: nothing evicted, the legacy file is not incremental, and it is over target.
+    const auto size_before = plugin_status_value(d, desc, "db_size_bytes");
+    REQUIRE(size_before.has_value());
+    CHECK(std::stoll(*size_before) > kMinBudget - 16 * kMiB);
+    CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
+          std::optional<std::string>{"0"});
+    CHECK(plugin_status_value(d, desc, "db_auto_vacuum") == std::optional<std::string>{"none"});
+    // The overage is measured when asked, not cached from a pass: this database is over its
+    // budget before any pass has ever run (a gauge that starts at 0 would hide it).
+    const auto over_before = plugin_status_value(d, desc, "budget_over_bytes");
+    REQUIRE(over_before.has_value());
+    CHECK(std::stoll(*over_before) > 0);
+
+    // A pass that can take nothing still reports the overage and evicts nothing: pause tcp (the
+    // exemption keeps its rows), so the only over-budget data is exempt.
+    const YuzuParam pause_tcp[] = {{"tcp_enabled", "false"}};
+    REQUIRE(d.run(desc, "configure", pause_tcp).rc == 0);
+    REQUIRE(d.run(desc, "rollup").rc == 0);
+    CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
+          std::optional<std::string>{"0"});
+    const auto over_paused = plugin_status_value(d, desc, "budget_over_bytes");
+    REQUIRE(over_paused.has_value());
+    CHECK(std::stoll(*over_paused) > 0);
+    const YuzuParam resume_tcp[] = {{"tcp_enabled", "true"}};
+    REQUIRE(d.run(desc, "configure", resume_tcp).rc == 0);
+
+    // A pass whose retention step sees a clock-guard event skips the budget (a clock the guard
+    // distrusts must not drive eviction). run_retention writes its anchor `retention_guard_last_pass`
+    // on every pass; making that one write fail raises a guard failure with no decline. The WHEN
+    // clause leaves the eviction counters' own echo_config writes alone, so a pass that did run
+    // the budget would still evict, and the evicting pass below proves the skip was not a disarm.
+    // The guard counters live in the plugin singleton and survive init/shutdown, so earlier cases in
+    // this process may have moved them: the assertions are on the change this pass makes.
+    const auto guard_value = [&](const std::string& line_prefix) -> std::int64_t {
+        const auto line = row_with_prefix(rows_of(d.run(desc, "status").captured), line_prefix);
+        return line ? std::stoll(line->substr(line_prefix.size())) : 0;
+    };
+    const auto skips_before = guard_value("retention_guard|__budget__|");
+    const auto clock_failures_before = guard_value("retention_guard_failed|__clock_state__|");
+    const auto failures_before = guard_value("retention_guard_failures_total|");
+    const auto declines_before = guard_value("retention_guard_declines_total|");
+
+    (void)raw_sql(db_path,
+                  "CREATE TRIGGER yuzu_test_block_anchor_ins BEFORE INSERT ON echo_config "
+                  "WHEN NEW.key = 'retention_guard_last_pass' "
+                  "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"
+                  "CREATE TRIGGER yuzu_test_block_anchor_upd BEFORE UPDATE ON echo_config "
+                  "WHEN NEW.key = 'retention_guard_last_pass' "
+                  "BEGIN SELECT RAISE(ABORT, 'blocked'); END;");
+    REQUIRE(d.run(desc, "rollup").rc == 0);
+    // The skip is its own line and in neither total: one failure (the anchor write), no decline.
+    CHECK(guard_value("retention_guard|__budget__|") == skips_before + 1);
+    CHECK(guard_value("retention_guard_failed|__clock_state__|") == clock_failures_before + 1);
+    CHECK(guard_value("retention_guard_failures_total|") == failures_before + 1);
+    CHECK(guard_value("retention_guard_declines_total|") == declines_before);
+    CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
+          std::optional<std::string>{"0"});
+    {
+        const auto kept = raw_sql(db_path, "SELECT count(*) FROM tcp_live");
+        REQUIRE(kept.size() == 1);
+        CHECK(kept[0][0] == "35");
+    }
+    (void)raw_sql(db_path, "DROP TRIGGER yuzu_test_block_anchor_ins;"
+                           "DROP TRIGGER yuzu_test_block_anchor_upd;");
+
+    const auto pass = d.run(desc, "rollup");
+    REQUIRE(pass.rc == 0);
+
+    // The evicting pass ends with a TRUNCATE checkpoint, so the WAL file is empty (or gone); a
+    // PASSIVE one would leave the pass's own writes in it.
+    std::error_code wal_ec;
+    const auto wal_size = fs::file_size(fs::path{db_path.string() + "-wal"}, wal_ec);
+    CHECK((wal_ec || wal_size == 0));
+
+    // Eviction ran on the public path and took the raw rows (enforce_budget in do_rollup).
+    CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
+          std::optional<std::string>{"34"});
+    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total") ==
+          std::optional<std::string>{"0"});
+    // Only the 23 h row is left: the 24 h floor holds against a mark of "now".
+    const auto left = raw_sql(db_path, "SELECT count(*) FROM tcp_live");
+    REQUIRE(left.size() == 1);
+    CHECK(left[0][0] == "1");
+
+    // The measured size dropped to within the budget and the overage is published as zero.
+    const auto size_after = plugin_status_value(d, desc, "db_size_bytes");
+    REQUIRE(size_after.has_value());
+    CHECK(std::stoll(*size_after) < std::stoll(*size_before));
+    CHECK(std::stoll(*size_after) <= kMinBudget);
+    CHECK(plugin_status_value(d, desc, "budget_over_bytes") == std::optional<std::string>{"0"});
+
+    // The conversion gate (maybe_vacuum_to_incremental in the same pass): data was under target and
+    // the freelist large, so the one-off VACUUM ran, succeeded and cleared its deferral marker.
+    CHECK(plugin_status_value(d, desc, "db_auto_vacuum") == std::optional<std::string>{"incremental"});
+    const auto deferred =
+        raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'auto_vacuum_deferred_at'");
+    REQUIRE(deferred.size() == 1);
+    CHECK(deferred[0][0] == "0");
+}
+
+namespace {
+
+#ifdef _WIN32
+using SockT = SOCKET;
+using SockLen = int;
+constexpr SockT kNoSock = INVALID_SOCKET;
+void close_sock(SockT s) { ::closesocket(s); }
+#else
+using SockT = int;
+using SockLen = socklen_t;
+constexpr SockT kNoSock = -1;
+void close_sock(SockT s) { ::close(s); }
+#endif
+
+std::uint32_t current_pid() {
+#ifdef _WIN32
+    return static_cast<std::uint32_t>(::GetCurrentProcessId());
+#else
+    return static_cast<std::uint32_t>(::getpid());
+#endif
+}
+
+// Two ESTABLISHED loopback sockets owned by this process: a listener on 127.0.0.1 (kernel-chosen
+// port, so no fixed port), a client connected to it and the accepted end. All in this thread, no
+// process spawned: connect completes in the kernel before accept is called.
+struct LoopbackPair {
+    SockT listener{kNoSock};
+    SockT client{kNoSock};
+    SockT server{kNoSock};
+    int listener_port{0};
+    int client_port{0};
+
+    LoopbackPair() = default;
+    LoopbackPair(const LoopbackPair&) = delete;
+    LoopbackPair& operator=(const LoopbackPair&) = delete;
+    ~LoopbackPair() {
+        for (const SockT s : {server, client, listener})
+            if (s != kNoSock)
+                close_sock(s);
+    }
+
+    [[nodiscard]] bool open() {
+#ifdef _WIN32
+        static const bool winsock_ok = [] {
+            WSADATA wsa;
+            return ::WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+        }();
+        if (!winsock_ok)
+            return false;
+#endif
+        const auto port_of = [](SockT s) {
+            sockaddr_in a{};
+            SockLen len = sizeof a;
+            if (::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) != 0)
+                return 0;
+            return static_cast<int>(ntohs(a.sin_port));
+        };
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1)
+            return false;
+        listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener == kNoSock ||
+            ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
+            ::listen(listener, 1) != 0)
+            return false;
+        listener_port = port_of(listener);
+        addr.sin_port = htons(static_cast<std::uint16_t>(listener_port));
+        client = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (client == kNoSock ||
+            ::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
+            return false;
+        server = ::accept(listener, nullptr, nullptr);
+        client_port = port_of(client);
+        return server != kNoSock && listener_port != 0 && client_port != 0;
+    }
+};
+
+// Blocks until the peer's FIN arrives (recv returns 0), which leaves this end in CLOSE_WAIT. A
+// blocking kernel event, not a poll: nothing is sent on the pair, so 0 can only mean the FIN.
+bool wait_for_peer_fin(SockT s) {
+    char buf[16];
+#ifdef _WIN32
+    return ::recv(s, buf, static_cast<int>(sizeof buf), 0) == 0;
+#else
+    return ::recv(s, buf, sizeof buf, 0) == 0;
+#endif
+}
+
+} // namespace
+
+TEST_CASE("echo plugin: a polled tcp row is named by the process source, and stays unnamed once "
+          "that source is paused",
+          "[echo][local_dispatcher][pidname]") {
+    // The poll legs set a socket's pid but never its process name, so on this host the only thing
+    // that names a stored tcp row is the plugin's pid -> name map (filled from the process poll).
+    // That map is plugin-private behind the frozen C ABI, hence the public path: a real socket
+    // pair owned by this process, one `collect_fast`, and a raw read of what tcp_live stored.
+    //
+    // Why real loopback sockets (the test-efficiency rule asks for the justification): the only
+    // input `collect_fast` takes through the frozen ABI is the OS socket table itself. There is no
+    // seam to hand the loaded .dylib/.so/.dll a fixture connection list (the collector is a free
+    // function the plugin calls directly), so the one way to put a row with THIS pid in front of
+    // the poll leg is to own a socket. Loopback is the cheapest such socket: no network, no DNS
+    // for its own addresses (the collector skips 127.0.0.1), kernel-chosen ports, torn down with
+    // the pair. The remaining host dependence is the collector's reverse-DNS pass over whatever
+    // OTHER sockets the host has open, bounded by its 3 s per-snapshot budget (the plugin has no
+    // switch to turn it off). The poll leg is the path for an unprivileged macOS user and for
+    // Linux and Windows always; as root on macOS the nstat stream becomes the primary tcp source
+    // and bypasses the poll leg, so the case is skipped there rather than asserting on a path
+    // the host would not take.
+#ifdef __APPLE__
+    if (::geteuid() == 0) {
+        WARN("running as root on macOS: nstat is the primary tcp source and the poll leg under "
+             "test is bypassed -- skipping");
+        return;
+    }
+#endif
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_pidname_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    const auto db_path = dir_guard.path / "echo.db";
+    yuzu::agent::LocalDispatcher d;
+
+    // The loaded plugin instance outlives init/shutdown in this process and its source-health
+    // ledger is not reset by init, so whatever happens below the process source must be left
+    // reporting an enabled token (a later case reads `status` and expects no source_disabled in
+    // it) and the plugin shut down. Scope-exit, so a failed REQUIRE after the pause cannot leave
+    // the singleton paused for the rest of the run. CHECK only: this runs during unwind.
+    const YuzuParam resume[] = {{"process_enabled", "true"}};
+    const yuzu::test::ScopeExit restore_process_source{[&] {
+        CHECK(d.run(desc, "configure", resume).rc == 0);
+        (void)d.run(desc, "collect_fast");
+        desc->shutdown(ctx.get());
+    }};
+
+    // The name the process enumeration reports for this very process: what the poll seeds the map
+    // with, so it is the name a correctly named row must carry.
+    std::string expected;
+    for (const auto& p : yuzu::agent::enumerate_processes())
+        if (p.pid == current_pid())
+            expected = p.name;
+    if (expected.empty()) {
+        // A sandbox or container that denies process listing: the poll could not have named
+        // this process either, so the case has nothing to check. Same idiom as the root skip.
+        WARN("process enumeration cannot name this process -- skipping (restricted environment)");
+        return;
+    }
+
+    // The client end of a pair: the row whose local port is the client's and whose remote port
+    // is the listener's.
+    const auto stored_row = [&](const LoopbackPair& pair) {
+        return raw_sql(db_path,
+                       std::format("SELECT process_name, pid FROM tcp_live WHERE local_port = {} "
+                                   "AND remote_port = {}",
+                                   pair.client_port, pair.listener_port));
+    };
+
+    LoopbackPair first;
+    REQUIRE(first.open());
+    {
+        const auto r = d.run(desc, "collect_fast");
+        INFO(r.captured);
+        const auto rows = stored_row(first);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0][0] == expected);
+        CHECK(rows[0][1] == std::to_string(current_pid()));
+    }
+
+    // A confirmed disable forgets the map: a socket opened afterwards is stored unnamed rather
+    // than under a name the paused source would no longer have learned.
+    const YuzuParam pause[] = {{"process_enabled", "false"}};
+    REQUIRE(d.run(desc, "configure", pause).rc == 0);
+    LoopbackPair second;
+    REQUIRE(second.open());
+    {
+        const auto r = d.run(desc, "collect_fast");
+        INFO(r.captured);
+        const auto rows = stored_row(second);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0][0].empty());
+        CHECK(rows[0][1] == std::to_string(current_pid()));
+    }
+}
+
+TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on the next tick, not "
+          "lost to the hourly de-duplication",
+          "[echo][local_dispatcher][closing_dedup]") {
+    // A socket first seen already closing is recorded once per hour per (process, remote). The
+    // hour's seen-set must advance only when the rows commit: a tick whose insert fails persists
+    // neither the rows nor the baseline, so the next tick re-derives the same first sighting and
+    // must still record it. A seen-set committed before the insert would swallow that row for the
+    // rest of the hour. The set is plugin-private behind the frozen C ABI, so the case drives the
+    // public path: an accepted socket in CLOSE_WAIT, a trigger that fails the first tick's insert,
+    // then a second tick.
+    //
+    // Real loopback sockets, as in the process-name case above: the only input collect_fast takes
+    // is the OS socket table, and a socket pair owned by this process is the cheapest way to put a
+    // closing socket in front of it. No process, no timing assumption (the CLOSE_WAIT state is
+    // reached by a blocking recv for the peer's FIN). As root on macOS the nstat stream is the
+    // primary tcp source and bypasses the poll leg under test, so the case is skipped there.
+#ifdef __APPLE__
+    if (::geteuid() == 0) {
+        WARN("running as root on macOS: nstat is the primary tcp source and the poll leg under "
+             "test is bypassed -- skipping");
+        return;
+    }
+#endif
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_closing_dedup_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    const auto db_path = dir_guard.path / "echo.db";
+    yuzu::agent::LocalDispatcher d;
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
+
+    // A sandbox or container that denies process listing also denies the collector sight of this
+    // process's sockets: nothing to check there. Same idiom as the process-name case.
+    bool lists_own_process = false;
+    for (const auto& p : yuzu::agent::enumerate_processes())
+        if (p.pid == current_pid())
+            lists_own_process = true;
+    if (!lists_own_process) {
+        WARN("process enumeration cannot see this process -- skipping (restricted environment)");
+        return;
+    }
+
+    // The accepted end becomes CLOSE_WAIT once the client closes and its FIN has arrived; that
+    // end still has an fd here, so both the macOS fd walk and the Linux inode map keep it.
+    LoopbackPair pair;
+    REQUIRE(pair.open());
+    close_sock(pair.client);
+    pair.client = kNoSock;
+    REQUIRE(wait_for_peer_fin(pair.server));
+
+    // The accepted end's row: local port is the listener's, remote port the client's.
+    const auto closing_rows = [&] {
+        return raw_sql(db_path, std::format("SELECT state FROM tcp_live WHERE local_port = {} AND "
+                                            "remote_port = {}",
+                                            pair.listener_port, pair.client_port));
+    };
+
+    (void)raw_sql(db_path, "CREATE TRIGGER yuzu_test_block_tcp BEFORE INSERT ON tcp_live "
+                           "BEGIN SELECT RAISE(ABORT, 'blocked'); END;");
+    {
+        const auto r = d.run(desc, "collect_fast");
+        INFO(r.captured);
+        CHECK(r.rc == 1);
+    }
+    CHECK(closing_rows().empty());
+    (void)raw_sql(db_path, "DROP TRIGGER yuzu_test_block_tcp;");
+
+    {
+        const auto r = d.run(desc, "collect_fast");
+        INFO(r.captured);
+        CHECK(r.rc == 0);
+    }
+    const auto rows = closing_rows();
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0][0] == "CLOSE_WAIT");
 }

@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <format>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -91,7 +92,16 @@ void RegistryCursorSource::start(EchoDatabase& db) {
     // ones, and the force_all_ reconcile reads) finalises as lost-restart.
     events_since_ = reader_.now_ts();
     last_query_ts_ = events_since_;
-    ensure_watch(scope_.roots_for(reader_.loaded_sids()));
+    try {
+        ensure_watch(scope_.roots_for(reader_.loaded_sids()));
+    } catch (const IncompleteCaptureError& e) {
+        // A partial list would arm a partial watch: arm nothing here. The first collect()
+        // enumerates again (a restart's force_all_, a fresh baseline or the empty list all
+        // force it) and, if that also fails, keeps the cursor and retries.
+        spdlog::warn("Echo registry: the loaded user hives could not be listed at start-up ({}); "
+                     "their watches arm on the first tick that can list them",
+                     e.what());
+    }
 }
 
 void RegistryCursorSource::stop() noexcept {
@@ -153,7 +163,8 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                     "contract)",
                now, snapshot_id));
         const bool rebaseline_all = fresh || (gap_pending && cause == GapCause::Disabled);
-        const bool reconcile = (cur.tick % kReconcileEveryTicks == 0) || force_all_;
+        const bool hourly = cur.tick % kReconcileEveryTicks == 0;
+        const bool reconcile = hourly || force_all_;
 
         // The loaded user hives: re-enumerated on a name-watch signal, a reconcile
         // tick or a re-baseline, otherwise the cursor's list stands.
@@ -162,12 +173,83 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         std::vector<std::string> sids = cur.hku;
         if (hku_changed || reconcile || rebaseline_all || sids.empty())
             sids = reader_.loaded_sids();
-        const std::vector<std::string> roots = scope_.roots_for(sids);
-        ensure_watch(roots);
+        // The unloaded profiles, asked for when the loaded list is re-enumerated for a reason
+        // other than being empty (a name-watch mark, the reconcile, a re-baseline), while the
+        // known list is empty, and again while the last walk was incomplete or a known profile
+        // has no path yet (a user who just logged off during an incomplete walk). Re-enumerating
+        // an empty loaded list does not walk by itself. The walk is classified against
+        // THIS tick's `sids`, the one HKU snapshot every decision below uses, so a profile is
+        // offline exactly when it is not in `sids`. An incomplete walk keeps the known list, and
+        // a sid loaded last tick that is not now joins it (reconcile_offline): scope is removed
+        // only when a complete walk shows the profile gone, never because a walk failed.
+        const std::vector<std::string> prev_hku = cur.hku;
+        const std::vector<OfflineProfile> prev_offline = cur.offline;
+        std::vector<OfflineProfile> offline = cur.offline;
+        bool discovery_incomplete = offline_incomplete_;
+        const bool offline_unresolved =
+           offline_incomplete_ ||
+           std::any_of(offline.begin(), offline.end(),
+                       [](const OfflineProfile& o) { return o.path.empty(); });
+        if (hku_changed || reconcile || rebaseline_all || offline.empty() || offline_unresolved) {
+            OfflineDiscovery d = reader_.offline_profiles(sids);
+            offline = reconcile_offline(cur.offline, prev_hku, sids, d);
+            // The ProfileList walk is index-driven: a profile deleted or renamed (X -> X.bak) while
+            // it runs can be skipped though it is healthy, or its `.bak` sibling can be skipped so a
+            // temporary profile's folder is listed alone. A change to a KNOWN profile's scope is
+            // therefore taken only when two walks of this tick agree: a profile is removed only
+            // when two complete walks both omit it (a user who has just logged off included), and
+            // a path first learned or changed for it is adopted only when both walks list the SAME
+            // path, otherwise its previous entry stands (pathless stays pathless and deferred) and
+            // the next tick walks again. An incomplete second walk removes nothing.
+            // `owed` is every profile a walk must still name (reconcile_offline's own `known`, so a
+            // virtual service or system SID that unloaded is not one of them).
+            const auto owed =
+               reconcile_offline(cur.offline, prev_hku, sids, OfflineDiscovery{false, {}, {}});
+            const auto find_sid = [](auto& v, const std::string& sid) {
+                return std::find_if(v.begin(), v.end(),
+                                    [&](const OfflineProfile& o) { return o.sid == sid; });
+            };
+            const auto changed = [&](const OfflineProfile& k) {
+                const auto it = find_sid(offline, k.sid);
+                return it == offline.end() || it->path != k.path; // dropped, filled or changed
+            };
+            if (std::any_of(owed.begin(), owed.end(), changed)) {
+                d = reader_.offline_profiles(sids);
+                const auto second = reconcile_offline(cur.offline, prev_hku, sids, d);
+                for (const auto& k : owed) {
+                    const auto p1 = find_sid(offline, k.sid);
+                    const auto p2 = find_sid(second, k.sid);
+                    if ((p1 == offline.end()) == (p2 == second.end()) &&
+                        (p1 == offline.end() || p1->path == p2->path))
+                        continue; // the walks agree: what walk 1 decided stands
+                    if (p1 != offline.end())
+                        *p1 = k; // the walks disagree: the previous entry stands
+                    else
+                        offline.push_back(k);
+                }
+                for (const auto& p : second) // a sid no earlier walk knew: adopt as before
+                    if (find_sid(offline, p.sid) == offline.end())
+                        offline.push_back(p);
+            }
+            discovery_incomplete = !d.complete;
+        } else {
+            std::erase_if(offline, [&](const OfflineProfile& o) {
+                return std::find(sids.begin(), sids.end(), o.sid) != sids.end();
+            });
+        }
+        const std::vector<std::string> live_roots = scope_.roots_for(sids);
+        const std::vector<std::string> roots = scope_.roots_for(sids, offline);
+        // Offline roots are never armed: there is no watch on an unloaded hive.
+        ensure_watch(live_roots);
+        std::set<std::string> offline_sids;
+        for (const auto& o : offline)
+            offline_sids.insert(o.sid);
 
-        // Roots that left scope (a logged-off user): drop their state and shrink the
-        // baseline row, so a logon later re-baselines from scratch, never as a mass
-        // removal of what the unloaded hive "lost".
+        // Roots that left scope -- a profile two COMPLETE walks show gone from the profile list, or
+        // a name that is no longer a profile hive (a logged-off user stays in scope as an offline
+        // root, and a logon diffs against its baseline): drop their state and shrink the baseline
+        // row, so a profile that reappears re-baselines from scratch, never as a mass removal of
+        // what the unloaded hive "lost".
         std::vector<StateWrite> state_writes;
         for (auto it = cur.roots.begin(); it != cur.roots.end();) {
             if (std::find(roots.begin(), roots.end(), it->first) == roots.end()) {
@@ -190,12 +272,33 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
 
         std::vector<RegistryCandidate> fresh_candidates;
         const std::int64_t deadline = now + kSnapshotBudget100ns;
-        const std::size_t n = roots.size();
-        const std::size_t start_idx = n == 0 ? 0 : static_cast<std::size_t>(cur.tick) % n;
-        bool read_any = false;
-        for (std::size_t i = 0; i < n; ++i) {
-            const std::string& root = roots[(start_idx + i) % n];
-            RegistryRootState& st = cur.roots[root];
+
+        // Live <-> offline transitions. A root that was loaded and is offline now drops its
+        // loaded window_base and consumes its stale notify, so nothing from its loaded life
+        // pins the ETW retention floor (the take is restored on a failed commit, like every
+        // other). A root that was offline and is loaded now is due at once: its first loaded
+        // read diffs against the offline baseline this tick.
+        for (const auto& root : roots) {
+            const std::string sid = hku_sid_of(root);
+            if (sid.empty())
+                continue;
+            const auto sit = cur.roots.find(root);
+            if (is_offline_root(root, offline_sids)) {
+                if (std::find(prev_hku.begin(), prev_hku.end(), sid) != prev_hku.end()) {
+                    if (sit != cur.roots.end())
+                        sit->second.window_base = 0;
+                    rb.taken.emplace_back(root, reader_.dirty->take(root));
+                }
+            } else if (sit != cur.roots.end() &&
+                       std::any_of(prev_offline.begin(), prev_offline.end(),
+                                   [&](const OfflineProfile& o) { return o.sid == sid; }) &&
+                       (sit->second.status == "complete" || sit->second.status == "absent")) {
+                sit->second.status = "due";
+            }
+        }
+
+        // Per-root state reset for a re-baseline or a control-set switch.
+        const auto init_state = [&](const std::string& root, RegistryRootState& st) {
             if (rebaseline_all) {
                 st.baselined = false;
             } else if (ccs_switched && st.baselined &&
@@ -206,6 +309,125 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                    snapshot_id));
                 st.baselined = false;
             }
+        };
+
+        // Everything that follows a read of one root: diff against its baseline, baseline
+        // write, the unreadable / denied-child gap rows, and the root's state. `snap` is the
+        // dirty state consumed before a live read (empty for an offline one); an offline root's
+        // window_base never advances.
+        const auto apply_read = [&](const std::string& root, RegistryRootState& st, SubtreeRead rd,
+                                    std::int64_t read_start, std::int64_t read_end,
+                                    const RegistryDirtyTable::Snap& snap, bool offline_root) {
+            const std::int64_t last_dirty = reader_.dirty->last(root);
+
+            RegistryBaseline base;
+            bool fresh_root = !st.baselined;
+            if (st.baselined && rd.status != RegistryReadStatus::Unreadable) {
+                const auto stored = db.try_get_state(baseline_collector(root));
+                if (!stored)
+                    throw IncompleteCaptureError("Echo registry: baseline read failed: " +
+                                                 stored.error());
+                const auto decoded = decode_registry_baseline(*stored);
+                if (!stored->has_value() || decoded.malformed) {
+                    // The cursor says this root was baselined and the baseline is gone
+                    // or unusable: say so and start it over, rather than diff against
+                    // nothing (which would report the whole subtree as added).
+                    rows.push_back(registry_gap_row(
+                       "baselinelost", root + ":" + std::to_string(now),
+                       "gap:baselinelost:" + root, now, snapshot_id));
+                    fresh_root = true;
+                } else {
+                    base = decoded.baseline;
+                }
+            }
+            // The window the writes behind these candidates fall in; st.window_base (this
+            // root's last COMPLETE read start) is advanced only below, after the diff.
+            const RegistryWindow window = candidate_window(st.window_base, read_end, snap.first,
+                                                           last_dirty, kEtwWindowSlack100ns);
+            DiffResult diff = diff_registry_snapshot(
+               base, rd, root, offline_root ? "offline" : (snap.first != 0 ? "notify" : "reconcile"),
+               window, read_end, fresh_root);
+            for (auto& c : diff.candidates)
+                fresh_candidates.push_back(std::move(c));
+            if (rd.status != RegistryReadStatus::Unreadable && (fresh_root || diff.changed))
+                state_writes.push_back({baseline_collector(root),
+                                        encode_registry_baseline(diff.baseline)});
+
+            // A root that could not be read, or child keys that deny access, are a blind
+            // spot the operator must be able to see: one gap row when the root becomes
+            // unreadable or a child key is newly denied, none while it holds steady, shrinks
+            // or clears. The cursor commits with the row, so a replay cannot lose or
+            // duplicate it.
+            if (rd.status == RegistryReadStatus::Unreadable) {
+                if (st.status != "unreadable") {
+                    std::string detail = "gap:unreadable:" + root +
+                                         " (the root could not be read; its baseline is kept and "
+                                         "nothing is derived for it until it can be)";
+                    if (!rd.reason.empty())
+                        detail += " (" + rd.reason + ")";
+                    rows.push_back(registry_gap_row("unreadable",
+                                                    root + ":" + std::to_string(read_end),
+                                                    std::move(detail), now, snapshot_id));
+                }
+            } else {
+                std::sort(rd.skipped.begin(), rd.skipped.end());
+                rd.skipped.erase(std::unique(rd.skipped.begin(), rd.skipped.end()), rd.skipped.end());
+                // A gap is a GAIN: a denied child the stored set does not hold. A Capped read
+                // stops its walk early, so its list is partial -- it may add to the stored set
+                // but never shrinks it, else the next Complete read would look like a change
+                // and report an unchanged set again. (The diff above was given the read's own
+                // list: its Capped handling already keeps the unvisited keys.)
+                std::set<std::string> known(st.skipped.begin(), st.skipped.end());
+                bool gained = false;
+                for (const auto& sk : rd.skipped)
+                    if (known.insert(sk).second)
+                        gained = true;
+                if (rd.status == RegistryReadStatus::Capped) {
+                    // Bounded: each Capped read can add up to kSkippedCap fresh names, so a root
+                    // that stays Capped would grow the persisted cursor row without limit. Past
+                    // the cap the sorted prefix is kept (`gained` was decided above, so a new name
+                    // still writes its one gap row); a name clamped away can raise one more gap
+                    // row when a later read sees it again -- at most one a tick, and 33 denied
+                    // children under one root is already the Capped anomaly the manual documents.
+                    st.skipped.assign(known.begin(), known.end());
+                    if (st.skipped.size() > kSkippedCap)
+                        st.skipped.resize(kSkippedCap);
+                } else {
+                    st.skipped = std::move(rd.skipped);
+                }
+                if (gained)
+                    rows.push_back(registry_gap_row("unreadable",
+                                                    root + ":" + std::to_string(read_end),
+                                                    denied_children_detail(root, st.skipped), now,
+                                                    snapshot_id));
+            }
+
+            st.read_start = read_start;
+            st.read_end = read_end;
+            if (!offline_root)
+                st.deferred = false; // an owed offline read is moot once the hive is read as a loaded root
+            st.status = std::string(to_string(rd.status));
+            if (rd.status != RegistryReadStatus::Unreadable)
+                st.baselined = true; // a Capped first read is a partial baseline, by design
+            if (offline_root && fresh_root && rd.status == RegistryReadStatus::Capped)
+                st.baselined = false; // ... but an offline one is retried (next tick) as a fresh root
+            if (!offline_root &&
+                (rd.status == RegistryReadStatus::Complete || rd.status == RegistryReadStatus::Absent))
+                st.window_base = read_start; // the NEXT window starts here
+        };
+
+        // The loaded roots first (HKLM and the loaded hives), rotated so a tick that runs out of
+        // budget resumes where it stopped. Offline hives come after them: a queue of logged-off
+        // profiles can only ever take what the loaded roots left, never the budget a notified
+        // loaded root was owed.
+        const std::size_t n = live_roots.size();
+        const std::size_t start_idx = n == 0 ? 0 : static_cast<std::size_t>(cur.tick) % n;
+        bool read_any = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::string& root = live_roots[(start_idx + i) % n];
+            RegistryRootState& st = cur.roots[root];
+            init_state(root, st);
+
             bool armed = reader_.root_armed(root);
             if (!armed)
                 armed = reader_.rearm(root);
@@ -234,94 +456,92 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             const std::int64_t read_start = reader_.now_ts();
             SubtreeRead rd = reader_.read_subtree(root, deadline);
             const std::int64_t read_end = reader_.now_ts();
-            const std::int64_t last_dirty = reader_.dirty->last(root);
+            apply_read(root, st, std::move(rd), read_start, read_end, snap, false);
+        }
 
-            RegistryBaseline base;
-            bool fresh_root = !st.baselined;
-            if (st.baselined && rd.status != RegistryReadStatus::Unreadable) {
-                const auto stored = db.try_get_state(baseline_collector(root));
-                if (!stored)
-                    throw IncompleteCaptureError("Echo registry: baseline read failed: " +
-                                                 stored.error());
-                const auto decoded = decode_registry_baseline(*stored);
-                if (!stored->has_value() || decoded.malformed) {
-                    // The cursor says this root was baselined and the baseline is gone
-                    // or unusable: say so and start it over, rather than diff against
-                    // nothing (which would report the whole subtree as added).
-                    rows.push_back(registry_gap_row(
-                       "baselinelost", root + ":" + std::to_string(now),
-                       "gap:baselinelost:" + root, now, snapshot_id));
-                    fresh_root = true;
-                } else {
-                    base = decoded.baseline;
-                }
+        // The offline hives, one mount each, deferred hives first, then the one read longest ago
+        // (read_end is persisted per root), the sid breaking ties. Due on the HOURLY tick -- not on
+        // a restart's force_all_, which exists for a lost notify or ETW buffer an unloaded hive
+        // never had -- or when never read, re-baselined, Capped last time, or a retry; never on
+        // a notify.
+        struct HiveGroup {
+            std::string sid, path;
+            std::vector<std::string> roots;
+            bool deferred{false};
+            std::int64_t oldest_read{std::numeric_limits<std::int64_t>::max()};
+        };
+        std::map<std::string, std::vector<std::string>> roots_of_sid; // one pass, not one per hive
+        for (const auto& r : roots)
+            if (const std::string sid = hku_sid_of(r); !sid.empty())
+                roots_of_sid[sid].push_back(r);
+        std::vector<HiveGroup> groups;
+        for (const auto& o : offline) {
+            const auto found = roots_of_sid.find(o.sid);
+            if (found == roots_of_sid.end())
+                continue; // not a profile hive name: nothing to read
+            HiveGroup g{o.sid, o.path, found->second};
+            for (const auto& r : g.roots) {
+                RegistryRootState& st = cur.roots[r];
+                init_state(r, st);
+                st.armed = true; // nothing to arm on an unloaded hive: that is not a defect
+                g.deferred = g.deferred || st.deferred;
+                g.oldest_read = std::min(g.oldest_read, st.read_end);
             }
-            // The window the writes behind these candidates fall in; st.window_base (this
-            // root's last COMPLETE read start) is advanced only below, after the diff.
-            const RegistryWindow window = candidate_window(st.window_base, read_end, snap.first,
-                                                           last_dirty, kEtwWindowSlack100ns);
-            DiffResult diff = diff_registry_snapshot(base, rd, root,
-                                                     snap.first != 0 ? "notify" : "reconcile",
-                                                     window, read_end, fresh_root);
-            for (auto& c : diff.candidates)
-                fresh_candidates.push_back(std::move(c));
-            if (rd.status != RegistryReadStatus::Unreadable && (fresh_root || diff.changed))
-                state_writes.push_back({baseline_collector(root),
-                                        encode_registry_baseline(diff.baseline)});
-
-            // A root that could not be read, or child keys that deny access, are a blind
-            // spot the operator must be able to see: one gap row when the root becomes
-            // unreadable or a child key is newly denied, none while it holds steady, shrinks
-            // or clears. The cursor commits with the row, so a replay cannot lose or
-            // duplicate it.
-            if (rd.status == RegistryReadStatus::Unreadable) {
-                if (st.status != "unreadable")
-                    rows.push_back(registry_gap_row(
-                       "unreadable", root + ":" + std::to_string(read_end),
-                       "gap:unreadable:" + root +
-                          " (the root could not be read; its baseline is kept and nothing is "
-                          "derived for it until it can be)",
-                       now, snapshot_id));
-            } else {
-                std::sort(rd.skipped.begin(), rd.skipped.end());
-                rd.skipped.erase(std::unique(rd.skipped.begin(), rd.skipped.end()), rd.skipped.end());
-                // A gap is a GAIN: a denied child the stored set does not hold. A Capped read
-                // stops its walk early, so its list is partial -- it may add to the stored set
-                // but never shrinks it, else the next Complete read would look like a change
-                // and report an unchanged set again. (The diff above was given the read's own
-                // list: its Capped handling already keeps the unvisited keys.)
-                std::set<std::string> known(st.skipped.begin(), st.skipped.end());
-                bool gained = false;
-                for (const auto& s : rd.skipped)
-                    if (known.insert(s).second)
-                        gained = true;
-                if (rd.status == RegistryReadStatus::Capped) {
-                    // Bounded: each Capped read can add up to kSkippedCap fresh names, so a root
-                    // that stays Capped would grow the persisted cursor row without limit. Past
-                    // the cap the sorted prefix is kept (`gained` was decided above, so a new name
-                    // still writes its one gap row); a name clamped away can raise one more gap
-                    // row when a later read sees it again -- at most one a tick, and 33 denied
-                    // children under one root is already the Capped anomaly the manual documents.
-                    st.skipped.assign(known.begin(), known.end());
-                    if (st.skipped.size() > kSkippedCap)
-                        st.skipped.resize(kSkippedCap);
-                } else {
-                    st.skipped = std::move(rd.skipped);
-                }
-                if (gained)
-                    rows.push_back(registry_gap_row("unreadable",
-                                                    root + ":" + std::to_string(read_end),
-                                                    denied_children_detail(root, st.skipped), now,
-                                                    snapshot_id));
+            groups.push_back(std::move(g));
+        }
+        std::sort(groups.begin(), groups.end(), [](const HiveGroup& a, const HiveGroup& b) {
+            if (a.deferred != b.deferred)
+                return a.deferred;
+            if (a.oldest_read != b.oldest_read)
+                return a.oldest_read < b.oldest_read;
+            return a.sid < b.sid;
+        });
+        for (const auto& g : groups) {
+            const auto defer = [&] {
+                for (const auto& r : g.roots)
+                    cur.roots[r].deferred = true; // status untouched: a refused hive keeps its one gap row
+            };
+            // A profile whose path is not known yet (it logged off while the walk was incomplete)
+            // cannot be mounted: it is never passed to the reader, keeps its baseline and status,
+            // and is marked deferred so the first tick a complete walk supplies the path reads it,
+            // not the next hour.
+            if (g.path.empty()) {
+                defer();
+                continue;
             }
+            const bool offline_due = std::any_of(g.roots.begin(), g.roots.end(), [&](const std::string& r) {
+                const RegistryRootState& st = cur.roots[r];
+                return hourly || st.deferred || st.status.empty() || st.status == "due" ||
+                       st.status == "capped" || (!st.baselined && st.status != "unreadable");
+            });
+            if (!offline_due)
+                continue;
+            if (read_any && reader_.now_ts() >= deadline) {
+                defer();
+                continue;
+            }
+            read_any = true;
 
-            st.read_start = read_start;
-            st.read_end = read_end;
-            st.status = std::string(to_string(rd.status));
-            if (rd.status != RegistryReadStatus::Unreadable)
-                st.baselined = true; // a Capped first read is a partial baseline, by design
-            if (rd.status == RegistryReadStatus::Complete || rd.status == RegistryReadStatus::Absent)
-                st.window_base = read_start; // the NEXT window starts here
+            const std::int64_t read_start = reader_.now_ts();
+            OfflineHiveRead hv = reader_.read_offline_hive(g.sid, g.path, g.roots, deadline);
+            const std::int64_t read_end = reader_.now_ts();
+            if (!hv.attempted) {
+                defer(); // not tried: retried next tick, no row
+                continue;
+            }
+            for (const auto& r : g.roots) {
+                RegistryRootState& gs = cur.roots[r];
+                gs.deferred = false;
+                SubtreeRead rd;
+                if (const auto it = hv.roots.find(r); it != hv.roots.end()) {
+                    rd = std::move(it->second);
+                } else {
+                    rd.status = RegistryReadStatus::Unreadable; // the mount answered nothing for it
+                }
+                if (rd.reason.empty() && rd.status == RegistryReadStatus::Unreadable)
+                    rd.reason = hv.reason;
+                apply_read(r, gs, std::move(rd), read_start, read_end, {}, true);
+            }
         }
 
         // The buffer is read BEFORE the loss counters: an eviction between the two would
@@ -372,13 +592,14 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         cur.tick += 1;
         cur.held = std::move(stitched.held_next);
         cur.hku = sids;
+        cur.offline = offline;
         // No future window starts before the minimum window_base, nor does any held one
         // start before its own lo: an epoch ending before both can never intersect again.
         // A root whose notify is still unread (the read budget deferred it, or it was marked
         // again during its own read) has no candidate yet, so its pending window is counted
         // here too: the event floor and the loss-epoch floor are one value.
         std::map<std::string, std::int64_t> pending_first;
-        for (const auto& root : roots)
+        for (const auto& root : live_roots) // an offline root never holds the floor
             if (const auto first = reader_.dirty->first(root); first != 0)
                 pending_first.emplace(root, first);
         const std::int64_t watermark = retention_watermark(cur.roots, pending_first);
@@ -418,12 +639,23 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         totals_.none += stitched.counters.none;
 
         // Status keys (always written, skipped when unchanged).
+        // watch_roots / unarmed describe the LIVE roots (an offline root has nothing to arm);
+        // unreadable / capped stay aggregate over every root, so a capped offline read is visible.
         std::size_t unarmed = 0, unreadable = 0, capped = 0;
-        for (const auto& [_, st] : cur.roots) {
-            unarmed += st.armed ? 0 : 1;
+        std::size_t offline_roots = 0, offline_unreadable = 0, offline_deferred = 0;
+        for (const auto& [name, st] : cur.roots) {
+            const bool off = is_offline_root(name, offline_sids);
+            unarmed += (!off && !st.armed) ? 1 : 0;
             unreadable += st.status == "unreadable" ? 1 : 0;
             capped += st.status == "capped" ? 1 : 0;
+            offline_roots += off ? 1 : 0;
+            offline_unreadable += (off && st.status == "unreadable") ? 1 : 0;
+            offline_deferred += (off && st.deferred) ? 1 : 0;
         }
+        if (discovery_incomplete && !offline_incomplete_)
+            spdlog::warn("Echo registry: the profile list could not be read completely; the known "
+                         "logged-off profiles stay in scope until a complete walk says otherwise");
+        offline_incomplete_ = discovery_incomplete;
         const std::pair<const char*, std::string> keys[] = {
            // The key watch is always what detects; the session only names the writer.
            {"registry_capture_method", reader_.etw_running() ? "notify+etw" : "notify"},
@@ -433,10 +665,14 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
            {"registry_attr_attributed", std::to_string(totals_.attributed)},
            {"registry_attr_ambiguous", std::to_string(totals_.ambiguous)},
            {"registry_attr_none", std::to_string(totals_.none)},
-           {"registry_watch_roots", std::to_string(roots.size())},
+           {"registry_watch_roots", std::to_string(live_roots.size())},
            {"registry_watch_roots_unarmed", std::to_string(unarmed)},
            {"registry_roots_unreadable", std::to_string(unreadable)},
            {"registry_roots_capped", std::to_string(capped)},
+           {"registry_offline_roots", std::to_string(offline_roots)},
+           {"registry_offline_roots_unreadable", std::to_string(offline_unreadable)},
+           {"registry_offline_roots_deferred", std::to_string(offline_deferred)},
+           {"registry_offline_discovery_incomplete", discovery_incomplete ? "1" : "0"},
         };
         for (const auto& [k, v] : keys) {
             auto& last = last_status_written_[k];
@@ -487,6 +723,11 @@ std::unique_ptr<RegistryCursorSource> make_registry_cursor_source(RegistryScope 
 #include <win_reg_handle.hpp>   // yuzu::win::RegKey
 #include <win_str.hpp>          // yuzu::win wide<->UTF-8
 
+#include <win_profiles.hpp> // with_user_hive, enumerate_profile_list (the shared guarded offline-hive ladder)
+
+#include "bounded_wait.hpp"           // yuzu::shared::bounded_call_ex
+#include "echo_hive_mount_gate.hpp"  // g_mount_workers_in_flight, MountWorkerGuard, kHiveMountBoundMs, pin_plugin_module
+#include "echo_mapdrive_backfill.hpp" // decide_walk_gate, decide_mount_call, profile_list_complete
 #include "echo_win_process_name.hpp" // process_basename_for_pid
 
 #include <atomic>
@@ -1102,6 +1343,10 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
         }
         const std::string child_path =
            full + "\\" + yuzu::win::from_wide(sub.data(), static_cast<int>(slen));
+        // Not configuration (see registry_path_excluded): never opened, so its constant writes
+        // cannot disturb the read of the rest of the root.
+        if (registry_path_excluded(child_path))
+            continue;
         yuzu::win::RegKey child;
         // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
         // SymbolicLinkValue), never followed into whatever it points at.
@@ -1137,8 +1382,49 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
     // can no longer be queried was deleted mid-walk, which is the same answer. Control flow
     // reaches here only when neither `capped` nor `unreadable` is set.
     KeyInfo after;
-    if (query_key(key, after) != ERROR_SUCCESS || !(after == before))
+    if (query_key(key, after) != ERROR_SUCCESS || !(after == before)) {
         ctx.capped = true;
+        return;
+    }
+    // The key's write time, published only now that the two queries agree: a row takes it as
+    // its time. A key written during the walk, or one the walk left early (capped, unreadable),
+    // gets no stamp, and its candidates fall back to the end of the read.
+    ctx.out->written[full] = static_cast<std::int64_t>(
+        (static_cast<std::uint64_t>(before.written.dwHighDateTime) << 32) |
+        before.written.dwLowDateTime);
+}
+
+// Reads the subtree under an already-open `key`, labelling its key paths from `label` (never from
+// the HKEY: an offline hive is mounted under a salted name the rows must not carry).
+SubtreeRead read_root_at(HKEY key, const std::string& label, std::int64_t deadline) noexcept {
+    SubtreeRead out;
+    try {
+        ReadCtx ctx{&out, {}, deadline, false, false, {}};
+        read_key(ctx, key, label, 0);
+        if (ctx.unreadable) {
+            out.keys.clear();
+            out.written.clear();
+            out.skipped.clear();
+            out.status = RegistryReadStatus::Unreadable;
+        } else {
+            out.status = ctx.capped ? RegistryReadStatus::Capped : RegistryReadStatus::Complete;
+        }
+    } catch (...) {
+        out.keys.clear();
+        out.written.clear();
+        out.skipped.clear();
+        out.status = RegistryReadStatus::Unreadable;
+    }
+    return out;
+}
+
+// Is `sid`'s hive gone from HKEY_USERS? A loaded profile's hive is HKU\<sid>; once the user logs
+// off it is unloaded and the key no longer exists.
+bool hku_hive_unloaded(const std::string& sid) {
+    yuzu::win::RegKey key;
+    const LONG rc =
+       RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(sid).c_str(), 0, KEY_READ, key.put());
+    return rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND;
 }
 
 SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
@@ -1147,6 +1433,19 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
         yuzu::win::RegKey key;
         const LONG rc = open_root(root, KEY_READ, key);
         if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND) {
+            // The root is not there -- or its whole hive is not: a user who logged off after
+            // collect() took its HKU snapshot (or before a missed name-watch mark refreshed it)
+            // answers the same way. Absent would be read as "every value was deleted" and blank
+            // the baseline; Unreadable keeps it, and the next HKU refresh moves the root offline,
+            // where it stays Unreadable (counted in registry_offline_roots_unreadable) until the
+            // hourly tick reads the hive and diffs it against that baseline. A key missing under
+            // a hive that is still loaded stays Absent.
+            const std::string sid = hku_sid_of(root);
+            if (!sid.empty() && hku_hive_unloaded(sid)) {
+                out.status = RegistryReadStatus::Unreadable;
+                out.reason = "hive_unloaded";
+                return out;
+            }
             out.status = RegistryReadStatus::Absent;
             return out;
         }
@@ -1154,15 +1453,7 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
             out.status = RegistryReadStatus::Unreadable;
             return out;
         }
-        ReadCtx ctx{&out, {}, deadline, false, false, {}};
-        read_key(ctx, key.get(), root, 0);
-        if (ctx.unreadable) {
-            out.keys.clear();
-            out.skipped.clear();
-            out.status = RegistryReadStatus::Unreadable;
-        } else {
-            out.status = ctx.capped ? RegistryReadStatus::Capped : RegistryReadStatus::Complete;
-        }
+        return read_root_at(key.get(), root, deadline);
     } catch (...) {
         out.keys.clear();
         out.skipped.clear();
@@ -1183,20 +1474,309 @@ int read_current_control_set() {
     return static_cast<int>(v);
 }
 
+// The loaded-user list is the one HKU snapshot collect() classifies profiles against, so a
+// walk that ends on anything but ERROR_NO_MORE_ITEMS is a failed read: it throws
+// IncompleteCaptureError (the cursor-source rule: a transient read failure keeps the cursor)
+// instead of returning the names found so far, because a partial list would read a loaded
+// user as logged off and drop that user's watch and dirty state. The end-of-list decision is
+// walk_enumeration (echo_registry_parsers.hpp), which the unit suite runs on every platform.
 std::vector<std::string> enumerate_hku() {
-    std::vector<std::string> out;
     wchar_t buf[256];
-    for (DWORD i = 0;; ++i) {
+    auto walk = walk_enumeration([&](unsigned i, std::string& name, std::string& err) {
         DWORD len = 256;
-        if (RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr) !=
-            ERROR_SUCCESS)
-            break;
-        out.push_back(yuzu::win::from_wide(buf, static_cast<int>(len)));
+        const LONG rc =
+            RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr);
+        if (rc == ERROR_SUCCESS) {
+            name = yuzu::win::from_wide(buf, static_cast<int>(len));
+            return ListStep::Item;
+        }
+        if (rc == ERROR_NO_MORE_ITEMS)
+            return ListStep::End;
+        err = "error " + std::to_string(rc);
+        return ListStep::Error;
+    });
+    if (!walk.error.empty())
+        throw IncompleteCaptureError("Echo registry: HKEY_USERS enumeration failed at " +
+                                     walk.error);
+    return std::move(walk.names);
+}
+
+// ── Offline (unloaded) per-user hives ───────────────────────────────────────
+
+// The profiles whose hive is not loaded, from one ProfileList walk. This shell only gathers
+// the facts (the walk's Win32 codes, the merged profile list, the sids whose record failed);
+// classify_offline_discovery (echo_registry_parsers.hpp, unit-tested on every OS) decides.
+// `loaded` is collect()'s own HKU snapshot for this tick, not a second enumeration: a profile
+// is offline exactly when collect() does not hold it as loaded, so none can fall between two
+// snapshots. `complete` is mapdrive's own rule (profile_list_complete, plus "not truncated"): a
+// walk that was cut short, that hit an unreadable ProfileList or that stopped at the profile
+// cap proves nothing about what is absent, so the core keeps the scope it knew.
+OfflineDiscovery discover_offline_profiles(const std::vector<std::string>& loaded) noexcept {
+    try {
+        const auto disc = yuzu::win::enumerate_profile_list();
+        if (disc.truncated) {
+            static std::atomic<bool> s_warned{false};
+            if (!s_warned.exchange(true))
+                spdlog::warn("Echo registry: profile list truncated at {} entries -- logged-off "
+                             "profiles beyond that are not discovered (repeats suppressed)",
+                             yuzu::win::kMaxProfiles);
+        }
+        const auto profiles = yuzu::profiles::build_profile_list(disc.records, loaded);
+        std::vector<std::string> failed;
+        for (const auto& f : disc.record_failures)
+            failed.push_back(f.sid);
+        return classify_offline_discovery(
+           profile_list_complete(disc.root_rc, disc.last_rc, disc.probe_rc),
+           disc.root_rc != ERROR_SUCCESS, disc.truncated, profiles, failed);
+    } catch (...) {
+        return OfflineDiscovery{false, {}, {}};
     }
-    return out;
+}
+
+// One tick's mount bookkeeping: the first mount to time out (or be refused) stops every later
+// mount this tick -- each would only queue behind the stuck worker's offline-hive mutex. A tick
+// is identified by its absolute deadline, so a new deadline clears the halt. start() touches it
+// once on the starting thread before the first tick; collect() then owns it on one thread --
+// sequenced, so no lock.
+struct OfflineMountTick {
+    std::int64_t deadline{0};
+    bool halted{false};
+    const char* halted_token{"skipped_after_timeout"};
+    // The closed gate was warned of; the next mount attempt that finds it open clears this.
+    bool gate_warned{false};
+    // The start-up sweep of leftover YUZU_HIVE_* mounts has not completed (see
+    // run_pending_hive_sweep). Cleared only when its worker returned.
+    bool sweep_pending{true};
+};
+
+// Runs the start-up sweep of leftover `YUZU_HIVE_*` mounts once, through the same gate and bounded
+// worker as a mount (the sweep needs the same process-wide offline-hive lock, and
+// ScopedOfflineHiveLock has no try-lock, so a bare call at start would wait forever behind a
+// worker a sibling source abandoned). `sweep_pending` is cleared only when the worker returned.
+// A closed gate, a rejected call or a timeout leaves it pending: the next read_offline_hive_bounded
+// runs it again before its mount, so a sweep that could not run at start is not lost. A rejected
+// or timed-out call halts the tick, as a mount's would.
+// ponytail: Echo-only. The effect is process-wide, so a sibling plugin's leftover mount is swept
+// too; move this to the shared ladder if a non-Echo consumer ever wants its own trigger.
+void run_pending_hive_sweep(OfflineMountTick& tick) {
+    if (!tick.sweep_pending || tick.halted)
+        return;
+    if (yuzu::echo::decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load()) !=
+        yuzu::echo::WalkGate::open)
+        return;
+    const auto bounded = yuzu::shared::bounded_call_ex(kHiveMountBoundMs, [] {
+        const MountWorkerGuard in_flight; // counted until this closure really returns
+        return yuzu::echo::sweep_leftover_hive_mounts();
+    });
+    if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {
+        tick.sweep_pending = false;
+        return;
+    }
+    const auto decision = yuzu::echo::decide_mount_call(
+       bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
+          ? yuzu::echo::MountCallResult::timed_out
+          : yuzu::echo::MountCallResult::rejected);
+    tick.halted = decision.halt_walk;
+    tick.halted_token = decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
+    spdlog::warn("Echo registry: sweep of leftover hive mounts did not complete ({}); retried "
+                 "before the next offline mount",
+                 decision.attempted ? "timeout" : "mount_rejected");
+}
+
+// One warning per open -> closed transition of the shared mount gate (a failed module pin, or a
+// worker abandoned on a timeout that is still running): while it stays closed every hive is
+// answered not-attempted and retried next tick, which would otherwise be silent -- the gate
+// closing is the one thing that stops ALL offline reads, so it is worth one line, not one per tick.
+void note_mount_gate(OfflineMountTick& tick, yuzu::echo::WalkGate gate) {
+    if (gate == yuzu::echo::WalkGate::open) {
+        tick.gate_warned = false;
+        return;
+    }
+    if (!tick.gate_warned) {
+        tick.gate_warned = true;
+        spdlog::warn("Echo registry: no offline hive mounts ({}); logged-off profiles are retried on "
+                     "the next tick (this repeats only after the gate has reopened)",
+                     yuzu::echo::walk_gate_token(gate));
+    }
+}
+
+OfflineHiveRead unreadable_hive(const std::vector<std::string>& roots, bool attempted,
+                                const std::string& reason) {
+    OfflineHiveRead r;
+    r.attempted = attempted;
+    r.reason = reason;
+    for (const auto& root : roots) {
+        SubtreeRead u;
+        u.status = RegistryReadStatus::Unreadable;
+        u.reason = reason;
+        r.roots.emplace(root, std::move(u));
+    }
+    return r;
+}
+
+// Mounts `sid`'s hive once through the shared guarded ladder (default-on hive-file guard,
+// process-wide offline-hive lock, SeBackup/SeRestore scope, live arm wins if the user logged in
+// meanwhile) and reads every requested root from that one mount. The wait is bounded by
+// bounded_call_ex; the worker is detached on a timeout, which the module pin and the shared
+// in-flight gate make safe (see echo_mapdrive_collector.cpp). Everything the worker uses is
+// copied into the closure.
+OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::string& path,
+                                          const std::vector<std::string>& roots,
+                                          std::int64_t deadline, OfflineMountTick& tick) {
+    if (tick.deadline != deadline) {
+        tick.deadline = deadline;
+        tick.halted = false;
+    }
+    // A sweep that could not run at start runs before the first mount that finds the gate open;
+    // if it halts the tick, the check below answers not-attempted.
+    run_pending_hive_sweep(tick);
+    if (tick.halted)
+        return unreadable_hive(roots, false, std::string("offline:") + tick.halted_token);
+    const auto gate = yuzu::echo::decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load());
+    note_mount_gate(tick, gate);
+    if (gate != yuzu::echo::WalkGate::open)
+        return unreadable_hive(roots, false,
+                               std::string("offline:") + yuzu::echo::walk_gate_token(gate));
+
+    auto bounded = yuzu::shared::bounded_call_ex(
+       kHiveMountBoundMs, [sid, path, roots, deadline]() -> OfflineHiveRead {
+           const MountWorkerGuard in_flight; // counted until this closure really returns
+           OfflineHiveRead r;
+           // Built before the try so the handler allocates nothing (a bad_alloc there would
+           // leave the closure and the caller blocked for the whole bound); it only moves this in.
+           // Building it can itself throw, before any mount: the closure then unwinds, the guard
+           // above releases the count and the caller reports a timeout at the bound.
+           OfflineHiveRead failed = unreadable_hive(roots, true, "offline:exception");
+           yuzu::win::HiveAccessReport report;
+           try {
+               const auto status = yuzu::win::with_user_hive(
+                  sid, path,
+                  [&](HKEY root) {
+                      const std::string prefix = "HKU\\" + sid + "\\";
+                      for (const auto& logical : roots) {
+                          SubtreeRead out;
+                          if (!logical.starts_with(prefix)) {
+                              out.status = RegistryReadStatus::Unreadable;
+                          } else {
+                              yuzu::win::RegKey key;
+                              const LONG rc = RegOpenKeyExW(
+                                 root, yuzu::win::to_wide(logical.substr(prefix.size())).c_str(),
+                                 REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY, key.put());
+                              if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND)
+                                  out.status = RegistryReadStatus::Absent;
+                              else if (rc != ERROR_SUCCESS)
+                                  out.status = RegistryReadStatus::Unreadable;
+                              else
+                                  out = read_root_at(key.get(), logical, deadline);
+                          }
+                          r.roots[logical] = std::move(out);
+                      }
+                  },
+                  &report);
+               if (status != yuzu::win::HiveAccessStatus::ok)
+                   r = unreadable_hive(
+                      roots, true,
+                      "offline:" + yuzu::profiles::hive_access_token(status, report.refusal));
+           } catch (...) {
+               r = std::move(failed);
+           }
+           // The second statement outside the try (building `failed` above is the first). A
+           // leaked mount is system-wide and keeps NTUSER.DAT locked until something releases it.
+           if (report.unload_failed) {
+               // Every failure is recorded (which hive, which mount); the alert is raised once.
+               spdlog::info("Echo registry: hive unload failed for {} (mount HKU\\{})", sid,
+                            report.mount_name);
+               static std::atomic<bool> s_unload_warned{false};
+               if (!s_unload_warned.exchange(true))
+                   spdlog::warn("Echo registry: hive unload failed for HKU\\{} -- the profile's "
+                                "NTUSER.DAT stays locked until a holder releases it; retry "
+                                "`reg unload HKU\\{}` (repeats suppressed)",
+                                report.mount_name, report.mount_name);
+           }
+           return r;
+       });
+
+    if (bounded.status != yuzu::shared::BoundedCallStatus::Completed) {
+        // TimedOut: a real, failed attempt whose worker is still running. Rejected: the shared
+        // outstanding-call ceiling was full and no mount ran, so it is not an attempt. Either
+        // way no further mount is tried this tick.
+        const auto decision = yuzu::echo::decide_mount_call(
+           bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
+              ? yuzu::echo::MountCallResult::timed_out
+              : yuzu::echo::MountCallResult::rejected);
+        tick.halted = decision.halt_walk;
+        tick.halted_token =
+           decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
+        spdlog::warn("Echo registry: offline hive mount for {} ({}); no further mounts this tick",
+                     sid, decision.attempted ? "timeout" : "mount_rejected");
+        return unreadable_hive(roots, decision.attempted,
+                               decision.attempted ? "offline:timeout" : "offline:mount_rejected");
+    }
+    return std::move(*bounded.value);
 }
 
 } // namespace
+
+HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
+    std::vector<std::string> stale;
+    HiveSweepResult r;
+    bool privilege_missing = false;
+    try {
+        // Held for the whole sweep, and taken BEFORE the names are listed. Every mount this process
+        // makes holds this lock from RegLoadKeyW to the unload (with_user_hive), so while we hold it
+        // no `YUZU_HIVE_*` name is an in-process mount in use -- the name carries no process
+        // identity to tell a live mount from a stale one (unique_hive_mount_name salts it per
+        // process but never publishes the salt). A mount owned by ANOTHER process that has a handle
+        // open fails the non-forced unload below and is retained. Residual: a second Yuzu process's
+        // mount in its handle-less window (before it opens the root, or after it closes it and
+        // before it unloads) can be unloaded here; an out-of-process mount is unguarded
+        // (win_reg_handle.hpp), and that is the default shape on the shared CI pools.
+        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");
+        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);
+        if (stale.empty())
+            return r;
+        // RegUnLoadKeyW needs SeRestorePrivilege, which the agent account already holds
+        // (docs/agent-privilege-model.md); with_user_hive enables it the same way per mount.
+        const yuzu::win::PrivilegeScope restore_priv(L"SeRestorePrivilege");
+        if (restore_priv.ok()) {
+            r = sweep_hive_mounts(stale, [](const std::string& name) {
+                // Never RegUnLoadKey with force: a holder with an open handle is a live user of the hive.
+                return RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(name).c_str()) == ERROR_SUCCESS;
+            });
+        } else {
+            // A hardened install may strip it (a documented degraded mode, as in with_user_hive).
+            // Every unload would fail ERROR_PRIVILEGE_NOT_HELD and read as a holder keeping the hive
+            // open, so none is attempted. The sweep still completes: the privilege will not appear on
+            // a retry, and one warning per start is all this needs.
+            r.retained = std::move(stale);
+            privilege_missing = true;
+        }
+    } catch (...) {
+        // The lock and the privilege scope were released by unwinding. Returning normally makes the
+        // sweep complete: one attempt per start, the same rule privilege_missing follows.
+        spdlog::warn("Echo registry: sweep of leftover hive mounts failed (exception); retried at "
+                     "the next start");
+    }
+    // Logged after the lock is released, so logging never extends another caller's wait.
+    if (privilege_missing) {
+        std::string names;
+        for (const auto& n : r.retained)
+            names += (names.empty() ? "HKU\\" : ", HKU\\") + n;
+        spdlog::warn("Echo registry: privilege_missing -- SeRestorePrivilege is not held, so the "
+                     "leftover hive mount(s) {} cannot be unloaded and the profile's NTUSER.DAT "
+                     "stays locked; unload each with `reg unload` from an elevated prompt",
+                     names);
+        return r;
+    }
+    for (const auto& n : r.released)
+        spdlog::info("Echo registry: unloaded leftover hive mount HKU\\{}", n);
+    for (const auto& n : r.retained)
+        spdlog::warn("Echo registry: leftover hive mount HKU\\{} could not be unloaded (the unload "
+                     "was refused or failed) -- the profile's NTUSER.DAT stays locked until it is "
+                     "released; retry `reg unload HKU\\{}` from an elevated prompt",
+                     n, n);
+    return r;
+}
 
 std::wstring registry_etw_session_name() {
     // Salted per process: the CI pools run several agents as one OS identity, and a
@@ -1214,6 +1794,9 @@ RegistryReader make_windows_registry_reader() {
     etw->buffer = buffer;
     auto watcher = std::make_shared<WinWatcher>();
     watcher->dirty = dirty;
+    // Shared by the offline-read hook and start(): the mount halt, the gate-warning latch and the
+    // pending start-up sweep are one source's state.
+    auto tick = std::make_shared<OfflineMountTick>();
 
     RegistryReader r;
     r.dirty = dirty;
@@ -1222,6 +1805,13 @@ RegistryReader make_windows_registry_reader() {
         return read_root(normalise_registry_path(root, read_current_control_set()), deadline);
     };
     r.loaded_sids = [] { return enumerate_hku(); };
+    r.offline_profiles = [](const std::vector<std::string>& loaded) {
+        return discover_offline_profiles(loaded);
+    };
+    r.read_offline_hive = [tick](const std::string& sid, const std::string& path,
+                                 const std::vector<std::string>& roots, std::int64_t deadline) {
+        return read_offline_hive_bounded(sid, path, roots, deadline, *tick);
+    };
     r.now_ts = [] { return filetime_now(); };
     r.etw_running = [etw] { return etw->running.load(); };
     r.session_loss = [etw] { return etw->loss(); };
@@ -1231,7 +1821,11 @@ RegistryReader make_windows_registry_reader() {
     r.rearm = [watcher](const std::string& root) { return watcher->rearm(root); };
     // ponytail: a session that dies after start is not restarted -- capture_method flips to
     // notify and rows say attr:off; add a restart if that is ever seen in the field.
-    r.start = [etw] {
+    r.start = [etw, tick] {
+        // Before the session and before any offline mount: a mount a previous run leaked keeps its
+        // profile's NTUSER.DAT locked, so it must not outlive the restart that could release it.
+        // Bounded and gated like a mount; a sweep it cannot run here waits for the first offline read.
+        run_pending_hive_sweep(*tick);
         if (const ULONG rc = etw->start(); rc != ERROR_SUCCESS)
             spdlog::warn("Echo registry: Kernel-Registry ETW session unavailable (Win32 error {}; "
                          "5 = the agent is not elevated) -- the key watch still runs, rows will "

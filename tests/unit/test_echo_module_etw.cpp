@@ -7,7 +7,9 @@
 // verifier), and the off-Windows no-op contract. The Windows-only cases at the end drive
 // the REAL no-reparse image open + by-handle WinVerifyTrust against files on the host.
 
+#include "echo_aggregator.hpp"
 #include "echo_db.hpp"
+#include "echo_hour_dedup.hpp"
 #include "echo_local_image_path.hpp"
 #include "echo_module_etw.hpp"
 #include "echo_module_stream.hpp"
@@ -15,10 +17,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -147,6 +151,14 @@ TEST_CASE("module_is_risky flags unsigned/invalid/revoked/kernel/blocked", "[ech
     CHECK(module_is_risky(blocked));
 }
 
+namespace {
+// One filter pass over a fresh seen-set (a new hour, an agent restart).
+std::vector<ModuleEvent> filter_once(std::vector<ModuleEvent> in, std::size_t max_signed = 4096) {
+    HourlySeenSet seen;
+    return apply_module_risk_filter(std::move(in), seen, max_signed);
+}
+} // namespace
+
 TEST_CASE("risk-filter keeps every risky load (no dedup for risky)", "[echo][module][filter]") {
     std::vector<ModuleEvent> in;
     for (int i = 0; i < 10; ++i) {
@@ -154,7 +166,7 @@ TEST_CASE("risk-filter keeps every risky load (no dedup for risky)", "[echo][mod
         e.signed_state = ModuleSignedState::kUnsigned; // risky → all kept, even identical
         in.push_back(e);
     }
-    auto out = apply_module_risk_filter(std::move(in));
+    auto out = filter_once(std::move(in));
     CHECK(out.size() == 10);
 }
 
@@ -162,8 +174,8 @@ TEST_CASE("risk-filter dedups identical signed loads within a batch", "[echo][mo
     std::vector<ModuleEvent> in;
     for (int i = 0; i < 50; ++i)
         in.push_back(make_signed("chrome.exe", "kernel32.dll", "Microsoft"));
-    auto out = apply_module_risk_filter(std::move(in));
-    CHECK(out.size() == 1); // one distinct (proc,module,dir,signer,state) signed tuple
+    auto out = filter_once(std::move(in));
+    CHECK(out.size() == 1); // one distinct (action, process, module, dir) per hour
 }
 
 TEST_CASE("risk-filter keeps same-named signed DLLs from DIFFERENT dirs distinct",
@@ -174,38 +186,32 @@ TEST_CASE("risk-filter keeps same-named signed DLLs from DIFFERENT dirs distinct
     auto sys = make_signed("app.exe", "version.dll", "Acme");
     sys.module_dir = R"(C:\Windows\System32)";
     std::vector<ModuleEvent> in{app, sys};
-    auto out = apply_module_risk_filter(std::move(in));
+    auto out = filter_once(std::move(in));
     CHECK(out.size() == 2); // module_dir is in the dedup key — NOT collapsed
 }
 
-TEST_CASE("risk-filter routes signed kUnloaded through dedup", "[echo][module][filter]") {
-    std::vector<ModuleEvent> in;
-    for (int i = 0; i < 10; ++i) {
-        auto e = make_signed("app.exe", "k.dll", "MS");
-        e.action = ModuleAction::kUnloaded; // non-risky → deduped like loaded
-        in.push_back(e);
-    }
-    auto out = apply_module_risk_filter(std::move(in));
-    CHECK(out.size() == 1);
-}
-
-TEST_CASE("risk-filter keeps a signed load and its unload distinct", "[echo][module][filter]") {
-    // The action is in the dedup key: a `loaded` and an `unloaded` of the SAME
-    // (proc, module, dir, signer, state) tuple must NOT collapse, or unload
-    // visibility in module_live is erased (the M2 review finding).
+TEST_CASE("risk-filter drops unloaded events and keeps the load", "[echo][module][filter]") {
+    // Unloads are not stored: the lowest-value observation, and about half the volume.
     auto loaded = make_signed("app.exe", "k.dll", "MS"); // action defaults to kLoaded
     auto unloaded = make_signed("app.exe", "k.dll", "MS");
     unloaded.action = ModuleAction::kUnloaded;
-    std::vector<ModuleEvent> in{loaded, unloaded};
-    auto out = apply_module_risk_filter(std::move(in));
-    CHECK(out.size() == 2); // action in the key keeps load/unload as separate rows
+    std::vector<ModuleEvent> in{unloaded, loaded, unloaded};
+    auto out = filter_once(std::move(in));
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].action == ModuleAction::kLoaded);
+
+    // Even a risky unload is not stored (only loads are risk-kept).
+    auto risky_unload = make_signed("app.exe", "evil.dll", "");
+    risky_unload.signed_state = ModuleSignedState::kUnsigned;
+    risky_unload.action = ModuleAction::kUnloaded;
+    CHECK(filter_once({risky_unload}).empty());
 }
 
 TEST_CASE("risk-filter caps distinct signed loads per drain", "[echo][module][filter]") {
     std::vector<ModuleEvent> in;
     for (int i = 0; i < 20; ++i)
         in.push_back(make_signed("app.exe", "mod" + std::to_string(i) + ".dll", "Acme"));
-    auto out = apply_module_risk_filter(std::move(in), /*max_signed=*/5);
+    auto out = filter_once(std::move(in), /*max_signed=*/5);
     CHECK(out.size() == 5);
 }
 
@@ -218,8 +224,172 @@ TEST_CASE("risk-filter keeps risky even past the signed cap", "[echo][module][fi
         e.signed_state = ModuleSignedState::kUnsigned;
         in.push_back(e);
     }
-    auto out = apply_module_risk_filter(std::move(in), /*max_signed=*/5);
+    auto out = filter_once(std::move(in), /*max_signed=*/5);
     CHECK(out.size() == 8); // 5 signed + 3 risky
+}
+
+TEST_CASE("risk-filter cap is checked before the seen-set: a capped load is admitted on retry",
+          "[echo][module][filter]") {
+    // Only an admitted row is marked. A load dropped by the per-drain cap must not consume
+    // its hourly slot, or it would be lost for the rest of the hour.
+    HourlySeenSet seen;
+    auto first = apply_module_risk_filter(
+        {make_signed("p", "a.dll", "S"), make_signed("p", "b.dll", "S"),
+         make_signed("p", "c.dll", "S")},
+        seen, /*max_signed=*/2);
+    REQUIRE(first.size() == 2);
+    CHECK(first[0].module_name == "a.dll");
+    CHECK(first[1].module_name == "b.dll");
+
+    // Later in the same hour, with the cap free: c.dll is admitted, a.dll and b.dll are not.
+    auto second = apply_module_risk_filter(
+        {make_signed("p", "a.dll", "S"), make_signed("p", "b.dll", "S"),
+         make_signed("p", "c.dll", "S")},
+        seen, /*max_signed=*/2);
+    REQUIRE(second.size() == 1);
+    CHECK(second[0].module_name == "c.dll");
+}
+
+TEST_CASE("risk-filter against a COPY: an uncommitted drain is re-filtered identically",
+          "[echo][module][filter]") {
+    // The plugin filters with a copy and commits it only after the insert succeeds.
+    const HourlySeenSet committed;
+    std::vector<ModuleEvent> batch{make_signed("p", "a.dll", "S"), make_signed("p", "b.dll", "S")};
+    HourlySeenSet attempt1 = committed;
+    CHECK(apply_module_risk_filter(batch, attempt1).size() == 2); // insert "failed": not committed
+    HourlySeenSet attempt2 = committed;
+    CHECK(apply_module_risk_filter(batch, attempt2).size() == 2); // same rows again
+    CHECK(apply_module_risk_filter(batch, attempt2).empty());     // committed: now de-duplicated
+}
+
+TEST_CASE("risk-filter stream replay: one row per (action, process, module, dir) per hour",
+          "[echo][module][filter]") {
+    // 65,000 loads in one hour: 40 loader processes, each drawing from its own 300 of 700
+    // module paths (12,000 possible keys, under the 20,000-key cap), 3% unsigned, one load in
+    // five followed by an unload. The oracle recomputes the expected count independently.
+    constexpr std::int64_t kHour = 1'699'999'200; // a multiple of 3600
+    static_assert(kHour % 3600 == 0);
+    struct Stream {
+        std::vector<ModuleEvent> events;
+        std::size_t risky{0};
+        std::set<std::string> distinct_ordinary;
+    };
+    const auto build = [&](std::int64_t hour_ts) {
+        Stream s;
+        std::uint32_t x = 12345;
+        for (int i = 0; i < 65'000; ++i) {
+            x = x * 1664525u + 1013904223u;
+            const auto proc = (x >> 8) % 40;
+            const auto mod = (proc * 17 + (x >> 16) % 300) % 700;
+            ModuleEvent e = make_signed("proc" + std::to_string(proc), "m" + std::to_string(mod) + ".dll", "MS");
+            e.module_dir = R"(C:\Windows\System32)";
+            e.ts_unix = hour_ts + (i % 3000);
+            if (x % 100 < 3)
+                e.signed_state = ModuleSignedState::kUnsigned;
+            if (module_is_risky(e))
+                ++s.risky;
+            else
+                s.distinct_ordinary.insert(e.process_name + "|" + e.module_name);
+            s.events.push_back(e);
+            if (i % 5 == 0) {
+                ModuleEvent u = e;
+                u.action = ModuleAction::kUnloaded;
+                u.signed_state = ModuleSignedState::kSigned; // an ordinary unload
+                s.events.push_back(std::move(u));
+            }
+        }
+        return s;
+    };
+    const auto run = [](const Stream& s, HourlySeenSet& seen) {
+        std::size_t kept = 0;
+        // Drains of 5,000 events, as the fast tick would hand them over.
+        for (std::size_t at = 0; at < s.events.size(); at += 5000) {
+            std::vector<ModuleEvent> drain(
+                s.events.begin() + static_cast<std::ptrdiff_t>(at),
+                s.events.begin() +
+                    static_cast<std::ptrdiff_t>(std::min(at + 5000, s.events.size())));
+            const auto out = apply_module_risk_filter(std::move(drain), seen, /*max_signed=*/100000);
+            for (const auto& e : out)
+                CHECK(e.action != ModuleAction::kUnloaded);
+            kept += out.size();
+        }
+        return kept;
+    };
+
+    HourlySeenSet seen;
+    const Stream h0 = build(kHour);
+    REQUIRE(h0.risky > 1500); // not vacuous: about 3% of 65,000 are unsigned
+    CHECK(run(h0, seen) == h0.risky + h0.distinct_ordinary.size());
+    CHECK(seen.overflows() == 0);
+    // The next hour re-admits each ordinary key exactly once.
+    const Stream h1 = build(kHour + 3600);
+    CHECK(run(h1, seen) == h1.risky + h1.distinct_ordinary.size());
+    CHECK(seen.overflows() == 0);
+}
+
+TEST_CASE("risk-filter: a boot seed does not consume the slot of a later load",
+          "[echo][module][filter]") {
+    // Action is in the key. module_hourly.load_count counts 'loaded' rows only, so a seed
+    // that shared the key would hide the load and the module would read as never loaded.
+    auto seed = make_signed("app.exe", "k.dll", "MS");
+    seed.action = ModuleAction::kSeed;
+    seed.ts_unix = 1'700'000'100;
+    auto load = make_signed("app.exe", "k.dll", "MS");
+    load.ts_unix = 1'700'000'200;
+    auto kept = filter_once({seed, load});
+    REQUIRE(kept.size() == 2);
+
+    // And through the real hourly rollup: one loaded row -> load_count 1.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_module_seed_load_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    std::vector<ModuleRow> rows;
+    for (const auto& e : kept) {
+        ModuleRow r;
+        r.ts = e.ts_unix;
+        r.snapshot_id = 1;
+        r.action = std::string{module_action_token(e.action)};
+        r.process_name = e.process_name;
+        r.module_name = e.module_name;
+        r.module_dir = e.module_dir;
+        r.signed_state = std::string{module_signed_token(e.signed_state)};
+        r.signer = e.signer;
+        rows.push_back(std::move(r));
+    }
+    REQUIRE(db.insert_module_events(rows));
+    // The hour of the rows has closed by `now`.
+    (void)run_aggregation(db, 1'700'000'000 + 7200);
+    auto q = db.execute_query("SELECT module_name, load_count FROM module_hourly");
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 1);
+    CHECK(q->rows[0][0] == "k.dll");
+    CHECK(q->rows[0][1] == "1");
+}
+
+// ── catalog lookup verdict (pure; the Windows shell feeds it the lookup outcome) ──
+
+TEST_CASE("catalog_lookup_verdict maps a lookup to a verdict, never risky on an error",
+          "[echo][module][etw]") {
+    const auto unsigned_v = catalog_lookup_verdict(CatalogLookup::kNotFound);
+    CHECK(unsigned_v.state == ModuleSignedState::kUnsigned);
+    CHECK(unsigned_v.signer.empty());
+
+    const auto signed_v = catalog_lookup_verdict(CatalogLookup::kFoundValid, "Microsoft Windows");
+    CHECK(signed_v.state == ModuleSignedState::kSigned);
+    CHECK(signed_v.signer == "Microsoft Windows");
+
+    // A failed lookup, or a catalog that listed the hash but did not verify: unknown, and an
+    // unknown verdict is not risky (a system DLL must not be stored as unsigned on a lookup error).
+    const auto error_v = catalog_lookup_verdict(CatalogLookup::kError, "ignored");
+    CHECK(error_v.state == ModuleSignedState::kUnknown);
+    CHECK(error_v.signer.empty());
+    ModuleEvent e = make_signed("app.exe", "k.dll", "");
+    e.signed_state = error_v.state;
+    CHECK_FALSE(module_is_risky(e));
+    e.signed_state = unsigned_v.state;
+    CHECK(module_is_risky(e));
 }
 
 // ── SigningCache (injectable fake verifier) ─────────────────────────────────
@@ -444,8 +614,10 @@ TEST_CASE("Windows module drain: an ancestor DIRECTORY symlink is refused",
 
 TEST_CASE("Windows module drain: the by-handle verdict equals the by-name verdict",
           "[echo][module][etw][windows]") {
-    for (const wchar_t* rel :
-         {L"\\ntoskrnl.exe", L"\\ci.dll", L"\\drivers\\ntfs.sys", L"\\kernel32.dll"}) {
+    // Embedded-signature images only: the by-name oracle has no catalog lookup, so a
+    // catalog-signed image (kernel32.dll) reads unsigned there; those are covered by the
+    // catalog cases below.
+    for (const wchar_t* rel : {L"\\ntoskrnl.exe", L"\\ci.dll", L"\\drivers\\ntfs.sys"}) {
         const std::wstring w = system_dir() + rel;
         if (GetFileAttributesW(w.c_str()) == INVALID_FILE_ATTRIBUTES)
             continue;
@@ -462,6 +634,50 @@ TEST_CASE("Windows module drain: the by-handle verdict equals the by-name verdic
     const ModuleSignVerdict v = verify_image_signature_win(image.get(), candidate->second);
     CHECK(v.state == ModuleSignedState::kSigned);
     CHECK(v.signer == "Microsoft Windows"); // the production signing certificate's display name
+}
+
+TEST_CASE("Windows module drain: a catalog-signed system image reads signed, with a signer",
+          "[echo][module][etw][windows]") {
+    // A System32 binary with no embedded signature whose hash a system catalog lists
+    // (Get-AuthenticodeSignature reports SignatureType=Catalog). The embedded check says
+    // unsigned (the oracle); the catalog lookup must turn that into signed. Which binaries
+    // qualify depends on the Windows build: on some, WinVerifyTrust already resolves the
+    // catalog for the system DLLs (the oracle reads them signed) and only the executables
+    // below still read unsigned, so the list carries both kinds and the first qualifying
+    // image is used.
+    std::optional<std::pair<std::wstring, std::string>> candidate;
+    for (const wchar_t* rel : {L"\\kernel32.dll", L"\\kernelbase.dll", L"\\user32.dll",
+                               L"\\advapi32.dll", L"\\cmd.exe", L"\\ping.exe", L"\\notepad.exe"}) {
+        const std::wstring w = system_dir() + rel;
+        if (GetFileAttributesW(w.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            oracle_state(w) == ModuleSignedState::kUnsigned) {
+            candidate = std::make_pair(w, nt_path_of(w));
+            break;
+        }
+    }
+    REQUIRE(candidate.has_value()); // not vacuous: one catalog-signed image exists
+    const auto image = open_local_image_no_reparse(candidate->second);
+    REQUIRE(image);
+    const ModuleSignVerdict v = verify_image_signature_win(image.get(), candidate->second);
+    CHECK(v.state == ModuleSignedState::kSigned);
+    CHECK_FALSE(v.signer.empty());
+    // Repeatable on the same handle: the lookup rewinds it and does not consume it.
+    CHECK(verify_image_signature_win(image.get(), candidate->second).state ==
+          ModuleSignedState::kSigned);
+}
+
+TEST_CASE("Windows module drain: an image in no catalog and without a signature reads unsigned",
+          "[echo][module][etw][windows]") {
+    // The running test executable: built locally, signed by nobody, listed in no catalog.
+    wchar_t exe[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    REQUIRE((n > 0 && n < MAX_PATH));
+    const std::string nt = nt_path_of(std::wstring(exe, n));
+    const auto image = open_local_image_no_reparse(nt);
+    REQUIRE(image);
+    const ModuleSignVerdict v = verify_image_signature_win(image.get(), nt);
+    CHECK(v.state == ModuleSignedState::kUnsigned);
+    CHECK(v.signer.empty());
 }
 
 TEST_CASE("Windows module drain: the verdict comes from the handle, not the name",

@@ -36,6 +36,7 @@
 #include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_middleware.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
@@ -170,6 +171,7 @@ struct LabeledSpan {
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
+        {"middleware", capdecls::plugin_action_catalogue_middleware(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -208,6 +210,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
+        capdecls::plugin_action_catalogue_middleware(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -402,9 +405,9 @@ TEST_CASE("capability catalogue: mgmt_posture.posture pins its exact classificat
 }
 
 /// Exact-row pin for `shares.list`. A read-only listing of the shares the host serves (as
-/// configured on Linux, live Server-service state on Windows) under `Infrastructure`:Read with
-/// no execute gate. Pinning it directly means a silent drift to a mutating class, a different
-/// securable, or a gate on a facts-only read fails here.
+/// configured on Linux and macOS, live Server-service state on Windows) under
+/// `Infrastructure`:Read with no execute gate. Pinning it directly means a silent drift to a
+/// mutating class, a different securable, or a gate on a facts-only read fails here.
 TEST_CASE("capability catalogue: shares.list pins its exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_shares();
@@ -587,12 +590,12 @@ TEST_CASE("capability catalogue: firmware_posture classifies `firmware` and refu
 /// class, so without this pin a silent change to `Mutating` or `Security`
 /// ships green (an orchestrator probe confirmed it). Appended at the end of
 /// the file so sibling plugins' pins do not collide textually.
-TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exact "
+TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.python pin their exact "
           "classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_runtimes();
-    REQUIRE(rows.size() == 2);
-    for (const auto action : {"dotnet", "jvm"}) {
+    REQUIRE(rows.size() == 3);
+    for (const auto action : {"dotnet", "jvm", "python"}) {
         const auto it =
             std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
         REQUIRE(it != rows.end());
@@ -771,4 +774,23 @@ TEST_CASE("capability catalogue: no plugin name can collide with the unverified 
     }
     CHECK(rows > 0);
     CHECK(kUnverifiedProvenanceLabel.front() == '~');
+}
+
+/// Exact-row pin for `middleware.ibm_mq`: ReadOnly/None on the `Inventory` securable (an
+/// installed-software fact, not a posture fact). The generic invariants accept ANY seeded
+/// securable and ANY dispatch class, so without this pin a silent re-typing ships green.
+TEST_CASE("capability catalogue: middleware.ibm_mq pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_middleware();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "middleware");
+    CHECK(row.action == "ibm_mq");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
 }

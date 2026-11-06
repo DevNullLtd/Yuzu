@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "custom_properties_store.hpp"
+#include "dedup_fleet_tags.hpp" // agent command-dedup store fleet telemetry (#3663)
 #include "dex_perf_rules.hpp"
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
@@ -927,7 +928,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "flags, never ACLs or NFS client host lists; not the mapping/session observations echo "
          "mapdrive records; Linux reads the configuration as written (/etc/exports, "
          "/etc/exports.d and /etc/samba/smb.conf), Windows reads the live Server-service shares "
-         "through NetShareEnum (name, path, kind and flags only), macOS is planned; read-only"},
+         "through NetShareEnum (name, path, kind and flags only), macOS reads the share points "
+         "recorded by sharing -l -f json plus /etc/exports as written (not live smbd/nfsd "
+         "state); read-only"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
@@ -953,14 +956,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
         {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
-        {"hardware.chassis", "Chassis type, serial and asset tag (planned on every OS this release; one unsupported status row)"},
-        {"hardware.baseboard", "Baseboard vendor, product and serial (planned on every OS this release; one unsupported status row)"},
-        {"hardware.swap", "Swap devices and page files with total and used size (planned on every OS this release; one unsupported status row)"},
-        {"hardware.machine_id", "Keyed hash of the OS machine identifier (planned on every OS this release; one unsupported status row)"},
+        {"hardware.chassis", "Chassis type, serial and asset tag (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.baseboard", "Baseboard vendor, product and serial (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.swap", "Swap devices and page files with total and used size (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.machine_id", "Fixed-label HMAC-SHA256 of the OS machine identifier, a stable pseudonym that is not secret from a holder of the raw id (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
         // disk_actions
         {"disk_actions.smart", "Per-physical-drive health: model, transport, media type and, where the OS exposes it, wear indicators"},
         {"disk_actions.volumes", "Mapping between physical drives and the logical volumes they back, with mount points"},
-        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (planned on every OS this release; one unsupported status row)"},
+        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (read on Windows via WMI: Win32_DiskPartition view, no Microsoft Reserved partition, drive letters only, unmeasured on dynamic disks/BitLocker/Storage Spaces; planned on Linux and macOS: one unsupported status row)"},
         {"disk_actions.topology", "LVM, md, multipath and APFS container layers above the physical disks (planned on every OS this release; one unsupported status row)"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
@@ -1154,6 +1157,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"runtimes.jvm",
          "List installed JVMs by image type, version, home and vendor from each home's "
          "release file (Linux only; standard roots only, no subprocess)"},
+        {"runtimes.python",
+         "List installed Python interpreters by flavour, version, install path and vendor "
+         "(Windows PEP 514 registry keys, macOS python.org framework, Linux python3.<minor> "
+         "files with major.minor only; standard roots only, no subprocess)"},
+        // middleware
+        {"middleware.ibm_mq",
+         "List installed IBM MQ installations by version and install path from installer metadata "
+         "(Linux: mqinst.ini + swidtag names; no subprocess; Windows and macOS planned)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},
@@ -2482,6 +2493,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         metrics.clear_gauge_family(m.gauge);
     for (const auto& m : kGuardianIoCeilingMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // #3663: the dedup-store capacity MAX is the one dedup gauge that is ABSENT-not-zero (a
+    // per-agent reading that nobody may report). The dedup agent COUNTS are server-owned counts
+    // published every sweep, 0 included, so they need no clear (same as the OTA gauge).
+    metrics.clear_gauge_family(kDedupRowsMaxGauge);
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -2695,6 +2710,28 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
     int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
+    // #3663: agent command-dedup store telemetry. Counts of AGENTS (not sums of per-process
+    // counters), published every sweep including 0, so a flat 0 is a measurement;
+    // `dedup_reporting` is the denominator that says whether anyone is being measured and
+    // `dedup_tag_rejected` makes a dropped forged value visible (see dedup_fleet_tags.hpp).
+    std::array<int, kNDedupAgentCountMetrics> dedup_agent_counts{};
+    int dedup_reporting = 0;
+    int dedup_tag_rejected = 0;
+    unsigned long long dedup_rows_max = 0;
+    bool dedup_rows_reported = false;
+    // std::string twins of the table's C-string tag keys: unordered_map::find takes the key
+    // type, so passing the char* would heap-construct a temporary key per lookup, per agent,
+    // per sweep. Built once; same pattern, and the same static-destruction reasoning, as
+    // gj_keys below (the sole production reader, health_recompute_thread_, is joined in
+    // ServerImpl::stop() before exit).
+    static const std::array<std::string, kNDedupAgentCountMetrics> dedup_keys = [] {
+        std::array<std::string, kNDedupAgentCountMetrics> keys;
+        for (std::size_t i = 0; i < kNDedupAgentCountMetrics; ++i)
+            keys[i] = kDedupAgentCountMetrics[i].tag;
+        return keys;
+    }();
+    static const std::string dedup_rows_key{kDedupRowsTag};
+
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
 
@@ -2789,6 +2826,44 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         static const std::string kKeySyncSkip{"yuzu.sync.installed_software.skip_streak"};
         if (parse_echo_corruption_total(get_view(kKeySyncSkip)))
             ++sync_skipping;
+
+        // #3663: agent command-dedup store. Absent tag = this agent does not report it (an
+        // older agent): skipped, neither counted nor rejected. A PRESENT tag is classified once
+        // and the verdict is mutually exclusive: rejected (forged / malformed), or a valid
+        // reading that either counts the agent or does not. In-place reads, no copies.
+        {
+            bool dedup_agent_rejected = false;
+            for (std::size_t i = 0; i < kNDedupAgentCountMetrics; ++i) {
+                const auto it = snap.status_tags.find(dedup_keys[i]);
+                if (it == snap.status_tags.end())
+                    continue;
+                switch (classify_dedup_value(kDedupAgentCountMetrics[i].kind, it->second)) {
+                case DedupVerdict::kRejected:
+                    dedup_agent_rejected = true;
+                    break;
+                case DedupVerdict::kCounted:
+                    ++dedup_agent_counts[i];
+                    if (i == kDedupPresenceIndex)
+                        ++dedup_reporting;
+                    break;
+                case DedupVerdict::kNotCounted:
+                    if (i == kDedupPresenceIndex)
+                        ++dedup_reporting;
+                    break;
+                }
+            }
+            if (const auto it = snap.status_tags.find(dedup_rows_key);
+                it != snap.status_tags.end()) {
+                if (const auto rows = parse_dedup_value(it->second)) {
+                    dedup_rows_max = std::max(dedup_rows_max, *rows);
+                    dedup_rows_reported = true;
+                } else {
+                    dedup_agent_rejected = true;
+                }
+            }
+            if (dedup_agent_rejected)
+                ++dedup_tag_rejected;
+        }
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
@@ -3128,6 +3203,17 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // needs no clear_gauge_family.
     metrics.gauge("yuzu_fleet_inventory_sync_skipping", {{"source", "installed_software"}})
         .set(static_cast<double>(sync_skipping));
+    // #3663: agent command-dedup store. The agent COUNTS and the two meta-gauges are
+    // server-owned counts over the reporting population, published every sweep, 0 included
+    // (no clear needed). Only the capacity MAX is absent-not-zero: cleared at the top, set
+    // only when at least one agent reported a value that passed the parse.
+    for (std::size_t i = 0; i < kNDedupAgentCountMetrics; ++i)
+        metrics.gauge(kDedupAgentCountMetrics[i].gauge)
+            .set(static_cast<double>(dedup_agent_counts[i]));
+    metrics.gauge(kDedupReportingGauge).set(static_cast<double>(dedup_reporting));
+    metrics.gauge(kDedupTagRejectedGauge).set(static_cast<double>(dedup_tag_rejected));
+    if (dedup_rows_reported)
+        metrics.gauge(kDedupRowsMaxGauge).set(static_cast<double>(dedup_rows_max));
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;

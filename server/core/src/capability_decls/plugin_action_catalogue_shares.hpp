@@ -15,7 +15,8 @@
 /// `list` is ReadOnly/None. The Linux leg reads /etc/exports, /etc/exports.d/*.exports and
 /// /etc/samba/smb.conf with bounded no-follow reads plus one lstat; the Windows leg calls
 /// NetShareEnum (level 2, level 1 when refused) against the local Server service in bounded
-/// pages; the macOS leg is a PLANNED placeholder that reads nothing. No leg touches the
+/// pages; the macOS leg runs the bounded `/usr/sbin/sharing -l -f json` argv leaf and reads
+/// /etc/exports without following a link (still ReadOnly/None, no ACLs). No leg touches the
 /// network beyond that local RPC, takes an operator-supplied argument, emits an ACL or an
 /// NFS client host list, or changes host state: the action reports which shares the host
 /// serves (Linux: is configured to serve) as a FACT. Share

@@ -7,8 +7,10 @@
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
+#include "middleware_runner.hpp" // yuzu::middleware::run_leg: the REAL runner feeds the middleware cases
 #include "msi_packages_inventory.hpp"
 #include "pkg_inventory_parsers.hpp"
+#include "runtimes_python_parsers.hpp"
 #include "sync_source_installed_software.hpp"
 #include "windows_optional_features_parsers.hpp"
 
@@ -20,10 +22,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -37,10 +41,12 @@ using yuzu::agent::AdaptedRows;
 using yuzu::agent::ConstrainedPolicy;
 using yuzu::agent::installed_software_canonical_blob;
 using yuzu::agent::make_installed_software_source;
+using yuzu::agent::parse_middleware_output;
 using yuzu::agent::parse_msi_packages_list_inventory_output;
 using yuzu::agent::parse_pkg_inventory_managers_output;
 using yuzu::agent::parse_pkg_inventory_packages_output;
 using yuzu::agent::parse_pkg_inventory_store_packages_output;
+using yuzu::agent::parse_runtimes_python_output;
 using yuzu::agent::parse_windows_optional_features_output;
 using yuzu::agent::parse_installed_apps_output;
 using yuzu::agent::sha256_hex;
@@ -142,6 +148,25 @@ TEST_CASE("parse_installed_apps_output tolerates short and over-long inv rows",
     }
 }
 
+namespace {
+
+// A live agent wakes at least every kMaxTickSeconds. A single tick() far past a source's
+// next_fire is a resume from sleep (SAM-19: re-armed with a spread, not fired at once), so a
+// test that means "one interval later" walks the clock the way the agent's own loop does.
+std::int64_t live_advance(SyncScheduler& sched, std::int64_t from, std::int64_t to,
+                          const std::function<bool()>& done = {}) {
+    std::int64_t t = from;
+    while (t < to) {
+        t = std::min(t + SyncScheduler::kMaxTickSeconds.count(), to);
+        sched.tick(t);
+        if (done && done())
+            break;
+    }
+    return t;
+}
+
+} // namespace
+
 TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[sync][scheduler]") {
     std::map<std::string, std::string> kv;
     auto kv_get = [&](const std::string& k) {
@@ -185,7 +210,7 @@ TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[syn
 
     // Unchanged content one interval later → hash-only (no blob).
     std::int64_t t2 = 1000 + 700 + 86400 + 1;
-    sched.tick(t2);
+    live_advance(sched, 1700, t2);
     REQUIRE(calls == 2);
     CHECK_FALSE(last_had_blob);
 
@@ -193,7 +218,7 @@ TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[syn
     cur_hash = "h2";
     cur_blob = "b2";
     std::int64_t t3 = t2 + 86400 + 1;
-    sched.tick(t3);
+    live_advance(sched, t2, t3);
     REQUIRE(calls == 3);
     CHECK(last_had_blob);
 
@@ -201,7 +226,7 @@ TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[syn
     // but the scheduler then force-fulls on the next pass.
     next_need = {"installed_software"};
     std::int64_t t4 = t3 + 86400 + 1;
-    sched.tick(t4);
+    t4 = live_advance(sched, t3, t4, [&] { return calls == 4; }); // stop at the nacked send
     REQUIRE(calls == 4);
     CHECK_FALSE(last_had_blob); // hash-only send that the server nacked
 
@@ -508,13 +533,24 @@ TEST_CASE("SyncScheduler: weekly full-floor resends a full payload even when unc
     REQUIRE(calls == 1);
     REQUIRE(last_had_blob);
 
-    sched.tick(1700 + 86400 + 1); // unchanged, within the floor → hash-only
+    live_advance(sched, 1700, 1700 + 86400 + 1); // unchanged, within the floor → hash-only
     REQUIRE(calls == 2);
     REQUIRE_FALSE(last_had_blob);
 
-    // Past last_full + kFullFloor, still unchanged → forced FULL.
-    sched.tick(1700 + SyncScheduler::kFullFloor.count() + 1);
-    REQUIRE(calls == 3);
+    // Daily hash-only syncs through the week, never a blob while inside the floor.
+    bool any_blob = false;
+    std::int64_t t = 1700 + 86400 + 1;
+    const std::int64_t floor_at = 1700 + SyncScheduler::kFullFloor.count();
+    while (t < floor_at) {
+        const int before = calls;
+        t = std::min(t + SyncScheduler::kMaxTickSeconds.count(), floor_at);
+        sched.tick(t);
+        any_blob = any_blob || (calls != before && last_had_blob);
+    }
+    CHECK_FALSE(any_blob);
+
+    // Past last_full + kFullFloor, still unchanged → the next sync is a forced FULL.
+    live_advance(sched, floor_at, floor_at + 86400 + 1, [&] { return last_had_blob; });
     CHECK(last_had_blob);
 }
 
@@ -1277,7 +1313,8 @@ struct FakeOut {
     std::map<std::string, std::tuple<YuzuResultStatus, YuzuResultCompleteness, std::string>>
         result_status;
 };
-FakeOut g_fake[4]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages
+FakeOut g_fake[6]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages,
+                   // 4 runtimes, 5 middleware (not in all_plugins())
 
 template <int I>
 int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
@@ -1300,6 +1337,8 @@ const char* const kFakeIaActions[] = {"list_inventory", nullptr};
 const char* const kFakePkgActions[] = {"managers", "packages", "store_packages", nullptr};
 const char* const kFakeWofActions[] = {"list", nullptr};
 const char* const kFakeMsiActions[] = {"list_inventory", nullptr};
+const char* const kFakeRtActions[] = {"python", nullptr};
+const char* const kFakeMiddlewareActions[] = {"ibm_mq", nullptr};
 
 #define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
     const YuzuPluginDescriptor var = {YUZU_PLUGIN_ABI_VERSION, plugin_name, "1.0.0", "test fake", \
@@ -1309,13 +1348,16 @@ YUZU_FAKE_DESC(kFakeIa, "installed_apps", kFakeIaActions, 0);
 YUZU_FAKE_DESC(kFakePkg, "pkg_inventory", kFakePkgActions, 1);
 YUZU_FAKE_DESC(kFakeWof, "windows_optional_features", kFakeWofActions, 2);
 YUZU_FAKE_DESC(kFakeMsi, "msi_packages", kFakeMsiActions, 3);
+YUZU_FAKE_DESC(kFakeRt, "runtimes", kFakeRtActions, 4);
+YUZU_FAKE_DESC(kFakeMiddleware, "middleware", kFakeMiddlewareActions, 5);
 #undef YUZU_FAKE_DESC
 
 SyncPluginMap all_plugins() {
     return {{"installed_apps", &kFakeIa},
             {"pkg_inventory", &kFakePkg},
             {"windows_optional_features", &kFakeWof},
-            {"msi_packages", &kFakeMsi}};
+            {"msi_packages", &kFakeMsi},
+            {"runtimes", &kFakeRt}};
 }
 
 void reset_fakes() {
@@ -1325,6 +1367,10 @@ void reset_fakes() {
         f.rc.clear();
         f.result_status.clear();
     }
+    // runtimes.python defaults to a clean empty read (the sample-shaped runs below pin digests that
+    // carry no python rows); the runtimes cases override it.
+    g_fake[4].out["python"] =
+        yuzu::shared::format_status_row("python", yuzu::shared::StatusLevel::supported, "") + "\n";
 }
 
 void fake_mac() {
@@ -2416,6 +2462,16 @@ TEST_CASE("collector: typed completeness - FULL collected; an opted-in PARTIAL a
     }
 }
 
+TEST_CASE("collector: installed_software carries the 01:00-05:00 local nightly window",
+          "[sync][collector][window]") {
+    // The only place the window is set: every other source keeps a plain 24 h phase slot.
+    fake_mac();
+    const auto src = make_installed_software_source(all_plugins());
+    REQUIRE(src.window);
+    CHECK(src.window->start_min == 60);
+    CHECK(src.window->end_min == 300);
+}
+
 TEST_CASE("collector: skip_reason names the cause of each skip and clears on success",
           "[sync][collector]") {
     fake_mac();
@@ -2520,6 +2576,7 @@ std::string show_entry(const SwEntry& e) {
 std::string show(const AdaptedRows& r) {
     std::string s = r.status == Status::ok            ? "ok"
                     : r.status == Status::unsupported ? "unsupported"
+                    : r.status == Status::withheld    ? "withheld"
                                                       : "failed";
     s += "|reason=" + r.reason + "|n=" + std::to_string(r.entries.size());
     for (const auto& e : r.entries)
@@ -2909,6 +2966,7 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         const char* action;
         bool windows;       // which sample set the other actions come from
         const char* mapped; // a valid row the action maps; empty for managers (they keep it)
+        bool withholds = false; // table policy drop_source: constrained withholds the rows, not the cycle
     };
     const Case cases[] = {
         {1, "pkg_inventory", "packages", false, "package|homebrew|wget|1.24|formula"},
@@ -2916,7 +2974,8 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
          "package|snap|btop|1.4.7|app|1073|-|-|active"},
         {1, "pkg_inventory", "managers", false, ""},
         {3, "msi_packages", "list_inventory", true,
-         "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"}};
+         "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"},
+        {4, "runtimes", "python", false, "python|cpython|3.14.6|C:/P/|PythonCore", true}};
     for (const auto& c : cases) {
         INFO(c.plugin << "." << c.action);
         const std::string source = std::string(c.plugin) + "." + c.action;
@@ -2931,18 +2990,21 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
             return std::make_pair(collected, src.skip_reason());
         };
         const std::string a = c.action;
-        // constrained with no data row: skipped, the status token is the reason
-        CHECK(skip_with(nl({st(a, "constrained", "tok")})) ==
-              std::make_pair(false, source + ":tok"));
-        // constrained with a row of the wrong shape: still skipped
-        CHECK(skip_with(nl({st(a, "constrained", "tok"), "garbage|row"})) ==
-              std::make_pair(false, source + ":tok"));
-        // constrained with a row the adapter MAPS: still skipped, so the action table's
-        // `constrained` column (fail) is what is pinned, not just the zero-row fallback.
+        // What a constrained answer does to the cycle, per the action table's `constrained` column:
+        // fail skips it with the status token as the reason; drop_source (runtimes.python) lets it
+        // continue with only that source's rows withheld (the collector-level case in the
+        // runtimes.python test below pins the rows).
+        const auto constrained_outcome = c.withholds ? std::make_pair(true, std::string{})
+                                                     : std::make_pair(false, source + ":tok");
+        // constrained with no data row
+        CHECK(skip_with(nl({st(a, "constrained", "tok")})) == constrained_outcome);
+        // constrained with a row of the wrong shape: the same outcome
+        CHECK(skip_with(nl({st(a, "constrained", "tok"), "garbage|row"})) == constrained_outcome);
+        // constrained with a row the adapter MAPS: the same outcome, so the action table's
+        // `constrained` column is what is pinned, not just the zero-row fallback.
         // Managers is the one action that keeps such a cycle (cases below).
         if (c.mapped[0] != '\0') {
-            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) ==
-                  std::make_pair(false, source + ":tok"));
+            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) == constrained_outcome);
         }
         // zero, two, short and mis-levelled status rows
         CHECK(skip_with("") == std::make_pair(false, source + ":bad status"));
@@ -3017,5 +3079,968 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
                                          std::string("manager|") + m + "|present|1|/|-|-"}))) ==
                   res("ok", "tok"));
         }
+    }
+}
+
+// runtimes.python through the COLLECTOR (the adapter cases below call the parser directly): the
+// table row is what wires the plugin in, so removing it, or flipping its ConstrainedPolicy away
+// from drop_source, turns a section here red.
+TEST_CASE("collector: runtimes.python contributes sourced rows, a constrained Python read withholds "
+          "only them and a PARTIAL one aborts the cycle",
+          "[sync][collector][runtimes]") {
+    const std::string python_row =
+        "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python";
+    const auto python_records = [](const std::string& blob) {
+        std::size_t n = 0;
+        for (const auto& rec : records_of(blob)) {
+            const auto f = fields_of(rec);
+            REQUIRE(f.size() == 16);
+            // Every record sourced runtimes.python is a python-ecosystem Python entry, and back.
+            CHECK((f[15] == "runtimes.python") == (f[5] == "python"));
+            if (f[15] != "runtimes.python") continue;
+            ++n;
+            CHECK(f[0] == "Python");
+            CHECK(f[1] == "3.13.1");
+            CHECK(f[4] == "app");
+        }
+        return n;
+    };
+    SECTION("a python row becomes one sourced python record beside the other sources") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), python_row});
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        CHECK(python_records(got->first) == 1);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1 + 1);
+    }
+    SECTION("escaped pipes in the free-text fields do not cost the sourced row") {
+        // Built by the real producer: vendor and install_path go through safe_output_field, so a
+        // literal pipe reaches the collector as `\|` and must not read as a sixth field.
+        yuzu::runtimes::PythonRecord rec;
+        rec.flavour = yuzu::runtimes::PythonFlavour::cpython;
+        rec.version = "3.13.1";
+        rec.install_path = "C:\\Python|313\\";
+        rec.vendor = "org.python|custom";
+        const auto piped = yuzu::runtimes::python_row(rec);
+        REQUIRE(piped.find("\\|") != std::string::npos);
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), piped});
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        CHECK(python_records(got->first) == 1);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1 + 1);
+    }
+    SECTION("a clean empty read contributes nothing and does not skip the cycle") {
+        fake_mac();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        CHECK(python_records(got->first) == 0);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1);
+    }
+    SECTION("a constrained status withholds the python rows only, even one that carries a row") {
+        fake_mac();
+        g_fake[4].out["python"] =
+            nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
+        // The real leg also types the answer CONSTRAINED + PARTIAL (runtimes_legs.hpp emit_read):
+        // the withheld verdict must win over the PARTIAL skip, which would cost the whole cycle.
+        g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                             "linux:runtimes:permission_denied"};
+        auto src = make_installed_software_source(all_plugins());
+        REQUIRE(src.skip_reason);
+        const auto got = src.collect();
+        REQUIRE(got.has_value()); // the cycle continues
+        CHECK(src.skip_reason().empty());
+        CHECK(python_records(got->first) == 0);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1); // every other source's rows survive
+    }
+    SECTION("a supported status with typed PARTIAL completeness skips the cycle") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), python_row});
+        g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                             "x"};
+        auto src = make_installed_software_source(all_plugins());
+        REQUIRE(src.skip_reason);
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "runtimes.python:partial");
+    }
+}
+
+// runtimes.python adapter
+TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / python",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    // Rows as the plugin emits them over the committed captures: the debian:bookworm listing
+    // (major.minor only on Linux), the python.org 3.13.1 framework plist (macOS) and a Windows
+    // PythonCore tag (flavour/path/vendor are dropped: no installed_software slot).
+    const auto r = parse_runtimes_python_output(
+        nl({"status|python|supported|-",
+            "python|unmodelled|3.11|/usr/bin/python3.11|-",
+            "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
+            "python|cpython|3.14.6|C:/Python314/|PythonCore"}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 3);
+    const char* versions[] = {"3.11", "3.13.1", "3.14.6"};
+    for (std::size_t i = 0; i < 3; ++i) {
+        CHECK(r.entries[i].name == "Python");
+        CHECK(r.entries[i].version == versions[i]);
+        CHECK(r.entries[i].kind == "app");
+        CHECK(r.entries[i].ecosystem == "python");
+        CHECK(r.entries[i].publisher.empty());
+    }
+}
+
+TEST_CASE("runtimes python adapter: rows built by the producer round-trip through escaped pipes",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    yuzu::runtimes::PythonRecord rec;
+    rec.flavour = yuzu::runtimes::PythonFlavour::cpython;
+    rec.version = "3.13.1";
+    rec.install_path = "C:\\Python|313\\"; // a literal backslash folds to '/', a pipe to `\|`
+    rec.vendor = "org.python|custom";
+    const auto row = yuzu::runtimes::python_row(rec);
+    // Pin the wire form the adapter has to read, so a producer change shows up here.
+    REQUIRE(row == "python|cpython|3.13.1|C:/Python\\|313/|org.python\\|custom");
+    SECTION("one piped vendor and path: one entry, version unchanged") {
+        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}), kFailPolicy);
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].version == "3.13.1");
+        CHECK(r.entries[0].ecosystem == "python");
+    }
+    SECTION("more escaped pipes than the split width still read as five logical fields") {
+        rec.vendor = "a|b|c|d|e|f|g|h|i|j|k|l";
+        const auto r = parse_runtimes_python_output(
+            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}), kFailPolicy);
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].version == "3.13.1");
+    }
+}
+
+TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dropped",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    const auto r = parse_runtimes_python_output(
+        nl({"status|python|supported|-", "python|unmodelled|-|/usr/bin/python3.x|-",
+            "python|cpython|3.1|/p", "jvm|jdk|17|/x|-", "python|cpython|3.2|/p|v|extra"}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 1);
+    CHECK(r.entries[0].version.empty());
+    CHECK(r.entries[0].ecosystem == "python");
+}
+
+TEST_CASE("runtimes python adapter: status grammar decides the answer", "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    // No status row, or one for another action: bad status.
+    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}), kFailPolicy).status ==
+          Status::failed);
+    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy).status ==
+          Status::failed);
+    // constrained under the table row's drop_source policy: status withheld, zero entries even
+    // though a row was present, reason = the status tokens (what the collector logs).
+    const auto w = parse_runtimes_python_output(
+        nl({"status|python|constrained|linux:runtimes:permission_denied",
+            "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
+        ConstrainedPolicy::drop_source);
+    CHECK(show(w) == res("withheld", "linux:runtimes:permission_denied"));
+    // the adapter still honours an explicit fail policy
+    const auto c = parse_runtimes_python_output(
+        nl({"status|python|constrained|linux:runtimes:permission_denied",
+            "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
+        ConstrainedPolicy::fail);
+    CHECK(c.status == Status::failed);
+    CHECK(c.reason == "linux:runtimes:permission_denied");
+    // unsupported is skipped with no entries.
+    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}), kFailPolicy);
+    CHECK(u.status == Status::unsupported);
+    CHECK(u.entries.empty());
+}
+
+// --- middleware (SAM.2): the generic product adapter, ConstrainedPolicy::drop_source ---
+
+namespace {
+constexpr ConstrainedPolicy kDropPolicy = ConstrainedPolicy::drop_source;
+
+// REAL-CAPTURE-shaped row (IBM MQ 9.4.5.0 registered install; the leg reports VRM, 9.4.5):
+// <id>|<title>|<name>|<version or ->|<install_path>|<edition or ->
+constexpr const char* kMqRow = "ibm_mq|IBM MQ|Installation1|9.4.5|/opt/mqm|-";
+
+AdaptedRows bind_mq(const std::string& s) { return parse_middleware_output(s, "ibm_mq", kDropPolicy); }
+
+SyncPluginMap with_middleware() {
+    SyncPluginMap m = all_plugins();
+    m["middleware"] = &kFakeMiddleware;
+    return m;
+}
+
+std::size_t count_source(const std::string& blob, std::string_view source) {
+    std::size_t n = 0;
+    for (const auto& rec : records_of(blob))
+        if (fields_of(rec)[15] == source)
+            ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("middleware adapter: a row maps to the product table's entry",
+          "[sync][parse][adapter][middleware]") {
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), kMqRow}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.4.5", "IBM", "app", "ibm_mq")}));
+    // `-` is the wire spelling of "no version": the honest-empty field is the empty string.
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"),
+                           "ibm_mq|IBM MQ|Installation2|-|/opt/mqm2|-"}))) ==
+          res("ok", "", {entry_of("IBM MQ", "", "IBM", "app", "ibm_mq")}));
+    // the edition column is not carried
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"),
+                           "ibm_mq|IBM MQ|Installation3|9.3.5.0|/opt/mqm3|Advanced"}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.3.5.0", "IBM", "app", "ibm_mq")}));
+    // two installations are two entries
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), kMqRow,
+                      "ibm_mq|IBM MQ|Installation2|9.3.5.0|/opt/mqm2|-"}))
+              .entries.size() == 2);
+    // zero rows + supported is a legitimate "none installed"
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-")}))) == res("ok", ""));
+}
+
+TEST_CASE("middleware adapter: an action that is not in the product table fails",
+          "[sync][parse][adapter][middleware]") {
+    CHECK(show(parse_middleware_output(nl({st("nope", "supported", "-"), "nope|IBM MQ|n|1|/p|-"}),
+                                       "nope", kDropPolicy)) ==
+          res("failed", "unknown middleware product"));
+    CHECK(show(parse_middleware_output("", "", kDropPolicy)) ==
+          res("failed", "unknown middleware product"));
+}
+
+TEST_CASE("middleware adapter: a row is accepted only when its title equals the table title",
+          "[sync][parse][adapter][middleware]") {
+    const std::string good = kMqRow;
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), good}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.4.5", "IBM", "app", "ibm_mq")}));
+    for (const char* title : {"-", "", "ibm mq", "IBM MQ ", " IBM MQ", "IBM  MQ", "Oracle"}) {
+        INFO("title=[" << title << "]");
+        const std::string bad = std::string("ibm_mq|") + title + "|InstallationX|1.0|/opt/x|-";
+        // dropped, siblings kept, the source stays ok
+        CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), bad, good, bad}))) ==
+              res("ok", "", {entry_of("IBM MQ", "9.4.5", "IBM", "app", "ibm_mq")}));
+        CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), bad}))) == res("ok", ""));
+        // dropped rows are COUNTED (seen, not mapped): under keep_rows_if_present_seen a
+        // constrained answer holding only such rows is kept, not failed
+        CHECK(show(parse_middleware_output(nl({st("ibm_mq", "constrained", "tok"), bad}), "ibm_mq",
+                                           ConstrainedPolicy::keep_rows_if_present_seen)) ==
+              res("ok", "tok"));
+    }
+}
+
+TEST_CASE("middleware adapter: an escaped pipe in a free-text field is one field and not two",
+          "[sync][parse][adapter][middleware]") {
+    // safe_output_field writes a literal '|' as `\|`; a raw-pipe split would see seven tokens
+    // and silently drop the row although the status is supported.
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"),
+                           "ibm_mq|IBM MQ|Inst\\|1|9.4.5.0|/opt/mq\\|east|-"}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.4.5.0", "IBM", "app", "ibm_mq")}));
+    // an escaped pipe does not hide a real extra field: still seven tokens, still rejected
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), "ibm_mq|IBM MQ|I\\|1|9.4|/p|-|extra"}))
+              .entries.empty());
+}
+
+TEST_CASE("middleware adapter: status grammar and row shape and the drop_source policy",
+          "[sync][parse][adapter][middleware]") {
+    const std::string bad = res("failed", "bad status");
+    // bad or missing status fails the cycle (it is not a constrained answer)
+    CHECK(show(bind_mq(nl({kMqRow}))) == bad);
+    CHECK(show(bind_mq("")) == bad);
+    CHECK(show(bind_mq(nl({"status|ibm_mq|supported", kMqRow}))) == bad);
+    CHECK(show(bind_mq(nl({st("ibm_mq", "bogus", "-"), kMqRow}))) == bad);
+    CHECK(show(bind_mq(nl({st("oracle", "supported", "-"), kMqRow}))) == bad);
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), st("ibm_mq", "supported", "-"), kMqRow}))) ==
+          bad);
+    // unsupported: skipped silently, zero entries, no reason
+    CHECK(show(bind_mq(nl({st("ibm_mq", "unsupported", "macos:planned"), kMqRow}))) ==
+          res("unsupported", ""));
+    // constrained under drop_source: zero entries, reason = the tokens, status withheld --
+    // with rows, without rows, and with a row the adapter would not even see
+    const std::string tok = "linux:middleware:mqinst_ini:permission_denied";
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), kMqRow}))) == res("withheld", tok));
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok)}))) == res("withheld", tok));
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), "garbage"}))) == res("withheld", tok));
+    CHECK(show(bind_mq(crlf(nl({st("ibm_mq", "constrained", tok), kMqRow})))) ==
+          res("withheld", tok));
+    // row shape: only exactly six tokens with this action's tag are rows
+    const std::string r = kMqRow;
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r + "|extra"})).entries.empty()); // 7 tokens
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r.substr(0, r.rfind('|'))})).entries.empty()); // 5
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), "oracle" + r.substr(6)})).entries.empty());
+    // over-wide rows (more than the splitter's ten tokens) are rejected, never truncated
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r + "|1|2|3|4|5|6|7"})).entries.empty());
+    // the policy is the only difference: the same constrained answer fails under `fail`
+    CHECK(show(parse_middleware_output(nl({st("ibm_mq", "constrained", "tok"), kMqRow}), "ibm_mq",
+                                       kFailPolicy)) == res("failed", "tok"));
+}
+
+TEST_CASE("collector: middleware.ibm_mq publishes its mapped fields; a withheld one contributes "
+          "nothing and the cycle continues",
+          "[sync][collector][middleware]") {
+    SECTION("a supported answer publishes IBM MQ with source middleware.ibm_mq") {
+        fake_windows();
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        auto src = make_installed_software_source(with_middleware());
+        const auto got = src.collect();
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
+        CHECK(count_source(got->first, "msi_packages.list_inventory") > 0);
+        for (const auto& rec : records_of(got->first)) {
+            const auto f = fields_of(rec);
+            if (f[15] != "middleware.ibm_mq")
+                continue;
+            CHECK(f[0] == "IBM MQ");
+            CHECK(f[1] == "9.4.5");
+            CHECK(f[2] == "IBM");
+            CHECK(f[4] == "app");
+            CHECK(f[5] == "ibm_mq");
+        }
+    }
+    SECTION("a constrained answer is withheld: the blob equals the no-middleware baseline") {
+        fake_windows();
+        const auto baseline = collect_with(all_plugins());
+        REQUIRE(baseline.has_value());
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_ini:permission_denied"),
+                                      kMqRow});
+        // the typed answer a constrained read carries; a withheld source never reaches the
+        // PARTIAL check, so the cycle is not skipped for it
+        g_fake[5].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                             "linux:middleware:mqinst_ini:permission_denied"};
+        auto src = make_installed_software_source(with_middleware());
+        const auto got = src.collect();
+        REQUIRE(got.has_value());
+        CHECK(got->second == baseline->second); // identical hash: nothing from middleware
+        CHECK(got->first == baseline->first);
+        REQUIRE(src.skip_reason);
+        CHECK(src.skip_reason().empty());
+    }
+    SECTION("an unsupported answer contributes nothing and the cycle continues") {
+        fake_windows();
+        const auto baseline = collect_with(all_plugins());
+        REQUIRE(baseline.has_value());
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "unsupported", "macos:planned")});
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(got->first == baseline->first);
+    }
+    SECTION("a failing source still skips the cycle beside a healthy middleware") {
+        fake_windows();
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        g_fake[3].out["list_inventory"] = "status|list_inventory|constrained|windows:msi_enum:5\n";
+        auto src = make_installed_software_source(with_middleware());
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "msi_packages.list_inventory:windows:msi_enum:5");
+    }
+    SECTION("a malformed middleware status is a failure and not a withheld source") {
+        fake_windows();
+        g_fake[5].out["ibm_mq"] = nl({kMqRow}); // no status row
+        auto src = make_installed_software_source(with_middleware());
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "middleware.ibm_mq:bad status");
+    }
+    SECTION("a middleware rc != 0 skips the cycle") {
+        fake_windows();
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-")});
+        g_fake[5].rc["ibm_mq"] = 1;
+        CHECK_FALSE(collect_with(with_middleware()).has_value());
+    }
+}
+
+TEST_CASE("collector: populated -> constrained -> recovered middleware cycles",
+          "[sync][collector][middleware]") {
+    // Each cycle replaces the agent's whole stored inventory server-side, so a constrained cycle
+    // must publish the no-middleware blob (the IBM MQ rows go away) and recovery must restore it.
+    fake_windows();
+    const auto baseline = collect_with(all_plugins());
+    REQUIRE(baseline.has_value());
+    // No log assertions: the collector lives in libyuzu_agent_core, whose spdlog registry is a
+    // separate image from this binary's on macOS (test_log_capture.hpp, #3355), so a capture here
+    // would pass or fail by platform. The withheld status and reason are pinned at the adapter
+    // level above (parse_middleware_output); this case pins the published blob.
+    const auto populated = [] {
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        g_fake[5].result_status.erase("ibm_mq");
+    };
+
+    populated();
+    const auto c1 = collect_with(with_middleware());
+    REQUIRE(c1.has_value());
+    CHECK(count_source(c1->first, "middleware.ibm_mq") == 1);
+    CHECK(c1->second != baseline->second);
+
+    g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_ini:permission_denied")});
+    const auto c2 = collect_with(with_middleware());
+    REQUIRE(c2.has_value());
+    CHECK(count_source(c2->first, "middleware.ibm_mq") == 0);
+    CHECK(c2->second == baseline->second);
+    CHECK(c2->first == baseline->first);
+    CHECK(count_source(c2->first, "msi_packages.list_inventory") > 0); // the other sources stayed
+
+    populated();
+    const auto c3 = collect_with(with_middleware());
+    REQUIRE(c3.has_value());
+    CHECK(c3->second == c1->second);
+    CHECK(c3->first == c1->first);
+}
+
+// --- the REAL runner's output through the collector (data faults keep their siblings) ---
+
+namespace {
+namespace mwr = yuzu::middleware;
+
+/// A minimal in-memory Fs for the generic middleware runner: one scripted read of the enumerator
+/// file, every installation directory absent (versions stay `-`: this case is about rows, not
+/// versions).
+struct MwFakeFs {
+    mwr::Read ini;
+    mwr::Read read_abs(std::string_view, std::size_t) { return ini; }
+    mwr::Listing list_under(std::string_view, std::string_view) {
+        return mwr::Listing{{}, false, false, mwr::Read::Outcome::absent};
+    }
+    bool exhausted() const { return false; }
+    std::string_view os() const { return "linux"; }
+};
+
+/// What the real ibm_mq Linux leg writes for `fs`: the composed rows (status row first), one per line.
+std::string run_ibm_mq(MwFakeFs& fs) {
+    const mwr::Product& p = *mwr::find_product("ibm_mq");
+    yuzu::shared::ConstraintAccumulator acc;
+    auto budget = mwr::make_row_budget();
+    const auto data = mwr::run_leg(p, p.linux, fs, acc, budget,
+                                   [](std::string_view, std::string_view, mwr::ItemReason,
+                                      std::string_view) {});
+    std::string out;
+    for (const auto& row : mwr::compose_output(p.id, data, acc))
+        out += row + "\n";
+    return out;
+}
+
+constexpr const char* kBrokenStanza = "Installation:\n   Name=Broken\n";
+constexpr const char* kGoodStanza = "Installation:\n   Name=Installation1\n   FilePath=/opt/mqm\n";
+} // namespace
+
+TEST_CASE("collector: a malformed mqinst.ini stanza beside a valid one still publishes IBM MQ",
+          "[sync][collector][middleware]") {
+    fake_windows();
+    const auto baseline = collect_with(all_plugins());
+    REQUIRE(baseline.has_value());
+    const std::string denied = "linux:middleware:mqinst_ini:permission_denied";
+
+    SECTION("a dropped stanza and a valid sibling: supported, the sibling's row is published") {
+        MwFakeFs fs;
+        fs.ini = {mwr::Read::Outcome::ok, std::string{kBrokenStanza} + kGoodStanza};
+        const std::string out = run_ibm_mq(fs);
+        REQUIRE(out.starts_with("status|ibm_mq|supported|-\n"));
+        // the adapter keeps the answer (not withheld) and maps the one row
+        CHECK(show(bind_mq(out)) == res("ok", "", {entry_of("IBM MQ", "", "IBM", "app", "ibm_mq")}));
+
+        g_fake[5].out["ibm_mq"] = out; // no typed status: the leg declares OK/FULL
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
+        CHECK(got->second != baseline->second);
+    }
+    SECTION("every stanza dropped: constrained, malformed, withheld (never an empty supported)") {
+        MwFakeFs fs;
+        fs.ini = {mwr::Read::Outcome::ok, kBrokenStanza};
+        const std::string out = run_ibm_mq(fs);
+        const std::string token = "linux:middleware:mqinst_ini:malformed";
+        REQUIRE(out == "status|ibm_mq|constrained|" + token + "\n");
+        CHECK(show(bind_mq(out)) == res("withheld", token));
+
+        g_fake[5].out["ibm_mq"] = out;
+        g_fake[5].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL, token};
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+        CHECK(got->second == baseline->second);
+    }
+    SECTION("positive control: a permission fault on the same file still withholds the source") {
+        MwFakeFs fs;
+        fs.ini = {mwr::Read::Outcome::denied, {}};
+        const std::string out = run_ibm_mq(fs);
+        REQUIRE(out == "status|ibm_mq|constrained|" + denied + "\n");
+        CHECK(show(bind_mq(out)) == res("withheld", denied));
+
+        g_fake[5].out["ibm_mq"] = out;
+        g_fake[5].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL, denied};
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+        CHECK(got->second == baseline->second);
+    }
+}
+
+TEST_CASE("middleware adapter: the leg's own escaped rows round-trip through the adapter",
+          "[sync][parse][adapter][middleware]") {
+    // mw::format_row (the leg) and the collector's escape-aware split are two implementations of one
+    // grammar. A pipe in the installation name or path must leave the row six fields wide, so the
+    // entry is the one a plain name and path would give. Hand-written escaped literals (the case
+    // above) cannot catch the leg's writer drifting from the collector's reader.
+    const std::string plain = mwr::format_row("ibm_mq", "IBM MQ", "Installation1", "9.4.5", "/opt/mqm", "");
+    const std::string piped = mwr::format_row("ibm_mq", "IBM MQ", "Inst|1", "9.4.5", "/opt/mq|east", "");
+    const std::string tricky = mwr::format_row("ibm_mq", "IBM MQ", "a\\|b", "9.4.5", "C:\\mq\\|x", "");
+    REQUIRE(piped.find("\\|") != std::string::npos); // the pipe really was escaped on the wire
+    const AdaptedRows want = bind_mq(nl({st("ibm_mq", "supported", "-"), plain}));
+    REQUIRE(want.entries.size() == 1);
+    for (const std::string* row : {&piped, &tricky}) {
+        CAPTURE(*row);
+        const AdaptedRows got = bind_mq(nl({st("ibm_mq", "supported", "-"), *row}));
+        CHECK(show(got) == show(want));
+    }
+}
+
+TEST_CASE("middleware adapter and collector: a leg row built from NUL-bearing installer text still maps",
+          "[sync][parse][adapter][collector][middleware]") {
+    // mw::format_row scrubs a NUL to '?' (scrub_wire_bytes), so the row reaches the collector whole.
+    // Unscrubbed, the plugin ABI's C string would end the row at the NUL while the status row stays
+    // `supported`; the adapter then rejects the short row and the source's stored rows are erased.
+    const std::string row = mwr::format_row("ibm_mq", "IBM MQ", std::string{"In\0st", 5}, "9.4.5",
+                                            std::string{"/opt/m\0qm", 9}, "");
+    REQUIRE(row.find('\0') == std::string::npos);
+    const std::string out = nl({st("ibm_mq", "supported", "-"), row});
+    CHECK(show(bind_mq(out)) == res("ok", "", {entry_of("IBM MQ", "9.4.5", "IBM", "app", "ibm_mq")}));
+
+    fake_windows();
+    g_fake[5].out["ibm_mq"] = out;
+    const auto got = collect_with(with_middleware());
+    REQUIRE(got.has_value());
+    CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
+}
+
+TEST_CASE("collector: one drop_source source withheld does not touch the other",
+          "[sync][collector][runtimes][middleware]") {
+    // python and ibm_mq both withhold on a CONSTRAINED answer (each its own `continue` in the
+    // collector loop). Withholding one must leave the other's rows in the blob, in both directions.
+    const std::string python_row = "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python";
+    const std::string tok = "linux:middleware:mqinst_ini:permission_denied";
+    const auto constrain = [](std::size_t slot, const char* action, const std::string& token) {
+        g_fake[slot].result_status[action] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                              YUZU_RESULT_COMPLETENESS_PARTIAL, token};
+    };
+
+    SECTION("python withheld, ibm_mq kept") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
+        constrain(4, "python", "linux:runtimes:permission_denied");
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "runtimes.python") == 0);
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
+    }
+    SECTION("ibm_mq withheld, python kept") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), python_row});
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "constrained", tok), kMqRow});
+        constrain(5, "ibm_mq", tok);
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "runtimes.python") == 1);
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SAM-19: delay_max on request_now, source lists, maintenance windows, catch-up.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// UTC as the "local" zone: deterministic and DST-free (the DST edges are pinned in
+// test_sync_window.cpp). from_local normalises an out-of-range day like mktime does.
+yuzu::agent::LocalClock utc_clock() {
+    namespace c = std::chrono;
+    yuzu::agent::LocalClock clock;
+    clock.to_local = [](std::int64_t t) {
+        const c::sys_seconds tp{c::seconds{t}};
+        const c::sys_days d = c::floor<c::days>(tp);
+        const c::year_month_day ymd{d};
+        const c::hh_mm_ss<c::seconds> hms{tp - d};
+        std::tm l{};
+        l.tm_year = static_cast<int>(ymd.year()) - 1900;
+        l.tm_mon = static_cast<int>(static_cast<unsigned>(ymd.month())) - 1;
+        l.tm_mday = static_cast<int>(static_cast<unsigned>(ymd.day()));
+        l.tm_hour = static_cast<int>(hms.hours().count());
+        l.tm_min = static_cast<int>(hms.minutes().count());
+        l.tm_sec = static_cast<int>(hms.seconds().count());
+        return l;
+    };
+    clock.from_local = [](const std::tm& l) {
+        const c::sys_days d = c::sys_days{c::year{l.tm_year + 1900} /
+                                          c::month{static_cast<unsigned>(l.tm_mon + 1)} / 1} +
+                              c::days{l.tm_mday - 1};
+        return static_cast<std::int64_t>(
+            c::duration_cast<c::seconds>(d.time_since_epoch() + c::hours{l.tm_hour} +
+                                         c::minutes{l.tm_min} + c::seconds{l.tm_sec})
+                .count());
+    };
+    return clock;
+}
+
+struct Sam19Rig {
+    std::map<std::string, std::string> kv;
+    int calls{0};
+    bool last_had_blob{false};
+    std::map<std::string, int> collects; // per source
+    std::unique_ptr<SyncScheduler> sched;
+
+    Sam19Rig() { reset_scheduler(); }
+
+    void reset_scheduler() { // a "restart": new scheduler over the same persisted KV
+        sched = std::make_unique<SyncScheduler>(
+            "agent-sam19",
+            [this](const std::string& k) {
+                auto it = kv.find(k);
+                return it == kv.end() ? std::string{} : it->second;
+            },
+            [this](const std::string& k, const std::string& v) { kv[k] = v; },
+            [this](const std::vector<std::pair<std::string, std::string>>&,
+                   const std::vector<std::pair<std::string, std::string>>& blobs)
+                -> std::optional<std::vector<std::string>> {
+                ++calls;
+                last_had_blob = !blobs.empty();
+                return std::vector<std::string>{};
+            },
+            utc_clock());
+    }
+
+    void add(const std::string& name, std::optional<yuzu::agent::SyncWindow> window = {},
+             bool skips = false) {
+        SyncSource src;
+        src.name = name;
+        src.interval = std::chrono::seconds{86400};
+        src.window = window;
+        src.skip_backoff = skips;
+        src.collect = [this, name, skips]() -> std::optional<std::pair<std::string, std::string>> {
+            ++collects[name];
+            if (skips)
+                return std::nullopt;
+            return std::make_pair(std::string{"blob"}, std::string{"hash"});
+        };
+        sched->add_source(src);
+    }
+
+    std::int64_t next_fire(const std::string& name) const {
+        return std::stoll(kv.at("sync." + name + ".next_fire"));
+    }
+};
+
+constexpr std::int64_t kNoon = 1'781'092'800; // 2026-06-10 12:00:00Z
+int utc_minutes(std::int64_t t) {
+    const auto l = utc_clock().to_local(t);
+    return l.tm_hour * 60 + l.tm_min;
+}
+
+} // namespace
+
+TEST_CASE("SAM-19: request_now(delay_max) arms a stable spread and fires in a later tick",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("a");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // first send
+    REQUIRE(r.calls == 1);
+
+    const std::int64_t t0 = kNoon + 5000;
+    auto armed = r.sched->request_now("a", std::chrono::seconds{600});
+    REQUIRE(armed == std::vector<std::string>{"a"});
+    r.sched->tick(t0);
+    const std::int64_t due = r.next_fire("a");
+    REQUIRE(due > t0); // this agent's offset is non-zero, so it does not fire in the same tick
+    REQUIRE(due < t0 + 600);
+    CHECK(r.calls == 1);
+    CHECK(r.kv.at("sync.a.force_full") == "1");
+
+    r.sched->tick(due);
+    CHECK(r.calls == 2);
+    CHECK(r.last_had_blob); // force_full carried through the delayed path
+
+    // Stable: the same request a day later spreads by the same offset.
+    const std::int64_t t1 = due + 86400;
+    (void)r.sched->request_now("a", std::chrono::seconds{600});
+    r.sched->tick(t1);
+    CHECK(r.next_fire("a") - t1 == due - t0);
+}
+
+TEST_CASE("SAM-19: a source requested twice keeps the smaller delay", "[sync][scheduler][sam19]") {
+    for (bool delayed_first : {true, false}) {
+        Sam19Rig r;
+        r.add("a");
+        r.sched->tick(kNoon);
+        r.sched->tick(kNoon + 700);
+        REQUIRE(r.calls == 1);
+        if (delayed_first) {
+            (void)r.sched->request_now("a", std::chrono::seconds{600});
+            (void)r.sched->request_now("a");
+        } else {
+            (void)r.sched->request_now("a");
+            (void)r.sched->request_now("a", std::chrono::seconds{600});
+        }
+        r.sched->tick(kNoon + 5000);
+        INFO("delayed_first=" << delayed_first);
+        CHECK(r.calls == 2); // immediate wins in both orders
+    }
+}
+
+TEST_CASE("SAM-19: request_now takes a source list, all-or-nothing", "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("a");
+    r.add("b");
+    r.add("c");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // all three first-sent in one batch
+    REQUIRE(r.calls == 1);
+    const auto before = r.collects;
+
+    SECTION("a list arms each name, reported in registration order") {
+        auto armed = r.sched->request_now("c,a");
+        CHECK(armed == std::vector<std::string>{"a", "c"});
+        r.sched->tick(kNoon + 5000);
+        CHECK(r.collects["a"] == before.at("a") + 1);
+        CHECK(r.collects["c"] == before.at("c") + 1);
+        CHECK(r.collects["b"] == before.at("b"));
+    }
+    SECTION("one unknown name arms nothing and returns empty") {
+        CHECK(r.sched->request_now("a,zzz").empty());
+        CHECK(r.sched->request_now("zzz,a").empty());
+        CHECK(r.sched->request_now("a,").empty());
+        CHECK(r.sched->request_now(",a").empty());
+        CHECK(r.sched->request_now("").empty());
+        r.sched->tick(kNoon + 5000);
+        CHECK(r.collects == before);
+    }
+    SECTION("a duplicated name is armed once") {
+        CHECK(r.sched->request_now("a,a") == std::vector<std::string>{"a"});
+    }
+}
+
+TEST_CASE("SAM-19: a windowed source lands every sync inside its window",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("w", yuzu::agent::SyncWindow{60, 300});
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // first send at 12:11
+    REQUIRE(r.calls == 1);
+    const std::int64_t first = r.next_fire("w");
+    CHECK(first > kNoon + 700);
+    CHECK(first <= kNoon + 700 + 86400);
+    CHECK(utc_minutes(first) >= 60);
+    CHECK(utc_minutes(first) < 300);
+
+    r.sched->tick(first - 1); // not before the window moment
+    CHECK(r.calls == 1);
+    r.sched->tick(first);
+    CHECK(r.calls == 2);
+    const std::int64_t second = r.next_fire("w");
+    CHECK(second - first == 86400); // the same moment tomorrow
+}
+
+TEST_CASE("SAM-19: a windowed source's skip ladder is capped at the window fire",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    const std::int64_t now = kNoon + 10 * 3600; // 22:00Z
+    r.kv["sync.w.next_fire"] = std::to_string(now);
+    r.kv["sync.w.skip_streak"] = "3"; // the next skip is streak 4: a plain 8 h delay = 06:00
+    r.kv["sync.w.last_skip"] = "x";
+    r.add("w", yuzu::agent::SyncWindow{60, 300}, /*skips=*/true);
+    r.sched->tick(now);
+    REQUIRE(r.collects["w"] == 1);
+    const std::int64_t nf = r.next_fire("w");
+    CHECK(nf >= now + 3 * 3600); // not before 01:00
+    CHECK(nf < now + 7 * 3600);  // capped under the 06:00 an 8 h backoff would give
+    CHECK(utc_minutes(nf) >= 60);
+    CHECK(utc_minutes(nf) < 300);
+}
+
+TEST_CASE("SAM-19: a source without a window keeps its phase-slot cadence",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("p");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700);
+    REQUIRE(r.calls == 1);
+    const std::int64_t first = r.next_fire("p");
+    CHECK(first > kNoon + 700);
+    CHECK(first <= kNoon + 700 + 86400);
+    r.sched->tick(first);
+    CHECK(r.next_fire("p") - first == 86400); // slot-aligned: exactly one interval on
+}
+
+TEST_CASE("SAM-19: an overdue source is spread on restart and on resume, not fired at once",
+          "[sync][scheduler][sam19]") {
+    const std::int64_t later = kNoon + 3 * 86400;
+    SECTION("restart: a fresh scheduler over state persisted days ago") {
+        Sam19Rig r;
+        r.add("a");
+        r.sched->tick(kNoon);
+        r.sched->tick(kNoon + 700);
+        REQUIRE(r.calls == 1);
+
+        r.reset_scheduler();
+        r.add("a");
+        r.sched->tick(later);
+        CHECK(r.calls == 1);
+        CHECK(r.next_fire("a") >= later);
+        CHECK(r.next_fire("a") < later + SyncScheduler::kCatchUpWindow.count());
+        r.sched->tick(r.next_fire("a"));
+        CHECK(r.calls == 2);
+    }
+    SECTION("resume: the same scheduler ticked far past next_fire") {
+        Sam19Rig r;
+        r.add("a");
+        r.sched->tick(kNoon);
+        r.sched->tick(kNoon + 700);
+        REQUIRE(r.calls == 1);
+
+        r.sched->tick(later);
+        CHECK(r.calls == 1);
+        CHECK(r.next_fire("a") >= later);
+        CHECK(r.next_fire("a") < later + SyncScheduler::kCatchUpWindow.count());
+        r.sched->tick(r.next_fire("a"));
+        CHECK(r.calls == 2);
+    }
+}
+
+TEST_CASE("SAM-19: a delayed request_now still pending at a restart is re-armed by the catch-up "
+          "spread and still sends a full report",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("a");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // first send
+    REQUIRE(r.calls == 1);
+
+    const std::int64_t t0 = kNoon + 5000;
+    REQUIRE(r.sched->request_now("a", std::chrono::seconds{600}) == std::vector<std::string>{"a"});
+    r.sched->tick(t0); // persists the arm: next_fire in (t0, t0 + 600), force_full = 1
+    const std::int64_t armed = r.next_fire("a");
+    REQUIRE(armed > t0);
+    REQUIRE(r.kv.at("sync.a.force_full") == "1");
+
+    // The agent is back more than one clamped sleep after the armed moment.
+    r.reset_scheduler();
+    r.add("a");
+    const std::int64_t reboot = armed + SyncScheduler::kMaxTickSeconds.count() + 1;
+    r.sched->tick(reboot);
+    CHECK(r.calls == 1); // not fired at once
+    const std::int64_t rearmed = r.next_fire("a");
+    CHECK(rearmed >= reboot); // the catch-up spread replaced the request's offset
+    CHECK(rearmed < reboot + SyncScheduler::kCatchUpWindow.count());
+    CHECK(r.kv.at("sync.a.force_full") == "1");
+
+    r.last_had_blob = false; // an unforced second send would be hash-only (same hash, < 7 d)
+    r.sched->tick(rearmed);
+    CHECK(r.calls == 2);
+    CHECK(r.last_had_blob); // force_full survived the restart and the re-arm
+}
+
+TEST_CASE("SAM-19: a persisted next_fire the agent could not have written is re-armed, not trusted",
+          "[sync][scheduler][sam19]") {
+    // A clock stepped back, a VM restore, or a corrupt KV value: the schedule is far in the
+    // future (or saturated by strtoll) and, left alone, would stall the source until the wall
+    // clock caught up.
+    auto persist = [](Sam19Rig& r, const std::string& next_fire) {
+        r.kv["sync.a.next_fire"] = next_fire;
+        r.kv["sync.a.last_hash"] = "hash";
+        r.kv["sync.a.last_full"] = std::to_string(kNoon);
+        r.kv["sync.a.force_full"] = "0";
+    };
+
+    SECTION("a far-future next_fire is re-armed inside the catch-up window") {
+        for (const std::string& far : {std::to_string(kNoon + 10 * 86400),
+                                       std::to_string(kNoon + 2 * 86400 + 1)}) {
+            Sam19Rig r;
+            persist(r, far);
+            r.add("a");
+            r.sched->tick(kNoon);
+            INFO("persisted next_fire=" << far);
+            CHECK(r.calls == 0); // not at once
+            CHECK(r.next_fire("a") >= kNoon);
+            CHECK(r.next_fire("a") < kNoon + SyncScheduler::kCatchUpWindow.count());
+            CHECK(r.kv.at("sync.a.last_hash") == "hash"); // only the schedule was corrected
+            CHECK(r.kv.at("sync.a.force_full") == "0");
+
+            r.sched->tick(r.next_fire("a")); // and it syncs once the spread offset passes
+            CHECK(r.calls == 1);
+            CHECK_FALSE(r.last_had_blob); // hash-only: unchanged, inside the weekly floor
+        }
+    }
+    SECTION("a saturated value (strtoll clamps to LLONG_MIN / LLONG_MAX) does not overflow") {
+        for (const char* saturated : {"-9223372036854775808", "9223372036854775807",
+                                      "99999999999999999999", "-99999999999999999999"}) {
+            Sam19Rig r;
+            persist(r, saturated);
+            r.add("a");
+            r.sched->tick(kNoon);
+            INFO("persisted next_fire=" << saturated);
+            CHECK(r.calls == 0);
+            CHECK(r.next_fire("a") >= kNoon);
+            CHECK(r.next_fire("a") < kNoon + SyncScheduler::kCatchUpWindow.count());
+        }
+    }
+    SECTION("a normally armed next_fire a day ahead is left alone") {
+        Sam19Rig r;
+        const std::int64_t tomorrow = kNoon + 86400;
+        persist(r, std::to_string(tomorrow));
+        r.add("a");
+        r.sched->tick(kNoon);
+        CHECK(r.calls == 0);
+        CHECK(r.next_fire("a") == tomorrow); // not rewritten
+    }
+}
+
+TEST_CASE("SAM-19: a repeated delayed request never pushes an earlier armed fire later",
+          "[sync][scheduler][sam19]") {
+    const std::int64_t t0 = kNoon + 5000;
+    constexpr std::chrono::seconds kDelay{86400};
+
+    // Persist `persisted_next_fire`, request a kDelay-delayed sync of "a" and run one tick at t0.
+    auto request_at = [&](Sam19Rig& r, std::int64_t persisted_next_fire) {
+        r.kv["sync.a.next_fire"] = std::to_string(persisted_next_fire);
+        r.add("a");
+        REQUIRE(r.sched->request_now("a", kDelay) == std::vector<std::string>{"a"});
+        r.sched->tick(t0);
+    };
+
+    // This agent's stable offset for a delay of kDelay: a past next_fire is replaced by it.
+    std::int64_t offset = 0;
+    {
+        Sam19Rig probe;
+        request_at(probe, t0 - 100);
+        offset = probe.next_fire("a") - t0;
+    }
+    REQUIRE(offset > 2);
+    REQUIRE(offset < kDelay.count());
+
+    SECTION("a future fire already sooner than the offset is kept, and the sync is still forced full") {
+        Sam19Rig r;
+        const std::int64_t sooner = t0 + offset / 2; // e.g. a skip-ladder retry
+        request_at(r, sooner);
+        CHECK(r.next_fire("a") == sooner);
+        CHECK(r.kv.at("sync.a.force_full") == "1");
+        CHECK(r.calls == 0);
+    }
+    SECTION("a future fire later than the offset is pulled earlier to it") {
+        Sam19Rig r;
+        request_at(r, t0 + kDelay.count() + offset); // inside the two-day sanity bound
+        CHECK(r.next_fire("a") == t0 + offset);
+        CHECK(r.kv.at("sync.a.force_full") == "1");
+    }
+    SECTION("a past fire is replaced by the offset, not kept") {
+        Sam19Rig r;
+        request_at(r, t0 - 100); // due but not yet sent, within one clamped sleep
+        CHECK(r.next_fire("a") == t0 + offset);
+        CHECK(r.kv.at("sync.a.force_full") == "1");
+        CHECK(r.calls == 0);
     }
 }

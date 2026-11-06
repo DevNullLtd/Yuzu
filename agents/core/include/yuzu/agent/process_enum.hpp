@@ -18,6 +18,7 @@
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
 #include <cstdint>
+#include <istream>
 #include <string>
 #include <vector>
 
@@ -47,5 +48,25 @@ struct ProcessInfo {
  * Returns an empty vector on unsupported platforms or on failure.
  */
 YUZU_EXPORT std::vector<ProcessInfo> enumerate_processes();
+
+namespace detail {
+
+/// Read every remaining byte of `in` (a /proc/<pid>/cmdline stream). Never throws: when the
+/// process exits mid-read libstdc++'s filebuf::underflow throws, and an istreambuf_iterator
+/// (unlike istream::read / operator<<) has no sentry to catch it, so the exception used to
+/// unwind through the snapshot pump and terminate the agent. On a throw the bytes read before
+/// it are returned. Exposed for the unit test.
+YUZU_EXPORT std::string read_proc_bytes(std::istream& in) noexcept;
+
+#if defined(__linux__) || defined(__APPLE__)
+/// Parse a /proc/<pid>/status stream into `pi`: Name, PPid, and the real Uid resolved to a user
+/// name. The whole stream is read (it is no longer cut after the three fields, so later fields
+/// are reachable); the first occurrence of each field wins. Never throws: a malformed PPid or
+/// Uid leaves that field at its default, and a stream that fails mid-read keeps what parsed.
+/// Exposed for the unit test.
+YUZU_EXPORT void parse_proc_status(std::istream& in, ProcessInfo& pi) noexcept;
+#endif // __linux__ || __APPLE__
+
+} // namespace detail
 
 } // namespace yuzu::agent

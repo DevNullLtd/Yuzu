@@ -297,33 +297,54 @@ check_strict(Path) ->
     %% exactly such divergence hid the fd-socket loopback bypass).
     YuzuEnv = proplists:get_value(yuzu_gw, Cfg, []),
     Pins = proplists:get_value(mgmt_peer_pins, YuzuEnv, []),
-    ?assertMatch([_ | _], Pins),
     %% The peer authorization exactly as the boot guard resolves it (#6016): a
-    %% strict config ships the PIN mode (the identity is an explicit opt-in, never
-    %% shipped on), so the server is admitted by its pin, and the deny-list is
-    %% well-formed.
-    {ok, #{mode := Mode} = Auth} =
+    %% strict config ships the IDENTITY mode with no pin (release N+1), so the
+    %% server is admitted by the identity the install CA mints onto its leaf, a
+    %% key renewal needs nothing here, and the deny-list is well-formed.
+    ?assertEqual([], Pins),
+    {ok, #{mode := Mode} = Auth0} =
         yuzu_gw_mgmt_identity:resolve(proplists:get_value(mgmt_peer_auth_mode, YuzuEnv, undefined),
                                       proplists:get_value(mgmt_peer_identity, YuzuEnv, undefined),
                                       proplists:get_value(mgmt_peer_denied, YuzuEnv, []),
                                       Listeners, Pins),
-    ?assertEqual(pin, Mode),
-    ?assertEqual(pin, proplists:get_value(mgmt_peer_auth_mode, YuzuEnv, undefined)),
+    ?assertEqual(identity, Mode),
+    ?assertEqual(identity, proplists:get_value(mgmt_peer_auth_mode, YuzuEnv, undefined)),
+    %% The CRL source (#6016 PR 4b), as the boot guard resolves it: the reference gateway config
+    %% reads the server's CRL over https with the management listener's CA as the fetch CA, so a
+    %% deleted key (withdrawal silently off) or a typo (boot refused) is a red test here; the
+    %% sys.config.prod copy carries only a commented example and sets none.
+    CrlSource = proplists:get_value(mgmt_crl_source, YuzuEnv, undefined),
+    case lists:suffix("reference-gateway-sys.config", Path) of
+        true ->
+            ?assertMatch({ok, #{source := {url, #{host := "server", port := 8443,
+                                                  path := "/api/v1/ca/crl"}}}},
+                         yuzu_gw_mgmt_crl_source:resolve(CrlSource, undefined, undefined,
+                                                         Listeners));
+        false ->
+            ?assertEqual(undefined, CrlSource),
+            ?assertEqual({ok, none},
+                         yuzu_gw_mgmt_crl_source:resolve(CrlSource, undefined, undefined,
+                                                         Listeners))
+    end,
+    %% The shipped path names a CA file this test host does not have, so the
+    %% identity derives to nothing here; on a real install it is derived from the
+    %% one-certificate default-ca.pem. Give the resolver the value it would find.
+    Auth = Auth0#{identity := <<"yuzu://INSTALL/server">>},
     ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(Listeners, Pins, false, Auth)),
-    %% ...and non-vacuously: strip the pins and the same evaluation must REFUSE,
-    %% proving the guard actually recognised the mgmt listener.
+    %% ...and non-vacuously: an identity that did not resolve, with no pin to fall
+    %% back on, must REFUSE, proving the guard actually recognised the mgmt listener.
     ?assertMatch({error, {insecure_mgmt_listener, _}},
-                 yuzu_gw_app:evaluate_mgmt_posture(Listeners, [], false, Auth)),
-    %% ...and, were the operator to opt in, a resolved identity alone is enough in
-    %% the identity modes, with no pin at all; an unresolved one is not.
-    Opted = Auth#{identity := <<"yuzu://INSTALL/server">>},
-    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
-                       Listeners, [], false, Opted#{mode := identity})),
-    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
-                       Listeners, [], false, Opted#{mode := identity_or_pin})),
+                 yuzu_gw_app:evaluate_mgmt_posture(Listeners, Pins, false,
+                                                   Auth#{identity := undefined})),
+    %% ...and the explicit opt-outs still work: `pin' needs a pin, and the
+    %% transition mode is admitted by the identity or a pin.
     ?assertMatch({error, {insecure_mgmt_listener, _}},
-                 yuzu_gw_app:evaluate_mgmt_posture(
-                   Listeners, [], false, (Opted#{mode := identity})#{identity := undefined})),
+                 yuzu_gw_app:evaluate_mgmt_posture(Listeners, [], false, Auth#{mode := pin})),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
+                       Listeners, [{spki_sha256, lists:duplicate(64, $a)}], false,
+                       Auth#{mode := pin})),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
+                       Listeners, [], false, Auth#{mode := identity_or_pin})),
     lists:foreach(fun(L) ->
         ?assertEqual(?AUTH_FUN, maps:get(auth_fun, L, missing)),
         ?assertMatch(#{certfile := [_ | _], keyfile := [_ | _], cacertfile := [_ | _]},
