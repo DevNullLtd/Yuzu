@@ -89,20 +89,23 @@ void store_unavailable(httplib::Response& res, const SettingsError& e) {
         unavailable(res, "collection settings store unavailable");
 }
 
-enum class Authority { Admit, Deny, Degraded };
+// Degraded = the RBAC read could not be completed (503); Lapsed = the session ended between the
+// route's sign-in check and the probe (401). Both carry the probe's own answer on `res`.
+enum class Authority { Admit, Deny, Degraded, Lapsed };
 
 // The ManagementGroup permission gate is the only authority (the global grant while RBAC
 // enforcement is on, the legacy role rule while it is off): settings are managed by fleet
 // administrators, and this build has no group-scoped delegation. `op` is "Read" or "Write". The
 // unavailable-aware probe runs into a THROWAWAY response: a refusal is answered by the route with
-// its own audited 403, and a 503 from it (the RBAC read could not be completed) is copied to `res`
-// and ends the request, so an outage is never read as a refusal or an admit.
+// its own audited 403, and a 503 from it (the RBAC read could not be completed) or a 401 (no
+// session) is copied to `res` and ends the request, so an outage is never read as a refusal or an
+// admit, and a lapsed session is never recorded as withdrawn authority.
 Authority global_authority(const SoftwareCollectionSettingsRoutes::Deps& deps,
                            const httplib::Request& req, httplib::Response& res, const char* op) {
     httplib::Response probe; // throwaway
     if (deps.probe_perm_fn(req, probe, kGroupTargetType, op))
         return Authority::Admit;
-    if (probe.status != 503)
+    if (probe.status != 503 && probe.status != 401)
         return Authority::Deny;
     res.status = probe.status;
     res.body = probe.body;
@@ -112,7 +115,7 @@ Authority global_authority(const SoftwareCollectionSettingsRoutes::Deps& deps,
         res.headers.erase(k);
     for (const auto& [k, v] : probe.headers)
         res.set_header(k, v);
-    return Authority::Degraded;
+    return probe.status == 401 ? Authority::Lapsed : Authority::Degraded;
 }
 
 // nullopt = not an integer, or out of int range.
@@ -279,6 +282,7 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                  case Authority::Admit:
                      break;
                  case Authority::Degraded:
+                 case Authority::Lapsed:
                      return;
                  case Authority::Deny:
                      // The quiet probe withholds its row for a cookie session, so the refusal
@@ -330,10 +334,12 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
 
             const bool is_root = group_id == cs::kRootGroupId;
             const Authority authority = global_authority(deps, req, res, "Write");
-            if (authority == Authority::Degraded) {
+            if (authority == Authority::Degraded || authority == Authority::Lapsed) {
                 (void)detail::try_persist_audit(deps.audit_fn, req, kVerbUpdate, "denied",
                                                 kGroupTargetType, group_id,
-                                                "authority read degraded");
+                                                authority == Authority::Lapsed
+                                                    ? "session ended ahead of the write"
+                                                    : "authority read degraded");
                 return;
             }
             if (authority == Authority::Deny) {
@@ -385,7 +391,7 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                                                     kGroupTargetType, group_id, text);
             };
 
-            // The grant again, immediately ahead of the write: a revoke that lands while the
+            // The gate again, immediately ahead of the write: a revoke that lands while the
             // request waited on its reads and the requested row refuses it. The settings
             // transaction cannot join the RBAC tables: a revoke landing between this check and
             // the COMMIT is ordered behind the write (an accepted window of one store call).
@@ -395,8 +401,11 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
             case Authority::Degraded:
                 outcome("denied", "authority read degraded");
                 return;
+            case Authority::Lapsed:
+                outcome("denied", "session ended ahead of the write");
+                return;
             case Authority::Deny:
-                outcome("denied", "global grant withdrawn ahead of the write");
+                outcome("denied", "write authority withdrawn ahead of the write");
                 fail(res, 403, "forbidden");
                 return;
             }

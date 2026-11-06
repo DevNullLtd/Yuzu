@@ -163,6 +163,8 @@ struct RoutesRig {
     std::vector<AuditRow> audit;
     bool audit_ok{true};
     std::function<void(const AuditRow&)> on_audit; // runs once a row is stored
+    // When set, answers the unavailable-aware probe in place of the real gate (per call).
+    SoftwareCollectionSettingsRoutes::ProbePermFn probe_override;
     SoftwareCollectionSettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
@@ -223,6 +225,8 @@ struct RoutesRig {
                                   const std::string& o) { return ar->require_permission(req, res, t, o); },
                 .probe_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                         const std::string& type, const std::string& op) {
+                    if (probe_override)
+                        return probe_override(req, res, type, op);
                     return ar->probe_permission_unavailable_aware(req, res, type, op);
                 },
                 .scoped_perm_fn =
@@ -584,7 +588,66 @@ TEST_CASE("collection settings PUT: a grant revoked behind the requested row ref
     REQUIRE(rig.audit.size() == 2);
     CHECK(rig.audit[0].result == "requested");
     CHECK(rig.audit[1].result == "denied");
-    CHECK(rig.audit[1].detail == "global grant withdrawn ahead of the write");
+    CHECK(rig.audit[1].detail == "write authority withdrawn ahead of the write");
+}
+
+TEST_CASE("collection settings PUT: the re-check ahead of the write answers an outage and a lapsed "
+          "session as what they are",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
+    const auto version = rig.store->get(rig.group_p)->value().version;
+    rig.audit.clear();
+
+    SECTION("an RBAC read that fails at the second check is a 503 and an outcome row") {
+        // A cold replica of the RBAC store answers the second probe once the role table is gone;
+        // the first probe runs on the real gate and admits.
+        PgPool replica_pool{{.conninfo = rig.rbac_bundle.dsn(), .size = 1}};
+        yuzu::MetricsRegistry replica_metrics;
+        RbacStore replica_store{replica_pool};
+        replica_store.set_metrics(&replica_metrics);
+        REQUIRE(replica_store.is_open());
+        AuthRoutes replica_ar{rig.cfg, rig.auth_mgr, &replica_store, rig.api_tokens.get(),
+                              /*audit_store=*/nullptr, &rig.mgmt, /*tag_store=*/nullptr,
+                              /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider};
+        TableFault fault{rig.rbac_bundle.dsn(), "rbac_store.principal_roles"};
+        int probes = 0;
+        rig.probe_override = [&](const httplib::Request& req, httplib::Response& res,
+                                 const std::string& t, const std::string& o) {
+            return ++probes == 1 ? rig.ar->probe_permission_unavailable_aware(req, res, t, o)
+                                 : replica_ar.probe_permission_unavailable_aware(req, res, t, o);
+        };
+        rig.on_audit = [&](const AuditRow& a) {
+            if (a.result == "requested")
+                fault.arm();
+        };
+        auto res = rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(9000, 0, version));
+        CHECK(probes == 2);
+        CHECK(res->status == 503);
+        CHECK(json::parse(res->body)["error"]["retry_after_ms"].is_number());
+        fault.repair();
+        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
+        REQUIRE(rig.audit.size() == 2);
+        CHECK(rig.audit[0].result == "requested");
+        CHECK(rig.audit[1].result == "denied");
+        CHECK(rig.audit[1].detail == "authority read degraded");
+    }
+    SECTION("a session that ends behind the requested row is a 401, never withdrawn authority") {
+        const auto& cookie = boss.at("Cookie");
+        const std::string token = cookie.substr(cookie.find('=') + 1);
+        rig.on_audit = [&](const AuditRow& a) {
+            if (a.result == "requested")
+                (void)rig.auth_mgr.invalidate_session(token);
+        };
+        auto res = rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(9000, 0, version));
+        CHECK(res->status == 401);
+        CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
+        REQUIRE(rig.audit.size() == 2);
+        CHECK(rig.audit[0].result == "requested");
+        CHECK(rig.audit[1].result == "denied");
+        CHECK(rig.audit[1].detail == "session ended ahead of the write");
+    }
 }
 
 TEST_CASE("collection settings PUT: an unavailable authority read is a 503, never a 403 or an admit",
