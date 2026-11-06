@@ -203,7 +203,7 @@ TEST_CASE("collection settings resolve: membership branches", "[collection_setti
         CHECK(r->source_group_id == "xx");
         CHECK(r->effective.interval_s == 7200);
     }
-    SECTION("sibling memberships under one ancestor: a higher-priority sibling still wins") {
+    SECTION("sibling memberships under one ancestor: a higher-priority sibling wins") {
         const std::vector<cs::GroupNode> tree{node("xx", "", 1), node("g1", "xx", 2),
                                               node("g2", "xx", 3)};
         const auto r = cs::resolve({"g1", "g2"}, tree,
