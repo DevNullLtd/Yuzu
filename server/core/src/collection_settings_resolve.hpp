@@ -127,6 +127,17 @@ inline const CollectionSettings kFleetDefault = [] {
     return s;
 }();
 
+/// Lowercase hex digits only: the alphabet of group ids and versions.
+[[nodiscard]] inline bool is_lower_hex(std::string_view s) {
+    return std::ranges::all_of(
+        s, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+/// A document or effective version: 64 lowercase hex characters (SHA-256).
+[[nodiscard]] inline bool is_version_text(std::string_view s) {
+    return s.size() == 64 && is_lower_hex(s);
+}
+
 [[nodiscard]] inline bool is_collection_plugin(std::string_view name) {
     return std::ranges::find(kCollectionPlugins, name) != kCollectionPlugins.end();
 }

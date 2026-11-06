@@ -62,11 +62,8 @@ bool bindable(std::string_view v) {
 }
 
 bool valid_group_id(std::string_view id) {
-    if (id.empty() || id.size() > SoftwareCollectionSettingsStore::kMaxGroupIdBytes)
-        return false;
-    return std::ranges::all_of(id, [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-    });
+    return !id.empty() && id.size() <= SoftwareCollectionSettingsStore::kMaxGroupIdBytes &&
+           cs::is_lower_hex(id);
 }
 
 std::unexpected<Error> fail(Kind kind, std::string message) {
@@ -225,7 +222,7 @@ SoftwareCollectionSettingsStore::put(const std::string& group_id,
         return fail(Kind::InvalidInput, "invalid group id");
     if (!bindable(actor) || actor.size() > 1024)
         return fail(Kind::InvalidInput, "invalid actor");
-    if (expected_version && (expected_version->size() != 64 || !valid_group_id(*expected_version)))
+    if (expected_version && !cs::is_version_text(*expected_version))
         return fail(Kind::InvalidInput, "expected_version must be 64 lowercase hex characters");
     if (auto ok = cs::validate(settings, group_id == cs::kRootGroupId); !ok)
         return fail(Kind::InvalidInput, ok.error());

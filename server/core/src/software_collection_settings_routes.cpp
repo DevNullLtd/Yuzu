@@ -12,6 +12,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <expected>
 #include <limits>
 #include <map>
 #include <string_view>
@@ -127,94 +128,95 @@ Authority group_authority(const SoftwareCollectionSettingsRoutes::Deps& deps,
     return Authority::Deny;
 }
 
-bool read_int(const json& v, int& out) {
+// nullopt = not an integer, or out of int range.
+std::optional<int> read_int(const json& v) {
     if (v.is_number_unsigned()) {
         const auto u = v.get<std::uint64_t>();
         if (u > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
-            return false;
-        out = static_cast<int>(u);
-        return true;
+            return std::nullopt;
+        return static_cast<int>(u);
     }
     if (!v.is_number_integer())
-        return false;
+        return std::nullopt;
     const auto i = v.get<std::int64_t>();
     if (i < std::numeric_limits<int>::min() || i > std::numeric_limits<int>::max())
-        return false;
-    out = static_cast<int>(i);
-    return true;
+        return std::nullopt;
+    return static_cast<int>(i);
 }
 
-bool is_lower_hex64(std::string_view s) {
-    return s.size() == 64 && std::ranges::all_of(s, [](char c) {
-               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-           });
-}
-
-// Body -> settings + expected version. nullopt error text = ok.
+// Body -> settings + expected version, or the 400 text.
 struct ParsedPut {
     cs::CollectionSettings settings;
     std::optional<std::string> expected_version; // nullopt = create only
     std::string expected_text;                    // "none" or the 64-hex, for the audit row
 };
 
-std::optional<std::string> parse_put(const std::string& body, ParsedPut& out) {
+std::expected<ParsedPut, std::string> parse_put(const std::string& body) {
+    using Bad = std::unexpected<std::string>;
     if (mcp::json_exceeds_depth(body, mcp::kMcpMaxJsonDepth))
-        return "body nesting is too deep";
+        return Bad("body nesting is too deep");
     const auto j = json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object())
-        return "body must be a JSON object";
+        return Bad("body must be a JSON object");
     for (const auto& [key, v] : j.items()) {
         (void)v;
         if (key != "interval_s" && key != "window" && key != "timezone" && key != "plugins" &&
             key != "priority" && key != "expected_version")
-            return "unknown field: " + audit_token(key.substr(0, 64));
+            return Bad("unknown field: " + audit_token(key.substr(0, 64)));
     }
+    ParsedPut out;
     const auto interval = j.find("interval_s");
-    if (interval == j.end() || !read_int(*interval, out.settings.interval_s))
-        return "interval_s is required and must be an integer";
+    const auto interval_s = interval == j.end() ? std::nullopt : read_int(*interval);
+    if (!interval_s)
+        return Bad("interval_s is required and must be an integer");
+    out.settings.interval_s = *interval_s;
     if (const auto w = j.find("window"); w != j.end() && !w->is_null()) {
         if (!w->is_object() || w->size() != 2)
-            return "window must be null or {start_min, end_min}";
-        cs::Window win;
+            return Bad("window must be null or {start_min, end_min}");
         const auto s = w->find("start_min");
         const auto e = w->find("end_min");
-        if (s == w->end() || e == w->end() || !read_int(*s, win.start_min) ||
-            !read_int(*e, win.end_min))
-            return "window needs integer start_min and end_min";
-        out.settings.window = win;
+        const auto start = s == w->end() ? std::nullopt : read_int(*s);
+        const auto end = e == w->end() ? std::nullopt : read_int(*e);
+        if (!start || !end)
+            return Bad("window needs integer start_min and end_min");
+        out.settings.window = cs::Window{*start, *end};
     }
     if (const auto tz = j.find("timezone"); tz != j.end()) {
         if (!tz->is_string())
-            return "timezone must be a string";
+            return Bad("timezone must be a string");
         out.settings.timezone = tz->get<std::string>();
     }
     const auto plugins = j.find("plugins");
     if (plugins == j.end() || !plugins->is_object())
-        return "plugins is required and must be an object";
+        return Bad("plugins is required and must be an object");
     // An unknown key is refused here, not by validate(), so the name it echoes into the message
     // and the audit detail is bounded and neutralised (CWE-117).
     for (const auto& [name, on] : plugins->items()) {
         if (!cs::is_collection_plugin(name))
-            return "unknown plugin key: " + audit_token(name.substr(0, 64));
+            return Bad("unknown plugin key: " + audit_token(name.substr(0, 64)));
         if (!on.is_boolean())
-            return "plugins values must be booleans";
+            return Bad("plugins values must be booleans");
         out.settings.plugins[name] = on.get<bool>();
     }
-    if (const auto p = j.find("priority"); p != j.end() && !read_int(*p, out.settings.priority))
-        return "priority must be an integer";
+    if (const auto p = j.find("priority"); p != j.end()) {
+        const auto priority = read_int(*p);
+        if (!priority)
+            return Bad("priority must be an integer");
+        out.settings.priority = *priority;
+    }
     out.expected_text = "none";
     if (const auto ev = j.find("expected_version"); ev != j.end()) {
         if (!ev->is_string())
-            return "expected_version must be a string";
+            return Bad("expected_version must be a string");
         const auto text = ev->get<std::string>();
         if (text != "none") {
-            if (!is_lower_hex64(text))
-                return "expected_version must be 'none' or 64 lowercase hex characters";
+            if (!cs::is_version_text(text))
+                return Bad("expected_version must be 'none' or 64 lowercase hex characters");
             out.expected_version = text;
             out.expected_text = text;
         }
     }
-    return std::nullopt;
+    return out;
 }
 
 std::string one_line(const std::optional<cs::CollectionSettings>& s) {
@@ -338,11 +340,12 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                 return;
             }
 
-            ParsedPut parsed;
-            if (const auto err = parse_put(req.body, parsed)) {
-                refuse(400, *err, *err);
+            auto parsed_or = parse_put(req.body);
+            if (!parsed_or) {
+                refuse(400, parsed_or.error(), parsed_or.error());
                 return;
             }
+            ParsedPut& parsed = *parsed_or;
             if (const auto ok = cs::validate(parsed.settings, is_root); !ok) {
                 refuse(400, ok.error(), ok.error());
                 return;
