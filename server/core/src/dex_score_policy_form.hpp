@@ -146,17 +146,6 @@ split_override_key(std::string_view name) {
     return "overrides[" + std::to_string(row) + "]." + std::string(rest);
 }
 
-/// True when any field of override `row` other than its image and Remove box holds text. The
-/// map is sorted by path, so the row's fields are one contiguous run.
-[[nodiscard]] inline bool row_has_values(const DexFormValues& v, int row) {
-    const std::string prefix = row_key(row, "");
-    for (auto it = v.lower_bound(prefix); it != v.end() && it->first.starts_with(prefix); ++it)
-        if (it->first != prefix + "image" && it->first != prefix + "remove" &&
-            !trim(it->second).empty())
-            return true;
-    return false;
-}
-
 [[nodiscard]] inline std::string num(double d) { return std::format("{}", d); }
 
 [[nodiscard]] inline const std::string& value_of(const DexFormValues& v, const std::string& name) {
@@ -302,14 +291,11 @@ dex_form_to_document(const DexFormPairs& pairs) {
         const std::string image = trim(value_of(v, row_key(row, "image")));
         if (value_of(v, row_key(row, "remove")) == "on")
             continue;
-        if (image.empty()) {
-            // A blank row is dropped; a row with typed values and no image is the operator's
-            // input and is refused by name, never silently lost.
-            if (row_has_values(v, row))
-                return std::unexpected(DexFormError{row_key(row, "image"),
-                                                    "an override needs an application image"});
-            continue;
-        }
+        // dex_form_values already dropped every all-blank row, so a row that reaches here with no
+        // image carries typed input and is refused by name, never silently lost.
+        if (image.empty())
+            return std::unexpected(DexFormError{row_key(row, "image"),
+                                                "an override needs an application image"});
         const auto at = [&](std::string_view rest) { return row_key(row, rest); };
         json ov{{"image", image}};
         json ot = json::object();

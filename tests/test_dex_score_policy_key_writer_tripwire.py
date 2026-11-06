@@ -111,7 +111,7 @@ def wiring_problems(text):
     if setter[0] > register[0]:
         out.append("set_dex_score_policy_writer must be called BEFORE register_routes: the deps are "
                    "captured by value there, so a later call leaves all three routes answering 503")
-    guard = next((ln for ln in reversed(lines[:setter[0]]) if ln.startswith("if (")), "")
+    guard = nearest_if(setter[0])[1]
     if guard != "if (dex_score_policy_provider_) {":
         out.append("the writer deps must be set under exactly `if (dex_score_policy_provider_) {`; "
                    "any other guard changes where the three routes answer 503")
