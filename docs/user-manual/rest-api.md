@@ -310,23 +310,27 @@ Every request is checked against a per-route body-size cap **before authenticati
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
 | `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Five classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware`, `dex_score_policy` and `commands`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
-| `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. Do **not** send `Content-Encoding: identity` explicitly: `has_non_identity_content_encoding` correctly admits it past this gate (it isn't a compressed encoding), but httplib's own body reader then calls `create_decompressor("identity")` — which matches none of gzip/deflate/br/zstd, returns null, and httplib answers a bare `415` itself (`httplib.h`'s `prepare_content_receiver`), before this gate, any route handler, or the A4/SCIM envelope code ever runs. That response carries none of the structure this section promises — no A4 envelope, no `correlation_id`, no `yuzu_body_cap_rejected_total` increment. Until that gap is closed at the code level, the only conforming way to send an identity-encoded body is to omit the header. |
+| `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. An explicit `Content-Encoding: identity` is admitted by this gate and, on cpp-httplib 0.59, passed through unchanged by httplib's body reader (through 0.37.1 httplib answered it with a bare `415` of its own). Omitting the header remains the plainest way to send an identity-encoded body. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
 
+**Refusals that come before this gate (cpp-httplib 0.59).** A request with an invalid `Content-Length`, two differing `Content-Length` headers, a non-zero `Content-Length` together with `Transfer-Encoding`, or a `Transfer-Encoding` whose final coding is not `chunked` is answered a bare `400` with the connection closed by httplib before the pre-routing handler runs, so it carries no A4 envelope and does not increment `yuzu_body_cap_rejected_total`. A path longer than 256 bytes matches no regex route (the `(.+)` id-in-path routes) and answers `404` with the connection closed.
+
+**Responses that close the connection (cpp-httplib 0.59).** A response that leaves a declared request body unread now closes the connection (`Connection: close`). Clients that pool connections will reconnect more often after such a response. A client or proxy that is still sending a large request body when the response is written may see a connection reset instead of the response; an idempotent client should retry as it would for any reset.
+
 ### Post-Read Backstop (#2407)
 
-The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 30 of 34 classes (distinct `path_class` labels, the catch-all `default` included) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 30 of 35 classes (distinct `path_class` labels, the catch-all `default` included) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
 
 A second stage, installed by `server.cpp` through `PostReadStageRegistry` and run by the route sink (`HttplibRouteSink` wraps every handler it registers on the web server), closes that gap from the other side. It runs **after** httplib's `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. It is deliberately not `Server::set_pre_request_handler`: from cpp-httplib v0.47.0 that handler runs *before* the body is read, where `req.body` is empty and a size check on it can never fire. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
 
-**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 30-of-34-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
+**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 30-of-35-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
 
 **The two stages are mutually exclusive per request, not stacked.** httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so it never calls `dispatch_request` for a request that gate already refused — a **measurable** over-cap body (a declared `Content-Length` above the cap) is still rejected by the pre-routing gate, before anything is buffered, exactly as before this stage existed. Do not describe this as "the cap now runs twice" — in practice `over_cap_post_read` fires almost exclusively for the chunked/unmeasurable case the pre-routing gate deliberately admits.
 
 **Limitations — read before relying on this as complete coverage:**
 
-- **Multipart is not covered.** httplib only appends to `req.body` on the non-multipart branch of `read_content` (`httplib.h:11002` swaps the receiver for the multipart parser once it detects a multipart body) — so `req.body.size()` reads 0 for ANY multipart request, regardless of the real bytes read off the wire. **No multipart class is covered** — stated as a rule rather than a list, because an earlier draft of this text enumerated a single class and was wrong: `/api/settings/updates/upload` (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so the 4 MiB default) are multipart too. Their chunked-body gap is **not** closed by this stage. This is not a regression introduced here — it is exactly as exposed as it was before this stage existed — but do not read the post-read stage as having closed coverage for every class.
+- **Multipart is not covered.** httplib only appends to `req.body` on the non-multipart branch of `read_content_core` (`httplib.h v0.59.0:13674-13696` swaps the receiver for the multipart parser once it detects a multipart body) — so `req.body.size()` reads 0 for ANY multipart request, regardless of the real bytes read off the wire. **No multipart class is covered** — stated as a rule rather than a list, because an earlier draft of this text enumerated a single class and was wrong: `/api/settings/updates/upload` (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so the 4 MiB default) are multipart too. Their chunked-body gap is **not** closed by this stage. This is not a regression introduced here — it is exactly as exposed as it was before this stage existed — but do not read the post-read stage as having closed coverage for every class.
 - **The stage only runs when a route matched.** It runs inside a registered route's handler, which httplib only calls once routing has matched a route — a request to a path that 404s never reaches it at all. A route registered on the web server other than through the route sink would also not be wrapped; none is. It is a backstop behind the pre-routing gate for matched routes, not a second universal pre-auth gate.
 
 **Why not one global cap?** httplib's own `Server::set_payload_max_length` is a single server-wide knob shared by every route on the same listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload — a single small value would break those outright, and a single large value (httplib's 100 MiB default) leaves every small JSON/form route able to buffer up to 100 MiB from an unauthenticated caller. The table below exists so each route class gets a cap sized to what it actually needs.
@@ -380,7 +384,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the five 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **38 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config`, `dex_score_policy`, `software_curation` and `software_alias_pack`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **34 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **39 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config`, `dex_score_policy`, `software_curation` and `software_alias_pack`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **35 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -439,7 +443,7 @@ While a just-in-time elevation is active, `effective_role` is `admin`, `elevated
 | `auth_source` | Always present. How the session authenticated: `local`, `oidc`, `saml`, `api_token`, `mcp_token` or `engine_token`. |
 | `mcp_tier` | The MCP authorization tier of an MCP token; an empty string for any other session. |
 | `scope_service` | The service tag of a service-scoped token; an empty string when the session is not service-scoped. |
-| `rbac_enabled` | The server's cached view of the RBAC switch. It can lag a change made on another replica, and it does not report the degraded state in which enforcement fails closed (tracked in #6033). |
+| `rbac_enabled` | The server's cached view of the RBAC switch. It can lag a change made on another replica, and it does not report the degraded state in which enforcement fails closed; read that from [`GET /api/v1/rbac/enforcement`](#get-apiv1rbacenforcement) (its `unconfirmed` field). |
 | `rbac_role` | Deprecated display field: the first DIRECT role assignment in role-name order. Omitted for an engine principal while RBAC is off, for an engine principal with no grant while RBAC is on, and when the role-store read failed. For a human with no direct role it shows the legacy label `Administrator` or `Viewer`, including while RBAC is on; that label is not a grant and not authority. Read `rbac_roles` instead. |
 | `rbac_roles` | The principal's DIRECT role assignments only; roles held through a group grant are not listed. It is not access-review evidence: the access-review export (`AccessReview:Read`) is. With RBAC off it is `[]`. Omitted when the role-store read failed. |
 | `rbac_roles_resolved` | `false` only when the role-store read failed; it is `true` otherwise, including with RBAC off (no read is made then, so `true` is not proof that enforcement is off). When `false` the route still answers `200` and omits `rbac_role` and `rbac_roles`; treat an absent list as unknown, not as "no roles". |
@@ -3330,6 +3334,152 @@ MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
 
 ---
 
+#### `GET /api/v1/rbac/enforcement`
+
+Read the RBAC enforcement state as this server replica sees it, plus an advisory
+verdict on whether the caller could change it. The machine twin of the
+**Enforce roles** panel (`GET /fragments/access/enforcement`) on the Users and
+roles page; the write is `PUT /api/v1/rbac/enforcement` below.
+
+**Permission:** any signed-in session, the same as its fragment and `GET /api/v1/me`. No
+`require_permission` or permission gate is applied, and the route is not RBAC-gated (the same
+class as `GET /api/v1/me` and `POST /api/v1/rbac/check`): the RBAC store is the data this route
+reads, not its gate. A service-scoped API token is refused `403` before anything is read,
+because the route reports fleet-wide RBAC state. An MCP-tier token and an engine session are
+not refused: they get a `200`, and an MCP-tier token reads `administrator: "may_not"` (see below).
+Nothing about any other principal is returned.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "unconfirmed": false,
+    "administrator": "may"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled` | The serving replica's cached view of the enforcement switch, for display. It is a cached view: on another replica it can lag the durable value by a bounded stale-serve window (#2703), and a replica that never observed an enable can read `false` while another replica enforces. |
+| `unconfirmed` | `true` when that cached view could not be re-confirmed against the store (a degraded read). **Client rule: when `unconfirmed` is `true`, treat enforcement as ON whatever `enabled` says.** The server fails closed in that state, so a displayed `enabled: false` there is a stale value that is not in effect (`enabled: false, unconfirmed: true` means enforcement is on, and `enabled: true, unconfirmed: true` means the same). `unconfirmed: false` is not a guarantee that no other replica disagrees. |
+| `administrator` | An advisory verdict on the caller's own credential: `may`, `may_not` or `unconfirmed`. Defined below. |
+
+**Naming collision.** The top-level field `unconfirmed` (a boolean about the cached enforcement
+view) and the value `administrator: "unconfirmed"` (about the verdict) are different things with
+the same word. They answer different questions and can disagree in any combination; every
+combination in the table below is legitimate.
+
+**Forward compatibility.** `unconfirmed` is a single boolean and does not say why the view is
+unconfirmed. A later release may add a separate field that names the cause. If it does, any
+cause of an unconfirmed view still reports `unconfirmed: true`, so the client rule above holds
+unchanged. Clients must ignore response fields they do not recognise (the MCP twin's output schema
+is closed, see the `get_rbac_enforcement` row in [mcp.md](mcp.md)). No such field is returned today.
+
+**`administrator`.**
+
+- `may`: the RBAC administration routes (role assignment and `PUT /api/v1/rbac/enforcement`) would
+  admit this credential's durable authority now.
+- `may_not`: they would refuse it.
+- `unconfirmed`: a required store could not answer the question; retry.
+
+`may` is advisory and is NOT a go signal for a mutation. It excludes the REST MFA step-up, the MCP
+tier and approval ladder, and the PUT's destination-regime `409`, and the server decides again on
+every PUT. With enforcement on, the check looks at durable user-type Administrator grants only;
+with enforcement off, it looks at the caller's local account role (an inactive account is a
+confirmed absence). So an account whose Administrator authority is not a durable grant on an
+active local account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily
+elevated session, or an Administrator held only through a group) reads `may_not` even when it can
+act as an administrator in some other way. In practice an OpenID Connect principal reads `may_not`
+today: the assignment routes cannot write a grant for an `oidc:` principal id (see
+[#5182](https://github.com/Tr3kkR/Yuzu/issues/5182)), and a first sign-in whose account provisioning
+failed leaves no account row. A grant installed by other means (direct SQL, see "If the guard refuses
+an action you intend" in [RBAC](rbac.md)) on an active provisioned account would read `may` with
+enforcement on. A
+just-revoked Administrator reads `may_not` on a fresh read; what can lag on another replica is the
+cached `enabled` value, which only selects which of the two sources applies. On REST an engine
+session reads `may_not` (engines are not Administrators), and so does an MCP-tier token, because
+the REST predicate denies any MCP-tier credential structurally: this credential cannot administer
+RBAC through REST, which says nothing about its owner's roles. The MCP twin applies no tier rule,
+so an MCP administrator reads `may` whatever its tier, even where the mutation is then refused. A
+service-scoped token never receives a verdict: it is refused (`403`) before any verdict.
+
+The verdict is decided from durable grant rows, or from the local account role when enforcement is
+off; the cached view only selects which of the two applies. It is neither forced nor hidden when the
+view is unconfirmed (the HTML fragment skips the hint in that case; this route does not). While the
+cached value is a stale off (`enabled: false` with `unconfirmed: true`), an account with no
+Administrator grant row reads `administrator: "unconfirmed"`, because the predicate cannot tell a
+missing grant from a stale view. While it is a stale on (`enabled: true` with `unconfirmed: true`),
+the same account reads `administrator: "may_not"`, because enforcement is on and a missing grant row
+is a confirmed absence. So `enabled: false, unconfirmed: true, administrator: "unconfirmed"` is a
+real answer. An engine and (on REST) an MCP-tier token are `may_not` from structural checks before
+any store is read; a service-scoped token is refused (`403`) before any verdict.
+
+**What a client should do:**
+
+| View | `administrator: "may"` | `administrator: "may_not"` | `administrator: "unconfirmed"` |
+|---|---|---|---|
+| `enabled: true`, `unconfirmed: false` | Enforcement is on. You may attempt a change; the server decides again. | On. Ask an Administrator. | On. Re-read in a few seconds. |
+| `enabled: true`, `unconfirmed: true` | On (view not re-confirmed). You may attempt a change. | On. Ask an Administrator. | On. Re-read in a few seconds. |
+| `enabled: false`, `unconfirmed: true` | Treat as ON. The `false` is stale. You may attempt a change. | Treat as ON. Ask an Administrator. | Treat as ON. Re-read in a few seconds. |
+| `enabled: false`, `unconfirmed: false` | Off as this replica sees it; another replica may enforce. | Off here. Ask an Administrator to change it. | Off here. Re-read in a few seconds. |
+
+Any `administrator` value a client does not recognise must be treated as `unconfirmed`: the set
+is closed today, but a client should not assume it stays closed. "Re-read in a few seconds" has no
+server-supplied interval on a `200`; the `503` answers carry `retry_after_ms` of 5000 and a similar
+interval is a reasonable default. **Cadence:** each call writes one audit row (two on the MCP
+twin), so poll no faster than that 5000 ms interval.
+
+```bash
+curl -s -b cookies.txt https://yuzu.example.com/api/v1/rbac/enforcement
+# {"data":{"enabled":true,"unconfirmed":false,"administrator":"may"},"meta":{"api_version":"v1"}}
+```
+
+With an API token instead of a session cookie:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/rbac/enforcement
+# {"data":{"enabled":true,"unconfirmed":false,"administrator":"may"},"meta":{"api_version":"v1"}}
+```
+
+A plain API token gets a real verdict (`may`, `may_not` or `unconfirmed`), while an MCP-tier token
+gets `may_not` on REST, because the REST predicate denies any MCP-tier credential structurally.
+
+**Errors:** `401`: no valid session (a bare refusal, no audit row); `403`: a service-scoped
+token (audited as a `denied` row, see below; the body names no permission that would admit the
+caller); `503`: the RBAC store is not open (retryable, `retry_after_ms` is 5000, no audit row),
+or the audit row for a successful read could not be saved (see below; also `retry_after_ms` 5000).
+Retry the read after that interval. During an audit outage the read keeps answering `503`: it is
+not a way to inspect state while the audit sink is failing.
+
+**Audit:** a successful read writes `rbac.enforcement.read` with a server-derived detail such
+as `enabled=true; unconfirmed=false; administrator=may` (nothing from the session or the request
+is embedded). On a deployment with a wired audit sink this fails closed: a row that cannot be
+saved answers `503` with `Sec-Audit-Failed: true` and the body is never sent. With no audit sink
+wired (audit off) the read succeeds without a row, so read "every successful read is audited" as
+"every successful read on a deployment with a wired sink". The `401` and the store-not-open
+`503` write no row, like the `PUT` and the fragment. A service-scoped refusal writes a `denied`
+row. `GET /fragments/access/enforcement` and `GET /api/v1/me` read the same state without
+writing a row. See `docs/user-manual/audit-log.md`.
+
+**Headers:** the `200` response carries `Cache-Control: no-store, private` (the error responses
+do not set it).
+
+**Rolling upgrade.** The route is new in this release. A replica that has not been upgraded is
+expected to answer `404` for it (and an unknown tool for `get_rbac_enforcement` on MCP); retry
+or pin the client to an upgraded replica. On MCP the older replica is also expected to audit the
+attempt as `mcp.get_rbac_enforcement` with `result=denied` and `detail=unknown tool`, so a SIEM
+rule on denied MCP rows can fire for a tool that exists on the upgraded replicas until every
+replica is upgraded. This is the expected behaviour of an older build, not something that has
+been observed on a live rolling upgrade.
+
+MCP twin: `get_rbac_enforcement`, see `docs/user-manual/mcp.md`.
+
+---
+
 #### `PUT /api/v1/rbac/enforcement`
 
 Enable or disable RBAC enforcement fleet-wide (durable; every replica
@@ -3394,10 +3544,10 @@ administrator after the switch (enabling: no fleet-wide `Administrator`
 grant; disabling: local account role is not `admin`) — the response's
 `remediation` field names the exact follow-up call; `503` — the RBAC or
 `AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
-audit row could not persist: treat the change as unconfirmed and check it with the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`). `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state (#6033). Audited `rbac.enforcement_changed` — see
+audit row could not persist: treat the change as unconfirmed. Do not rely on `GET /api/v1/rbac/enforcement` (above) to confirm it during an audit outage, because that read also answers `503` when the audit sink is the failing part. Once the audit sink is healthy it reports the state (and the unconfirmed bit); the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`) is the other read. `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state. Audited `rbac.enforcement_changed`; see
 `docs/user-manual/audit-log.md`.
 
-There is no `GET` twin: this route's own response echoes the authoritative post-write value, and the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the strongest available read. It is still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state (#6033).
+This route's own response echoes the authoritative post-write value. The read is `GET /api/v1/rbac/enforcement` (above), which reports the cached view and its unconfirmed state for any signed-in session; the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the stronger read for an auditor. Both are still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state.
 
 MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
 
@@ -4391,7 +4541,10 @@ limits are below).
 id, or one carrying a NUL byte) is refused with `400` and the message
 `campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
 store is read, and writes no audit row. The check runs after the permission
-gate, so a caller without the permission still gets the `403`.
+gate, so a caller without the permission still gets the `403`. A path that is
+longer than 256 bytes in all is refused by the server before the route runs
+(`404`, with the connection closed), so an id of a few hundred characters never
+reaches this check (see "Refusals that come before this gate" above).
 
 **Responses:** `200`, the object below, in `data`, with `meta` as shown.
 
@@ -11708,9 +11861,9 @@ Render the Role assignments panel: every fleet-wide grant (type, principal, role
 
 Render the RBAC enforcement panel.
 
-- **Permission:** any signed-in session, the same as its twin `GET /api/v1/me`. Neither the account-role gate nor a permission gate is applied. A service-scoped API token is refused first (**403**, audit action `access.fragment.access_denied`), because the panel reports fleet-wide RBAC state.
+- **Permission:** any signed-in session, the same gate as `GET /api/v1/me` and as its machine twin `GET /api/v1/rbac/enforcement` (all three are session-only). Neither the account-role gate nor a permission gate is applied. A service-scoped API token is refused first (**403**, audit action `access.fragment.access_denied`), because the panel reports fleet-wide RBAC state.
 - **Response (200):** HTML fragment: the setting (On or Off) with an **Enforce roles** switch when that same administrator check admits the caller (a hint: the server decides on every PUT), a disabled switch ("Only a durable Administrator can change this.") for everyone else, a disabled switch with "Your administrator authority could not be confirmed. Reload to try again." when the check cannot be answered, **Unconfirmed** when the store's view could not be confirmed (the cached flag is not drawn at all in that case), or a red "could not be read" box when the RBAC store is not open. Never "Off" for a failed read.
-- **Headers:** `Cache-Control: no-store`. No audit row (the twin writes none).
+- **Headers:** `Cache-Control: no-store`. No audit row: the fragment writes none, unlike its machine twin `GET /api/v1/rbac/enforcement` (which writes `rbac.enforcement.read`); `GET /api/v1/me` also writes none.
 
 **`GET /fragments/access/users/detail?username=<name>`**
 

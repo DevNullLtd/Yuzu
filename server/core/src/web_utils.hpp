@@ -768,23 +768,28 @@ has_non_identity_content_encoding(std::string_view content_encoding) noexcept {
 /// all-digit value above 2^64-1: `std::from_chars` reports
 /// `std::errc::result_out_of_range` for that input and the old code folded
 /// that to `content_length = 0` ("no header, don't cap"), while httplib's
-/// own `is_numeric()` + `strtoull()` parser (httplib.h:2769-2789) accepts
-/// the same digits and returns `SIZE_MAX` — the value it then ALSO uses to
-/// decide what it buffers (httplib.h:7057-7061). One unauthenticated
+/// own `is_numeric()` + `strtoull()` parser (0.37.1) accepted
+/// the same digits and returned `SIZE_MAX` — the value it then ALSO used to
+/// decide what it buffered. (0.59.0 parses with `std::from_chars`, flags an
+/// out-of-range value as invalid and answers 400, see the end of this comment.) One unauthenticated
 /// `Content-Length: 99999999999999999999999` (or any all-digit value above
 /// 2^64-1) defeated every class's cap, including /mcp/'s and the 256 KiB
 /// ca_import_chain/scim classes (governance Gate 8 CRITICAL). Calling
 /// httplib's accessor from this ONE function — used by both server.cpp's
 /// production gate and this file's own test fixtures
 /// (`test_body_cap_policy.cpp`'s `UnifiedBodyCapTestServer`,
-/// `test_mcp_body_cap.cpp`'s `BodyCapTestServer`) — makes that divergence
-/// structurally impossible rather than something to keep re-verifying by
-/// hand every time either call site is touched. A genuinely malformed
-/// (non-numeric / negative / whitespace-padded) `Content-Length` still
-/// reads as 0 here — that is fine, NOT a re-opened gap: httplib's OWN
-/// reader (the `is_invalid_value` branch, httplib.h:7057-7063) answers 400
-/// and refuses to read the body at all for that case, so no handler is
-/// ever reached regardless of what this gate alone decides.
+/// `test_mcp_body_cap.cpp`'s `BodyCapTestServer`), gives all three the same
+/// Content-Length reading, so a call site that is touched later need not be re-checked
+/// by hand. A genuinely malformed
+/// (non-numeric or negative) `Content-Length` still
+/// reads as 0 here (httplib trims surrounding whitespace, so `Content-Length:  5` reads as 5).
+/// That is fine, NOT a re-opened gap: httplib's OWN
+/// reader answers 400 and refuses to read the body at all for that case,
+/// so no handler is ever reached regardless of what this gate alone
+/// decides. (httplib 0.59.0 also answers 400 to an all-digit value above
+/// 2^64-1 while parsing the request head, before this gate runs; this
+/// function still returns SIZE_MAX for it, which the gate refuses with 413
+/// on an httplib that lets it through.)
 template <typename Req>
 [[nodiscard]] inline std::uint64_t content_length_for_body_cap(const Req& req) noexcept {
     return req.get_header_value_u64("Content-Length", 0);
@@ -803,12 +808,15 @@ template <typename Req>
 /// THE DESIGN RULE, learned the hard way: do NOT re-implement httplib's
 /// header parsing and hope the two agree. The first attempt tested
 /// `Transfer-Encoding` with a case-SENSITIVE `find("chunked")` while httplib
-/// decides with `case_ignore::equal(...)` (httplib.h:6967) — so
+/// decides with `case_ignore::equal(...)` (httplib.h v0.59.0:8469) — so
 /// `Transfer-Encoding: Chunked` passed this check as a measurable body and was
 /// then read as chunked, bounded only by the 100 MB global default. One
 /// capital letter defeated the whole cap. The substring test was also wrong in
-/// the other direction: httplib compares the value for EQUALITY, so
-/// `identity, chunked` is not chunked to httplib while `find` matched it. So
+/// the other direction on httplib 0.37.1, which compared the whole value for
+/// EQUALITY, so `identity, chunked` was not chunked to it while `find` matched
+/// it. From 0.59.0 httplib reads the FINAL coding of the combined list
+/// (httplib.h v0.59.0:8441-8470), so `gzip, chunked` is chunked to it and the two
+/// agree on that case; the rule below does not depend on which it is. So
 /// this refuses ANY non-empty `Transfer-Encoding`, on ANY method — not just
 /// chunked and not just POST/PUT/PATCH, since httplib's `expect_content`
 /// treats chunking independently of the method, so a chunked
@@ -816,7 +824,7 @@ template <typename Req>
 ///
 /// DELETE is DELIBERATELY EXCLUDED from the no-`Content-Length` rule, and the
 /// reasoning is worth keeping because two reviewers disagreed on it.
-/// `expect_content` (httplib.h:8330) is true for DELETE too, so a DELETE
+/// `expect_content` (httplib.h v0.59.0:10058-10064) is true for DELETE too, so a DELETE
 /// carrying an UNDECLARED body is admitted here — today harmlessly, because
 /// with `CPPHTTPLIB_SSL_ENABLED` that path returns without reading, which is
 /// an accidental dependency on a build flag rather than a bound. Closing it
@@ -860,16 +868,16 @@ template <typename Req>
 /// `oversize = !unmeasurable && content_length > cap`, so the BROAD rule
 /// suppressed the size check: `Transfer-Encoding: identity` plus a
 /// `Content-Length` of 8 MiB was admitted on every class whose
-/// `requires_measurable` is false, 24 of 25, including the
+/// `requires_measurable` is false, including the
 /// health probes — because httplib honours an exact `chunked` and NOTHING
 /// else, falling through to `Content-Length` and reading every byte. The gate
 /// discarded a length httplib was about to act on. Verified on a raw socket
 /// against the real vendored httplib.
 ///
-/// `is_chunked` MUST come from httplib's own `is_chunked_transfer_encoding`,
-/// never from a local reading of the header. Third time this change was bitten
-/// by that same root cause — `Content-Encoding` and the `Content-Length`
-/// overflow parse were the first two — and all three were fixed the same way:
+/// `is_chunked` MUST come from httplib's own decision, through `is_chunked_for_body_cap`
+/// (body_cap_httplib.hpp), never from a local reading of the header. Third time this
+/// change was bitten by that same root cause (`Content-Encoding` and the `Content-Length`
+/// overflow parse were the first two), and all three were fixed the same way:
 /// ask httplib instead of re-deciding.
 [[nodiscard]] inline bool content_length_is_authoritative(bool has_content_length,
                                                           bool is_chunked) noexcept {
@@ -1167,6 +1175,40 @@ inline std::string render_duration_bar_html(int64_t duration_ms,
         "<div class=\"duration-bar duration-bar--{}\" "
         "style=\"width:{}%\" role=\"img\" aria-label=\"{} ms\"></div>",
         status_class, pct, duration_ms);
+}
+
+
+/// True when the request carries a `Transfer-Encoding` header line of ANY value, including an
+/// empty one. `get_header_value` reads only the FIRST such line, while httplib decides on the
+/// LAST token of the LAST line (`is_chunked_transfer_encoding`), so a request sent as an empty
+/// `Transfer-Encoding:` line followed by `Transfer-Encoding: chunked` reads as "no
+/// Transfer-Encoding" through `get_header_value` and is still read as chunked by httplib. Ask
+/// this whenever the question is "does this request declare a framed body".
+template <typename Req>
+[[nodiscard]] inline bool transfer_encoding_present(const Req& req) {
+    return req.has_header("Transfer-Encoding");
+}
+
+/// The `transfer_encoding` argument `evaluate_body_cap` is given: the first line's value, or the
+/// non-empty marker "present" when the header exists but its first line is empty (see
+/// `transfer_encoding_present`). `body_unmeasurable` refuses ANY non-empty value, so the marker
+/// keeps the gate's "this body cannot be measured in advance" decision in step with httplib.
+template <typename Req>
+[[nodiscard]] inline std::string transfer_encoding_for_body_cap(const Req& req) {
+    auto value = req.get_header_value("Transfer-Encoding");
+    if (value.empty() && transfer_encoding_present(req))
+        value = "present";
+    return value;
+}
+
+/// True when the request declares a body httplib will read: a non-zero `Content-Length` (an
+/// out-of-range one reads as SIZE_MAX, see `content_length_for_body_cap`) or any
+/// `Transfer-Encoding` line. Deliberately BROAD, like `body_unmeasurable`: it only decides whether
+/// to close, so a false positive costs one keep-alive connection and a false negative leaves a
+/// body unread on a connection that stays open.
+template <typename Req>
+[[nodiscard]] inline bool declares_framed_body(const Req& req) {
+    return content_length_for_body_cap(req) > 0 || transfer_encoding_present(req);
 }
 
 } // namespace yuzu::server

@@ -1463,7 +1463,7 @@ account policy)"* — this ships **both** halves.
   placeholder certificate strings). An earlier draft parsed the file with a
   different loader and disagreed with the verifier in both directions
   (`BEGIN TRUSTED CERTIFICATE` rejected, Ed25519 accepted), so the single shared
-  helper is load-bearing: do not add a second certificate probe.
+  helper is load-bearing: do not add a second certificate probe. The helper also refuses a key type outside the verifier's algorithm allowlist (RSA and EC key data), so a key that xmlsec can adopt but the verifier would refuse (Ed25519 and Ed448 on xmlsec 1.3.12) is reported broken at start-up, not at the first sign-in.
 
   Deliberate limits of that second check:
   - **Local only — no network.** OIDC discovery and signing-key fetches stay
@@ -3527,8 +3527,8 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 - 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 38 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
-  - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
-  - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
+  - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution on macOS (the resolver is capped at the per-operation timeout if httplib's non-blocking resolver is compiled in; that build setting has not been checked for macOS) and on Windows, but not on a Linux build with glibc: there cpp-httplib 0.59.0 cancels a lookup at that timeout and then waits for the resolver itself to finish, about 30 s with default resolver settings (cpp-httplib's header says the system resolver timeout, about 30 s by default, past the caller's timeout; read as about 30 s from the start of the lookup, not measured) (longer with several nameservers or search domains), and only an unresponsive resolver causes the wait (an answered NXDOMAIN fails at once). `resolve_host_addresses` calls `httplib::detail::getaddrinfo_with_timeout` directly, so the IdP GETs, the check before the token-exchange POST connects (`exchange_code` -> `vet_egress_target`) and the one-time NAT64 probe lookup, and with them sign-in and Test Connection, are not held to the 10 s figure on glibc; a musl build uses a bounded thread fallback. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
+  - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib (0.37.1 and 0.59.0) waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
   - The token-exchange POST has per-operation timeouts only (10/15/15 s on Linux and macOS; Windows uses the WinHTTP defaults) and no total bound. Its response is capped at 256 KiB on every platform (on Windows the size of each chunk is checked against the remaining allowance before it is allocated), and the Windows request sets the WinHTTP redirect policy to never and accepts only HTTP status 200 (`WinHttpQueryHeaders`), so a 3xx answer fails the sign-in instead of being followed to an unchecked host or parsed as a token response.
   - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
   - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key, while a token with no `kid` is checked against each usable key in turn (at most the first 16, in the order published). An RSA key with a modulus under 2048 bits, or an exponent below 3, even or over 32 bits, is skipped at parse: defence in depth against a weak IdP key, not against a tampered JWKS. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
@@ -3724,6 +3724,82 @@ only when a change cannot be expressed as an idempotent additive re-seed
 (`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
+
+## Enforcement-state read (#6033)
+
+`GET /api/v1/rbac/enforcement` and the MCP tool `get_rbac_enforcement` are the machine twins of
+the enforcement fragment (`GET /fragments/access/enforcement`). Both call ONE builder,
+`read_rbac_enforcement` (`rbac_enforcement_read.hpp`), and return `enabled`, `unconfirmed` and
+an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP tool adds
+`audit_persisted`.
+
+- **Two groups answering different questions.** `enabled`/`unconfirmed` are the serving replica's
+  cached view (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`, read through the two display
+  accessors only, never `rbac_enforcement_label()`, which routed clause 4 of the A2/A1 row
+  reserves). **Client rule: when `unconfirmed` is true, treat enforcement as ON whatever `enabled`
+  says** (a stale off is treated as on; a stale on is on either way). `administrator` is
+  `rbac_admin_hint` on the caller's own surface (`kRest` for the route, `kMcp` for the tool; the
+  surface has no default, clause 5). The builder calls it once and neither forces nor suppresses
+  the result when the view is degraded. The predicate behind it does consult the cached enforcement
+  label, but only to choose which durable source answers (Administrator grant rows when enforcement
+  is on or unconfirmed, the local account role when it is off); the answer itself is read from those
+  rows and then the regime check. So it is not independent of cache state. While the cached value
+  is a stale off (`enabled:false` with `unconfirmed:true`), an account with no Administrator grant
+  row reads `administrator:"unconfirmed"`, because the predicate cannot tell a missing grant from
+  a stale view. While it is a stale on (`enabled:true` with `unconfirmed:true`), the same account
+  reads `administrator:"may_not"`, because enforcement is on and a missing grant row is a
+  confirmed absence.
+  The two uses of "unconfirmed" (the boolean about the view, the value about the verdict) can
+  appear in any combination. The hint now has two production callers, the `rbac_admin_hint_fn`
+  wiring in `server.cpp` and `read_rbac_enforcement`; the read consumes the answer and changes no
+  admission input of either function. The HTML fragment's habit of skipping the hint when the view
+  is degraded is a rendering decision and is deliberately not copied.
+- **`administrator` defined.** `may` = the RBAC administration routes (role assignment and
+  `PUT /rbac/enforcement`) would admit this credential's durable authority now; `may_not` = they
+  would refuse it; `unconfirmed` = a required store could not answer, retry. A client treats any
+  value it does not recognise as `unconfirmed`. Engine and (on REST) MCP-tier credentials are
+  `may_not` from structural checks before any store is read (a service-scoped token never receives
+  a verdict: it is refused 403 before any verdict, by the explicit REST deny and the C8 gate on
+  MCP). An account whose Administrator authority is not a durable grant on an active local
+  account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily elevated
+  session, or an Administrator held only through a group) reads `may_not`, because only durable
+  user-type grants count with enforcement on, and the local account role with it off (clause 3).
+  In practice an OpenID Connect principal reads `may_not` today: the assignment routes cannot write
+  a grant for an `oidc:` principal id (see #5182), and a first sign-in whose account provisioning
+  failed leaves no account row (`provision_sso_identity` is fail-soft: a failure is logged and the
+  login proceeds). A grant installed by other means (direct SQL, see "If the guard refuses an action
+  you intend" in `docs/user-manual/rbac.md`) on an active provisioned account would read `may` with
+  enforcement on. A just-revoked Administrator
+  reads `may_not` on a fresh read; what can lag on another replica is the cached `enabled` value,
+  which only selects which source applies.
+- **Advisory, not a promise.** `may` means the RBAC administration routes would admit this
+  credential's durable authority now. It is not a go signal for a mutation. It excludes REST MFA step-up, the MCP tier and approval
+  ladder (a readonly-tier administrator reads `may` on MCP and `set_rbac_enforcement` still
+  refuses it), and the enforcement PUT's destination-regime `409`. On REST an MCP-tier token reads
+  `may_not` because the predicate denies it structurally on `kRest`: "this credential cannot
+  administer RBAC through REST", not "its owner lacks Administrator". The REST route does not add
+  `deny_mcp_token_session` or `deny_engine_session` to a read that discloses nothing about
+  anyone else.
+- **Gate (owner ruling, ADR-1005 2026-11-03 entry).** The REST route is session-only (`auth_fn`),
+  with no `perm_fn`, for parity with its fragment and `GET /api/v1/me`: a
+  `perm_fn(Infrastructure, Read)` gate would make the machine twin stricter than the fragment
+  and invent an authority the route does not have. It is therefore not RBAC-gated, the same
+  class as `GET /api/v1/me` and `POST /api/v1/rbac/check`, and is recorded as one
+  `GATE_PARITY_NO_GATE_ALLOWED` entry. A service-scoped token is refused on both transports
+  (REST `deny_fleet_wide_service_scoped` with no permission named, per clause 5 of the
+  service-scope row; MCP `ServiceScopeClass` `denied`) and the pair is never added to
+  `kServiceScopeGlobalSafe`. Nothing about other principals is returned, so the topology floor
+  (`kTopologyFloor`) is not engaged.
+- **Audit.** Every successful read writes `rbac.enforcement.read` with a server-derived detail
+  (`enabled=...; unconfirmed=...; administrator=...`) and nothing taken from the session. REST
+  fails closed (`503` plus `Sec-Audit-Failed`, body never sent); MCP also writes the generic
+  `mcp.get_rbac_enforcement` row, attempts both independently and reports
+  `audit_persisted:false` if either drops. An empty audit callback is audit-off and the read
+  succeeds, so "every read is audited" holds for a deployment with a wired sink. The null or
+  closed RBAC store `503` and a bare `401` write no row (matching the PUT and the fragment). A REST service-scoped refusal does write a `denied` row. The fragment and `GET /api/v1/me` read the same state unaudited.
+- **Residual: a cached view.** A replica that never observed an enable can read
+  `enabled:false, unconfirmed:false` while another replica enforces, bounded by the stale-serve
+  window (#2703). The access-review export's `rbac_enforcement` label is the stronger read.
 
 ## Periodic access reviews (SOC 2 CC6.2)
 
@@ -5383,6 +5459,21 @@ The CSP uses `'unsafe-inline'` for `script-src`/`style-src` because the dashboar
 Operators can extend the CSP via `--csp-extra-sources "https://cdn.example.com https://beacon.example.com"` (space-separated, validated at CLI parse — control bytes / semicolons / `'unsafe-eval'` are rejected at startup with a clear error). The flag's value is appended to `script-src`/`style-src`/`connect-src`/`img-src` only.
 
 Header construction lives in `server/core/src/security_headers.{hpp,cpp}` (`yuzu::server::security` namespace) — the production server and the unit/integration tests in `tests/unit/server/test_security_headers.cpp` (38 cases) share the same `HeaderBundle::make()`/`apply()` code path. The resolved bundle is logged at INFO at startup so operators can confirm activation: `Security headers active: CSP=N bytes, HSTS=on/off, Referrer-Policy="...", Permissions-Policy=N bytes`.
+
+### Close rule for an unread request body (cpp-httplib 0.59)
+
+The main listener's post-routing handler calls `close_if_unread_framed_body`
+(`server/core/src/body_cap_httplib.hpp`) on every response, a pre-routing `Handled`
+answer included: a response below `400` that left a declared request body
+unread carries `Connection: close` (httplib closes a `400`-or-above response
+itself). Keep that single call in the post-routing handler: never add a
+per-return `set_header` in the pre-routing handler, where a new early return
+would forget it, and never move `close_if_unread_framed_body` to
+`set_pre_request_handler`, which runs before the body is read. The plain-HTTP
+redirect listener closes its redirect answer unconditionally instead (`health_routes.cpp`). The
+wiring is pinned by a lexical case in `test_step_up_wiring.cpp`. This rule is
+not part of the MFA step-up chokepoint: it sits next to the security-headers
+call because both run in the same post-routing handler.
 
 ## Self-target principal-destruction guard (hard invariant, #397/#403/ca-B1)
 

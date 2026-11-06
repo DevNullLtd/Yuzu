@@ -53,6 +53,7 @@
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
 #include "echo_corruption_audit.hpp" // #1567 corruption audit gate
+#include "body_cap_httplib.hpp" // header-derived body-cap arguments read the way httplib reads them
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
@@ -15379,7 +15380,7 @@ private:
 
             // #4722: same TLS 1.2 cipher allow-list as the gRPC listeners.
             // httplib's create_server_context() already floors at
-            // TLS1_2_VERSION (httplib.h:16411); this pins the suites.
+            // TLS1_2_VERSION (httplib.h v0.59.0:19358-19363); this pins the suites.
             // tls_context() is the current accessor (ssl_context() is
             // [[deprecated]]). Fail closed: an unpinned HTTPS listener must
             // not serve. (Note: the cert-missing `return`s above deliberately
@@ -15467,8 +15468,8 @@ private:
         // enters service. Deferring the spawn (base < max) instead activates httplib's
         // dynamic branch, which does `jobs_.push_back(...)` and THEN
         // `dynamic_threads_.emplace_back(std::thread(...))` inside enqueue's lock
-        // (httplib.h:9792-9798), called from the accept loop with no handler
-        // (httplib.h:11322). The same terminate then becomes reachable at RUNTIME, under
+        // (httplib.h v0.59.0:12002-12016), called from the accept loop with no handler
+        // (httplib.h v0.59.0:14063). The same terminate then becomes reachable at RUNTIME, under
         // load, pre-auth — the server boots healthy and aborts later. Lower probability,
         // far worse blast radius. Note also that a wrapper catching there and returning
         // false is NOT a fix: the job capturing the socket is already queued, so the
@@ -15659,7 +15660,7 @@ private:
             // file's own web_utils.hpp already documented the opposite.
             // Verified empirically against this vcpkg baseline: httplib's
             // `expect_content()` is true for ANY method with `Content-Length >
-            // 0` or chunked framing (httplib.h:8330), so a GET declaring
+            // 0` or chunked framing (httplib.h v0.59.0:10058-10064), so a GET declaring
             // `Content-Length: 20971520` buffers 20 MiB regardless of method.
             // A legitimate GET/HEAD body is 0 bytes, which resolves under the
             // (4 MiB, by default) cap trivially.
@@ -15684,30 +15685,29 @@ private:
             // per class, per the file-header reasoning above; chunked is
             // legal HTTP this repo does not control every client's use of.
             //
-            // CONNECTION-REUSE CONSTRAINT (D5 — investigated, NOT fixable
-            // here). Returning Handled means the body is never read off the
-            // socket, which is the whole point: a rejection never buffers the
-            // oversized payload.
+            // CONNECTION-REUSE CONSTRAINT (D5). Returning Handled means the body is
+            // never read off the socket, which is the whole point: a rejection never
+            // buffers the oversized payload.
             //
-            // The consequence is that this handler cannot also close the
-            // connection. httplib stamps an ADVISORY `Connection: close`
-            // response header on a 4xx, but its own close decision is
-            // internal state that `pre_routing_handler_` is given no access
-            // to — its signature carries only `(const Request&, Response&)`,
-            // no stream and no socket — so neither closing nor draining is
-            // reachable from here. The two server-GLOBAL knobs that could
-            // force it are both rejected: one is already rejected elsewhere
-            // in this file for squeezing the multipart cert upload and
-            // content-distribution staging, and the other would break
-            // legitimate keep-alive fleet-wide to fix one pre-auth path.
+            // This handler cannot close the connection itself: its signature carries only
+            // `(const Request&, Response&)`, no stream and no socket. What it CAN do is
+            // set `Connection: close` on the response, and httplib honours that. By status:
             //
-            // DO NOT spend time re-deriving this — it has been investigated
-            // against the vendored httplib and confirmed unfixable at this
-            // layer. The residual risk, its deployment preconditions and the
-            // candidate remediations are tracked through private security
-            // reporting per SECURITY.md, deliberately not restated here.
-            // Re-evaluate if a future httplib exposes the stream or the
-            // close flag to a pre-routing handler.
+            //   * 400 and above: httplib stamps `Connection: close` itself.
+            //   * below 400 (the sign-in 302 below, any future 2xx/3xx): from httplib 0.59 a
+            //     response that leaves a declared request body unread must carry
+            //     `Connection: close` (httplib.h v0.59.0:14797-14806); the response therefore
+            //     closes the connection.
+            //
+            // So the rule is applied ONCE, for every response, in the POST-ROUTING handler
+            // below (httplib runs it after it has chosen the Connection header and before the
+            // headers are written): `close_if_unread_framed_body` (body_cap_httplib.hpp) sets
+            // `Connection: close` on a response below 400 whose declared body was never read.
+            // Do not add a per-return `set_header` in this handler. Pinned by
+            // test_body_cap_policy.cpp ("Pre-routing answer: a response to a request with an
+            // unread framed body closes the connection"), which reads the socket to EOF for a
+            // 302, a 200, a 413 and a 400, and by test_step_up_wiring.cpp's lexical row for the
+            // call below.
             //
             // Returns true (and has already populated `res`) when the
             // request was refused; false means "not this gate's business,
@@ -15718,17 +15718,18 @@ private:
                 // CONTAIN THE WHOLE BLOCK, not just the metric (governance
                 // Gate 8, security + cpp-safety). httplib invokes this
                 // handler from TWO sites: routing() (inside process_request's
-                // try/catch) and the WebSocket-upgrade path at
-                // httplib.h:11741, which is NOT — and ThreadPool::worker runs
-                // tasks bare. Every throwing expression below (header reads,
+                // try/catch) and the WebSocket-upgrade path (reached from
+                // process_request's upgrade branch), which is NOT — and
+                // ThreadPool::worker runs tasks bare. Every throwing expression below (header reads,
                 // the log, the sanitizers, the counters, the envelope build)
                 // must stay inside this try, or a crafted request reaches an
                 // unguarded call site and takes the whole process down.
                 try {
                     // TWO deliberately separate header lookups (#2407 R1 fix,
                     // hardened 2026-08-07 — do not "simplify" back to one).
-                    // Presence (`has_content_length`) is answered by this
-                    // iterator range. The VALUE comes from
+                    // Presence is answered by `has_content_length_for_body_cap`
+                    // (body_cap_httplib.hpp), the iterator range over the
+                    // header map. The VALUE comes from
                     // `content_length_for_body_cap` (web_utils.hpp) — see
                     // that function's doc comment for the CRITICAL bypass a
                     // hand-rolled `std::from_chars` parse caused here once
@@ -15737,29 +15738,26 @@ private:
                     // code, while httplib's own accessor, which this now
                     // calls directly, correctly reports `SIZE_MAX`). Routing
                     // both this call site and the test fixtures' through the
-                    // ONE shared function makes that divergence structurally
-                    // impossible instead of something to keep re-verifying
-                    // by hand.
-                    const auto cl_range = req.headers.equal_range("Content-Length");
-                    const bool has_content_length = cl_range.first != cl_range.second;
-
+                    // ONE shared function keeps the Content-Length value
+                    // reading the same everywhere.
                     // THE DECISION — the ONE callable both this production
                     // chokepoint and test_body_cap_policy.cpp's
                     // UnifiedBodyCapTestServer fixture invoke (#2898). See
                     // `evaluate_body_cap`'s doc comment (body_cap_policy.hpp)
                     // for the D1-D5 ordering it encodes and why it stays
                     // httplib-free; `is_chunked` MUST come from httplib's own
-                    // `is_chunked_transfer_encoding`, never a re-derived
+                    // `is_chunked_transfer_encoding` (through `is_chunked_for_body_cap`),
+                    // never a re-derived
                     // reading of the header text (third time this change was
                     // bitten by re-deciding a framing/length header
                     // ourselves instead of asking httplib — see
                     // `content_length_is_authoritative`'s doc comment).
                     const auto decision = yuzu::server::evaluate_body_cap(
-                        req.method, req.path, has_content_length,
+                        req.method, req.path, has_content_length_for_body_cap(req),
                         content_length_for_body_cap(req),
-                        req.get_header_value("Transfer-Encoding"),
-                        req.get_header_value("Content-Encoding"),
-                        httplib::detail::is_chunked_transfer_encoding(req.headers));
+                        transfer_encoding_for_body_cap(req),
+                        content_encoding_for_body_cap(req),
+                        is_chunked_for_body_cap(req));
 
                     if (!decision.refuse)
                         return false;
@@ -16276,7 +16274,7 @@ private:
         // class's cap can be checked against before anything is read off the
         // socket). It has a structural limit, recorded in body_cap_policy.hpp's
         // KNOWN LIMITATION paragraph: on any class with `requires_measurable ==
-        // false` (24 of 25 rows) a genuine chunked — or otherwise unmeasurable
+        // false` a genuine chunked — or otherwise unmeasurable
         // — body is NOT size-checked there at all; it falls through to
         // httplib's own 100 MiB backstop (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`) and
         // is handed to the route handler uncapped by this table. This second
@@ -16381,10 +16379,12 @@ private:
         // maintainer would trust. `enforce_pre_auth_body_cap` is contained
         // because httplib calls `pre_routing_handler_` from the UNGUARDED
         // WebSocket-upgrade path. This stage is NOT reachable from there —
-        // that path calls `pre_routing_handler_` and the upgrade entry's own
-        // handler, never a route handler, and this stage runs inside the route
-        // handlers. A route handler runs inside `routing()`, which httplib's
-        // `process_request` wraps in try/catch.
+        // that path calls `pre_routing_handler_`, (from cpp-httplib 0.59.0)
+        // `pre_request_handler_` (this server installs none), and the upgrade
+        // entry's own handler, never a route handler, and this stage runs
+        // inside the route handlers. A route handler runs inside
+        // `routing()`, which httplib's `process_request` wraps in
+        // try/catch.
         //
         // It is contained anyway, deliberately: relying on a caller's
         // try/catch means this block's safety depends on vendored code we do
@@ -16524,6 +16524,11 @@ private:
             // Applied to ALL responses (dashboard, API, metrics, health,
             // error pages).
             security_headers.apply(res);
+            // A response written without reading the request's declared body must close the
+            // connection: from httplib 0.59 a response below 400 that leaves that body unread
+            // must carry `Connection: close` (the pre-routing answers above).
+            // See the helper.
+            close_if_unread_framed_body(req, res);
 
             // CORS headers for all /api/ responses (H6)
             // Only reflect Origin if it matches the server's own origin
@@ -16878,7 +16883,8 @@ private:
                         return auth_routes_->deny_service_scoped_session(req, res, action, message,
                                                                           target_type, target_id);
                     },
-                // The ONE call site of `rbac_admin_hint` (routed A2/A1 row): the page draws the
+                // The page's call site of `rbac_admin_hint` (routed A2/A1 row; the other is
+                // `read_rbac_enforcement`, the machine twin's builder): the page draws the
                 // Assign button and the enforcement switch from the authority the A2/A1 routes
                 // apply (the durable-Administrator predicate, then the regime check; A1 applies
                 // the regime rule inside set_enforcement), not from the session's base role.
@@ -17192,10 +17198,10 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health (draw-time)
-                             // #5906: is_running() is set after a successful bind (httplib.h:11268)
-                             // and cleared on return (11269), so a failed bind, pre-accept
+                             // #5906: is_running() is set after a successful bind (httplib.h v0.59.0:13995)
+                             // and cleared on return (13996), so a failed bind, pre-accept
                              // startup and a completed shutdown all read "not serving". No finer
-                             // signal in httplib 0.37.1; web_thread_done_ is set only after the
+                             // signal in httplib 0.59.0; web_thread_done_ is set only after the
                              // drain (caveat: AUTH POSTURE banner, health_routes.hpp).
                              .plaintext_probe_sink = redirect_sink_.get(),
                              .main_listener_serving_fn =
