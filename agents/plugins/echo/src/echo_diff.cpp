@@ -506,11 +506,25 @@ std::vector<NetworkEvent> compute_network_events(
     std::unordered_map<std::string, const NetConnection*> curr_map;
     for (const auto& c : current) curr_map[make_key(c)] = &c;
 
+    // A listening socket is not a connection: it appears and vanishes as listen_open / listen_close
+    // (folded into the tcp tiers with remote_addr='*', remote_port=<local port>) and never as
+    // connected / disconnected.
+    const auto is_listen = [](const NetConnection& c) { return c.state == "LISTEN"; };
+    // A connection attempt that vanishes (or turns to a closing state) while its last observed state
+    // is SYN_SENT never reached ESTABLISHED in any poll: `failed`. A poll-based observer cannot tell
+    // a refused or timed-out attempt from one the remote accepted and closed between two polls, so
+    // `failed` can over-count on a very short-lived connection (docs/user-manual/echo.md).
+    const auto end_action = [](const NetConnection& before) {
+        return before.state == "SYN_SENT" ? "failed" : "disconnected";
+    };
+
     for (const auto& c : current) {
         const bool closing = tcp_state_is_closing(c.state);
         const auto it = prev_map.find(make_key(c));
         if (it == prev_map.end()) {
-            if (!closing) {
+            if (is_listen(c)) {
+                emit("listen_open", c);
+            } else if (!closing) {
                 emit("connected", c);
             } else if (closing_seen.first_this_hour(
                            timestamp,
@@ -523,17 +537,23 @@ std::vector<NetworkEvent> compute_network_events(
             }
             continue;
         }
+        if (is_listen(c))
+            continue; // still listening
         const bool was_closing = tcp_state_is_closing(it->second->state);
         if (!was_closing && closing)
-            emit("disconnected", c); // the connection ended; the state says how
+            emit(end_action(*it->second), c); // the connection ended; the state says how
         else if (was_closing && !closing)
             emit("connected", c); // the 4-tuple was reused by a new connection
     }
 
     for (const auto& c : previous) {
         // A socket that was already closing was accounted for when it entered that state.
-        if (!curr_map.contains(make_key(c)) && !tcp_state_is_closing(c.state))
-            emit("disconnected", c);
+        if (curr_map.contains(make_key(c)))
+            continue;
+        if (is_listen(c))
+            emit("listen_close", c);
+        else if (!tcp_state_is_closing(c.state))
+            emit(end_action(c), c);
     }
 
     return events;
@@ -630,8 +650,12 @@ std::vector<UserEvent> compute_user_events(
             events.push_back({timestamp, snapshot_id, "login", u.user, u.domain, u.logon_type, u.session_id});
     }
     for (const auto& u : previous) {
-        if (!curr_map.contains(make_key(u)))
+        const auto it = curr_map.find(make_key(u));
+        if (it == curr_map.end())
             events.push_back({timestamp, snapshot_id, "logout", u.user, u.domain, u.logon_type, u.session_id});
+        else if (!u.disconnected && it->second->disconnected)
+            // Still logged on but detached (a Windows session in WTSDisconnected): not a logout.
+            events.push_back({timestamp, snapshot_id, "disconnect", u.user, u.domain, u.logon_type, u.session_id});
     }
 
     return events;
