@@ -175,7 +175,7 @@
       "definition_id": "crossplatform.virtualization.host"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited and field 0 is the row kind; `-` is an absent value. The first row is always `status|host|<supported\\|constrained\\|unsupported>|<reason or ->`. The `host` row has seven fields: `host|<yes\\|no\\|unknown>|<guest\\|host_with_hypervisor\\|bare_metal\\|unknown>|<vendor>|<product>|<source>|<high\\|medium\\|low>`. `vendor` is the hypervisor (`kvm`, `hyperv`, `vmware`, `xen`, `virtualbox`, `parallels`, `bhyve`, `qemu`, `acrn`, `aws`, `gce`, `alibaba`, `openstack`, `nutanix`, `apple` or `other`) for a guest or host, and the hardware manufacturer for `bare_metal` and `unknown`. `source` is the evidence that decided the kind (`cpuid`, `smbios`, `sysctl` or `sys_hypervisor`); when the kind is `unknown` it carries the joined reason tokens instead, so the row an operator reads explains itself. The `container` row is `container|<yes\\|no\\|unknown>|<evidence or reason>`. Every OS-supplied value (DMI and SMBIOS strings, the hardware model) is scrubbed (NUL and malformed UTF-8 become `?`) and escaped for the server's pipe grammar.",
+  "outputs_note": "Every row is pipe-delimited and field 0 is the row kind; `-` is an absent value. The first row is always `status|host|<supported\\|constrained\\|unsupported>|<reason or ->`. The `host` row has seven fields: `host|<yes\\|no\\|unknown>|<guest\\|host_with_hypervisor\\|bare_metal\\|unknown>|<vendor>|<product>|<source>|<high\\|medium\\|low>`. `vendor` is the hypervisor (`kvm`, `hyperv`, `vmware`, `xen`, `virtualbox`, `parallels`, `bhyve`, `qemu`, `acrn`, `aws`, `gce`, `alibaba`, `openstack`, `nutanix`, `apple` or `other`) for a guest or host, and the hardware manufacturer for `bare_metal` and `unknown`. `source` is the evidence that decided the kind (`cpuid`, `smbios`, `sysctl` or `sys_hypervisor`); when the kind is `unknown` it carries the joined host-decision reason tokens instead (container read failures stay on the container row), so the row an operator reads explains itself. The `container` row is `container|<yes\\|no\\|unknown>|<evidence or reason>`. Every OS-supplied value (DMI and SMBIOS strings, the hardware model) is scrubbed (NUL and malformed UTF-8 become `?`) and escaped for the server's pipe grammar.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -229,6 +229,12 @@
       "provenance": "`linux:virtualization:container:markers_<cause>`, `linux:virtualization:container:cgroup_<cause>`, `linux:virtualization:container:cgroup_not_read`",
       "status": "`CONSTRAINED`",
       "when": "Linux: a container marker probe or `/proc/self/cgroup` could not be read; the container row is `unknown` unless a marker already answered"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:smbios:unreadable`, `macos:virtualization:smbios:unreadable`, `windows:virtualization:smbios:unreadable`",
+      "status": "`CONSTRAINED`",
+      "when": "SMBIOS was reported unreadable with no cause token; a defensive fallback so an unknown is never unexplained (no shipped leg produces it today)"
     },
     {
       "completeness": "partial",

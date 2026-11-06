@@ -52,6 +52,8 @@ class VirtualizationDefinitionColumns(unittest.TestCase):
 
     def test_operational_defaults_are_pinned(self):
         spec = _definitions()["host"]["spec"]
+        self.assertEqual(spec["type"], "question")
+        self.assertEqual(spec["execution"]["concurrency"], "per-device")
         self.assertEqual(spec["gather"]["ttlSeconds"], 3600)
         self.assertEqual(spec["approval"]["mode"], "auto")
         self.assertEqual(spec["permissions"]["executeRoles"], ["endpoint-admin", "endpoint-operator"])
@@ -61,9 +63,10 @@ class VirtualizationDefinitionColumns(unittest.TestCase):
     def test_the_plugin_is_default_on(self):
         # Inventory:Read device facts, not privacy-gated: no default-off kill-switch seed names it.
         server = (REPO_ROOT / "server" / "core" / "src" / "server.cpp").read_text(encoding="utf-8")
-        seeds = re.findall(r"seed_kill_switch_default_off\s*\((.*?)\)\s*\)", server, re.DOTALL)
-        self.assertGreater(len(seeds), 0, "the seed-call pattern matched nothing; fix the regex")
-        self.assertFalse([c for c in seeds if "virtualization" in c])
+        # The first string literal of each call is the plugin name, whatever form the call takes.
+        names = re.findall(r'seed_kill_switch_default_off\s*\(\s*"([^"]+)"', server)
+        self.assertGreater(len(names), 0, "the seed-call pattern matched nothing; fix the regex")
+        self.assertNotIn("virtualization", names)
 
 
 if __name__ == "__main__":

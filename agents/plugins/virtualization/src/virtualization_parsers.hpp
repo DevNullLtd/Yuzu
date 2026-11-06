@@ -233,7 +233,8 @@ inline std::optional<std::string_view> vm_vendor_from_smbios(std::string_view ma
                                                              std::string_view product) {
     // AWS bare-metal instance types carry `.metal` in product_name (manufacturer is still
     // "Amazon EC2"); no VM product name does. Nutanix NX appliances are excluded by their row
-    // requiring the AHV product.
+    // requiring the AHV product. Heuristic: it applies to every vendor, so a VM product name
+    // containing ".metal" would read as hardware (none is known).
     if (detail::contains_ci(product, ".metal"))
         return std::nullopt;
     for (const auto& r : detail::kSmbios) {

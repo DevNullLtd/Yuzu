@@ -29,11 +29,9 @@ using namespace yuzu::virtualization;
 
 namespace {
 
-using State = ReadState;
-
 SmbiosFacts smbios_ok(std::string mfr, std::string prod) {
     SmbiosFacts s;
-    s.state = State::ok;
+    s.state = ReadState::ok;
     s.manufacturer = std::move(mfr);
     s.product = std::move(prod);
     return s;
@@ -41,7 +39,7 @@ SmbiosFacts smbios_ok(std::string mfr, std::string prod) {
 
 SmbiosFacts smbios_unreadable(std::string reason) {
     SmbiosFacts s;
-    s.state = State::unreadable;
+    s.state = ReadState::unreadable;
     s.reason = std::move(reason);
     return s;
 }
@@ -64,7 +62,7 @@ CpuidFacts cpuid_hv(std::string sig, std::uint32_t max_leaf = 0x40000001u,
     return c;
 }
 
-Facts linux_facts() {
+Facts linux_base() {
     Facts f;
     f.os = "linux";
     f.container.mode = ContainerInputs::Mode::linux_read;
@@ -192,7 +190,7 @@ TEST_CASE("virtualization: a Windows host running Hyper-V is host_with_hyperviso
 TEST_CASE("virtualization: a WSL2 style Hyper-V guest reads guest hyperv", "[virtualization][classify]") {
     // SYNTHETIC: the Microsoft hypervisor signature without the root-partition bit, and DMI as
     // the Linux kernel publishes it under Hyper-V.
-    Facts f = linux_facts();
+    Facts f = linux_base();
     f.cpuid = cpuid_hv("Microsoft Hv", 0x4000000Cu, "Hv#1", false);
     f.smbios = smbios_ok("Microsoft Corporation", "Virtual Machine");
 
@@ -319,7 +317,7 @@ TEST_CASE("virtualization: the root-partition bit is only trusted behind CPUID d
 TEST_CASE("virtualization: an identified guest with an unreadable SMBIOS stays guest but constrained",
           "[virtualization][classify]") {
     // SYNTHETIC: hypervisor bit set, KVM signature, DMI refused.
-    Facts f = linux_facts();
+    Facts f = linux_base();
     f.cpuid = cpuid_hv(kvm_sig());
     f.smbios = smbios_unreadable("linux:virtualization:dmi:permission_denied");
 
@@ -336,9 +334,9 @@ TEST_CASE("virtualization: an identified guest with an unreadable SMBIOS stays g
 TEST_CASE("virtualization: a malformed hypervisor signature is a medium-confidence guest",
           "[virtualization][classify][cpuid]") {
     // SYNTHETIC: the hypervisor bit is set but the 0x40000000 signature is not 12 bytes.
-    Facts f = linux_facts();
+    Facts f = linux_base();
     f.cpuid = cpuid_hv("KVMKVMKVM");
-    f.smbios.state = State::absent;
+    f.smbios.state = ReadState::absent;
     const auto c = classify(f);
     CHECK(c.kind == Kind::guest);
     CHECK(c.is_virtual == Tri::yes);
@@ -349,7 +347,7 @@ TEST_CASE("virtualization: a malformed hypervisor signature is a medium-confiden
 
 TEST_CASE("virtualization: AWS .metal instances read bare_metal not guest", "[virtualization][classify]") {
     // SYNTHETIC: sys_vendor "Amazon EC2" on an instance with no hypervisor bit.
-    Facts f = linux_facts();
+    Facts f = linux_base();
     f.cpuid = cpuid_clear();
     f.smbios = smbios_ok("Amazon EC2", "c5.metal");
     const auto c = classify(f);
@@ -359,9 +357,10 @@ TEST_CASE("virtualization: AWS .metal instances read bare_metal not guest", "[vi
 
 TEST_CASE("virtualization: an unreadable SMBIOS with no reason still names its source",
           "[virtualization][classify][strict]") {
-    Facts f = linux_facts();
+    Facts f = linux_base();
     f.cpuid = cpuid_clear();
-    f.smbios.state = State::unreadable; // no shell leaves the reason empty; the plugin must not trust that
+    // no shell leaves the reason empty; the plugin must not trust that
+    f.smbios.state = ReadState::unreadable;
     const auto c = classify(f);
     CHECK(c.kind == Kind::unknown);
     CHECK(c.source == "linux:virtualization:smbios:unreadable");
@@ -372,7 +371,7 @@ TEST_CASE("virtualization: an unreadable SMBIOS with no reason still names its s
 
 TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[virtualization][strict]") {
     SECTION("CPUID clear but DMI unreadable is unknown and the host row says why") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
         f.smbios = smbios_unreadable("linux:virtualization:dmi:permission_denied");
         const auto c = classify(f);
@@ -385,14 +384,14 @@ TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[vi
         CHECK(p.reason == c.source);
     }
     SECTION("an unreadable OS hint source blocks bare_metal too") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
         f.smbios = smbios_ok("Example Board Vendor", "Example Board");
         f.failures.push_back("linux:virtualization:sys_hypervisor:eio");
         CHECK(classify(f).kind == Kind::unknown);
     }
     SECTION("no CPUID (ARM) and a non-VM DMI is unknown with the permanent limitation token") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.smbios = smbios_ok("Example Board Vendor", "Example Board");
         const auto c = classify(f);
         CHECK(c.kind == Kind::unknown);
@@ -402,7 +401,7 @@ TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[vi
         CHECK(p.reason == "linux:virtualization:cpuid:unavailable");
     }
     SECTION("no CPUID (ARM) and a VM DMI vendor is a guest and needs no limitation token") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.smbios = smbios_ok("QEMU", "KVM Virtual Machine");
         const auto p = decide(f);
         CHECK(p.status == StatusState::supported);
@@ -436,9 +435,9 @@ TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[vi
         CHECK(c.source.find("macos:virtualization:hv_vmm_present:unreadable") != std::string::npos);
     }
     SECTION("absent DMI (ENOENT) is readable: CPUID clear is still bare_metal") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
-        f.smbios.state = State::absent;
+        f.smbios.state = ReadState::absent;
         CHECK(classify(f).kind == Kind::bare_metal);
     }
 }
@@ -446,7 +445,7 @@ TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[vi
 TEST_CASE("virtualization: a positive OS hint is never outranked by negative evidence",
           "[virtualization][classify][hint]") {
     SECTION("/sys/hypervisor/type xen with CPUID clear and a non-VM DMI") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
         f.smbios = smbios_ok("Example Board Vendor", "Example Board");
         f.hint = linux_os_hint("xen\n");
@@ -487,7 +486,7 @@ TEST_CASE("virtualization: an SMBIOS walk fault is a constraint not a clean abse
         SmbiosTable t;
         t.error = Error::truncated;
         const auto s = smbios_facts_from_table(t);
-        CHECK(s.state == State::unreadable);
+        CHECK(s.state == ReadState::unreadable);
         CHECK(s.reason == "windows:virtualization:smbios:truncated");
 
         Facts f;
@@ -508,7 +507,7 @@ TEST_CASE("virtualization: an SMBIOS walk fault is a constraint not a clean abse
         SmbiosTable t;
         t.system.status = Status::malformed;
         const auto s = smbios_facts_from_table(t);
-        CHECK(s.state == State::unreadable);
+        CHECK(s.state == ReadState::unreadable);
         CHECK(s.reason == "windows:virtualization:smbios:malformed");
     }
     SECTION("a Type 1 decoded BEFORE a later fault still identifies a VM vendor") {
@@ -518,7 +517,7 @@ TEST_CASE("virtualization: an SMBIOS walk fault is a constraint not a clean abse
         t.system.data.product = "VMware7,1";
         t.error = Error::truncated;
         const auto s = smbios_facts_from_table(t);
-        CHECK(s.state == State::unreadable);
+        CHECK(s.state == ReadState::unreadable);
         CHECK(s.manufacturer == "VMware, Inc.");
 
         Facts f;
@@ -538,31 +537,31 @@ TEST_CASE("virtualization: an SMBIOS walk fault is a constraint not a clean abse
         SmbiosTable t;
         t.system.status = Status::ok;
         t.system.data.manufacturer = "Example Board Vendor";
-        CHECK(smbios_facts_from_table(t).state == State::ok);
-        CHECK(smbios_facts_from_table(SmbiosTable{}).state == State::absent);
+        CHECK(smbios_facts_from_table(t).state == ReadState::ok);
+        CHECK(smbios_facts_from_table(SmbiosTable{}).state == ReadState::absent);
     }
     SECTION("an RSMB call failure token") {
         const auto s = smbios_read_failure("size_race");
-        CHECK(s.state == State::unreadable);
+        CHECK(s.state == ReadState::unreadable);
         CHECK(s.reason == "windows:virtualization:smbios:size_race");
     }
 }
 
 TEST_CASE("virtualization: DMI halves combine without hiding an unreadable one", "[virtualization][dmi]") {
-    FieldRead ok_v{State::ok, "Example\n", ""};
-    FieldRead ok_p{State::ok, "Board", ""};
-    FieldRead gone{State::absent, "", ""};
-    FieldRead bad{State::unreadable, "", "permission_denied"};
+    FieldRead ok_v{ReadState::ok, "Example\n", ""};
+    FieldRead ok_p{ReadState::ok, "Board", ""};
+    FieldRead gone{ReadState::absent, "", ""};
+    FieldRead bad{ReadState::unreadable, "", "permission_denied"};
 
-    CHECK(combine_dmi(ok_v, ok_p).state == State::ok);
-    CHECK(combine_dmi(ok_v, gone).state == State::ok);
-    CHECK(combine_dmi(gone, gone).state == State::absent);
+    CHECK(combine_dmi(ok_v, ok_p).state == ReadState::ok);
+    CHECK(combine_dmi(ok_v, gone).state == ReadState::ok);
+    CHECK(combine_dmi(gone, gone).state == ReadState::absent);
     const auto s = combine_dmi(ok_v, bad);
-    CHECK(s.state == State::unreadable);
+    CHECK(s.state == ReadState::unreadable);
     CHECK(s.manufacturer == "Example"); // trailing newline trimmed
     CHECK(s.reason == "linux:virtualization:dmi:permission_denied");
     // Both halves failing keeps both reasons, an identical cause once.
-    CHECK(combine_dmi(bad, FieldRead{State::unreadable, "", "eio"}).reason ==
+    CHECK(combine_dmi(bad, FieldRead{ReadState::unreadable, "", "eio"}).reason ==
           "linux:virtualization:dmi:permission_denied,linux:virtualization:dmi:eio");
     CHECK(combine_dmi(bad, bad).reason == "linux:virtualization:dmi:permission_denied");
     CHECK(errno_token(ENOENT) == "enoent");
@@ -572,8 +571,10 @@ TEST_CASE("virtualization: DMI halves combine without hiding an unreadable one",
 
 namespace {
 
-FieldRead read_ok(std::string v) { return FieldRead{State::ok, std::move(v), ""}; }
-FieldRead read_bad(std::string cause) { return FieldRead{State::unreadable, "", std::move(cause)}; }
+FieldRead read_ok(std::string v) { return FieldRead{ReadState::ok, std::move(v), ""}; }
+FieldRead read_bad(std::string cause) {
+    return FieldRead{ReadState::unreadable, "", std::move(cause)};
+}
 
 /// A clean bare-metal Linux read: every source answered, CPUID clear, nothing in a container.
 LinuxReads clean_reads() {
@@ -605,7 +606,7 @@ TEST_CASE("virtualization: linux_facts builds the facts and tokens from the inje
         r.product_name = FieldRead{};
         r.hypervisor_type = FieldRead{}; // absent
         const Facts f = linux_facts(cpuid_clear(), r);
-        CHECK(f.smbios.state == State::absent);
+        CHECK(f.smbios.state == ReadState::absent);
         CHECK(f.failures.empty());
         CHECK(decide(f).status == StatusState::supported);
     }
@@ -675,7 +676,7 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
           "[virtualization][container]") {
     const auto verdict = [](bool dockerenv, bool containerenv, std::optional<std::string> cg,
                             std::string reason = "") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.container.dockerenv = dockerenv;
         f.container.containerenv = containerenv;
         f.container.cgroup = std::move(cg);
@@ -713,9 +714,9 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         const auto v = verdict(false, false, std::nullopt, "linux:virtualization:container:cgroup_permission_denied");
         CHECK(v.value == Tri::unknown);
         CHECK(v.read_failed);
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
-        f.smbios.state = State::absent;
+        f.smbios.state = ReadState::absent;
         f.container.cgroup = std::nullopt;
         f.container.reason = "linux:virtualization:container:cgroup_permission_denied";
         const auto p = decide(f);
@@ -725,9 +726,9 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         CHECK(classify(f).kind == Kind::bare_metal);
     }
     SECTION("a marker hit still reports a failed cgroup read in the status") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
-        f.smbios.state = State::absent;
+        f.smbios.state = ReadState::absent;
         f.container.dockerenv = true;
         f.container.cgroup = std::nullopt;
         f.container.reason = "linux:virtualization:container:cgroup_eio";
@@ -740,7 +741,7 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
 TEST_CASE("virtualization: row fields are scrubbed and escaped with the field count intact",
           "[virtualization][format]") {
     SECTION("pipes and newlines cannot open a field or a row") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
         f.smbios = smbios_ok("Example", "Bo|ard\nTwo");
         const auto row = decide(f).rows[0];
@@ -756,7 +757,7 @@ TEST_CASE("virtualization: row fields are scrubbed and escaped with the field co
         CHECK(wire_field("caf\xc3\xa9") == "caf\xc3\xa9"); // valid UTF-8 survives
         CHECK(wire_field("") == "-");
 
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
         f.smbios = smbios_ok("Example", std::string{"Bo\0ar\xff" "d", 7});
         const auto row = decide(f).rows[0];
@@ -765,9 +766,9 @@ TEST_CASE("virtualization: row fields are scrubbed and escaped with the field co
         CHECK(row.find("Bo?ar?d") != std::string::npos);
     }
     SECTION("the host row has 7 fields and the container row 3") {
-        Facts f = linux_facts();
+        Facts f = linux_base();
         f.cpuid = cpuid_clear();
-        f.smbios.state = State::absent;
+        f.smbios.state = ReadState::absent;
         const auto p = decide(f);
         REQUIRE(p.rows.size() == 2);
         CHECK(split_row(p.rows[0]).size() == 7);
@@ -776,9 +777,9 @@ TEST_CASE("virtualization: row fields are scrubbed and escaped with the field co
         CHECK(p.rows[1].rfind("container|", 0) == 0);
     }
     SECTION("status is constrained iff a token accumulated") {
-        Facts clean = linux_facts();
+        Facts clean = linux_base();
         clean.cpuid = cpuid_clear();
-        clean.smbios.state = State::absent;
+        clean.smbios.state = ReadState::absent;
         CHECK(decide(clean).status == StatusState::supported);
         CHECK(decide(clean).reason.empty());
 
