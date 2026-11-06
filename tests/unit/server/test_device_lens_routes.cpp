@@ -15,6 +15,7 @@
 #include "guardian_api_local.hpp"     // make_local_guardian_api
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"             // PgConn/PgResult -- the DROP-TABLE degrade test below
+#include "test_guardian_api_double.hpp" // FnGuardianApi
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -23,6 +24,8 @@
 
 #include <libpq-fe.h>
 
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -279,6 +282,56 @@ TEST_CASE("device lenses: Guardian lens on a degraded read renders the degraded 
                       "degraded.</div>");
     REQUIRE(audited.size() == 1);
     CHECK(audited[0] == "guardian.device.view|a-1");
+}
+
+// The Guardian lens renders the rows of a GuardianDeviceGuardsReport (the report wraps the guard
+// rows plus the #7217 unrepresented-pending summary; the lens shows only the rows today), and a
+// degraded (nullopt) report from the same double still renders the degraded placeholder.
+TEST_CASE("device lenses: Guardian lens renders the guards of a report; a nullopt report degrades",
+          "[device][routes]") {
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("a report with guards renders them") {
+        yuzu::server::GuardianDeviceGuardsReport report;
+        yuzu::server::GuardianDeviceGuardRow row;
+        row.rule_id = "r-1";
+        row.name = "Disk encryption guard";
+        row.state = "drifted";
+        row.updated_at = "2026-11-06T10:00:00Z";
+        report.guards.push_back(row);
+        report.unrepresented_pending_guards = 2;
+        report.unrepresented_pending_rule_ids = {"r-8", "r-9"};
+        auto api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+            /*list_rules_fn=*/nullptr, /*get_rule_fn=*/nullptr, /*status_fn=*/nullptr,
+            /*agent_status_fn=*/nullptr, /*rule_status_fn=*/nullptr,
+            [report](const std::string&) { return std::optional(report); });
+        yuzu::server::test::TestRouteSink sink;
+        DeviceLensRoutes routes;
+        routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, api, audit);
+        auto r = sink.Get("/fragments/device/guardian?id=a-1&bare=1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Disk encryption guard") != std::string::npos);
+        CHECK(r->body.find("Guardian store degraded.") == std::string::npos);
+    }
+    SECTION("a nullopt report renders the degraded placeholder") {
+        auto api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+            /*list_rules_fn=*/nullptr, /*get_rule_fn=*/nullptr, /*status_fn=*/nullptr,
+            /*agent_status_fn=*/nullptr, /*rule_status_fn=*/nullptr,
+            [](const std::string&) -> std::optional<yuzu::server::GuardianDeviceGuardsReport> {
+                return std::nullopt;
+            });
+        yuzu::server::test::TestRouteSink sink;
+        DeviceLensRoutes routes;
+        routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, api, audit);
+        auto r = sink.Get("/fragments/device/guardian?id=a-1&bare=1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Guardian store degraded.") != std::string::npos);
+    }
 }
 
 // #4855: a WIRED DexApi whose signal-summary read DEGRADES (a real store, a

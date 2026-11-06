@@ -1225,9 +1225,12 @@ savepoint a writer locks every pending event of the pair in `ingest_seq` order i
 row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
 event-row waits of single-event ingest, repair and `delete_rule` are acyclic; the batch path (no production
 caller) carries no such guarantee. Every census read that returns per-pair state, or a rollup of it, discloses
-`order_uncertain` and `projection_pending` (or `uncertain_rules`), with one named exception: the device-compliance
-read covers represented pairs only and does not yet report them. A pending event whose pair has no census row is
-visible only on `yuzu_server_guardian_census_pending_events`. See the user manual's Compliance overview for the
+`order_uncertain` and `projection_pending` (or `uncertain_rules`); the device-compliance read, which was the one
+named exception, now reports the two flags per guard and an `uncertain_guards` rollup (#7217). A pending event
+whose pair has no census row has no row to carry the flags: both per-device reads (device-compliance and the
+all-guards read) report such pairs as `unrepresented_pending_guards` and a bounded `unrepresented_pending_rule_ids`
+list, and they are also counted on `yuzu_server_guardian_census_pending_events`. The census read and that count are
+two non-atomic observations. See the user manual's Compliance overview for the
 operator-facing contract.
 
 ### 9.2 REST API endpoints

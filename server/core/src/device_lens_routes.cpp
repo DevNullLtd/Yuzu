@@ -96,7 +96,9 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
         // unwired `!guardian_api_` "unavailable" one above), never a silent
         // empty/partial guard list (which would misreport
         // a device as having no guards, or drop live drift verdicts, for the
-        // operator viewing this lens).
+        // operator viewing this lens). A failed unrepresented-pending read also
+        // degrades the whole read (the seam returns nullopt), so it lands here too;
+        // showing the unrepresented-pending summary on the lens is a follow-up.
         auto guards_result = guardian_api_->device_guards(id);
         if (!guards_result) {
             res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store degraded.",
@@ -105,8 +107,8 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
             return;
         }
         std::vector<DeviceGuardRow> guards;
-        guards.reserve(guards_result->size());
-        for (const auto& g : *guards_result) {
+        guards.reserve(guards_result->guards.size());
+        for (const auto& g : guards_result->guards) {
             DeviceGuardRow row;
             row.name = g.name; // already resolved + rule_id-fallback'd by the seam
             row.state = g.state;

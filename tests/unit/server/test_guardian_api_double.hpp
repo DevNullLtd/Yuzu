@@ -46,7 +46,7 @@ public:
         std::function<std::optional<yuzu::server::GuardianAgentStatusRollup>(const std::string&)>;
     using RuleStatusFn = std::function<std::optional<std::vector<yuzu::server::GuardianRuleAgentStatusRow>>(
         const std::string&)>;
-    using DeviceGuardsFn = std::function<std::optional<std::vector<yuzu::server::GuardianDeviceGuardRow>>(
+    using DeviceGuardsFn = std::function<std::optional<yuzu::server::GuardianDeviceGuardsReport>(
         const std::string&)>;
     using DeviceComplianceFn =
         std::function<std::optional<yuzu::server::GuardianDeviceComplianceRollup>(
@@ -100,7 +100,7 @@ public:
         return rule_status_fn_(rule_id);
     }
 
-    [[nodiscard]] std::optional<std::vector<yuzu::server::GuardianDeviceGuardRow>>
+    [[nodiscard]] std::optional<yuzu::server::GuardianDeviceGuardsReport>
     device_guards(const std::string& agent_id) const override {
         if (!device_guards_fn_)
             return std::nullopt;

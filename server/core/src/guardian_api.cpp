@@ -81,7 +81,7 @@ public:
         return guardian_rule_agent_status_rows(*store_, rule_id);
     }
 
-    [[nodiscard]] std::optional<std::vector<GuardianDeviceGuardRow>>
+    [[nodiscard]] std::optional<GuardianDeviceGuardsReport>
     device_guards(const std::string& agent_id) const override {
         if (!store_)
             return std::nullopt;

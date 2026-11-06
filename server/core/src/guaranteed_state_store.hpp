@@ -212,6 +212,19 @@ struct PolicyGenerationRaise {
 /// `kStoreUnavailable`: the store could not read or write the counter (never reported as 0).
 enum class PolicyGenerationRaiseError { kOutOfRange, kStoreUnavailable };
 
+/// Cap on the rule ids `GuaranteedStateStore::unrepresented_pending_for_agent` returns (#7217). The
+/// count is exact and never capped; only the id list is.
+inline constexpr std::size_t kUnrepresentedPendingIdCap = 50;
+
+/// Result of `GuaranteedStateStore::unrepresented_pending_for_agent`: how many (agent, rule) pairs of
+/// one device have a retained `projection_pending` event and NO census row, and the first
+/// `kUnrepresentedPendingIdCap` of their rule ids in `rule_id` order. `count > rule_ids.size()`
+/// means the list is truncated.
+struct UnrepresentedPendingSummary {
+    std::int64_t count{0};
+    std::vector<std::string> rule_ids;
+};
+
 class GuaranteedStateStore {
 public:
     /// Borrows the shared pool and runs the `guaranteed_state_store` schema
@@ -261,6 +274,15 @@ public:
     /// the store is used concurrently and clear it with an empty function.
     void set_census_lock_barrier_for_test(std::function<void()> fn) {
         census_lock_barrier_ = std::move(fn);
+    }
+
+    /// Test seam for `unrepresented_pending_for_agent` (#7217): while `fn` is set, every call that
+    /// reaches the database step invokes it first and returns `std::unexpected` when it returns true,
+    /// so a test can fail ONLY this read (the earlier reads on the same request keep working). The
+    /// engaged-empty filter short-circuit never reaches it. Set it before the store is used
+    /// concurrently; clear it with an empty function. Production leaves it empty.
+    void set_unrepresented_pending_fault_for_test(std::function<bool()> fn) {
+        unrepresented_pending_fault_ = std::move(fn);
     }
 
     /// Test seam for the pre-commit health check: `fn` runs with the transaction's `PGconn*` (as
@@ -465,6 +487,19 @@ public:
     std::expected<std::size_t, std::string>
     uncertain_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
 
+    /// Pairs of ONE device (`agent_id`) that have a retained `projection_pending` event and NO census
+    /// row (#7217): evidence the represented-pair reads cannot show. `rule_filter`: `nullopt` = every
+    /// rule; engaged-empty = `{0, {}}` without a lease or a seam call; non-empty = only those
+    /// rule ids (the Baseline-anchored form passes the deployed snapshot). `count` is the exact
+    /// number of distinct qualifying rule ids; `rule_ids` the first `kUnrepresentedPendingIdCap` in
+    /// `rule_id` order. No live-rule join: a pending event can outlive its rule only through the
+    /// #6829 race, and that is exactly the evidence this read exists to disclose. Runs under a 5 s
+    /// `SET LOCAL statement_timeout`; any failure (store not open, pool timeout, timeout expiry,
+    /// query error) is `std::unexpected`, counted on `kDegradeSourceCensus`, NEVER a zero.
+    std::expected<UnrepresentedPendingSummary, std::string>
+    unrepresented_pending_for_agent(const std::string& agent_id,
+                                    const std::optional<std::vector<std::string>>& rule_filter) const;
+
     std::size_t rule_count() const;
     /// Type-distinguishable twin of `rule_count()`: an error string on a store that is not open,
     /// a pool timeout or a failed query, never 0 (the degrade-collapsing `rule_count()` would
@@ -576,6 +611,7 @@ private:
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
+    std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::function<void(void*)> pre_commit_hook_;    // test seam, empty in production
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;

@@ -170,7 +170,9 @@ TEST_CASE("GuardianApi::agent_status / device_guards: an agent with no census ro
 
     auto guards = api->device_guards("no-such-agent");
     REQUIRE(guards.has_value());
-    CHECK(guards->empty());
+    CHECK(guards->guards.empty());
+    CHECK(guards->unrepresented_pending_guards == 0);
+    CHECK(guards->unrepresented_pending_rule_ids.empty());
 }
 
 TEST_CASE("GuardianApi::rule_status: an unknown rule_id is an honest empty census, not an error",

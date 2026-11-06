@@ -76,7 +76,7 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
     return out;
 }
 
-std::optional<std::vector<GuardianDeviceGuardRow>>
+std::optional<GuardianDeviceGuardsReport>
 guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id) {
     auto statuses = store.agent_rule_statuses_for_agent(agent_id);
     if (!statuses)
@@ -88,8 +88,13 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
     auto names = store.rule_names_for(rule_ids);
     if (!names)
         return std::nullopt;
-    std::vector<GuardianDeviceGuardRow> out;
-    out.reserve(statuses->size());
+    // #7217: retained events with no census row are invisible to the two reads above. Same
+    // ADR-0038 posture: a degrade must never render as "nothing pending".
+    auto unrepresented = store.unrepresented_pending_for_agent(agent_id, std::nullopt);
+    if (!unrepresented)
+        return std::nullopt;
+    GuardianDeviceGuardsReport out;
+    out.guards.reserve(statuses->size());
     for (const auto& s : *statuses) {
         GuardianDeviceGuardRow row;
         row.rule_id = s.rule_id;
@@ -99,8 +104,10 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
         row.updated_at = s.updated_at;
         row.order_uncertain = s.order_uncertain;
         row.projection_pending = s.projection_pending;
-        out.push_back(std::move(row));
+        out.guards.push_back(std::move(row));
     }
+    out.unrepresented_pending_guards = unrepresented->count;
+    out.unrepresented_pending_rule_ids = std::move(unrepresented->rule_ids);
     return out;
 }
 
@@ -150,6 +157,18 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
     }
     const auto& rule_names = *rule_names_result;
 
+    // #7217: pending events for snapshot members with no census row are invisible to
+    // agent_rule_statuses_for_agent. Same ADR-0038 posture and same audit obligation as the two
+    // reads above (pii_access_began is already true): a degrade must never render as "nothing
+    // pending". An empty guard_ids is an engaged-empty filter, which the store answers without a
+    // query.
+    auto unrepresented = store.unrepresented_pending_for_agent(
+        agent_id, std::optional<std::vector<std::string>>(guard_ids));
+    if (!unrepresented) {
+        *store_degraded = true;
+        return std::nullopt;
+    }
+
     std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
     for (auto& st : *statuses_result)
         dev[st.rule_id] = std::move(st);
@@ -183,8 +202,14 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
         row.name = (nit != rule_names.end() && !nit->second.empty()) ? nit->second : rid;
         row.status = status;
         row.updated_at = updated_at;
+        row.order_uncertain = it->second.order_uncertain;
+        row.projection_pending = it->second.projection_pending;
+        if (row.order_uncertain || row.projection_pending)
+            ++out.uncertain_guards;
         out.guards.push_back(std::move(row));
     }
+    out.unrepresented_pending_guards = unrepresented->count;
+    out.unrepresented_pending_rule_ids = std::move(unrepresented->rule_ids);
     out.pending = out.total_guards - (out.compliant + out.drifted + out.errored);
     return out;
 }

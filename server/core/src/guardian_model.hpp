@@ -26,9 +26,9 @@
 /// otherwise refuse to render, never render an empty/zero result that would
 /// misreport the fleet as compliant or a rule as having no reporting agents.
 ///
-/// The six result structs these functions return (`GuardianStatusRollup`
+/// The seven result structs these functions return (`GuardianStatusRollup`
 /// through `GuardianDeviceComplianceRollup`, plus its nested
-/// `GuardianDeviceComplianceGuardRow`) live in the pure
+/// `GuardianDeviceComplianceGuardRow`, and `GuardianDeviceGuardsReport`) live in the pure
 /// `guardian_types.hpp` (included below), NOT here — this header
 /// forward-declares `GuaranteedStateStore`/`BaselineStore` and its functions
 /// take them by reference, so it cannot itself sit behind the ADR-0031 WS-A4
@@ -122,10 +122,15 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
 /// scan post-filtered in C++ — same modernisation `device-compliance`
 /// already made for this identical class of read.
 ///
+/// Also reports the device's unrepresented pending events (retained events with
+/// no census row, `unrepresented_pending_for_agent`, #7217) as a count plus a
+/// capped id list, separate from `guards`.
+///
 /// Returns `nullopt` on a degraded `agent_rule_statuses_for_agent()`/
-/// `rule_names_for()` read — caller MUST refuse to render (503 on REST),
-/// never render an empty list as "this device has no guards".
-std::optional<std::vector<GuardianDeviceGuardRow>>
+/// `rule_names_for()`/`unrepresented_pending_for_agent()` read — caller MUST
+/// refuse to render (503 on REST), never render an empty list as "this device
+/// has no guards".
+std::optional<GuardianDeviceGuardsReport>
 guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id);
 
 /// Per-baseline device-compliance rollup — shared by

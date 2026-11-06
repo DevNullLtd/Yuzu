@@ -74,10 +74,14 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // so an alert can aggregate `by (reason, source)` without missing any family.
 constexpr const char* kDegradeSource = "guardian_state";
 constexpr const char* kDegradeSourceRules = "guardian_rules";
-// The census pending-evidence count read (pending_projection_count_checked,
-// #5690) is a third source on the same counter: it is neither a DEX read nor
-// an authoritative rule/status read, and a failure leaves the published gauge
-// at its previous value, so it gets its own label to be told apart.
+// The census pending-evidence reads are a third source on the same counter:
+// they are neither a DEX read nor an authoritative rule/status read, so they
+// get their own label to be told apart. The label covers two kinds of read:
+// the census pending-count gauge read (pending_projection_count_checked,
+// #5690), whose failure freezes the published gauge at its previous value, and
+// the per-device unrepresented-pending reads (unrepresented_pending_for_agent,
+// #7217), which fail hard (REST 503 / retryable MCP error) and never serve an
+// empty result.
 constexpr const char* kDegradeSourceCensus = "guardian_census";
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
@@ -3588,6 +3592,84 @@ GuaranteedStateStore::pending_projection_count_checked() const {
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     }
     return to_i64(PQgetvalue(res.get(), 0, 0));
+}
+
+// Pairs of one device with a retained pending event and no census row (#7217). The represented-pair
+// reads (agent_rule_statuses*, errored/uncertain_rule_count) cannot show these: with no census row
+// the pair is invisible to them. There is no live-rule join on purpose: a pending event can outlive
+// its rule through the #6829 race, and that is exactly the evidence this read discloses. Every
+// failure is std::unexpected and counted on the census source; a zero is only ever a real answer.
+std::expected<UnrepresentedPendingSummary, std::string>
+GuaranteedStateStore::unrepresented_pending_for_agent(
+    const std::string& agent_id, const std::optional<std::vector<std::string>>& rule_filter) const {
+    static DegradeSampler sampler;
+    // Engaged-empty filter: nothing can qualify, so no lease and no seam call (ADR-0017 INV-2).
+    if (rule_filter && rule_filter->empty())
+        return UnrepresentedPendingSummary{};
+    const auto degrade = [this](const char* reason, const char* what, const std::string& detail) {
+        if (const auto d = note_read_degrade(metrics_, reason, kDegradeSourceCensus, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unrepresented_pending_for_agent: {}: {}", what,
+                         ::yuzu::log_key_token(detail));
+    };
+    if (!open_) {
+        degrade(kReasonStoreNotOpen, "store not open", "");
+        return std::unexpected("database not open");
+    }
+    if (unrepresented_pending_fault_ && unrepresented_pending_fault_()) {
+        degrade(kReasonQueryError, "injected fault", "");
+        return std::unexpected("query failed: injected fault");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        degrade(kReasonPoolTimeout, "pool acquire timed out", "");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    PGconn* conn = lease.get();
+    pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
+    if (begin.status() != PGRES_COMMAND_OK) {
+        degrade(kReasonQueryError, "BEGIN failed", PQerrorMessage(conn));
+        return std::unexpected(std::string("BEGIN failed: ") + PQerrorMessage(conn));
+    }
+    pg::PgTxn txn(conn);
+    pg::PgResult timeout =
+        pg::exec_params(conn, "SET LOCAL statement_timeout = '5s'", std::vector<std::string>{});
+    if (timeout.status() != PGRES_COMMAND_OK) {
+        degrade(kReasonQueryError, "statement_timeout failed", PQresultErrorMessage(timeout.get()));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(timeout.get())));
+    }
+    // DISTINCT pairs of this device, minus any with a census row; the window count is taken before
+    // the LIMIT, so the count is exact while the id list is capped.
+    std::vector<std::string> params{agent_id};
+    std::string sql = "WITH q AS (SELECT DISTINCT e.rule_id "
+                      "FROM guaranteed_state_store.guaranteed_state_events e "
+                      "WHERE e.agent_id = $1 AND e.projection_pending ";
+    if (rule_filter) {
+        std::vector<std::string_view> views;
+        views.reserve(rule_filter->size());
+        for (const std::string& r : *rule_filter)
+            views.emplace_back(r);
+        sql += "AND e.rule_id = ANY($2::text[]) ";
+        params.push_back(pg::to_text_array(views));
+    }
+    sql += "AND NOT EXISTS (SELECT 1 FROM guaranteed_state_store.guardian_agent_rule_status c "
+           "WHERE c.agent_id = e.agent_id AND c.rule_id = e.rule_id)) "
+           "SELECT rule_id, count(*) OVER () AS total FROM q ORDER BY rule_id LIMIT " +
+           std::to_string(kUnrepresentedPendingIdCap);
+    pg::PgResult res = pg::exec_params(conn, sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        degrade(kReasonQueryError, "query failed", PQresultErrorMessage(res.get()));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
+    UnrepresentedPendingSummary out;
+    const int rows = PQntuples(res.get());
+    out.rule_ids.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        out.rule_ids.emplace_back(PQgetvalue(res.get(), i, 0));
+        if (i == 0)
+            out.count = to_i64(PQgetvalue(res.get(), 0, 1));
+    }
+    return out;
 }
 
 std::size_t GuaranteedStateStore::event_count() const {

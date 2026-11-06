@@ -1673,10 +1673,18 @@ static const ToolDef kTools[] = {
      "named Baseline). Mirrors the new GET /api/v1/guaranteed-state/agents/{agent_id}/rules "
      "exactly, same shared builder. Each guard carries order_uncertain and projection_pending "
      "with the meaning documented on get_guardian_rule_status; a guard reading compliant with "
-     "either true must not be reported as settled. Per-device scoped (management-group aware) via the same "
+     "either true must not be reported as settled. guards[] lists represented pairs only (a "
+     "pair with a census row); a pair for which this device holds retained projection-pending "
+     "census evidence but no census row yet is not a guard and appears only as "
+     "unrepresented_pending_guards (exact count, any rule) and unrepresented_pending_rule_ids "
+     "(first 50 in sorted order; a count above the list length means truncation; an id may name "
+     "a rule no longer in the catalogue; names are not resolved). total_guards is the length of "
+     "guards[] and excludes them. The census read and that evidence read are two separate "
+     "non-atomic observations; a zero count or false flag establishes neither freshness nor "
+     "completeness. Per-device scoped (management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"}},"required":["agent_id","guards","total_guards"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids"]})j"},
 
     // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
     // Closes the remaining MCP gap on the Guaranteed State surface: the 6
@@ -1860,10 +1868,21 @@ static const ToolDef kTools[] = {
      "compliance signal to act on (draft Baseline, or nothing reported yet) — do not compute "
      "a percentage when false. Per-device behavioral read — every call is audit-logged "
      "(guardian.device.view). Per-device scoped (management-group aware) via the SAME gate "
-     "get_guardian_agent_status uses. Counts and states cover REPRESENTED pairs only and do not "
-     "report ordering uncertainty or pending census evidence: a guard reading compliant here may "
-     "still be order_uncertain or projection_pending; call get_guardian_device_guards for those "
-     "flags before reporting the device as settled.",
+     "get_guardian_agent_status uses. Counts and states cover REPRESENTED pairs only (pairs with a "
+     "census row for this device). Each guards[] row carries order_uncertain (sticky: the "
+     "ordering of the persisted verdict cannot be proven) and projection_pending (a retained "
+     "event for the pair is not yet reflected in the row); uncertain_guards counts emitted "
+     "guards with either flag, each once, and overlaps the verdict counts. A true flag means "
+     "do not report the guard as settled. unrepresented_pending_guards (exact) and "
+     "unrepresented_pending_rule_ids (first 50 sorted; a larger count means truncation; an id "
+     "may name a rule no longer in the catalogue) report deployed-snapshot members for which "
+     "this device holds retained projection-pending census evidence but no census row yet: "
+     "excluded from guards[], total_guards and every verdict count. A nonzero unrepresented "
+     "count with assessable false means evidence exists that has not reached the census. The "
+     "census read and that evidence read are two separate non-atomic observations; last_updated "
+     "stays census-only; a zero count or false flag establishes neither freshness nor "
+     "completeness. get_guardian_device_guards lists every rule of the device, not limited to "
+     "this Baseline.",
      R"j({"type":"object","properties":{)j"
      R"j("baseline":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline name (stable across reseeds, unlike baseline_id)"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256})j"
@@ -1873,10 +1892,13 @@ static const ToolDef kTools[] = {
      R"j("deployed":{"type":"boolean"},"assessable":{"type":"boolean"},"agent_id":{"type":"string"},)j"
      R"j("total_guards":{"type":"integer"},"snapshot_total":{"type":"integer"},"compliant":{"type":"integer"},)j"
      R"j("drifted":{"type":"integer"},"errored":{"type":"integer"},"pending":{"type":"integer"},)j"
+     R"j("uncertain_guards":{"type":"integer","minimum":0},)j"
+     R"j("unrepresented_pending_guards":{"type":"integer","minimum":0},)j"
+     R"j("unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},)j"
      R"j("last_updated":{"type":["string","null"]},)j"
-     R"j("guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"status":{"type":"string"},"updated_at":{"type":["string","null"]}},"required":["rule_id","name","status"]}},)j"
+     R"j("guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"status":{"type":"string"},"updated_at":{"type":["string","null"]},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","status","order_uncertain","projection_pending"]}},)j"
      R"j("audit_persisted":{"type":"boolean"})j"
-     R"j(},"required":["baseline","deployed","assessable","agent_id","total_guards","snapshot_total","compliant","drifted","errored","pending","guards"]})j"},
+     R"j(},"required":["baseline","deployed","assessable","agent_id","total_guards","snapshot_total","compliant","drifted","errored","pending","uncertain_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids","guards"]})j"},
 
     // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
     {"list_dex_signals",
@@ -16524,8 +16546,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #7217: same shape as the REST twin. The unrepresented pending
+                // pairs (retained projection-pending events with no census row)
+                // are NOT guards: excluded from guards[] and total_guards, and
+                // reported as an exact count + bounded sorted rule_id list. A
+                // failure of that read already surfaced as the degraded error
+                // above (rows has no value), never as zeros.
                 JArr arr;
-                for (const auto& r : *rows) {
+                for (const auto& r : rows->guards) {
                     arr.add(JObj()
                                 .add("rule_id", r.rule_id)
                                 .add("name", r.name)
@@ -16534,10 +16562,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("order_uncertain", r.order_uncertain)
                                 .add("projection_pending", r.projection_pending));
                 }
+                JArr unrepresented_ids;
+                for (const auto& rid : rows->unrepresented_pending_rule_ids)
+                    unrepresented_ids.add(rid);
                 JObj payload;
                 payload.add("agent_id", agent_id)
                     .raw("guards", arr.str())
-                    .add("total_guards", static_cast<int64_t>(rows->size()));
+                    .add("total_guards", static_cast<int64_t>(rows->guards.size()))
+                    .add("unrepresented_pending_guards", rows->unrepresented_pending_guards)
+                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(
@@ -17719,8 +17752,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         gj.raw("updated_at", "null");
                     else
                         gj.add("updated_at", g.updated_at);
+                    // #7217: same two census flags as the REST twin.
+                    gj.add("order_uncertain", g.order_uncertain)
+                        .add("projection_pending", g.projection_pending);
                     guards.add(std::move(gj));
                 }
+                JArr unrepresented_ids;
+                for (const auto& rid : rollup->unrepresented_pending_rule_ids)
+                    unrepresented_ids.add(rid);
 
                 JObj b;
                 b.add("baseline_id", rollup->baseline_id)
@@ -17737,7 +17776,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("compliant", rollup->compliant)
                     .add("drifted", rollup->drifted)
                     .add("errored", rollup->errored)
-                    .add("pending", rollup->pending);
+                    .add("pending", rollup->pending)
+                    .add("uncertain_guards", rollup->uncertain_guards)
+                    .add("unrepresented_pending_guards", rollup->unrepresented_pending_guards)
+                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str());
                 if (rollup->last_updated.empty())
                     payload.raw("last_updated", "null");
                 else

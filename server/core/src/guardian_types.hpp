@@ -192,6 +192,12 @@ struct GuardianDeviceComplianceGuardRow {
                              // rule has since been deleted from the catalogue
     std::string status;     // "compliant" | "drifted" | "errored" | "pending"
     std::string updated_at; // ISO-8601 of the last reported verdict; empty if none
+    /// Sticky: the ordering of the persisted verdict for this (device, guard) pair cannot be
+    /// proven. false does not prove the verdict is fresh.
+    bool order_uncertain{false};
+    /// A retained event for this pair is not yet reflected in the census row. false does not
+    /// prove the row is complete.
+    bool projection_pending{false};
 };
 
 struct GuardianDeviceComplianceRollup {
@@ -206,7 +212,33 @@ struct GuardianDeviceComplianceRollup {
     std::int64_t errored{0};
     std::int64_t pending{0};
     std::string last_updated; // max reported updated_at across guards; empty if none
+                              // (census-only: never advanced by an unrepresented pending event)
     std::vector<GuardianDeviceComplianceGuardRow> guards;
+    /// Emitted guards whose row has order_uncertain OR projection_pending, counted once per
+    /// guard. Overlaps the verdict counts (compliant/drifted/errored/pending): a drifted guard
+    /// with order_uncertain is counted in both. 0 does not establish freshness.
+    std::int64_t uncertain_guards{0};
+    /// Distinct rule_ids (deployed-snapshot members only) that have retained pending events for
+    /// this device and NO census row. Excluded from guards[], total_guards and every verdict
+    /// count. The count is exact; the id list is capped by the store. The ids may name a rule no
+    /// longer in the catalogue. 0 does not establish completeness.
+    std::int64_t unrepresented_pending_guards{0};
+    std::vector<std::string> unrepresented_pending_rule_ids;
+};
+
+/// Per-device all-guards report - the rows of `GuardianDeviceGuardRow` plus the unrepresented
+/// pending summary. Shared by `GET /api/v1/guaranteed-state/agents/{agent_id}/rules` and MCP
+/// `get_guardian_device_guards`.
+struct GuardianDeviceGuardsReport {
+    /// One row per guard this device has a census row for; each row carries its own
+    /// order_uncertain / projection_pending flags.
+    std::vector<GuardianDeviceGuardRow> guards;
+    /// Distinct rule_ids (ANY rule, not limited to a Baseline) with retained pending events for
+    /// this device and NO census row. Excluded from guards[]. The count is exact; the id list is
+    /// capped by the store and may name a rule no longer in the catalogue. 0 does not establish
+    /// completeness.
+    std::int64_t unrepresented_pending_guards{0};
+    std::vector<std::string> unrepresented_pending_rule_ids;
 };
 
 } // namespace yuzu::server

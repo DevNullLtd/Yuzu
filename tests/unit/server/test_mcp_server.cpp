@@ -6796,9 +6796,9 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards denies an out-of-scope devic
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
         [&device_guards_calls](const std::string&)
-            -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            -> std::optional<GuardianDeviceGuardsReport> {
             ++device_guards_calls;
-            return std::vector<GuardianDeviceGuardRow>{};
+            return GuardianDeviceGuardsReport{};
         });
     ts.guardian_api_for_test = seam_api;
     std::string securable_seen, operation_seen;
@@ -6852,9 +6852,11 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards hands the requested agent_id
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
         [&device_guards_calls, row](const std::string&)
-            -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            -> std::optional<GuardianDeviceGuardsReport> {
             ++device_guards_calls;
-            return std::vector<GuardianDeviceGuardRow>{row};
+            GuardianDeviceGuardsReport report;
+            report.guards = {row};
+            return report;
         });
     ts.guardian_api_for_test = seam_api;
     std::string securable_seen, operation_seen;
@@ -6895,9 +6897,9 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards scope gate unwired -> fail c
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
         [&device_guards_calls](const std::string&)
-            -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            -> std::optional<GuardianDeviceGuardsReport> {
             ++device_guards_calls;
-            return std::vector<GuardianDeviceGuardRow>{};
+            return GuardianDeviceGuardsReport{};
         });
     ts.guardian_api_for_test = seam_api;
     ts.start("readonly");
@@ -7985,8 +7987,10 @@ TEST_CASE("MCP get_guardian_device_guards (seam-bypass tripwire): answers via th
         yuzu::server::test::FnGuardianApi::StatusFn{},
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
-        [seam_row](const std::string&) -> std::optional<std::vector<GuardianDeviceGuardRow>> {
-            return std::vector<GuardianDeviceGuardRow>{seam_row};
+        [seam_row](const std::string&) -> std::optional<GuardianDeviceGuardsReport> {
+            GuardianDeviceGuardsReport report;
+            report.guards = {seam_row};
+            return report;
         });
     McpTestServer ts;
     ts.guaranteed_state_store_for_test = &store;
@@ -44975,6 +44979,369 @@ TEST_CASE("MCP Guardian: the twins carry the flags order_uncertain and projectio
     CHECK(required("get_guardian_agent_status").find("uncertain_rules") != std::string::npos);
     CHECK(required("get_guardian_rule_status").find("projection_pending") != std::string::npos);
     CHECK(required("get_guardian_device_guards").find("order_uncertain") != std::string::npos);
+}
+
+// ── #7217: ordering uncertainty and unrepresented pending pairs on the two per-device reads ──
+//
+// get_guardian_device_compliance gains order_uncertain / projection_pending per guard,
+// uncertain_guards and the unrepresented summary; get_guardian_device_guards gains the unrepresented
+// summary. An UNREPRESENTED pair is a (device, rule) with retained projection-pending evidence and no
+// census row: it is not a guard, so it is excluded from guards[], total_guards and every verdict
+// count. The seed mirrors test_rest_guaranteed_state.cpp's seed_ordering_uncertainty, and the REST
+// twin below runs the same builders over the same stores, so rest["data"] == the MCP payload.
+namespace {
+
+constexpr const char* kMcpFailMarkedTs = "2026-06-20T10:02:00Z";
+
+// The REST routes beside the MCP tools, over the SAME two stores. `sink` is declared AFTER the route
+// owner it registers (TestRouteSink invariant 1, #1786).
+struct GuardianRestTwin {
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink;
+
+    GuardianRestTwin(yuzu::server::GuaranteedStateStore* gs, yuzu::server::BaselineStore* bl) {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
+            yuzu::server::auth::Session session;
+            session.username = "admin";
+            session.role = yuzu::server::auth::Role::admin;
+            return session;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                           const std::string&, const std::string&, const std::string&) -> bool {
+            return true;
+        };
+        yuzu::server::RestApiV1::ScopedPermFn scoped_perm_fn =
+            [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&,
+               const std::string&) -> bool { return true; };
+        api.register_routes(sink, auth_fn, perm_fn, audit_fn,
+                            /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                            /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
+                            /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                            /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                            /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                            /*audit_store=*/nullptr, /*service_group_fn=*/{}, /*tag_push_fn=*/{},
+                            /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
+                            /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr,
+                            /*license_store=*/nullptr, gs,
+                            /*metrics_registry=*/&metrics, /*session_revoke_fn=*/{},
+                            /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{}, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{}, /*network_api=*/{}, /*lockout_clear_fn=*/{}, bl,
+                            std::move(scoped_perm_fn),
+                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
+                            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
+                            /*list_read_fn=*/{}, /*fleet_read_fn=*/{}, /*agents_fn=*/{},
+                            /*response_visible_set_fn=*/{}, /*verify_api=*/nullptr,
+                            /*device_api=*/nullptr, /*dex_api=*/nullptr,
+                            /*dex_perf_api=*/nullptr,
+                            yuzu::server::make_local_guardian_api(gs, bl));
+    }
+};
+
+// Create + deploy a Baseline whose snapshot is exactly `members`.
+void mcp_deploy_baseline(yuzu::server::BaselineStore& bs, const std::string& name,
+                         const std::vector<std::string>& members) {
+    Baseline b;
+    b.name = name;
+    auto bid = bs.create_baseline(b);
+    REQUIRE(bid.has_value());
+    REQUIRE(bs.set_members(*bid, members).has_value());
+    Baseline deployed = *bs.get_baseline(*bid);
+    deployed.deployed_snapshot = nlohmann::json(members).dump();
+    deployed.lifecycle = kBaselineDeployed;
+    REQUIRE(bs.update_baseline(deployed).has_value());
+}
+
+// The trigger test_rest_guaranteed_state.cpp and the #5690 case above use: it refuses the census
+// write of any verdict stamped kMcpFailMarkedTs, leaving that event stored with pending evidence.
+// When the refused write is the FIRST delivery of a pair there is no census row at all.
+void mcp_install_fail_marked_trigger(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(
+        conn.get(),
+        "CREATE FUNCTION guaranteed_state_store.yuzu_test_fail_marked() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN IF NEW.updated_at = '2026-06-20T10:02:00Z' THEN "
+        "RAISE EXCEPTION 'forced census failure' USING ERRCODE = 'XX000'; END IF; "
+        "RETURN NEW; END $$; "
+        "CREATE TRIGGER yuzu_test_fail_marked BEFORE INSERT OR UPDATE ON "
+        "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION "
+        "guaranteed_state_store.yuzu_test_fail_marked()")};
+    REQUIRE(r.ok());
+}
+
+// WS-1 against the Baseline snapshot {r1, r2, r3, r4}:
+//   r1  compliant at 10:01, then an OLDER-key drift arrives later: order_uncertain
+//   r2  compliant at 10:01 (represented), then a 10:02 drift the trigger refuses: projection_pending
+//   r3  clean
+//   r4  first delivery refused by the trigger: pending evidence, NO census row (unrepresented)
+//   r5  as r4 but not a snapshot member (unrepresented on the all-guards read only)
+void mcp_seed_ordering_world(const std::string& gs_dsn, yuzu::server::GuaranteedStateStore& store,
+                             yuzu::server::BaselineStore& bs) {
+    mcp_seed_rule(store, "r1", "guard-one");
+    mcp_seed_rule(store, "r2", "guard-two");
+    mcp_seed_rule(store, "r3", "guard-three");
+    mcp_seed_rule(store, "r4", "guard-four");
+    mcp_seed_rule(store, "r5", "guard-five");
+    mcp_install_fail_marked_trigger(gs_dsn);
+    mcp_deploy_baseline(bs, "Ordering B", {"r1", "r2", "r3", "r4"});
+    mcp_seed_status(store, "a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "a2", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z");
+    mcp_seed_status(store, "b1", "WS-1", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "b2", "WS-1", "r2", "drift.detected", kMcpFailMarkedTs);
+    mcp_seed_status(store, "c1", "WS-1", "r3", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "d1", "WS-1", "r4", "guard.compliant", kMcpFailMarkedTs);
+    mcp_seed_status(store, "f1", "WS-1", "r5", "guard.compliant", kMcpFailMarkedTs);
+}
+
+std::vector<std::string> mcp_string_array(const nlohmann::json& a) {
+    REQUIRE(a.is_array());
+    std::vector<std::string> out;
+    for (const auto& x : a)
+        out.push_back(x.get<std::string>());
+    return out;
+}
+
+const nlohmann::json& mcp_guard_row(const nlohmann::json& guards, const char* rule_id) {
+    for (const auto& g : guards)
+        if (g["rule_id"].get<std::string>() == rule_id)
+            return g;
+    FAIL("no guard row for " << rule_id);
+    return guards;
+}
+
+constexpr const char* kMcpComplianceCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":7217,"params":{"name":"get_guardian_device_compliance",)"
+    R"("arguments":{"baseline":"Ordering B","agent_id":"WS-1"}}})";
+constexpr const char* kMcpAllGuardsCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":7218,"params":{"name":"get_guardian_device_guards",)"
+    R"("arguments":{"agent_id":"WS-1"}}})";
+constexpr const char* kRestComplianceUrl =
+    "/api/v1/guaranteed-state/device-compliance?baseline=Ordering%20B&agent_id=WS-1";
+constexpr const char* kRestAllGuardsUrl = "/api/v1/guaranteed-state/agents/WS-1/rules";
+
+} // namespace
+
+TEST_CASE("MCP Guardian: the two per-device reads report ordering uncertainty and unrepresented "
+          "pending pairs, equal to the REST data (#7217)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+    mcp_seed_ordering_world(db.dsn(), store, baseline_store);
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    GuardianRestTwin rest(&store, &baseline_store);
+
+    const auto mcp_payload = [&](const char* call) {
+        auto res = ts.call(call);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        data.erase("audit_persisted"); // MCP-only, present only when the audit row dropped
+        return data;
+    };
+    const auto rest_data = [&](const char* url) {
+        auto res = rest.sink.Get(url);
+        REQUIRE(res);
+        INFO(res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+
+    SECTION("get_guardian_device_compliance") {
+        const auto d = mcp_payload(kMcpComplianceCall);
+        // Independent expected values (two equally wrong payloads would still be equal).
+        CHECK(d["total_guards"].get<int>() == 3);
+        CHECK(d["compliant"].get<int>() == 3);
+        CHECK(d["drifted"].get<int>() == 0);
+        CHECK(d["errored"].get<int>() == 0);
+        CHECK(d["pending"].get<int>() == 0);
+        CHECK(d["snapshot_total"].get<int>() == 4);
+        CHECK(d["assessable"].get<bool>());
+        REQUIRE(d["guards"].size() == 3);
+        CHECK(mcp_guard_row(d["guards"], "r1")["order_uncertain"].get<bool>());
+        CHECK_FALSE(mcp_guard_row(d["guards"], "r1")["projection_pending"].get<bool>());
+        CHECK_FALSE(mcp_guard_row(d["guards"], "r2")["order_uncertain"].get<bool>());
+        CHECK(mcp_guard_row(d["guards"], "r2")["projection_pending"].get<bool>());
+        CHECK_FALSE(mcp_guard_row(d["guards"], "r3")["order_uncertain"].get<bool>());
+        CHECK_FALSE(mcp_guard_row(d["guards"], "r3")["projection_pending"].get<bool>());
+        for (const auto& g : d["guards"]) {
+            CHECK(g["rule_id"].get<std::string>() != "r4"); // pending-only: not a guard
+            CHECK(g["rule_id"].get<std::string>() != "r5"); // outside the snapshot
+        }
+        CHECK(d["uncertain_guards"].get<int>() == 2);
+        CHECK(d["unrepresented_pending_guards"].get<int>() == 1);
+        CHECK(mcp_string_array(d["unrepresented_pending_rule_ids"]) ==
+              std::vector<std::string>{"r4"});
+
+        CHECK(rest_data(kRestComplianceUrl) == d);
+    }
+
+    SECTION("get_guardian_device_guards") {
+        const auto d = mcp_payload(kMcpAllGuardsCall);
+        CHECK(d["guards"].size() == 3); // r1, r2, r3; r4 and r5 have no census row
+        CHECK(d["total_guards"].get<std::size_t>() == d["guards"].size());
+        CHECK(mcp_guard_row(d["guards"], "r1")["order_uncertain"].get<bool>());
+        CHECK(mcp_guard_row(d["guards"], "r2")["projection_pending"].get<bool>());
+        // Not limited to a Baseline: r5 is reported here although no Baseline names it.
+        CHECK(d["unrepresented_pending_guards"].get<int>() == 2);
+        CHECK(mcp_string_array(d["unrepresented_pending_rule_ids"]) ==
+              std::vector<std::string>{"r4", "r5"});
+
+        CHECK(rest_data(kRestAllGuardsUrl) == d);
+    }
+}
+
+// The existing DROP SCHEMA degrade cases fail an EARLIER read (rule_names_for) first, so they prove
+// nothing about the new read. The store seam fails ONLY the unrepresented-pending read.
+TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable error with a failure "
+          "audit, never zeros, on both per-device reads, and the tools recover (#7217)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+    mcp_seed_ordering_world(db.dsn(), store, baseline_store);
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    std::atomic<int> calls{0};
+    store.set_unrepresented_pending_fault_for_test([&calls] {
+        ++calls;
+        return true;
+    });
+
+    int expected_calls = 0;
+    for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
+        INFO(call);
+        ts.audit_log.clear();
+        auto res = ts.call(call);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK_FALSE(body.contains("result")); // no data, never zeros
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"].get<std::string>().find("degraded") != std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(res->body.find("unrepresented_pending") == std::string::npos);
+        CHECK(calls.load() == ++expected_calls);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "guardian.device.view|failure") == 1);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "guardian.device.view|success") == 0);
+    }
+
+    // Clear the seam: both tools answer again, with the evidence.
+    store.set_unrepresented_pending_fault_for_test({});
+    for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
+        INFO(call);
+        ts.audit_log.clear();
+        auto res = ts.call(call);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(data["unrepresented_pending_guards"].get<int>() >= 1);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "guardian.device.view|success") == 1);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "guardian.device.view|failure") == 0);
+    }
+    CHECK(calls.load() == expected_calls); // the cleared seam is not consulted again
+}
+
+TEST_CASE("MCP Guardian: the advertised output schemas list the #7217 fields as required, "
+          "bounded and typed, and the descriptions no longer disclaim them",
+          "[mcp][integration][guardian][ordering]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7219})");
+    REQUIRE(list);
+    const auto tools = nlohmann::json::parse(list->body)["result"]["tools"];
+    const auto tool = [&](const char* name) -> nlohmann::json {
+        for (const auto& t : tools)
+            if (t["name"] == name)
+                return t;
+        FAIL("no tool " << name);
+        return nlohmann::json{};
+    };
+    const auto names_in = [](const nlohmann::json& arr) {
+        std::set<std::string> out;
+        REQUIRE(arr.is_array());
+        for (const auto& x : arr)
+            out.insert(x.get<std::string>());
+        return out;
+    };
+    const auto check_summary_schema = [&](const nlohmann::json& schema) {
+        const auto& props = schema["properties"];
+        const auto required = names_in(schema["required"]);
+        for (const char* k : {"unrepresented_pending_guards", "unrepresented_pending_rule_ids"}) {
+            INFO(k);
+            CHECK(props.contains(k));
+            CHECK(required.count(k) == 1);
+        }
+        CHECK(props["unrepresented_pending_guards"]["type"] == "integer");
+        CHECK(props["unrepresented_pending_guards"]["minimum"] == 0);
+        const auto& ids = props["unrepresented_pending_rule_ids"];
+        CHECK(ids["type"] == "array");
+        CHECK(ids["maxItems"] == 50);
+        CHECK(ids["uniqueItems"] == true);
+        CHECK(ids["items"]["type"] == "string");
+    };
+
+    const auto compliance = tool("get_guardian_device_compliance");
+    const auto& cs = compliance["outputSchema"];
+    check_summary_schema(cs);
+    CHECK(cs["properties"].contains("uncertain_guards"));
+    CHECK(names_in(cs["required"]).count("uncertain_guards") == 1);
+    CHECK(cs["properties"]["uncertain_guards"]["type"] == "integer");
+    CHECK(cs["properties"]["uncertain_guards"]["minimum"] == 0);
+    const auto& citems = cs["properties"]["guards"]["items"];
+    const auto item_required = names_in(citems["required"]);
+    for (const char* k : {"order_uncertain", "projection_pending"}) {
+        INFO(k);
+        CHECK(citems["properties"].contains(k));
+        CHECK(citems["properties"][k]["type"] == "boolean");
+        CHECK(item_required.count(k) == 1);
+    }
+    const std::string cdesc = compliance["description"].get<std::string>();
+    CHECK(cdesc.size() < 4096);
+    CHECK(cdesc.find("do not report ordering uncertainty") == std::string::npos);
+    CHECK(cdesc.find("uncertain_guards") != std::string::npos);
+    CHECK(cdesc.find("unrepresented_pending_guards") != std::string::npos);
+    CHECK(cdesc.find("get_guardian_device_guards") != std::string::npos);
+
+    const auto guards = tool("get_guardian_device_guards");
+    check_summary_schema(guards["outputSchema"]);
+    const std::string gdesc = guards["description"].get<std::string>();
+    CHECK(gdesc.size() < 4096);
+    CHECK(gdesc.find("unrepresented_pending_guards") != std::string::npos);
 }
 
 // ── cancel_execution / record_execution_rerun (#2146 batch B) ───────────────────────────────
