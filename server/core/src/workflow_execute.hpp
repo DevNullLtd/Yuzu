@@ -327,8 +327,8 @@ inline constexpr std::string_view kStepNotProvenUnsentText =
     "stores by plugin and time before re-running";
 
 /// What a KEYED run's refusal says when it was answered after the idempotency key was bound to the
-/// run: the key now replays this failed run (or conflicts), so a retry of the same call can never
-/// run again. An unkeyed run keeps the advice of its cause.
+/// run: the key now replays this run (as failed, aborted, or whatever class the stored steps show;
+/// or conflicts), so a retry of the same call can never run again. An unkeyed run keeps the advice of its cause.
 inline constexpr std::string_view kKeyedRetryRemediation =
     "the idempotency key is bound to this run and a repeat of it replays this answer; use a new "
     "idempotency key (MCP: a new approval) for another run, after reading the run";

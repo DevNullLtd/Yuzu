@@ -38,11 +38,12 @@ namespace yuzu::server {
 
 /// The most agent ids a run row stores in `agent_ids_json`. The run itself always targets the FULL
 /// list the caller named; only the stored copy is bounded, so a looped run over a huge list cannot
-/// grow `workflow_executions` by ~1.3 MB a row. 1000 ids of up to 128 bytes is about 131 KB.
+/// grow `workflow_executions` by ~1.3 MB a row. 1000 ids of up to 128 bytes is 131,001 bytes of
+/// JSON text.
 inline constexpr std::size_t kStoredAgentIdsMax = 1000;
 
 /// The most bytes of JSON text a run row stores in `agent_ids_json`, the marker included: 1000 ids
-/// of the 128 bytes the v1 and MCP routes allow, quoted and comma-separated, is 131,002 bytes. The
+/// of the 128 bytes the v1 and MCP routes allow, quoted and comma-separated, is 131,001 bytes. The
 /// legacy execute route checks no id length, so the count alone does not bound the column.
 inline constexpr std::size_t kStoredAgentIdsMaxBytes = 131072;
 

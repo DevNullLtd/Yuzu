@@ -334,14 +334,15 @@ WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
     // dispatch returns, and that write can be dropped), so the one remediation for every terminal
     // class says so; a step left running, or stored failed by a throw, is no better evidence.
     const std::string read_and_rerun =
-        "read get_workflow_execution for what ran; " + std::string(kStepNotProvenUnsentText) +
+        "read the run for what ran (MCP get_workflow_execution, REST "
+        "GET /api/v1/workflow-executions/{id}); " + std::string(kStepNotProvenUnsentText) +
         "; a step left running, or recorded failed because its dispatch threw, may have been sent "
         "too; a deliberate re-run needs a new idempotency key";
     if (o.replay_status == kReplayRunning) {
         o.message = "this idempotency key is bound to a run that is still in progress; nothing was "
                     "sent for this call";
-        o.remediation = "poll get_workflow_execution on the execution_id; do not send this call "
-                        "again";
+        o.remediation = "poll the run on the execution_id (MCP get_workflow_execution, REST "
+                        "GET /api/v1/workflow-executions/{id}); do not send this call again";
     } else if (o.replay_status == kReplayCompleted) {
         o.message = "this idempotency key is bound to a run that already completed; nothing was "
                     "sent for this call";
@@ -365,7 +366,9 @@ WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
     } else {
         o.message = "this idempotency key is bound to a run whose outcome could not be confirmed; "
                     "nothing was sent for this call";
-        o.remediation = "read get_workflow_execution; " + std::string(kStepNotProvenUnsentText) +
+        o.remediation = "read the run (MCP get_workflow_execution, REST GET "
+                        "/api/v1/workflow-executions/{id}); " +
+                        std::string(kStepNotProvenUnsentText) +
                         "; if the run may still be live, wait for it before re-running; a "
                         "deliberate re-run needs a new key";
     }

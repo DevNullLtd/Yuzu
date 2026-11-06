@@ -6763,7 +6763,7 @@ tell "never started" from "started", and a blind re-send dispatches every step t
 `Idempotency-Key` header: a fresh unique string per intended run, 8 to 128 characters from
 `A-Z a-z 0-9 . _ : -`, sent exactly once. The key belongs to the calling principal (another principal's
 identical key is a different key) and stays bound to its run for the life of the run record; nothing
-prunes it. The run record also keeps your account name, the call's correlation id and the full agent list, so
+prunes it. The run record also keeps your account name, the call's correlation id and the agent ids it named (distinct ids, capped at 1,000 and at 131,072 bytes, then a count and digest marker), so
 what is stored about whom is listed under "Workflow run records are not pruned" in
 [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146). A repeat of the SAME key with the SAME request (the workflow id and the SET of agent ids:
 order and repeats do not matter; the stored step definitions are not part of it, so an instruction
@@ -6942,8 +6942,9 @@ workflow was soft-deleted; its history is kept), `status`, `current_step`, `star
 `completed_at`. Never agent ids, step results or `agents_reached` (use the detail route for those).
 Newest first by `(started_at, id)`.
 
-A confined caller (management-group or service-scoped) sees only runs with at least one agent in
-its scope. The scope is applied in the database **before** ordering and the page limit, so a run
+A confined caller (management-group or service-scoped) sees only runs with at least one of the
+stored agent ids in its scope (for a run that named more ids than a row stores, see the cap note
+under `GET /api/v1/workflow-executions/{id}`). The scope is applied in the database **before** ordering and the page limit, so a run
 the caller cannot see never takes a page slot, `next_cursor` and the page length depend only on
 runs the caller may see, and a hand-made cursor naming a hidden run reveals nothing. A run whose
 stored agent list is malformed, empty or not an array is invisible to a confined caller.
@@ -7022,13 +7023,18 @@ REST's usual fail-closed-on-audit-failure posture — this file's `AuditFn` pred
 For an unconfined (global-grant) caller, each step's `result` also carries `agents_reached` (the
 step's dispatch-time target-agent count) — stripped above for a confined caller, as described.
 
-A run row stores at most 1,000 of the agent ids the run named (the run itself still sends to every
-id). When a run named more, `agent_ids` holds only stored ids (a confined caller's own visible
-devices are kept first), `agent_ids_truncated` is `true`, and a caller with no device scope also
-gets `agent_ids_total`, the number the run named. Both fields are absent for a run stored whole,
-and `agent_ids_total` is never sent to a confined caller. A confined caller sees a truncated run
-only if one of the stored ids is in its scope. The same applies to `GET /api/workflow-executions/{id}`
-and MCP `get_workflow_execution`.
+A run row stores each distinct agent id the run named once, in the order first named, at most
+1,000 of them and at most 131,072 bytes of JSON text (the run itself still sends to every id as
+sent). When the distinct ids do not all fit, `agent_ids` holds only the stored ids (when the
+creator is a confined caller, the creator's own visible devices are stored first, so the creator
+keeps seeing the run; that ordering protects the creator only), `agent_ids_truncated` is `true`,
+and a caller with no device scope also gets `agent_ids_total`, the number of distinct ids the run
+named. Both fields are absent for a run stored whole, and `agent_ids_total` is never sent to a
+confined caller. A confined caller sees a truncated run only if one of the stored ids is in its
+scope, so a confined reader other than the creator whose devices fall past the stored ids does not
+see the run (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
+unconfined readers and the audit log still see it. The same applies to
+`GET /api/workflow-executions/{id}` and MCP `get_workflow_execution`.
 
 #### `GET /api/v1/executions`
 

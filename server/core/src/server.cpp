@@ -1634,10 +1634,11 @@ public:
                           "-32015). No audit row and no approval ticket is spent on a refusal",
                           "counter");
         // Repeats of a workflow-run idempotency key answered WITHOUT sending anything, by
-        // outcome: replayed (the run it is bound to is terminal), in_progress (that run is still
-        // running: the caller is told to poll), conflict (the same key with a different request,
-        // HTTP 422 / MCP -32602). Closed set, every member pre-seeded. A running replay writes no
-        // audit row, so this counter is its only record.
+        // outcome: replayed (the run it is bound to is terminal and its stored rows prove how it
+        // ended), indeterminate (it is not provable, or the run is past the stale bound),
+        // in_progress (that run is still running: the caller is told to poll), conflict (the same
+        // key with a different request, HTTP 422 / MCP -32602). Closed set, every member
+        // pre-seeded. A running replay writes no audit row, so this counter is its only record.
         metrics_.describe(yuzu::server::kWorkflowRunIdempotentMetric,
                           "Repeats of a workflow-run idempotency key (POST /api/v1/workflows/{id}/"
                           "execute Idempotency-Key header, MCP execute_workflow idempotency_key) "
@@ -1671,8 +1672,9 @@ public:
                           "may have been sent), or none. A run killed with the process never "
                           "answers and is never counted here; a run whose final status write "
                           "failed (yuzu_server_workflow_finalize_failed_total) is counted when "
-                          "its call is answered, as partial if something was sent and failed if "
-                          "not.",
+                          "its call is answered by the same order as any run: failed if it threw, "
+                          "aborted after a deadline, credential or send-time stop, interrupted by "
+                          "a shutdown, else partial if something was sent and failed if not.",
                           "counter");
         yuzu::server::seed_workflow_run_metrics(metrics_);
         // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
@@ -9603,8 +9605,9 @@ public:
                         .set(static_cast<double>(stream_budget_->active_for_surface(
                             yuzu::server::detail::SseSurface::kWorkflowRun)));
                 }
-                // Workflow run table size: one catalog row, bounded to ~0.5 s worst case and
-                // noexcept (a failed sample keeps the previous gauge values).
+                // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
+                // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
+                // connection), noexcept (a failed sample keeps the previous gauge values).
                 if (workflow_engine_)
                     workflow_engine_->refresh_table_size_metrics();
                 if (pg_pool_) {

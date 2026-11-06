@@ -1265,8 +1265,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      second deadline. The 2026-10-30 entry is left as written; this entry supersedes
      its residual sentence only.
      - **Known residuals of this change (recorded by the change author; ADR-owner
-       acceptance pending).** Each was checked against the code at the commit that
-       wrote this paragraph. Only the token-cache lag in residual 3 has a tracking
+       acceptance pending, except the confined-reader visibility consequence of the
+       stored agent id cap in residual 13, which the owner accepted on 2026-11-06).**
+       Each was checked against the code at the commit that wrote this paragraph. Only the token-cache lag in residual 3 has a tracking
        reference (#4766, token revocation and expiry without the durable-generation
        discipline sessions have; `AuthRoutes::revalidate_stream` cites #2447, which is
        the separate stream grace-clock point); no issue is filed
@@ -1334,13 +1335,27 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            sweep clears it.
        13. *Run records are kept without limit (revisit by 2027-01-15).* No prune
            exists for `workflow_executions` (see `docs/clock-guarded-retention.md`),
-           so the account name, the key and the agent list (at most 1,000 ids, about
-           131 KB per run: a longer list stores its first 1,000 ids and a count and
-           digest marker, `stored_agent_ids_json`) stay for the life of the database, and a deleted-and-
-           recreated username inherits the old account's keys. The table now has a size
-           gauge (`yuzu_server_workflow_executions_rows`, `_bytes`) and a growth alert
+           so the account name, the key and the agent list (the distinct ids, at most
+           1,000 of them and at most 131,072 bytes of JSON text per run, each id at most
+           256 bytes: a list that does not fit stores the ids that fit and a marker with
+           the count of distinct ids and a digest, `stored_agent_ids_json`) stay for the
+           life of the database, and a deleted-and-recreated username inherits the old
+           account's keys. The table now has a size gauge
+           (`yuzu_server_workflow_executions_rows`, `_bytes`) and a growth alert
            (`YuzuWorkflowExecutionsTableLarge`, above 100,000 rows for 30 minutes); the
            rows are still never pruned.
+
+           *Owner-accepted: confined-reader visibility (owner decision 2026-11-06,
+           "accept and record").* For a run naming more than 1,000 distinct agent ids
+           (or whose ids exceed the 131,072-byte stored budget), a CONFINED reader's
+           scoped visibility of the run depends on the stored ids. The creator is
+           protected by the creator-first ordering (a confined creator's own visible ids
+           are stored first); another confined reader whose devices fall past the cap
+           does not see the run in its scoped list or detail reads. Unconfined readers
+           and the audit log still see it, and the check fails closed (a malformed or
+           empty column is invisible to a confined reader). The trigger is distinct ids
+           beyond the cap: duplicates do not consume it, and an id that names no device
+           does. The run is still dispatched to every id it named.
 
 ## Interim rules (until the named follow-ups ship)
 

@@ -3122,10 +3122,11 @@ groups:
             rule is increase()[15m] > 0 with for: 2m, not a rate.
 
       # Workflow run table growth (#2146, ADR-1005 residual 13). Run rows are never pruned, and a
-      # run row is bounded but not small: agent_ids_json stores at most 1,000 ids, about 131 KB
-      # (1,000 x (128-byte id + 2 quotes + comma)), before TOAST compression. 100,000 rows is
-      # therefore about 13 GB if every row were at that worst case and about 130 MB at a typical
-      # 10-device run (about 1.3 KB). The series is yuzu_server_workflow_executions_rows
+      # run row is bounded but not small: agent_ids_json stores at most 1,000 distinct ids and at
+      # most 131,072 bytes of JSON text (1,000 ids of 128 bytes, quoted and comma-separated, is
+      # 131,001 bytes), on every route, before TOAST compression. 100,000 rows is therefore up to
+      # about 13 GB if every row were at that worst case and about 130 MB at a typical 10-device
+      # run (about 1.3 KB). The series is yuzu_server_workflow_executions_rows
       # (WorkflowEngine::refresh_table_size_metrics, planner estimate, sampled about every 15 s);
       # every replica reads the same table, so the rule collapses the replicas with max by (job).
       - alert: YuzuWorkflowExecutionsTableLarge
@@ -3142,9 +3143,9 @@ groups:
             rows (yuzu_server_workflow_executions_rows, job {{ $labels.job }}) and has been
             above 100,000 for 30 minutes. Run rows are never deleted, so the table only
             grows, on the same Postgres that holds the audit, auth and session tables. A
-            row stores at most 1,000 device ids (about 131 KB before compression), so
-            100,000 rows is about 130 MB if a typical run names 10 devices and up to about
-            13 GB if every run named 1,000 or more. Read
+            row stores at most 1,000 distinct device ids and 131,072 bytes of them
+            (before compression), so 100,000 rows is about 130 MB if a typical run names 10
+            devices and up to about 13 GB if every run filled that column. Read
             yuzu_server_workflow_executions_bytes for the real size (heap, TOAST and
             indexes), then find the caller: a looping client shows up as many rows in
             GET /api/v1/workflow-executions and as workflow.execute audit rows from one

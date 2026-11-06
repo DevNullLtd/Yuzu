@@ -279,7 +279,9 @@ public:
     std::expected<void, std::string> cancel_execution(const std::string& id);
 
     /// One cheap read of the run table's size: a single catalog/statistics row, no table scan, in
-    /// one transaction bounded by a 250 ms lease acquire and a 250 ms `statement_timeout`.
+    /// one transaction whose lease acquire is bounded at 250 ms (plus the pool's connect timeout
+    /// when it must open a connection) and whose statement is bounded by a 250 ms
+    /// `statement_timeout`.
     /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) is a genuine failure and is never a zero.
     std::expected<ExecutionTableEstimate, std::string> execution_table_estimate() const;
 
@@ -289,7 +291,9 @@ public:
     /// `kWorkflowExecutionsStatsUnavailableMetric` and logs a warning at most once per five
     /// minutes per cause. Never throws; no-op without a sink. Called
     /// from the maintenance tick (`health_recompute_thread_`), so it must stay inside that
-    /// thread's serial budget (about 0.5 s worst case).
+    /// thread's serial budget: about 250 ms plus the 250 ms statement timeout when a connection is
+    /// idle, but when the pool must open a connection a started connect runs to completion, so the
+    /// bound is roughly 250 ms plus `connect_timeout_s` (10 s by default).
     void refresh_table_size_metrics() noexcept;
 
 private:

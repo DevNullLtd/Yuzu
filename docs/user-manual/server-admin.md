@@ -5663,23 +5663,40 @@ What a run row holds, and how to treat it:
   `POST /api/workflows/{id}/execute` leaves it empty. `correlation_id` is the call's correlation id
   (the same value the call's audit rows carry). `idempotency_key` is the caller's own string,
   `request_fingerprint` a SHA-256 of the request.
-- **Where it ran.** `agent_ids_json` holds the device ids the caller named, up to 1,000 of them
-  (about 131 KB at 128 bytes each). A run that names more still sends to every id it names; only the
-  stored copy is bounded. Above 1,000 ids the column holds the first 1,000 (for a caller confined to
-  a device scope, that caller's own visible devices are kept first) followed by one marker object,
-  `{"truncated":true,"total":<count named>,"sha256":"<hash of the full list's JSON text>"}`, so the
-  column is still a JSON array and the true count and a digest of the full list stay in the row.
-  The run's detail reads then show `agent_ids_truncated: true` and, to a caller with no device
-  scope, `agent_ids_total`. A confined reader sees the run only if one of the stored ids is in
-  its scope, so for a run that named more than 1,000 devices a reader whose devices were not stored
-  does not see it. The legacy execute route shares the same insert and the same bound. Rows are
+- **Where it ran.** `agent_ids_json` holds the device ids the caller named, as a JSON array of
+  strings, each distinct id once in the order it was first named (a repeated id is stored once).
+  The column is bounded three ways on every route that starts a run (the v1 route, MCP and the
+  legacy execute route share the same insert): at most 1,000 ids, at most 131,072 bytes of JSON
+  text in all (the marker included), and an id longer than 256 bytes (the longest id any agent can
+  have) is never stored. A run still sends to every id it names, as the caller sent them; only the
+  stored copy is bounded. When the distinct ids do not all fit, the column holds the ones that fit,
+  followed by one marker object
+  `{"truncated":true,"total":<distinct ids named>,"sha256":"<hash>"}`: `total` counts every distinct
+  id including any that were not stored, and `sha256` is the digest of the JSON text of the
+  distinct list in the order it was first named (null if the digest could not be computed). The
+  column is still a JSON array, so the true count and a digest of the list stay in the row. For a
+  caller confined to a device scope, that caller's own visible ids are stored first, then the rest
+  in the order named. The run's detail reads then show `agent_ids_truncated: true` and, to a caller
+  with no device scope, `agent_ids_total`. A list with no repeated id that fits the bounds is
+  stored unchanged.
+
+  **Accepted residual (owner decision, 2026-11-06).** A confined reader sees a run only if one
+  of the stored ids is in its scope. For a run that names more than 1,000 distinct ids, or whose
+  ids do not fit the 131,072-byte budget, that depends on which ids were stored: the confined
+  creator is protected by the ordering above (its own visible ids are stored first), but another
+  confined reader whose devices fall past the cap does not see the run in its list or its detail
+  read. Unconfined readers and the audit log still see it, and a malformed or empty column is
+  invisible to a confined reader, never visible. The trigger is distinct ids beyond the cap
+  (an id that names no device counts; a repeated id does not).
+
+  Rows are
   still never trimmed, so size the Postgres volume for the run rate you expect: the bound caps
   each row, not the number of rows. The server watches the row count for you:
   `yuzu_server_workflow_executions_rows` (an estimate, sampled about every 15 seconds without a
   table scan) and `yuzu_server_workflow_executions_bytes` (heap, TOAST and indexes, step results
   excluded) are exported, and the `YuzuWorkflowExecutionsTableLarge` alert warns when the estimate
   stays above 100,000 rows for 30 minutes. That is about 130 MB if a typical run names 10 devices
-  and up to about 13 GB if every run names 1,000 or more. When it fires, read the bytes gauge,
+  and up to about 13 GB if every run fills the 131,072-byte column. When it fires, read the bytes gauge,
   then find the caller (a looping client appears as many rows in
   `GET /api/v1/workflow-executions` and as `workflow.execute` audit rows from one principal) and
   stop it. Nothing deletes rows for you and no route does, so reclaiming space is a DBA decision
