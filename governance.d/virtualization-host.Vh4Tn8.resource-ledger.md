@@ -14,7 +14,7 @@ type under RAII.
 
 | Resource | Type | Owner | Scope | Notes |
 |---|---|---|---|---|
-| `FileRead::data` | `std::string` | `read_source` (Linux leg) | function-local | Bytes of one sysfs, procfs or DMI attribute, capped at 4 KiB (DMI, `/sys/hypervisor/type`), 64 KiB (`/proc/self/cgroup`) or 2 MiB (`/proc/cpuinfo`); a larger file is `oversized`, never a partial read. The descriptor behind it is opened and closed inside `read_open_fd` (`FdCloser`). |
+| `FileRead::data` | `std::string` | `read_source` (Linux leg) | function-local | Bytes of one sysfs, procfs or DMI attribute, capped at 4 KiB (DMI, `/sys/hypervisor/type`) or 64 KiB (`/proc/self/cgroup`); a larger file is `oversized`, never a partial read. The descriptor behind it is opened and closed inside `read_open_fd` (`FdCloser`). |
 | `Facts` | struct of `std::string` / `std::vector<std::string>` / `std::optional` | `run_linux`, `run_macos`, `run_windows` | function-local | The plain-data input to `decide`; moved into the `Posture` and rendered to rows; nothing escapes the frame. |
 | `RsmbRead::bytes` | `std::vector<std::uint8_t>` | `read_smbios` (Windows leg) | function-local | The RawSMBIOSData buffer from `GetSystemFirmwareTable`, capped at 1 MiB by `read_rsmb_table`; decoded by `parse_rsmb` into value types and dropped at the end of `read_smbios`. No handle. |
 | `buf` | `std::string` | `sysctl_string` (macOS leg) | function-local | Sized by the two-call `sysctlbyname` probe; no handle. |

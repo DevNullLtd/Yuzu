@@ -11,7 +11,7 @@
 //                                                            -> host_with_hypervisor (not virtual)
 //   3. CPUID hypervisor present                              -> guest (medium when the vendor
 //                                                               signature is not a well-formed 12 bytes)
-//   3b. an OS hint says virtual (sysctl, /sys/hypervisor, /proc/cpuinfo flag) -> guest (medium)
+//   3b. an OS hint says virtual (sysctl, /sys/hypervisor)    -> guest (medium)
 //   4. a readable negative signal AND no consulted source unreadable -> bare_metal
 //   5. anything else                                         -> unknown, with the reason tokens
 // SMBIOS beats the root-partition bit because VBS nested inside another hypervisor sets
@@ -119,8 +119,7 @@ inline bool root_partition_leaf_readable(std::string_view vendor_sig, std::uint3
 enum class ReadState { ok, absent, unreadable };
 
 struct SmbiosFacts {
-    using State = ReadState;
-    State state = State::absent;
+    ReadState state = ReadState::absent;
     /// May be set even when unreadable (a Type 1 decoded before a later walk fault is kept).
     std::string manufacturer;
     std::string product;
@@ -129,7 +128,7 @@ struct SmbiosFacts {
 
 struct OsHint {
     std::optional<bool> os_says_virtual; ///< nullopt = this OS gave no signal either way
-    std::string source;                  ///< sysctl | sys_hypervisor | cpuinfo
+    std::string source;                  ///< sysctl | sys_hypervisor
     std::string vendor_hint;             ///< e.g. the /sys/hypervisor/type value
 };
 
@@ -295,7 +294,7 @@ inline bool root_partition_set(const CpuidFacts& c) {
 /// stable order. Container read failures are accounted separately (classify_container).
 inline std::vector<std::string> failure_tokens(const Facts& f) {
     std::vector<std::string> out = f.failures;
-    if (f.smbios.state == SmbiosFacts::State::unreadable)
+    if (f.smbios.state == ReadState::unreadable)
         // An unexplained unknown is the one output this plugin must never emit: no shell leaves
         // the reason empty today, but if one did the status would still name the source.
         out.push_back(f.smbios.reason.empty() ? detail::token(f, "smbios:unreadable")
@@ -325,7 +324,7 @@ inline Classification classify(const Facts& f) {
     c.tokens = failure_tokens(f);
     const std::string manufacturer = wire_field(f.smbios.manufacturer);
     const auto sm_vendor = vm_vendor_from_smbios(f.smbios.manufacturer, f.smbios.product);
-    const bool sm_unreadable = f.smbios.state == SmbiosFacts::State::unreadable;
+    const bool sm_unreadable = f.smbios.state == ReadState::unreadable;
     const std::string product = wire_field(f.smbios.product);
 
     // 1. SMBIOS names a VM vendor.
@@ -607,7 +606,7 @@ inline SmbiosFacts combine_dmi(const FieldRead& vendor, const FieldRead& product
 /// SMBIOS facts for a Windows RSMB read that failed before any table was decoded.
 inline SmbiosFacts smbios_read_failure(std::string_view cause) {
     SmbiosFacts s;
-    s.state = SmbiosFacts::State::unreadable;
+    s.state = ReadState::unreadable;
     s.reason = "windows:virtualization:smbios:" + std::string{cause};
     return s;
 }
@@ -625,75 +624,39 @@ inline SmbiosFacts smbios_facts_from_table(const yuzu::shared::smbios::SmbiosTab
         s.product = t.system.data.product.value_or("");
     }
     if (t.error) {
-        s.state = SmbiosFacts::State::unreadable;
+        s.state = ReadState::unreadable;
         s.reason = std::string{"windows:virtualization:smbios:"} +
                    (*t.error == yuzu::shared::smbios::Error::truncated ? "truncated" : "malformed");
     } else if (t.system.status == Status::malformed) {
-        s.state = SmbiosFacts::State::unreadable;
+        s.state = ReadState::unreadable;
         s.reason = "windows:virtualization:smbios:malformed";
     } else {
-        s.state = t.system.status == Status::ok ? SmbiosFacts::State::ok : SmbiosFacts::State::absent;
+        s.state = t.system.status == Status::ok ? ReadState::ok : ReadState::absent;
     }
     return s;
 }
 
-/// True when a /proc/cpuinfo `flags` line carries the `hypervisor` flag as a whole word.
-inline bool cpuinfo_has_hypervisor_flag(std::string_view cpuinfo) {
-    size_t pos = 0;
-    while (pos < cpuinfo.size()) {
-        size_t nl = cpuinfo.find('\n', pos);
-        if (nl == std::string_view::npos)
-            nl = cpuinfo.size();
-        const std::string_view line = cpuinfo.substr(pos, nl - pos);
-        pos = nl + 1;
-        if (line.rfind("flags", 0) != 0)
-            continue;
-        const size_t colon = line.find(':');
-        if (colon == std::string_view::npos)
-            continue;
-        std::string_view rest = line.substr(colon + 1);
-        while (!rest.empty()) {
-            const size_t b = rest.find_first_not_of(" \t");
-            if (b == std::string_view::npos)
-                break;
-            rest.remove_prefix(b);
-            const size_t e = rest.find_first_of(" \t");
-            if (rest.substr(0, e) == "hypervisor")
-                return true;
-            if (e == std::string_view::npos)
-                break;
-            rest.remove_prefix(e);
-        }
-    }
-    return false;
-}
-
-/// Linux OS hint: /sys/hypervisor/type (when non-empty) wins over the cpuinfo flag. Linux
-/// supplies positive hints only; neither present is "no signal", not "not virtual".
-inline OsHint linux_os_hint(std::string_view sys_hypervisor_type, bool cpuinfo_flag) {
+/// Linux OS hint: a non-empty /sys/hypervisor/type. Linux supplies a positive hint only; an
+/// empty or missing file is "no signal", not "not virtual".
+inline OsHint linux_os_hint(std::string_view sys_hypervisor_type) {
     OsHint h;
-    std::string t = detail::lower(sys_hypervisor_type);
-    t.erase(t.find_last_not_of(" \r\n") + 1);
+    const std::string t = detail::rtrim(detail::lower(sys_hypervisor_type));
     if (!t.empty()) {
         h.os_says_virtual = true;
         h.source = "sys_hypervisor";
         h.vendor_hint = t;
-    } else if (cpuinfo_flag) {
-        h.os_says_virtual = true;
-        h.source = "cpuinfo";
     }
     return h;
 }
 
-/// Everything the Linux shell reads, before any decision: the five bounded file reads and the
+/// Everything the Linux shell reads, before any decision: the four bounded file reads and the
 /// errno of the two container-marker probes (0 = present, ENOENT = absent, else a failure). The
 /// probes default to absent so an unfilled LinuxReads never reads as "in a container".
 struct LinuxReads {
     FieldRead sys_vendor;
     FieldRead product_name;
     FieldRead hypervisor_type;
-    FieldRead cpuinfo; ///< left absent when CPUID answered: the flag adds nothing on x86
-    FieldRead cgroup;  ///< /proc/self/cgroup, the agent's own membership
+    FieldRead cgroup; ///< /proc/self/cgroup, the agent's own membership
     int dockerenv_errno = ENOENT;
     int containerenv_errno = ENOENT;
 };
@@ -713,12 +676,7 @@ inline Facts linux_facts(CpuidFacts cpuid, const LinuxReads& r) {
         hv_type = r.hypervisor_type.value;
     else if (r.hypervisor_type.state == ReadState::unreadable)
         f.failures.push_back(detail::linux_token("sys_hypervisor", r.hypervisor_type.cause));
-    bool cpuinfo_flag = false;
-    if (r.cpuinfo.state == ReadState::ok)
-        cpuinfo_flag = cpuinfo_has_hypervisor_flag(r.cpuinfo.value);
-    else if (r.cpuinfo.state == ReadState::unreadable)
-        f.failures.push_back(detail::linux_token("cpuinfo", r.cpuinfo.cause));
-    f.hint = linux_os_hint(hv_type, cpuinfo_flag);
+    f.hint = linux_os_hint(hv_type);
 
     f.container.mode = ContainerInputs::Mode::linux_read;
     std::vector<std::string> failed;

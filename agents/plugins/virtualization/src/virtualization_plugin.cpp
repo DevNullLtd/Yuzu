@@ -3,8 +3,8 @@
  *
  * Action:
  *   "host" -- is this device a VM, which hypervisor, and is the agent itself in a container:
- *               Linux   CPUID (x86), DMI, /sys/hypervisor/type, the /proc/cpuinfo hypervisor
- *                       flag, /.dockerenv, /run/.containerenv, /proc/self/cgroup;
+ *               Linux   CPUID (x86), DMI, /sys/hypervisor/type, /.dockerenv,
+ *                       /run/.containerenv, /proc/self/cgroup;
  *               macOS   sysctl kern.hv_vmm_present and hw.model;
  *               Windows CPUID (x86), the SMBIOS System Information table (RSMB).
  *
@@ -32,7 +32,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "CPUID leaves 1 and 0x40000000-0x40000003 (x86), /sys/class/dmi/id/{sys_vendor,"
-         "product_name}, /sys/hypervisor/type, /proc/cpuinfo, /.dockerenv, /run/.containerenv "
+         "product_name}, /sys/hypervisor/type, /.dockerenv, /run/.containerenv "
          "and /proc/self/cgroup (bounded reads, no subprocess)",
          "ARM has no CPUID: SMBIOS and OS hints alone decide, and a host with neither reads "
          "unknown, never bare_metal; a KVM host reads bare_metal (its own CPUID is not "

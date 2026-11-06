@@ -5,8 +5,7 @@
 ##
 ## Sources by platform (no subprocess on any):
 ##   Linux:   CPUID (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type,
-##            the /proc/cpuinfo hypervisor flag, /.dockerenv, /run/.containerenv and the
-##            agent's own /proc/self/cgroup.
+##            /.dockerenv, /run/.containerenv and the agent's own /proc/self/cgroup.
 ##   macOS:   sysctl kern.hv_vmm_present and hw.model.
 ##   Windows: CPUID (x86) and the SMBIOS System Information table (GetSystemFirmwareTable RSMB).
 ##
@@ -81,7 +80,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_5
         type: string
-        description: 'host: the evidence source that decided the kind (cpuid, smbios, sysctl, sys_hypervisor or cpuinfo); when the kind is unknown, the joined reason tokens instead. Not used by the other kinds.'
+        description: 'host: the evidence source that decided the kind (cpuid, smbios, sysctl or sys_hypervisor); when the kind is unknown, the joined reason tokens instead. Not used by the other kinds.'
         example: sysctl
         platforms: [windows, linux, darwin]
       - name: field_6

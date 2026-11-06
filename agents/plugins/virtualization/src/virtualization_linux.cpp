@@ -30,7 +30,6 @@ namespace yuzu::virtualization {
 namespace {
 
 constexpr size_t kSmallCap = 4096;
-constexpr size_t kCpuinfoCap = 2 * 1024 * 1024;
 constexpr size_t kCgroupCap = 64 * 1024;
 
 CpuidFacts read_cpuid() {
@@ -84,12 +83,6 @@ int run_linux(yuzu::CommandContext& ctx) {
     r.sys_vendor = read_source("/sys/class/dmi/id/sys_vendor", kSmallCap);
     r.product_name = read_source("/sys/class/dmi/id/product_name", kSmallCap);
     r.hypervisor_type = read_source("/sys/hypervisor/type", kSmallCap);
-    // ponytail: the cpuinfo `hypervisor` flag is CPUID leaf 1 ECX bit 31, which read_cpuid already
-    // read, so on x86 the file adds nothing and an oversized one (> ~1,300 logical CPUs) would only
-    // block bare_metal; it is read only when CPUID is unavailable (ARM has no `flags` line either,
-    // so today it contributes on neither architecture). Drop the source in a follow-up.
-    if (!cpuid.available)
-        r.cpuinfo = read_source("/proc/cpuinfo", kCpuinfoCap);
     r.cgroup = read_source("/proc/self/cgroup", kCgroupCap);
     r.dockerenv_errno = probe("/.dockerenv");
     r.containerenv_errno = probe("/run/.containerenv");

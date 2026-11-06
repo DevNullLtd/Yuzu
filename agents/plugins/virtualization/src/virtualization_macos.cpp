@@ -59,11 +59,11 @@ int run_macos(yuzu::CommandContext& ctx) {
 
     const auto model = sysctl_string("hw.model");
     if (model) {
-        f.smbios.state = SmbiosFacts::State::ok;
+        f.smbios.state = ReadState::ok;
         f.smbios.manufacturer = "Apple Inc.";
         f.smbios.product = *model;
     } else {
-        f.smbios.state = SmbiosFacts::State::unreadable;
+        f.smbios.state = ReadState::unreadable;
         f.smbios.reason = "macos:virtualization:hw_model:unreadable";
     }
 

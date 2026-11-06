@@ -29,7 +29,7 @@ using namespace yuzu::virtualization;
 
 namespace {
 
-using State = SmbiosFacts::State;
+using State = ReadState;
 
 SmbiosFacts smbios_ok(std::string mfr, std::string prod) {
     SmbiosFacts s;
@@ -190,12 +190,11 @@ TEST_CASE("virtualization: a Windows host running Hyper-V is host_with_hyperviso
 }
 
 TEST_CASE("virtualization: a WSL2 style Hyper-V guest reads guest hyperv", "[virtualization][classify]") {
-    // SYNTHETIC: the Microsoft hypervisor signature without the root-partition bit, DMI as the
-    // Linux kernel publishes it under Hyper-V, and the cpuinfo hypervisor flag.
+    // SYNTHETIC: the Microsoft hypervisor signature without the root-partition bit, and DMI as
+    // the Linux kernel publishes it under Hyper-V.
     Facts f = linux_facts();
     f.cpuid = cpuid_hv("Microsoft Hv", 0x4000000Cu, "Hv#1", false);
     f.smbios = smbios_ok("Microsoft Corporation", "Virtual Machine");
-    f.hint = linux_os_hint("", true);
 
     const auto c = classify(f);
     CHECK(c.kind == Kind::guest);
@@ -389,7 +388,7 @@ TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[vi
         Facts f = linux_facts();
         f.cpuid = cpuid_clear();
         f.smbios = smbios_ok("Example Board Vendor", "Example Board");
-        f.failures.push_back("linux:virtualization:cpuinfo:eio");
+        f.failures.push_back("linux:virtualization:sys_hypervisor:eio");
         CHECK(classify(f).kind == Kind::unknown);
     }
     SECTION("no CPUID (ARM) and a non-VM DMI is unknown with the permanent limitation token") {
@@ -450,23 +449,12 @@ TEST_CASE("virtualization: a positive OS hint is never outranked by negative evi
         Facts f = linux_facts();
         f.cpuid = cpuid_clear();
         f.smbios = smbios_ok("Example Board Vendor", "Example Board");
-        f.hint = linux_os_hint("xen\n", false);
+        f.hint = linux_os_hint("xen\n");
         const auto c = classify(f);
         CHECK(c.kind == Kind::guest);
         CHECK(c.vendor == "xen");
         CHECK(c.confidence == Confidence::medium);
         CHECK(c.source == "sys_hypervisor");
-    }
-    SECTION("the cpuinfo hypervisor flag alone") {
-        Facts f = linux_facts();
-        f.cpuid = cpuid_clear();
-        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
-        f.hint = linux_os_hint("", true);
-        const auto c = classify(f);
-        CHECK(c.kind == Kind::guest);
-        CHECK(c.vendor == "other");
-        CHECK(c.confidence == Confidence::medium);
-        CHECK(c.source == "cpuinfo");
     }
     SECTION("macOS hv_vmm_present=1 on a model that is not a VirtualMac name") {
         Facts f;
@@ -582,16 +570,6 @@ TEST_CASE("virtualization: DMI halves combine without hiding an unreadable one",
     CHECK(errno_token(12345) == "errno_12345");
 }
 
-TEST_CASE("virtualization: cpuinfo flag parse matches the whole word on a flags line",
-          "[virtualization][hint]") {
-    CHECK(cpuinfo_has_hypervisor_flag("processor : 0\nflags\t\t: fpu vme hypervisor lahf_lm\n"));
-    CHECK(cpuinfo_has_hypervisor_flag("flags: hypervisor"));
-    CHECK_FALSE(cpuinfo_has_hypervisor_flag("flags\t: fpu vme lahf_lm\n"));
-    CHECK_FALSE(cpuinfo_has_hypervisor_flag("flags\t: fpu hypervisor_x lahf_lm\n"));
-    CHECK_FALSE(cpuinfo_has_hypervisor_flag("model name\t: a hypervisor appliance\n"));
-    CHECK_FALSE(cpuinfo_has_hypervisor_flag(""));
-}
-
 namespace {
 
 FieldRead read_ok(std::string v) { return FieldRead{State::ok, std::move(v), ""}; }
@@ -631,22 +609,20 @@ TEST_CASE("virtualization: linux_facts builds the facts and tokens from the inje
         CHECK(f.failures.empty());
         CHECK(decide(f).status == StatusState::supported);
     }
-    SECTION("the sys_hypervisor and cpuinfo failures carry their source prefix") {
+    SECTION("a sys_hypervisor failure carries its source prefix") {
         LinuxReads r = clean_reads();
         r.hypervisor_type = read_bad("eio");
-        r.cpuinfo = read_bad("oversized");
         const Facts f = linux_facts(CpuidFacts{}, r);
-        REQUIRE(f.failures.size() == 2);
+        REQUIRE(f.failures.size() == 1);
         CHECK(f.failures[0] == "linux:virtualization:sys_hypervisor:eio");
-        CHECK(f.failures[1] == "linux:virtualization:cpuinfo:oversized");
     }
-    SECTION("the sys_hypervisor value and the cpuinfo flag become the OS hint") {
+    SECTION("the sys_hypervisor value becomes the OS hint, trailing whitespace trimmed") {
         LinuxReads r = clean_reads();
         r.hypervisor_type = read_ok("xen\n");
         CHECK(linux_facts(cpuid_clear(), r).hint.vendor_hint == "xen");
+        CHECK(linux_os_hint("Xen\t\r\n").vendor_hint == "xen");
         r.hypervisor_type = FieldRead{};
-        r.cpuinfo = read_ok("flags\t: fpu hypervisor\n");
-        CHECK(linux_facts(CpuidFacts{}, r).hint.source == "cpuinfo");
+        CHECK_FALSE(linux_facts(cpuid_clear(), r).hint.os_says_virtual.has_value());
     }
     SECTION("a refused marker probe is a markers_ token, ENOENT is not") {
         LinuxReads r = clean_reads();
