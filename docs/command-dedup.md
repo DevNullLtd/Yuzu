@@ -142,7 +142,7 @@ claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
   dispatched before the stamp but delivered to the agent after it takes a ring slot the count never
   saw. The 2x margin absorbs the race between the check and the agent's
   claim; it is not sized for a sustained uncounted outage. The sound close, which makes the agent
-  refuse an id older than its own ring, needs a wire change and is not part of this change. No test
+  refuse an id older than its own ring, needs a wire change and is not part of this change (tracked as #7204). No test
   observes a real agent at the production ring size.
 
 ## Related

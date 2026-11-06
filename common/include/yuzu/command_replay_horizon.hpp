@@ -63,7 +63,7 @@
 ///      The 2x margin absorbs the race between the horizon check and the agent's claim and the
 ///      staleness of one tick; it is NOT sized to tolerate a sustained, uncounted outage. A sound
 ///      close of the under-count needs the agent to refuse an id older than its own ring (a wire
-///      change) and is not part of this change.
+///      change) and is not part of this change; it is tracked as #7204.
 ///
 /// The margin is the headroom the count does not otherwise account for. Do not tighten it to
 /// `<`/`<=` without re-deriving all of the above.
