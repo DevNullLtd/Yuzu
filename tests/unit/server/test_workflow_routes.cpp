@@ -4906,6 +4906,23 @@ TEST_CASE("POST /api/workflows/:id/execute: a list over the stored-id cap dispat
     const auto all = nlohmann::json::parse(open->body)["data"];
     CHECK(all["agent_ids"].size() == yuzu::server::kStoredAgentIdsMax);
     CHECK(all["agent_ids_total"] == static_cast<std::int64_t>(count));
+
+    // The legacy detail route applies the same disclosure bound: a confined reader is told the
+    // list was cut but not how many devices the run named beyond its scope.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{mine}};
+    auto legacy = h.sink.Get("/api/workflow-executions/" + exec_id);
+    REQUIRE(legacy);
+    REQUIRE(legacy->status == 200);
+    const auto legacy_detail = nlohmann::json::parse(legacy->body);
+    CHECK(legacy_detail["agent_ids"] == nlohmann::json::array({mine}));
+    CHECK(legacy_detail["agent_ids_truncated"] == true);
+    CHECK_FALSE(legacy_detail.contains("agent_ids_total"));
+    h.fleet_read_scope = std::nullopt;
+    auto legacy_open = h.sink.Get("/api/workflow-executions/" + exec_id);
+    REQUIRE(legacy_open);
+    REQUIRE(legacy_open->status == 200);
+    CHECK(nlohmann::json::parse(legacy_open->body)["agent_ids_total"] ==
+          static_cast<std::int64_t>(count));
 }
 
 TEST_CASE("POST /api/workflows/:id/execute: ids of several KB each dispatch in full and the stored "

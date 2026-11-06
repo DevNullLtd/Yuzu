@@ -33,6 +33,7 @@
 #include "stream_budget.hpp"
 #include "test_route_sink.hpp"
 #include "test_workflow_api_double.hpp"
+#include "workflow_model.hpp"
 #include "workflow_execute.hpp"
 #include "workflow_execute_routes.hpp"
 #include "workflow_parity_scenarios.hpp"
@@ -129,6 +130,9 @@ struct Fx {
     std::function<ConfinedDispatchOutcome(const WorkflowStepInstruction&,
                                           const std::vector<std::string>&, const DispatchCaller&)>
         dispatch_override;
+
+    /// The `agent_ids_json` text the stand-in engine would store for the last run it started.
+    std::string stored_agent_ids_text;
 
     std::string engine_status{"completed"};
     /// The step rows and status the stand-in engine persisted per execution id, as the real
@@ -326,10 +330,13 @@ struct Fx {
     /// synchronously, one callback per step; a failed step does not stop the loop here
     /// (on_failure=continue semantics).
     WorkflowRunFn run_fn() {
-        return [this](const std::string&, const std::vector<std::string>&, StepDispatchFn fn,
+        return [this](const std::string&, const std::vector<std::string>& agent_ids, StepDispatchFn fn,
                       ConditionEvalFn, const WorkflowRunControl& control)
                    -> std::expected<std::string, std::string> {
             engine_called = true;
+            // What the real engine stores for the run row, from the same function and the hook the
+            // sequence handed it.
+            stored_agent_ids_text = stored_agent_ids_json(agent_ids, control.stored_copy_first);
             seen_deadline = control.deadline;
             seen_before_attempt = static_cast<bool>(control.before_attempt);
             if (!engine_error)
@@ -2744,6 +2751,30 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a malformed body is a 400 even a
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(r.refused("per_principal_stream_cap") == 0);
+}
+
+TEST_CASE("workflow execute: a confined creator naming more than the stored-id cap still sees its own "
+          "run, through the REST v1 route (#2146 stored_copy_first)",
+          "[workflow][twin][rest][security][stored_ids]") {
+    Rest r;
+    const std::size_t count = kStoredAgentIdsMax + 50;
+    nlohmann::json body{{"agent_ids", nlohmann::json::array()}};
+    for (std::size_t i = 0; i < count; ++i)
+        body["agent_ids"].push_back("other-" + std::to_string(i)); // others' devices first
+    body["agent_ids"].push_back("mine");
+    r.caller.exec_visible = authz::VisibleSet{std::unordered_set<std::string>{"mine"}};
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", body.dump());
+    REQUIRE(res);
+    REQUIRE(res->status == 202);
+
+    WorkflowExecution we;
+    we.agent_ids_json = r.fx.stored_agent_ids_text;
+    REQUIRE(stored_agent_ids_total(we.agent_ids_json) == static_cast<std::int64_t>(count + 1));
+    CHECK(workflow_execution_visible(
+        we, authz::VisibleSet{std::unordered_set<std::string>{"mine"}}));
+    // A reader scoped to a device that did not make the stored copy does not see it (fails closed).
+    CHECK_FALSE(workflow_execution_visible(
+        we, authz::VisibleSet{std::unordered_set<std::string>{"other-" + std::to_string(count - 1)}}));
 }
 
 TEST_CASE("workflow run budget: the REST route stamps a 60 s deadline when it takes the call, and the "

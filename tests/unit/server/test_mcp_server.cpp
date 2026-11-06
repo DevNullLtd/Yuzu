@@ -78,6 +78,7 @@
 #include "test_workflow_api_double.hpp" // ADR-0031 WS-A4 (eighth family): FnWorkflowApi, seam-bypass tripwire tests
 #include "store_errors.hpp"               // kDbErrorPrefix (list_workflow_executions degrade test)
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
+#include "workflow_model.hpp" // stored_agent_ids_json: the stored-copy hook test
 #include "workflow_execute.hpp" // #2146: kWorkflowSyncBudget, the run budget the MCP cap case asserts
 #include "dispatch_zero_reach.hpp" // ZeroReachCause / zero_reach_token: the closed zero-reach list the execute_workflow schema must name
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
@@ -49974,6 +49975,56 @@ TEST_CASE("MCP execute_workflow: a caller with no tier (the handler path) claims
     CHECK(sj["execution_id"] == "exec-1");
     CHECK(fx.run_calls == 1);
     CHECK(fx.dispatches == 2);
+}
+
+TEST_CASE("MCP execute_workflow: a confined creator naming more than the stored-id cap still sees "
+          "its own run (#2146 stored_copy_first)",
+          "[mcp][pg][workflow][twin][security][stored_ids]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.caller_fn_for_test = [](const auth::Session&) {
+        return yuzu::server::DispatchCaller{
+            .principal = "alice",
+            .principal_role = "user",
+            .exec_visible = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"mine"}},
+            .principal_is_admin = false};
+    };
+    std::string stored;
+    ts.workflow_run_for_test = [&](const std::string&, const std::vector<std::string>& agent_ids,
+                                   yuzu::server::StepDispatchFn, yuzu::server::ConditionEvalFn,
+                                   const yuzu::server::WorkflowRunControl& control)
+        -> std::expected<std::string, std::string> {
+        ++fx.run_calls;
+        stored = yuzu::server::stored_agent_ids_json(agent_ids, control.stored_copy_first);
+        if (control.on_admitted)
+            control.on_admitted("exec-1");
+        return std::string{"exec-1"};
+    };
+    ts.start_with_dispatch(fx.dispatch_fn());
+
+    const std::size_t count = yuzu::server::kStoredAgentIdsMax + 50;
+    nlohmann::json args{{"workflow_id", "wf-1"}, {"agent_ids", nlohmann::json::array()}};
+    for (std::size_t i = 0; i < count; ++i)
+        args["agent_ids"].push_back("other-" + std::to_string(i)); // others' devices first
+    args["agent_ids"].push_back("mine");
+    auto res = ts.call(wf_exec_call(args.dump(), 1));
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(fx.run_calls == 1);
+
+    yuzu::server::WorkflowExecution we;
+    we.agent_ids_json = stored;
+    REQUIRE(yuzu::server::stored_agent_ids_total(stored) == static_cast<std::int64_t>(count + 1));
+    CHECK(yuzu::server::workflow_execution_visible(
+        we, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"mine"}}));
 }
 
 TEST_CASE("MCP execute_workflow: publishes the legacy workflow.executed once for an admitted run of "

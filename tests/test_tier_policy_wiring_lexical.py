@@ -89,6 +89,15 @@ call site would pass every existing test. This gate closes that:
      wiring can show it). The drain loop's own feed is pinned in
      tests/unit/server/test_shutdown_join_order.cpp.
 
+  9. (#2146, stored agent id copy) `WorkflowRunControl::stored_copy_first` is OPTIONAL by construction
+     (an empty one stores the ids in request order), so deleting the setter compiles and passes every
+     unit rig while a confined creator that names more than the stored cap loses sight of its own
+     run. Pinned as active lines, each EXACTLY ONCE with its body: workflow_execute.cpp's
+     `drive_run` (`control.stored_copy_first = [&req](...) { return authz::in_scope(
+     req.caller.exec_visible, id); };`, shared by REST v1 and MCP) and workflow_routes.cpp's legacy
+     execute handler (`... [&caller] ... caller.exec_visible`). Behaviour is pinned beside the
+     stand-ins in test_workflow_execute_twins.cpp and test_mcp_server.cpp.
+
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
 `/* */` block that comments out an entire real site while preserving its exact leading
@@ -301,6 +310,29 @@ SHOULD_STOP_DRAIN = ("                    if (draining_.load(std::memory_order_a
                      "                        return yuzu::server::WorkflowStopLevel::kDraining;\n")
 
 
+WORKFLOW_EXECUTE_CPP = ROOT / "server" / "core" / "src" / "workflow_execute.cpp"
+WORKFLOW_ROUTES_CPP = ROOT / "server" / "core" / "src" / "workflow_routes.cpp"
+STORED_COPY_DRIVE_RUN = (r"^[ \t]*control\.stored_copy_first = \[&req\]\(const std::string& id\) \{\s*"
+                         r"return authz::in_scope\(req\.caller\.exec_visible, id\);\s*\};")
+STORED_COPY_LEGACY = (r"^[ \t]*control\.stored_copy_first = \[&caller\]\(const std::string& id\) \{\s*"
+                      r"return authz::in_scope\(caller\.exec_visible, id\);\s*\};")
+STORED_COPY_ANY = r"^[ \t]*(?:\w+\.)?stored_copy_first\s*="
+
+
+def stored_copy_problems(execute_src, routes_src):
+    """One message per violated clause 9 pin; [] when clean."""
+    out = []
+    for label, src, pat in (("workflow_execute.cpp (drive_run, REST v1 and MCP)", execute_src, STORED_COPY_DRIVE_RUN),
+                            ("workflow_routes.cpp (legacy execute handler)", routes_src, STORED_COPY_LEGACY)):
+        n = count_rx(pat, src)
+        every = count_rx(STORED_COPY_ANY, src)
+        if n != 1 or every != 1:
+            out.append(f"expected exactly 1 active 'control.stored_copy_first = ...in_scope(<caller>.exec_visible, id)' "
+                       f"assignment in {label}, found {n} well-formed of {every} assignments. Without it a confined "
+                       "creator that names more than the stored cap loses sight of its own run.")
+    return out
+
+
 class TierPolicyWiringLexical(unittest.TestCase):
     def setUp(self):
         self.src = SERVER_CPP.read_text(encoding="utf-8")
@@ -491,6 +523,39 @@ class TierPolicyWiringLexical(unittest.TestCase):
                 for frag in present:
                     self.assertIn(frag, joined)
                 self.assertEqual(len(p), len(present))
+
+
+class StoredCopyHookWiringLexical(unittest.TestCase):
+    def setUp(self):
+        self.execute = WORKFLOW_EXECUTE_CPP.read_text(encoding="utf-8")
+        self.routes = WORKFLOW_ROUTES_CPP.read_text(encoding="utf-8")
+
+    def test_source_is_clean(self):
+        p = stored_copy_problems(self.execute, self.routes)
+        for m in p:
+            print(f"\n::error::{TAG}: {m}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_mutations_are_caught(self):
+        drive = re.search(STORED_COPY_DRIVE_RUN, self.execute, re.M).group(0)
+        legacy = re.search(STORED_COPY_LEGACY, self.routes, re.M).group(0)
+        cases = [
+            ("drive_run setter deleted", self.execute.replace(drive, "", 1), self.routes),
+            ("drive_run setter commented out", self.execute.replace(drive, "// " + drive, 1), self.routes),
+            ("drive_run hook ignores the caller's scope",
+             self.execute.replace(drive, drive.replace("authz::in_scope(req.caller.exec_visible, id)", "false"), 1),
+             self.routes),
+            ("drive_run setter duplicated", self.execute + drive + "\n", self.routes),
+            ("legacy setter deleted", self.execute, self.routes.replace(legacy, "", 1)),
+            ("legacy setter commented out", self.execute, self.routes.replace(legacy, "// " + legacy, 1)),
+            ("legacy hook ignores the caller's scope", self.execute,
+             self.routes.replace(legacy, legacy.replace("authz::in_scope(caller.exec_visible, id)", "true"), 1)),
+        ]
+        for name, execute, routes in cases:
+            with self.subTest(mutation=name):
+                self.assertNotEqual((execute, routes), (self.execute, self.routes), "mutation did not change the source")
+                p = stored_copy_problems(execute, routes)
+                self.assertEqual(len(p), 1, p)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@
 #include "test_route_sink.hpp"
 #include "workflow_api_local.hpp"
 #include "workflow_engine.hpp"
+#include "workflow_model.hpp"
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -289,6 +290,30 @@ TEST_CASE("workflows page real gate: a group-scoped reader sees its runs and not
     const auto rows = r.audit("workflow_execution.detail.fetch");
     CHECK(std::find(rows.begin(), rows.end(), "denied|r-alice") != rows.end());
     CHECK(std::find(rows.begin(), rows.end(), "denied|r-nope") == rows.end());
+}
+
+TEST_CASE("workflows page real gate: a truncated stored id list shows an unconfined viewer the true "
+          "device count and a confined viewer only its own scope (#2146)",
+          "[pg][workflow][workflows][page][confinement][authz][stored_ids]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, wf_page_tpl);
+    Rig r{db.dsn()};
+    // 12 ids named, the stored copy keeps 3 (bob-agent first) and a marker with total 12.
+    std::vector<std::string> named{"bob-agent"};
+    for (int i = 0; i < 11; ++i)
+        named.push_back("other-agent-" + std::to_string(i));
+    const auto stored = stored_agent_ids_json(named, {}, 3);
+    REQUIRE(stored_agent_ids_total(stored) == 12);
+    r.run("r-trunc", 400, stored);
+
+    auto open = r.get(r.mint("gary"), "/fragments/workflow-runs/r-trunc");
+    REQUIRE(open->status == 200);
+    CHECK(has(open->body, "<span>Devices</span><b>12</b>"));
+
+    auto confined = r.get(r.mint("bob"), "/fragments/workflow-runs/r-trunc");
+    REQUIRE(confined->status == 200);
+    CHECK(has(confined->body, "<span>Devices in your scope</span><b>1</b>"));
+    CHECK_FALSE(has(confined->body, "<b>12</b>"));
+    CHECK_FALSE(has(confined->body, "other-agent-"));
 }
 
 TEST_CASE("workflows page real gate: a service-scoped token is narrowed on runs and refused definitions",
