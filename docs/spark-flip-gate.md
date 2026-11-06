@@ -1596,8 +1596,9 @@ flip, with a red-first test each:
     `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
     accident, and server-state loss (a Postgres restore, an outbox drop) no longer self-heals by
     re-push; an explicit census resync mechanism is a flip precondition, tracked in #5718 (since
-    #5674 PR1 the census write is in the event transaction under a savepoint, though a
-    Redelivered event still does not repair it; and `guard.errored` is now a census state, #5667
+    #5674 PR1 the census write is in the event transaction under a savepoint, and since #5690
+    PR2a-1 a Redelivered event repairs a census write that failed (the event is stored with
+    pending evidence), though it still does not repair a row the re-push loss left stale; and `guard.errored` is now a census state, #5667
     residual (a), so more stale census rows can exist than when this loss was first written); (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
     the absent-row sweep and before the per-rule rewrites leaves the previous rows for carried
     rules, i.e. OLD content, including a rule the push disabled or changed, until the next push
@@ -2417,17 +2418,19 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   RESOLVED means the state mapping and its tests are done; it is not "DONE with no
   residual". Residuals to resolve or risk-accept before PR-6 sign-off (the Sign-off row's gate; the
   "pre-PR-5" tags elsewhere in this section are the original tag, kept for history): (a) on the single-event
-  ingest path a Redelivered event returns before the census write, so mixed-version redelivery never
-  repairs a census row; since #5674 PR1 the census write is in the event transaction under a
+  ingest path a Redelivered event repairs a census write that failed (#5690 PR2a-1: the event is
+  stored with pending evidence) and otherwise returns before the census write, so mixed-version
+  redelivery of an event that was projected never repairs a census row; since #5674 PR1 the census write is in the event transaction under a
   savepoint, a failed write keeps the event and is counted on
   `yuzu_server_guardian_census_proj_failures_total` (so a transient Postgres failure still leaves a detached rule showing its last verdict, now visibly), and a deleted rule's census rows are removed with it; (b)
   recovery after a spark re-arm is by code reading only, with no agent-level detach,
-  re-arm, compliant-edge test (#5676); (c) the row timestamp is agent-asserted with no
-  server clamp (`guardian_ingest.cpp:293`) and a `>=` tie rule
-  (the `ON CONFLICT ... WHERE EXCLUDED.updated_at >=` guard in `project_rule_status()`), so clock skew or a same-second tie across the
-  lifecycle and compliance lanes can leave a false compliant (#5690; live today
+  re-arm, compliant-edge test (#5676); (c) the census orders by a key limited to server receipt plus 300 s (#5690 PR2a-1;
+  the text timestamp in `guardian_ingest.cpp` (`ts_to_iso8601`) still feeds the TEXT column only) with ties broken by the
+  event INSERT's `ingest_seq`, and flags a refused, tied or unprovable ordering (`order_uncertain`), so clock skew or a same-instant tie across the
+  lifecycle and compliance lanes is shown as uncertain and no longer silently leaves a false compliant
+  (#5690; the agent now stamps milliseconds, and an agent that predates that stamps whole seconds; live today
   for guard.unhealthy; the agent-side hold, PR #5776, delays each overtake by up to
-  H = 1 s and then permits up to N = 64, but cannot close the same-second tie); (d) the census is absent from the decommission cascade, so
+  H = 1 s and then permits up to N = 64, which does not change the tie rule); (d) the census is absent from the decommission cascade, so
   REST/MCP errored_rules and the dashboard can disagree after a decommission (#5675).
 - **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
   ITSELF, not deferred.** `guardian_lifecycle_journal.cpp`'s replay-validation allowlist
@@ -2810,9 +2813,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   lane was permitted to overtake an older entry in the other lane, so events may have reached
   the stream out of enqueue order (a release is counted even if that call launches nothing).
   The audit trail is complete, but the data-integrity consequence is #5690: a later-launched
-  sender overtaking an older one, combined with the server's same-second `>=` tie in
-  `project_rule_status` (`guard.errored` versus a delayed `guard.compliant`), can leave the
-  server holding a false `compliant`. #5690 is open and gates the flip. Correlate with
+  sender overtaking an older one (`guard.errored` versus a delayed `guard.compliant`) reaches
+  the server's census ordering out of stamp order, which the server now flags `order_uncertain`
+  instead of silently keeping a false `compliant`. #5690 is open and gates the flip; the flag
+  makes the outcome visible and is not a ruling that the gate is met. Correlate with
   `yuzu.guardian_send_stalls` / send exceptions on the same endpoint
   (`docs/user-manual/metrics.md`). The gauge is an unlabelled fleet sum and there is no
   operator surface for per-agent heartbeat tags yet (`docs/prometheus/yuzu-alerts.yml`
@@ -2832,13 +2836,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `GuardianSparkRuntime::drain_bounded()`. The earlier claim here that no consumer depends on
   strict cross-lane wire ordering is withdrawn: the server maps `guard.compliant` to
   `compliant` and `guard.errored`/`guard.unhealthy` to `errored`
-  (`event_state_from_type()` in `guaranteed_state_store.cpp`) and keeps a row on
-  `EXCLUDED.updated_at >= stored` (`project_rule_status()`) at one-second timestamp resolution (`guardian_ingest.cpp:293`), with the
-  equal-timestamp case pinned by the "equal timestamps, distinct event ids" section of the "guard.errored maps to the errored census state (C-1)" case in `test_guaranteed_state_store.cpp`, so an overtaking
-  `errored` can leave a false compliant. That is #5690 (C-1 residual (c), above); the
-  agent-side hold (PR #5776) delays each overtake by up to H = 1 s and then permits up to
-  N = 64 launches, with no time bound until the lane finds no blocker or empties, so it
-  cannot close the same-second tie.
+  (`event_state_from_type()` in `guaranteed_state_store.cpp`) and, before #5690, kept a row on
+  `EXCLUDED.updated_at >= stored` at one-second timestamp resolution, so an overtaking
+  `errored` could leave a false compliant. #5690 (C-1 residual (c), above) replaced that with the
+  `(key, ingest_seq)` ordering: a same-key pair of different verdicts is ordered by arrival and flagged
+  `order_uncertain`, and the agent now stamps milliseconds. The agent-side hold (PR #5776) delays each
+  overtake by up to H = 1 s and then permits up to N = 64 launches, with no time bound until the lane
+  finds no blocker or empties; it does not change the tie rule.
 - Known behaviour of the hold (verified against `wrapped_send()` and
   `GuardianSparkRuntime::try_page_batch`'s page-time stamp, not measured on a fleet):
   (i) a large lifecycle replay is stamped at page time, so it holds live compliance entries
@@ -2857,9 +2861,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   mutex to a younger errored send released after H, so the errored reaches the wire first.
   UP-14: `enqueued_ns` is `system_clock`; a backward wall-clock step between an older compliant
   and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
-  whatever the wire order, and the hold cannot touch it (server side). Note on #5690's
-  acceptance options (factual, not a ruling): a same-second tie policy closes UP-13 but not
-  UP-14; receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
+  whatever the wire order (the pair is flagged `order_uncertain` when the errored arrives
+  second; in the other order the compliant applies, and the pair is flagged only if one of the
+  conditions in the Guardian guide's section 'When a verdict is flagged or does not move'
+  holds), and the hold cannot touch it (server side). Note on #5690's
+  acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14 (the
+  server now flags a tied or mis-ordered pair rather than keeping it silently);
+  receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
   closes both. The test `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
 - Owner: not assigned in source material.
