@@ -365,7 +365,8 @@ example.
 ### A6. Stated limits
 
 (a) A withdrawal is effective on a gateway after its next successful fetch, up to
-`mgmt_crl_refresh_ms` after the server publishes, and only for streams admitted after that: a
+`mgmt_crl_refresh_ms` after the server publishes (plus the time the loads around it take: the next
+wait starts after a load ends), and only for streams admitted after that: a
 management stream already running when the certificate is withdrawn is not cut (a new stream, even on a
 connection the server already holds open, is checked and refused). (b) The CRL is signed by the install CA, so a holder of the CA
 key can mint a certificate and a CRL that omits it; this is the same trust the identity already
@@ -474,8 +475,7 @@ host, `parse/3` run in a fresh process and its memory sampled every millisecond,
 | smallest entries (serials 1 to 755,405) | 755,405 | 16,586,359 (15.82 MiB) | 594 and 599 ms, 554 MiB | 2,535 and 2,524 ms | 1,111 MiB (both runs) | 21.2 MiB |
 
 So a gateway that is handed a CRL at the bound needs about 1.1 GiB (1,111 to 1,153 MiB measured; plan for 1.2 GiB) of free memory for the second or two
-the watcher parses it (about 2.5 KB per entry at the server's entry size; the earlier figure of "about
-half a gibibyte" understated it). Afterwards the loaded CRL is about 21 to 24 MiB per copy, and **two
+the watcher parses it (about 2.5 KB per entry at the server's entry size). Afterwards the loaded CRL is about 21 to 24 MiB per copy, and **two
 copies stay resident**: the watcher's state and the `persistent_term` the stream check reads (the parse
 result is built on the watcher's heap and then copied into `persistent_term`), so about 45 to 50 MiB.
 The watcher collects the parse garbage as soon as the parse returns (a test pins that the heap falls to
@@ -492,10 +492,10 @@ to 31536000): the widest `nextUpdate - thisUpdate` a CRL may carry, otherwise re
 gateway's clock**, so a gateway with a wrong clock is not made refuse a good CRL by it (clock faults
 stay `future_dated` and the staleness check). The refusal is made after the signature verifies and
 before the `future_dated` test: a width is a property of a CRL the CA signed. **Unset in code**, so a
-configuration written before this change behaves exactly as before; the **shipped reference
+configuration without the key has no bound; the **shipped reference
 configuration sets 691200 (8 days)**, which must stay above 7 days plus 300 seconds: a server that
-predates #6919 publishes CRLs valid for 7 days, backdated 300 seconds, and a gateway upgraded before its
-server would otherwise refuse every CRL mid-rollout (A4: the gateway must work against both). A bad value
+publishes CRLs valid for 7 days, backdated 300 seconds, would otherwise have every CRL refused (A4: the
+gateway must work against both). A bad value
 refuses the boot like its siblings. It closes the "Trust" limit of the manual for a deployment that
 sets it: a validly signed CRL with a far-future `nextUpdate` (only the CA key can sign one) is refused
 rather than believed until that date. It does not bound a CRL narrower than the setting: the 8-day
@@ -509,11 +509,12 @@ what does not decode or is not internally consistent (no `cRLNumber`, `nextUpdat
 together in `reject_reasons/0`, the `load_reject()` type, the counter's pre-seed, the metric help
 text, `metrics.md`, the Grafana README, `gateway.md`, the alert annotations and the closed-set tests.
 The refusal for policy still happens before the signature is checked, so an unsigned delta reads
-`unsupported`, not `unverified` (as before it read `malformed`).
+`unsupported`, not `unverified` (`malformed` is kept for input that does not decode).
 
 **Down-only refresh jitter (#7067 item 2).** Each wait is `mgmt_crl_refresh_ms` shortened by a random
 0 to 10 percent, never lengthened: a symmetric jitter would stretch A6(a)'s "up to
-`mgmt_crl_refresh_ms` after the server publishes" bound, and down-only keeps it. It desynchronises a
+`mgmt_crl_refresh_ms` after the server publishes" bound (which already adds the time the loads around it
+take), and down-only keeps it. It desynchronises a
 fleet restarted together (precedent: the slowed resend of unacknowledged notices, "jittered down by up to 20%" in the manual).
 
 **Size early warning (#7067 item 3).** A WARN is logged when a fetched body passes 75 percent of the
@@ -576,7 +577,7 @@ that a non-author reviewer can accept or reject it, and none is accepted by bein
 | Residual | Owner | Review-by trigger | Approver |
 |---|---|---|---|
 | (a) Transient parse memory about 1.1 GiB (1,111 to 1,153 MiB measured; plan for 1.2 GiB) at the 16 MiB bound, with the boot-time load parsing synchronously | gateway maintainers | a CRL above 50 percent of the bound, any deployment with a container memory limit, or follow-up (i), #7192, landing | approver: unset, a non-author must record it |
-| (b) The memo has a single slot: two different bad bodies served alternately are parsed and counted on every tick | gateway maintainers | a report of a feed that alternates bodies, or follow-up (v), #7193, landing | approver: unset, a non-author must record it |
+| (b) The memo has a single slot: two different bad bodies served alternately, or a bad body alternated with the accepted CRL, are parsed and counted on every other tick or every tick; a `304 Not Modified` answer (a feed that sends an `ETag`; the Yuzu server sends none) does not end the memory | gateway maintainers | a report of a feed that alternates bodies, or follow-up (v), #7193, landing | approver: unset, a non-author must record it |
 | (c) Identically replayed or `future_dated` validly signed bytes are never remembered and cost the full decode on every tick | gateway maintainers | follow-up (i), #7192, landing, or a server that publishes `future_dated` CRLs in production | approver: unset, a non-author must record it |
 | (d) The validity bound is unset in code, so the far-future-`nextUpdate` trust limit stays open for a configuration that does not set it | gateway maintainers | the release that makes the key required, or the boot refusal without a source (#7195) | approver: unset, a non-author must record it |
 | (e) The shipped 8-day bound still lets a CRL be believed for up to 8 days plus the 24-hour grace | gateway maintainers | a change in the server's CRL validity, or a shorter shipped default | approver: unset, a non-author must record it |

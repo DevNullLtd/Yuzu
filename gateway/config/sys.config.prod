@@ -206,8 +206,8 @@
         %% (`validity_too_long'): without it a CRL with a far-future nextUpdate keeps being
         %% believed and keeps the staleness alerts quiet. The width is read from the CRL's own two
         %% dates, never from this host's clock. 691200 (8 days) must stay above 7 days plus 300 s,
-        %% the validity a server that predates #6919 publishes, or a gateway upgraded before its
-        %% server refuses every CRL mid-rollout. The Yuzu server publishes 48 hours.
+        %% the validity a server that publishes 7-day CRLs backdated 300 s needs, or every CRL
+        %% is refused. The Yuzu server publishes 48 hours.
         %% The example below is commented out because this file ships no mgmt_crl_source (a key with no
         %% source is inert); deploy/docker/reference-gateway-sys.config sets both, so a deployment that
         %% enables the source here should set this key with it.

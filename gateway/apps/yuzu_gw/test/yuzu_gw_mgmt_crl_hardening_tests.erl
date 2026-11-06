@@ -506,6 +506,26 @@ an_accepted_crl_ends_the_memory_test() ->
         ?assertEqual([unverified, unverified], Rs)
     end).
 
+%% The identical-bytes path ends the memory too: A good, B refused, A again (the same bytes as the
+%% CRL held, so no parse), B again within the hour is a new rejection and is counted.
+identical_accepted_bytes_end_the_memory_test() ->
+    with_memo(fun() ->
+        P = policy(),
+        ok = yuzu_gw_mgmt_crl_source:publish_policy(P),
+        Good = crl("crl-populated.der"),
+        Bad = crl("crl-evil.der"),
+        S1 = yuzu_gw_mgmt_crl_source:load(P, state(), fetch_of(Good), ?NOW),
+        S2 = yuzu_gw_mgmt_crl_source:load(P, S1, fetch_of(Bad), ?NOW + 5),
+        ?assertMatch(#{rejected := {_, _, _, unverified, _}}, S2),
+        S3 = yuzu_gw_mgmt_crl_source:load(P, S2, fetch_of(Good), ?NOW + 10),
+        ?assertMatch(#{rejected := none, last_reject := undefined}, S3),
+        S4 = yuzu_gw_mgmt_crl_source:load(P, S3, fetch_of(Bad), ?NOW + 15),
+        ?assertMatch(#{last_reject := unverified}, S4),
+        ?assertEqual(3, parses()),     %% Good, Bad, Bad again; the second Good is not parsed
+        {Rs, _} = drain(),
+        ?assertEqual([unverified, unverified], Rs)
+    end).
+
 %% What is never remembered.
 only_the_six_are_memoisable_test() ->
     ?assertEqual(lists:sort([malformed, unsupported, too_large, unverified, issuer_mismatch,

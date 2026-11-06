@@ -508,9 +508,11 @@ applied(Bin, CaDers, Etag, State0, Now, Policy) ->
     CaHash = crypto:hash(sha256, CaDers),
     case Loaded =/= none andalso Hash =:= OldHash andalso CaHash =:= OldCaHash of
         true ->
-            %% The same bytes under the same certificates: nothing to verify again.
+            %% The same bytes under the same certificates: nothing to verify again. Like any
+            %% accepted CRL, they end the memory of an earlier refusal (A good, B refused, A
+            %% again, B again: B's second run is a new rejection and is counted).
             report_state(Loaded, true),
-            State#{etag := Etag, last_reject := undefined};
+            State#{etag := Etag, last_reject := undefined, rejected => none};
         false ->
             MaxValidity = maps:get(max_validity_s, Policy, undefined),
             case memo_state(maps:get(rejected, State, none), Hash, CaHash, MaxValidity, Now) of
@@ -575,7 +577,7 @@ warn_size(Bin, State, Now) ->
             logger:warning(
               "mgmt_crl_source: the CA's CRL is ~b bytes, ~.1f% of the ~b byte bound; past it "
               "every fetch is refused (too_large) and the CRL held stops being refreshed. The "
-              "CRL only grows: plan the gateway upgrade (docs/user-manual/gateway.md, Limits)",
+              "CRL only grows: plan a raise of the bound (docs/user-manual/gateway.md, Limits)",
               [Size, Size * 100 / Max, Max]),
             State#{size_warned_at => Now};
         false ->

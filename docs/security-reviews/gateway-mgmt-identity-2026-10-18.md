@@ -152,8 +152,8 @@ not be enabled there. A pin is immune to both.
    verification certificates and the `mgmt_crl_max_validity_s` in force, for one hour, and never for
    `future_dated`, `replay` or a fetch failure, so it can pin a refusal for at most an hour and cannot change
    what a CRL admits. The reference configuration now ships `mgmt_crl_max_validity_s` 691200 (8 days): a
-   server older than #6919 publishes 7-day CRLs backdated 300 s, which sits under that bound by one day minus
-   300 s, so a gateway upgraded first does not refuse every CRL mid-rollout; a feed wider than 8 days is
+   server that publishes 7-day CRLs backdated 300 s sits under that bound by one day minus
+   300 s, so such a feed is admitted; a feed wider than 8 days is
    refused `validity_too_long` and, with no CRL held, fails the plane closed. The residuals this adds are
    listed, unapproved, in the ADR 2004 Update.
 3. **The deny-list names serials, not keys.** A compromised server **key** is withdrawn by denying

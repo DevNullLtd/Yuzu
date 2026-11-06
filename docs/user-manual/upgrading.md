@@ -2376,70 +2376,36 @@ The release that introduced the server identity (the section above) left it an o
 
 ## Behaviour change: the gateway reads the CA's CRL, so a withdrawn server certificate is refused (#6016 PR 4b)
 
-Until now an identity-mode gateway admitted any certificate carrying the server identity for as long as it verified; revoking one in the CA inventory changed nothing on the gateway unless an operator added its serial to `mgmt_peer_denied` and restarted. The reference gateway config (`deploy/docker/reference-gateway-sys.config`) now sets `{yuzu_gw, mgmt_crl_source}` (`sys.config.prod` has it commented): the gateway fetches the CA's public CRL from the server's 8443 over verified TLS and refuses a listed serial (`crl_revoked`). A gateway config of your own that does not set it is unchanged and logs a WARN under `identity` and `identity_or_pin`; a later release will refuse to boot there.
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a fleet forward.
 
-| Your gateway configuration | What this release does |
+An identity-mode gateway with a CRL source refuses any server certificate whose serial the CA's CRL lists (`crl_revoked`). The reference gateway config (`deploy/docker/reference-gateway-sys.config`) sets `{yuzu_gw, mgmt_crl_source}` (`sys.config.prod` has it commented): the gateway fetches the CA's public CRL from the server's 8443 over verified TLS. With no source, the gateway admits any certificate carrying the server identity for as long as it verifies, and revoking one in the CA inventory changes nothing on the gateway unless an operator adds its serial to `mgmt_peer_denied` and restarts. A gateway config that does not set the key logs a WARN under `identity` and `identity_or_pin`; a later release will refuse to boot there.
+
+| Your gateway configuration | Behaviour |
 |---|---|
 | The shipped reference config, taken fresh | Fetches `https://server:8443/api/v1/ca/crl` every 5 s, trusting the management listener's `cacertfile`. |
-| Your own `sys.config`, no `mgmt_crl_source` | Unchanged; the boot logs a WARN (`{yuzu_gw, mgmt_crl_source} is not set ...`). |
+| Your own `sys.config`, no `mgmt_crl_source` | No CRL check; the boot logs a WARN (`{yuzu_gw, mgmt_crl_source} is not set ...`). |
 | A server whose 8443 certificate is not issued by the install CA (a bring-your-own dashboard certificate), or whose names do not include the URL host (the reference compose passes `--cert-san=dns:server`) | **Set `{url, Url, #{cacertfile => Path}}` naming the CA that issued it and use a host the certificate carries, or `{file, Path}`.** Otherwise the fetch fails `fetch_tls` (the same reason for a CA or a name mismatch) and **every management stream is refused `revocation_unknown`**. |
-| A `pin`-mode gateway that sets a source | The check still applies to the pinned certificate, which must be issued by the CA that signs the CRL, or every stream is refused. |
+| A `pin`-mode gateway that sets a source | The check applies to the pinned certificate, which must be issued by the CA that signs the CRL, or every stream is refused. |
 
-**Before you upgrade the gateway:** upgrade every server replica first, so the CRL is served and republished on the 48 hour cadence (the `0.16.x` row above). **Renewing the server certificate:** the one automatic re-issue (the upgrade that adds the identity) revokes the old server serial as `superseded` and publishes the CRL at once, so restart every server replica back to back: a replica that has not restarted still presents the old certificate and is refused (`no_uri_san` in `identity` mode, `crl_revoked` where a pin admitted it) until it does. Do not revoke a server serial by hand while a replica still uses it, and see [Withdrawing a server certificate](gateway.md#withdrawing-a-server-certificate) for the by-hand revoke, which a restart does not undo.
+**Order in a fresh deployment:** bring up every server replica before the gateways, so the CRL is served and republished on the 48 hour cadence. **Replacing the server certificate:** when the old server serial is revoked (including as `superseded` when the certificate is replaced), the CA publishes the CRL at once, so restart every server replica back to back: a replica that has not restarted still presents the old certificate and is refused (`no_uri_san` in `identity` mode, `crl_revoked` where a pin admitted it) until it does. Do not revoke a server serial by hand while a replica still uses it, and see [Withdrawing a server certificate](gateway.md#withdrawing-a-server-certificate) for the by-hand revoke, which a restart does not undo.
 
-**Applying it** is a gateway restart, which disconnects the node's agents: do it only if they can take the disconnect, because agents without the #5183 fix stay wedged after a gateway restart. Roll the gateways one at a time.
+**Changing the gateway's CRL configuration** is a gateway restart, which disconnects the node's agents: do it only if they can take the disconnect, because agents without the #5183 fix stay wedged after a gateway restart. Restart the gateways one at a time.
 
-**Log text.** The gateway's rejection log line now ends `see mgmt_peer_auth_mode, mgmt_peer_pins, mgmt_crl_source)`; a SIEM or log rule that matches the previous tail (`..., mgmt_peer_pins)`) needs updating.
+**Log text.** The gateway's rejection log line ends `see mgmt_peer_auth_mode, mgmt_peer_pins, mgmt_crl_source)`; a SIEM or log rule that matches it should match that tail.
 
-**Checking it worked:** `yuzu_gw_mgmt_crl_loaded` is `1` and `yuzu_gw_mgmt_crl_number` matches the server's CRL; `yuzu_gw_mgmt_crl_rejected_total{reason}` names why a fetch failed. **Rolling back the gateway** to a binary from before this change **silently drops the CRL check**: that binary ignores `mgmt_crl_source`, so a withdrawn certificate is admitted again and nothing warns you except the absence of the `yuzu_gw_mgmt_crl_*` series. A binary from before #6016 ignores `mgmt_peer_denied` too, so put the pins back first (the previous section's rollback paragraph); from #6016 on, re-add withdrawn serials to `mgmt_peer_denied` before you roll back.
+**Checking it works:** `yuzu_gw_mgmt_crl_loaded` is `1` and `yuzu_gw_mgmt_crl_number` matches the server's CRL; `yuzu_gw_mgmt_crl_rejected_total{reason}` names why a fetch failed. A gateway that exports no `yuzu_gw_mgmt_crl_*` series is not checking the CRL, whatever `mgmt_crl_source` says, and admits a withdrawn certificate with no other warning, so confirm those series exist on every gateway.
 
 ## Behaviour change: the gateway's CRL reasons, refusal counting and validity bound (#7070, #7067)
 
-These follow the gateway CRL change above and apply when the gateway binary is upgraded. The relabelling
-in (a) changes a label and nothing else, and the hourly re-evaluation in (b) re-adjudicates the same
-bytes under the same certificates and so cannot change admission. **Only (c) can change what the
-management plane admits or refuses, and only if you adopt the key or the new reference config** (a CRL
-feed wider than the bound).
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a fleet forward.
 
-- **(a) Policy refusals are now `unsupported`, not `malformed`.** A CRL that decodes but is refused by
-  policy (a delta, scoped or indirect CRL, a `removeFromCRL` entry, an extension the gateway cannot
-  process) was counted and logged `malformed`; it is now `yuzu_gw_mgmt_crl_rejected_total{reason="unsupported"}`,
-  and `malformed` is kept for input that does not decode. A dashboard or alert keyed on `malformed`
-  to catch those goes quiet; add `unsupported` to it. The set is now fourteen reasons (also
-  `validity_too_long`, all created at 0 at start).
-- **(b) The rejection counter counts once per distinct rejection, repeated hourly.** A CRL refused
-  because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`,
-  `validity_too_long`) is remembered by hash for one hour and not decoded again on every refresh, so
-  `rate()` of `yuzu_gw_mgmt_crl_rejected_total` sees less than before (once an hour while the refusal
-  persists, instead of every 5 seconds). `future_dated`, `replay`, the fetch reasons and a `too_large` reported by the fetch still count
-  every attempt. The state gauges (`yuzu_gw_mgmt_crl_loaded`, `..._last_success_timestamp_seconds`) are
-  reported exactly as before, and no shipped alert rates on the counter: a rule of your own that does
-  should read `increase()` over a window longer than an hour, or the gauges.
-- **(c) The reference config now sets `mgmt_crl_max_validity_s` to `691200` (8 days).** A CRL whose
-  `nextUpdate` is more than 8 days after its `thisUpdate` is refused `validity_too_long`. The Yuzu server
-  publishes 48 hours, and a server older than #6919 seven days, so the shipped value admits both. **A
-  CRL source whose CRLs are valid for longer than 8 days (a corporate CA feed, a `{file, Path}` you
-  build yourself with a wide window) gets `validity_too_long`; with no CRL yet held, every management
-  stream is then refused `revocation_unknown`** until a narrower CRL loads. This is the dominant case:
-  the gateway restart that applies the upgrade drops the CRL the old process held, so a feed wider than
-  the bound with no CRL held refuses every management stream from the first moment of the new process
-  until the key is raised. A bound below the width the server itself publishes (about 173,100 s) does
-  the same to the Yuzu server's own CRLs. Raise the key, or remove
-  it (unset is no bound, and is the default in code; an existing `sys.config` of your own is unchanged
-  unless you add the key). A change is read at boot, so it takes a gateway restart (not a reload),
-  which disconnects the node's agents as above.
-- **(d) Smaller changes.** The boot line `Management CRL source: ...` gains `; maximum validity <n>s`
-  (or `not bounded`), which a log rule matching the old tail needs to allow for. The gateway logs a
-  WARN, at most once an hour, once a fetched CRL passes 12 MiB (75 percent of the 16 MiB bound). The
-  refresh wait is now shortened by a random 0 to 10 percent (never lengthened), so a fleet restarted
-  together does not poll the server in one burst; a withdrawal still reaches a gateway within one
-  `mgmt_crl_refresh_ms`.
-- **(e) Sizing note.** Measured, parsing a CRL at the 16 MiB bound costs the gateway **about 1.1 GiB of
-  transient memory (1,111 to 1,153 MiB measured; plan for 1.2 GiB)** (about 2.5 KB per entry at the
-  server's entry size) and 2 to 2.5 seconds, then about 21 to 24 MiB per copy stays held, in two copies
-  (the watcher's state and `persistent_term`). The memory shedder counts this against the cgroup limit and
-  may suspend the agent listeners during such a parse, before an out-of-memory kill. Size a gateway's memory limit for the CRL it can be handed, not for
-  today's: the old manual figure of about half a gibibyte was too low. See `gateway.md`, "Limits".
+These follow the gateway CRL change above. The reason labelling in (a) and the hourly re-evaluation in (b) re-adjudicate the same bytes under the same certificates and so cannot change admission. **Only (c) can change what the management plane admits or refuses, and only for a CRL feed wider than the bound.**
+
+- **(a) The reason set is fourteen.** A CRL that decodes but is refused by policy (a delta, scoped or indirect CRL, a `removeFromCRL` entry, an extension the gateway cannot process) is counted and logged `yuzu_gw_mgmt_crl_rejected_total{reason="unsupported"}`; `malformed` is for input that does not decode; `validity_too_long` is a CRL wider than the bound in (c). All fourteen are created at 0 at start. A dashboard or alert meant to catch policy refusals selects `unsupported`, not `malformed`.
+- **(b) The rejection counter counts once per distinct rejection, repeated hourly.** A CRL refused because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`) is remembered by hash for one hour and not decoded again on every refresh, so `rate()` of `yuzu_gw_mgmt_crl_rejected_total` sees one count an hour while the refusal persists, not one every 5 seconds. A CRL that is accepted ends the memory, including the same bytes as the CRL already held; a `304 Not Modified` answer from a feed that sends an `ETag` does not (the Yuzu server sends none). `future_dated`, `replay`, the fetch reasons and a `too_large` reported by the fetch count every attempt. The state gauges (`yuzu_gw_mgmt_crl_loaded`, `..._last_success_timestamp_seconds`) are reported on every refresh, and no shipped alert rates on the counter: a rule of your own that does should read `increase()` over a window longer than an hour, or the gauges.
+- **(c) The reference config sets `mgmt_crl_max_validity_s` to `691200` (8 days).** A CRL whose `nextUpdate` is more than 8 days after its `thisUpdate` is refused `validity_too_long`. The Yuzu server publishes 48 hours, so the shipped value leaves wide headroom. **A CRL source whose CRLs are valid for longer than 8 days (a corporate CA feed, a `{file, Path}` you build yourself with a wide window) gets `validity_too_long`.** A gateway starts holding no CRL, so a feed wider than the bound refuses every management stream `revocation_unknown` from the first moment until a narrower CRL loads. A bound below the width the server itself publishes (about 173,100 s) does the same to the Yuzu server's own CRLs. Raise the key (an integer from 3600 to 31536000), or remove it (the only option for a feed wider than a year): unset means no bound, which is the default in code, so a `sys.config` of your own has no bound until you set the key. The key is read at boot, so a change takes a gateway restart (not a reload), which disconnects the node's agents as above.
+- **(d) Smaller behaviours.** The boot line `Management CRL source: ...` ends `; maximum validity <n>s` (or `not bounded`). The gateway logs a WARN, at most once an hour, once a fetched CRL passes 12 MiB (75 percent of the 16 MiB bound). The refresh wait is shortened by a random 0 to 10 percent (never lengthened), so a fleet restarted together does not poll the server in one burst. A withdrawal reaches a gateway within one `mgmt_crl_refresh_ms` of the server publishing it, plus the time the loads around it take: the next wait starts after a load ends, and a load is a fetch (bounded at 3 s) plus, for a CRL near the bound, 2 to 2.5 seconds to decode and verify; a failed fetch adds another interval.
+- **(e) Sizing note.** Parsing a CRL at the 16 MiB bound costs the gateway **about 1.1 GiB of transient memory (1,111 to 1,153 MiB measured; plan for 1.2 GiB)** (about 2.5 KB per entry at the server's entry size) and 2 to 2.5 seconds, then about 21 to 24 MiB per copy stays held, in two copies (the watcher's state and `persistent_term`). The memory shedder counts this against the cgroup limit and may suspend the agent listeners during such a parse, before an out-of-memory kill. A memory limit below the peak kills the gateway during that parse, and because the boot load parses synchronously it is killed again on every restart; on a limit below about 1.6 GiB the shedder suspends the agent listeners first. Size a gateway's memory limit for the CRL it can be handed, not for today's. See `gateway.md`, "Limits".
 
 ## Behaviour change: the Security and sign-in page (single sign-on, two-factor, HTTPS and agent mTLS)
 
