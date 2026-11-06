@@ -2262,6 +2262,11 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
             spec["paths"].at("/guaranteed-state/status/{agent_id}").at("get").value("description", "");
         CHECK(sdesc.find("reads all-zero here") != std::string::npos);
         CHECK(sdesc.find("unrepresented_pending_guards") != std::string::npos);
+        const std::string fdesc =
+            spec["paths"].at("/guaranteed-state/status").at("get").value("description", "");
+        CHECK(fdesc.find("counts only pairs that have a census row") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/agents/{agent_id}/rules") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/device-compliance") != std::string::npos);
 
         // all-guards: the inline schema.
         const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
