@@ -655,7 +655,8 @@ public:
     ///
     /// Returns nullopt when the store is closed or the read degraded. NEVER treat nullopt as zero:
     /// the outbox refuses to send on an unreadable position. Failures on a replica other than the
-    /// one reading are not counted: see `common/include/yuzu/command_replay_horizon.hpp`.
+    /// one reading, or in an earlier process lifetime of the same one, are not counted (that is
+    /// the first of several under-count cases): see `common/include/yuzu/command_replay_horizon.hpp`.
     [[nodiscard]] std::optional<DispatchPosition> current_dispatch_position() const;
 
     /// #3678: count one dispatch whose `record_command_dispatch` write did not happen -- failed,

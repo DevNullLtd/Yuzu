@@ -18399,7 +18399,7 @@ private:
                                                                    plugin, action);
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
-                // #3678 (R4): the dispatch counters (DispatchPosition) the redelivery horizon is
+                // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
                 // measured on. An unwired tracker reads as unreadable, which HOLDS every
                 // occurrence (fail closed) -- never as 0.
                 .dispatch_seq_fn = [this]() -> std::optional<DispatchPosition> {

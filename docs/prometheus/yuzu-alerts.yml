@@ -1003,7 +1003,7 @@ groups:
           summary: "The command outbox is holding all scheduled work on {{ $labels.instance }}"
           description: >-
             For several minutes (roughly 7 or more) the command outbox delivery loop on
-            {{ $labels.instance }} has been unable to read the dispatch counters its redelivery
+            {{ $labels.instance }} has been unable to read the dispatch counts its retry
             limit needs (cause sequence_unreadable) or has no reader wired (sequence_unwired), so
             it sends and fails NOTHING: every pending scheduled occurrence is held and no audit row
             is written. The alert keeps firing for about 10 minutes after the read recovers.
@@ -1021,7 +1021,8 @@ groups:
       # UPDATE on the outbox, or a store that cannot write. Like a hold it stalls scheduled work
       # with a throttled log line and no audit row, but it is excluded from YuzuOutboxHeld because
       # it also occurs for a few seconds at every leader handover. `for: 1h` over a 30m window
-      # means only a persistent failure fires it.
+      # fires after a failure of roughly 35 to 45 minutes (31m does not, 45m does) and keeps
+      # firing for up to 30 minutes after recovery: a persistent failure, not a handover.
       - alert: YuzuOutboxStampFailing
         expr: |
           sum by (instance) (increase(yuzu_server_command_outbox_deliver_hold_cause_total{cause="stamp_not_committed"}[30m])) > 0
@@ -1031,11 +1032,11 @@ groups:
         annotations:
           summary: "The command outbox cannot record first-attempt stamps on {{ $labels.instance }}"
           description: >-
-            For at least an hour the command outbox delivery loop on {{ $labels.instance }} has
+            For roughly 35 to 45 minutes or more the command outbox delivery loop on {{ $labels.instance }} has
             been unable to commit the stamp it must write before a scheduled occurrence's first
             attempt, so those occurrences are HELD (not sent, not failed, no audit row). Likely
-            causes: the command_outbox_store schema is missing the dispatch stamp columns (a
-            database that ran an earlier unreleased build of this change), the server role lacks
+            causes: the command_outbox_store schema is missing the dispatch stamp columns (check its
+            schema_meta version), the server role lacks
             UPDATE on the outbox, or Postgres is rejecting writes. Check the server log line
             "held: stamp_not_committed" and the outbox's schema_meta version.
 
@@ -1049,12 +1050,14 @@ groups:
       # `increase()` ignores a series' FIRST sample, so a dead-letter on the first leader tick
       # after a restart (which can land inside one scrape interval) would create the series
       # already at N>0 and never fire. The second clause covers that: a series that is non-zero
-      # now and did not exist an hour ago.
+      # now and had no sample at all between 7 hours and 1 hour ago (a range lookup, not a point
+      # lookup: a scrape gap of up to 6 hours must not make a long-lived series look newborn).
       - alert: YuzuOutboxDeadLettered
         expr: |
           increase(yuzu_server_command_outbox_deliver_horizon_exceeded_total[1h]) > 0
             or (yuzu_server_command_outbox_deliver_horizon_exceeded_total > 0
-                unless yuzu_server_command_outbox_deliver_horizon_exceeded_total offset 1h)
+                unless on (job, instance)
+                  last_over_time(yuzu_server_command_outbox_deliver_horizon_exceeded_total[6h] offset 1h))
         labels:
           severity: warning
         annotations:

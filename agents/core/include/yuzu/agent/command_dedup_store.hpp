@@ -183,8 +183,9 @@ public:
      * undeduplicated (its claim had failed, fail-open) OR this is a duplicate
      * terminal. It is NOT a measure of the eviction-driven double-execute: an
      * outcome aged out of the ring produces a fresh Claimed on redelivery, not a
-     * Miss, so that path is not separately detectable here (it is bounded by
-     * kMaxDedupRows exceeding the server's outbox redelivery horizon, #3678, not
+     * Miss, so that path is not separately detectable here (it is limited, as an
+     * estimate, by kMaxDedupRows exceeding the server's outbox redelivery horizon,
+     * #3678 -- see command_replay_horizon.hpp for what the estimate misses -- and not
      * observed). Best-effort + noexcept: a failure only degrades durability. Miss on
      * an empty id / closed store returns Miss / Error respectively.
      */

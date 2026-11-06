@@ -110,7 +110,7 @@ CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
         d_.metrics->describe(
             "yuzu_server_command_outbox_deliver_hold_cause_total",
             "Pending outbox occurrences HELD (neither sent nor failed) because the redelivery "
-            "horizon check (#3678) could not run, by `cause`: sequence_unwired (no reader wired; "
+            "retry-limit check (#3678) could not run, by `cause`: sequence_unwired (no reader wired; "
             "also ends the tick), sequence_unreadable (the dispatch counters could not be read; "
             "also ends the tick), or stamp_not_committed (the first-attempt stamp was fenced out, "
             "already set, or the store degraded). A held row is retried on the next tick.",

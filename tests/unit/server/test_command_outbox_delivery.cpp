@@ -1538,6 +1538,15 @@ TEST_CASE("CommandOutboxDelivery[pg]: a stamp from ANOTHER leadership term is co
         CHECK(probe.calls == 1);
         CHECK(fx.raw_state("occ-x") == "pending");
     }
+    SECTION("an EQUAL count inside one term differences to zero and the row is sent") {
+        // The boundary of the `unrecorded_now >= unrecorded_stamp` guard: equal is still same-term.
+        // With `>` instead of `>=` the row would be charged its whole count (500 >= 10) and refused.
+        fx.set_stamp("occ-x", 1000, 500, fx.epoch());
+        fx.unrecorded = 500;
+        loop.tick();
+        CHECK(probe.calls == 1);
+        CHECK(fx.raw_state("occ-x") == "pending");
+    }
     SECTION("a huge local count with the shared sequence advanced dead-letters instead of "
             "wrapping negative") {
         fx.set_stamp("occ-x", 1000, 0, fx.epoch() - 1);

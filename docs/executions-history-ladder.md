@@ -101,8 +101,8 @@ A dispatch whose record is NOT written (a failed write, a latch skip) is still s
 agent dedup-ring slot, so `AgentServiceImpl::record_command_dispatch` counts it into the process-local
 `ExecutionTracker::note_unrecorded_dispatch`. `current_dispatch_position()` returns that count beside the
 shared value, never summed into it (they are on different scales). Only the process that fails to write
-counts it: a write outage on a replica other than the
-one running the outbox is not seen there, so while `YuzuDispatchRecordWriteFailing` fires on any replica
+counts it, and an earlier process lifetime takes its count with it: a write outage on a replica other than the
+one running the outbox, or before this process started, is not seen there (`docs/command-dedup.md` has the full set), so while `YuzuDispatchRecordWriteFailing` fires on any replica
 the horizon protection should be read as weakened, not as in force.
 
 A loop that writes one record per target is bounded differently, so that an outage costs the loop one

@@ -39,7 +39,7 @@
 ///    outage age each other (100 such rows add about 3 a second). One push to
 ///    `kMaxOutboxRedeliveryHorizonCommands` targets dead-letters every stamped pending row at that
 ///    moment. A different-term reader also charges its whole unrecorded history, which includes
-///    failures that predate the stamp and which never decays inside a process: once a process has
+///    failures that predate the stamp. That count never decays inside a process: once a process has
 ///    accumulated about `kMaxOutboxRedeliveryHorizonCommands` unrecorded dispatches (one large
 ///    push during a tripped record latch is enough), EVERY later change of leadership on it
 ///    dead-letters every stamped pending row until it restarts.

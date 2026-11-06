@@ -16,10 +16,13 @@
   failed, and the tick ends (`yuzu_server_command_outbox_deliver_hold_cause_total{cause}` rises).
   **Limits.** The count is an estimate, not a guarantee. It is fleet-wide and counts a Guardian,
   asset-tag or sync push once per target, so a very large push can end a waiting occurrence early.
-  Dispatch records that fail to write are counted only by the server process that made them, so a
-  different replica, or an earlier run of the same server that has since restarted or lost
-  leadership, takes its count with it, and the limit can trip late. A command dispatched before the
-  first attempt but delivered to the agent after it is not counted. Agents running without a
+  Guardian control messages count although they take no place in the agent's memory. Dispatch
+  records that fail to write are counted only by the server process that made them, so a different
+  replica, or an earlier run of the same server that has since restarted or been taken over by
+  another replica, takes its count with it, and the limit can trip late. So can a command dispatched
+  before the first attempt but delivered to the agent after it, a database restore that leaves the
+  count above a waiting occurrence's recorded value, and a replica working from an out-of-date view
+  that sends an occurrence another replica has just marked failed. Agents running without a
   working command-dedup store are not protected: they re-run every redelivery. It does not limit
   time: an occurrence stuck on a quiet fleet is not ended by it (the time and retry-count caps
   remain open under #4167). New schema: `execution_tracker` migration 9 and `command_outbox_store`
