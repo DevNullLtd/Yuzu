@@ -91,9 +91,11 @@ inline constexpr std::chrono::milliseconds kAcquireBackoffMax{250};
 ///
 /// SHUTDOWN. The wait is deliberately not cut short by a stop: the write it serves must still
 /// get its chance during shutdown. But once `stopping()` is true the deadline is pulled in to
-/// `stop_cap` after the moment the stop was first seen, so a pool that is down cannot hold the
-/// process past the web server's own shutdown bound. `stopping` is asked after every empty
-/// answer.
+/// `stop_cap` after the moment the stop was first seen. The cap is best-effort: it is only
+/// consulted between tries, and a `try_acquire` already in flight (a pool connect can run up to
+/// its connect timeout, 10 s) is not interruptible, nor is the first try, which runs whatever the
+/// cap. Shutdown stays bounded by the web server's own bound, then the process exits hard.
+/// `stopping` is asked after every empty answer.
 ///
 /// Pure and header-only like `interruptible_wait`: the clock is injected.
 template <class TryAcquire, class Stopping, class Clock = SteadyWaitClock>

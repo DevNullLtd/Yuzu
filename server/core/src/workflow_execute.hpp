@@ -484,9 +484,9 @@ struct WorkflowExecuteRequest {
     /// `execution_id` (the `requested` row, a pre-admission refusal) joins to the run by it. Set
     /// by the transport from its response; empty only in a unit harness, which then stamps nothing.
     std::string correlation_id;
-    /// MCP only: the approval ticket the caller presented (the one `consume_ticket` spent when the
-    /// call reached the handler), written as `approval_id=` on every row so an audit reader can
-    /// join the run to the human approval without the idempotency key. Empty on REST (no ticket
+    /// MCP only: the approval id the caller presented (bounded and cleaned; only a row written
+    /// after the ticket was consumed has it verified), written as `approval_id=` on every row so
+    /// an audit reader can join the run to the human approval without the idempotency key. Empty on REST (no ticket
     /// flow) and on a call that carried none.
     std::string approval_id;
     /// MCP supervised tier only: the step effects the consumed ticket was bound to (the probe's

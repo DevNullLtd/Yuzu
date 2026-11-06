@@ -1621,7 +1621,8 @@ public:
         // Workflow runs refused at ADMISSION, by reason: a held-open cap (global_stream_cap: the
         // shared budget is full; per_principal_stream_cap: this principal already has 2 runs) or
         // a draining server. Closed set, every member pre-seeded so an absent() alert reads
-        // "never happened", not "no series yet". Nothing was read, sent or audited.
+        // "never happened", not "no series yet". No workflow or instruction was read, nothing
+        // was sent or audited (a keyed call has had only its key looked up).
         metrics_.describe(yuzu::server::kWorkflowRunRefusedMetric,
                           "Workflow runs (POST /api/v1/workflows/{id}/execute, MCP "
                           "execute_workflow, and the legacy POST /api/workflows/{id}/execute) "

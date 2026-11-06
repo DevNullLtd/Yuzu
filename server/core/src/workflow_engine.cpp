@@ -39,9 +39,10 @@ constexpr std::chrono::milliseconds kWriteTimeout{2000};
 // The ONE retry of a run's final status write, when the first attempt could not get a lease: a
 // row left `running` is an orphan nothing sweeps, so the retry is allowed to wait out a busy pool.
 constexpr std::chrono::milliseconds kFinalizeRetryTimeout{10000};
-// The most the final status write's retry may keep waiting once a server stop is seen: the web
-// server's shutdown bound is 15 s and the run's own skip writes, first finalize try and readback
-// have already spent part of it.
+// The most the final status write's retry may keep waiting once a server stop is seen, checked
+// between tries only: a lease acquire already in flight (a pool connect can run up to its connect
+// timeout, 10 s) and the first non-persist try are not interruptible, so this is best-effort and
+// the process stays bounded by the web server's 15 s shutdown bound, then the hard exit.
 constexpr std::chrono::milliseconds kFinalizeStopBudget{3000};
 
 /// Counts one run in `WorkflowEngine::in_flight_` for exactly the scope it is alive in, so no

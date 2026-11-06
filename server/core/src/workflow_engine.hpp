@@ -189,7 +189,8 @@ public:
     /// is not slept on (the step's `on_failure` policy applies at once). A THROW from `dispatch_fn`,
     /// `condition_fn` or `control.on_admitted` is a failed, never-retried step: the execution is
     /// closed `failed` through the guarded finalize, the remaining steps are marked skipped, and
-    /// the exception is rethrown to the caller, so a run is never left `running` behind a throw.
+    /// the exception is rethrown to the caller, so a throw leaves a run `running` only when the
+    /// final status write itself fails twice (below).
     /// `control.on_admitted` is called once with the new execution id after admission and before
     /// the first step.
     ///

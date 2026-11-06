@@ -1294,7 +1294,7 @@ static const ToolDef kTools[] = {
      "workflow_execution.detail.fetch (set-and-proceed, audit_persisted:false on an admitted "
      "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"agent_ids_truncated":{"type":"boolean"},"agent_ids_total":{"type":"integer"},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed — the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"agent_ids_truncated":{"type":"boolean"},"agent_ids_total":{"type":"integer"},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed: the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
 
     {"list_workflow_executions", "List workflow executions (runs) — WorkflowEngine's own multi-step "
      "run records, a DIFFERENT data model from list_executions's single-instruction fan-out "
@@ -8711,8 +8711,9 @@ McpServer::HandlerFn McpServer::build_handler(
             };
             // An execute_workflow run refused at ADMISSION (cap or draining): the same HTTP 429 /
             // 503 + Retry-After and honest retry_after_ms the streamed-POST cap answers, with the
-            // budget's own reason token. Nothing was read, sent or audited (the counter is the
-            // record) and no approval ticket was spent. The code is the existing stream-cap code
+            // budget's own reason token. No workflow or instruction was read, nothing was sent or
+            // audited (the counter is the record; a keyed call has had only its key looked up)
+            // and no approval ticket was spent. The code is the existing stream-cap code
             // (-32012) for a cap and the existing shutdown code (-32015) while draining.
             const auto respond_workflow_admission_refused = [&](const WorkflowExecuteOutcome& out) {
                 const bool draining = out.status == WorkflowExecuteStatus::kDraining;
