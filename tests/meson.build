@@ -2075,7 +2075,8 @@ if build_server
       # guard.hpp and guardian_preserved_tally.hpp (-> common/include/yuzu/log_token.hpp)
       # and spark.hpp: all header-only, found through this block plus the common/include
       # root that yuzu_server_core_dep already carries (server/core/meson.build,
-      # yuzu_server_core_incs); no link to yuzu_agent_core.
+      # its include_directories('include') and '../../common/include'); no link to
+      # yuzu_agent_core.
       #
       # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
@@ -4167,6 +4168,19 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
   _python3_test,
   args: [files('test_dedup_fleet_tags_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# guardian_backend reader wiring (#2240): lexical pins for what no unit test can see. Every
+# health-store freshness read (sweep, perf/net snapshot, both device accessors) passes the ONE
+# kAgentHealthStaleness constant (the tests only ever use windows of 0 and 300 s); the field is
+# absent from AgentRegistry::to_json_obj(), server.cpp, the legacy /api/agents routes and the
+# dashboard row (HARD RULE); and ServerImpl::health_store_ is declared before every DeviceApi
+# holder (destruction order). Carries its own in-memory mutation self-test. No build required.
+test('guardian_backend reader wiring lexical gate (#2240)',
+  _python3_test,
+  args: [files('test_guardian_backend_wiring_lexical.py')],
+  suite: 'server',
   timeout: 30,
 )
 

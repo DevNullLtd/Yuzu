@@ -253,6 +253,14 @@ TEST_CASE("DeviceApi guardian_backend: the registry is the population, the healt
     const auto ghost = api->lookup_device("gb-ghost");
     REQUIRE(ghost.has_value());
     CHECK_FALSE(ghost->has_value());
+
+    // HARD RULE (#2240): the registry's own JSON snapshot, which feeds the unauthenticated legacy
+    // GET /api/agents and the dashboard, never carries the field.
+    const auto snapshot = registry.to_json_obj();
+    REQUIRE(snapshot.is_array());
+    REQUIRE_FALSE(snapshot.empty());
+    for (const auto& entry : snapshot)
+        CHECK_FALSE(entry.contains("guardian_backend"));
 }
 
 TEST_CASE("AgentHealthStore guardian_backend accessors: staleness uses the sweep's clock and parse",
@@ -290,4 +298,8 @@ TEST_CASE("AgentHealthStore guardian_backend accessors: staleness uses the sweep
     CHECK(token == "spark");
     CHECK(yuzu::server::detail::guardian_backend_token_view(
               yuzu::server::detail::kGuardianBackendIdxSpark) == token);
+    // Pointer identity, not just equality: a view into the store's status_tags would still read
+    // "spark" after the mutation above unless a sanitizer is watching the freed node.
+    CHECK(token.data() ==
+          yuzu::server::detail::kGuardianBackendTokens[yuzu::server::detail::kGuardianBackendIdxSpark]);
 }

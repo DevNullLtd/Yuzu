@@ -16,13 +16,13 @@
 // What's covered:
 //   - GET /api/v1/devices: gate deny (401/403/503-unwired) -> no rows; gate
 //     admit + scope filter -> only in-scope rows, correct devices_omitted
-//     count; row shape matches list_agents' 5-field contract.
+//     count; row shape matches list_agents' 6-field contract.
 //   - GET /api/v1/devices/{id}: found in-scope -> 200 w/ fields (tags key
 //     always present, possibly empty — see the PURE builder section below for
 //     why); out-of-scope match collapses to the SAME 404 as a genuinely
 //     nonexistent agent_id (#1700-style existence-oracle closure).
 //   - device_agent_row_json / device_agent_detail_json (PURE, no HTTP/store):
-//     5-field row shape; tags array populated (key/value/source per entry)
+//     6-field row shape; tags array populated (key/value/source per entry)
 //     — the DeviceApi seam (device_api.hpp) always returns an (possibly
 //     empty) tags vector, so the emitted JSON always carries the key.
 //   - GET /api/v1/management-groups/agent-count-preview: perm_fn/auth_fn gate;
@@ -228,7 +228,7 @@ TEST_CASE("GET /api/v1/devices — gate denial forwards the gate's own status, n
     CHECK(res->status == 403);
 }
 
-TEST_CASE("GET /api/v1/devices — admitted + unfiltered scope returns every agent, 6-field rows",
+TEST_CASE("GET /api/v1/devices - admitted + unfiltered scope returns every agent, 6-field rows",
           "[rest][devices]") {
     DeviceRestHarness h;
     h.fleet_scope = std::nullopt; // TOP
