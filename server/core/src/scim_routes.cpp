@@ -1698,6 +1698,20 @@ void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_
     bump_deprovision_saml_unlinked(auth_mgr);
 }
 
+/// How `revoke_linked_credentials_or_fail` treats a non-persisted DURABLE SESSION delete (#4772).
+/// A required parameter with no default, so each call site states its choice.
+///
+///  - `Required`: a non-persisted session delete fails the call closed (500, audit `partial`)
+///    and the caller leaves the account untouched, so the IdP can retry and converge.
+///  - `BackstoppedByAccountRemoval`: ONLY for SCIM create-inactive. The account was created or
+///    revived a moment earlier under a fresh scim_id, so the principal set is the slug alone and
+///    holds no sessions of its own to revoke; the account removal that follows runs its own
+///    post-deactivation session wipe (`AuthManager::remove_user_checked`), which fails closed
+///    (`RemoveUserOutcome::RemovedSessionWipeFailed` / `StoreFailure`). Failing here instead would
+///    only strand a created-but-active account that the IdP's retry meets with a 409. The failure
+///    is still recorded in the audit detail, and the function still hands the principal set back.
+enum class SessionLegGate { Required, BackstoppedByAccountRemoval };
+
 /// ADR-2001 §§1,3 — resolve the deprovision principal set for `resource` and
 /// revoke credentials (tokens then sessions, per principal) across it,
 /// credentials-FIRST, before the caller proceeds to mark the account
@@ -1709,7 +1723,8 @@ void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_
 ///
 /// Returns false (and has already sent a response + audited `audit_action`
 /// as "failure"/"partial") on identity-link resolution failure, a missing/
-/// closed `token_store`, or a non-persisted token revoke — the caller MUST
+/// closed `token_store`, a non-persisted token revoke, or (under
+/// `SessionLegGate::Required`) a non-persisted durable session delete — the caller MUST
 /// NOT proceed to `remove_user`/mark-inactive in any of those cases
 /// (ADR-2001 §3 fail-closed-on-non-persist). On success, returns true and
 /// writes the revoked counts into `detail_out` (folded into the caller's own
@@ -1719,7 +1734,8 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
                                        auth::AuthManager* auth_mgr, AuditStore* audit_store,
                                        const httplib::Request& req, httplib::Response& res,
                                        const ScimResource& resource,
-                                       const std::string& audit_action, std::string& detail_out,
+                                       const std::string& audit_action, SessionLegGate session_gate,
+                                       std::string& detail_out,
                                        std::vector<std::string>* principals_out = nullptr) {
     auto principals =
         resolve_deprovision_principals(*scim_store, resource.scim_id, resource.username);
@@ -1755,25 +1771,38 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
                 // principal strings, not just the count, so the audit row is
                 // self-contained CC6.8 evidence.
                 enumerate_principals_for_audit(*principals);
-    if (!revoke_result.api_tokens_persisted || !revoke_result.sessions_persisted) {
-        // #4772: the durable session DELETE is held to the same fail-closed contract as the
-        // token revoke. A session row that did not delete survives and is rehydrated by another
-        // replica (or after a restart), so the principal would stay signed in.
-        if (!revoke_result.api_tokens_persisted)
-            detail_out += " api_tokens_db_error=true";
-        if (!revoke_result.sessions_persisted)
-            detail_out += " sessions_db_error=true";
+    // #4772: the durable session DELETE is held to the same fail-closed contract as the token
+    // revoke, except where `session_gate` says the account removal that follows is the backstop
+    // (SCIM create-inactive). A session row that did not delete survives and is rehydrated by
+    // another replica (or after a restart), so the principal would stay signed in.
+    DeprovisionRevokeResult gating = revoke_result;
+    if (session_gate == SessionLegGate::BackstoppedByAccountRemoval)
+        gating.sessions_persisted = true; // not what fails this call; still recorded below
+    if (!revoke_result.api_tokens_persisted)
+        detail_out += " api_tokens_db_error=true";
+    if (!revoke_result.sessions_persisted) {
+        detail_out += " sessions_db_error=true";
+        if (session_gate == SessionLegGate::BackstoppedByAccountRemoval)
+            detail_out += " session_leg_backstopped=true";
+    }
+    if (!gating.all_persisted()) {
         spdlog::error("ScimRoutes: the credential revoke did not persist (api_tokens={}, "
                      "sessions={}) for one or more principals linked to '{}' (scim_id={}) — "
                      "refusing to report a clean deprovision (ADR-2001 §3 fail-closed)",
                      revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                      resource.username, resource.scim_id);
         send_scim_error(res, 500,
-                        !revoke_result.api_tokens_persisted
-                            ? "failed to revoke API tokens for one or more linked identities"
-                            : "failed to revoke sessions for one or more linked identities");
+                        "failed to revoke " + std::string(failed_legs_phrase(gating)) +
+                            " for one or more linked identities");
         audit(auth_mgr, audit_store, req, audit_action, "partial", resource.scim_id, detail_out);
         return false;
+    }
+    if (!revoke_result.sessions_persisted) {
+        // Only reachable with BackstoppedByAccountRemoval: carry on to the account removal, whose
+        // own post-deactivation session wipe fails closed if the store is still unwell.
+        spdlog::warn("ScimRoutes: the session delete did not persist for '{}' (scim_id={}); "
+                     "the account removal's own session wipe is the backstop (#4772)",
+                     resource.username, resource.scim_id);
     }
     if (principals_out)
         *principals_out = std::move(*principals);
@@ -1907,8 +1936,8 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
     std::string revoke_detail;
     std::vector<std::string> principals;
     if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr, audit_store, req,
-                                           res, resource, audit_action, revoke_detail,
-                                           &principals))
+                                           res, resource, audit_action, SessionLegGate::Required,
+                                           revoke_detail, &principals))
         return false;
 
     if (remove_account_or_respond(ctx, auth_mgr, audit_store, req, res, resource.username,
@@ -2607,8 +2636,11 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 return;
             }
             std::vector<std::string> principals;
+            // #4772: the session leg is NOT what gates this create-inactive path - see
+            // `SessionLegGate::BackstoppedByAccountRemoval`. The token leg still fails closed.
             if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr, audit_store,
                                                    req, res, *resource, "scim.user.provisioned",
+                                                   SessionLegGate::BackstoppedByAccountRemoval,
                                                    revoke_detail, &principals)) {
                 record_request(auth_mgr, "create", res.status);
                 return;
@@ -3228,10 +3260,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }
-                       if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr,
-                                                              audit_store, req, res, *resource,
-                                                              "scim.user.deleted", revoke_detail,
-                                                              &erased_principals)) {
+                       if (!revoke_linked_credentials_or_fail(
+                               scim_store, token_store, auth_mgr, audit_store, req, res, *resource,
+                               "scim.user.deleted", SessionLegGate::Required, revoke_detail,
+                               &erased_principals)) {
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }

@@ -1553,7 +1553,8 @@ TEST_CASE("revoke_deprovision_credentials: reports sessions_persisted from the d
     REQUIRE_FALSE(f.auth_mgr.create_local_session_for_test("zed", auth::Role::user, true).empty());
 
     SECTION("healthy store: both legs persist") {
-        auto result = revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
+        auto result =
+            revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
         CHECK(result.api_tokens_persisted);
         CHECK(result.sessions_persisted);
         CHECK(result.api_tokens_revoked == 2);
@@ -1564,9 +1565,12 @@ TEST_CASE("revoke_deprovision_credentials: reports sessions_persisted from the d
 
     SECTION("durable session delete fails: reported, tokens still revoked for every principal") {
         f.wipe_fault.arm();
-        auto result = revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
+        auto result =
+            revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
         f.wipe_fault.repair();
         CHECK_FALSE(result.sessions_persisted);
+        // The local cache is wiped regardless: the count is this replica's, not the durable one.
+        CHECK(result.sessions_revoked == 2);
         // The token leg is independent and unaffected; both principals were still processed.
         CHECK(result.api_tokens_persisted);
         CHECK(result.api_tokens_revoked == 2);
@@ -1576,6 +1580,50 @@ TEST_CASE("revoke_deprovision_credentials: reports sessions_persisted from the d
         CHECK(durable_session_rows(f, "yolanda") == 1);
         CHECK(durable_session_rows(f, "zed") == 1);
     }
+
+    // One principal's delete fails and the other's persists: the aggregate must be the AND of all
+    // of them whichever comes first (a last-writer-wins fold passes only one of the two orders),
+    // and the loop must keep going past the failure.
+    SECTION("only the FIRST principal's delete fails") {
+        auto fault = yuzu::test::SessionDeleteFault::ForUser(f.auth_db.pool(), "yolanda");
+        fault.arm();
+        auto result =
+            revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
+        fault.repair();
+        CHECK_FALSE(result.sessions_persisted);
+        CHECK(result.api_tokens_persisted);
+        CHECK(durable_session_rows(f, "yolanda") == 1); // survived
+        CHECK(durable_session_rows(f, "zed") == 0);     // processed after the failure
+    }
+    SECTION("only the LAST principal's delete fails") {
+        auto fault = yuzu::test::SessionDeleteFault::ForUser(f.auth_db.pool(), "zed");
+        fault.arm();
+        auto result =
+            revoke_deprovision_credentials(*f.token_store, f.auth_mgr, {"yolanda", "zed"});
+        fault.repair();
+        CHECK_FALSE(result.sessions_persisted);
+        CHECK(result.api_tokens_persisted);
+        CHECK(durable_session_rows(f, "yolanda") == 0);
+        CHECK(durable_session_rows(f, "zed") == 1); // survived
+    }
+}
+
+// The shared wording/aggregate helpers every deprovision seam uses (one copy, so the SCIM and
+// dashboard text cannot diverge, and a new credential leg has one place to be folded in).
+TEST_CASE("DeprovisionRevokeResult: all_persisted and failed_legs_phrase cover every leg (#4772)",
+          "[scim][adr2001][orchestrator][sessions-persisted]") {
+    DeprovisionRevokeResult r;
+    CHECK(r.all_persisted());
+    CHECK(failed_legs_phrase(r).empty());
+    r.sessions_persisted = false;
+    CHECK_FALSE(r.all_persisted());
+    CHECK(failed_legs_phrase(r) == "sessions");
+    r.api_tokens_persisted = false;
+    CHECK_FALSE(r.all_persisted());
+    CHECK(failed_legs_phrase(r) == "API tokens and sessions");
+    r.sessions_persisted = true;
+    CHECK_FALSE(r.all_persisted());
+    CHECK(failed_legs_phrase(r) == "API tokens");
 }
 
 TEST_CASE("ScimRoutes: PATCH active=false revokes API tokens AND sessions for BOTH the slug "
@@ -5471,6 +5519,143 @@ TEST_CASE("ScimRoutes: deprovision fails closed when the durable session delete 
     CHECK_FALSE(f.auth_mgr.get_user_role("sdp").has_value());
 }
 
+// #4772 on SCIM create-inactive (POST active:false). The account is created or revived as ACTIVE
+// and mapped BEFORE the credential revoke, so failing the call there on the session leg would
+// strand a live account that the IdP's retry meets with a 409. The session leg is therefore not
+// what gates this path (`SessionLegGate::BackstoppedByAccountRemoval`): the account removal that
+// follows runs its own post-deactivation session wipe, which fails closed. The token leg still
+// fails closed. These tests pin all three halves of that decision.
+namespace {
+std::vector<AuditEvent> provisioned_rows(Fixture& f) {
+    AuditQuery q;
+    q.action = "scim.user.provisioned";
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    return *rows;
+}
+} // namespace
+
+TEST_CASE("ScimRoutes: POST active:false with a healthy session store deactivates and records no "
+          "session fault (#4772)",
+          "[pg][scim][routes][adr2001][deprovision][sessions-persisted]") {
+    Fixture f;
+    f.use_session_store();
+    HookedScim h{f};
+    auto res = h.send(f, "POST", "/scim/v2/Users",
+                      json{{"userName", "pia"}, {"active", false}}.dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK_FALSE(f.auth_mgr.get_user_role("pia").has_value()); // deactivated
+    const auto rows = provisioned_rows(f);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "success");
+    CHECK(rows[0].detail.find("sessions_db_error") == std::string::npos);
+    CHECK(rows[0].detail.find("api_tokens_db_error") == std::string::npos);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0] == std::vector<std::string>{"pia"});
+}
+
+TEST_CASE("ScimRoutes: POST active:false is NOT stranded by a failed session delete in the revoke "
+          "leg: the account removal's own wipe is the backstop (#4772)",
+          "[pg][scim][routes][adr2001][deprovision][sessions-persisted]") {
+    Fixture f;
+    f.use_session_store();
+    HookedScim h{f};
+
+    SECTION("the revoke leg's delete fails, the post-deactivation wipe persists: deactivated, 201") {
+        // Fails exactly the FIRST session DELETE statement (the revoke leg's); the wipe inside
+        // the account removal is the second and goes through.
+        auto fault = yuzu::test::SessionDeleteFault::FirstStatement(f.auth_db.pool());
+        fault.arm();
+        auto res = h.send(f, "POST", "/scim/v2/Users",
+                          json{{"userName", "quin"}, {"active", false}}.dump());
+        fault.repair();
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK_FALSE(f.auth_mgr.get_user_role("quin").has_value()); // deactivated, not stranded
+        const auto rows = provisioned_rows(f);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        // The failure is on the record, marked so the success row is not read as "all clean".
+        CHECK(rows[0].detail.find("sessions_db_error=true") != std::string::npos);
+        CHECK(rows[0].detail.find("session_leg_backstopped=true") != std::string::npos);
+        // The principal set still reached the erasure hook (the early-return guard).
+        REQUIRE(h.calls.size() == 1);
+        CHECK(h.calls[0] == std::vector<std::string>{"quin"});
+    }
+
+    SECTION("both session deletes fail: still fails CLOSED - deactivated and a 500, never a 201") {
+        f.wipe_fault.arm(); // the whole table: the revoke leg's delete AND the wipe fail
+        auto res = h.send(f, "POST", "/scim/v2/Users",
+                          json{{"userName", "rhea"}, {"active", false}}.dump());
+        f.wipe_fault.repair();
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK_FALSE(f.auth_mgr.get_user_role("rhea").has_value()); // deactivated, not left active
+        const auto rows = provisioned_rows(f);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "failure");
+        CHECK(rows[0].detail.find("account deactivated; durable session wipe failed") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("ScimRoutes: POST active:false still fails closed on the API-token leg (#4772)",
+          "[pg][scim][routes][adr2001][deprovision][sessions-persisted]") {
+    Fixture f;
+    f.use_session_store();
+    // The exhausted-pool idiom from the PATCH token test above: a second ApiTokenStore whose only
+    // connection is held, so revoke_for_principal times out and reports "did not persist".
+    yuzu::server::pg::PgPool starved_pool{{.conninfo = f.auth_db.dsn(), .size = 1}};
+    ApiTokenStore starved_token_store{starved_pool};
+    REQUIRE(starved_token_store.is_open());
+    HookedScim h{f, /*throws=*/false, &starved_token_store};
+    auto hog = starved_pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog);
+    auto res = h.send(f, "POST", "/scim/v2/Users",
+                      json{{"userName", "sol"}, {"active", false}}.dump());
+    hog.reset();
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    const auto rows = provisioned_rows(f);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "partial");
+    CHECK(rows[0].detail.find("api_tokens_db_error=true") != std::string::npos);
+    CHECK(rows[0].detail.find("sessions_db_error") == std::string::npos);
+}
+
+// When BOTH credential legs fail, the 500 names both (it used to name only the API tokens), and the
+// audit detail carries both flags.
+TEST_CASE("ScimRoutes: deprovision names every failed credential leg (#4772)",
+          "[pg][scim][routes][adr2001][deprovision][sessions-persisted]") {
+    Fixture f;
+    f.use_session_store();
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "tess"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE_FALSE(f.auth_mgr.create_local_session_for_test("tess", auth::Role::user, false).empty());
+
+    yuzu::server::pg::PgPool starved_pool{{.conninfo = f.auth_db.dsn(), .size = 1}};
+    ApiTokenStore starved_token_store{starved_pool};
+    REQUIRE(starved_token_store.is_open());
+    HookedScim h{f, /*throws=*/false, &starved_token_store};
+    auto hog = starved_pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog);
+    f.wipe_fault.arm();
+    auto res = h.send(f, "PATCH", "/scim/v2/Users/" + id, deactivate_ops().dump());
+    f.wipe_fault.repair();
+    hog.reset();
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK(res->body.find("failed to revoke API tokens and sessions for one or more linked "
+                         "identities") != std::string::npos);
+    const auto rows = audit_rows(f, "scim.user.deactivated", id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "partial");
+    CHECK(rows[0].detail.find("api_tokens_db_error=true") != std::string::npos);
+    CHECK(rows[0].detail.find("sessions_db_error=true") != std::string::npos);
+    CHECK(f.auth_mgr.get_user_role("tess").has_value()); // untouched
+}
+
 TEST_CASE("ScimRoutes: a failed durable session wipe after the deactivation is a 500 that says "
           "the account IS deactivated (#4966)",
           "[pg][scim][routes][lastadmin][wipefailed]") {
@@ -5513,12 +5698,18 @@ TEST_CASE("ScimRoutes: a failed durable session wipe on POST active:false is the
           "[pg][scim][routes][lastadmin][wipefailed]") {
     Fixture f;
     f.use_session_store();
-    yuzu::test::SessionWipeFaultAfterDeactivation fault{f.auth_db.pool()}; // fires after the deactivation
+    // Renames the table when the deactivation commits, so only the post-deactivation wipe faults.
+    yuzu::test::SessionWipeFaultAfterDeactivation fault{f.auth_db.pool()};
     fault.arm();
     auto res = f.post("/scim/v2/Users", {{"userName", "wfp"}, {"active", false}});
     REQUIRE(res);
     CHECK(res->status == 500);
     CHECK_FALSE(f.auth_mgr.get_user_role("wfp").has_value());
+    const auto rows = provisioned_rows(f);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].detail.find("account deactivated; durable session wipe failed") !=
+          std::string::npos);
 }
 
 namespace {

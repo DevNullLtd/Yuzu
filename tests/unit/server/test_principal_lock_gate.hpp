@@ -287,8 +287,8 @@ public:
                    "ALTER TABLE session_store.sessions_gone RENAME TO sessions") {}
 };
 
-/// A ONE-SHOT flap of the durable session table: `session_store.sessions` is renamed away when the
-/// transaction that DEACTIVATES an account commits (a deferred constraint trigger, the
+/// A DELAYED fault on the durable session table: `session_store.sessions` is renamed away when the
+/// transaction that DEACTIVATES an account commits (and stays away until `repair()`) (a deferred constraint trigger, the
 /// `ProvenanceFaultAfterDeactivation` pattern). The credentials-first session revoke that precedes
 /// the deactivation therefore PERSISTS (#4772 fails a deprovision closed before that point), and
 /// only the post-commit wipe inside `remove_user_checked` faults: the `RemovedSessionWipeFailed`
@@ -316,6 +316,60 @@ public:
               "'session_store' AND table_name = 'sessions_gone') THEN "
               "ALTER TABLE session_store.sessions_gone RENAME TO sessions; "
               "END IF; END $do$") {}
+};
+
+/// Fails selected `DELETE FROM session_store.sessions` statements while INSERT/SELECT keep working
+/// (so a login still mints a session; unlike `SessionWipeFault`, which renames the table). Two
+/// modes, both a trigger that raises (a failed statement, so `SessionStore::invalidate_user`
+/// reports a non-persisted delete):
+///  - `ForUser(pool, "name")`: a ROW trigger that fails only when a row of that username is being
+///    deleted, so a multi-principal revoke can fail ONE principal and not the others (the user
+///    needs a durable session row for the trigger to fire).
+///  - `FirstStatement(pool)`: a STATEMENT trigger gated on a sequence (non-transactional, so a
+///    failure does not reset it) that fails exactly the first DELETE statement and lets every later
+///    one through, even when no row matches. The credentials-first revoke leg faults and the
+///    post-deactivation wipe persists.
+/// `username` is interpolated into the DDL, so it is restricted to [a-z0-9_].
+class SessionDeleteFault : public SqlFault {
+public:
+    static SessionDeleteFault ForUser(yuzu::server::pg::PgPool& pool, const std::string& username) {
+        REQUIRE(!username.empty());
+        for (char c : username)
+            REQUIRE(((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'));
+        return SessionDeleteFault(
+            pool,
+            "DO $do$ BEGIN "
+            "EXECUTE $f$CREATE OR REPLACE FUNCTION public.yuzu_test_fail_session_delete() "
+            "RETURNS trigger LANGUAGE plpgsql AS $b$ BEGIN "
+            "RAISE EXCEPTION 'yuzu_test_fail_session_delete'; END $b$$f$; "
+            "EXECUTE $f$CREATE TRIGGER yuzu_test_fail_session_delete BEFORE DELETE ON "
+            "session_store.sessions FOR EACH ROW WHEN (OLD.username = '" + username + "') "
+            "EXECUTE FUNCTION public.yuzu_test_fail_session_delete()$f$; END $do$");
+    }
+    static SessionDeleteFault FirstStatement(yuzu::server::pg::PgPool& pool) {
+        return SessionDeleteFault(
+            pool,
+            "DO $do$ BEGIN "
+            "DROP SEQUENCE IF EXISTS public.yuzu_test_session_delete_seq; "
+            "CREATE SEQUENCE public.yuzu_test_session_delete_seq; "
+            "EXECUTE $f$CREATE OR REPLACE FUNCTION public.yuzu_test_fail_session_delete() "
+            "RETURNS trigger LANGUAGE plpgsql AS $b$ BEGIN "
+            "IF nextval('public.yuzu_test_session_delete_seq') = 1 THEN "
+            "RAISE EXCEPTION 'yuzu_test_fail_session_delete'; END IF; "
+            "RETURN NULL; END $b$$f$; "
+            "EXECUTE $f$CREATE TRIGGER yuzu_test_fail_session_delete BEFORE DELETE ON "
+            "session_store.sessions FOR EACH STATEMENT "
+            "EXECUTE FUNCTION public.yuzu_test_fail_session_delete()$f$; END $do$");
+    }
+
+private:
+    SessionDeleteFault(yuzu::server::pg::PgPool& pool, std::string apply)
+        : SqlFault(pool, std::move(apply),
+                   "DO $do$ BEGIN "
+                   "DROP TRIGGER IF EXISTS yuzu_test_fail_session_delete ON "
+                   "session_store.sessions; "
+                   "DROP FUNCTION IF EXISTS public.yuzu_test_fail_session_delete(); "
+                   "DROP SEQUENCE IF EXISTS public.yuzu_test_session_delete_seq; END $do$") {}
 };
 
 /// `rbac_store.principal_roles` moved aside: every RbacStore grant read fails (the SCIM

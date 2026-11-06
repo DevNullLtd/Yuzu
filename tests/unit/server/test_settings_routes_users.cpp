@@ -1743,7 +1743,8 @@ TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deacti
     CHECK(h.has_audit("user.delete", "partial", "User", "bob"));
     CHECK(h.audit_detail("user.delete", "partial", "bob")
               .starts_with("account_deactivated session_wipe_failed=true"));
-    // A repeat once the store is healthy finishes the job and answers 404 (already inactive).
+    // Once the store is healthy a repeat answers 404 (already inactive); there is nothing left to
+    // finish here, because the earlier revoke leg had already removed the session.
     fault.repair();
     // The credentials-first revoke (#4772) already deleted the durable session before the
     // deactivation, so the post-commit wipe that faulted had nothing left to remove.

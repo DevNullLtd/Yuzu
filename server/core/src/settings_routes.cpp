@@ -4874,7 +4874,7 @@ void SettingsRoutes::register_routes(
                 // principal strings, not just the count — mirrors the SCIM
                 // seam's `revoke_linked_credentials_or_fail`.
                 enumerate_principals_for_audit(*principals);
-            if (!revoke_result.api_tokens_persisted || !revoke_result.sessions_persisted) {
+            if (!revoke_result.all_persisted()) {
                 // #4772: the durable session DELETE is held to the same fail-closed contract
                 // as the token revoke (a surviving session row is rehydrated by another
                 // replica or after a restart).
@@ -4889,8 +4889,9 @@ void SettingsRoutes::register_routes(
                              revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                              username);
                 audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
-                const std::string what = !revoke_result.api_tokens_persisted ? "API tokens"
-                                                                              : "sessions";
+                // A fixed literal from `failed_legs_phrase` (never user data), so it is safe
+                // inside the HX-Trigger JSON below.
+                const std::string what(failed_legs_phrase(revoke_result));
                 res.status = 500;
                 res.set_header("HX-Trigger",
                                R"({"showToast":{"message":"Failed to revoke )" + what +

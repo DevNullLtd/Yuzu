@@ -2707,11 +2707,12 @@ operator-facing matrix of every case, including what is not covered, is in
 |---|---|---|
 | `scim.user.provisioned` | `success` | `POST /scim/v2/Users` succeeds (new account, or a revived reprovision) |
 | `scim.user.provisioned` | `denied` | `POST` rejected `409` — `userName` collision against a currently-active account |
+| `scim.user.provisioned` | `partial` | `POST /scim/v2/Users` with `active:false`: the credential revoke before the immediate deactivation did not persist its API tokens (`500`, detail `api_tokens_db_error=true`; the account was already created or revived and mapped, so the IdP's retry meets `409`). `target_id` is the new resource's SCIM id, where the rollback `failure` rows below use the userName. A `success` row for the same request can carry `sessions_db_error=true session_leg_backstopped=true` (the session delete did not persist and the account removal's own wipe covered it); a deactivation whose wipe also failed is `failure` with `account deactivated; durable session wipe failed` |
 | `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails). (#6836) A revive whose post-reactivation role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone and the account stays down); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed` |
 | `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500`; `failure` / `503` (#6836) with `detail` `store_unavailable: provenance check` or `store_unavailable: role check` when the provenance re-check, or the role re-check on an active resource (including straight after a reactivation), that a `PUT` (always) or a `PATCH` with `externalId` runs before its `externalId` write could not read the user store; when it follows an `active` change, that change was already applied and has its own `success` row |
-| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
+| `scim.user.deactivated` | `success` / `failure` / `partial` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#4772) `partial` / `500`: the credential revoke did not persist (`api_tokens_db_error=true` and/or `sessions_db_error=true` in `detail`); the account was not touched and a retry completes. |
 | `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`. `failure` causes (#4966): the tombstone's role could not be read (`500`, `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, `administrator grant check unavailable`), or the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is a `scim.user.provenance_denied` (`404`), not a `reactivated` row. (#6836) The provenance check inside the reactivation, when the user store could not answer it, is `failure` / `503` with `detail` `store_unavailable: provenance check`; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard="provenance"}`. The role re-check that a `PUT`/`PATCH` carrying `externalId` runs straight after a reactivation is audited as `scim.user.updated`, not `scim.user.reactivated`. |
-| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
+| `scim.user.deleted` | `success` / `failure` / `partial` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#4772) `partial` / `500`: the credential revoke did not persist (`api_tokens_db_error=true` and/or `sessions_db_error=true` in `detail`); the account was not touched and a retry completes. |
 | `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"`; **or** (#4966) a `POST /Users` or an `active:true` reactivation names a username that already holds an `Administrator` grant or a deactivated record whose role is not `user`. Counted on `yuzu_scim_provenance_denied_total` for the same causes (including the group-recompute provenance skip, which writes no audit row; a FAILED provenance read in the recompute is not a provenance refusal and is recorded as an undetermined member instead). For a deactivate, delete, reactivate, update or a `POST` that revives a removed account, a store fault is not a denial (#6836): when the user store cannot answer the provenance or role read (a `POST` revive re-reads only the role), no `scim.user.provenance_denied` row is written, `yuzu_scim_provenance_denied_total` does not move and the linked-identity escalation does not fire; the request answers `503` and is audited as its own action with `store_unavailable`. The `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them). |
 | `scim.user.last_administrator_refused` | `denied` / `partial` | (#4966) The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability` on the Users routes; a refused group-derived demotion is not a `409`: the Group request keeps its `2xx` and the member keeps the role). `partial` for a LATE refusal (the linked credentials were revoked before the guard refused); `denied` for an early refusal and for a refused demotion. Every refusal also raises a critical analytics event. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}` |
 | `scim.user.compensation_failed` | `failure` | (#4966) The guarded undo of a half-finished create/revive was refused or failed (`outcome` = `guard_refused_last_administrator` / `deactivated_but_session_wipe_failed` / `store_failure`). Written with a critical analytics event and `yuzu_scim_compensation_failed_total{outcome}`; the account is left active only for the guard refusal |
@@ -2834,10 +2835,13 @@ and the dashboard's `DELETE /api/settings/users/{username}` all resolve the
 full principal set — the slug **plus every `oidc:<iss>#<sub>` identity
 currently linked to it** — and revoke API tokens (`ApiTokenStore::
 revoke_for_principal`) and sessions for **each** principal in that set,
-**before** the account is marked inactive/deleted. On any revoke that fails
+**before** the account is marked inactive/deleted. On any revoke (API tokens or sessions) that fails
 to persist, the caller does **not** report a clean success: SCIM returns
-`500` (so the IdP retries) and the audit result is `partial`; the dashboard
-delete likewise refuses to proceed to `remove_user`. This mirrors `/me`'s
+`500` (so the IdP retries, and the retry converges because the account was
+not touched) and the audit result is `partial`; the dashboard
+delete likewise refuses to proceed to `remove_user`. SCIM `POST /Users` with
+`active:false` is the exception, described under "That bound holds only once
+the durable session delete has persisted" below. This mirrors `/me`'s
 own `api_tokens_revoked=N`/`sessions_revoked=N` detail-string pattern.
 Implementation: `deprovision_revoke.{hpp,cpp}` (the shared
 resolver/orchestrator, deliberately **not** a reuse of `session_revoke_fn`,
@@ -2886,12 +2890,50 @@ once the durable session delete has persisted** (#4772), exactly as the
 token sentence above holds only after `revoke_for_principal` has persisted:
 `revoke_deprovision_credentials` folds every principal's
 `invalidate_user_sessions(...).db_persisted` into
-`DeprovisionRevokeResult::sessions_persisted`, and a `false` there fails the
-deprovision closed like a non-persisted token revoke (SCIM 500 so the IdP
-retries; the dashboard delete 500s without deleting the account; audit
-`partial` with `sessions_db_error=true`). Without that, a failed delete
-leaves the durable row for another replica, or this one after a restart, to
-rehydrate.
+`DeprovisionRevokeResult::sessions_persisted` (and the token results into
+`api_tokens_persisted`). At the three "required" sites — SCIM `PATCH`/`PUT`
+with `active:false`, SCIM `DELETE` of an active resource and the dashboard
+`DELETE /api/settings/users/{username}` — a `false` on either leg fails the
+deprovision closed: HTTP 500, the account stays active, the SCIM resource and
+links are untouched, the audit result is `partial` and the detail carries
+`api_tokens_db_error=true` and/or `sessions_db_error=true`. A retry after the
+store recovers completes it. If the delete fails, the durable row survives
+and another replica, or this one after a restart, rehydrates it.
+
+The session leg was not always checked. Before #4772 the result of the
+session delete in the revoke step was dropped. For the local username the
+wipe inside the account removal (`remove_user_checked`) repeated the delete
+after the deactivation and failed closed, so a silent success needed both
+deletes to fail. For a linked `oidc:`/`saml:` principal that later wipe
+covers only the SCIM slug, so the revoke step was the only session delete
+and a failure there was silent.
+
+**SCIM `POST /Users` with `active:false` is deliberately different.** Its
+token leg fails closed as above (500, `scim.user.provisioned` / `partial`,
+`api_tokens_db_error=true`). Because the account was created or revived a
+moment earlier under a fresh `scim_id`, the IdP's retry meets `409`; the
+connector has to reconcile with `GET` and `PATCH` `active:false`, so the
+retry convergence promised for the three sites above does **not** apply
+here. Its session leg is not gated: a fresh `scim_id` has no sessions of its
+own, and the account removal that follows runs its own post-deactivation
+session wipe, which fails closed. A non-persisted session delete in the
+revoke step is recorded as `sessions_db_error=true
+session_leg_backstopped=true` (so a `success` row can carry it), and the call
+succeeds only if that later wipe persisted. If the wipe also fails, the
+account is deactivated and the call returns 500 with audit result `failure`
+and detail `account deactivated; durable session wipe failed`.
+
+**Known residual.** If that post-deactivation wipe itself fails
+(`RemovedSessionWipeFailed`), the account is deactivated but a surviving
+durable session row is not checked against account state by session
+validation and can keep validating until its expiry; a SCIM retry of an
+already-deactivated resource does not re-run the wipe.
+
+**Audit vocabulary.** Three tokens mean "the durable session delete did not
+persist", and each is kept where it is documented: `db_error=true` (logout,
+`session.revoke_all`, `/me`), `;db_persisted=false` (the OIDC/SAML
+post-mint re-check) and `sessions_db_error=true` (deprovision). Do not
+rename one to match another.
 
 **D1 — a SCIM slug elevated to admin outside SCIM (the #2021 guard
 interaction).** `deprovision_role_ok` still refuses (404, per the
@@ -3046,10 +3088,12 @@ reads (this guarantee assumes no read-replica routing).
 The existing `scim.user.deactivated`/`.deleted` rows (see Audit actions
 above) now also carry `api_tokens_revoked=N sessions_revoked=N
 principals=N` in `detail` on success, and `partial` is now a possible
-`result` for those two actions specifically (a non-persisted credential
+`result` for those two actions (a non-persisted credential
 revoke, detail `api_tokens_db_error=true` and/or `sessions_db_error=true` —
-see "Deprovision-time revoke" above), in addition to the existing
-`success`/`failure`. When the detail lists the revoked principals
+see "Deprovision-time revoke" above; `target_id` is the resource's SCIM id),
+in addition to the existing `success`/`failure`. `scim.user.provisioned` can
+also carry `partial` for a `POST` with `active:false` whose token revoke did
+not persist (`target_id` is again the SCIM id). When the detail lists the revoked principals
 (`revoked_principals=a,b,c`), each principal string is tokenized before it is
 written (#4966, CWE-117): `,`, space, `=`, control bytes and every byte
 >= 0x80 become `_`, and a string over 256 bytes is shortened. The tokenization
