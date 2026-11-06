@@ -1267,13 +1267,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        per-device effective settings are not reachable over MCP; the OpenAPI
        document is readable as the `yuzu://openapi` resource.
      - **The exception relaxes no control.** Settings are managed by fleet
-       administrators: reads need the global `ManagementGroup:Read` grant and
-       writes the global `ManagementGroup:Write` grant, checked again
-       immediately ahead of the write; this build has no group-scoped
-       delegation. Each write is audited with a
+       administrators: writes need the global `ManagementGroup:Write` grant
+       (the administrator role while RBAC enforcement is off, the default),
+       checked again immediately ahead of the write; reads take the same
+       `ManagementGroup:Read` gate as the other management-group routes,
+       which admits any signed-in session while RBAC enforcement is off; the
+       device route needs `Inventory:Read` scoped to the device. This build
+       has no group-scoped delegation. Each write is audited with a
        `requested` row stored ahead of the write (an audit row that cannot be
        stored is a `503` and nothing is written) and an outcome row. A degraded
-       read answers `503`, never an empty `200`. The A4 envelope and the OpenAPI
+       store read answers `503`, never an empty `200`; an RBAC read that cannot
+       be completed is a `503` on the per-group read and the write, and the
+       shared deny-on-degrade `403` on the list and the device route. The A4 envelope and the OpenAPI
        entries hold for all four. Wire reference: `docs/user-manual/rest-api.md`,
        "Software collection settings".
      - Recorded by the change author; ADR-owner acceptance pending.

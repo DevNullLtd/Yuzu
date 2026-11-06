@@ -91,7 +91,8 @@ void store_unavailable(httplib::Response& res, const SettingsError& e) {
 
 enum class Authority { Admit, Deny, Degraded };
 
-// The global ManagementGroup grant is the only authority: settings are managed by fleet
+// The ManagementGroup permission gate is the only authority (the global grant while RBAC
+// enforcement is on, the legacy role rule while it is off): settings are managed by fleet
 // administrators, and this build has no group-scoped delegation. `op` is "Read" or "Write". The
 // unavailable-aware probe runs into a THROWAWAY response: a refusal is answered by the route with
 // its own audited 403, and a 503 from it (the RBAC read could not be completed) is copied to `res`

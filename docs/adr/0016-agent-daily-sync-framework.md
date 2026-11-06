@@ -1185,8 +1185,10 @@ The server stores a collection settings document per management group
 (`SoftwareCollectionSettingsStore`, schema `software_collection_settings_store`, tables `settings` and
 `settings_history`) and resolves the document that applies to a device. The agent behaviour is a hard
 requirement on the settings push, below. Wire reference: `docs/user-manual/rest-api.md`, "Software
-collection settings". Settings are managed by fleet administrators (the global `ManagementGroup`
-grant); group-scoped delegation is not part of this build. This build sends no settings to agents.
+collection settings". Settings are managed by fleet administrators: a write needs the global
+`ManagementGroup:Write` grant (the administrator role while RBAC enforcement is off), and reads take
+the standard `ManagementGroup:Read` gate; group-scoped delegation is not part of this build. This
+build sends no settings to agents.
 
 - **Document.** `interval_s` 3600 to 604800, an optional window in minutes past local midnight, a zone
   (empty = the machine's own, else an IANA name checked against `pg_timezone_names` in the write
