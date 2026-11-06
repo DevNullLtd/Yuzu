@@ -7,7 +7,8 @@
  * container verdict) is in that header too. Reads go through posix_secure_read (bounded, regular
  * files only, no deadline of its own: a hung procfs/sysfs read pins the calling pool worker like
  * every posix_secure_read consumer, #4875); ENOENT is "absent" and any other failure is an
- * unreadable source. The container check reads the AGENT's own /proc/self/cgroup, not PID 1's,
+ * unreadable source (a host-decision one blocks bare_metal, a container one only constrains the
+ * status). The container check reads the AGENT's own /proc/self/cgroup, not PID 1's,
  * which answers a different question when the PID namespace is shared, plus the type systemd
  * records in /run/systemd/container (how a system container is told from a host).
  */

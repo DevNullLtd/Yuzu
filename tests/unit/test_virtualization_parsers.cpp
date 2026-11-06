@@ -40,6 +40,12 @@ SmbiosFacts smbios_ok(std::string mfr, std::string prod) {
     return s;
 }
 
+/// The neutral board strings that match no vendor-table row.
+SmbiosFacts board() { return smbios_ok("Example Board Vendor", "Example Board"); }
+
+/// A lowercase 64-hex container id, the shape every runtime's cgroup path carries.
+const std::string kContainerId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 SmbiosFacts smbios_unreadable(std::string reason) {
     SmbiosFacts s;
     s.state = ReadState::unreadable;
@@ -175,7 +181,7 @@ TEST_CASE("virtualization: a Windows host running Hyper-V is host_with_hyperviso
     Facts f;
     f.os = "windows";
     f.cpuid = cpuid_hv("Microsoft Hv", 0x4000000Cu, "Hv#1", true);
-    f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+    f.smbios = board();
     f.container.mode = ContainerInputs::Mode::windows_not_read;
 
     const auto c = classify(f);
@@ -221,7 +227,7 @@ TEST_CASE("virtualization: the root-partition bit alone separates a Hyper-V host
     };
 
     SECTION("bit clear: a guest, hyperv, high") {
-        const auto c = classify(classify_with(false, smbios_ok("Example Board Vendor", "Example Board")));
+        const auto c = classify(classify_with(false, board()));
         CHECK(c.kind == Kind::guest);
         CHECK(c.is_virtual == Tri::yes);
         CHECK(c.vendor == "hyperv");
@@ -229,13 +235,13 @@ TEST_CASE("virtualization: the root-partition bit alone separates a Hyper-V host
         CHECK(c.confidence == Confidence::high);
     }
     SECTION("bit unread under a held contract: a guest, medium") {
-        const auto c = classify(classify_with(std::nullopt, smbios_ok("Example Board Vendor", "Example Board")));
+        const auto c = classify(classify_with(std::nullopt, board()));
         CHECK(c.kind == Kind::guest);
         CHECK(c.vendor == "hyperv");
         CHECK(c.confidence == Confidence::medium);
     }
     SECTION("bit set: the host") {
-        const auto c = classify(classify_with(true, smbios_ok("Example Board Vendor", "Example Board")));
+        const auto c = classify(classify_with(true, board()));
         CHECK(c.kind == Kind::host_with_hypervisor);
         CHECK(c.confidence == Confidence::high);
     }
@@ -343,7 +349,7 @@ TEST_CASE("virtualization: the root-partition bit is only trusted behind CPUID d
         Facts f;
         f.os = "windows";
         f.cpuid = cpuid_hv("Microsoft Hv", 0x40000002u, "Hv#1", true); // max leaf too low
-        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+        f.smbios = board();
         const auto c = classify(f);
         CHECK(c.kind == Kind::guest);
         CHECK(c.vendor == "hyperv");
@@ -353,7 +359,7 @@ TEST_CASE("virtualization: the root-partition bit is only trusted behind CPUID d
         Facts f;
         f.os = "windows";
         f.cpuid = cpuid_hv("Microsoft Hv", 0x40000002u, "Hv#1", std::nullopt);
-        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+        f.smbios = board();
         const auto c = classify(f);
         CHECK(c.kind == Kind::guest);
         CHECK(c.is_virtual == Tri::yes);
@@ -417,7 +423,8 @@ TEST_CASE("virtualization: an unreadable SMBIOS with no reason still names its s
     CHECK(p.reason == "linux:virtualization:smbios:unreadable");
 }
 
-TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[virtualization][strict]") {
+TEST_CASE("virtualization: an unreadable host-decision source never reads as bare_metal",
+          "[virtualization][strict]") {
     SECTION("CPUID clear but DMI unreadable is unknown and the host row says why") {
         Facts f = linux_base();
         f.cpuid = cpuid_clear();
@@ -434,13 +441,13 @@ TEST_CASE("virtualization: an unreadable source never reads as bare_metal", "[vi
     SECTION("an unreadable OS hint source blocks bare_metal too") {
         Facts f = linux_base();
         f.cpuid = cpuid_clear();
-        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+        f.smbios = board();
         f.failures.push_back("linux:virtualization:sys_hypervisor:eio");
         CHECK(classify(f).kind == Kind::unknown);
     }
     SECTION("no CPUID (ARM) and a non-VM DMI is unknown with the permanent limitation token") {
         Facts f = linux_base();
-        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+        f.smbios = board();
         const auto c = classify(f);
         CHECK(c.kind == Kind::unknown);
         CHECK(c.source == "linux:virtualization:cpuid:unavailable");
@@ -495,7 +502,7 @@ TEST_CASE("virtualization: a positive OS hint is never outranked by negative evi
     SECTION("/sys/hypervisor/type xen with CPUID clear and a non-VM DMI") {
         Facts f = linux_base();
         f.cpuid = cpuid_clear();
-        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+        f.smbios = board();
         f.hint = linux_os_hint("xen\n");
         const auto c = classify(f);
         CHECK(c.kind == Kind::guest);
@@ -771,22 +778,21 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
     }
     SECTION("a cgroup path in a runtime's own form") {
         // Each runtime's real shape, one fixture per form (lowercase 64-hex container id).
-        const std::string hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         struct Form {
             std::string path;
             const char* runtime;
         };
         const std::vector<Form> forms{
-            {"12:cpu:/docker/" + hex + "\n", "docker"},
-            {"0::/system.slice/docker-" + hex + ".scope\n", "docker"},
-            {"0::/docker-" + hex + "\n", "docker"},
-            {"12:cpu:/kubepods/burstable/pod1/" + hex + "\n", "kubepods"},
+            {"12:cpu:/docker/" + kContainerId + "\n", "docker"},
+            {"0::/system.slice/docker-" + kContainerId + ".scope\n", "docker"},
+            {"0::/docker-" + kContainerId + "\n", "docker"},
+            {"12:cpu:/kubepods/burstable/pod1/" + kContainerId + "\n", "kubepods"},
             {"0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-" +
-                 hex + ".scope\n",
+                 kContainerId + ".scope\n",
              "kubepods"},
             {"0::/kubepods-besteffort-pod1.slice\n", "kubepods"},
-            {"0::/system.slice/cri-containerd-" + hex + ".scope\n", "containerd"},
-            {"0::/machine.slice/libpod-" + hex + ".scope\n", "podman"},
+            {"0::/system.slice/cri-containerd-" + kContainerId + ".scope\n", "containerd"},
+            {"0::/machine.slice/libpod-" + kContainerId + ".scope\n", "podman"},
             {"12:cpu:/lxc/mycontainer\n", "lxc"},
             {"0::/lxc.payload.mycontainer/init.scope\n", "lxc"},
         };
@@ -799,7 +805,6 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         CHECK(verdict(false, false, "0::/kubepods.slice/pod1/cri-containerd-x.scope\n").value == Tri::yes);
     }
     SECTION("a host unit that merely contains a runtime's name is not a container") {
-        const std::string hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         const std::vector<std::string> negatives{
             "0::/docker-host.slice/yuzu-agent.service\n",
             "0::/system.slice/yuzu-podman-monitor.service\n",
@@ -817,8 +822,8 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
             "0::/lxc/\n",
             "0::/kubepods-x\n",
             // a 63- and a 65-digit id, a non-hex one and an uppercase one are not ids
-            "0::/docker/" + hex.substr(1) + "\n",
-            "0::/docker/" + hex + "0\n",
+            "0::/docker/" + kContainerId.substr(1) + "\n",
+            "0::/docker/" + kContainerId + "0\n",
             "0::/system.slice/libpod-" + std::string(64, 'g') + ".scope\n",
             "0::/system.slice/libpod-" + std::string(64, 'A') + ".scope\n",
         };
@@ -849,7 +854,7 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         CHECK(v.evidence == "linux:virtualization:container:markers_permission_denied");
     }
     SECTION("/run/systemd/container names a system container whose cgroup path looks like a host's") {
-        // XP-1: LXD/Incus/systemd-nspawn run systemd as PID 1, so the agent's cgroup is a plain
+        // LXD/Incus/systemd-nspawn run systemd as PID 1, so the agent's cgroup is a plain
         // `0::/system.slice/...` exactly as on a host; systemd records the type here instead.
         const std::string host_shaped = "0::/system.slice/yuzu-agent.service\n";
         for (const char* type : {"lxc\n", "systemd-nspawn", "docker\n", "podman\n", "oci\n", "lxc-libvirt\n"}) {
@@ -869,7 +874,6 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         CHECK(odd.evidence == "/run/systemd/container");
     }
     SECTION("a WSL value, an empty file and a blank one fall through to the cgroup scan unchanged") {
-        const std::string hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         for (const char* type : {"wsl\n", "wsl", "wsl \t\r\n", "", "\n", "  \n"}) {
             INFO(type);
             const std::string t{type};
@@ -879,10 +883,17 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
             const auto opaque = verdict(false, false, "0::/\n", "", t);
             CHECK(opaque.value == Tri::unknown);
             CHECK(opaque.evidence == "linux:virtualization:container:cgroup_root_opaque");
-            const auto docker = verdict(false, false, "0::/docker/" + hex + "\n", "", t);
+            const auto docker = verdict(false, false, "0::/docker/" + kContainerId + "\n", "", t);
             CHECK(docker.value == Tri::yes);
             CHECK(docker.evidence == "cgroup:docker");
         }
+    }
+    SECTION("systemd record outranks a runtime cgroup") {
+        // lxc beside a valid Docker cgroup: the systemd record is the evidence, not the cgroup match.
+        const auto v = verdict(false, false, "0::/docker/" + kContainerId + "\n", "", std::string{"lxc\n"});
+        CHECK(v.value == Tri::yes);
+        CHECK(v.evidence == "/run/systemd/container");
+        CHECK_FALSE(v.read_failed);
     }
     SECTION("a marker file outranks /run/systemd/container, and an absent file changes nothing") {
         CHECK(verdict(true, false, "0::/\n", "", std::string{"lxc\n"}).evidence == "/.dockerenv");
@@ -1116,7 +1127,7 @@ TEST_CASE("virtualization: every token and evidence string the fixtures emit fol
     {
         Facts f; // Windows on ARM64: no CPUID, SMBIOS readable and not a VM
         f.os = "windows";
-        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+        f.smbios = board();
         f.container.mode = ContainerInputs::Mode::windows_not_read;
         fixtures.push_back(f);
     }

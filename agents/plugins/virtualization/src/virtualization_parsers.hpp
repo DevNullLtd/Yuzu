@@ -14,14 +14,15 @@
 //                                                               or a Microsoft Hv root-partition
 //                                                               bit could not be read)
 //   3b. an OS hint says virtual (sysctl, /sys/hypervisor)    -> guest (medium)
-//   4. a readable negative signal AND no consulted source unreadable -> bare_metal
+//   4. a readable negative signal AND no host-decision source unreadable -> bare_metal
 //   5. anything else                                         -> unknown, with the reason tokens
 // SMBIOS beats the root-partition bit because VBS nested inside another hypervisor sets
 // CreatePartitions yet is a guest. bare_metal is reachable only when NO consulted source
-// positively identifies virtualization AND no consulted source failed to read; an unreadable
-// source, or the absence of any negative signal (ARM has no CPUID), reads `unknown`, never
-// bare_metal. The reason for an unknown appears on the status row AND in the host row's
-// `source` field.
+// positively identifies virtualization AND no host-decision source (SMBIOS, CPUID, OS hint)
+// failed to read; an unreadable host-decision source, or the absence of any negative signal
+// (ARM has no CPUID), reads `unknown`, never bare_metal. A failed container read is not a
+// host-decision source: it constrains the status but does not block bare_metal. The reason
+// for an unknown appears on the status row AND in the host row's `source` field.
 //
 // The root-partition bit (CPUID leaf 0x40000003 EBX bit 0, CreatePartitions) is only meaningful
 // when the hypervisor-discovery contract holds: signature "Microsoft Hv", max leaf >= 0x40000003

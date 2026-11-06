@@ -50,6 +50,12 @@ class VirtualizationDefinitionColumns(unittest.TestCase):
         row_kind = _definitions()["host"]["spec"]["result"]["columns"][0]
         self.assertEqual(row_kind["values"], ROW_KINDS)
 
+    def test_field_2_accepts_container_evidence(self):
+        # field_2 is multiplexed per row_kind: status/kind/evidence strings, so no closed value list.
+        field_2 = _definitions()["host"]["spec"]["result"]["columns"][2]
+        self.assertEqual(field_2["name"], "field_2")
+        self.assertNotIn("values", field_2)
+
     def test_operational_defaults_are_pinned(self):
         spec = _definitions()["host"]["spec"]
         self.assertEqual(spec["type"], "question")

@@ -58,12 +58,12 @@ flowchart TD
   C -->|"yes"| G2["guest, vendor from the signature"]
   C -->|"no"| D{"OS hint says virtual"}
   D -->|"yes"| G3["guest, medium"]
-  D -->|"no"| E{"A readable negative signal and no source failed to read"}
+  D -->|"no"| E{"A readable negative signal and no host-decision source failed to read"}
   E -->|"yes"| BM["bare_metal"]
   E -->|"no"| U["unknown, reasons on the status row and the source field"]
 ```
 
-The order matters: a positive identification is never outranked by a negative or missing signal, and an unreadable source can never be read as "not virtual".
+The order matters: a positive identification is never outranked by a negative or missing signal, and an unreadable host-decision source (SMBIOS, CPUID, OS hint) can never be read as "not virtual".
 
 ## OS capability
 
@@ -85,7 +85,7 @@ The order matters: a positive identification is never outranked by a negative or
 |---|---|---|---|---|
 | Windows | agent daemon (LocalSystem today, `docs/agent-privilege-model.md`) | None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable` | Not measured yet: the Windows capture is taken on a bare-metal host with Hyper-V enabled and replaces this cell | `CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine |
 | macOS | agent daemon (root under the shipped LaunchDaemon today, `docs/agent-privilege-model.md`) | None: both sysctls answer an unprivileged caller | The sample was captured as an unprivileged user, not under the LaunchDaemon account | `CONSTRAINED` / partial with `macos:virtualization:hv_vmm_present:unreadable` or `macos:virtualization:hw_model:unreadable`; the kind is `unknown` |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None: the DMI attributes and `/run/systemd/container` read are world-readable; the root-only `product_serial` and `product_uuid` are never read | Not measured yet: the Linux capture is taken inside a WSL2 distribution (a Hyper-V guest) and replaces this cell | `CONSTRAINED` / partial with `linux:virtualization:<source>:<cause>` and the kind `unknown` (or the kind another source already established), never `bare_metal` |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None: the DMI attributes and `/run/systemd/container` read are world-readable; the root-only `product_serial` and `product_uuid` are never read | Not measured yet: the Linux capture is taken inside a WSL2 distribution (a Hyper-V guest) and replaces this cell | `CONSTRAINED` / partial; a refused host-decision source (SMBIOS, CPUID, OS hint) reports `linux:virtualization:<source>:<cause>` and the kind `unknown` (or the kind another source already established), never `bare_metal`; a refused container read reports `linux:virtualization:container:<cause>`, constrains the status and does not block `bare_metal` |
 
 No subprocess, no shell and no network use: every leg is an in-process read (CPUID, sysctl, bounded file reads, `access(2)`, the Windows firmware table). The Linux file reads are size-bounded but have no deadline of their own, like every `posix_secure_read` consumer (#4875): a hung procfs or sysfs read would hold one agent pool worker until it returns.
 
