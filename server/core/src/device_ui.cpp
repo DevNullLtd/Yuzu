@@ -1035,7 +1035,7 @@ std::string unrepresented_notice(std::int64_t count, const std::vector<std::stri
                     " recorded events not yet reflected in the compliance census.</b> The "
                     "compliance figures on this page do not include " +
                     (count == 1 ? "it" : "them") +
-                    ", so this device is not shown as compliant. " +
+                    ", so this device is not shown as clean (all compliant). " +
                     std::string(kUncertainRunbookPointer);
     if (!ids.empty()) {
         const std::size_t shown = std::min(ids.size(), kLensIdsShown);
