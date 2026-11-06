@@ -9,6 +9,7 @@ echo_objcpp_args = []
 echo_sources = files(
   'src/echo_plugin.cpp',
   'src/echo_db.cpp',
+  'src/echo_db_v10_migration.cpp',
   'src/echo_diff.cpp',
   'src/echo_schema_registry.cpp',
   'src/echo_fold_schema.cpp',

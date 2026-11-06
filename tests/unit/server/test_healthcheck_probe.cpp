@@ -446,9 +446,9 @@ TEST_CASE("healthcheck: run_healthcheck with a probe that answers in time prints
 TEST_CASE("healthcheck: run_healthcheck turns an exception from the probe into exit 1 and one "
           "line",
           "[server][healthcheck]") {
-    // httplib 0.37.1 reserves the response body on a peer-claimed Content-Length before its
-    // payload ceiling applies, so a hostile or buggy peer can make the real probe throw
-    // std::bad_alloc. Mutation: without the try/catch around run_healthcheck's probe_bounded
+    // httplib 0.37.1 reserved the response body on a peer-claimed Content-Length before its
+    // payload ceiling applied (0.59.0 caps the reservation at that ceiling), so a hostile or buggy
+    // peer can make the real probe throw std::bad_alloc. Mutation: without the try/catch around run_healthcheck's probe_bounded
     // call, the exception is stored by probe_bounded's packaged_task and rethrown by done.get()
     // into Catch2, which reports these sections failed (unexpected exception) rather than the
     // process aborting.
@@ -678,8 +678,8 @@ TEST_CASE("healthcheck: default-CA mode verifies a leaf issued by the install CA
 
 TEST_CASE("healthcheck: the probe trusts ONLY its anchor - never the system store",
           "[server][healthcheck][live]") {
-    // httplib 0.37.1 load_certs() merges the OS trust store into the context when
-    // no CA file path is set. After a connect the client's own store must hold
+    // httplib merges the OS trust store into the context when no CA file path is set
+    // (0.37.1: load_certs(); 0.59.0: load_client_ca_config() in Auto mode). After a connect the client's own store must hold
     // exactly the anchor's one certificate; a system-store merge adds every OS
     // root, so this fails on any httplib branch-order change (and on every host
     // that carries OS roots, which is every CI image and dev box).
