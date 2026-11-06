@@ -489,10 +489,17 @@ TEST_CASE("operate pages: the Workflows action controller keeps its guards",
     CHECK_FALSE(has(js, "keeps running on the server"));
     // A refused run (429 cap, 503 draining or store) says when to retry from Retry-After instead
     // of a bare status, and a 429/503 is never folded into the generic "Could not start" text.
-    CHECK(has(js, "function runRefusalText(status, message, retryAfter) {"));
+    CHECK(has(js, "function runRefusalText(status, message, retryAfter, remediation) {"));
     CHECK(has(js, "if (r.status === 429 || r.status === 503) {"));
-    CHECK(has(js, "return runRefusalText(r.status, msg, r.headers.get('Retry-After'));"));
+    CHECK(has(js, "return runRefusalText(r.status, msg, r.headers.get('Retry-After'), rem);"));
     CHECK(has(js, "' Try again in ' + secs + ' seconds.' : ' Try again shortly.'"));
+    // The server message and the follow-up read as separate sentences (capitalised, closed with a
+    // full stop), and a 503 (a draining server is stopping) returns BEFORE the retry-in-N hint:
+    // it shows the server's own remediation, or "Try again shortly." when it sent none.
+    CHECK(has(js, "t = t.charAt(0).toUpperCase() + t.slice(1);"));
+    CHECK(has(js, "return /[.!?]$/.test(t) ? t : t + '.';"));
+    CHECK(has(js, "if (status === 503) return why + ' ' + (sentence(remediation) || 'Try again shortly.');"));
+    CHECK(js.find("if (status === 503) return why + ' '") < js.find("' Try again in ' + secs + ' seconds.'"));
     CHECK(has(js, "starting another run may be refused for up to a minute."));
     CHECK(js.find("r.status === 429 || r.status === 503") < js.find("'Could not start the run (HTTP '"));
     // A key on the row's own button is the button's, not a row selection.
