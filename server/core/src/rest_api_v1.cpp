@@ -782,8 +782,8 @@ const std::string& openapi_spec() {
       "bearerAuth": {"type": "http", "scheme": "bearer", "description": "API token via Authorization: Bearer <token>"},
       "apiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-Yuzu-Token", "description": "API token via X-Yuzu-Token header"},
       "cookieAuth": {"type": "apiKey", "in": "cookie", "name": "yuzu_session", "description": "Session cookie from /login"},
-      "uploadGrantAuth": {"type": "apiKey", "in": "header", "name": "X-Yuzu-Upload-Grant", "description": "Upload grant credential, <grant_id>.<grant_secret>, from the mint response"},
-      "uploadSessionAuth": {"type": "apiKey", "in": "header", "name": "X-Yuzu-Upload-Session", "description": "Upload session credential, <upload_id>.<session_secret>, from the session-open response"}
+      "uploadGrantAuth": {"type": "apiKey", "in": "header", "name": "X-Yuzu-Upload-Grant", "description": "Upload grant credential, <grant_id>.<grant_secret>, from the mint response. Known defect: the server's pre-routing session check does not yet exempt the agent upload routes, so a request that carries only this header is answered 401 with the generic unauthorized body, before the handler runs"},
+      "uploadSessionAuth": {"type": "apiKey", "in": "header", "name": "X-Yuzu-Upload-Session", "description": "Upload session credential, <upload_id>.<session_secret>, from the session-open response. Known defect: the server's pre-routing session check does not yet exempt the agent upload routes, so a request that carries only this header is answered 401 with the generic unauthorized body, before the handler runs"}
     },
     "schemas": {
       "ApiEnvelope": {
