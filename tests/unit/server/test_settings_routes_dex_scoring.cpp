@@ -283,11 +283,6 @@ struct Harness {
         return res;
     }
     std::string stored_revision() const { return dex_score_policy_revision(stored.value_or("")); }
-    // The grant is refused on both seams (the realistic case: one principal, one RBAC answer).
-    void deny(const std::string& pair) {
-        loud_denied.insert(pair);
-        quiet_denied.insert(pair);
-    }
 };
 
 // Parks inside the provider's commit, holding its writer lock, so a route write meets WriterBusy
@@ -404,15 +399,11 @@ TEST_CASE("scoring GET: a reader without GuaranteedState:Read learns nothing and
 TEST_CASE("scoring GET: a reader without Infrastructure:Write sees every control disabled",
           "[server][routes][dex][score_policy][scoring]") {
     // Whatever the legacy role says: the page is editable exactly when PUT /api/v1/dex/score-policy
-    // would admit the caller, and that is asked quietly.
+    // would admit the caller, and that is asked quietly. An administrator account RBAC has not
+    // granted the write to is still disabled (a non-administrator refusal would not tell the
+    // grant gate from the role gate).
     Harness h;
-    SECTION("an administrator account RBAC has not granted the write to") {
-        h.quiet_denied.insert("Infrastructure:Write");
-    }
-    SECTION("a non-administrator account that was refused the write") {
-        h.is_admin = false;
-        h.quiet_denied.insert("Infrastructure:Write");
-    }
+    h.quiet_denied.insert("Infrastructure:Write");
     const auto res = h.get();
     CHECK(res->status == 200);
     CHECK(has(res->body, "data-denied=\"write\""));
@@ -554,6 +545,8 @@ TEST_CASE("scoring save: a stale revision is refused and never overwrites",
         CHECK(res->status == 200);
         CHECK(has(res->body, "data-refused=\"stale\""));
         CHECK(has(res->body, "changed by someone else"));
+        CHECK(has(res->get_header_value("HX-Trigger"),
+                  "Score policy not saved: changed by someone else"));
         const auto tags = control_tags(res->body);
         REQUIRE(tags.size() > 20); // a body with no controls would pass the loop below vacuously
         for (const auto& t : tags) {
@@ -576,7 +569,9 @@ TEST_CASE("scoring save: a missing if_match is a 428 or a refusal token",
     Harness h;
     const auto body = form_body(dex_form_values(policy_with_excellent(95.0)), "");
     CHECK(h.post(kSave, body)->status == 428);
-    CHECK(has(h.post(kSave, body, kHx)->body, "data-refused=\"if_match_missing\""));
+    const auto hx = h.post(kSave, body, kHx);
+    CHECK(has(hx->body, "data-refused=\"if_match_missing\""));
+    CHECK(has(hx->get_header_value("HX-Trigger"), "Score policy not saved: reload and try again"));
     CHECK(h.cas_calls == 0);
 }
 
@@ -638,7 +633,16 @@ TEST_CASE("scoring save: an unreadable store answers the unavailable note, never
     CHECK_FALSE(has(hx->body, "Shipped defaults"));
     CHECK_FALSE(has(hx->body, "Policy in force"));
     CHECK_FALSE(has(hx->body, "<form"));
-    CHECK(has(hx->get_header_value("HX-Trigger"), "Score policy not saved: try again shortly"));
+    // The toast names what the body says, not a field the body cannot mark.
+    CHECK(has(hx->get_header_value("HX-Trigger"), "Config store unavailable"));
+    // A form fault (typed input in an override row with no image) is refused before the writer is
+    // asked, yet the body is still the unavailable note: its toast must not point at a marked field.
+    auto faulty = dex_form_values(dex_default_score_policy());
+    faulty["overrides[0].weights.hangs"] = "5";
+    const auto form_fault = h.post(kSave, form_body(faulty, h.stored_revision()), kHx);
+    CHECK(has(form_fault->body, "Config store unavailable"));
+    CHECK(has(form_fault->get_header_value("HX-Trigger"), "Config store unavailable"));
+    CHECK_FALSE(has(form_fault->get_header_value("HX-Trigger"), "fix the marked field"));
     const auto plain = h.post(kSave, body);
     CHECK(plain->status == 503);
     CHECK(json::parse(plain->body)["error"]["retry_after_ms"].is_number());
@@ -749,25 +753,14 @@ TEST_CASE("scoring POST: every refusal before the writer leaves nothing behind",
         for (const auto& call : h.perm_calls)
             CHECK(call == std::pair<std::string, std::string>{"Infrastructure", "Write"});
         CHECK(h.denied_rows.size() == 3); // one standing denied row per refused attempt
+        CHECK(h.denied_rows[0] == "auth.permission_required/Infrastructure:Write");
+        // The loud seam, not the page-view probe (which writes no denied row for a cookie session).
+        CHECK(h.quiet_calls.empty());
         CHECK(h.admin_calls == 0);
         CHECK(h.reads == 0);
         CHECK(h.apps_calls == 0);
         CHECK(h.rows.empty());
         CHECK(h.cas_calls == 0);
-        CHECK_FALSE(h.stored);
-    }
-    SECTION("the write gate is the loud seam: a quiet allow cannot admit a loud refusal") {
-        // The page-view probe writes no denied row for a cookie session, so an action route that
-        // used it would refuse silently. Quiet allows everything here; loud refuses the write.
-        Harness h;
-        h.loud_denied.insert("Infrastructure:Write");
-        const auto res = h.post(kSave, body, kHx);
-        CHECK(res->status == 403);
-        CHECK(h.quiet_calls.empty());
-        REQUIRE(h.denied_rows.size() == 1);
-        CHECK(h.denied_rows[0] == "auth.permission_required/Infrastructure:Write");
-        CHECK(h.cas_calls == 0);
-        CHECK(h.rows.empty());
         CHECK_FALSE(h.stored);
     }
     SECTION("a caller with the write but without GuaranteedState:Read is refused second, before any read") {
@@ -841,6 +834,8 @@ TEST_CASE("scoring save: an audit store that refuses the attempted row fails clo
     const auto res = h.post(kSave, body, kHx);
     CHECK(res->status == 200);
     CHECK(has(res->body, "data-refused=\"audit_unavailable\""));
+    CHECK(has(res->get_header_value("HX-Trigger"),
+              "Score policy not saved: audit unavailable, try again shortly"));
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(h.cas_calls == 0);
     CHECK_FALSE(h.stored);

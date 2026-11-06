@@ -2503,16 +2503,10 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
                                       DexScorePolicyWriteRequest::Op op, bool dry_run) {
     const bool put = op == DexScorePolicyWriteRequest::Op::Put;
     const char* leaf = dry_run ? "preview" : (put ? "save" : "reset");
-    // AUTHORITY IS THE REST TWIN'S, exactly: a fragment is a view over the API, not a second
-    // authority (ADR-1005 Decision 4). PUT/DELETE /api/v1/dex/score-policy gate on
-    // Infrastructure:Write, so these POSTs do too, first and in the same order; then
-    // GuaranteedState:Read, because every answer carries the Apps model's application names (the
-    // datalist, the preview table). The legacy-admin test (admin_fn_) is deliberately not used:
-    // it never consults RBAC, so a principal refused by the REST route could write through here.
-    // Both gates are the LOUD perm_fn_: a refused cookie session leaves the standing
-    // auth.permission_required row. read_perm (the quiet probe, which writes no denied row for a
-    // cookie session) is for the GET page view only; an action route must not use it
-    // (auth_routes.hpp).
+    // Authority is the REST twin's (ADR-1005 Decision 4): Infrastructure:Write first, then
+    // GuaranteedState:Read (every answer carries application names), both through the loud
+    // perm_fn_. Never admin_fn_ (it bypasses RBAC, so the REST route's refusal could be written
+    // around) and never read_perm on an action route (it is quiet for a cookie session).
     if (!perm_fn_(req, res, "Infrastructure", "Write"))
         return;
     if (!perm_fn_(req, res, "GuaranteedState", "Read"))
@@ -2559,9 +2553,11 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
                             std::optional<std::int64_t> retry_after_ms, std::string remediation) {
         if (htmx) {
             res.status = 200;
-            res.set_header("HX-Trigger", dex_scoring_toast(toast, "error"));
             // With the pre-apply read failed there is no policy to show: "Shipped defaults"
-            // would be a false statement about the store, so the section is the unavailable note.
+            // would be a false statement about the store, so the section is the unavailable note
+            // and the toast names that, not a field the body does not mark.
+            const char* const shown_toast = current ? toast : "Config store unavailable";
+            res.set_header("HX-Trigger", dex_scoring_toast(shown_toast, "error"));
             res.set_content(
                 current ? render_dex_scoring_section(shown, true,
                                                      if_match.value_or(shown.revision), &posted,
@@ -2600,8 +2596,9 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
     // Stamped from the session this handler resolved, never re-resolved from the request. The
     // bool survives: a refused 'attempted' row is the writer's AuditUnavailable 503. A row that
     // did not persist also marks the response Sec-Audit-Failed, as the REST twin does through
-    // emit_behavioral_audit (the writer's contract leaves that signal to the handler); has_header
-    // keeps a second failed row from appending a second value.
+    // emit_behavioral_audit (the writer's contract leaves that signal to the handler). The writer
+    // lets at most one row fail per request (a failed 'attempted' row ends it), so the header
+    // is set at most once.
     deps.audit = [this, &req, &res, &session,
                   role = auth::role_to_string(auth::effective_role(*session))](
                      std::string_view verb, std::string_view result,
@@ -2609,7 +2606,7 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
         const bool persisted =
             audit_as_session_fn_(req, *session, role, std::string(verb), std::string(result),
                                  "RuntimeConfig", std::string(kDexScorePolicyKey), detail_json);
-        if (!persisted && !res.has_header("Sec-Audit-Failed"))
+        if (!persisted)
             res.set_header("Sec-Audit-Failed", "true");
         return persisted;
     };
@@ -2644,8 +2641,7 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
         preview.degraded = true;
         // The image suggestions come from the "now" model below (the same applications, whatever
         // the policy), so the render does not read the Apps model a third time.
-        std::vector<std::string> subjects;
-        bool have_subjects = false;
+        std::optional<std::vector<std::string>> subjects;
         // "Now" is scored under the revision this handler read (the one the form edits), through
         // the same explicit-policy path as the proposal, never under the provider's cache, which
         // can trail another replica's write by a refresh interval. If that read and the dry run's
@@ -2655,12 +2651,11 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
             const auto now_model = dex_apps_fn_(now);
             preview = dex_tier_preview(now_model, dex_apps_fn_(r.in_force));
             subjects = dex_scoring_subjects(now_model);
-            have_subjects = true;
         }
         res.set_header("HX-Trigger", dex_scoring_toast("Preview only: nothing saved", "success"));
         res.set_content(render_dex_scoring_section(shown, true, r.previous_revision, &posted,
                                                    std::nullopt, std::move(preview), "",
-                                                   have_subjects ? &subjects : nullptr),
+                                                   subjects ? &*subjects : nullptr),
                         "text/html; charset=utf-8");
         return;
     }

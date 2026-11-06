@@ -485,7 +485,7 @@ std::string dex_subnav(const std::string& active, int window_days) {
            tab("network", "Network", "/fragments/network/overview") +
            // Rendered statically for every viewer: no capability probe here (each
            // failed probe would write a denied audit row per sub-nav render). The
-           // Scoring and Alerts fragments themselves show the Administrator-role note.
+           // Scoring and Alerts fragments themselves show their own permission note.
            tab("scoring", "Scoring", "/fragments/dex/scoring") +
            tab("alerts", "Alerts", "/fragments/dex/alerts") + "</div>";
 }

@@ -2,8 +2,6 @@
 
 Every owning boundary and every borrow the diff adds or changes in C++ (server/core/src/dex_score_policy_form.hpp, settings_routes.{hpp,cpp}, server.cpp, dex_routes.cpp, step_up_policy.hpp, body_cap_policy.hpp and the test files: test_dex_score_policy_form.cpp, test_settings_routes_dex_scoring.cpp, test_dex_routes.cpp, test_body_cap_policy.cpp and test_step_up_policy.cpp). The diff adds no fd, HANDLE, SOCKET, `FILE*`, sqlite3, libpq, OpenSSL or BCrypt object, subprocess, mapped library or temp path, and no thread outside the test-only `WriterHold` (R9). Everything the pure header builds is a value (`std::string`, `std::vector`, `std::map`, `nlohmann::json`); the only borrows are the two `std::function` seams and the closures below. No manual cleanup in new C++.
 
-The findings of this governance run are recorded beside this ledger as `governance.d/dex-score-policy-scoring-tab.q7Kd2m.jsonl` (same stem), which the orchestrator commits when the governance gate closes.
-
 | ID | Resource / construct | Owner type | Acquired | Released | Transfer | Failure cleanup |
 |---|---|---|---|---|---|---|
 | R1 | `SettingsRoutes::dex_score_policy_writer_` | `std::optional<DexScorePolicyWriteDeps>` member (copy of the REST deps: three `std::function`s and a `shared_ptr<DexScorePolicyProvider>`) | `set_dex_score_policy_writer`, once in server.cpp before the listener starts | `~SettingsRoutes` | the REST route holds its own copy; the provider is shared by `shared_ptr`; the store reader and writers borrow `*runtime_config_store_` exactly as the REST copy does (stop() joins the listener before the store is reset) | none (RAII members) |

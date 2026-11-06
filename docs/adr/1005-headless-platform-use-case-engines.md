@@ -948,11 +948,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **A UI over the REST pair.** `GET` reads, `save` writes (`PUT`),
        `preview` is `PUT ?dry_run=true` and `reset` is `DELETE`
        `/api/v1/dex/score-policy`. The tab calls the same write function
-       (`apply_dex_score_policy`), gates on the same `Infrastructure:Write`
-       (writes) and `GuaranteedState:Read` (view), and writes the same audit
-       rows, so it is a view over the API and not a second authority. Each route
-       has a `planned:#6087` row in `scripts/ci/api-parity/dex.json` naming its
-       REST twin; the rows flip to twinned when the twins land.
+       (`apply_dex_score_policy`), gates writes on the REST grant
+       `Infrastructure:Write` plus `GuaranteedState:Read` (Read is not
+       view-only: every answer carries application names), gates viewing on
+       `GuaranteedState:Read`, and writes the same audit rows, so it is a view
+       over the API and not a second authority. Each route has a
+       `planned:#6087` row in `scripts/ci/api-parity/dex.json` naming its REST
+       twin; the rows flip to twinned when the twins land.
      - **The one capability with no headless twin: the tier-change diff.** The
        preview lists which of the top applications would change tier. A REST
        dry run answers only the validated document and revision, so the diff

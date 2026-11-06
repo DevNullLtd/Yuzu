@@ -98,11 +98,8 @@ using json = nlohmann::json;
     return std::string(s.substr(b, s.find_last_not_of(ws) - b + 1));
 }
 
-/// A JSON number when `text` is wholly one (an integer stays an integer, so the event cap
-/// parses), otherwise the raw text as a bounded JSON string for the parser to refuse by name.
-/// strtod also reads hexadecimal ("0x10") and hex-float ("0x1p3") forms that a JSON body would
-/// refuse, so a text holding x/X/p/P is never offered to it; from_chars<double> would need no
-/// such guard but is not available on Apple Clang 15.
+/// A JSON number when `raw` is wholly one, else the raw text as a bounded string the parser
+/// refuses by name; x/X/p/P text skips strtod, which would accept hex and hex-float forms.
 [[nodiscard]] inline json number_or_string(const std::string& raw) {
     const std::string t = trim(raw);
     if (!t.empty() && t.find_first_of("xXpP") == std::string::npos) {
@@ -118,10 +115,8 @@ using json = nlohmann::json;
     return t.substr(0, kDexFormMaxBadNumberBytes);
 }
 
-/// `overrides[N].rest` -> {N, rest}. An index of five or more digits is no real row: it reads
-/// as one past kDexFormMaxOverrideIndex, so the form is refused whole rather than the pair being
-/// ignored. A leading zero ("007") is not the canonical spelling of any row (the form looks row 7
-/// up as "overrides[7]."), so such a name is malformed and ignored like any other.
+/// `overrides[N].rest` -> {N, rest}. A 5+ digit N reads as past kDexFormMaxOverrideIndex, so the
+/// form is refused whole; a leading zero ("007") spells no row ("overrides[7]."), so it is ignored.
 [[nodiscard]] inline std::optional<std::pair<int, std::string_view>>
 split_override_key(std::string_view name) {
     constexpr std::string_view kPre = "overrides[";

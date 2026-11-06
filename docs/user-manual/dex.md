@@ -74,13 +74,14 @@ rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
 ### Scoring
 
 The **Scoring** tab (`/fragments/dex/scoring`) shows the score policy in force and lets an
-administrator edit every parameter of it in one place. Viewing needs the
-**`GuaranteedState:Read`** permission. Editing needs the **`Infrastructure:Write`** permission
+operator who holds `Infrastructure:Write` edit every parameter of it in one place. Viewing needs
+the **`GuaranteedState:Read`** permission. Editing needs the **`Infrastructure:Write`** permission
 (Administrator holds it by default) and the same read permission, because every answer carries
 application names. `Infrastructure:Write` is the grant `PUT` and `DELETE /api/v1/dex/score-policy`
-require, so the tab can do exactly what the API can for the same account, no more and no less;
-the legacy Administrator role is not what decides it. Anyone who can view without
-`Infrastructure:Write` sees the same page with every control disabled and a note naming the grant.
+require, so the tab can do no more than the API can for the same account; it additionally needs
+`GuaranteedState:Read`. The legacy Administrator role is not what decides it. Anyone who can view
+without `Infrastructure:Write` sees the same page with every control disabled and a note naming the
+grant.
 If the runtime-config store is not open, the tab shows *Config store unavailable* instead of the
 form.
 
@@ -134,11 +135,7 @@ edits on screen. A change reaches every server typically within 5 seconds. Tier 
 names are HTML-escaped wherever they are shown.
 
 **Rolling upgrades.** Do not save or reset the policy during a rolling upgrade or rollback of the
-server. A server on the previous release reads a version 2 document (one that sets a model
-parameter) as `unsupported_version` and scores under the shipped defaults until every server runs
-the same release, and a write made through the API on such a server replaces the whole document. The
-Scoring tab does not exist on a server that predates it: behind a load balancer,
-`GET /fragments/dex/scoring` answers `404` from such a replica. See [Upgrading](upgrading.md).
+server; see [Upgrading](upgrading.md#behaviour-change-the-dex-scoring-tab-edits-the-score-policy-from-the-dashboard).
 
 ### Catalogue
 

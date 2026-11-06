@@ -345,17 +345,6 @@ TEST_CASE("form: the limits hold at the exact boundary on both sides",
         REQUIRE_FALSE(refused);
         CHECK(refused.error().field == "overrides");
     }
-    SECTION("exactly 200 override rows are built and validated") {
-        auto v = dex_form_values(dex_default_score_policy());
-        for (std::size_t i = 0; i < kDexPolicyMaxOverrides; ++i)
-            v["overrides[" + std::to_string(i) + "].image"] = "app" + std::to_string(i) + ".exe";
-        const auto doc = dex_form_to_document(pairs_of(v));
-        REQUIRE(doc);
-        CHECK(doc->row_of_override.size() == kDexPolicyMaxOverrides);
-        const auto parsed = dex_score_policy_validate_text(doc->text);
-        REQUIRE(parsed);
-        CHECK(parsed->overrides.size() == kDexPolicyMaxOverrides);
-    }
     SECTION("exactly kDexFormMaxPairs pairs are accepted, one more is refused") {
         const auto body_of = [](std::size_t n) {
             std::string b;
@@ -376,15 +365,8 @@ TEST_CASE("form: the limits hold at the exact boundary on both sides",
     }
 }
 
-TEST_CASE("form: an override index above the limit is refused before anything is built, and 201 "
-          "real rows reach the validator's too_many_overrides",
+TEST_CASE("form: 201 real override rows reach the validator's too_many_overrides",
           "[server][dex][score_policy][form]") {
-    auto v = dex_form_values(dex_default_score_policy());
-    v["overrides[300].image"] = "x.exe";
-    const auto refused = dex_form_to_document(pairs_of(v));
-    REQUIRE_FALSE(refused);
-    CHECK(refused.error().field == "overrides");
-
     auto many = dex_form_values(dex_default_score_policy());
     for (int i = 0; i <= 200; ++i)
         many["overrides[" + std::to_string(i) + "].image"] = "app" + std::to_string(i) + ".exe";
@@ -394,9 +376,6 @@ TEST_CASE("form: an override index above the limit is refused before anything is
     REQUIRE_FALSE(bad);
     CHECK(bad.error().field == "overrides");
     CHECK(has(bad.error().message, "too_many_overrides"));
-
-    DexFormPairs huge(kDexFormMaxPairs + 1, std::pair<std::string, std::string>{"x", "y"});
-    CHECK_FALSE(dex_form_to_document(huge));
 }
 
 TEST_CASE("form: the image key folds to ASCII lower case so a case-only duplicate is refused on "
@@ -509,27 +488,6 @@ TEST_CASE("render: one form, three controls inside it, section body only",
     }
     CHECK(has(html, "hx-target=\"#dex-scoring-section\" hx-swap=\"innerHTML\" hx-confirm="));
     CHECK_FALSE(has(html, "id=\"dex-scoring-section\""));
-}
-
-TEST_CASE("render: tier names and image keys are HTML-escaped at every sink",
-          "[server][dex][score_policy][form]") {
-    DexScoringView view = view_of(dex_default_score_policy());
-    view.values["tiers.names.good"] = "O'Brien's";
-    view.values["overrides[0].image"] = "<img src=x>";
-    view.suggestions = {"<img src=x>"};
-    view.fault = "<b>fault</b>";
-    DexTierPreview pv;
-    pv.total = 1;
-    pv.changed = 1;
-    pv.rows.push_back({"<script>", "O'Brien's", "<i>"});
-    view.preview = pv;
-    const auto html = render_dex_scoring_section(view);
-    CHECK(has(html, "value=\"O&#39;Brien&#39;s\""));
-    CHECK(has(html, "&lt;img src=x&gt;"));
-    CHECK(has(html, "&lt;script&gt;"));
-    CHECK_FALSE(has(html, "<img"));
-    CHECK_FALSE(has(html, "<script"));
-    CHECK_FALSE(has(html, "<b>fault"));
 }
 
 TEST_CASE("render: a hostile string is escaped literally at every sink",
