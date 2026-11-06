@@ -2,8 +2,8 @@
  * test_software_collection_settings_store.cpp - SoftwareCollectionSettingsStore (born-on-Postgres,
  * schema `software_collection_settings_store`): migration, conditional writes (create-only,
  * version-guarded replace, never last-writer-wins), the timezone existence check, the count-bounded
- * history, the read rule (corrupt vs forward-compatible rows), the list cap and the failure channel
- * (a held pool is Unavailable, never "no document").
+ * history, the read rule (a corrupt row vs a missing known key read as the fleet default), the list
+ * cap and the failure channel (a held pool is Unavailable, never "no document").
  */
 
 #include "software_collection_settings_store.hpp"
