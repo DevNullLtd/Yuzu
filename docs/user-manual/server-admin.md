@@ -1194,7 +1194,21 @@ no-backfill, since this store never existed before 3.3).
   actual delivery outcome. **Any SIEM correlation rule or audit-count
   assurance built on "one audit event per scheduled fire" must be updated**
   to expect the pair, or to key off `command.outbox_delivered` for the
-  delivery outcome.
+  delivery outcome. A `failure` row is not always "reached nobody": since
+  #3678 it also records a redelivery dead-letter (detail contains
+  `redelivery_horizon_exceeded` or `redelivery_sequence_regressed`) for an
+  occurrence that may or may not have reached any agent.
+- **A scheduled run's retry is now bounded (#3678).** Previously a run whose
+  delivery kept being retried was re-sent indefinitely under the same command
+  ID. An agent only remembers its most recent 20,000 completed commands, so an
+  old retry could re-execute a command the agent had forgotten. The server now
+  refuses a retry once its dispatch count has advanced by 10,000 since the
+  occurrence's first attempt: the occurrence is marked failed
+  (`redelivery_horizon_exceeded`), audited, and never sent again. An approval
+  ticket it used stays spent. The count is an estimate and can err in both
+  directions; see "Execution semantics" in `docs/user-manual/instructions.md`
+  for the limits and the steps to take after a dead-letter. Alerts:
+  `YuzuOutboxHeld`, `YuzuOutboxStampFailing` and `YuzuOutboxDeadLettered`.
 - **New metrics.** Eight counters and a backlog gauge —
   `yuzu_server_command_outbox_*` — cover enqueue-side degrade and the
   delivery loop's outcomes (delivered / no-agents / denied / retry / errors /

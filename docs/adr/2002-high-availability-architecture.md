@@ -369,6 +369,30 @@ claim-commit and the external send is unavoidable:
   forwards transparently, no gateway-side dedup today), so an at-least-once re-drive is effectively-once
   — **contingent on WS-0** making the agent's dedup durable (today's `dedup_current_`/`dedup_previous_`
   are in-memory and cleared on reconnect, `agent.cpp` `dedup_current_.clear()`).
+  - **Redelivery horizon (#3678).** The agent's dedup is a ring over the most recent
+    `kAgentDedupRingRows` TERMINAL commands, so a stable `command_id` re-sent after that many newer
+    commands is a fresh claim and RE-EXECUTES. The outbox therefore bounds a redrive by a COUNT, not a
+    clock. Before a row's first attempt it records the shared `dispatch_seq` (advanced once per recorded
+    dispatch call at the one dispatch chokepoint), this process's count of dispatches whose record write
+    failed, and the leader epoch (`ExecutionTracker::current_dispatch_position`). A redrive's estimate is the
+    shared delta plus the unrecorded delta — differenced when the same leadership term reads it, the reader's
+    whole local count when another term does — and one that reaches `kMaxOutboxRedeliveryHorizonCommands` is
+    dead-lettered `redelivery_horizon_exceeded`; a shared sequence that went backwards is dead-lettered
+    `redelivery_sequence_regressed`. Neither is sent. The constant is `static_assert`ed to at most half the ring
+    (`common/include/yuzu/command_replay_horizon.hpp`). It is an estimate, not a proof: it over-counts
+    (fleet-wide, per-target fan-out, `__guard__`, redrives re-recording their own id, a different-term reader's
+    whole unrecorded count that never decays inside a process — safe, an early dead-letter) and can under-count
+    when record writes fail on a replica other than the reading one OR in an earlier process lifetime of the same
+    replica (a restart or a leadership change forgets the previous process's post-stamp failures; a restart cannot
+    make the shared sequence regress, so it is not a safe refusal), when a command is dispatched before the stamp
+    but reaches the agent after it, when a restore leaves the shared sequence above a row's stamp, or when a stale
+    replica sends a row a peer has just dead-lettered (the send precedes the fenced write) — all unsafe; the 2x
+    margin is not sized for a sustained uncounted outage, and the sound close is agent-side. An unreadable or unwired position HOLDS
+    the row and ends the tick (the direction that cannot re-execute). A stamp written by an attempt that
+    provably reached no agent is cleared. Not covered: a stuck row on a quiet fleet is not capped by count (the
+    age and attempts caps remain #4167); `DeploymentEngine`'s fresh-`command_id` re-dispatch takes a new ring
+    slot each time and is not a replay; `forward_gateway_pending` re-sends the same `command_id` a bounded
+    number of times, each attempt with its own 300 s deadline.
 - **Fencing token in the claim transaction:** every claim CAS checks the leader's fencing token, so a
   stale ex-leader cannot commit a claim even before it notices its lock dropped. A boolean "I am
   leader" cached outside the lock connection is prohibited.
