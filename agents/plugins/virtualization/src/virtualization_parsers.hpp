@@ -9,8 +9,10 @@
 //   1. SMBIOS / hardware model names a VM vendor            -> guest (high)
 //   2. CPUID hypervisor present, Microsoft Hv, and the Hyper-V root-partition bit set
 //                                                            -> host_with_hypervisor (not virtual)
-//   3. CPUID hypervisor present                              -> guest (medium when the vendor
-//                                                               signature is not a well-formed 12 bytes)
+//   3. CPUID hypervisor present                              -> guest (medium when the signature
+//                                                               is malformed, SMBIOS is unreadable,
+//                                                               or a Microsoft Hv root-partition
+//                                                               bit could not be read)
 //   3b. an OS hint says virtual (sysctl, /sys/hypervisor)    -> guest (medium)
 //   4. a readable negative signal AND no consulted source unreadable -> bare_metal
 //   5. anything else                                         -> unknown, with the reason tokens
@@ -29,8 +31,9 @@
 // TOKEN CLASSES. (a) constraint tokens from the sources,
 //   ^(windows|macos|linux):virtualization:[a-z0-9_]+(:[a-z0-9_]+)*$
 // (b) the seam exception token `<os>:leg:exception`, written only by execute_host's catch arm;
-// (c) evidence strings in the container row's third field (`/.dockerenv`, a matched cgroup
-// token, `macos:no_container_runtime`), which are not tokens and never reach set_result_status.
+// (c) evidence strings in the container row's third field (`/.dockerenv`, `/run/systemd/container`,
+// a matched cgroup token, `macos:no_container_runtime`), which are not tokens and never reach
+// set_result_status.
 //
 // The `status|host|...` row is NOT built here; report_host in virtualization_legs.hpp owns it.
 
@@ -137,6 +140,9 @@ struct ContainerInputs {
     Mode mode = Mode::linux_read;
     bool dockerenv = false;
     bool containerenv = false;
+    /// /run/systemd/container text (systemd PID 1 writes the container TYPE there); nullopt =
+    /// absent. A failed read is a token in `reason`, never a value here.
+    std::optional<std::string> systemd_container;
     std::optional<std::string> cgroup; ///< /proc/self/cgroup text; nullopt = not read
     std::string reason;                ///< failure token when a container source could not be read
 };
@@ -169,13 +175,18 @@ inline bool contains_ci(std::string_view hay, std::string_view needle) {
     return lower(hay).find(needle) != std::string::npos; // needles are lowercase
 }
 
+inline std::string rtrim(std::string s) {
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+    return s;
+}
+
 struct SigRow {
     std::string_view sig; // exactly 12 bytes
     std::string_view vendor;
 };
 
 // "KVMKVMKVM" is followed by three NULs on the wire.
-inline constexpr std::array<SigRow, 9> kSignatures{{
+inline constexpr auto kSignatures = std::to_array<SigRow>({
     {std::string_view{"KVMKVMKVM\0\0\0", 12}, "kvm"},
     {"Microsoft Hv", "hyperv"},
     {"VMwareVMware", "vmware"},
@@ -185,7 +196,7 @@ inline constexpr std::array<SigRow, 9> kSignatures{{
     {"bhyve bhyve ", "bhyve"},
     {"TCGTCGTCGTCG", "qemu"},
     {"ACRNACRNACRN", "acrn"},
-}};
+});
 
 struct SmbiosRow {
     std::string_view manufacturer; ///< lowercase substring; empty = ignore
@@ -193,7 +204,7 @@ struct SmbiosRow {
     std::string_view vendor;
 };
 
-inline constexpr std::array<SmbiosRow, 17> kSmbios{{
+inline constexpr auto kSmbios = std::to_array<SmbiosRow>({
     {"qemu", "", "qemu"},
     {"red hat", "kvm", "kvm"},
     {"red hat", "rhev", "kvm"},
@@ -211,7 +222,7 @@ inline constexpr std::array<SmbiosRow, 17> kSmbios{{
     {"openstack", "", "openstack"},
     {"nutanix", "ahv", "nutanix"},
     {"", "virtualmac", "apple"},
-}};
+});
 
 } // namespace detail
 
@@ -251,8 +262,9 @@ inline std::optional<std::string_view> vm_vendor_from_smbios(std::string_view ma
 // Wire formatting
 // ---------------------------------------------------------------------------
 
-/// OS-supplied bytes -> a row-safe field: NUL and malformed UTF-8 become '?', then pipes,
-/// backslashes and newlines are escaped. Empty becomes "-".
+/// OS-supplied bytes -> a row-safe field: NUL and malformed UTF-8 become '?', then
+/// safe_output_field escapes pipes, folds a backslash to '/' and turns a newline into a space.
+/// Empty becomes "-".
 inline std::string wire_field(std::string_view v) {
     std::string s(v);
     yuzu::shared::scrub_wire_bytes(s);
@@ -515,6 +527,19 @@ inline ContainerVerdict classify_container(const Facts& f) {
         v.evidence = "/run/.containerenv";
         return v;
     }
+    // systemd PID 1 writes the container TYPE (lxc, systemd-nspawn, docker, podman, ...) to
+    // /run/systemd/container, which is how an LXD/Incus/nspawn system container is told from a
+    // host: its cgroup path is a plain `0::/system.slice/...` either way. `wsl` is excluded
+    // (systemd classes WSL2 as a container type, but a WSL2 agent is a Hyper-V guest and falls
+    // through to the cgroup scan); empty falls through too. The content is never emitted.
+    if (in.systemd_container) {
+        const std::string type = detail::rtrim(*in.systemd_container);
+        if (!type.empty() && type != "wsl") {
+            v.value = Tri::yes;
+            v.evidence = "/run/systemd/container";
+            return v;
+        }
+    }
     std::vector<std::string> paths;
     if (in.cgroup) {
         paths = detail::cgroup_paths(*in.cgroup);
@@ -540,6 +565,8 @@ inline ContainerVerdict classify_container(const Facts& f) {
         v.evidence = detail::token(f, "container:cgroup_root_opaque");
         return v;
     }
+    // Residual: a container whose init is not systemd and that sets no marker file (a
+    // Fargate-style or hand-rolled runtime) shows a host-shaped path and reads `no` here.
     v.value = Tri::no;
     v.evidence = "linux:no_container_marker";
     return v;
@@ -622,11 +649,6 @@ inline void push_unique(std::vector<std::string>& v, std::string s) {
         v.push_back(std::move(s));
 }
 
-inline std::string rtrim(std::string s) {
-    s.erase(s.find_last_not_of(" \t\r\n") + 1);
-    return s;
-}
-
 } // namespace detail
 
 /// Combines the two Linux DMI attributes into SmbiosFacts. Either unreadable makes the whole
@@ -698,14 +720,15 @@ inline OsHint linux_os_hint(std::string_view sys_hypervisor_type) {
     return h;
 }
 
-/// Everything the Linux shell reads, before any decision: the four bounded file reads and the
+/// Everything the Linux shell reads, before any decision: the five bounded file reads and the
 /// errno of the two container-marker probes (0 = present, ENOENT = absent, else a failure). The
 /// probes default to absent so an unfilled LinuxReads never reads as "in a container".
 struct LinuxReads {
     FieldRead sys_vendor;
     FieldRead product_name;
     FieldRead hypervisor_type;
-    FieldRead cgroup; ///< /proc/self/cgroup, the agent's own membership
+    FieldRead systemd_container; ///< /run/systemd/container, the container type systemd records
+    FieldRead cgroup;            ///< /proc/self/cgroup, the agent's own membership
     int dockerenv_errno = ENOENT;
     int containerenv_errno = ENOENT;
 };
@@ -713,7 +736,8 @@ struct LinuxReads {
 /// Linux Facts from the reads: the DMI combine, the `linux:virtualization:<source>:<cause>`
 /// tokens, the OS hint and the container inputs. Every failed container read is kept
 /// (comma-joined in container.reason); ENOENT is a definitive absence and never a token, except
-/// that /proc/self/cgroup missing entirely is `cgroup_enoent` (the agent cannot answer).
+/// that /proc/self/cgroup missing entirely is `cgroup_enoent` (the agent cannot answer). A missing
+/// /run/systemd/container is the normal host case: absent, no token.
 inline Facts linux_facts(CpuidFacts cpuid, const LinuxReads& r) {
     Facts f;
     f.os = "linux";
@@ -738,6 +762,12 @@ inline Facts linux_facts(CpuidFacts cpuid, const LinuxReads& r) {
     };
     marker(r.dockerenv_errno, f.container.dockerenv);
     marker(r.containerenv_errno, f.container.containerenv);
+    if (r.systemd_container.state == ReadState::ok)
+        f.container.systemd_container = r.systemd_container.value;
+    else if (r.systemd_container.state == ReadState::unreadable)
+        detail::push_unique(
+            failed,
+            detail::linux_token("container", "systemd_container_" + r.systemd_container.cause));
     if (r.cgroup.state == ReadState::ok)
         f.container.cgroup = r.cgroup.value;
     else

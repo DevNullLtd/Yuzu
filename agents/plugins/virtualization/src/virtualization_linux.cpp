@@ -5,9 +5,11 @@
  * linux_facts (virtualization_parsers.hpp) turns them into Facts, tokens included. Every decision
  * (the vendor tables, the root-partition gate, the precedence, bare_metal vs unknown, the
  * container verdict) is in that header too. Reads go through posix_secure_read (bounded, regular
- * files only); ENOENT is "absent" and any other failure is an unreadable source. The container
- * check reads the AGENT's own /proc/self/cgroup, not PID 1's, which answers a different question
- * when the PID namespace is shared.
+ * files only, no deadline of its own: a hung procfs/sysfs read pins the calling pool worker like
+ * every posix_secure_read consumer, #4875); ENOENT is "absent" and any other failure is an
+ * unreadable source. The container check reads the AGENT's own /proc/self/cgroup, not PID 1's,
+ * which answers a different question when the PID namespace is shared, plus the type systemd
+ * records in /run/systemd/container (how a system container is told from a host).
  */
 #include "virtualization_legs.hpp"
 
@@ -83,6 +85,7 @@ int run_linux(yuzu::CommandContext& ctx) {
     r.sys_vendor = read_source("/sys/class/dmi/id/sys_vendor", kSmallCap);
     r.product_name = read_source("/sys/class/dmi/id/product_name", kSmallCap);
     r.hypervisor_type = read_source("/sys/hypervisor/type", kSmallCap);
+    r.systemd_container = read_source("/run/systemd/container", kSmallCap);
     r.cgroup = read_source("/proc/self/cgroup", kCgroupCap);
     r.dockerenv_errno = probe("/.dockerenv");
     r.containerenv_errno = probe("/run/.containerenv");

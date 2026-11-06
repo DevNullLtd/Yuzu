@@ -16,8 +16,8 @@
 /// procfs files, marker-file existence and (Windows) the SMBIOS System Information table. No leg
 /// spawns a process, touches the network, takes an operator-supplied argument or changes host
 /// state, and the action reports whether the device is a VM, which hypervisor, and whether the
-/// agent runs in a container as FACTS. An unreadable source is reported `unknown` with a reason,
-/// never as bare metal.
+/// agent runs in a container as FACTS. A host-decision source (SMBIOS, CPUID, OS hint) that
+/// cannot be read is reported `unknown` with a reason, never as bare metal.
 ///
 /// Grouped under `Inventory`: the rows are estate-inventory device facts, not privacy-gated data
 /// (no account, hostname or serial is emitted), so the action is default-on for inventory

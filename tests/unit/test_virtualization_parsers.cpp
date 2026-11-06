@@ -21,7 +21,10 @@
 #include <array>
 #include <cerrno>
 #include <optional>
+#include <regex>
+#include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -187,9 +190,11 @@ TEST_CASE("virtualization: a Windows host running Hyper-V is host_with_hyperviso
     CHECK(p.rows[1] == "container|unknown|windows:virtualization:container:not_read");
 }
 
-TEST_CASE("virtualization: a WSL2 style Hyper-V guest reads guest hyperv", "[virtualization][classify]") {
+TEST_CASE("virtualization: a WSL2 style Hyper-V guest is decided by its SMBIOS, reads guest hyperv",
+          "[virtualization][classify]") {
     // SYNTHETIC: the Microsoft hypervisor signature without the root-partition bit, and DMI as
-    // the Linux kernel publishes it under Hyper-V.
+    // the Linux kernel publishes it under Hyper-V. The VM-vendor SMBIOS answers at step 1, so
+    // this case does not exercise the root-partition bit (see the next case for that).
     Facts f = linux_base();
     f.cpuid = cpuid_hv("Microsoft Hv", 0x4000000Cu, "Hv#1", false);
     f.smbios = smbios_ok("Microsoft Corporation", "Virtual Machine");
@@ -198,7 +203,50 @@ TEST_CASE("virtualization: a WSL2 style Hyper-V guest reads guest hyperv", "[vir
     CHECK(c.kind == Kind::guest);
     CHECK(c.is_virtual == Tri::yes);
     CHECK(c.vendor == "hyperv");
+    CHECK(c.source == "smbios");
     CHECK(c.confidence == Confidence::high);
+}
+
+TEST_CASE("virtualization: the root-partition bit alone separates a Hyper-V host from a guest",
+          "[virtualization][classify][cpuid]") {
+    // SYNTHETIC: the full Hv#1 discovery contract holds and the board is not a VM vendor's, so
+    // the bit is the only thing that can decide.
+    const auto classify_with = [](std::optional<bool> root, SmbiosFacts smbios) {
+        Facts f;
+        f.os = "windows";
+        f.cpuid = cpuid_hv("Microsoft Hv", 0x4000000Cu, "Hv#1", root);
+        f.smbios = std::move(smbios);
+        f.container.mode = ContainerInputs::Mode::windows_not_read;
+        return f;
+    };
+
+    SECTION("bit clear: a guest, hyperv, high") {
+        const auto c = classify(classify_with(false, smbios_ok("Example Board Vendor", "Example Board")));
+        CHECK(c.kind == Kind::guest);
+        CHECK(c.is_virtual == Tri::yes);
+        CHECK(c.vendor == "hyperv");
+        CHECK(c.source == "cpuid");
+        CHECK(c.confidence == Confidence::high);
+    }
+    SECTION("bit unread under a held contract: a guest, medium") {
+        const auto c = classify(classify_with(std::nullopt, smbios_ok("Example Board Vendor", "Example Board")));
+        CHECK(c.kind == Kind::guest);
+        CHECK(c.vendor == "hyperv");
+        CHECK(c.confidence == Confidence::medium);
+    }
+    SECTION("bit set: the host") {
+        const auto c = classify(classify_with(true, smbios_ok("Example Board Vendor", "Example Board")));
+        CHECK(c.kind == Kind::host_with_hypervisor);
+        CHECK(c.confidence == Confidence::high);
+    }
+    SECTION("bit set but SMBIOS unreadable: still the host, medium, and the status is constrained") {
+        const Facts f = classify_with(true, smbios_unreadable("windows:virtualization:smbios:truncated"));
+        const auto c = classify(f);
+        CHECK(c.kind == Kind::host_with_hypervisor);
+        CHECK(c.is_virtual == Tri::no);
+        CHECK(c.confidence == Confidence::medium);
+        CHECK(decide(f).status == StatusState::constrained);
+    }
 }
 
 TEST_CASE("virtualization: SMBIOS beats the root-partition bit (VBS nested in VMware)",
@@ -633,6 +681,36 @@ TEST_CASE("virtualization: linux_facts builds the facts and tokens from the inje
         CHECK(f.container.cgroup.has_value());
         CHECK_FALSE(f.container.dockerenv);
     }
+    SECTION("/run/systemd/container is the container input: present, absent, and refused") {
+        LinuxReads r = clean_reads();
+        r.systemd_container = read_ok("lxc\n");
+        const Facts present = linux_facts(cpuid_clear(), r);
+        REQUIRE(present.container.systemd_container.has_value());
+        CHECK(*present.container.systemd_container == "lxc\n");
+        CHECK(present.container.reason.empty());
+        const auto p = decide(present);
+        CHECK(p.status == StatusState::supported);
+        CHECK(p.rows[1] == "container|yes|/run/systemd/container");
+
+        // ENOENT is the normal host case: nothing recorded, no token.
+        r.systemd_container = FieldRead{};
+        const Facts absent = linux_facts(cpuid_clear(), r);
+        CHECK_FALSE(absent.container.systemd_container.has_value());
+        CHECK(absent.container.reason.empty());
+        CHECK(decide(absent).rows[1] == "container|no|linux:no_container_marker");
+
+        // A refusal is a token (like the marker probes), never a "no": unknown, status constrained.
+        r.systemd_container = read_bad("permission_denied");
+        const Facts refused = linux_facts(cpuid_clear(), r);
+        CHECK_FALSE(refused.container.systemd_container.has_value());
+        CHECK(refused.container.reason == "linux:virtualization:container:systemd_container_permission_denied");
+        const auto rp = decide(refused);
+        CHECK(rp.status == StatusState::constrained);
+        CHECK(rp.reason == refused.container.reason);
+        CHECK(rp.rows[1] == "container|unknown|" + refused.container.reason);
+        // The host verdict does not depend on a container-source failure.
+        CHECK(classify(refused).kind == Kind::bare_metal);
+    }
     SECTION("a present marker sets its flag and needs no token") {
         LinuxReads r = clean_reads();
         r.containerenv_errno = 0;
@@ -675,12 +753,14 @@ TEST_CASE("virtualization: simultaneous source failures are all reported", "[vir
 TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
           "[virtualization][container]") {
     const auto verdict = [](bool dockerenv, bool containerenv, std::optional<std::string> cg,
-                            std::string reason = "") {
+                            std::string reason = "",
+                            std::optional<std::string> systemd_container = std::nullopt) {
         Facts f = linux_base();
         f.container.dockerenv = dockerenv;
         f.container.containerenv = containerenv;
         f.container.cgroup = std::move(cg);
         f.container.reason = std::move(reason);
+        f.container.systemd_container = std::move(systemd_container);
         return classify_container(f);
     };
 
@@ -733,6 +813,9 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
             "12:cpu:/podman/abc123\n",
             "12:cpu:/docker/abc123\n",
             "0::/system.slice/docker-abc123.scope\n",
+            // an lxc directory with no container name, and a kubepods-* name that is not a .slice unit
+            "0::/lxc/\n",
+            "0::/kubepods-x\n",
             // a 63- and a 65-digit id, a non-hex one and an uppercase one are not ids
             "0::/docker/" + hex.substr(1) + "\n",
             "0::/docker/" + hex + "0\n",
@@ -757,6 +840,54 @@ TEST_CASE("virtualization: the container verdict reads the agent's own cgroup",
         const auto v = verdict(false, false, "0::/system.slice/yuzu-agent.service\n");
         CHECK(v.value == Tri::no);
         CHECK(v.evidence == "linux:no_container_marker");
+    }
+    SECTION("a failed marker probe with a readable plain cgroup is unknown, never no") {
+        const auto v = verdict(false, false, "0::/system.slice/a.service\n",
+                               "linux:virtualization:container:markers_permission_denied");
+        CHECK(v.value == Tri::unknown);
+        CHECK(v.read_failed);
+        CHECK(v.evidence == "linux:virtualization:container:markers_permission_denied");
+    }
+    SECTION("/run/systemd/container names a system container whose cgroup path looks like a host's") {
+        // XP-1: LXD/Incus/systemd-nspawn run systemd as PID 1, so the agent's cgroup is a plain
+        // `0::/system.slice/...` exactly as on a host; systemd records the type here instead.
+        const std::string host_shaped = "0::/system.slice/yuzu-agent.service\n";
+        for (const char* type : {"lxc\n", "systemd-nspawn", "docker\n", "podman\n", "oci\n", "lxc-libvirt\n"}) {
+            INFO(type);
+            const auto v = verdict(false, false, host_shaped, "", std::string{type});
+            CHECK(v.value == Tri::yes);
+            CHECK(v.evidence == "/run/systemd/container");
+            CHECK_FALSE(v.read_failed);
+        }
+        // ... including where the cgroup namespace hides the path altogether.
+        const auto opaque = verdict(false, false, "0::/\n", "", std::string{"lxc\n"});
+        CHECK(opaque.value == Tri::yes);
+        CHECK(opaque.evidence == "/run/systemd/container");
+        // The container TYPE is never emitted, whatever the file holds.
+        const auto odd = verdict(false, false, host_shaped, "", std::string{"we|ird\ntype"});
+        CHECK(odd.value == Tri::yes);
+        CHECK(odd.evidence == "/run/systemd/container");
+    }
+    SECTION("a WSL value, an empty file and a blank one fall through to the cgroup scan unchanged") {
+        const std::string hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for (const char* type : {"wsl\n", "wsl", "wsl \t\r\n", "", "\n", "  \n"}) {
+            INFO(type);
+            const std::string t{type};
+            const auto plain = verdict(false, false, "0::/system.slice/yuzu-agent.service\n", "", t);
+            CHECK(plain.value == Tri::no);
+            CHECK(plain.evidence == "linux:no_container_marker");
+            const auto opaque = verdict(false, false, "0::/\n", "", t);
+            CHECK(opaque.value == Tri::unknown);
+            CHECK(opaque.evidence == "linux:virtualization:container:cgroup_root_opaque");
+            const auto docker = verdict(false, false, "0::/docker/" + hex + "\n", "", t);
+            CHECK(docker.value == Tri::yes);
+            CHECK(docker.evidence == "cgroup:docker");
+        }
+    }
+    SECTION("a marker file outranks /run/systemd/container, and an absent file changes nothing") {
+        CHECK(verdict(true, false, "0::/\n", "", std::string{"lxc\n"}).evidence == "/.dockerenv");
+        CHECK(verdict(false, true, "0::/\n", "", std::string{"lxc\n"}).evidence == "/run/.containerenv");
+        CHECK(verdict(false, false, "0::/system.slice/a.service\n").value == Tri::no);
     }
     SECTION("an unreadable cgroup with no marker is unknown and constrains the status") {
         const auto v = verdict(false, false, std::nullopt, "linux:virtualization:container:cgroup_permission_denied");
@@ -835,5 +966,204 @@ TEST_CASE("virtualization: row fields are scrubbed and escaped with the field co
         bad.failures.push_back("linux:virtualization:sys_hypervisor:eio");
         CHECK(decide(bad).status == StatusState::constrained);
         CHECK(decide(bad).reason == "linux:virtualization:sys_hypervisor:eio");
+    }
+}
+
+TEST_CASE("virtualization: no serial number or UUID from a decoded Type 1 reaches a row",
+          "[virtualization][sensitivity]") {
+    using namespace yuzu::shared::smbios;
+    // SYNTHETIC: the shared walker decodes serial, SKU, family and UUID into the transient table;
+    // the plugin keeps only manufacturer and product, and no row may carry the rest.
+    SmbiosTable t;
+    t.system.status = Status::ok;
+    t.system.data.manufacturer = "Example Board Vendor";
+    t.system.data.product = "Example Board";
+    t.system.data.serial = "SERIAL-SENTINEL-0042";
+    t.system.data.sku = "SKU-SENTINEL-7";
+    t.system.data.family = "FAMILY-SENTINEL";
+    t.system.data.uuid = std::array<std::uint8_t, 16>{0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78,
+                                                      0x9A, 0xBC, 0xDE, 0xF0, 0x01, 0x02, 0x03, 0x04};
+    t.baseboard.status = Status::ok;
+    t.baseboard.data.serial = "BOARD-SERIAL-SENTINEL";
+
+    const SmbiosFacts kept = smbios_facts_from_table(t);
+    REQUIRE(kept.state == ReadState::ok);
+    CHECK(kept.manufacturer == "Example Board Vendor");
+    CHECK(kept.product == "Example Board");
+
+    const std::array<CpuidFacts, 3> cpuids{cpuid_clear(), cpuid_hv(kvm_sig()),
+                                           cpuid_hv("Microsoft Hv", 0x4000000Cu, "Hv#1", true)};
+    for (const auto& cpuid : cpuids) {
+        Facts f;
+        f.os = "windows";
+        f.cpuid = cpuid;
+        f.smbios = kept;
+        f.container.mode = ContainerInputs::Mode::windows_not_read;
+        const auto p = decide(f);
+        std::string everything = p.reason;
+        for (const auto& row : p.rows)
+            everything += "\n" + row;
+        everything = yuzu::virtualization::detail::lower(everything);
+        for (const char* secret :
+             {"sentinel", "serial", "deadbeef", "de-ad", "12345678", "9abcdef0", "01020304"}) {
+            INFO(secret);
+            CHECK(everything.find(secret) == std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("virtualization: every token and evidence string the fixtures emit follows the grammar",
+          "[virtualization][tokens]") {
+    // Class (a): ^(windows|macos|linux):virtualization:[a-z0-9_]+(:[a-z0-9_]+)*$. Class (c) is a
+    // closed set of evidence literals. The sweep covers each read-failure shape the pure core
+    // builds (every errno_token branch, every Linux source, the Windows SMBIOS causes) and every
+    // success shape, so a new token that breaks the documented grammar fails here.
+    const std::regex grammar{R"(^(windows|macos|linux):virtualization:[a-z0-9_]+(:[a-z0-9_]+)*$)"};
+    const std::set<std::string> evidence_literals{
+        "/.dockerenv",       "/run/.containerenv", "/run/systemd/container",
+        "cgroup:docker",     "cgroup:kubepods",    "cgroup:containerd",
+        "cgroup:podman",     "cgroup:lxc",         "linux:no_container_marker",
+        "macos:no_container_runtime"};
+
+    const auto split_tokens = [](const std::string& joined) {
+        std::vector<std::string> out;
+        size_t pos = 0;
+        while (pos <= joined.size()) {
+            size_t comma = joined.find(',', pos);
+            if (comma == std::string::npos)
+                comma = joined.size();
+            if (comma > pos)
+                out.push_back(joined.substr(pos, comma - pos));
+            pos = comma + 1;
+        }
+        return out;
+    };
+
+    std::vector<Facts> fixtures;
+    // Linux: each source failing in turn, once per errno branch errno_token maps.
+    for (const int err : {EACCES, EPERM, EIO, ELOOP, ENOTDIR, EINVAL, 12345}) {
+        for (const char* cause_src : {"sys_vendor", "product_name", "hypervisor_type",
+                                      "systemd_container", "cgroup"}) {
+            LinuxReads r = clean_reads();
+            const FieldRead bad = read_bad(errno_token(err));
+            const std::string which = cause_src;
+            if (which == "sys_vendor")
+                r.sys_vendor = bad;
+            else if (which == "product_name")
+                r.product_name = bad;
+            else if (which == "hypervisor_type")
+                r.hypervisor_type = bad;
+            else if (which == "systemd_container")
+                r.systemd_container = bad;
+            else
+                r.cgroup = bad;
+            fixtures.push_back(linux_facts(cpuid_clear(), r));
+        }
+        LinuxReads markers = clean_reads();
+        markers.dockerenv_errno = err;
+        markers.containerenv_errno = err;
+        fixtures.push_back(linux_facts(cpuid_clear(), markers));
+    }
+    for (const char* cause : {"not_regular", "oversized"}) {
+        LinuxReads r = clean_reads();
+        r.product_name = read_bad(cause);
+        r.systemd_container = read_bad(cause);
+        fixtures.push_back(linux_facts(cpuid_clear(), r));
+    }
+    {
+        LinuxReads r = clean_reads();
+        r.cgroup = FieldRead{}; // cgroup_enoent
+        fixtures.push_back(linux_facts(cpuid_clear(), r));
+        fixtures.push_back(linux_facts(CpuidFacts{}, clean_reads())); // no CPUID: cpuid:unavailable
+    }
+    // Linux success and classification shapes that feed the evidence column.
+    for (const char* cgroup :
+         {"0::/\n", "0::/docker/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+          "0::/kubepods.slice/x\n", "0::/lxc/c1\n", "0::/system.slice/yuzu-agent.service\n"}) {
+        LinuxReads r = clean_reads();
+        r.cgroup = read_ok(cgroup);
+        fixtures.push_back(linux_facts(cpuid_clear(), r));
+    }
+    for (const char* sd : {"lxc\n", "wsl\n", ""}) {
+        LinuxReads r = clean_reads();
+        r.systemd_container = read_ok(sd);
+        fixtures.push_back(linux_facts(cpuid_clear(), r));
+    }
+    for (const bool containerenv : {false, true}) {
+        LinuxReads r = clean_reads();
+        (containerenv ? r.containerenv_errno : r.dockerenv_errno) = 0;
+        fixtures.push_back(linux_facts(cpuid_clear(), r));
+    }
+    // Windows: each SMBIOS failure cause, a framing fault, and the no-CPUID limitation.
+    for (const char* cause : {"call_failed", "oversized", "size_race"}) {
+        Facts f;
+        f.os = "windows";
+        f.cpuid = cpuid_clear();
+        f.smbios = smbios_read_failure(cause);
+        f.container.mode = ContainerInputs::Mode::windows_not_read;
+        fixtures.push_back(f);
+    }
+    for (const auto err : {yuzu::shared::smbios::Error::truncated, yuzu::shared::smbios::Error::malformed}) {
+        yuzu::shared::smbios::SmbiosTable t;
+        t.error = err;
+        Facts f;
+        f.os = "windows";
+        f.cpuid = cpuid_clear();
+        f.smbios = smbios_facts_from_table(t);
+        f.container.mode = ContainerInputs::Mode::windows_not_read;
+        fixtures.push_back(f);
+    }
+    {
+        Facts f; // Windows on ARM64: no CPUID, SMBIOS readable and not a VM
+        f.os = "windows";
+        f.smbios = smbios_ok("Example Board Vendor", "Example Board");
+        f.container.mode = ContainerInputs::Mode::windows_not_read;
+        fixtures.push_back(f);
+    }
+    // macOS: the sysctl-failure shapes (the shell supplies these exact tokens) and the clean read.
+    for (const char* tail : {"hv_vmm_present:unreadable", "hw_model:unreadable"}) {
+        Facts f;
+        f.os = "macos";
+        f.failures.push_back(std::string{"macos:virtualization:"} + tail);
+        f.smbios = smbios_ok("Apple Inc.", "Mac16,10");
+        f.container.mode = ContainerInputs::Mode::macos_none;
+        fixtures.push_back(f);
+    }
+    {
+        Facts f; // an unreadable SMBIOS with no reason: the defensive fallback token
+        f.os = "linux";
+        f.cpuid = cpuid_clear();
+        f.smbios.state = ReadState::unreadable;
+        f.container.mode = ContainerInputs::Mode::linux_read;
+        f.container.cgroup = "0::/system.slice/a.service\n";
+        fixtures.push_back(f);
+    }
+
+    REQUIRE(fixtures.size() > 40);
+    for (const auto& f : fixtures) {
+        const auto p = decide(f);
+        for (const auto& tok : split_tokens(p.reason)) {
+            INFO(tok);
+            CHECK(std::regex_match(tok, grammar));
+        }
+        REQUIRE(p.rows.size() == 2);
+        const auto host = split_row(p.rows[0]);
+        const auto container = split_row(p.rows[1]);
+        REQUIRE(host.size() == 7);
+        REQUIRE(container.size() == 3);
+        if (host[2] == "unknown") // an unknown host row carries its reason tokens as the source
+            for (const auto& tok : split_tokens(host[5])) {
+                INFO(tok);
+                CHECK(std::regex_match(tok, grammar));
+            }
+        if (container[1] == "unknown") {
+            for (const auto& tok : split_tokens(container[2])) {
+                INFO(tok);
+                CHECK(std::regex_match(tok, grammar));
+            }
+        } else {
+            INFO(container[2]);
+            CHECK(evidence_literals.count(container[2]) == 1);
+        }
     }
 }

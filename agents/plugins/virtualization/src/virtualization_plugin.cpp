@@ -4,18 +4,18 @@
  * Action:
  *   "host" -- is this device a VM, which hypervisor, and is the agent itself in a container:
  *               Linux   CPUID (x86), DMI, /sys/hypervisor/type, /.dockerenv,
- *                       /run/.containerenv, /proc/self/cgroup;
+ *                       /run/.containerenv, /run/systemd/container, /proc/self/cgroup;
  *               macOS   sysctl kern.hv_vmm_present and hw.model;
  *               Windows CPUID (x86), the SMBIOS System Information table (RSMB).
  *
  * FACTS ONLY and read-only, no subprocess. A Windows machine running Hyper-V, VBS or WSL2 sets
  * the CPUID hypervisor bit but is the HOST, not a guest: the Hyper-V root-partition bit
- * separates them (kind host_with_hypervisor). An unreadable source never reads as bare metal:
- * the kind is `unknown` with the reason.
+ * separates them (kind host_with_hypervisor). A host-decision source (SMBIOS, CPUID, OS hint) that
+ * cannot be read never reads as bare metal: the kind is `unknown` with the reason.
  *
- * This TU is portable except for its single dispatch #if (the mgmt_posture shape). All three
- * descriptor legs are declared unconditionally so the capability-matrix generator sees a stable
- * shape on every host.
+ * This TU is portable except for two #if chains: the seam's exception-token selection and the
+ * per-OS dispatch in execute() (the mgmt_posture shape). All three descriptor legs are declared
+ * unconditionally so the capability-matrix generator sees a stable shape on every host.
  */
 
 #include <yuzu/plugin.hpp>
@@ -32,12 +32,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "CPUID leaves 1 and 0x40000000-0x40000003 (x86), /sys/class/dmi/id/{sys_vendor,"
-         "product_name}, /sys/hypervisor/type, /.dockerenv, /run/.containerenv "
-         "and /proc/self/cgroup (bounded reads, no subprocess)",
+         "product_name}, /sys/hypervisor/type, /.dockerenv, /run/.containerenv, "
+         "/run/systemd/container and /proc/self/cgroup (bounded reads, no subprocess)",
          "ARM has no CPUID: SMBIOS and OS hints alone decide, and a host with neither reads "
          "unknown, never bare_metal; a KVM host reads bare_metal (its own CPUID is not "
          "virtualised) but a Xen dom0 reads guest/xen; a cgroup-v2 namespace-obscured root reads "
-         "container unknown"},
+         "container unknown; a container whose init is not systemd and that sets no marker file "
+         "reads container no"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "sysctlbyname kern.hv_vmm_present and hw.model",
          "no CPUID on arm64: the sysctl is the readable negative; container is always no"},
@@ -46,7 +47,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "CPUID leaves 1 and 0x40000000-0x40000003 (__cpuid, x86) and the SMBIOS System "
          "Information table via GetSystemFirmwareTable('RSMB')",
          "container not read: always unknown, windows:virtualization:container:not_read; ARM64 "
-         "has no CPUID and reads as Linux ARM"},
+         "has no CPUID: a Windows-on-ARM device reads unknown "
+         "(windows:virtualization:cpuid:unavailable) unless SMBIOS names a VM vendor, and a "
+         "Hyper-V or VBS host is not detected on ARM64"},
     },
 };
 
