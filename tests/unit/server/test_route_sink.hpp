@@ -11,6 +11,10 @@
 // This sink lets each route owner's `register_routes(HttpRouteSink&, ...)`
 // overload be exercised in-process. Single-threaded, no sockets, nothing
 // for TSan's interceptors to fight with.
+// Concurrent dispatch() calls from several threads are safe only while the registered handlers
+// use const routes/state (dispatch() reads routes_ and builds its Request/Response locally; none
+// of it locks, and add() must not run after registration) - test_health_routes.cpp's
+// scrape-vs-publish cases (#7098) rely on that.
 //
 // WHAT THIS SINK MODELS, AND WHAT IT DOES NOT (#1786).
 // It reproduces httplib::Server's REQUEST PARSING for the handful of fields
