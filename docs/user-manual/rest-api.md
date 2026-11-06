@@ -5727,13 +5727,13 @@ guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depend
 fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
 where it sits: a record is still in its finer tier until the coarser roll-up closes. It holds while
 the device is within its `db_budget_bytes` (default 250 MiB): a device over its byte budget removes
-raw capture rows older than 24 h that their first summary tier has passed and hourly rows older
-than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is back under;
-`echo.status` reports it as `budget_evicted_raw_rows_total` and `budget_evicted_hourly_rows_total`
-(see the Echo manual, The database byte budget). It is a
-floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
-roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
-that tier, not a deeper tier. The
+hourly rows older than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is
+back under (daily and monthly rows, the `usage` tables and paused sources are never taken);
+`echo.status` reports it as `budget_evicted_hourly_rows_total` (`budget_evicted_raw_rows_total` is
+retired: there is no raw tier) (see the Echo manual, The database byte budget). It is a floor on
+rows that exist, not on coverage: every event folds into every tier as it arrives, so an agent that
+is offline records nothing for that span in any tier, and there is no later aggregation pass or
+catch-up window that could fill it. The
 `usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
 set (20,000 runs) before this limit can apply.
 
@@ -5766,10 +5766,10 @@ server-enforced reading, if one ever ships, lands under a new key, never by rede
     "echo": {
       "tick_seconds": 900,
       "tiers": [
-        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+        { "source": "usage", "tier": "live", "limit_kind": "rows", "limit": 200000,
           "bucket_seconds": 0, "guaranteed_depth_seconds": null },
-        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
-          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 15552000,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 15465600 }
       ]
     }
   },
@@ -9857,7 +9857,7 @@ Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, 
 - `yuzu_viz_pushed_cap_evictions_total` (gauge) — `pushed_` map entries evicted because the map hit the 100 000-agent hard cap. The victim is the least-recently-seen agent by *server* receipt time (not the agent-controlled `ts`); each eviction emits a `topology.push.evicted_for_cap` audit event.
 - `yuzu_viz_pushed_map_size` (gauge) — current `pushed_` map occupancy; the memory-pressure signal to alert on before evictions begin.
 
-**`fleet_snapshot.v1` (agent-emitted payload).** The `fleet_topology.v1` document above is the server-aggregated shape; the per-agent payload the agent pushes (via `HeartbeatRequest.fleet_snapshot_json`) or returns from a dispatched `echo.fleet_snapshot` is `fleet_snapshot.v1`. Its `schema_minor` is at **2** — the `1 → 2` bump added an optional `connections[].last_seen_seconds_ago` field, emitted only when non-zero, alongside the operator-tunable Echo plugin config key `fleet_snapshot_window_seconds` (default `3600`): connections seen within that window are merged into the snapshot even if not ESTABLISHED at the exact `/proc` sample instant. `fleet_snapshot_window_seconds` is an Echo plugin config key set via `echo.configure`, not a server CLI flag.
+**`fleet_snapshot.v1` (agent-emitted payload).** The `fleet_topology.v1` document above is the server-aggregated shape; the per-agent payload the agent pushes (via `HeartbeatRequest.fleet_snapshot_json`) or returns from a dispatched `echo.fleet_snapshot` is `fleet_snapshot.v1`. Its `schema_minor` is at **2** — the `1 → 2` bump added an optional `connections[].last_seen_seconds_ago` field, emitted only when non-zero, alongside the Echo plugin config key `fleet_snapshot_window_seconds` (default `3600`), which no longer has an effect: the snapshot carries only the connections ESTABLISHED at the exact `/proc` sample instant, because Echo keeps no per-connection rows to merge in. `fleet_snapshot_window_seconds` is an Echo plugin config key set via `echo.configure`, not a server CLI flag.
 
 **Example**
 
@@ -13288,7 +13288,9 @@ Dispatch a single-device `echo.purge_source` that **permanently drops every ware
 - 503 with `Sec-Audit-Failed: true`, the body `The audit record could not be stored, so nothing was sent. Retry once the audit store recovers.` (`data-reason="audit_unavailable"`) and the same text as an `HX-Trigger` error toast, when the `attempted` audit row cannot be stored (#3619). Nothing is purged. Counted as `yuzu_echo_source_purge_total{result="audit_unavailable"}`.
 - The permission gate's refusal (normally `403`) when `Infrastructure:Delete` was withdrawn while the `attempted` row was being stored (#3619). Nothing is purged; audited as `result=failure` with `detail` `permission_revoked device=<id> source=<src>` and counted as `yuzu_echo_source_purge_total{result="denied"}`.
 
-**Audit:** Emits `echo.source.purge` with `result=attempted` (same `detail`) once every check has passed (a request those checks refuse writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
+**Audit:** Emits `echo.source.purge` with `result=attempted` (same `detail`) once every check has passed (a request those checks refuse writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row; the audit row records the dispatch, never the agent's outcome.
+
+**What the agent reports (the response record):** one JSON line, `{"source":"<name>","rows_deleted":<n>,"status":"purged","dictionary_pending":<true|false>}`, or an `error|...` line (`source_not_paused`, `config_unreadable`, an unknown source). `status` `purged` means the source's rows are deleted. The interned strings only those rows referenced are swept afterwards under a 60 s deadline: when the sweep ran out of time or failed, `dictionary_pending` is `true` and the record's result status is `CONSTRAINED` (the status alone reaches the server; the completeness and the status detail, `echo:purge_dictionary_pending`, are in the agent's log). **A pending result is not a complete erasure**: the strings stay on the device until the weekly dictionary sweep, or until the purge is run again (a rerun deletes nothing twice and finishes the sweep). An automation that promises erasure must read `dictionary_pending`, not `status` alone. One further limit: a write-ahead-log checkpoint that finds the file busy right after the purge leaves the deleted pages in the log until the next checkpoint, and the reply still says `purged` (the agent logs a warning).
 
 **Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes.
 
@@ -13308,7 +13310,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 | `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Others → 400. |
 
 **Responses:**
-- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled, or `config_unreadable` if the enable flag could not be read) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
+- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` and `dictionary_pending` (and the agent-side `source_not_paused` refusal if the source was re-enabled, or `config_unreadable` if the enable flag could not be read) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `dictionary_pending` `true` (with a `CONSTRAINED` result status on the record) means the rows are gone but the strings they referenced stay until the weekly sweep or a rerun of the purge: not a complete erasure (see the fragment route above). `X-Correlation-Id` header on every response.
 - **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
 - **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
 - **404** — dispatch reached zero agents (device offline).

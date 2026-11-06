@@ -328,8 +328,8 @@ TEST_CASE("GET /api/v1/settings/data-retention carries the Echo tier defaults an
     REQUIRE(tiers.is_array());
     bool found = false;
     for (const auto& t : tiers)
-        found = found || (t.at("source") == "process" && t.at("tier") == "live" &&
-                          t.at("limit").get<long long>() == 100000);
+        found = found || (t.at("source") == "process" && t.at("tier") == "hourly" &&
+                          t.at("limit").get<long long>() == 7776000);
     CHECK(found);
 
     auto frag = h.sink.Get("/fragments/settings/data-retention");

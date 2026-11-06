@@ -1383,6 +1383,7 @@ echo_test_exe = executable(
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
+    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, shim views
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1396,6 +1397,7 @@ echo_test_exe = executable(
     '../agents/plugins/echo/src/echo_schema_registry.cpp',
     '../agents/plugins/echo/src/echo_fold_schema.cpp',
     '../agents/plugins/echo/src/echo_fold.cpp',
+    '../agents/plugins/echo/src/echo_db_v10_migration.cpp',  # schema v10: the one-transaction roll-up flip (test_echo_v10_migration.cpp drives it)
     '../agents/plugins/echo/src/echo_aggregator.cpp',
     '../agents/plugins/echo/src/echo_usage.cpp',
     '../agents/plugins/echo/src/echo_perf.cpp',
@@ -1442,8 +1444,13 @@ echo_test_exe = executable(
 # deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
 # live-registry case adds its own 15s waits on top. Revisit the value once #7173/#7135 settle; there
 # is no commitment to lower it, because the 50% rule is met at 180s.
-test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 180)
+# The schema-v10 migration cases ([v10]: a seeded v9 database folded over all 17 sources, chunked
+# folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
+# run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
+# third test() too. Together the three filters cover every case exactly once.
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
+test('echo v10 migration', echo_test_exe, args: ['[v10]~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -1765,6 +1772,7 @@ if build_server
       # (see the include-path constraint below) - the test includes the header by
       # relative path.
       '../agents/plugins/echo/src/echo_schema_registry.cpp',
+      '../agents/plugins/echo/src/echo_fold_schema.cpp', # the registry's roll-up tiers are declared there
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
