@@ -1706,8 +1706,9 @@ void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_
 ///  - `BackstoppedByAccountRemoval`: ONLY for SCIM create-inactive. The account was created or
 ///    revived a moment earlier under a fresh scim_id, so the principal set is the slug alone and
 ///    holds no sessions of its own to revoke (if a linked principal has appeared by the time the
-///    set is resolved, the gate reverts to `Required`: the backstop wipes the slug only); the account removal that follows runs its own
-///    post-deactivation session wipe (`AuthManager::remove_user_checked`), which fails closed
+///    set is resolved, the gate reverts to `Required`: the backstop wipes the slug only). The
+///    account removal that follows runs its own post-deactivation session wipe
+///    (`AuthManager::remove_user_checked`), which fails closed
 ///    (`RemoveUserOutcome::RemovedSessionWipeFailed` / `StoreFailure`). Failing here instead would
 ///    only strand a created-but-active account that the IdP's retry meets with a 409. The failure
 ///    is still recorded in the audit detail, and the function still hands the principal set back.

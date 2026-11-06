@@ -402,7 +402,7 @@ was already created, so the IdP's retry meets `409`; reconcile with a
 is covered by the account removal that follows, and a failed delete there is
 noted in the audit detail as `sessions_db_error=true session_leg_backstopped=true`
 (on the `scim.user.provisioned` `success` row, or on its `failure` row
-`account deactivated; durable session wipe failed`, never on a `partial` row);
+`account deactivated; durable session wipe failed`, but not on the row for a refused API-token revoke);
 if the set has any additional linked `oidc:` or `saml:` principal, the session
 step is gated like the other calls. While the session store is degraded a
 deprovision cannot complete; there is no override. Wait for PostgreSQL to

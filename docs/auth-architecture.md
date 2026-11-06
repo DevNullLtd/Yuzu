@@ -2940,8 +2940,11 @@ post-mint re-check) and `sessions_db_error=true` (deprovision). Do not
 rename one to match another. `session_leg_backstopped=true` is a modifier on
 `sessions_db_error=true`, not a fourth token: it appears only on the SCIM
 create-inactive (`POST /Users` with `active:false`) `scim.user.provisioned`
-`success` row and on its `failure` row `account deactivated; durable session
-wipe failed`, never on a `partial` row.
+rows, and only when the call goes on to the account removal: the `success`
+row, and the later refusal rows of that request (the `failure` row `account
+deactivated; durable session wipe failed`, the `503` store-failure row, a rare
+late last-administrator refusal). It is not written on the row for a refused
+API-token revoke.
 
 **D1 — a SCIM slug elevated to admin outside SCIM (the #2021 guard
 interaction).** `deprovision_role_ok` still refuses (404, per the
