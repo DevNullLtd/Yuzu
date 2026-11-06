@@ -65,11 +65,6 @@ using DexFormPairs = std::vector<std::pair<std::string, std::string>>;
 /// Field path -> submitted text. Sorted by path; the override row order comes from the index.
 using DexFormValues = std::map<std::string, std::string>;
 
-struct DexFormRefusal {
-    std::string field;
-    std::string message;
-};
-
 struct DexFormDocument {
     std::string text;                  ///< the version-2 JSON text handed to the writer
     std::vector<int> row_of_override;  ///< JSON override index -> submitted form row index
@@ -213,7 +208,7 @@ inline void attach(json& obj, const char* key, json&& child) {
     for (const auto& [name, value] : pairs)
         v.insert_or_assign(name, value);
     for (const int row : override_rows(v)) {
-        const std::string pre = "overrides[" + std::to_string(row) + "].";
+        const std::string pre = row_key(row, "");
         bool blank = true;
         for (auto it = v.lower_bound(pre); it != v.end() && it->first.starts_with(pre); ++it)
             if (!trim(it->second).empty())
@@ -271,15 +266,15 @@ inline void attach(json& obj, const char* key, json&& child) {
 /// Build the version-2 document the writer validates, plus the override row map. Refuses a
 /// form over the pair cap or naming an override row above kDexFormMaxOverrideIndex, before
 /// anything is built. Every range is left to the validator.
-[[nodiscard]] inline std::expected<DexFormDocument, DexFormRefusal>
+[[nodiscard]] inline std::expected<DexFormDocument, DexFormError>
 dex_form_to_document(const DexFormPairs& pairs) {
     using namespace dex_form_detail;
     if (pairs.size() > kDexFormMaxPairs)
-        return std::unexpected(DexFormRefusal{"document", "the form carries too many fields"});
+        return std::unexpected(DexFormError{"document", "the form carries too many fields"});
     const DexFormValues v = dex_form_values(pairs);
     const auto rows = override_rows(v);
     if (!rows.empty() && rows.back() > kDexFormMaxOverrideIndex)
-        return std::unexpected(DexFormRefusal{"overrides", "too many override rows"});
+        return std::unexpected(DexFormError{"overrides", "too many override rows"});
 
     json doc{{"version", kDexScorePolicyVersion}};
     json tiers = json::object();
@@ -312,25 +307,16 @@ dex_form_to_document(const DexFormPairs& pairs) {
     return out;
 }
 
-/// Rewrite a leading `overrides[j]` of a validator path to the submitted form row that carries
-/// it; a j outside the map answers the bare `overrides` group.
+/// Rewrite a leading `overrides[j].` of a validator path to the submitted form row that carries
+/// it; a j outside the map (or an index that is not one) answers the bare `overrides` group.
 [[nodiscard]] inline std::string dex_form_remap_field(std::string field,
                                                       const std::vector<int>& row_of_override) {
-    constexpr std::string_view kPre = "overrides[";
-    if (!field.starts_with(kPre))
-        return field;
-    const auto close = field.find(']');
-    if (close == std::string::npos)
-        return "overrides";
-    std::size_t j = 0;
-    for (std::size_t i = kPre.size(); i < close; ++i) {
-        if (field[i] < '0' || field[i] > '9' || j > 100000)
-            return "overrides";
-        j = j * 10 + static_cast<std::size_t>(field[i] - '0');
-    }
-    if (j >= row_of_override.size())
-        return "overrides";
-    return "overrides[" + std::to_string(row_of_override[j]) + "]" + field.substr(close + 1);
+    using namespace dex_form_detail;
+    if (const auto k = split_override_key(field))
+        return static_cast<std::size_t>(k->first) < row_of_override.size()
+                   ? row_key(row_of_override[static_cast<std::size_t>(k->first)], k->second)
+                   : std::string("overrides");
+    return field.starts_with("overrides[") ? std::string("overrides") : field;
 }
 
 // ── Tier-change preview ────────────────────────────────────────────────────────────────
@@ -409,13 +395,11 @@ namespace dex_form_detail {
 }
 
 /// One pass of the markup. `target` is the element carrying the error (a leaf input name, a
-/// group data-field, or "document"); `seen` collects every leaf and group id so the caller can
-/// resolve the target before the second pass.
+/// group data-field, or "document").
 class Renderer {
 public:
-    Renderer(const DexScoringView& v, std::string target, std::set<std::string>* seen)
-        : v_(v), target_(std::move(target)), seen_(seen),
-          locked_(!v.admin || v.refused == "stale") {}
+    Renderer(const DexScoringView& v, std::string target)
+        : v_(v), target_(std::move(target)), locked_(!v.admin || v.refused == "stale") {}
 
     [[nodiscard]] std::string run() {
         std::string o;
@@ -453,16 +437,11 @@ public:
 private:
     const DexScoringView& v_;
     std::string target_;
-    std::set<std::string>* seen_;
     bool locked_;
 
     [[nodiscard]] const char* dis() const { return locked_ ? " disabled" : ""; }
     [[nodiscard]] const std::string& val(const std::string& name) const {
         return value_of(v_.values, name);
-    }
-    void note(const std::string& name) const {
-        if (seen_)
-            seen_->insert(name);
     }
     [[nodiscard]] std::string err(const std::string& field) const {
         if (!v_.error || field != target_)
@@ -488,14 +467,13 @@ private:
     }
 
     [[nodiscard]] std::string group_open(const std::string& field, const char* legend,
-                                         const char* hint = "") const {
-        note(field);
+                                         const std::string& hint = {}) const {
         std::string o = "<fieldset class=\"grp\" data-field=\"" + esc(field) + "\"";
         if (v_.error && field == target_)
             o += " data-invalid=\"1\"";
         o += "><legend>" + std::string(legend) + "</legend>";
-        if (*hint)
-            o += "<p class=\"hint\">" + std::string(hint) + "</p>";
+        if (!hint.empty())
+            o += "<p class=\"hint\">" + hint + "</p>";
         return o;
     }
     [[nodiscard]] std::string group_close(const std::string& field) const {
@@ -504,7 +482,6 @@ private:
 
     [[nodiscard]] std::string input(const std::string& path, const char* label, const char* type,
                                     const std::string& attrs, bool inherit = false) const {
-        note(path);
         const bool bad = v_.error && path == target_;
         return "<div class=\"fld\"><label for=\"" + id_of(path) + "\">" + label +
                "</label><input class=\"in\" id=\"" + id_of(path) + "\" type=\"" + type +
@@ -592,11 +569,10 @@ private:
     }
 
     [[nodiscard]] std::string override_row(int row, bool blank) const {
-        const std::string base = "overrides[" + std::to_string(row) + "].";
-        const std::string field = "overrides[" + std::to_string(row) + "]";
+        const std::string base = row_key(row, "");
+        const std::string field = base.substr(0, base.size() - 1); // no trailing dot
         const std::string& image = val(base + "image");
         const bool open = v_.error && target_.starts_with(field);
-        note(field);
         std::string o = "<details class=\"ovr\"" + std::string(open ? " open" : "") +
                         "><summary>" + (blank ? std::string("New application override")
                                               : esc(image)) + "</summary>";
@@ -618,16 +594,13 @@ private:
 
     [[nodiscard]] std::string overrides_panel() const {
         const auto rows = override_rows(v_.values);
-        note("overrides");
         std::string o = "<section class=\"panel dxs\"><div class=\"hd\"><h2>Application "
-                        "overrides</h2></div><div class=\"pb\"><fieldset class=\"grp\" "
-                        "data-field=\"overrides\"";
-        if (v_.error && target_ == "overrides")
-            o += " data-invalid=\"1\"";
-        o += "><legend>Per-application policy</legend><p class=\"hint\">An override is keyed by "
-             "the exact image name (case is ignored) and replaces only the fields it sets. At "
-             "most " + std::to_string(kDexPolicyMaxOverrides) + " overrides; " +
-             std::to_string(rows.size()) + " in use.</p>";
+                        "overrides</h2></div><div class=\"pb\">" +
+                        group_open("overrides", "Per-application policy",
+                                   "An override is keyed by the exact image name (case is "
+                                   "ignored) and replaces only the fields it sets. At most " +
+                                       std::to_string(kDexPolicyMaxOverrides) + " overrides; " +
+                                       std::to_string(rows.size()) + " in use.");
         if (!v_.suggestions.empty()) {
             o += "<datalist id=\"dxs-apps\">";
             for (const auto& s : v_.suggestions)
@@ -643,7 +616,7 @@ private:
             o += "<p class=\"hint\" data-limit=\"reached\">The limit of " +
                  std::to_string(kDexPolicyMaxOverrides) +
                  " overrides is reached; remove one to add another.</p>";
-        return o + err("overrides") + "</fieldset></div></section>";
+        return o + group_close("overrides") + "</div></section>";
     }
 
     [[nodiscard]] std::string buttons() const {
@@ -688,23 +661,14 @@ private:
 
 /// The Scoring tab's section BODY (no wrapper id: the GET handler adds
 /// `<div id="dex-scoring-section">`, and every POST answers this body, swapped innerHTML).
-/// The error mark lands on the input named for error->field, else on the longest enclosing
-/// group, else on the document.
+/// The error mark lands on the input or group named by error->field; a field the form has no
+/// element for marks the document, so a refusal is never silent.
 [[nodiscard]] inline std::string render_dex_scoring_section(const DexScoringView& v) {
     using dex_form_detail::Renderer;
-    std::string target;
-    if (v.error) {
-        std::set<std::string> seen;
-        (void)Renderer(v, "", &seen).run();
-        target = v.error->field;
-        while (!target.empty() && !seen.contains(target)) {
-            const auto cut = target.find_last_of(".[");
-            target = cut == std::string::npos ? std::string() : target.substr(0, cut);
-        }
-        if (target.empty())
-            target = "document";
-    }
-    return Renderer(v, std::move(target), nullptr).run();
+    std::string out = Renderer(v, v.error ? v.error->field : std::string()).run();
+    if (v.error && out.find("class=\"err\"") == std::string::npos)
+        out = Renderer(v, "document").run();
+    return out;
 }
 
 } // namespace yuzu::server

@@ -20,11 +20,11 @@ namespace {
 
 DexFormPairs pairs_of(const DexFormValues& v) { return {v.begin(), v.end()}; }
 
-std::string count_str(const std::string& hay, const std::string& needle) {
+std::size_t count_of(const std::string& hay, const std::string& needle) {
     std::size_t n = 0;
     for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
         ++n;
-    return std::to_string(n);
+    return n;
 }
 bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
@@ -280,9 +280,9 @@ TEST_CASE("render: no blank row and the limit text at 200 overrides",
 TEST_CASE("render: one form, three controls inside it, section body only",
           "[server][dex][score_policy][form]") {
     const auto html = render_dex_scoring_section(view_of(dex_default_score_policy()));
-    CHECK(count_str(html, "<form") == "1");
-    CHECK(count_str(html, "</form>") == "1");
-    CHECK(count_str(html, "hx-post=\"/api/settings/dex-scoring/save\"") == "1");
+    CHECK(count_of(html, "<form") == 1);
+    CHECK(count_of(html, "</form>") == 1);
+    CHECK(count_of(html, "hx-post=\"/api/settings/dex-scoring/save\"") == 1);
     const auto close = html.find("</form>");
     for (const char* op : {"preview", "reset"}) {
         const auto at = html.find(std::string("hx-post=\"/api/settings/dex-scoring/") + op + "\"");
@@ -327,17 +327,17 @@ TEST_CASE("render: the error mark lands on the input, the group or the document"
     auto group = with_error("tiers.edges");
     CHECK(has(group, "<fieldset class=\"grp\" data-field=\"tiers.edges\" data-invalid=\"1\">"));
     CHECK(has(group, "<span class=\"err\" data-field=\"tiers.edges\""));
-    CHECK(count_str(group, "class=\"err\"") == "1");
+    CHECK(count_of(group, "class=\"err\"") == 1);
 
     auto leaf = with_error("overrides[2].weights.breadth");
     CHECK(has(leaf, "<span class=\"err\" data-field=\"overrides[2].weights.breadth\""));
     CHECK(has(leaf, "aria-invalid=\"true\""));
-    CHECK(count_str(leaf, "class=\"err\"") == "1");
+    CHECK(count_of(leaf, "class=\"err\"") == 1);
 
     CHECK(has(with_error("document"), "<span class=\"err\" data-field=\"document\""));
-    // A path the form has no element for falls back to the nearest enclosing group, then the document.
+    // A path the form has no element for marks the document.
     CHECK(has(with_error("overrides[2].weights.nope"),
-              "<span class=\"err\" data-field=\"overrides[2].weights\""));
+              "<span class=\"err\" data-field=\"document\""));
     CHECK(has(with_error("version"), "<span class=\"err\" data-field=\"document\""));
 }
 
