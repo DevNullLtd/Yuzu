@@ -745,7 +745,7 @@ spec:
         displayName: Registry Change Capture Enabled
         description: >
           Enable or disable the Windows registry change source (registry →
-          $Registry_Hourly and $Registry_Daily; $Registry_Live is an empty view;
+          $Registry_Hourly and $Registry_Daily;
           cursor-model seam). **ON by default ("true")**, like
           every other capture source. Windows only; on Linux and macOS the source
           is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
@@ -761,8 +761,7 @@ spec:
           VALUES ARE STORED UNMASKED: the newest value of every value added or
           changed under a watched key is readable through echo.sql as last_data
           in $Registry_Hourly and $Registry_Daily, for the tier's retention (for
-          example a Winlogon autologon DefaultPassword when it changes); $Registry_Live
-          answers no rows. A value that has not changed is not: the per-key baseline
+          example a Winlogon autologon DefaultPassword when it changes). A value that has not changed is not: the per-key baseline
           in echo_state holds only its type, size and an unsalted hash. The
           source's cursor row (echo_cursor) holds the new value of a change still
           waiting for its writer. A baseline written by an older build also holds
@@ -800,8 +799,7 @@ spec:
           that first read is not a row; a user's baseline carries across logoff
           and logon, so a change made while they were logged off is reported by
           the next read.
-          Rows live in $Registry_Hourly and $Registry_Daily ($Registry_Live
-          is an empty view): the newest value of each changed value is
+          Rows live in $Registry_Hourly and $Registry_Daily: the newest value of each changed value is
           readable there as last_data, unmasked, for the tier's retention
           (90 days hourly, 180 days daily by default; time-based, not a row
           count). Setting "false" pauses capture
