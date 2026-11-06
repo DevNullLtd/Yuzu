@@ -1571,8 +1571,8 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
     }
 
     SECTION("a field sent on several lines is read as one comma-joined list (RFC 9110 5.3)") {
-        // The occurrences are added in whatever order the underlying unordered multimap keeps,
-        // so each case gives the same answer whichever line is read first.
+        // The occurrences are added in wire order (httplib keeps them in an insertion-ordered
+        // multimap), so each case gives the same answer whichever line is read first.
         const std::string stale = "\"0000000000000000\"";
         struct Case {
             std::string first;

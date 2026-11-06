@@ -1,4 +1,5 @@
 #include "rest_api_v1.hpp"
+#include "model_param_helpers.hpp"
 
 #include "content_etag.hpp" // content_etag: strong ETag of the OpenAPI document forms
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
@@ -5109,7 +5110,10 @@ void RestApiV1::register_routes(
                      req.has_param("plugin") ? req.get_param_value("plugin") : "";
 
                  std::vector<std::pair<std::string, std::string>> raw_fields;
-                 for (const auto& [key, value] : req.params) {
+                 // Iterate key-sorted, as `httplib::Params` (a `std::multimap`) did before
+                 // cpp-httplib 0.59: this order is the order of the response's
+                 // `unindexed_filter_keys`.
+                 for (const auto& [key, value] : model_detail::to_params(req.params)) {
                      if (key == "command_id" || key == "plugin")
                          continue;
                      raw_fields.emplace_back(key, value);
@@ -10964,7 +10968,7 @@ void RestApiV1::register_routes(
             if (!gate_opt)
                 return;
             const auto& gate = *gate_opt;
-            auto parsed = swc::parse_catalogue_params(req.params);
+            auto parsed = swc::parse_catalogue_params(model_detail::to_params(req.params));
             if (!parsed) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, parsed.error()), "application/json");
@@ -11077,7 +11081,7 @@ void RestApiV1::register_routes(
             if (!gate_opt)
                 return;
             const auto& gate = *gate_opt;
-            auto parsed = swc::parse_versions_params(req.params);
+            auto parsed = swc::parse_versions_params(model_detail::to_params(req.params));
             if (!parsed) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, parsed.error()), "application/json");
@@ -11307,7 +11311,7 @@ void RestApiV1::register_routes(
                  }
 
                  namespace swc = software_catalogue;
-                 auto parsed = swc::parse_devices_params(req.params);
+                 auto parsed = swc::parse_devices_params(model_detail::to_params(req.params));
                  if (!parsed) {
                      res.status = 400;
                      res.set_content(detail::a4_error(res, parsed.error()), "application/json");
