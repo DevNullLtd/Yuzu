@@ -1821,14 +1821,29 @@ std::expected<ExecutionTableEstimate, std::string> WorkflowEngine::execution_tab
 void WorkflowEngine::refresh_table_size_metrics() noexcept {
     if (!metrics_)
         return;
+    // A failed sample is counted on every tick; the log line is warn once per interval per cause
+    // (the tick is 15 s, so a persistent failure would otherwise write one line per tick).
+    const auto note_failure = [this](const std::string& cause) noexcept {
+        try {
+            metrics_->counter(kWorkflowExecutionsStatsUnavailableMetric).increment();
+            if (sample_warn_throttle_.should_warn(cause))
+                spdlog::warn("WorkflowEngine: run table size sample failed ({}); the rows and bytes "
+                             "gauges keep their last value",
+                             cause);
+        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the tick
+        }
+    };
     try {
         if (auto est = execution_table_estimate()) {
             metrics_->gauge(kWorkflowExecutionsRowsMetric).set(static_cast<double>(est->rows));
             metrics_->gauge(kWorkflowExecutionsBytesMetric).set(static_cast<double>(est->bytes));
         } else {
-            metrics_->counter(kWorkflowExecutionsStatsUnavailableMetric).increment();
+            note_failure(est.error());
         }
-    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the maintenance tick
+    } catch (const std::exception& e) {
+        note_failure(std::string("exception: ") + e.what());
+    } catch (...) {
+        note_failure("exception");
     }
 }
 

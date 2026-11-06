@@ -31,6 +31,7 @@
 #include "workflow_execute.hpp" // the idempotency pre-check over the real engine
 #include "workflow_model.hpp" // workflow_execution_visible: the differential oracle for the list predicate
 #include "workflow_parity_scenarios.hpp" // the scenario table both replay-parity matrices share
+#include "../test_log_capture.hpp"
 #include "sha256_hex.hpp"
 
 #include "../test_helpers.hpp"
@@ -4084,31 +4085,41 @@ TEST_CASE("WorkflowEngine: the run-table size estimate reflects inserted runs an
         CHECK(metrics.gauge(kWorkflowExecutionsBytesMetric).value() > 0.0); // indexes exist empty
         CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 0.0);
     }
+    // The estimate is GREATEST(n_live_tup, reltuples). ANALYZE sets both from the live row count,
+    // but a backend's insert delta that is still unflushed when ANALYZE runs is ADDED when it
+    // flushes, at most once per inserted row, so the value read is the row count or up to twice
+    // it. The assertions therefore use that closed range, never an exact count.
+    const auto in_range = [](double v, double rows) { return v >= rows && v <= 2 * rows; };
+
     SECTION("inserted runs show in the estimate once the planner statistics have them") {
         for (int i = 0; i < 3; ++i)
             REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
         analyze();
         const auto est = engine.execution_table_estimate();
         REQUIRE(est.has_value());
-        CHECK(est->rows == 3);
+        CHECK(in_range(static_cast<double>(est->rows), 3));
         CHECK(est->bytes > 0);
         engine.refresh_table_size_metrics();
-        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 3.0);
-        CHECK(metrics.gauge(kWorkflowExecutionsBytesMetric).value() ==
-              static_cast<double>(est->bytes));
+        CHECK(in_range(metrics.gauge(kWorkflowExecutionsRowsMetric).value(), 3));
+        CHECK(metrics.gauge(kWorkflowExecutionsBytesMetric).value() > 0.0);
     }
-    SECTION("a failed sample keeps the previous value and counts the failure") {
+    SECTION("a failed sample is bounded by the 250 ms statement timeout, keeps the previous value, "
+            "counts and logs the failure") {
         for (int i = 0; i < 2; ++i)
             REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
         analyze();
         engine.refresh_table_size_metrics();
-        REQUIRE(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 2.0);
+        const double held = metrics.gauge(kWorkflowExecutionsRowsMetric).value();
+        REQUIRE(in_range(held, 2));
 
-        // An ACCESS EXCLUSIVE lock makes pg_total_relation_size wait; the 250 ms statement
-        // timeout ends the sample as a failure. Grow the table first so a wrongly published value
-        // would differ from the held one.
-        REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
+        // Grow the table far past the held value (8 more runs: at least 10 rows, so a value
+        // published by mistake is above 4, the most `held` can be).
+        for (int i = 0; i < 8; ++i)
+            REQUIRE(engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn()).has_value());
         analyze();
+        // An ACCESS EXCLUSIVE lock makes pg_total_relation_size wait. The pool above sets a 5 s
+        // lock_timeout on every connection, so only the sample's own `SET LOCAL statement_timeout
+        // = '250ms'` can end the wait in well under 5 s: without it this elapsed-time bound fails.
         PgConn holder{PQconnectdb(wf_db_fx_.dsn().c_str())};
         REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
         for (const char* sql : {"BEGIN", "LOCK TABLE workflow_engine.workflow_executions "
@@ -4117,19 +4128,34 @@ TEST_CASE("WorkflowEngine: the run-table size estimate reflects inserted runs an
                 yuzu::server::pg::exec_params(holder.get(), sql, std::vector<std::string>{});
             REQUIRE(r.status() == PGRES_COMMAND_OK);
         }
+        const auto started = std::chrono::steady_clock::now();
         const auto blocked = engine.execution_table_estimate();
+        const auto elapsed = std::chrono::steady_clock::now() - started;
         REQUIRE_FALSE(blocked.has_value());
         CHECK(blocked.error().starts_with(kDbErrorPrefix));
+        CHECK(elapsed < std::chrono::milliseconds(2000));
+        CHECK(elapsed >= std::chrono::milliseconds(200)); // it did wait on the lock
+
+        yuzu::test::LogCapture logs{spdlog::level::warn};
         engine.refresh_table_size_metrics();
-        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 2.0); // held, not zeroed
-        CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 1.0);
+        engine.refresh_table_size_metrics();
+        logs.stop();
+        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == held); // held, not zeroed
+        CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 2.0);
+        // One warning for the cause, not one per failed tick.
+        const auto text = logs.text();
+        const auto first = text.find("run table size sample failed");
+        REQUIRE(first != std::string::npos);
+        CHECK(text.find("run table size sample failed", first + 1) == std::string::npos);
 
         PgResult release =
             yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
         REQUIRE(release.status() == PGRES_COMMAND_OK);
         engine.refresh_table_size_metrics();
-        CHECK(metrics.gauge(kWorkflowExecutionsRowsMetric).value() == 3.0);
-        CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 1.0);
+        const double after = metrics.gauge(kWorkflowExecutionsRowsMetric).value();
+        CHECK(in_range(after, 10));
+        CHECK(after > 4.0);
+        CHECK(metrics.counter(kWorkflowExecutionsStatsUnavailableMetric).value() == 2.0);
     }
     SECTION("without a metrics sink the refresh is a no-op") {
         engine.set_metrics(nullptr);

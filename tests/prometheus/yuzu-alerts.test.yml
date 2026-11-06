@@ -7740,3 +7740,21 @@ tests:
       - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
         eval_time: 50m
         exp_samples: []
+
+  # TABLE CASE D -- two replicas that each report the shared table at 60,000 rows (so each is below
+  # the threshold, and their sum of 120,000 is above it) stay quiet: the replicas read ONE table, so
+  # the collapse must be `max`, never `sum`. RED if `max by (job)` becomes `sum by (job)`, which
+  # multiplies the row count by the replica count and fires at 100,000 / N real rows.
+  # MUTATION-RUN on the pinned image in a scratch copy of the rules file: `max by (job)` ->
+  # `sum by (job)` reddened this case alone (it fired at 70m); cases A to C stay green under it.
+  - interval: 1m
+    name: workflow executions table - two replicas below the threshold whose sum is above it stay quiet
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "60000x80"
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s2"}'
+        values: "60000x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 70m
+        exp_samples: []

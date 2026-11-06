@@ -21,6 +21,7 @@
 /// backfill" line, and the caller (`server.cpp`) runs `legacy_sqlite_probe::warn_if_legacy_rows()`
 /// over the legacy file so a locally-wrong "no production fleet" premise gets a loud signal.
 
+#include "refusal_log_throttle.hpp" // bounds the repeated size-sample failure warning
 #include "workflow_run_port.hpp" // WorkflowRunControl (the per-run hooks execute() consumes)
 #include "workflow_types.hpp" // ADR-0031 WS-A4 (eighth family): relocated pure POD types
 
@@ -283,9 +284,10 @@ public:
     std::expected<ExecutionTableEstimate, std::string> execution_table_estimate() const;
 
     /// Samples `execution_table_estimate()` and publishes it to the wired metrics sink
-    /// (`kWorkflowExecutionsRowsMetric`, `kWorkflowExecutionsBytesMetric`). A failed sample
-    /// leaves both gauges at their previous value and counts
-    /// `kWorkflowExecutionsStatsUnavailableMetric`. Never throws; no-op without a sink. Called
+    /// (`kWorkflowExecutionsRowsMetric`, `kWorkflowExecutionsBytesMetric`). A failed sample, or a
+    /// sample that throws, leaves both gauges at their previous value, counts
+    /// `kWorkflowExecutionsStatsUnavailableMetric` and logs a warning at most once per five
+    /// minutes per cause. Never throws; no-op without a sink. Called
     /// from the maintenance tick (`health_recompute_thread_`), so it must stay inside that
     /// thread's serial budget (about 0.5 s worst case).
     void refresh_table_size_metrics() noexcept;
@@ -294,6 +296,7 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    mutable RefusalLogThrottle sample_warn_throttle_{std::chrono::seconds(300)};
     std::function<WorkflowStopLevel()> should_stop_;
     std::chrono::milliseconds write_timeout_;
     std::chrono::milliseconds finalize_retry_timeout_;
