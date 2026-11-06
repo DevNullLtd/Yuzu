@@ -3053,7 +3053,7 @@ private:
     std::vector<std::shared_ptr<JournalRecord>> pending_journal_;
     std::atomic<std::uint64_t> journal_stage_dropped_{0};  ///< overflow drop-oldest (disk-full backpressure)
     std::atomic<std::uint64_t> journal_stage_failures_{0}; ///< disarm record un-buildable post-teardown
-    std::atomic<std::uint64_t> journal_field_rejected_{0}; ///< NUL/oversized/non-UTF-8 field or empty rule_id kept out
+    std::atomic<std::uint64_t> journal_field_rejected_{0}; ///< NUL/oversized/non-UTF-8/empty rule_id
     std::atomic<std::uint64_t> journal_clock_rejected_{0}; ///< skewed clock (secs<=0) kept out (rev-4.1 #2)
     /// #2233 item 7: incremented each time enqueue_lifecycle_locked's log-once branch
     /// actually calls spdlog::warn (see lifecycle_backpressure_log_fires_for_test()).

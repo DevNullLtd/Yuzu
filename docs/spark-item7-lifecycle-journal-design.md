@@ -338,7 +338,7 @@ wires these to the heartbeat → Prometheus (unlabeled/low-cardinality).
 ## 9. Failure posture
 `set()` fail → `journal_write_failures`, per-push circuit-break, snapshot retained, retried by the maintenance
 tick; `pending_journal_` bounded → `journal_stage_dropped`. Parse/unknown-`v` → **quarantine** (`quarantine:<key>`,
-bounded/pruned) `journal_quarantined`; rename failure → `journal_quarantine_failures`. Field NUL/oversized →
+bounded/pruned) `journal_quarantined`; rename failure → `journal_quarantine_failures`. Field NUL/oversized or empty rule_id →
 `journal_field_rejected`. Fallible read error (§3) is distinguished from empty and retried, never treated as
 "journal empty". Prune failure → count, continue.
 

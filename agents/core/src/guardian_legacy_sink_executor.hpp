@@ -1223,7 +1223,7 @@ private:
             // AFTER it was already dequeued and sending.
             if (auto gi = st.gaps.find(it.rule_id); gi != st.gaps.end()) {
                 if (it.seq > gi->second.lost_seq) {
-                    st.gaps.erase(gi); // confirmed delivered, strictly newer than any known loss
+                    st.gaps.erase(gi); // delivered or disposed (Sent), strictly newer than any known loss
                     // #4783 Gate 4 UP-3: a gap CLEAR is the other half of
                     // change_gen's contract (record_gap_locked bumps it on every
                     // LOSS) - a caller comparing generations must see this too,

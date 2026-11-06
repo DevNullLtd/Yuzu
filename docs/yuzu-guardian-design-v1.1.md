@@ -3088,7 +3088,7 @@ heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 |---|---|---|---|
 | stage-drop | `pending_journal_` reserve exhausted under sustained write failure | `stage_dropped` | integrity gap, alert |
 | stage-failure | a disarm record could not be built after the rule was already torn down | `stage_failures` | integrity gap, alert |
-| field rejection | NUL / oversized / non-UTF-8 field kept a record out of the journal | `field_rejected` | integrity gap, alert |
+| field rejection | NUL / oversized / non-UTF-8 field or empty rule_id kept a record out of the journal | `field_rejected` | integrity gap, alert |
 | skewed-clock reject | normalized event timestamp floors to `seconds <= 0` (would replay as server-receipt-now and false-conflict) | `clock_rejected` | integrity gap, alert |
 | write failure | a `set()` failed; per-push circuit-broken, retried by the maintenance tick | `write_failures` | integrity gap, alert |
 | write-capacity reject | a new batch refused because the journal is at its byte/count cap | `write_capacity_rejected` | integrity gap, alert (UP-1) |

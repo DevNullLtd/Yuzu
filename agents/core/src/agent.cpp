@@ -4144,9 +4144,9 @@ private:
     // this is the only place the agent can see it. Callers then skip the Write and report the
     // event as Sent, meaning "disposed by design", not "delivered": a retry could never succeed,
     // and Retain/WriteFailed would respectively wedge the outbox head or record a gap against an
-    // empty rule id. No producer reaches this today: json_to_rule rejects an empty rule id before
-    // any rule arms (legacy and Spark), and DEX observations carry the `__observation__`
-    // sentinel. On the Spark path the journal mint gate only keeps such a record out of the
+    // empty rule id. No producer reaches this today: a pushed rule set with an empty rule id is
+    // rejected whole by apply_rules' is_valid_rule_id scan, json_to_rule rejects one on boot
+    // re-arm, and DEX observations carry the `__observation__` sentinel. On the Spark path the journal mint gate only keeps such a record out of the
     // journal (the live entry is still enqueued), so this refusal is what stops it reaching the
     // wire; it is the last line. Logged on the first occurrence and then every 1024th, so a bad
     // producer cannot flood; the counter exists only to set that cadence and is not exported.
