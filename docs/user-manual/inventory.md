@@ -427,15 +427,18 @@ time zone, and which collectors run is set per management group. Each group
 holds one document (an interval of 1 hour to 7 days, an optional window, a zone,
 a switch per collector and a priority), written through
 `PUT /api/v1/inventory/software/collection-settings/{group_id}`
-([REST API](rest-api.md#software-collection-settings)).
+([REST API](rest-api.md#software-collection-settings)). Settings are managed by
+fleet administrators (the global `ManagementGroup:Write` grant); group-scoped
+delegation is not part of this build.
 
 A device belongs to many groups, so the server resolves one document for it:
 each group the device belongs to is a branch (a group that is an ancestor of
 another of its groups gives way to the nearer one), the nearest group with a
 document wins inside a branch, priority decides between branches, and the root
-group's document is the fleet-wide default layer. The plugin kill switches always win over a document, and registered apps
-collection cannot be turned off by a document. A window needs a whole-day
-interval because the agent fires a window once per local day.
+group's document is the fleet-wide default layer. The plugin kill switches
+always win over a document, and registered apps collection cannot be turned off
+by a document. A window needs a whole-day interval because the agent fires a
+window once per local day.
 
 Settings take effect on agents only when the settings push lands. Until then the
 server stores and resolves them, shows the effective result for a device

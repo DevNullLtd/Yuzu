@@ -103,8 +103,8 @@ inline constexpr std::string_view kReferenceDataReplace =
 inline constexpr std::string_view kCollectionSettings =
     "per-group software collection settings (interval, window, zone, collector switches): not "
     "credentials, identity or authority, but a root document can switch collectors off "
-    "fleet-wide; audited ahead of the write; exempt by the plan's decision while the owner ruling "
-    "on the plugin kill-switch route is pending";
+    "fleet-wide; audited ahead of the write; exempt by the project owner's SAM-34 decision while "
+    "the owner ruling on the plugin kill-switch route is pending";
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";

@@ -1185,7 +1185,8 @@ The server stores a collection settings document per management group
 (`SoftwareCollectionSettingsStore`, schema `software_collection_settings_store`, tables `settings` and
 `settings_history`) and resolves the document that applies to a device. The agent behaviour is a hard
 requirement on the settings push, below. Wire reference: `docs/user-manual/rest-api.md`, "Software
-collection settings".
+collection settings". Settings are managed by fleet administrators (the global `ManagementGroup`
+grant); group-scoped delegation is not part of this build. This build sends no settings to agents.
 
 - **Document.** `interval_s` 3600 to 604800, an optional window in minutes past local midnight, a zone
   (empty = the machine's own, else an IANA name checked against `pg_timezone_names` in the write
@@ -1214,13 +1215,15 @@ collection settings".
   resolved fields only (interval, window, zone, sorted switches with the overlay applied), with no priority,
   source group or timestamps. Golden vectors are pinned in `test_collection_settings_resolve.cpp`.
 - **Read rule.** A stored row whose `plugins_json` does not parse, holds a non-boolean or an unknown key,
-  or whose scalar fields fail the validator is `Corrupt` (a `503`), never a default document. A
+  whose `version` is not 64 lowercase hex, or whose scalar fields fail the validator is `Corrupt` (a
+  `503` with no retry hint), never a default document. A
   missing known collector key reads as that collector's fleet default (on), and the stored `version`
   is returned as written.
 - **Writes.** Create is `INSERT ... ON CONFLICT DO NOTHING RETURNING`; replace is `SELECT ... FOR
   UPDATE`, a version compare, then `UPDATE ... WHERE version = $n RETURNING`. A stale version is a
-  conflict (`409`), never last-writer-wins. History keeps the newest 200 rows per group, trimmed by
-  count in the write transaction.
+  conflict (`409`), never last-writer-wins. A create is refused once 20,000 documents exist, the cap
+  the list read enforces. History keeps the newest 200 rows per group, trimmed by count in the write
+  transaction.
 - **Hard requirement on the settings push.** The agent must honour an interval of 1 hour to 7 days, run
   a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
   the per-collector switch, and reject any setting it cannot honour, then report the effective version
