@@ -36,7 +36,7 @@ struct SoftwareEntry {
                            // `via:<ecosystem>` (product_normalize.hpp kOriginLabelPrefix)
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat" (agent-side vocabulary)
-    std::string ecosystem; // rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature|msi|python|ibm_mq
+    std::string ecosystem; // rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature|msi|python|ibm_mq|dotnet|jvm
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;

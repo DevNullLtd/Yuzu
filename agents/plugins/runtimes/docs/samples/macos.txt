@@ -1,11 +1,11 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-28 · euid 501 · leg-hash 10a510136fd8
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-04 · euid 501 · leg-hash 3cef2d295916
 == action=dotnet
-status|dotnet|unsupported|macos:planned
-[result_status] UNAVAILABLE / PARTIAL / macos:planned
+status|dotnet|supported|-
+[result_status] OK / FULL / 
 
 == action=jvm
-status|jvm|unsupported|macos:planned
-[result_status] UNAVAILABLE / PARTIAL / macos:planned
+status|jvm|supported|-
+[result_status] OK / FULL / 
 
 == action=python
 status|python|supported|-
