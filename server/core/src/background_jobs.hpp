@@ -248,7 +248,8 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"workflow_engine.refresh_table_size_metrics", "health_recompute_thread_",
      BackgroundJobClass::ReplicaSafe,
      "read-only run-table size gauges: one catalog row, per-replica, 250 ms acquire and "
-     "statement bounds; a failed sample only counts and logs"},
+     "statement bounds (plus connect_timeout_s when the pool must open a connection); a failed "
+     "sample only counts and logs"},
     {"registry.reap_stale_sessions", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory Subscribe-stream reap (local presence)"},
     {"ca.publish_crl", "health_recompute_thread_", BackgroundJobClass::FencedLeaderOnly,

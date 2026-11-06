@@ -3847,7 +3847,7 @@ TEST_CASE("stored_agent_ids_json: distinct ids are bounded by count and by bytes
         for (std::size_t i = 0; i < 1000; ++i)
             ids.push_back(std::string(250, 'k') + std::to_string(1000 + i)); // 254 bytes: allowed
         const auto text = stored_agent_ids_json(ids);
-        CHECK(text.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(text.size() <= kStoredAgentIdsColumnMaxBytes);
         CHECK(strings_of(text).size() < ids.size());
         CHECK(strings_of(text).size() > 400); // the budget is used, not wasted
         CHECK(stored_agent_ids_total(text) == 1000);
@@ -3858,7 +3858,7 @@ TEST_CASE("stored_agent_ids_json: distinct ids are bounded by count and by bytes
         for (std::size_t i = 0; i < 1000; ++i)
             ids.push_back(std::string(4000, 'm') + std::to_string(i));
         const auto text = stored_agent_ids_json(ids);
-        CHECK(text.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(text.size() <= kStoredAgentIdsColumnMaxBytes);
         CHECK(strings_of(text) == std::vector<std::string>{"agent-A", "agent-B"});
         CHECK(stored_agent_ids_total(text) == 1003);
     }
@@ -3929,7 +3929,7 @@ TEST_CASE("stored_agent_ids_json: distinct ids are bounded by count and by bytes
         for (std::size_t i = 0; i < 1001; ++i)
             ids.push_back(std::string(124, 'z') + std::to_string(1000 + i)); // 128 bytes
         const auto text = stored_agent_ids_json(ids);
-        CHECK(text.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(text.size() <= kStoredAgentIdsColumnMaxBytes);
         CHECK(stored_agent_ids_total(text) == 1001);
     }
 }
@@ -4103,7 +4103,7 @@ TEST_CASE("WorkflowEngine: a run over the stored-id cap dispatches to the full l
         CHECK(dispatched == agents.size());
         const auto stored = stored_agent_ids_of(wf_db_fx_.dsn(), id);
         CHECK(stored.size() < 140000);
-        CHECK(stored.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(stored.size() <= kStoredAgentIdsColumnMaxBytes);
         CHECK(stored_agent_ids_total(stored) == static_cast<std::int64_t>(agents.size()));
         CHECK(count_rows(wf_db_fx_.dsn(),
                          "SELECT max(octet_length(agent_ids_json)) FROM "

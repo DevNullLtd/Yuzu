@@ -20,13 +20,13 @@ std::string id_json_text(std::string_view id) {
                                                 nlohmann::json::error_handler_t::replace);
 }
 
-// An id the stored copy never holds. Over `kStoredAgentIdMaxBytes` it cannot be a registered agent
+// An id the stored copy never holds. Over `kStoredAgentIdSkipBytes` it cannot be a registered agent
 // id. One containing a NUL byte cannot either (registration refuses it), and it must not be
 // stored: nlohmann writes it as a `\u0000` escape, which jsonb refuses, and one such escape takes
 // the whole column out of every confined list, the creator's own included. Skipping it hides no
 // device.
 bool unstorable_id(std::string_view id) {
-    return id.size() > kStoredAgentIdMaxBytes || id.find('\0') != std::string_view::npos;
+    return id.size() > kStoredAgentIdSkipBytes || id.find('\0') != std::string_view::npos;
 }
 
 } // namespace
@@ -34,7 +34,7 @@ bool unstorable_id(std::string_view id) {
 std::string stored_agent_ids_json(const std::vector<std::string>& agent_ids,
                                   const std::function<bool(const std::string&)>& first,
                                   std::size_t max, std::size_t max_bytes) {
-    static_assert(kStoredAgentIdMaxBytes == auth::kMaxAgentIdLength);
+    static_assert(kStoredAgentIdSkipBytes == auth::kMaxAgentIdLength);
 
     // Distinct ids in first-seen order. Duplicates are dropped BEFORE any cap, so padding a list
     // with copies of one id cannot push a real id out of the stored copy.

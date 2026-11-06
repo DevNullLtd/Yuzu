@@ -7025,14 +7025,17 @@ step's dispatch-time target-agent count) — stripped above for a confined calle
 
 A run row stores each distinct agent id the run named once, in the order first named, at most
 1,000 of them and at most 131,072 bytes of JSON text (the run itself still sends to every id as
-sent). When the distinct ids do not all fit, `agent_ids` holds only the stored ids (when the
-creator is a confined caller, the creator's own visible devices are stored first, so the creator
-keeps seeing the run; that ordering protects the creator only), `agent_ids_truncated` is `true`,
+sent). When the distinct ids do not all fit (or one was skipped: an id over 256 bytes or holding a
+NUL byte is never stored), `agent_ids` holds only the stored ids (when the creator is a confined
+caller, the ids in the creator's own dispatch scope, its `Execution:Execute` visibility, are
+stored first; the creator keeps seeing the run while that scope lies within the scope its reads
+are checked against, `Workflow:Read`, which a group-scoped `Operator` satisfies and a custom-role
+mix may not), `agent_ids_truncated` is `true`,
 and a caller with no device scope also gets `agent_ids_total`, the number of distinct ids the run
 named. Both fields are absent for a run stored whole, and `agent_ids_total` is never sent to a
 confined caller. A confined caller sees a truncated run only if one of the stored ids is in its
-scope, so a confined reader other than the creator whose devices fall past the stored ids does not
-see the run (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
+scope, so a confined reader whose devices fall past the stored ids does not see the run, and that
+can include the creator when its dispatch scope is not within its read scope (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
 unconfined readers and the audit log still see it. The same applies to
 `GET /api/workflow-executions/{id}` and MCP `get_workflow_execution`.
 

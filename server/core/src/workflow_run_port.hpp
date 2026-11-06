@@ -157,8 +157,10 @@ struct WorkflowRunControl {
     std::string correlation_id;
     /// Which of the named agent ids the run row's stored copy keeps FIRST when the list is longer
     /// than `kStoredAgentIdsMax` (`stored_agent_ids_json`, workflow_model.hpp). Storage only: the
-    /// run always targets the full list. A confined caller sets it to its own visible set, so the
-    /// run stays visible to the caller that started it; unset keeps the first ids in request order.
+    /// run always targets the full list. A confined caller sets it to its own dispatch
+    /// (`Execution:Execute`) visible set, which keeps the run visible to that caller only while
+    /// that set lies within the scope its reads are checked against (`Workflow:Read`); unset keeps
+    /// the first ids in request order.
     std::function<bool(const std::string&)> stored_copy_first;
 };
 

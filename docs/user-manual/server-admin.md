@@ -5668,26 +5668,31 @@ What a run row holds, and how to treat it:
   The column is bounded three ways on every route that starts a run (the v1 route, MCP and the
   legacy execute route share the same insert): at most 1,000 ids, at most 131,072 bytes of JSON
   text in all (the marker included), and an id longer than 256 bytes (the longest id any agent can
-  have) is never stored. A run still sends to every id it names, as the caller sent them; only the
+  have) or holding a NUL byte is never stored. A run still sends to every id it names, as the caller sent them; only the
   stored copy is bounded. When the distinct ids do not all fit, the column holds the ones that fit,
   followed by one marker object
   `{"truncated":true,"total":<distinct ids named>,"sha256":"<hash>"}`: `total` counts every distinct
   id including any that were not stored, and `sha256` is the digest of the JSON text of the
   distinct list in the order it was first named (null if the digest could not be computed). The
   column is still a JSON array, so the true count and a digest of the list stay in the row. For a
-  caller confined to a device scope, that caller's own visible ids are stored first, then the rest
-  in the order named. The run's detail reads then show `agent_ids_truncated: true` and, to a caller
-  with no device scope, `agent_ids_total`. A list with no repeated id that fits the bounds is
-  stored unchanged.
+  caller confined to a device scope, the ids in that caller's own dispatch scope (its
+  `Execution:Execute` visibility) are stored first, then the rest in the order named. The run's detail reads then show `agent_ids_truncated: true` and, to a caller
+  with no device scope, `agent_ids_total`. A list with no repeated id, no skipped id and
+  within the bounds is stored unchanged.
 
   **Accepted residual (owner decision, 2026-11-06).** A confined reader sees a run only if one
   of the stored ids is in its scope. For a run that names more than 1,000 distinct ids, or whose
   ids do not fit the 131,072-byte budget, that depends on which ids were stored: the confined
-  creator is protected by the ordering above (its own visible ids are stored first), but another
-  confined reader whose devices fall past the cap does not see the run in its list or its detail
-  read. Unconfined readers and the audit log still see it, and a malformed or empty column is
+  creator keeps seeing its own run only while the ids stored first (those in its `Execution:Execute`
+  dispatch scope) lie within the scope its reads are checked against (`Workflow:Read`). That holds
+  for a group-scoped `Operator`, which holds both permissions at one scope, and is not guaranteed
+  for a custom-role mix: with a global `Execution:Execute` grant and a group-scoped `Workflow:Read`
+  the ids are stored in the order named and the creator can lose sight of its own run past the
+  cap. Another confined reader whose devices fall past the cap does not see the run in its list or
+  its detail read. Unconfined readers and the audit log still see it, and a malformed or empty column is
   invisible to a confined reader, never visible. The trigger is distinct ids beyond the cap
-  (an id that names no device counts; a repeated id does not).
+  (an id that names no device counts; a repeated id does not; an id over 256 bytes or holding a NUL
+  byte is skipped and consumes nothing).
 
   Rows are
   still never trimmed, so size the Postgres volume for the run rate you expect: the bound caps

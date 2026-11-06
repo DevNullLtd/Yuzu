@@ -111,7 +111,9 @@ struct WorkflowExecution {
     std::string id;
     std::string workflow_id;
     std::string status;         // "pending", "running", "completed", "failed", "cancelled"
-    std::string agent_ids_json; // JSON array of target agent IDs
+    // JSON array of the DISTINCT agent IDs the run named, capped, with one trailing marker object on
+    // a truncated copy (`stored_agent_ids_json`); the run itself targets the full list.
+    std::string agent_ids_json;
     int64_t started_at{0};
     int64_t completed_at{0};
     int current_step{0};
