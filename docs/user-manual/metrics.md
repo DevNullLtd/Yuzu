@@ -2264,12 +2264,13 @@ Read it with these limits in mind:
   the `os` on the device row, which comes from the session.
 - **Per-device twin:** the same classification is served per device as the nullable
   `guardian_backend` field on `GET /api/v1/devices[/{id}]` and the `list_agents` and
-  `get_agent_details` MCP tools. `null` means this gauge does not count the agent, but not the
-  converse: the field covers only connected devices and is read live, while the gauge is
-  republished every sweep and also counts a just-disconnected agent.
+  `get_agent_details` MCP tools. `null` means the device has no valid tag within the window. The two can
+  differ in either direction for up to one sweep, and the field covers only connected devices and
+  is read live, while the gauge is republished every sweep and also counts a just-disconnected
+  agent.
 - **No alert ships.** A rule such as `yuzu_fleet_guardian_backend{backend=~"spark_failed|unwired"} > 0`
   becomes meaningful only after the flip. No shipped alert rule reads this family, and `unwired` is a
-  state no existing alert covers, so an alert for it is a flip precondition.
+  state no existing alert covers, so an alert for it should exist before the flip.
 
 | Metric | Type | Description |
 |---|---|---|

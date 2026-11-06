@@ -1535,8 +1535,11 @@ flip, with a red-first test each:
     between "Nothing about" and "Guard detection", so a single-line grep for the whole phrase
     finds nothing; grep for "Guard detection or enforcement changes") and "No alert rule
     ships with them", plus its "dormant in steady state until the Spark path is enabled"; in
-    `guaranteed-state.md`, the `yuzu.guardian_backend` paragraph's "it reads `legacy`
-    fleet-wide, since `prefer_spark` is not yet enabled anywhere in production", the
+    `guaranteed-state.md`, the `yuzu.guardian_backend` paragraph's "every reporting device
+    reads `legacy`, since `prefer_spark` is not yet enabled anywhere in production" (and the
+    same statement in `metrics.md`'s "`legacy` is every reporting agent" bullet, the
+    `kGuardianBackendHelp` HELP constant and the `mcp.md` rows for `list_agents` and
+    `get_agent_details`), the
     "dormant until Guardian enforces through SparkEngine" labels on the wedged-rule hold note
     and the congestion-parking note, and known limit (1) of the hold note, "no current
     production route emits such a push" (retired by #5547, which rewrote limit (1) of the hold

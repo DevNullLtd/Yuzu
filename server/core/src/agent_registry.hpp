@@ -1538,9 +1538,11 @@ public:
     /// disconnected (remove() has no production caller, so the sweep prune is the only eviction),
     /// while the device surfaces list only registry-connected rows. SAMPLING: the gauge is
     /// republished every 15 s sweep, these read the live store. So after a disconnect the gauge can
-    /// still count the agent for up to about 105 s (window plus one sweep); a null field implies the
-    /// gauge does not count the agent, but not the converse. CLOCK: last_seen (the tag rides every beat today; a status-beat split must
-    /// move this and the gauge together - see the header).
+    /// still count the agent for up to about 105 s (window plus one sweep), and the two can differ in
+    /// either direction for up to one sweep (a null field does not by itself mean the gauge has
+    /// stopped counting the agent, and a non-null field can precede the gauge's first count).
+    /// CLOCK: last_seen (the tag rides every beat today; a status-beat split must move this and the
+    /// gauge together - see the header).
     ///
     /// `guardian_backend_for` returns one entry per input id, ALIGNED by index: the token
     /// (a view into the header's constexpr table, static storage, safe after mu_ is released)

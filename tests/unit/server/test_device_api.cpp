@@ -255,7 +255,9 @@ TEST_CASE("DeviceApi guardian_backend: the registry is the population, the healt
     CHECK_FALSE(ghost->has_value());
 
     // HARD RULE (#2240): the registry's own JSON snapshot, which feeds the unauthenticated legacy
-    // GET /api/agents and the dashboard, never carries the field.
+    // GET /api/agents and the dashboard, never carries the field. This catches an unconditional
+    // key only (the fixture sets no health tag on the registered session); the lexical gate
+    // tests/test_guardian_backend_wiring_lexical.py backs it for the other spellings and files.
     const auto snapshot = registry.to_json_obj();
     REQUIRE(snapshot.is_array());
     REQUIRE_FALSE(snapshot.empty());

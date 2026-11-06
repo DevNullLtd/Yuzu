@@ -4177,11 +4177,13 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
 # absent from AgentRegistry::to_json_obj(), server.cpp, the legacy /api/agents routes and the
 # dashboard row (HARD RULE); and ServerImpl::health_store_ is declared before every DeviceApi
 # holder (destruction order). Carries its own in-memory mutation self-test. No build required.
+# Suite 'docs', like the other server-source lexical gates: a 'server'-only label is covered by
+# neither the Windows --suite list nor its --exclude-suite list (assert-suite-cover.py).
 test('guardian_backend reader wiring lexical gate (#2240)',
   _python3_test,
   args: [files('test_guardian_backend_wiring_lexical.py')],
-  suite: 'server',
-  timeout: 30,
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested

@@ -125,10 +125,10 @@ inline constexpr const char* kGuardianBackendHelp =
     "in the last 90 seconds, per core replica, so an agent that has just disconnected is counted "
     "until it ages out. "
     "The per-device reading is the guardian_backend field on GET /api/v1/devices and the "
-    "list_agents and get_agent_details MCP tools, null when this gauge would not count the "
-    "agent; the field covers only connected devices and is read live, so it can differ from this "
-    "gauge for up to about 105 seconds after a disconnect (90 second window plus one 15 second "
-    "sweep)";
+    "list_agents and get_agent_details MCP tools, null when the device has no valid tag within "
+    "the window; the field covers only connected devices and is read live, so it can differ from "
+    "this gauge in either direction for up to one 15 second sweep, and for up to about 105 "
+    "seconds after a disconnect (90 second window plus one sweep)";
 
 inline constexpr const char* kGuardianBackendReportingHelp =
     "Agents whose latest heartbeat carried a valid yuzu.guardian_backend tag this sweep - the "
