@@ -5548,6 +5548,169 @@ tests:
         eval_time: 1690m
         exp_samples: []
 
+  # -- Internal-CA CRL dated in the future (#7097) ---------------------------
+  #
+  # The gauge is the publishing replica's clock at build (published_at, epoch seconds;
+  # thisUpdate is 300 s earlier); promtool's time() is
+  # the eval time, so the rule reads value - eval time against 3600 s (the
+  # gateway's future tolerance). A value of 7200 s is 2 h ahead at 0 m and crosses
+  # the threshold exactly at 60 m (3600 s, `> 3600` is false there): pending from
+  # 0 m, firing from 2 m (for: 2m), gone at 60 m.
+  - interval: 1m
+    name: CA CRL future-dated - fires after 2m, clears exactly at the 3600 s boundary
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "7200x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 1m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 59m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+      # 3600 s ahead exactly is still inside the gateway's tolerance: not firing, not pending.
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 60m
+        exp_samples: []
+  # One second over the threshold at the moment `for:` completes: 3721 s ahead at 0 m is
+  # exactly 3601 s ahead at 2 m, still `> 3600`, so it fires at 2 m. A threshold of 3601
+  # would be false at that sample and never fire.
+  - interval: 1m
+    name: CA CRL future-dated - 3601 s ahead when for completes still fires
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "3721x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+  # Just over the line: 3660 s ahead at 0 m is > 3600 until 1 m, so it is pending for
+  # one minute and never fires (for: 2m). A value that crosses and stays is the case above.
+  - interval: 1m
+    name: CA CRL future-dated - a brief excursion over the threshold does not fire
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "3660x100"
+    promql_expr_test:
+      # Observe the excursion itself: pending at 0 m (3660 s ahead), nothing at 1 m
+      # (3600 s, not above the line), so a rule with no `for:` would be firing at 0 m.
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 0m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="pending"}'
+        eval_time: 0m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="pending", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+  # Healthy sawtooth: a CRL published every 24 h; the gauge is the replica's own clock at
+  # publish, so it is never above the current time. One republish, at 1440 m; checked before it,
+  # just after it, and a day later.
+  # (The series starts at 0, so the first publish is at the epoch itself.)
+  - interval: 1m
+    name: CA CRL future-dated - a healthy sawtooth never fires
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "0x1439 86100x1500"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1435m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1441m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 2870m
+        exp_samples: []
+  # The fix: the clock is corrected and the replica restarted at 20 m, so the new row is
+  # dated at the real time (900 s at 1200 s). Firing at 15 m, clear by 25 m.
+  - interval: 1m
+    name: CA CRL future-dated - a republish at the correct time clears it
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "7200x20 900x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 25m
+        exp_samples: []
+  # max by (job) follows the newest row: one replica holds an older value, another the
+  # future-dated one. One page for the job, and a second job with only healthy rows is quiet.
+  - interval: 1m
+    name: CA CRL future-dated - one page per job, an older replica value cannot mask it
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="old"}'
+        values: "0x100"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="new"}'
+        values: "9000x100"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-other",instance="a"}'
+        values: "0x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+  # Two HEALTHY replicas export the same row; a `sum by (job)` mutant would read about twice the
+  # epoch and page forever, and every other multi-replica case here is future-dated (sum and max
+  # agree there), so this is the case that pins the aggregation.
+  - interval: 1m
+    name: CA CRL future-dated - two healthy replicas stay quiet
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="a"}'
+        values: "86100x2000"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="b"}'
+        values: "86100x2000"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1500m
+        exp_samples: []
+  # The price of `max by (job)`, the reverse of the expiry alerts: after the fix, one replica
+  # whose reads keep failing still exports the OLD future-dated value, `max` selects it, and
+  # the alert keeps firing although the corrected replica reports a healthy value. Documented
+  # in the rule comment and the runbook; pinned here so a change to it is deliberate.
+  - interval: 1m
+    name: CA CRL future-dated - a replica stuck on the old future-dated value keeps the alert firing
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="stuck"}'
+        values: "9000x100"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="fixed"}'
+        values: "0x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+  # No series at all (no CRL, or an install with its own certificates): nothing fires.
+  - interval: 1m
+    name: CA CRL future-dated - no series fires nothing
+    input_series:
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="unrelated"}'
+        values: "9999999999x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 50m
+        exp_samples: []
+
   # -- Gateway pin file and certificate files unreadable --------------------
   #
   # A pin file whose latest read failed keeps its last key (commands still
