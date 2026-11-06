@@ -72,6 +72,7 @@
 
 #include "shutdown_drain_rules.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <limits>
@@ -383,9 +384,12 @@ TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the 
     const std::string log_cond = "if (running > 0 || workflow_runs > 0) {";
     const std::string loop_head = "for (;;) {\n                const auto elapsed = steady_clock::now() - drain_start;";
 
+    // `pin` is the problem text the mutation must produce: a mutation that trips an unrelated pin
+    // while its own goes quiet is the false green this guards against (qe-5).
     struct Case {
         const char* name;
         std::string text;
+        const char* pin;
     };
     // The run count's declaration as it stands in the loop (comment-stripped source, 16-space
     // indent), in its three parts: the head, the engine argument, the lease argument.
@@ -401,43 +405,69 @@ TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the 
     std::string hoisted = mutated(text, full_decl, "");
     hoisted = mutated(hoisted, loop_head, full_decl + "\n            " + loop_head);
     const std::vector<Case> cases = {
-        {"count argument replaced by 0", mutated(text, call_tail, "0))")},
-        {"tracker count passed twice", mutated(text, "min_grace, running,", "min_grace, running, running,")},
-        {"result ignored", mutated(mutated(text, call_head, "(void)shutdown_drain::keep_draining_for_work("),
-                                   call_tail, "workflow_runs);")},
-        {"negation dropped", mutated(text, call_head, "if (shutdown_drain::keep_draining_for_work(")},
-        {"no break on the result", mutated(text, "workflow_runs))\n                    break;",
-                                           "workflow_runs)) {}")},
-        {"count read hoisted above the loop", hoisted},
-        {"lease count zeroed (a run in prepare is not drained)", mutated(text, lease_arg, "0);")},
+        {"count argument replaced by 0", mutated(text, call_tail, "0))"),
+         "keep_draining_for_work must read"},
+        {"tracker count passed twice",
+         mutated(text, "min_grace, running,", "min_grace, running, running,"),
+         "keep_draining_for_work must read"},
+        {"result ignored",
+         mutated(mutated(text, call_head, "(void)shutdown_drain::keep_draining_for_work("),
+                 call_tail, "workflow_runs);"),
+         "must be the negated condition"},
+        {"negation dropped",
+         mutated(text, call_head, "if (shutdown_drain::keep_draining_for_work("),
+         "must be the negated condition"},
+        {"no break on the result",
+         mutated(text, "workflow_runs))\n                    break;", "workflow_runs)) {}"),
+         "must `break;` directly"},
+        {"count read hoisted above the loop", hoisted, "read above the drain loop"},
+        {"lease count zeroed (a run in prepare is not drained)", mutated(text, lease_arg, "0);"),
+         "does not bind `workflow_runs`"},
         {"lease count read from another surface",
          mutated(text, "SseSurface::kWorkflowRun)\n                                   : 0);",
-                 "SseSurface::kMcpGet)\n                                   : 0);")},
-        {"engine count dropped from the combined count", mutated(text, engine_arg, "0,\n")},
-        {"log branch no longer sees the engine count", mutated(text, log_cond, "if (running > 0) {")},
-        {"log branch removed", mutated(text, log_cond, "if (false) {")},
+                 "SseSurface::kMcpGet)\n                                   : 0);"),
+         "does not bind `workflow_runs`"},
+        {"engine count dropped from the combined count", mutated(text, engine_arg, "0,\n"),
+         "expected exactly one 'workflow_engine_->in_flight_runs()'"},
+        {"log branch no longer sees the engine count",
+         mutated(text, log_cond, "if (running > 0) {"), "log branch is missing"},
+        {"log branch removed", mutated(text, log_cond, "if (false) {"), "log branch is missing"},
         {"set_should_stop assigned something else",
-         mutated(text, kShouldStopCall, "workflow_engine_->set_unrelated(")},
+         mutated(text, kShouldStopCall, "workflow_engine_->set_unrelated("),
+         "expected exactly one"},
         {"set_should_stop lambda never reports a stop",
-         mutated(text, "WorkflowStopLevel::kStop;", "WorkflowStopLevel::kDraining;")},
+         mutated(text, "WorkflowStopLevel::kStop;", "WorkflowStopLevel::kDraining;"),
+         "lacks `stop_requested_ -> kStop`"},
         {"set_should_stop lambda never reports a drain",
-         mutated(text, "WorkflowStopLevel::kDraining;\n                    return yuzu::server::WorkflowStopLevel::kNone;",
-                 "WorkflowStopLevel::kNone;\n                    return yuzu::server::WorkflowStopLevel::kNone;")},
+         mutated(text,
+                 "WorkflowStopLevel::kDraining;\n                    return "
+                 "yuzu::server::WorkflowStopLevel::kNone;",
+                 "WorkflowStopLevel::kNone;\n                    return "
+                 "yuzu::server::WorkflowStopLevel::kNone;"),
+         "lacks `draining_ -> kDraining`"},
         {"draining wins over stop",
-         mutated(mutated(mutated(text, "if (stop_requested_.load(std::memory_order_acquire))\n"
-                                       "                        return yuzu::server::WorkflowStopLevel::kStop;",
-                                 "@@STOP@@"),
-                         "if (draining_.load(std::memory_order_acquire))\n"
-                         "                        return yuzu::server::WorkflowStopLevel::kDraining;",
+         mutated(
+             mutated(
+                 mutated(text,
                          "if (stop_requested_.load(std::memory_order_acquire))\n"
-                         "                        return yuzu::server::WorkflowStopLevel::kStop;"),
-                 "@@STOP@@",
+                         "                        return yuzu::server::WorkflowStopLevel::kStop;",
+                         "@@STOP@@"),
                  "if (draining_.load(std::memory_order_acquire))\n"
-                 "                        return yuzu::server::WorkflowStopLevel::kDraining;")},
+                 "                        return yuzu::server::WorkflowStopLevel::kDraining;",
+                 "if (stop_requested_.load(std::memory_order_acquire))\n"
+                 "                        return yuzu::server::WorkflowStopLevel::kStop;"),
+             "@@STOP@@",
+             "if (draining_.load(std::memory_order_acquire))\n"
+             "                        return yuzu::server::WorkflowStopLevel::kDraining;"),
+         "must test stop_requested_ before draining_"},
     };
     for (const auto& c : cases) {
         INFO("mutation: " << c.name);
-        CHECK_FALSE(drain_wiring_problems(c.text).empty());
+        const auto found = drain_wiring_problems(c.text);
+        CHECK_FALSE(found.empty());
+        CHECK(std::any_of(found.begin(), found.end(), [&](const std::string& p) {
+            return p.find(c.pin) != std::string::npos;
+        }));
     }
 }
 

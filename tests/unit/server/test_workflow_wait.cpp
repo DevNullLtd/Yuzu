@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -247,6 +248,90 @@ TEST_CASE("acquire_within: a stop pulls the deadline in to the stop budget, neve
         FakeClock::State st;
         (void)acquire_within(1s, empty, [] { return true; }, 3s, FakeClock{&st});
         CHECK(st.t - FakeClock::time_point{} == 1s);
+    }
+}
+
+TEST_CASE(
+    "acquire_within: a stop cannot interrupt an ask already in progress, it only shortens the "
+    "wait that follows (the finalize stop cap is best-effort)",
+    "[workflow][wait][acquire][stopcap]") {
+    // The pool's connect to an unreachable database blocks for its connect timeout whatever slice
+    // it was handed (pg_pool.hpp: "worst case roughly timeout + connect_timeout_s"). The fake ask
+    // does the same: it advances the virtual clock by the slice it was given, up to
+    // `kConnectBlocks`.
+    constexpr auto kConnectBlocks = 10s;
+    constexpr auto kStopCap = 3s;
+    const auto since_start = [](const FakeClock::State& st) {
+        return st.t - FakeClock::time_point{};
+    };
+
+    SECTION("one blocked ask spends the whole budget: 10 s for one call, and no second ask") {
+        FakeClock::State st;
+        std::vector<std::chrono::milliseconds> asked;
+        std::optional<FakeClock::duration> first_stop_check;
+        const auto r = acquire_within(
+            10s,
+            [&](std::chrono::milliseconds t) -> Lease {
+                asked.push_back(t);
+                st.t += std::min<FakeClock::duration>(t, kConnectBlocks); // blocked, then empty
+                return std::nullopt;
+            },
+            [&] {
+                if (!first_stop_check)
+                    first_stop_check = since_start(st);
+                return since_start(st) >= 1s; // the stop flipped at +1 s, inside the blocked ask
+            },
+            kStopCap, FakeClock{&st});
+        CHECK_FALSE(r.has_value());
+        REQUIRE(asked.size() == 1);
+        CHECK(asked.front() == 10000ms);
+        CHECK(since_start(st) == 10s);
+        CHECK(st.sleeps.empty());
+        // The stop is first looked at when the ask returns, not at +1 s when it was raised.
+        REQUIRE(first_stop_check.has_value());
+        CHECK(*first_stop_check == 10s);
+    }
+    SECTION(
+        "with budget to spare the cap bounds what follows the blocked ask, not the ask itself") {
+        FakeClock::State st;
+        std::vector<std::chrono::milliseconds> asked;
+        std::optional<FakeClock::duration> first_stop_check;
+        const auto r = acquire_within(
+            20s,
+            [&](std::chrono::milliseconds t) -> Lease {
+                asked.push_back(t);
+                st.t += std::min<FakeClock::duration>(t, kConnectBlocks);
+                return std::nullopt;
+            },
+            [&] {
+                if (!first_stop_check)
+                    first_stop_check = since_start(st);
+                return since_start(st) >= 1s;
+            },
+            kStopCap, FakeClock{&st});
+        CHECK_FALSE(r.has_value());
+        REQUIRE(first_stop_check.has_value());
+        CHECK(*first_stop_check ==
+              10s); // the blocked ask ran its full 10 s before the stop was seen
+        // The deadline then moved from +20 s to (stop seen at +10 s) + 3 s: the run is over at
+        // +13 s, not +20 s, and the cap is counted from when the stop was SEEN.
+        CHECK(since_start(st) >= 10s + kStopCap - kAcquireBackoffMax);
+        CHECK(since_start(st) <= 10s + kStopCap);
+        // The first ask was the 20 s slice; every later ask was handed no more than the cap.
+        REQUIRE(asked.size() >= 2);
+        CHECK(asked.front() == 20000ms);
+        for (std::size_t i = 1; i < asked.size(); ++i)
+            CHECK(asked[i] <= std::chrono::duration_cast<std::chrono::milliseconds>(kStopCap));
+        // Without a stop the same pool would have held the wait for the whole 20 s.
+        FakeClock::State quiet;
+        (void)acquire_within(
+            20s,
+            [&](std::chrono::milliseconds t) -> Lease {
+                quiet.t += std::min<FakeClock::duration>(t, kConnectBlocks);
+                return std::nullopt;
+            },
+            [] { return false; }, kStopCap, FakeClock{&quiet});
+        CHECK(since_start(quiet) == 20s);
     }
 }
 

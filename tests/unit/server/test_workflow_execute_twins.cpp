@@ -35,6 +35,7 @@
 #include "test_workflow_api_double.hpp"
 #include "workflow_execute.hpp"
 #include "workflow_execute_routes.hpp"
+#include "workflow_parity_scenarios.hpp"
 
 #include "agent.pb.h"
 
@@ -4360,7 +4361,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a lost clai
 // replay's status must be the first answer's class, `completed` ONLY for a run that succeeded. The
 // stand-in engine persists the step rows a real engine would (Fx::stored_rows), so the replay
 // judges stored data, never the engine's coarse status word. The real engine's own rows are
-// checked by the [pg] twin of this matrix in test_workflow_engine.cpp.
+// checked by the [pg] twin of this matrix in test_workflow_engine.cpp. Both take each scenario's
+// expected class and reason from workflow_parity_scenarios.hpp, and
+// tests/test_workflow_parity_scenarios_lexical.py holds the two files to that one table.
 
 namespace {
 
@@ -4403,8 +4406,11 @@ ParityRun run_then_replay(Fx& f, WorkflowExecuteRequest req) {
     return p;
 }
 
-void expect_parity(const ParityRun& p, std::string_view expected_class,
-                   std::string_view expected_reason) {
+void expect_parity(const ParityRun& p, const parity::Scenario& scenario) {
+    REQUIRE(parity::runs_in_stand_in(scenario));
+    const std::string_view expected_class = scenario.expected_class;
+    const std::string_view expected_reason = scenario.expected_reason;
+    INFO("scenario " << scenario.key);
     INFO("first answer class " << p.first_class);
     CHECK(p.first_class == expected_class);
     // The first answer counts the run ONCE, as its class, with the reason the classifier gives,
@@ -4452,7 +4458,7 @@ TEST_CASE("replay parity: a succeeded run replays `completed`, and nothing else 
     f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
     const auto p = run_then_replay(f, f.request());
     CHECK(p.first.status == WorkflowExecuteStatus::kOk);
-    expect_parity(p, "succeeded", "none");
+    expect_parity(p, parity::parity_scenario("succeeded"));
 }
 
 TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves the engine `completed`, "
@@ -4468,7 +4474,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.run_status == "completed"); // the engine's word, which the replay must not echo
         CHECK(p.replay.run_status == "completed");
-        expect_parity(p, "partial", "none");
+        expect_parity(p, parity::parity_scenario("continue_later_step_missed"));
     }
     SECTION("the FIRST step reached nobody and a later one did") {
         Fx f;
@@ -4477,7 +4483,8 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         ConfinedDispatchOutcome zero;
         zero.denied_quarantined_count = 1;
         f.outcomes["i-ro"] = zero;
-        expect_parity(run_then_replay(f, f.request()), "partial", "none");
+        expect_parity(run_then_replay(f, f.request()),
+                      parity::parity_scenario("continue_first_step_missed"));
     }
     SECTION("no step reached anyone: failed on both") {
         Fx f;
@@ -4489,7 +4496,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         f.outcomes["i-ro2"] = zero;
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.status == WorkflowExecuteStatus::kNoAgentsReached);
-        expect_parity(p, "failed", "quarantined");
+        expect_parity(p, parity::parity_scenario("nothing_reached"));
     }
     SECTION("two steps naming the SAME instruction: the failed one is not hidden by the one that reached") {
         Fx f;
@@ -4509,7 +4516,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         REQUIRE(p.first.steps.size() == 2);
         CHECK(p.first.steps[0].step_index == 0);
         CHECK(p.first.steps[1].step_index == 1);
-        expect_parity(p, "partial", "none");
+        expect_parity(p, parity::parity_scenario("same_instruction_twice"));
     }
 }
 
@@ -4547,7 +4554,7 @@ TEST_CASE("replay parity: a step retried to success is `completed` with run_outc
     CHECK(j.at("steps").at(0).at("attempt") == 1);
     CHECK(j.at("steps").at(1).at("attempt") == 2);
     CHECK_FALSE(j.contains("retryable"));
-    expect_parity(p, "succeeded", "none");
+    expect_parity(p, parity::parity_scenario("retried_to_success"));
 
     SECTION("still failing on the last attempt is not rescued by an earlier or later note") {
         Fx g;
@@ -4557,7 +4564,7 @@ TEST_CASE("replay parity: a step retried to success is `completed` with run_outc
         g.outcomes["i-ro"] = zero;
         const auto q = run_then_replay(g, g.request());
         CHECK(q.first.steps.size() == 2);
-        expect_parity(q, "failed", "quarantined");
+        expect_parity(q, parity::parity_scenario("retried_still_failing_only_step"));
     }
 }
 
@@ -4571,7 +4578,7 @@ TEST_CASE("replay parity: a step refused at send time (late_denied, definition_c
         f.late_defs["i-ro2"] = def("i-ro2", "os_info", "os_version", "always");
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.late_denied);
-        expect_parity(p, "aborted", "late_denied");
+        expect_parity(p, parity::parity_scenario("late_denied"));
     }
     SECTION("late_denied as the FIRST step, with the engine's run closed failed") {
         Fx f;
@@ -4579,7 +4586,7 @@ TEST_CASE("replay parity: a step refused at send time (late_denied, definition_c
         f.late_defs["i-ro"] = def("i-ro", "os_info", "os_version", "always");
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.late_denied);
-        expect_parity(p, "aborted", "late_denied");
+        expect_parity(p, parity::parity_scenario("late_denied_first_step"));
     }
     SECTION("definition_changed: the step moved off the effect the ticket was bound to") {
         Fx f;
@@ -4592,7 +4599,7 @@ TEST_CASE("replay parity: a step refused at send time (late_denied, definition_c
             {"i-ro2", workflow_step_effect(f.defs["i-ro2"])}};
         const auto p = run_then_replay(f, req);
         CHECK(p.first.late_denied);
-        expect_parity(p, "aborted", "definition_changed");
+        expect_parity(p, parity::parity_scenario("definition_changed"));
     }
 }
 
@@ -4606,7 +4613,7 @@ TEST_CASE("replay parity: a run the server's shutdown ended is interrupted on bo
         f.interrupt_before_step = 1;
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.interrupted);
-        expect_parity(p, "interrupted", "server_shutdown");
+        expect_parity(p, parity::parity_scenario("interrupted_after_step_1"));
     }
     SECTION("before anything was sent") {
         Fx f;
@@ -4614,7 +4621,7 @@ TEST_CASE("replay parity: a run the server's shutdown ended is interrupted on bo
         f.interrupt_before_step = 0;
         const auto p = run_then_replay(f, f.request());
         CHECK_FALSE(f.dispatched_anything());
-        expect_parity(p, "interrupted", "server_shutdown");
+        expect_parity(p, parity::parity_scenario("interrupted_before_anything_sent"));
     }
 }
 
@@ -4629,7 +4636,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         f.reauth_answers = {auth::CredentialCheck::kValid, auth::CredentialCheck::kRevoked};
         const auto p = run_then_replay(f, f.request());
         CHECK(p.first.credential_stop == kReasonCredentialRevoked);
-        expect_parity(p, "aborted", "credential_revoked");
+        expect_parity(p, parity::parity_scenario("credential_revoked"));
     }
     SECTION("the credential could not be confirmed before the first step: nothing was sent") {
         Fx f;
@@ -4639,7 +4646,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         const auto p = run_then_replay(f, f.request());
         CHECK_FALSE(f.dispatched_anything());
         CHECK(p.first.credential_stop == kReasonCredentialIndeterminate);
-        expect_parity(p, "aborted", "credential_indeterminate");
+        expect_parity(p, parity::parity_scenario("credential_indeterminate"));
     }
     SECTION("the deadline passed between step 1 and step 2") {
         Fx f;
@@ -4656,7 +4663,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         };
         const auto p = run_then_replay(f, req);
         CHECK(p.first.deadline_exceeded);
-        expect_parity(p, "aborted", "deadline_exceeded");
+        expect_parity(p, parity::parity_scenario("deadline_between_steps"));
     }
     SECTION("the deadline had passed before the first attempt: nothing was sent") {
         Fx f;
@@ -4666,7 +4673,7 @@ TEST_CASE("replay parity: a run the credential check or the deadline stopped is 
         const auto p = run_then_replay(f, req);
         CHECK_FALSE(f.dispatched_anything());
         CHECK(p.first.deadline_exceeded);
-        expect_parity(p, "aborted", "deadline_exceeded");
+        expect_parity(p, parity::parity_scenario("deadline_before_first_attempt"));
     }
 }
 
@@ -4688,12 +4695,13 @@ TEST_CASE("replay parity: a run whose dispatch threw is failed on both answers, 
         CHECK(p.first.status == WorkflowExecuteStatus::kRunFailed);
         // Step 1's send was real: the replay still calls the run failed, as the first answer did,
         // and never completed.
-        expect_parity(p, "failed", "dispatch_exception");
+        expect_parity(p, parity::parity_scenario("dispatch_threw"));
     }
     SECTION("the engine ended failed although every attempted step reached an agent") {
         Fx f;
         f.engine_status = "failed";
-        expect_parity(run_then_replay(f, f.request()), "partial", "none");
+        expect_parity(run_then_replay(f, f.request()),
+                      parity::parity_scenario("engine_not_completed_every_attempted_step_reached"));
     }
 }
 
