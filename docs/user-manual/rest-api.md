@@ -10137,8 +10137,8 @@ not the effective state, in the same shape as the `GET` above.
 
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
-may not have been applied: read the switch back with the same `plugin`, `action` and `os`, or repeat
-the `PUT`, which is safe to repeat), `503` (store
+may not have been applied: read the switch back with the same `plugin`, `action` and `os`, checking that the `source` it
+reports names the row you wrote, or repeat the `PUT`, which is safe to repeat), `503` (store
 unavailable, or the audit row could not be saved).
 
 ---
@@ -10200,7 +10200,8 @@ the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permiss
 
 Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
-revocable (already redeemed or already revoked). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
+revocable (already redeemed or already revoked), and `503` if the store is unavailable or the
+`attempted` audit row cannot be saved (nothing is revoked, so retry). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
 upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
@@ -10238,13 +10239,13 @@ ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the ref
   status answers `200`). The request that wins the expiry transition also tries to discard the partial
   file; a removal that fails is logged and the file stays.
 - **Body cap.** Every `/api/v1/uploads` route is capped at 8 MiB before authentication and must send a
-  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps).
+  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407).
 - **Store unavailable:** `503`.
 
 #### `POST /api/v1/uploads`
 
 Redeems a grant and opens an upload session. Send header `X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`
-and no body. Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
+and no body (send `Content-Length: 0`; a `POST` without a `Content-Length` is answered `411`). Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
 
 **Response (`201`):**
 
@@ -10289,6 +10290,8 @@ not be opened or written).
 **Audit:** chunks are not audited one by one. Only `upload_grant.chunk` `failure` rows for `expired`
 and `size_exceeded` are written. Like the other device-side upload rows, this is set-and-proceed: a row
 that cannot be persisted sets `Sec-Audit-Failed` on the response and the request still completes.
+The header reaches the calling agent; operators see a dropped row through
+`yuzu_server_audit_emit_failed_total` and the `YuzuAuditPersistFailures` alert.
 
 #### `POST /api/v1/uploads/{upload_id}/commit`
 
