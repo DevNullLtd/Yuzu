@@ -693,7 +693,7 @@ TEST_CASE("device_agent_row_json: guardian_backend is the token when set, null w
     CHECK(without["guardian_backend"].is_null());
 }
 
-TEST_CASE("GET /api/v1/devices — each row carries its own guardian_backend, one token one null",
+TEST_CASE("GET /api/v1/devices: each row carries its own guardian_backend, one token one null",
           "[rest][devices][guardian_backend]") {
     DeviceRestHarness h;
     h.add_agent("a1", "host1");
@@ -710,7 +710,7 @@ TEST_CASE("GET /api/v1/devices — each row carries its own guardian_backend, on
     CHECK(body["data"]["devices_omitted"].get<int64_t>() == 0);
 }
 
-TEST_CASE("GET /api/v1/devices/{id} — the detail carries guardian_backend alongside tags",
+TEST_CASE("GET /api/v1/devices/{id}: the detail carries guardian_backend alongside tags",
           "[rest][devices][guardian_backend]") {
     DeviceRestHarness h;
     h.add_agent("a1", "host1");
@@ -723,7 +723,7 @@ TEST_CASE("GET /api/v1/devices/{id} — the detail carries guardian_backend alon
     REQUIRE(body["data"].contains("tags"));
 }
 
-TEST_CASE("GET /api/v1/devices[/{id}] — the new field opens no new read for a confined caller",
+TEST_CASE("GET /api/v1/devices[/{id}]: the new field opens no new read for a confined caller",
           "[rest][devices][guardian_backend]") {
     // Engaged scope admits only a1. a2 has a backend set, but it is neither listed nor
     // looked up: the field rides the existing admit-then-filter read, it is not a second one.

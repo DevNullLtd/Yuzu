@@ -85,9 +85,9 @@ class HttpRouteSink;
 // a future refactor of the MCP handlers has a function to call instead of a
 // third inline copy.
 
-/// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`
+/// PURE: one device row: `agent_id`/`hostname`/`os`/`arch`/`agent_version`
 /// and `guardian_backend`, straight off `DeviceApi::DeviceListRow`'s fields (already
-/// defensively extracted at the seam — see `device_api.hpp`). `guardian_backend` is ALWAYS
+/// defensively extracted at the seam, see `device_api.hpp`). `guardian_backend` is ALWAYS
 /// present (#2240): one of "legacy" | "spark" | "spark_failed" | "unwired", or JSON null when the
 /// device has not reported the heartbeat tag (never "legacy"; see
 /// `guardian_backend_fleet_tags.hpp`). MCP `list_agents` / `get_agent_details` mirror this by
