@@ -305,10 +305,10 @@ struct Harness {
     // drives the derived state per event_state_from_type (guaranteed_state_
     // store.cpp): "guard.compliant"/"drift.remediated" -> compliant,
     // "drift.detected" -> drifted, "remediation.failed"/"guard.unhealthy"/
-    // "guard.errored" -> errored. The upsert keeps a row only when the new
-    // updated_at >= the existing one: an EQUAL timestamp overwrites (the later
-    // arrival wins) and an earlier one is silently dropped, so use a strictly
-    // increasing ts per (agent, rule) across multiple seeds.
+    // "guard.errored" -> errored. The census keeps the verdict with the greatest ordering key,
+    // which this helper derives from `ts` (whole seconds): an EQUAL ts is a tie that the later
+    // arrival wins, and an EARLIER ts leaves the verdict and flags the row order_uncertain, so
+    // use a strictly increasing ts per (agent, rule) to overwrite a verdict without a flag.
     void seed_status(const std::string& event_id, const std::string& agent_id,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts = "2026-09-01T00:00:00Z") {
@@ -319,6 +319,7 @@ struct Harness {
         e.event_type = event_type;
         e.severity = "info";
         e.timestamp = ts;
+        e.agent_ns = yuzu::test::iso8601_to_ns(ts);
         REQUIRE(store->insert_event(e).has_value());
     }
 
@@ -2392,4 +2393,106 @@ TEST_CASE("guard detail census: an agent-supplied id is encoded in the /viz/host
     // The dot-only device is still listed by name, just not linked.
     CHECK(res->body.find("host3") != std::string::npos);
     CHECK_FALSE(yuzu::test::has_url(urls, "/viz/host/.."));
+}
+
+TEST_CASE("guardian overview: 'All compliant' is never shown over an uncertain pair (#5690)",
+          "[pg][guardian_routes][ordering]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+
+    h.seed_status("e1", "lin-1", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
+    {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("All compliant") != std::string::npos);
+        CHECK(res->body.find("ordering uncertain") == std::string::npos);
+        // The census caption no longer claims "as of last check-in".
+        CHECK(res->body.find("as of last check-in") == std::string::npos);
+        CHECK(res->body.find("verdict projected by event order") != std::string::npos);
+    }
+    // An older verdict arriving later is refused and flags the pair.
+    h.seed_status("e2", "lin-1", "svc1", "drift.detected", "2026-09-01T09:00:00Z");
+    {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("All compliant") == std::string::npos);
+        CHECK(res->body.find("Compliant, ordering uncertain") != std::string::npos);
+        CHECK(res->body.find("worst-badge worst-warn") != std::string::npos);
+        CHECK(res->body.find("1 guard(s) with uncertain ordering or an unreflected verdict") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
+          "[pg][guardian_routes][ordering]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"},)"
+                    R"({"agent_id":"lin-2","hostname":"otherbox","os":"linux"}])";
+    // lin-1: a newer verdict, then an older one arriving later (refused, flagged). lin-2: clean.
+    h.seed_status("a1", "lin-1", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
+    h.seed_status("a2", "lin-1", "svc1", "drift.detected", "2026-09-01T09:00:00Z");
+    h.seed_status("b1", "lin-2", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
+    const std::string phrase = "1 pair with uncertain ordering or an unreflected verdict";
+    const std::string pointer =
+        "See the Guaranteed State guide, section 'When a verdict is flagged or does not move'.";
+
+    // The pointer sits inside the note that starts at `note_start`, before that note's closing div.
+    auto note_contains_pointer = [&](const std::string& body, const std::string& note_start) {
+        const auto start = body.find(note_start);
+        if (start == std::string::npos)
+            return false;
+        const auto close = body.find("</div>", start);
+        const auto at = body.find(pointer, start);
+        return close != std::string::npos && at != std::string::npos && at < close;
+    };
+
+    auto count_of = [&](const std::string& body) {
+        std::size_t count = 0;
+        for (std::size_t pos = body.find(phrase); pos != std::string::npos;
+             pos = body.find(phrase, pos + 1))
+            ++count;
+        return count;
+    };
+    SECTION("the overview census hint") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        CHECK(count_of(res->body) >= 1);
+    }
+    SECTION("the per-guard row on the guard view") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=guard");
+        REQUIRE(res != nullptr);
+        CHECK(count_of(res->body) >= 1);
+    }
+    SECTION("the per-baseline row on the baseline view") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=baseline");
+        REQUIRE(res != nullptr);
+        CHECK(count_of(res->body) >= 1);
+    }
+    SECTION("the guard page: a note under the hero and a marker on the device row") {
+        auto res = h.sink.Get("/fragments/guardian/guard/svc1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find(phrase + ": each device is counted") != std::string::npos);
+        CHECK(res->body.find("&middot; ordering uncertain") != std::string::npos);
+        // The note and the row marker both point at the runbook section.
+        std::size_t pointers = 0;
+        for (std::size_t pos = res->body.find(pointer); pos != std::string::npos;
+             pos = res->body.find(pointer, pos + 1))
+            ++pointers;
+        CHECK(pointers == 2);
+        CHECK(note_contains_pointer(res->body, phrase + ": each device is counted"));
+    }
+    SECTION("the baseline page: a note under the hero and a count on the guard row") {
+        auto res = h.sink.Get("/fragments/guardian/baseline/bl1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find(phrase + ": the figures above") != std::string::npos);
+        CHECK(res->body.find("1 uncertain") != std::string::npos);
+        CHECK(res->body.find(pointer) != std::string::npos);
+        CHECK(note_contains_pointer(res->body, phrase + ": the figures above"));
+    }
 }

@@ -111,6 +111,8 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
             row.name = g.name; // already resolved + rule_id-fallback'd by the seam
             row.state = g.state;
             row.updated_at = g.updated_at;
+            row.order_uncertain = g.order_uncertain;
+            row.projection_pending = g.projection_pending;
             guards.push_back(std::move(row));
         }
         res.set_content(render_device_guardian_lens(id, guards, tabs), "text/html; charset=utf-8");
