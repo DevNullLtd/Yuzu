@@ -223,6 +223,13 @@ public:
 
     /// The epoch stamped at our last successful acquire; `nullopt` if not leader.
     /// LOCK-FREE, same published-atomic channel and rationale as `is_leader()`.
+    ///
+    /// CONSUMER CONTRACT (#3678): the command outbox's redelivery horizon
+    /// (`CommandOutboxDelivery` rule R4) treats "the stored stamp epoch equals this epoch" as
+    /// "the same PROCESS stamped it", and so differences that process's own counters. That
+    /// holds only while an epoch is never shared by two processes and is minted afresh on every
+    /// acquisition (including a regain after `resign()`). Do not change either property without
+    /// revisiting that rule.
     [[nodiscard]] std::optional<std::int64_t> epoch() const;
 
     /// Liveness heartbeat on the owned connection. On failure, drops leadership

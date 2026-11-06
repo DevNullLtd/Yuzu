@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <format>
@@ -5024,6 +5025,8 @@ struct LiveRun {
     TestDb t = make_db();
     std::shared_ptr<RegistryDirtyTable> dirty;
     std::function<bool()> etw_running; // the reader's own answer: is the session delivering?
+    // The session's own loss counters; the failure message of a missed ETW event reads them (#7135).
+    std::function<SessionLoss()> session_loss;
     std::string root;                  // the watched root, as the dirty table names it
     std::unique_ptr<RegistryCursorSource> src;
     explicit LiveRun(const std::string& hklm_root, bool etw = true) : root("HKLM\\" + hklm_root) {
@@ -5035,6 +5038,7 @@ struct LiveRun {
         }
         dirty = reader.dirty;
         etw_running = reader.etw_running;
+        session_loss = reader.session_loss;
         src = make_registry_cursor_source(RegistryScope{{hklm_root}, {}}, std::move(reader));
         src->start(t.db);
     }
@@ -5046,11 +5050,67 @@ struct LiveRun {
     // collect (the row lands).
     template <class Write>
     void transition(Write&& write, std::function<bool(const RegistryEtwEvent&)> await_event = {}) {
+        const std::uint64_t pushed_before = src->buffer_for_test().pushed();
         write();
         REQUIRE(dirty->wait_dirty_for_test(root, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
-        if (await_event && etw_running())
-            REQUIRE(src->buffer_for_test().wait_for_event(
-               await_event, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
+        if (await_event && etw_running()) {
+            const bool seen = src->buffer_for_test().wait_for_event(
+                await_event, std::chrono::steady_clock::now() + std::chrono::seconds(15));
+            if (!seen) {
+                // #7135: on the shared CI box this wait timed out with nothing in the job log to
+                // say why. The session is system-wide, so name what it delivered since this write
+                // (all writers), whether our own buffer evicted any (evicted), whether an event
+                // carrying this process's pid arrived since this write (from_this_pid: the await
+                // predicate also needs the op and value name, so 1 here with the wait still timed
+                // out means an event arrived but did not match), and what the session says it
+                // lost. Events arriving while events_lost or rt_buffers_lost grow points at the
+                // session overflowing under load, which would have dropped this write's event; no
+                // events at all with etw_running=1 and zero loss points at a session that is not
+                // delivering; etw_running=0 means the session died during the wait. The counters
+                // are cumulative for the session, and zero loss does not prove nothing was dropped
+                // (provider-side drops are not counted). If loss_query_ok is 0 the counters are
+                // not evidence, and the loss counters print n/a. "Passed the reader's filter" counts only
+                // events the reader accepted (provider, the set/delete ids, status 0, decodable), so 0
+                // cannot tell an idle session from one whose events are all being rejected.
+                // from_this_pid is read after the 15 s wait and the loss query, so an event that landed
+                // in that gap reads as "arrived but did not match".
+                const SessionLoss loss = session_loss();
+                const auto evicted = src->buffer_for_test().drop_info().count;
+                // A deadline already in the past evaluates the predicate once, without waiting.
+                // seq is assigned together with pushed_ under the buffer lock, so
+                // seq > pushed_before means pushed since this write.
+                const bool from_this_pid = src->buffer_for_test().wait_for_event(
+                    [pushed_before](const RegistryEtwEvent& e) {
+                        return e.seq > pushed_before && e.pid == ::GetCurrentProcessId();
+                    },
+                    std::chrono::steady_clock::now());
+                const auto counter = [&loss](std::uint64_t v) {
+                    return loss.query_ok ? std::to_string(v) : std::string("n/a");
+                };
+                const std::string detail = std::format(
+                    "no ETW event from this write within 15 s. session passed {} events from "
+                    "all writers through the reader's filter since this write ({} buffered, {} "
+                    "evicted since the session started); events_lost={} rt_buffers_lost={} "
+                    "decode_failed={} loss_query_ok={} etw_running={} from_this_pid={}",
+                    src->buffer_for_test().pushed() - pushed_before,
+                    src->buffer_for_test().size(), evicted, counter(loss.events_lost),
+                    counter(loss.rt_buffers_lost), loss.decode_failed,
+                    static_cast<int>(loss.query_ok), static_cast<int>(etw_running()),
+                    static_cast<int>(from_this_pid));
+                // meson's job-log tail is the last 100 lines of the test's stdout then its
+                // stderr section, and hundreds of lines of per-case output follow this case,
+                // so a Catch2 message alone reaches only the uploaded meson-logs artifact.
+                // stderr is printed last: put the same text there too.
+                std::fputs(std::format("[#7135] {}\n", detail).c_str(), stderr);
+                FAIL(detail);
+            }
+        } else if (await_event) {
+            // The ETW attribution wait is skipped when the session is not running (a host that
+            // cannot start one, or one that died since start). Say so in the job-log tail, or a
+            // later assertion fails with no state text (#7135).
+            std::fputs("[#7135] ETW session not running at write time; ETW attribution wait skipped\n",
+                       stderr);
+        }
         tick(t.db, *src);
         g_clock_offset = kEtwSettle100ns + SEC;
         tick(t.db, *src);

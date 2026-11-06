@@ -151,7 +151,9 @@
       principal_type: d.principalType, principal_id: d.principalId, role_name: d.roleName,
       decision: btn.dataset.decision, justification: justification
     }).then(function (r) {
-      if (!r.ok) return failure(r);
+      // 409 = another reviewer decided this grant first (decisions are final): reload so the
+      // row shows the recorded decision instead of live buttons that can only fail again.
+      if (!r.ok) { if (r.status === 409) loadCampaign(id); return failure(r); }
       written(r);
       loadCampaign(id);
       return null;
