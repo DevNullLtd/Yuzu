@@ -4,9 +4,11 @@
  * Two layers:
  *   - unwired-dependency shapes (no Postgres): every route answers a 503 A4 envelope;
  *   - [pg][routes] over a REAL AuthRoutes gate (RbacStorePg, ManagementGroupStorePg, ApiTokenStorePg)
- *     and the real settings and plugin-config stores: the global grant as the only authority (a
- *     group-scoped role assignment, a plain, MCP-tier or service-scoped token without the grant is
- *     refused on every route), the re-check ahead of the write, the 503-versus-403 split on an
+ *     and the real settings and plugin-config stores: with RBAC enforcement on, the global grant as
+ *     the only authority (a group-scoped role assignment, a plain, MCP-tier or service-scoped token
+ *     without the grant is refused on every route); with it off, the legacy rule (reads for any
+ *     signed-in non-service-scoped session, writes for the administrator role); the re-check
+ *     ahead of the write, the 503-versus-403 split on an
  *     unavailable RBAC read, audit ordering, 409 bodies, the store-error mapping, and the host
  *     route over the pure resolver.
  */
@@ -542,6 +544,32 @@ TEST_CASE("collection settings routes: a caller without the global grant is refu
     CHECK(rig.store->get(rig.group_p)->value().settings.interval_s == 7200);
     CHECK_FALSE(rig.store->get(rig.group_c)->has_value());
     CHECK_FALSE(rig.store->get(rig.root)->has_value());
+}
+
+TEST_CASE("collection settings routes: with RBAC enforcement off, reads follow the legacy rule and "
+          "writes need the administrator role",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    rig.rbac.set_rbac_enabled(false);
+    const auto admin = rig.cookie("legacyadmin", auth::Role::admin);
+    const auto user = rig.cookie("plainuser");
+    const std::string list_path = "/api/v1/inventory/software/collection-settings";
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), admin, put_body(7200))->status == 200);
+
+    // Any signed-in non-admin session reads, as on the sibling management-group routes.
+    CHECK(rig.call("GET", list_path, user)->status == 200);
+    CHECK(rig.call("GET", rig.doc_path(rig.group_p), user)->status == 200);
+    // A write needs the administrator role.
+    rig.audit.clear();
+    CHECK(rig.call("PUT", rig.doc_path(rig.group_s), user, put_body(7200))->status == 403);
+    CHECK_FALSE(rig.store->get(rig.group_s)->has_value());
+    REQUIRE(rig.audit.size() == 1);
+    CHECK(rig.audit[0].detail == "refused by the ManagementGroup:Write gate");
+    // A service-scoped token is refused on the reads too.
+    auto svc = rig.api_tokens->create_token("svc", "plainuser", now_secs() + 3600, "billing");
+    REQUIRE(svc.has_value());
+    CHECK(rig.call("GET", list_path, rig.bearer(*svc))->status == 403);
+    CHECK(rig.call("GET", rig.doc_path(rig.group_p), rig.bearer(*svc))->status == 403);
 }
 
 TEST_CASE("collection settings PUT: a fleet administrator writes any group, the root and a priority",

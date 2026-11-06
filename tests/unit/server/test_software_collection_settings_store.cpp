@@ -415,6 +415,50 @@ TEST_CASE("SoftwareCollectionSettingsStore: a create at the row cap is TooMany; 
     CHECK(store.put("cccc00000001", make(7200), std::string(64, 'a'), "alice").has_value());
 }
 
+TEST_CASE("SoftwareCollectionSettingsStore: a create for a group that has a document at the cap is "
+          "a Conflict, not TooMany",
+          "[pg][store][collection_settings]") {
+    SETTINGS_STORE(store);
+    // The cap, with kGroupA's row among the rows: a retried create of a landed write.
+    exec_sql(settings_db_fx_.dsn(),
+             "INSERT INTO software_collection_settings_store.settings (group_id, interval_s, "
+             "plugins_json, version, updated_at) SELECT 'cccc' || lpad(g::text, 8, '0'), 86400, "
+             "'{}', repeat('a', 64), 1 FROM generate_series(1, " +
+                 std::to_string(SoftwareCollectionSettingsStore::kListRowCap - 1) + ") g");
+    exec_sql(settings_db_fx_.dsn(), insert_with_plugins("{}"));
+    const auto create = store.put(kGroupA, make(7200), std::nullopt, "alice");
+    REQUIRE_FALSE(create.has_value());
+    CHECK(create.error().kind == Kind::Conflict);
+    REQUIRE(create.error().current.has_value());
+    CHECK(create.error().current->group_id == kGroupA);
+    CHECK(create.error().current->version == std::string(64, 'a'));
+}
+
+TEST_CASE("SoftwareCollectionSettingsStore: a create waits on the create lock and fails within "
+          "lock_timeout",
+          "[pg][store][collection_settings]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, settings_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1, .lock_timeout_ms = 300}};
+    REQUIRE(pool.valid());
+    SoftwareCollectionSettingsStore store{pool};
+    REQUIRE(store.is_open());
+    // Another transaction holds the create lock, as a concurrent create past its count would.
+    PgConn holder{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(holder.get(), "BEGIN")}.status() == PGRES_COMMAND_OK);
+    REQUIRE(PgResult{PQexec(holder.get(),
+                            "SELECT pg_advisory_xact_lock(hashtextextended("
+                            "'software_collection_settings_store:create', 0))")}
+                .status() == PGRES_TUPLES_OK);
+    const auto blocked = store.put(kGroupA, make(), std::nullopt, "alice");
+    REQUIRE_FALSE(blocked.has_value());
+    CHECK(blocked.error().kind == Kind::WriteFailed);
+    CHECK_FALSE(store.get(kGroupA)->has_value());
+    // Released, the create lands on the pool's one connection: the failed one left it reusable.
+    REQUIRE(PgResult{PQexec(holder.get(), "COMMIT")}.status() == PGRES_COMMAND_OK);
+    REQUIRE(store.put(kGroupA, make(), std::nullopt, "alice").has_value());
+}
+
 TEST_CASE("SoftwareCollectionSettingsStore: concurrent writers from the same starting point - one wins",
           "[pg][store][collection_settings]") {
     SETTINGS_STORE(store);
