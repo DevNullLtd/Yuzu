@@ -2005,7 +2005,7 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
   that matter: agent shard C 480 s (shards A and B 240 s), `blocked log sink
-  SIGTERM harness` 300 s, echo 180 s, `gateway eunit` and `gateway ct` 600 s. (Shard
+  SIGTERM harness` 300 s, echo 180 s (`echo unit tests`; `echo fold sizing` and `echo v10 migration` are 300 s), `gateway eunit` and `gateway ct` 600 s. (Shard
   C was 240 s until #7135, a deliberate, temporary raise: see the sizing comment in
   `tests/meson.build`, and #7177 for the split that brings C back down. Echo was 90 s
   and is now 180 s, which keeps its measured passing runs under 50% of the limit.

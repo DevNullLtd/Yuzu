@@ -235,6 +235,16 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // (the check_permission pattern), and a service-scoped token is refused at the generic
     // MCP gate. No arguments, so it is a kNoArgTools entry in test_operator_surface_twins.cpp.
     {"get_me", "Infrastructure", "Read", true},
+    // get_rbac_enforcement, the twin of GET /api/v1/rbac/enforcement (ledger row
+    // get.fragments-access-enforcement, #6033). Like get_me, the REST route and the HTML
+    // fragment have no permission gate (session only), so this row pins the MCP side alone:
+    // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it,
+    // and a service-scoped token is refused at the generic MCP gate. No arguments. It is also
+    // listed in kNoArgTools in test_operator_surface_twins.cpp, but that entry is inert today:
+    // the check it exempts rejects only the exact schema literal {"type":"object","properties":{}},
+    // and this tool's input schema also carries additionalProperties:false, so it passes with or
+    // without the entry. The input schema itself is pinned in test_rbac_enforcement_read_mcp.cpp.
+    {"get_rbac_enforcement", "Infrastructure", "Read", true},
 };
 
 } // namespace yuzu::server::twin_table

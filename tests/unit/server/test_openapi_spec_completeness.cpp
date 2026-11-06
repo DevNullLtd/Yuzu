@@ -1571,8 +1571,8 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
     }
 
     SECTION("a field sent on several lines is read as one comma-joined list (RFC 9110 5.3)") {
-        // The occurrences are added in whatever order the underlying unordered multimap keeps,
-        // so each case gives the same answer whichever line is read first.
+        // The occurrences are added in wire order (httplib keeps them in an insertion-ordered
+        // multimap), so each case gives the same answer whichever line is read first.
         const std::string stale = "\"0000000000000000\"";
         struct Case {
             std::string first;
@@ -1844,7 +1844,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"5d12cce46b2c8920\"";
+    static const std::string kOperationIdChecksum = "\"70d0ae0ed158e548\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -2089,7 +2089,7 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
         {"/guaranteed-state/rules/{rule_id}/status",
          kList,
          true,
-         {"agent_id", "state", "updated_at"},
+         {"agent_id", "state", "updated_at", "order_uncertain", "projection_pending"},
          true,
          "",
          {}},
@@ -2109,18 +2109,20 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
          {"agent_id", "guards", "total_guards"},
          true,
          "guards",
-         {"rule_id", "name", "state", "updated_at"}},
+         {"rule_id", "name", "state", "updated_at", "order_uncertain", "projection_pending"}},
         {"/guaranteed-state/status",
          kOne,
          false,
-         {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "uncertain_rules",
+          "note"},
          false,
          "",
          {}},
         {"/guaranteed-state/status/{agent_id}",
          kOne,
          false,
-         {"agent_id", "total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         {"agent_id", "total_rules", "compliant_rules", "drifted_rules", "errored_rules",
+          "uncertain_rules", "note"},
          false,
          "",
          {}},

@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -65,6 +66,21 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                               BlastRadiusDetector* blast_radius = nullptr,
                               DexAlertRouter* alert_router = nullptr,
                               yuzu::MetricsRegistry* metrics = nullptr);
+
+/// The agent's wire timestamp as nanoseconds since the epoch, or nullopt when it cannot be used.
+/// The wire field is untrusted protobuf input: it must be present, `nanos` must be in [0, 1e9)
+/// and `seconds` must be in [0, INT64_MAX / 1e9 - 1] (9,223,372,035), so `seconds * 1e9 + nanos`
+/// cannot overflow. An ABSENT timestamp reads as seconds()==0 and must not be taken for a real
+/// epoch-0 instant, so it is nullopt too. This is the ONE validation of the stamp: the row's
+/// `agent_ns` (the census ordering key input) and the T_server diagnostic line both use it.
+[[nodiscard]] std::optional<std::int64_t> agent_stamp_ns(bool has_timestamp, std::int64_t seconds,
+                                                         std::int32_t nanos) noexcept;
+
+/// Counter of events the ingest boundary refuses before they reach the store, by `reason`
+/// (today only `empty_rule_id`: an event with no rule id cannot be projected or matched and is
+/// not stored). Warm-created at startup (server.cpp) so the series reads 0, not absent.
+inline constexpr char kGuardianEventsRejectedMetric[] =
+    "yuzu_server_guardian_events_rejected_total";
 
 /// Prometheus metric name for the store-operation latency histogram: server-side latency of
 /// `insert_event_classified` (the classify+store SQLite txn) for one Guardian event, split by

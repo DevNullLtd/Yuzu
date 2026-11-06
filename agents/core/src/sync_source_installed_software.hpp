@@ -41,7 +41,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq|chocolatey|winget|appx
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq|dotnet|jvm|chocolatey|winget|appx
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -62,7 +62,7 @@ using SyncPluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::le
 /// collector's action table; the status row itself is parsed by
 /// agents/shared/inventory_status_row.hpp). The collector's cycle is all-or-nothing, so a source
 /// that cannot answer skips the report -- except `drop_source`, which exists for the middleware
-/// rows only.
+/// and python rows only.
 enum class ConstrainedPolicy {
     /// The action fails the cycle: a partial roster would delete stored rows.
     fail,
@@ -74,7 +74,7 @@ enum class ConstrainedPolicy {
     // replace: DELETE agent rows + INSERT), so rows withheld this cycle are
     // REMOVED from the stored inventory until the source recovers: a constrained cycle shows as
     // the source's rows missing plus its warn line, never as stale rows. For the middleware rows
-    // only: their steady-state constraint is a permission fact, and failing the whole cycle would
+    // and python rows only: their steady-state constraint is a permission fact, and failing the whole cycle would
     // freeze every other source for ever.
     drop_source,
 };
@@ -162,6 +162,23 @@ YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::stri
 /// collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer withholds
 /// these rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
 YUZU_EXPORT AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy);
+
+/// Adapt `runtimes` `dotnet` output (`status|dotnet|<level>|...` plus five-token
+/// `dotnet|<flavour>|<version or ->|<install_path or ->|<vendor or ->`). Each row becomes
+/// {kind=app, ecosystem=dotnet, publisher=Microsoft}; name by flavour: `runtime` or `core` ->
+/// `.NET Runtime`, `sdk` -> `.NET SDK`, `netfx` -> `.NET Framework`, anything else -> `.NET`.
+/// `-` version -> empty; flavour, path and the row's vendor are dropped. The collector's table row
+/// uses ConstrainedPolicy::keep_rows_if_present_seen: a `constrained` answer that carried at
+/// least one dotnet row keeps its rows (status ok, reason = the tokens); one with no row fails
+/// the cycle (stored rows are untouched, never deleted); `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPolicy policy);
+
+/// Adapt `runtimes` `jvm` output (same five-token shape, row tag `jvm`). Each row becomes
+/// {kind=app, ecosystem=jvm}; name by flavour: `jdk` -> `Java JDK`, `jre` -> `Java JRE`, anything
+/// else -> `Java`; publisher = the row's vendor (the build's self-reported IMPLEMENTOR; `-` ->
+/// empty); `-` version -> empty; flavour and path dropped. Same keep_rows_if_present_seen policy
+/// as dotnet.
+YUZU_EXPORT AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy policy);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM

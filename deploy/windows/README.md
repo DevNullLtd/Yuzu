@@ -266,7 +266,7 @@ verified by `Assert-Toolchain.ps1`:
   "runner_count": 4,
   "pins":  { "python": "3.14.6", "meson": "1.11.1", "erlang": "28.4.2",
              "rebar3": "3.24.0", "postgres": "18.4", "windows_sdk": "10.0.26100.0", "build_jobs": 16,
-             "vcpkg_baseline": "4b77da7..." },
+             "vcpkg_baseline": "9eec002df1cd" },
   "env":   { "VCPKG_ROOT": "C:\\vcpkg", "CCACHE_DIR": "D:\\ci\\ccache",
              "RUNNER_TOOL_CACHE": "D:\\ci\\tool_cache",
              "YUZU_BUILD_JOBS": "16",
