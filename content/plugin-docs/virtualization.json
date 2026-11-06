@@ -1,0 +1,327 @@
+{
+  "actions": [
+    {
+      "action": "host",
+      "definition_ids": [
+        "crossplatform.virtualization.host"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "ARM has no CPUID: SMBIOS and OS hints alone decide, and a host with neither reads unknown, never bare_metal; a KVM or Xen host reads bare_metal (its own CPUID is not virtualised); a cgroup-v2 namespace-obscured root reads container unknown",
+          "mechanism": "CPUID leaves 1 and 0x40000000-0x40000003 (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type, /proc/cpuinfo, /.dockerenv, /run/.containerenv and /proc/self/cgroup (bounded reads, no subprocess)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "no CPUID on arm64: the sysctl is the readable negative; container is always no",
+          "mechanism": "sysctlbyname kern.hv_vmm_present and hw.model",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "container not read: always unknown, windows:virtualization:container:not_read; ARM64 has no CPUID and reads as Linux ARM",
+          "mechanism": "CPUID leaves 1 and 0x40000000-0x40000003 (__cpuid, x86) and the SMBIOS System Information table via GetSystemFirmwareTable('RSMB')",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Unreadable is never bare metal.** A source that fails to read, or a machine with no CPUID (ARM) and no other readable \"not virtual\" answer, reads `unknown` with the reason, not `bare_metal`. The cost is that some real bare-metal ARM hosts read `unknown`; the benefit is that a refused read can never be reported as a physical machine.",
+    "**A KVM or Xen host reads `bare_metal`.** The kind describes what the OS the agent runs on is running under; a Linux KVM or Xen dom0 host's own CPUID is not virtualised, so it is not detected as a hypervisor host. Only the Windows Hyper-V root partition is reported as `host_with_hypervisor`.",
+    "**Container membership is best effort.** On cgroup v2 an agent inside a cgroup namespace sees `0::/` whatever it runs in, and a host whose init places the agent at the cgroup root reads the same; both are `unknown` (`linux:virtualization:container:cgroup_root_opaque`), not `no`. Windows containers are not read: the row is always `unknown` with `windows:virtualization:container:not_read`. macOS always reports `no`.",
+    "**A customised Hyper-V guest can read as a host.** SMBIOS beats the root-partition bit, so a Hyper-V guest whose SMBIOS strings were changed to a non-VM vendor and which is granted CreatePartitions reads `host_with_hypervisor`. Nested virtualization with a custom SMBIOS is the only known case.",
+    "**Cloud-metadata and runtime detection are out of scope.** The plugin does not query a cloud metadata service, and WSL2 and runtime-posture facts are a separate action; `vendor` is the hypervisor, not the cloud account or instance."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports whether this device is a virtual machine, which hypervisor it runs under and whether the agent itself runs in a container, as facts only. The kind separates a guest from a Windows host that merely runs Hyper-V, VBS or WSL2 (host_with_hypervisor), and from bare metal. A source that could not be read never reads as bare metal: the kind is unknown and the reason is on the status row and in the host row's source field. A leading status row states whether the read was complete. Windows does not read container membership.",
+      "display_name": "Virtualization Host",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "crossplatform.virtualization.host",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Virtualization facts: VM or not, which hypervisor, container membership",
+  "how_it_works": "`host` reports whether this device is a virtual machine, which hypervisor it runs under, and whether the agent itself runs in a container, as facts only. It changes nothing and spawns nothing. The first row is always a `status` row saying whether the read was complete, then one `host` row (`is_virtual`, `kind`, `vendor`, `product`, `source`, `confidence`) and one `container` row. `kind` is `guest`, `host_with_hypervisor`, `bare_metal` or `unknown`; a container on a VM reports both facts, because `container` is its own row and not a `kind` value.\n\nThe decision is one table in `virtualization_parsers.hpp`, fed by what each OS shell reads. Linux reads CPUID (x86), the DMI `sys_vendor` and `product_name` attributes, `/sys/hypervisor/type`, the `hypervisor` flag in `/proc/cpuinfo`, the marker files `/.dockerenv` and `/run/.containerenv`, and the agent's own `/proc/self/cgroup` (not PID 1's, which answers a different question when the PID namespace is shared). macOS reads `kern.hv_vmm_present` and `hw.model`. Windows reads CPUID and the SMBIOS System Information table. A Windows machine running Hyper-V, VBS or WSL2 sets the CPUID hypervisor bit yet is the host, not a guest: when the hypervisor signature is `Microsoft Hv`, the interface signature is `Hv#1` and the maximum leaf reaches `0x40000003`, the Hyper-V root-partition bit (leaf `0x40000003` EBX bit 0, CreatePartitions) separates a host (`host_with_hypervisor`, `is_virtual` no) from a guest. Without that discovery contract the bit is never read.\n\nPrecedence: positive identification always beats negative evidence. SMBIOS or the hardware model naming a VM vendor decides first (so VBS nested inside another hypervisor, which sets the root-partition bit, still reads `guest`); then the root-partition bit; then the CPUID hypervisor bit; then a positive OS hint. `bare_metal` is reachable only when no consulted source identifies virtualization, at least one readable source says \"not virtual\", and no consulted source failed to read. Anything else is `unknown`, with the reasons on the status row and in the host row's `source` field.\n\n### What you can decide with it\n\n| Question | Linux | macOS | Windows |\n|---|---|---|---|\n| Is this device a VM? | Yes: `is_virtual` yes, no or unknown, with the evidence source and a confidence. | Yes, from `kern.hv_vmm_present` and the model name. | Yes, from CPUID and SMBIOS. |\n| Which hypervisor? | The CPUID signature, a DMI vendor or `/sys/hypervisor/type`. | `apple` for a `VirtualMac*` model, otherwise `other`. | The CPUID signature or the SMBIOS vendor. |\n| Is the agent in a container? | `yes` on a marker file or a container cgroup path; `no` only when the markers are absent and the cgroup names a real path; otherwise `unknown`. | Always `no`. | Not read: always `unknown`. |\n| Is this a Hyper-V, VBS or WSL2 host? | A WSL2 guest reads `guest` `hyperv`. | n/a | Yes: `host_with_hypervisor`, `is_virtual` no. |\n\n### Diagrams\n\n#### How the kind is decided\n\nThe order matters: a positive identification is never outranked by a negative or missing signal, and an unreadable source can never be read as \"not virtual\".",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "a297f9e5030a",
+  "manifest_version": 1,
+  "name": "virtualization",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Row shape discriminator (field 0). Values: status, host, container.",
+          "example": "host",
+          "name": "row_kind",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "host",
+            "container"
+          ]
+        },
+        {
+          "description": "status: the literal \"host\". host: is_virtual, yes (a guest), no (bare metal or a host running a hypervisor) or unknown. container: yes, no or unknown (is the agent itself in a container).",
+          "example": "no",
+          "name": "field_1",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "status: supported, constrained or unsupported (a leg that threw). host: kind, guest, host_with_hypervisor (a Windows host running Hyper-V, VBS or WSL2), bare_metal or unknown. container: the evidence (/.dockerenv, /run/.containerenv, cgroup:<runtime>, linux:no_container_marker, macos:no_container_runtime) or, for unknown, the reason (linux:virtualization:container:cgroup_root_opaque for a cgroup-v2 namespace that hides the answer, windows:virtualization:container:not_read on Windows).",
+          "example": "bare_metal",
+          "name": "field_2",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "supported",
+            "constrained",
+            "unsupported",
+            "guest",
+            "host_with_hypervisor",
+            "bare_metal",
+            "unknown"
+          ]
+        },
+        {
+          "description": "status: reason token(s) for a non-supported read, \"-\" when complete; tokens look like linux:virtualization:dmi:permission_denied, linux:virtualization:cpuid:unavailable, windows:virtualization:smbios:truncated, macos:virtualization:hw_model:unreadable, linux:leg:exception. host: the hypervisor vendor (kvm, hyperv, vmware, xen, virtualbox, parallels, bhyve, qemu, acrn, aws, gce, alibaba, openstack, nutanix, apple or other) for a guest or host_with_hypervisor, the hardware manufacturer for bare_metal and unknown, \"-\" when not read.",
+          "example": "Apple Inc.",
+          "name": "field_3",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "host: the SMBIOS product name or macOS hw.model, \"-\" when not read. Not used by the other kinds.",
+          "example": "Mac16,10",
+          "name": "field_4",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "host: the evidence source that decided the kind (cpuid, smbios, sysctl, sys_hypervisor or cpuinfo); when the kind is unknown, the joined reason tokens instead. Not used by the other kinds.",
+          "example": "sysctl",
+          "name": "field_5",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "host: confidence, high, medium or low (an unknown is low). Not used by the other kinds.",
+          "example": "high",
+          "name": "field_6",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "high",
+            "medium",
+            "low"
+          ]
+        }
+      ],
+      "definition_id": "crossplatform.virtualization.host"
+    }
+  ],
+  "outputs_note": "Every row is pipe-delimited and field 0 is the row kind; `-` is an absent value. The first row is always `status|host|<supported\\|constrained\\|unsupported>|<reason or ->`. The `host` row has seven fields: `host|<yes\\|no\\|unknown>|<guest\\|host_with_hypervisor\\|bare_metal\\|unknown>|<vendor>|<product>|<source>|<high\\|medium\\|low>`. `vendor` is the hypervisor (`kvm`, `hyperv`, `vmware`, `xen`, `virtualbox`, `parallels`, `bhyve`, `qemu`, `acrn`, `aws`, `gce`, `alibaba`, `openstack`, `nutanix`, `apple` or `other`) for a guest or host, and the hardware manufacturer for `bare_metal` and `unknown`. `source` is the evidence that decided the kind (`cpuid`, `smbios`, `sysctl`, `sys_hypervisor` or `cpuinfo`); when the kind is `unknown` it carries the joined reason tokens instead, so the row an operator reads explains itself. The `container` row is `container|<yes\\|no\\|unknown>|<evidence or reason>`. Every OS-supplied value (DMI and SMBIOS strings, the hardware model) is scrubbed (NUL and malformed UTF-8 become `?`) and escaped for the server's pipe grammar.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "constrained"
+  },
+  "privileges": [
+    {
+      "grant": "None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable`",
+      "if_refused": "`CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine",
+      "measured": "Not measured yet: the Windows capture is taken on a bare-metal host with Hyper-V enabled and replaces this cell",
+      "os": "Windows",
+      "runs_as": "agent daemon (LocalSystem today, `docs/agent-privilege-model.md`)"
+    },
+    {
+      "grant": "None: both sysctls answer an unprivileged caller",
+      "if_refused": "`CONSTRAINED` / partial with `macos:virtualization:hv_vmm_present:unreadable` or `macos:virtualization:hw_model:unreadable`; the kind is `unknown`",
+      "measured": "The sample was captured as an unprivileged user, not under the LaunchDaemon account",
+      "os": "macOS",
+      "runs_as": "agent daemon (root under the shipped LaunchDaemon today, `docs/agent-privilege-model.md`)"
+    },
+    {
+      "grant": "None: the DMI attributes read are world-readable; the root-only `product_serial` and `product_uuid` are never read",
+      "if_refused": "`CONSTRAINED` / partial with `linux:virtualization:<source>:<cause>` and the kind `unknown` (or the kind another source already established), never `bare_metal`",
+      "measured": "Not measured yet: the Linux capture is taken inside a WSL2 distribution (a Hyper-V guest) and replaces this cell",
+      "os": "Linux",
+      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
+    }
+  ],
+  "readme": "agents/plugins/virtualization/README.md",
+  "result_status": [
+    {
+      "completeness": "full",
+      "provenance": "(empty)",
+      "status": "`OK`",
+      "when": "every consulted source was read and the kind is established, or the container row is `unknown` by declaration (Windows: `windows:virtualization:container:not_read`) or by classification (`linux:virtualization:container:cgroup_root_opaque`); both appear on the container row only, never in the status provenance"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:dmi:<cause>`, `linux:virtualization:sys_hypervisor:<cause>`, `linux:virtualization:cpuinfo:<cause>`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: a DMI attribute, `/sys/hypervisor/type` or `/proc/cpuinfo` could not be read. `<cause>` is `permission_denied`, `eio`, `eloop`, `enotdir`, `einval`, `not_regular`, `oversized` or `errno_<n>`; a missing file (ENOENT) is a definitive absence, not a failure"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:cpuid:unavailable`, `macos:virtualization:cpuid:unavailable`, `windows:virtualization:cpuid:unavailable`",
+      "status": "`CONSTRAINED`",
+      "when": "No CPUID on this architecture (ARM) and nothing else supplied a readable \"not virtual\" answer, so the kind is `unknown`; not added when SMBIOS or a hint identifies the machine, nor on macOS when the sysctl answers"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:container:markers_<cause>`, `linux:virtualization:container:cgroup_<cause>`, `linux:virtualization:container:cgroup_not_read`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: a container marker probe or `/proc/self/cgroup` could not be read; the container row is `unknown` unless a marker already answered"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`macos:virtualization:hv_vmm_present:unreadable`, `macos:virtualization:hw_model:unreadable`",
+      "status": "`CONSTRAINED`",
+      "when": "macOS: a sysctl could not be read; the kind is `unknown`"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`windows:virtualization:smbios:truncated`, `windows:virtualization:smbios:malformed`, `windows:virtualization:smbios:call_failed`, `windows:virtualization:smbios:oversized`, `windows:virtualization:smbios:size_race`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows: the SMBIOS table walk stopped at a framing fault, the Type 1 structure was malformed, or the firmware-table read failed. A Type 1 decoded before a later fault still identifies a VM vendor"
+    },
+    {
+      "completeness": "unknown",
+      "provenance": "`windows:leg:exception` / `linux:leg:exception` / `macos:leg:exception`",
+      "status": "`UNAVAILABLE`",
+      "when": "a leg threw: an `unsupported` status row, reported instead of unwinding across the plugin boundary"
+    }
+  ],
+  "samples": {
+    "macos": {
+      "actions": [
+        {
+          "action": "host",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|host|supported|-",
+            "host|no|bare_metal|Apple Inc.|Mac16,10|sysctl|high",
+            "container|no|macos:no_container_runtime"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-11-06",
+        "host_class": "bare-metal",
+        "leg_hash": "a297f9e5030a",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "host",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp"
+    ],
+    "changelog": [
+      "changelog.d/pr12-1a-virtualization-host.added.md"
+    ],
+    "definitions": [
+      "content/definitions/virtualization.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/virtualization/src/virtualization_legs.hpp",
+      "agents/plugins/virtualization/src/virtualization_linux.cpp",
+      "agents/plugins/virtualization/src/virtualization_macos.cpp",
+      "agents/plugins/virtualization/src/virtualization_parsers.hpp",
+      "agents/plugins/virtualization/src/virtualization_plugin.cpp",
+      "agents/plugins/virtualization/src/virtualization_win.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/test_virtualization_definition.py",
+      "tests/unit/test_virtualization_local_dispatcher.cpp",
+      "tests/unit/test_virtualization_parsers.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `host` is also a gathered definition (`crossplatform.virtualization.host`, 3600s TTL).",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics.",
+    "**Sensitivity.** The rows describe the device, not a person: no account, hostname, serial number, UUID or MAC address is read or emitted. The SMBIOS manufacturer and product (or the macOS model) and the hypervisor vendor can identify the hardware or cloud provider of a device. The container evidence is a marker path or a runtime name, never a container or pod identifier.",
+    "**Siblings:** `hardware` (manufacturer, model and serials of the machine) and `device_identity`; this plugin only says whether that machine is virtual."
+  ]
+}

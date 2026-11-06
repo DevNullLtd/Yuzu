@@ -1,0 +1,116 @@
+## Virtualization Definitions
+## Reports whether the device is a virtual machine, which hypervisor, and whether the agent
+## itself runs in a container, as facts only: nothing is enforced, changed or fetched.
+## Plugin: virtualization | Actions: host
+##
+## Sources by platform (no subprocess on any):
+##   Linux:   CPUID (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type,
+##            the /proc/cpuinfo hypervisor flag, /.dockerenv, /run/.containerenv and the
+##            agent's own /proc/self/cgroup.
+##   macOS:   sysctl kern.hv_vmm_present and hw.model.
+##   Windows: CPUID (x86) and the SMBIOS System Information table (GetSystemFirmwareTable RSMB).
+##
+## A Windows machine running Hyper-V, VBS or WSL2 sets the CPUID hypervisor bit but is the HOST:
+## the Hyper-V root-partition bit separates it from a guest (kind host_with_hypervisor,
+## is_virtual no). An unreadable source never reads as bare metal: the kind is `unknown` and the
+## host row's source field carries the reason.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.virtualization.host
+  displayName: Virtualization Host
+  version: 1.0.0
+  description: >
+    Reports whether this device is a virtual machine, which hypervisor it runs under and whether
+    the agent itself runs in a container, as facts only. The kind separates a guest from a
+    Windows host that merely runs Hyper-V, VBS or WSL2 (host_with_hypervisor), and from bare
+    metal. A source that could not be read never reads as bare metal: the kind is unknown and the
+    reason is on the status row and in the host row's source field. A leading status row states
+    whether the read was complete. Windows does not read container membership.
+  tags: [inventory, virtualization, hypervisor, container, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: virtualization
+    action: host
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
+    # comes first.
+    #
+    #   status|host|<supported|constrained|unsupported>|<reason or ->
+    #   host|<yes|no|unknown>|<guest|host_with_hypervisor|bare_metal|unknown>|<vendor>|<product>|<source>|<high|medium|low>
+    #   container|<yes|no|unknown>|<evidence or reason>
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, host, container]
+        description: 'Row shape discriminator (field 0). Values: status, host, container.'
+        example: host
+        platforms: [windows, linux, darwin]
+      - name: field_1
+        type: string
+        description: 'status: the literal "host". host: is_virtual, yes (a guest), no (bare metal or a host running a hypervisor) or unknown. container: yes, no or unknown (is the agent itself in a container).'
+        example: 'no'
+        platforms: [windows, linux, darwin]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (a leg that threw). host: kind, guest, host_with_hypervisor (a Windows host running Hyper-V, VBS or WSL2), bare_metal or unknown. container: the evidence (/.dockerenv, /run/.containerenv, cgroup:<runtime>, linux:no_container_marker, macos:no_container_runtime) or, for unknown, the reason (linux:virtualization:container:cgroup_root_opaque for a cgroup-v2 namespace that hides the answer, windows:virtualization:container:not_read on Windows).'
+        example: bare_metal
+        values: [supported, constrained, unsupported, guest, host_with_hypervisor, bare_metal, unknown]
+        platforms: [windows, linux, darwin]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:virtualization:dmi:permission_denied, linux:virtualization:cpuid:unavailable, windows:virtualization:smbios:truncated, macos:virtualization:hw_model:unreadable, linux:leg:exception. host: the hypervisor vendor (kvm, hyperv, vmware, xen, virtualbox, parallels, bhyve, qemu, acrn, aws, gce, alibaba, openstack, nutanix, apple or other) for a guest or host_with_hypervisor, the hardware manufacturer for bare_metal and unknown, "-" when not read.'
+        example: Apple Inc.
+        platforms: [windows, linux, darwin]
+      - name: field_4
+        type: string
+        description: 'host: the SMBIOS product name or macOS hw.model, "-" when not read. Not used by the other kinds.'
+        example: Mac16,10
+        platforms: [windows, linux, darwin]
+      - name: field_5
+        type: string
+        description: 'host: the evidence source that decided the kind (cpuid, smbios, sysctl, sys_hypervisor or cpuinfo); when the kind is unknown, the joined reason tokens instead. Not used by the other kinds.'
+        example: sysctl
+        platforms: [windows, linux, darwin]
+      - name: field_6
+        type: string
+        description: 'host: confidence, high, medium or low (an unknown is low). Not used by the other kinds.'
+        example: high
+        values: [high, medium, low]
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Report virtualization facts"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [virtualization]
+
+status:
+  phase: active

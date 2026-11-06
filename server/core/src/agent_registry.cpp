@@ -931,6 +931,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "through NetShareEnum (name, path, kind and flags only), macOS reads the share points "
          "recorded by sharing -l -f json plus /etc/exports as written (not live smbd/nfsd "
          "state); read-only"},
+        {"virtualization.host",
+         "Virtualization facts: whether this device is a VM (guest), a Windows host running "
+         "Hyper-V/VBS/WSL2 (host_with_hypervisor, not a guest), or bare metal; which hypervisor; "
+         "and whether the agent itself runs in a container. CPUID, DMI/SMBIOS, sysctl and cgroup "
+         "reads only; an unreadable source reads unknown with a reason, never bare_metal; "
+         "read-only, no subprocess"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
