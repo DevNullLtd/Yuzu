@@ -19,16 +19,25 @@
 #include "baseline_store.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
+
+#include <format>
+#include <memory>
+#include <string>
+#include <vector>
 
 using yuzu::server::BaselineStore;
 using yuzu::server::GuaranteedStateEventQuery;
 using yuzu::server::GuaranteedStateEventRow;
 using yuzu::server::GuaranteedStateRuleRow;
 using yuzu::server::GuaranteedStateStore;
+using yuzu::server::GuardianReadFault;
 using yuzu::server::make_local_guardian_api;
 using yuzu::server::pg::PgPool;
 
@@ -86,6 +95,74 @@ GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
     e.timestamp = "2026-04-19T12:00:00Z";
     return e;
 }
+
+// ── #7217 helpers: raw rows, a deployed Baseline, and a table lock for the timeout arm ──
+
+constexpr const char* kGsSchema = "guaranteed_state_store";
+
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
+// A retained pending event with NO census row: written raw so nothing projects it.
+void raw_pending(const std::string& dsn, const std::string& agent, const std::string& rule) {
+    exec_sql(dsn, std::format("INSERT INTO {}.guaranteed_state_events (event_id, rule_id, agent_id, "
+                              "event_type, severity, timestamp, proj_key, projection_pending) "
+                              "VALUES ('up-{}-{}', '{}', '{}', 'guard.compliant', 'high', 't', 100, "
+                              "true)",
+                              kGsSchema, agent, rule, rule, agent));
+}
+
+// The census row a repair would have written for the pair (idempotent).
+void raw_census(const std::string& dsn, const std::string& agent, const std::string& rule) {
+    exec_sql(dsn, std::format("INSERT INTO {}.guardian_agent_rule_status (agent_id, rule_id, state, "
+                              "updated_at) VALUES ('{}', '{}', 'compliant', 't') "
+                              "ON CONFLICT (agent_id, rule_id) DO NOTHING",
+                              kGsSchema, agent, rule));
+}
+
+// Create a deployed Baseline whose snapshot is exactly `member_rule_ids`.
+void make_deployed_baseline(BaselineStore& baseline_store, const std::string& name,
+                            const std::vector<std::string>& member_rule_ids) {
+    yuzu::server::Baseline b;
+    b.name = name;
+    auto bid = baseline_store.create_baseline(b);
+    REQUIRE(bid.has_value());
+    REQUIRE(baseline_store.set_members(*bid, member_rule_ids).has_value());
+    auto deployed = *baseline_store.get_baseline(*bid);
+    std::string snap = "[";
+    for (std::size_t i = 0; i < member_rule_ids.size(); ++i)
+        snap += (i ? ",\"" : "\"") + member_rule_ids[i] + "\"";
+    snap += "]";
+    deployed.deployed_snapshot = snap;
+    deployed.lifecycle = yuzu::server::kBaselineDeployed;
+    REQUIRE(baseline_store.update_baseline(deployed).has_value());
+}
+
+// Holds ACCESS EXCLUSIVE on the events table from a separate connection until destroyed (closing
+// the connection rolls the transaction back), so a read of that table blocks until its statement
+// timeout fires (SQLSTATE 57014).
+class EventsTableLock {
+public:
+    explicit EventsTableLock(const std::string& dsn)
+        : conn_{PQconnectdb(dsn.c_str())} {
+        REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
+        run("BEGIN");
+        run(std::format("LOCK TABLE {}.guaranteed_state_events IN ACCESS EXCLUSIVE MODE", kGsSchema));
+    }
+
+private:
+    void run(const std::string& sql) {
+        yuzu::server::pg::PgResult r{PQexec(conn_.get(), sql.c_str())};
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+    }
+    yuzu::server::pg::PgConn conn_;
+};
 
 } // namespace
 
@@ -168,7 +245,9 @@ TEST_CASE("GuardianApi::agent_status / device_guards: an agent with no census ro
     REQUIRE(agent_status.has_value());
     CHECK(agent_status->total_rules == 0);
 
-    auto guards = api->device_guards("no-such-agent");
+    GuardianReadFault fault = GuardianReadFault::kTransient; // non-default: a no-op wrap cannot fake kNone
+    auto guards = api->device_guards("no-such-agent", &fault);
+    CHECK(fault == GuardianReadFault::kNone);
     REQUIRE(guards.has_value());
     CHECK(guards->guards.empty());
     CHECK(guards->unrepresented_pending_guards == 0);
@@ -205,10 +284,12 @@ TEST_CASE("GuardianApi::device_compliance: an unknown baseline name is a genuine
 
     bool store_degraded = true; // pre-seed non-default so a no-op wrap can't fake false
     bool pii_access_began = true;
+    GuardianReadFault fault = GuardianReadFault::kTransient;
     auto rollup = api->device_compliance("No Such Baseline", "agent-1", &store_degraded,
-                                         &pii_access_began);
+                                         &pii_access_began, &fault);
     CHECK_FALSE(rollup.has_value());
     CHECK_FALSE(store_degraded);
+    CHECK(fault == GuardianReadFault::kNone); // a genuine miss is not a fault of any kind
 }
 
 TEST_CASE("GuardianApi::list_events: forwards an empty, plain-vector, non-optional result — the "
@@ -271,16 +352,20 @@ TEST_CASE("GuardianApi: a null baseline_store degrades ONLY device_compliance �
     CHECK(api->status(std::nullopt).has_value());
     CHECK(api->agent_status("agent-1").has_value());
     CHECK(api->rule_status("rule-1").has_value());
-    CHECK(api->device_guards("agent-1").has_value());
+    GuardianReadFault guards_fault = GuardianReadFault::kTransient;
+    CHECK(api->device_guards("agent-1", &guards_fault).has_value());
+    CHECK(guards_fault == GuardianReadFault::kNone);
     CHECK(api->list_events(GuaranteedStateEventQuery{}).size() == 1);
 
     bool store_degraded = false;
     bool pii_access_began = true; // pre-seed non-default so a no-op wrap can't fake false
+    GuardianReadFault fault = GuardianReadFault::kNone;
     auto rollup = api->device_compliance("Any Baseline", "agent-1", &store_degraded,
-                                         &pii_access_began);
+                                         &pii_access_began, &fault);
     CHECK_FALSE(rollup.has_value());
     CHECK(store_degraded);
     CHECK_FALSE(pii_access_began);
+    CHECK(fault == GuardianReadFault::kTransient);
 }
 
 TEST_CASE("GuardianApi: a null guaranteed_state_store degrades every method to its own "
@@ -293,15 +378,19 @@ TEST_CASE("GuardianApi: a null guaranteed_state_store degrades every method to i
     CHECK_FALSE(api->status(std::nullopt).has_value());
     CHECK_FALSE(api->agent_status("any").has_value());
     CHECK_FALSE(api->rule_status("any").has_value());
-    CHECK_FALSE(api->device_guards("any").has_value());
+    GuardianReadFault fault = GuardianReadFault::kNone;
+    CHECK_FALSE(api->device_guards("any", &fault).has_value());
+    CHECK(fault == GuardianReadFault::kTransient);
     CHECK(api->list_events(GuaranteedStateEventQuery{}).empty());
 
     bool store_degraded = false;
     bool pii_access_began = true;
-    CHECK_FALSE(api->device_compliance("any", "any", &store_degraded, &pii_access_began)
+    fault = GuardianReadFault::kNone;
+    CHECK_FALSE(api->device_compliance("any", "any", &store_degraded, &pii_access_began, &fault)
                     .has_value());
     CHECK(store_degraded);
     CHECK_FALSE(pii_access_began);
+    CHECK(fault == GuardianReadFault::kTransient);
 }
 
 TEST_CASE("GuardianApi: a null guaranteed_state_store with a LIVE baseline_store still degrades "
@@ -315,9 +404,152 @@ TEST_CASE("GuardianApi: a null guaranteed_state_store with a LIVE baseline_store
 
     bool store_degraded = false;
     bool pii_access_began = true; // pre-seed non-default so a no-op wrap can't fake false
+    GuardianReadFault fault = GuardianReadFault::kNone;
     auto rollup = api->device_compliance("Any Baseline", "agent-1", &store_degraded,
-                                         &pii_access_began);
+                                         &pii_access_began, &fault);
     CHECK_FALSE(rollup.has_value());
     CHECK(store_degraded);
     CHECK_FALSE(pii_access_began);
+    CHECK(fault == GuardianReadFault::kTransient);
+}
+
+// ── #7217: read order and degrade kinds ──────────────────────────────────────
+
+// The unrepresented read is issued BEFORE the census read (SG-F3 / UP-4). The fault seam fires at
+// the start of the unrepresented read, so a side effect there that writes the pair's census row
+// lands between "before the unrepresented read" and "before the census read" only if the census
+// read comes AFTER it: census-first would read no row, then the repair would make the pair
+// represented, and the pair would be in NEITHER category.
+TEST_CASE("GuardianApi::device_guards: the unrepresented read precedes the census read, so a pair "
+          "repaired in between is in guards[] and never in neither",
+          "[pg][guardian_api][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    raw_pending(gs_db.dsn(), "agent-1", "r1");
+    const std::string dsn = gs_db.dsn();
+    store.set_unrepresented_pending_fault_for_test([dsn] {
+        raw_census(dsn, "agent-1", "r1"); // the repair
+        return false;                      // not a fault: the read proceeds
+    });
+    auto api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
+
+    GuardianReadFault fault = GuardianReadFault::kTransient;
+    auto report = api->device_guards("agent-1", &fault);
+    REQUIRE(report.has_value());
+    CHECK(fault == GuardianReadFault::kNone);
+    REQUIRE(report->guards.size() == 1);
+    CHECK(report->guards[0].rule_id == "r1");
+    CHECK(report->unrepresented_pending_guards == 0); // the pair is now represented
+    CHECK(report->unrepresented_pending_rule_ids.empty());
+}
+
+TEST_CASE("GuardianApi::device_compliance: the unrepresented read precedes the census read, so a "
+          "pair repaired in between is in guards[] and never in neither",
+          "[pg][guardian_api][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, baselinestore_tpl);
+    PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 2}};
+    BaselineStore baseline_store{bl_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    make_deployed_baseline(baseline_store, "B", {"r1"});
+    raw_pending(gs_db.dsn(), "agent-1", "r1");
+    const std::string dsn = gs_db.dsn();
+    store.set_unrepresented_pending_fault_for_test([dsn] {
+        raw_census(dsn, "agent-1", "r1");
+        return false;
+    });
+    auto api = make_local_guardian_api(&store, &baseline_store);
+
+    bool store_degraded = true;
+    bool pii_access_began = false;
+    GuardianReadFault fault = GuardianReadFault::kTransient;
+    auto rollup = api->device_compliance("B", "agent-1", &store_degraded, &pii_access_began, &fault);
+    REQUIRE(rollup.has_value());
+    CHECK_FALSE(store_degraded);
+    CHECK(fault == GuardianReadFault::kNone);
+    CHECK(rollup->total_guards == 1);
+    REQUIRE(rollup->guards.size() == 1);
+    CHECK(rollup->guards[0].rule_id == "r1");
+    CHECK(rollup->unrepresented_pending_guards == 0);
+}
+
+TEST_CASE("GuardianApi: a failed unrepresented read is kTransient on both reads, and the compliance "
+          "audit obligation (pii_access_began) is unchanged",
+          "[pg][guardian_api][fault]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, baselinestore_tpl);
+    PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 2}};
+    BaselineStore baseline_store{bl_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    make_deployed_baseline(baseline_store, "B", {"r1"});
+    store.set_unrepresented_pending_fault_for_test([] { return true; });
+    auto api = make_local_guardian_api(&store, &baseline_store);
+
+    GuardianReadFault fault = GuardianReadFault::kNone;
+    CHECK_FALSE(api->device_guards("agent-1", &fault).has_value());
+    CHECK(fault == GuardianReadFault::kTransient);
+
+    bool store_degraded = false;
+    bool pii_access_began = false;
+    fault = GuardianReadFault::kNone;
+    CHECK_FALSE(api->device_compliance("B", "agent-1", &store_degraded, &pii_access_began, &fault)
+                    .has_value());
+    CHECK(store_degraded);
+    CHECK(pii_access_began); // the Baseline was found before the failed read: audit "failure"
+    CHECK(fault == GuardianReadFault::kTransient);
+
+    // A null fault pointer is tolerated (the degrade is still reported through the other signals).
+    CHECK_FALSE(api->device_guards("agent-1", nullptr).has_value());
+    store_degraded = false;
+    CHECK_FALSE(
+        api->device_compliance("B", "agent-1", &store_degraded, &pii_access_began, nullptr)
+            .has_value());
+    CHECK(store_degraded);
+}
+
+// SQLSTATE 57014 end to end through the model and the seam: the table lock holds the read past a
+// 50 ms budget. The lock is released afterwards and the same store answers a follow-up read, so the
+// timeout leaves the pool intact.
+TEST_CASE("GuardianApi: a statement timeout of the unrepresented read is kStatementTimeout on both "
+          "reads, then the store recovers",
+          "[pg][guardian_api][fault][timeout]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, baselinestore_tpl);
+    PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 2}};
+    BaselineStore baseline_store{bl_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    make_deployed_baseline(baseline_store, "B", {"r1"});
+    store.set_unrepresented_pending_timeout_ms_for_test(50);
+    auto api = make_local_guardian_api(&store, &baseline_store);
+
+    {
+        EventsTableLock lock{gs_db.dsn()};
+
+        GuardianReadFault fault = GuardianReadFault::kNone;
+        CHECK_FALSE(api->device_guards("agent-1", &fault).has_value());
+        CHECK(fault == GuardianReadFault::kStatementTimeout);
+
+        bool store_degraded = false;
+        bool pii_access_began = false;
+        fault = GuardianReadFault::kNone;
+        CHECK_FALSE(
+            api->device_compliance("B", "agent-1", &store_degraded, &pii_access_began, &fault)
+                .has_value());
+        CHECK(store_degraded);
+        CHECK(pii_access_began);
+        CHECK(fault == GuardianReadFault::kStatementTimeout);
+    } // lock released
+
+    GuardianReadFault fault = GuardianReadFault::kTransient;
+    auto report = api->device_guards("agent-1", &fault);
+    REQUIRE(report.has_value());
+    CHECK(fault == GuardianReadFault::kNone);
 }

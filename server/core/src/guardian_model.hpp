@@ -21,7 +21,7 @@
 /// mechanical (list the struct's own fields) and low-risk compared to the
 /// query/computation logic these functions centralise.
 ///
-/// All four functions return `std::optional`/`nullopt` on a degraded store
+/// All of these functions return `std::optional`/`nullopt` on a degraded store
 /// read (ADR-0038 catastrophic-read set) — the caller MUST 503 (REST) or
 /// otherwise refuse to render, never render an empty/zero result that would
 /// misreport the fleet as compliant or a rule as having no reporting agents.
@@ -126,55 +126,80 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
 /// no census row, `unrepresented_pending_for_agent`, #7217) as a count plus a
 /// capped id list, separate from `guards`.
 ///
+/// Three reads, issued in this order: `unrepresented_pending_for_agent`, then
+/// `agent_rule_statuses_for_agent`, then `rule_names_for`. The unrepresented read goes FIRST
+/// (#7217 SG-F3 / UP-4): a pair repaired between the two reads can then only appear in BOTH
+/// categories (a harmless over-report), never in neither. The reads are NOT one atomic snapshot:
+/// a pair may appear both in `guards` and in the unrepresented list for one request after a
+/// concurrent repair, and the counts are exact per read, not a joint snapshot.
+///
 /// Returns `nullopt` on a degraded `agent_rule_statuses_for_agent()`/
 /// `rule_names_for()`/`unrepresented_pending_for_agent()` read — caller MUST
 /// refuse to render (503 on REST), never render an empty list as "this device
-/// has no guards".
+/// has no guards". `fault` (may be null) is set to `kNone` on entry and, on a
+/// `nullopt` return, to `kStatementTimeout` when the unrepresented read ran past its time budget
+/// (SQLSTATE 57014, a retained-backlog cause a retry does not fix) or `kTransient` for every other
+/// degrade.
 std::optional<GuardianDeviceGuardsReport>
-guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id);
+guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id,
+                           GuardianReadFault* fault);
 
 /// Per-baseline device-compliance rollup — shared by
 /// `GET /api/v1/guaranteed-state/device-compliance` and MCP
 /// `get_guardian_device_compliance` (#2146 Batch B1, extracted post-review).
-/// Both twins previously ran this same four-read sequence (baseline lookup,
+/// Both twins previously ran a four-read sequence (baseline lookup,
 /// deployed_member_rule_ids, rule_names_for, agent_rule_statuses_for_agent)
 /// inline, and both audited "success"/"not_found" right after the FIRST read
-/// only — a degrade in any of the other three then produced a 503 the audit
-/// row had already called "success". Aggregating all four reads here, behind
+/// only — a degrade in any of the other reads then produced a 503 the audit
+/// row had already called "success". #7217 added a fifth read,
+/// `unrepresented_pending_for_agent`. Aggregating all five reads here, behind
 /// one nullopt/`store_degraded` contract, means a caller can only audit once
 /// every read has actually completed.
 ///
+/// Read order: baseline lookup, `deployed_member_rule_ids`, `unrepresented_pending_for_agent`,
+/// `rule_names_for`, then `agent_rule_statuses_for_agent` LAST. The unrepresented read precedes
+/// the census read on purpose (#7217 SG-F3 / UP-4): a pair repaired between the two can then only
+/// appear in BOTH categories (a harmless over-report), never in neither. The reads are not one
+/// atomic snapshot: a pair may appear both in `guards` and in the unrepresented list for one
+/// request after a concurrent repair; counts are exact per read, not a joint snapshot.
+///
 /// `store_degraded` is a REQUIRED out-param, same contract as
 /// `BaselineStore::get_baseline_by_name`'s own `store_ok`: set true the
-/// moment ANY of the four underlying reads degrades, at which point the
+/// moment ANY of the five underlying reads degrades, at which point the
 /// return is always `nullopt` and the caller MUST refuse to render (503),
 /// never treat it as "baseline not found". `nullopt` with `*store_degraded
 /// == false` means the named baseline genuinely does not exist (400/404) -
 /// a real miss, not a fault. A degraded read must never render as a silent
 /// 0/compliant result (ADR-0038/ADR-0055 catastrophic-read set) - this
-/// function's whole job is making that the only way to call these four
+/// function's whole job is making that the only way to call these five
 /// reads.
 ///
 /// `pii_access_began` is a SECOND required out-param distinguishing WHICH
 /// read degraded, because the audit obligation differs: the baseline lookup
 /// (read 1) is genuinely pre-audit (no per-agent PII has been touched yet,
 /// same "no PII was looked up yet" posture this route has always had), but
-/// the remaining three reads only run once a real baseline was found - the
+/// the remaining four reads only run once a real baseline was found - the
 /// baseline itself being found already counts as having begun accessing
 /// this agent's per-baseline standing (`deployed_member_rule_ids`, read 2,
-/// derives the enforced set for it), and by the time reads 3/4 run,
-/// `agent_rule_statuses_for_agent` (the behavioral-PII read proper) has
-/// already executed too - so a degrade in ANY of reads 2/3/4 MUST still be
+/// derives the enforced set for it, and `pii_access_began` is set before any
+/// of the later reads), and the per-agent reads (the behavioral-PII reads
+/// proper) follow - so a degrade in ANY of reads 2-5 MUST still be
 /// audited as "failure" (matching `guardian_agent_status_rollup`'s sibling
 /// posture - over-audit rather than silently drop evidence of a completed
 /// PII access). Set false only when `*store_degraded` is also false, or when
 /// the degrade was the baseline lookup itself; true for any degrade in the
-/// remaining three reads. The caller must audit "failure" when
+/// remaining four reads. The caller must audit "failure" when
 /// `*store_degraded && *pii_access_began`, and skip the audit entirely only
 /// when `*store_degraded && !*pii_access_began`.
+///
+/// `fault` (may be null) is set to `kNone` on entry and, whenever `*store_degraded` is set, to
+/// `kStatementTimeout` when the unrepresented-pending read ran past its time budget (SQLSTATE
+/// 57014: a retained pending backlog, which a retry does not fix) or `kTransient` for every other
+/// degrade, including the baseline-store reads.
 std::optional<GuardianDeviceComplianceRollup>
 guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
                                   const std::string& baseline_name, const std::string& agent_id,
-                                  bool* store_degraded, bool* pii_access_began);
+                                  bool* store_degraded, bool* pii_access_began,
+                                  GuardianReadFault* fault);
 
 } // namespace yuzu::server

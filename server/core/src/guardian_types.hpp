@@ -226,6 +226,15 @@ struct GuardianDeviceComplianceRollup {
     std::vector<std::string> unrepresented_pending_rule_ids;
 };
 
+/// Why a per-device Guardian read could not answer (#7217). Reported through the `fault` out-parameter
+/// of `GuardianApi::device_guards` / `device_compliance` alongside the existing degrade signal (a
+/// `nullopt` result, and `*store_degraded` on compliance). `kTransient` means a retry can succeed
+/// (store not open, pool timeout, a failed statement). `kStatementTimeout` means the unrepresented
+/// pending read exceeded its time budget (SQLSTATE 57014): the cause is the size of the retained
+/// pending backlog, so retrying the same request fails identically until the backlog shrinks and
+/// the transports must NOT advertise a retry interval. `kNone` is the value when the read answered.
+enum class GuardianReadFault : std::uint8_t { kNone = 0, kTransient, kStatementTimeout };
+
 /// Per-device all-guards report - the rows of `GuardianDeviceGuardRow` plus the unrepresented
 /// pending summary. Shared by `GET /api/v1/guaranteed-state/agents/{agent_id}/rules` and MCP
 /// `get_guardian_device_guards`.

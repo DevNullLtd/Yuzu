@@ -1678,11 +1678,16 @@ static const ToolDef kTools[] = {
      "pair with a census row); a pair for which this device holds retained projection-pending "
      "census evidence but no census row yet is not a guard and appears only as "
      "unrepresented_pending_guards (exact count, any rule) and unrepresented_pending_rule_ids "
-     "(first 50 in sorted order; a count above the list length means truncation; an id may name "
-     "a rule no longer in the catalogue; names are not resolved). total_guards is the length of "
+     "(first 50 in ascending byte order of the rule id; a count above the list length means "
+     "truncation; an id is an agent-reported identifier that may not correspond to any rule and "
+     "may be long; names are not resolved). A nonzero count with an empty guards[] means evidence "
+     "exists that has not reached the census. total_guards is the length of "
      "guards[] and excludes them. The census read and that evidence read are two separate "
-     "non-atomic observations; a zero count or false flag establishes neither freshness nor "
-     "completeness. Per-device scoped (management-group aware) via the same "
+     "non-atomic observations (a pair may appear in both guards[] and the unrepresented list); a "
+     "zero count or false flag establishes neither freshness nor "
+     "completeness. A pending-evidence read that times out answers a non-retryable error (no "
+     "retry hint): the cause is a large retained pending backlog. Per-device scoped "
+     "(management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids"]})j"},
@@ -1875,14 +1880,18 @@ static const ToolDef kTools[] = {
      "event for the pair is not yet reflected in the row); uncertain_guards counts emitted "
      "guards with either flag, each once, and overlaps the verdict counts. A true flag means "
      "do not report the guard as settled. unrepresented_pending_guards (exact) and "
-     "unrepresented_pending_rule_ids (first 50 sorted; a larger count means truncation; an id "
-     "may name a rule no longer in the catalogue) report deployed-snapshot members for which "
+     "unrepresented_pending_rule_ids (first 50 in ascending byte order; a larger count means "
+     "truncation; an id is an agent-reported identifier that may not correspond to any rule) "
+     "report deployed-snapshot members for which "
      "this device holds retained projection-pending census evidence but no census row yet: "
      "excluded from guards[], total_guards and every verdict count. A nonzero unrepresented "
      "count with assessable false means evidence exists that has not reached the census. The "
-     "census read and that evidence read are two separate non-atomic observations; last_updated "
+     "census read and that evidence read are two separate non-atomic observations (a pair may "
+     "appear in both guards[] and the unrepresented list); last_updated "
      "stays census-only; a zero count or false flag establishes neither freshness nor "
-     "completeness. get_guardian_device_guards lists every rule of the device, not limited to "
+     "completeness. A pending-evidence read that times out answers a non-retryable error (no "
+     "retry hint): the cause is a large retained pending backlog. "
+     "get_guardian_device_guards lists every rule of the device, not limited to "
      "this Baseline.",
      R"j({"type":"object","properties":{)j"
      R"j("baseline":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline name (stable across reseeds, unlike baseline_id)"},)j"
@@ -16586,8 +16595,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards.
-                auto rows = guardian_api_->device_guards(agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards. `fault` says
+                // WHY a failed read failed (#7217): a pending-evidence statement timeout is
+                // deterministic for a given backlog and must not advertise a retry.
+                GuardianReadFault fault = GuardianReadFault::kNone;
+                auto rows = guardian_api_->device_guards(agent_id, &fault);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/agents/{agent_id}/rules and the
                 // dashboard Guardian device lens. MCP set-and-proceed
@@ -16597,9 +16609,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "guardian.device.view", rows ? "success" : "failure", "Agent",
                     agent_id, "per-device all-guards view via MCP");
                 if (!rows) {
+                    if (fault == GuardianReadFault::kStatementTimeout) {
+                        // Not transient: the pending-evidence read timed out because of the
+                        // size of the retained pending backlog, so a retry fails identically.
+                        // The failure audit above was written exactly as for any degrade; a
+                        // dropped row is signalled with audit_persisted:false.
+                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, audit_ok), "application/json"); // retry-hint-exempt: deterministic statement timeout (SQLSTATE 57014), a retry fails identically until the retained pending backlog shrinks
+                        return;
+                    }
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
                         "application/json");
                     return;
                 }
@@ -17750,18 +17770,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #2146 Batch B1 review fix: all four underlying reads (baseline
-                // lookup, deployed_member_rule_ids, rule_names_for,
-                // agent_rule_statuses_for_agent) now complete BEFORE the audit
-                // fires below - the prior inline version audited "success" right
-                // after the first read, so a degrade in any of the other three
-                // still surfaced a 500 the audit had already called successful.
+                // #2146 Batch B1 review fix: all five underlying reads (baseline
+                // lookup, deployed_member_rule_ids, unrepresented_pending_for_agent,
+                // rule_names_for, agent_rule_statuses_for_agent) now
+                // complete BEFORE the audit fires below - the prior inline version
+                // audited "success" right after the first read, so a degrade in any
+                // of the other reads still surfaced a 500 the audit had already
+                // called successful. The unrepresented-pending and census reads are
+                // separate non-atomic observations (#7217): a pair repaired between
+                // them may appear both in guards[] and in the unrepresented list for
+                // one request, never in neither (the unrepresented read is issued
+                // first), and the counts are exact per read, not a joint snapshot.
                 // ADR-0031 WS-A4 (ninth family): GuardianApi::device_compliance
                 // wraps guardian_device_compliance_rollup verbatim.
                 bool store_degraded = false;
                 bool pii_access_began = false;
+                GuardianReadFault fault = GuardianReadFault::kNone;
                 auto rollup = guardian_api_->device_compliance(baseline_name, agent_id,
-                                                                &store_degraded, &pii_access_began);
+                                                                &store_degraded, &pii_access_began,
+                                                                &fault);
                 if (store_degraded) {
                     // Scoped re-review fix: a degrade in the baseline lookup itself is
                     // genuinely pre-PII (no audit owed, same posture as before), but a
@@ -17770,15 +17797,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     // still be audited as "failure", never silently dropped (a
                     // completed PII read leaving zero audit trail is worse than the
                     // mislabeled-"success" bug this whole extraction fixed).
+                    // MCP is set-and-proceed: the error is returned either way, and a dropped
+                    // failure-audit row is signalled with audit_persisted:false (UP-9).
+                    bool degrade_audit_ok = true;
                     if (pii_access_began) {
-                        (void)yuzu::server::detail::try_persist_audit(
+                        degrade_audit_ok = yuzu::server::detail::try_persist_audit(
                             audit_fn, req, "guardian.device.view", "failure", "Agent", agent_id,
                             "baseline '" + baseline_name +
                                 "' per-device guard status via MCP - store degraded");
                     }
+                    if (fault == GuardianReadFault::kStatementTimeout) {
+                        // Not transient (#7217): the pending-evidence read timed out because of
+                        // the size of the retained pending backlog, so a retry fails
+                        // identically.
+                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, degrade_audit_ok), "application/json"); // retry-hint-exempt: deterministic statement timeout (SQLSTATE 57014), a retry fails identically until the retained pending backlog shrinks
+                        return;
+                    }
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
+                                degrade_audit_ok),
                         "application/json");
                     return;
                 }

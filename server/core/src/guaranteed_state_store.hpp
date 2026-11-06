@@ -225,6 +225,17 @@ struct UnrepresentedPendingSummary {
     std::vector<std::string> rule_ids;
 };
 
+/// Why `unrepresented_pending_for_agent` failed (#7217). `kStatementTimeout` is SQLSTATE 57014: the
+/// read ran past its time budget because of the size of the retained pending backlog, so a retry
+/// fails identically until the backlog shrinks. Everything else (store not open, pool timeout,
+/// BEGIN / SET LOCAL / query failure) is `kUnavailable` and is worth retrying.
+enum class UnrepresentedPendingFault { kUnavailable, kStatementTimeout };
+
+struct UnrepresentedPendingError {
+    UnrepresentedPendingFault kind{UnrepresentedPendingFault::kUnavailable};
+    std::string message;
+};
+
 class GuaranteedStateStore {
 public:
     /// Borrows the shared pool and runs the `guaranteed_state_store` schema
@@ -283,6 +294,13 @@ public:
     /// concurrently; clear it with an empty function. Production leaves it empty.
     void set_unrepresented_pending_fault_for_test(std::function<bool()> fn) {
         unrepresented_pending_fault_ = std::move(fn);
+    }
+
+    /// Test seam: the statement timeout `unrepresented_pending_for_agent` applies, in milliseconds
+    /// (default 5000). A test lowers it to reach SQLSTATE 57014 in well under a second instead of
+    /// waiting out the production budget. Set it while no read is in flight. Production never sets it.
+    void set_unrepresented_pending_timeout_ms_for_test(int ms) noexcept {
+        unrepresented_pending_timeout_ms_ = ms;
     }
 
     /// Test seam for the pre-commit health check: `fn` runs with the transaction's `PGconn*` (as
@@ -492,11 +510,15 @@ public:
     /// rule; engaged-empty = `{0, {}}` without a lease or a seam call; non-empty = only those
     /// rule ids (the Baseline-anchored form passes the deployed snapshot). `count` is the exact
     /// number of distinct qualifying rule ids; `rule_ids` the first `kUnrepresentedPendingIdCap` in
-    /// `rule_id` order. No live-rule join: a pending event can outlive its rule only through the
-    /// #6829 race, and that is exactly the evidence this read exists to disclose. Runs under a 5 s
-    /// `SET LOCAL statement_timeout`; any failure (store not open, pool timeout, timeout expiry,
-    /// query error) is `std::unexpected`, counted on `kDegradeSourceCensus`, NEVER a zero.
-    std::expected<UnrepresentedPendingSummary, std::string>
+    /// byte order of `rule_id` (`COLLATE "C"`, so the same ids on every cluster). No live-rule join:
+    /// a pending event can outlive its rule only through the #6829 race, and that is exactly the
+    /// evidence this read exists to disclose. Runs under a 5 s `SET LOCAL statement_timeout`. An
+    /// engaged-empty filter is answered without touching the store; every other failure (store not
+    /// open, pool timeout, BEGIN / SET LOCAL / query error, timeout expiry) is `std::unexpected`,
+    /// counted on the `guardian_census_device` degrade source, NEVER a zero. SQLSTATE 57014 is
+    /// `UnrepresentedPendingFault::kStatementTimeout` (reason `statement_timeout`): the retained
+    /// pending backlog is too large for the time budget, so a retry fails identically.
+    std::expected<UnrepresentedPendingSummary, UnrepresentedPendingError>
     unrepresented_pending_for_agent(const std::string& agent_id,
                                     const std::optional<std::vector<std::string>>& rule_filter) const;
 
@@ -612,6 +634,7 @@ private:
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
+    int unrepresented_pending_timeout_ms_{5000};         // test seam, 5000 in production
     std::function<void(void*)> pre_commit_hook_;    // test seam, empty in production
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;

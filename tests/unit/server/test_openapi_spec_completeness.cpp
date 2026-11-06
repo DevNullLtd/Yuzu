@@ -44,6 +44,7 @@
 #include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
 #include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
+#include "guaranteed_state_store.hpp" // kUnrepresentedPendingIdCap: the cap the maxItems literals mirror
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -2219,7 +2220,8 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
             REQUIRE(props.contains("unrepresented_pending_rule_ids"));
             const json& ids = props["unrepresented_pending_rule_ids"];
             CHECK(ids.value("type", "") == "array");
-            CHECK(ids.value("maxItems", 0) == 50);
+            // The served literal is bound to the store's cap: a change to one without the other fails here.
+            CHECK(ids.value("maxItems", std::size_t{0}) == yuzu::server::kUnrepresentedPendingIdCap);
             CHECK(ids.value("uniqueItems", false));
             REQUIRE(ids.contains("items"));
             CHECK(ids["items"].value("type", "") == "string");
@@ -2263,6 +2265,22 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
         check_flags(gdata["properties"].at("guards").at("items"));
         CHECK(gget.value("description", "").find("unrepresented_pending_guards") !=
               std::string::npos);
+        // N3: the 200 description names the new keys, not only the old three.
+        const std::string g200 = gget.at("responses").at("200").value("description", "");
+        CHECK(g200.find("unrepresented_pending_guards") != std::string::npos);
+        CHECK(g200.find("unrepresented_pending_rule_ids") != std::string::npos);
+        // The pending-evidence statement timeout is documented as NOT retryable on both routes, with
+        // the metric that counts it; the ordinary degrade keeps its retryable text.
+        for (const json* route : {&cget, &gget}) {
+            const std::string r503 = route->at("responses").at("503").value("description", "");
+            INFO(r503);
+            CHECK(r503.find("NOT") != std::string::npos);
+            CHECK(r503.find("retry_after_ms is null") != std::string::npos);
+            CHECK(r503.find("guardian_census_device") != std::string::npos);
+            CHECK(r503.find("statement_timeout") != std::string::npos);
+            CHECK(route->value("description", "").find("ascending byte order") !=
+                  std::string::npos);
+        }
     }
 }
 

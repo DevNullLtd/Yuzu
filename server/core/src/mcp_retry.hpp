@@ -43,6 +43,21 @@ inline constexpr std::int64_t kMcpStoreFaultRetryMs = 5000;
 inline constexpr std::string_view kCryptoPoolTooSmallRemedy =
     "restart the server with a larger --postgres-pool-size; a retry fails identically until then";
 
+/// The remediation of a per-device Guardian read (device-compliance, all-guards; REST and MCP) whose
+/// pending-evidence read hit its statement timeout (SQLSTATE 57014, #7217): no retry hint, a retry
+/// fails identically because the cause is the size of the retained pending backlog. Shared by
+/// mcp_server.cpp and rest_api_v1.cpp so the two transports cannot drift on the wording.
+inline constexpr std::string_view kGuardianCensusDeviceTimeoutRemedy =
+    "do not retry in a loop: a retry fails identically until the retained pending backlog shrinks; "
+    "ask an administrator to inspect max(yuzu_server_guardian_census_pending_events) and "
+    "yuzu_server_guardian_read_degrade_total{source=\"guardian_census_device\","
+    "reason=\"statement_timeout\"}";
+
+/// The message paired with `kGuardianCensusDeviceTimeoutRemedy` on both transports.
+inline constexpr std::string_view kGuardianCensusDeviceTimeoutMessage =
+    "the pending-evidence read for this device exceeded its time budget because of a large "
+    "retained pending backlog; retrying the same request will not help until the backlog shrinks";
+
 /// `retry_after_ms` for the plugin-config / API-token rotation family (the
 /// ~20-site bare-`2000` family). Anchor: `rotate_api_token`'s existing
 /// "mirrors the REST twin's 503 + Retry-After: 2 posture" — the REST 503

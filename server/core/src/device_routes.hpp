@@ -181,8 +181,18 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
 
 /// PURE: the Guardian lens for one device — compliance summary + per-guard state.
 /// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
+///
+/// `unrepresented_pending` / `unrepresented_ids` are the device's retained pending events that
+/// have NO census row yet (#7217: the count is exact, the id list is capped by the store and the
+/// ids are agent-reported identifiers). When the count is above zero the lens renders a notice and
+/// NEVER the clean tile state: the tile uses the same warn tone and "ordering uncertain" wording as
+/// an order-uncertain guard, and an empty `guards` list is not rendered as "No guards evaluated"
+/// (the device has evidence the census does not show). Defaults of 0 / empty leave every earlier
+/// caller's output byte-identical.
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true,
+                                        std::int64_t unrepresented_pending = 0,
+                                        const std::vector<std::string>& unrepresented_ids = {});
 
 /// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
 /// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which

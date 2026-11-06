@@ -6795,7 +6795,7 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards denies an out-of-scope devic
         yuzu::server::test::FnGuardianApi::StatusFn{},
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
-        [&device_guards_calls](const std::string&)
+        [&device_guards_calls](const std::string&, GuardianReadFault*)
             -> std::optional<GuardianDeviceGuardsReport> {
             ++device_guards_calls;
             return GuardianDeviceGuardsReport{};
@@ -6851,7 +6851,7 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards hands the requested agent_id
         yuzu::server::test::FnGuardianApi::StatusFn{},
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
-        [&device_guards_calls, row](const std::string&)
+        [&device_guards_calls, row](const std::string&, GuardianReadFault*)
             -> std::optional<GuardianDeviceGuardsReport> {
             ++device_guards_calls;
             GuardianDeviceGuardsReport report;
@@ -6896,7 +6896,7 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards scope gate unwired -> fail c
         yuzu::server::test::FnGuardianApi::StatusFn{},
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
-        [&device_guards_calls](const std::string&)
+        [&device_guards_calls](const std::string&, GuardianReadFault*)
             -> std::optional<GuardianDeviceGuardsReport> {
             ++device_guards_calls;
             return GuardianDeviceGuardsReport{};
@@ -7987,7 +7987,8 @@ TEST_CASE("MCP get_guardian_device_guards (seam-bypass tripwire): answers via th
         yuzu::server::test::FnGuardianApi::StatusFn{},
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
-        [seam_row](const std::string&) -> std::optional<GuardianDeviceGuardsReport> {
+        [seam_row](const std::string&, GuardianReadFault*)
+            -> std::optional<GuardianDeviceGuardsReport> {
             GuardianDeviceGuardsReport report;
             report.guards = {seam_row};
             return report;
@@ -8037,7 +8038,8 @@ TEST_CASE("MCP get_guardian_device_compliance (seam-bypass tripwire): answers vi
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
         yuzu::server::test::FnGuardianApi::DeviceGuardsFn{},
         [seam_rollup](const std::string&, const std::string&, bool* store_degraded,
-                     bool* pii_access_began) -> std::optional<GuardianDeviceComplianceRollup> {
+                     bool* pii_access_began,
+                     GuardianReadFault*) -> std::optional<GuardianDeviceComplianceRollup> {
             *store_degraded = false;
             *pii_access_began = true;
             return seam_rollup;
@@ -45210,18 +45212,127 @@ TEST_CASE("MCP Guardian: the two per-device reads report ordering uncertainty an
     }
 }
 
+// ── #7217 fault-injection helpers (MCP) ──
+// McpTestServer::call() runs the handler synchronously on the test thread, so no httplib worker ever
+// reads a seam while a test mutates it. The seam is still installed BEFORE ts.start() and turned off
+// through an atomic flag (never by replacing the std::function), and its state is shared by value.
+namespace {
+
+struct McpPendingFaultSeam {
+    std::atomic<int> calls{0};
+    std::atomic<bool> fail{true};
+};
+
+std::shared_ptr<McpPendingFaultSeam> mcp_install_pending_fault(GuaranteedStateStore& store) {
+    auto seam = std::make_shared<McpPendingFaultSeam>();
+    store.set_unrepresented_pending_fault_for_test([seam] {
+        seam->calls.fetch_add(1);
+        return seam->fail.load();
+    });
+    return seam;
+}
+
+double mcp_degrade_count(yuzu::MetricsRegistry& m, const char* source, const char* reason) {
+    return m.counter("yuzu_server_guardian_read_degrade_total",
+                     {{"reason", reason}, {"source", source}})
+        .value();
+}
+
+long mcp_audits(const McpTestServer& ts, const char* action_result) {
+    return std::count(ts.audit_log.begin(), ts.audit_log.end(), action_result);
+}
+
+// Holds ACCESS EXCLUSIVE on the events table from a separate connection, so the unrepresented-pending
+// read blocks until its statement timeout (a real backlog-shaped failure, not an injected one).
+class McpEventsTableLock {
+public:
+    explicit McpEventsTableLock(const std::string& dsn) : conn_{PQconnectdb(dsn.c_str())} {
+        REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn_.get(),
+            "BEGIN; LOCK TABLE guaranteed_state_store.guaranteed_state_events IN ACCESS EXCLUSIVE "
+            "MODE")};
+        REQUIRE(r.ok());
+    }
+    McpEventsTableLock(const McpEventsTableLock&) = delete;
+    McpEventsTableLock& operator=(const McpEventsTableLock&) = delete;
+    void release() noexcept {
+        if (conn_) {
+            yuzu::server::pg::PgResult r{PQexec(conn_.get(), "ROLLBACK")};
+            conn_ = yuzu::server::pg::PgConn{};
+        }
+    }
+    ~McpEventsTableLock() { release(); }
+
+private:
+    yuzu::server::pg::PgConn conn_;
+};
+
+// The payload of a successful MCP tool call (audit_persisted is MCP-only, present only when the
+// audit row dropped, so it is erased before payloads are compared with the REST data).
+nlohmann::json mcp_ok_payload(McpTestServer& ts, const char* call) {
+    auto res = ts.call(call);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    data.erase("audit_persisted");
+    return data;
+}
+
+nlohmann::json rest_twin_data(GuardianRestTwin& rest, const char* url) {
+    auto res = rest.sink.Get(url);
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(res->status == 200);
+    return nlohmann::json::parse(res->body)["data"];
+}
+
+// A GuardianApi double whose per-device reads fail with `*mode` (0 = statement timeout, 1 = an
+// unnamed degrade, which the handlers treat as transient) and report a taken PII access.
+std::shared_ptr<yuzu::server::test::FnGuardianApi>
+make_failing_device_api(std::shared_ptr<std::atomic<int>> mode) {
+    return std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [mode](const std::string&, GuardianReadFault* fault)
+            -> std::optional<GuardianDeviceGuardsReport> {
+            if (mode->load() == 0)
+                *fault = GuardianReadFault::kStatementTimeout;
+            return std::nullopt;
+        },
+        [mode](const std::string&, const std::string&, bool* store_degraded,
+               bool* pii_access_began, GuardianReadFault* fault)
+            -> std::optional<GuardianDeviceComplianceRollup> {
+            *store_degraded = true;
+            *pii_access_began = true;
+            if (mode->load() == 0)
+                *fault = GuardianReadFault::kStatementTimeout;
+            return std::nullopt;
+        });
+}
+
+} // namespace
+
 // The existing DROP SCHEMA degrade cases fail an EARLIER read (rule_names_for) first, so they prove
 // nothing about the new read. The store seam fails ONLY the unrepresented-pending read.
 TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable error with a failure "
           "audit, never zeros, on both per-device reads, and the tools recover (#7217)",
           "[pg][mcp][integration][guardian][ordering]") {
+    yuzu::MetricsRegistry metrics; // before the store: it holds a raw pointer to it
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
+    store.set_metrics(&metrics);
     YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
     yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
     BaselineStore baseline_store(bl_pool);
     mcp_seed_ordering_world(db.dsn(), store, baseline_store);
+    auto seam = mcp_install_pending_fault(store); // before ts.start()
 
     McpTestServer ts;
     ts.guaranteed_state_store_for_test = &store;
@@ -45230,12 +45341,6 @@ TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable erro
                                     const std::string&, const std::string&,
                                     const std::string&) -> bool { return true; };
     ts.start("readonly");
-
-    std::atomic<int> calls{0};
-    store.set_unrepresented_pending_fault_for_test([&calls] {
-        ++calls;
-        return true;
-    });
 
     int expected_calls = 0;
     for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
@@ -45249,16 +45354,19 @@ TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable erro
         CHECK(body["error"]["message"].get<std::string>().find("degraded") != std::string::npos);
         CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
               yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK_FALSE(body["error"]["data"].contains("audit_persisted")); // the failure row persisted
         CHECK(res->body.find("unrepresented_pending") == std::string::npos);
-        CHECK(calls.load() == ++expected_calls);
-        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
-                         "guardian.device.view|failure") == 1);
-        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
-                         "guardian.device.view|success") == 0);
+        CHECK(seam->calls.load() == ++expected_calls);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|success") == 0);
+        CHECK(pool.in_use() == 0);
     }
+    CHECK(mcp_degrade_count(metrics, "guardian_census_device", "query_error") == 2.0);
+    CHECK(mcp_degrade_count(metrics, "guardian_census_device", "statement_timeout") == 0.0);
+    CHECK(mcp_degrade_count(metrics, "guardian_census", "query_error") == 0.0);
 
-    // Clear the seam: both tools answer again, with the evidence.
-    store.set_unrepresented_pending_fault_for_test({});
+    // Turn the fault off: both tools answer again, with the evidence.
+    seam->fail = false;
     for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
         INFO(call);
         ts.audit_log.clear();
@@ -45268,12 +45376,297 @@ TEST_CASE("MCP Guardian: a failed unrepresented-pending read is a retryable erro
         REQUIRE(body.contains("result"));
         auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
         CHECK(data["unrepresented_pending_guards"].get<int>() >= 1);
-        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
-                         "guardian.device.view|success") == 1);
-        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
-                         "guardian.device.view|failure") == 0);
+        CHECK(mcp_audits(ts, "guardian.device.view|success") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 0);
     }
-    CHECK(calls.load() == expected_calls); // the cleared seam is not consulted again
+    CHECK(seam->calls.load() == 2 * expected_calls); // consulted again, answered "no fault"
+    // The pool still serves a write.
+    mcp_seed_status(store, "w1", "WS-9", "r3", "guard.compliant", "2026-06-20T10:05:00Z");
+    CHECK(pool.in_use() == 0);
+}
+
+// CH-7 on MCP: the store fails AND the failure-audit row cannot persist. MCP is set-and-proceed, so
+// the error is still returned (never data, never zeros) and says the audit row dropped.
+TEST_CASE("MCP Guardian: a store fault with a failing audit write is still an error, never data, "
+          "and reports audit_persisted:false (#7217)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+    mcp_seed_ordering_world(db.dsn(), store, baseline_store);
+    auto seam = mcp_install_pending_fault(store);
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.audit_fail_action_result_ = "guardian.device.view|failure";
+    ts.start("readonly");
+
+    for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
+        INFO(call);
+        auto res = ts.call(call);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK_FALSE(body.contains("result"));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["audit_persisted"] == false);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(res->body.find("unrepresented_pending") == std::string::npos);
+    }
+    CHECK(seam->calls.load() == 2);
+}
+
+// The route-level shape of a statement timeout on MCP, through the GuardianApi double: a non-retryable
+// error with the shared remediation, the failure audit written as for any degrade, and (with the
+// audit write failing too) audit_persisted:false.
+TEST_CASE("MCP Guardian: a pending-read statement timeout is a non-retryable error with a remedy, "
+          "the same failure audit, and a transient degrade keeps its hint (#7217)",
+          "[mcp][integration][guardian][ordering]") {
+    auto mode = std::make_shared<std::atomic<int>>(0);
+    McpTestServer ts;
+    ts.guardian_api_for_test = make_failing_device_api(mode);
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
+        INFO(call);
+        mode->store(0);
+        ts.audit_log.clear();
+        auto res = ts.call(call);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK_FALSE(body.contains("result"));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutMessage));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"]["remediation"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
+        CHECK(body["error"]["data"]["remediation"].get<std::string>().find("fails identically") !=
+              std::string::npos);
+        CHECK_FALSE(body["error"]["data"].contains("audit_persisted"));
+        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|success") == 0);
+
+        // The same tool on an ordinary degrade: the retry hint is back.
+        mode->store(1);
+        ts.audit_log.clear();
+        auto transient = ts.call(call);
+        REQUIRE(transient);
+        auto tbody = nlohmann::json::parse(transient->body);
+        REQUIRE(tbody.contains("error"));
+        CHECK(tbody["error"]["data"]["retry_after_ms"].get<int>() ==
+              yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
+
+        // The timeout with the failure-audit write failing: still the timeout error, and it says
+        // the audit row dropped.
+        mode->store(0);
+        ts.audit_fail_action_result_ = "guardian.device.view|failure";
+        auto dropped = ts.call(call);
+        ts.audit_fail_action_result_.clear();
+        REQUIRE(dropped);
+        auto dbody = nlohmann::json::parse(dropped->body);
+        REQUIRE(dbody.contains("error"));
+        CHECK(dbody["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(dbody["error"]["data"]["audit_persisted"] == false);
+    }
+}
+
+// SQLSTATE 57014 end to end on MCP: a lock held on the events table, a 50 ms budget.
+TEST_CASE("MCP Guardian: a real statement timeout on the pending read is a non-retryable error "
+          "counted as statement_timeout, and the tools recover (#7217)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    yuzu::MetricsRegistry metrics;
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    store.set_metrics(&metrics);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+    mcp_seed_ordering_world(db.dsn(), store, baseline_store);
+    store.set_unrepresented_pending_timeout_ms_for_test(50);
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    McpEventsTableLock lock(db.dsn());
+    int requests = 0;
+    for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
+        INFO(call);
+        ts.audit_log.clear();
+        auto res = ts.call(call);
+        REQUIRE(res);
+        ++requests;
+        auto body = nlohmann::json::parse(res->body);
+        CHECK_FALSE(body.contains("result"));
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutMessage));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"]["remediation"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
+        CHECK(res->body.find("unrepresented_pending") == std::string::npos);
+        CHECK(mcp_audits(ts, "guardian.device.view|failure") == 1);
+        CHECK(mcp_audits(ts, "guardian.device.view|success") == 0);
+        CHECK(pool.in_use() == 0);
+    }
+    CHECK(mcp_degrade_count(metrics, "guardian_census_device", "statement_timeout") ==
+          static_cast<double>(requests));
+    CHECK(mcp_degrade_count(metrics, "guardian_census_device", "query_error") == 0.0);
+    CHECK(mcp_degrade_count(metrics, "guardian_census", "statement_timeout") == 0.0);
+
+    lock.release();
+    store.set_unrepresented_pending_timeout_ms_for_test(5000);
+    for (const char* call : {kMcpComplianceCall, kMcpAllGuardsCall}) {
+        INFO(call);
+        CHECK(mcp_ok_payload(ts, call)["unrepresented_pending_guards"].get<int>() >= 1);
+    }
+    mcp_seed_status(store, "w1", "WS-9", "r3", "guard.compliant", "2026-06-20T10:05:00Z");
+    CHECK(pool.in_use() == 0);
+}
+
+// QE-F1 on MCP: more than 50 pending-only pairs, REST equal to MCP, count exact, ids capped and in
+// ascending byte order.
+TEST_CASE("MCP Guardian: more than 50 pending-only pairs are counted exactly, capped at 50 ids in "
+          "byte order, and equal to the REST data (#7217)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+
+    mcp_install_fail_marked_trigger(db.dsn());
+    std::vector<std::string> pending_ids{"P-upper"}; // 'P' sorts before 'p' in byte order only
+    for (int i = 0; i < 55; ++i)
+        pending_ids.push_back(std::format("p-{:02d}", i));
+    std::vector<std::string> snapshot = pending_ids;
+    snapshot.push_back("r-clean");
+    for (const auto& id : snapshot)
+        mcp_seed_rule(store, id, "guard " + id);
+    mcp_deploy_baseline(baseline_store, "Ordering B", snapshot);
+    mcp_seed_status(store, "ok1", "WS-1", "r-clean", "guard.compliant", "2026-06-20T10:01:00Z");
+    for (const auto& id : pending_ids)
+        mcp_seed_status(store, "pend-" + id, "WS-1", id, "guard.compliant", kMcpFailMarkedTs);
+
+    auto expected = pending_ids;
+    std::sort(expected.begin(), expected.end()); // std::string orders by unsigned byte value
+    expected.resize(yuzu::server::kUnrepresentedPendingIdCap);
+    REQUIRE(expected.front() == "P-upper");
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    GuardianRestTwin rest(&store, &baseline_store);
+
+    const std::pair<const char*, const char*> pairs[] = {{kMcpComplianceCall, kRestComplianceUrl},
+                                                         {kMcpAllGuardsCall, kRestAllGuardsUrl}};
+    for (const auto& [call, url] : pairs) {
+        INFO(call);
+        const auto d = mcp_ok_payload(ts, call);
+        CHECK(d["unrepresented_pending_guards"].get<int>() == 56);
+        CHECK(mcp_string_array(d["unrepresented_pending_rule_ids"]) == expected);
+        CHECK(d["total_guards"].get<int>() == 1);
+        CHECK(rest_twin_data(rest, url) == d);
+    }
+}
+
+// An undeployed (draft) Baseline: the summary is the zero shape on both transports and they agree.
+TEST_CASE("MCP Guardian: a draft Baseline reports the zero summary, equal to the REST data (#7217)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+
+    mcp_seed_rule(store, "r1", "guard-one");
+    mcp_install_fail_marked_trigger(db.dsn());
+    Baseline b;
+    b.name = "Ordering B";
+    auto bid = baseline_store.create_baseline(b);
+    REQUIRE(bid.has_value());
+    REQUIRE(baseline_store.set_members(*bid, {"r1"}).has_value());
+    mcp_seed_status(store, "d1", "WS-1", "r1", "guard.compliant", kMcpFailMarkedTs); // pending-only
+
+    auto seam = mcp_install_pending_fault(store);
+    seam->fail = false;
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    GuardianRestTwin rest(&store, &baseline_store);
+
+    const auto d = mcp_ok_payload(ts, kMcpComplianceCall);
+    CHECK_FALSE(d["deployed"].get<bool>());
+    CHECK_FALSE(d["assessable"].get<bool>());
+    CHECK(d["total_guards"].get<int>() == 0);
+    CHECK(d["uncertain_guards"].get<int>() == 0);
+    CHECK(d["unrepresented_pending_guards"].get<int>() == 0);
+    REQUIRE(d["unrepresented_pending_rule_ids"].is_array());
+    CHECK(d["unrepresented_pending_rule_ids"].empty());
+    CHECK(rest_twin_data(rest, kRestComplianceUrl) == d);
+    CHECK(seam->calls.load() == 0); // a draft Baseline never reads the store for the summary
+}
+
+// QE-F2 on MCP: a flagged represented pair outside the snapshot is not counted in uncertain_guards.
+TEST_CASE("MCP Guardian: a flagged represented pair outside the snapshot is not counted in "
+          "uncertain_guards (#7217)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+
+    mcp_seed_rule(store, "r1", "guard-one");
+    mcp_seed_rule(store, "r9", "guard-nine");
+    mcp_deploy_baseline(baseline_store, "Ordering B", {"r1"});
+    mcp_seed_status(store, "a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "z1", "WS-1", "r9", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "z2", "WS-1", "r9", "drift.detected",
+                    "2026-06-20T10:00:00Z"); // order_uncertain
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    const auto c = mcp_ok_payload(ts, kMcpComplianceCall);
+    CHECK(c["total_guards"].get<int>() == 1);
+    CHECK(c["uncertain_guards"].get<int>() == 0);
+    const auto g = mcp_ok_payload(ts, kMcpAllGuardsCall);
+    REQUIRE(g["guards"].size() == 2);
+    CHECK(mcp_guard_row(g["guards"], "r9")["order_uncertain"].get<bool>());
 }
 
 TEST_CASE("MCP Guardian: the advertised output schemas list the #7217 fields as required, "
@@ -45310,7 +45703,8 @@ TEST_CASE("MCP Guardian: the advertised output schemas list the #7217 fields as 
         CHECK(props["unrepresented_pending_guards"]["minimum"] == 0);
         const auto& ids = props["unrepresented_pending_rule_ids"];
         CHECK(ids["type"] == "array");
-        CHECK(ids["maxItems"] == 50);
+        // The served literal is bound to the store's cap: a change to one without the other fails here.
+        CHECK(ids["maxItems"] == yuzu::server::kUnrepresentedPendingIdCap);
         CHECK(ids["uniqueItems"] == true);
         CHECK(ids["items"]["type"] == "string");
     };
@@ -45342,6 +45736,10 @@ TEST_CASE("MCP Guardian: the advertised output schemas list the #7217 fields as 
     const std::string gdesc = guards["description"].get<std::string>();
     CHECK(gdesc.size() < 4096);
     CHECK(gdesc.find("unrepresented_pending_guards") != std::string::npos);
+    // CA-6: the sentence that tells a worker an empty guards[] is not "no evidence".
+    CHECK(gdesc.find("nonzero count with an empty guards[] means evidence") != std::string::npos);
+    CHECK(gdesc.find("non-retryable") != std::string::npos);
+    CHECK(cdesc.find("non-retryable") != std::string::npos);
 }
 
 // ── cancel_execution / record_execution_rerun (#2146 batch B) ───────────────────────────────

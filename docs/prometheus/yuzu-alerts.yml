@@ -4612,13 +4612,16 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Three sources on the SAME counter (guardian_census, #5690, #7217, covers
-      # the census pending-evidence count read: it serves no empty result, its
-      # gauge keeps its last value; and the two per-device unrepresented-pending
-      # reads: their degrade is a REST 503 / retryable MCP error, never an
-      # empty result), each keyed by reason
+      # Four sources on the SAME counter (guardian_census, #5690, covers the
+      # census pending-evidence count read: it serves no empty result, its
+      # gauge keeps its last value; guardian_census_device, #7217, covers the
+      # two per-device unrepresented-pending reads: their degrade is a REST 503 /
+      # MCP error, never an empty result, and does not touch the gauge), each
+      # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
-      # on guardian_state for the Apps list's in-flight budget): "guardian_state"
+      # on guardian_state for the Apps list's in-flight budget, and
+      # statement_timeout on guardian_census_device for a read that ran past its
+      # 5 s budget because of a large retained pending backlog): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -4646,13 +4649,21 @@ groups:
             - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
-            source="guardian_census" means a census pending-evidence read
-            failed: either the count read (#5690), which freezes the
+            source="guardian_census" means the census pending-evidence count
+            read failed (#5690), which freezes the
             yuzu_server_guardian_census_pending_events gauge at its last value (or
-            leaves it absent before the first successful read), or one of the
-            two per-device unrepresented-pending reads (#7217; device-compliance
-            and the per-device guards read), whose degrade is a 503 on REST
-            or a retryable error on MCP, never an empty result.
+            leaves it absent before the first successful read).
+            source="guardian_census_device" means one of the two per-device
+            unrepresented-pending reads failed (#7217; device-compliance and the
+            per-device guards read): the degrade is a 503 on REST or an MCP
+            error, never an empty result, and the gauge is not affected.
+            reason="statement_timeout" on that source is not transient: the
+            read ran past its 5 s budget because the retained pending backlog
+            is large, the REST 503 carries no retry_after_ms and the MCP error
+            is non-retryable, so a retry fails identically; compare
+            max(yuzu_server_guardian_census_pending_events) and see "When a
+            verdict is flagged or does not move", step 5, in the Guaranteed
+            State guide.
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
             errored_rule_count/uncertain_rule_count) is degrading: the read itself returns a typed

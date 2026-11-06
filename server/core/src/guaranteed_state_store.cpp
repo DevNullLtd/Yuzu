@@ -63,26 +63,32 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
 // "source" so a future second Guardian-adjacent read-degrade emitter stays
-// distinguishable on the same dashboards without a metric rename. Three
+// distinguishable on the same dashboards without a metric rename. Four
 // sources exist today: "guardian_state" for the DEX/observation
 // family (dex_read<>/dex_observation, fail-soft — an empty/degraded result
 // is returned to the caller), "guardian_rules" for the AUTHORITATIVE
 // rule/status reads (get_rule/list_rules/agent_rule_statuses*/rule_names*/
 // errored_rule_count/uncertain_rule_count, fail-hard — a std::expected error is returned and the
-// caller decides how to fail) (#4856), and "guardian_census" (below). All
+// caller decides how to fail) (#4856), and the two census sources below. All
 // bump the SAME counter, yuzu_server_guardian_read_degrade_total{reason,source},
 // so an alert can aggregate `by (reason, source)` without missing any family.
 constexpr const char* kDegradeSource = "guardian_state";
 constexpr const char* kDegradeSourceRules = "guardian_rules";
-// The census pending-evidence reads are a third source on the same counter:
-// they are neither a DEX read nor an authoritative rule/status read, so they
-// get their own label to be told apart. The label covers two kinds of read:
-// the census pending-count gauge read (pending_projection_count_checked,
-// #5690), whose failure freezes the published gauge at its previous value, and
-// the per-device unrepresented-pending reads (unrepresented_pending_for_agent,
-// #7217), which fail hard (REST 503 / retryable MCP error) and never serve an
-// empty result.
+// "guardian_census" is the census pending-count GAUGE read only
+// (pending_projection_count_checked, #5690): its failure freezes the published
+// gauge at its previous value, so a rising counter on this source with a flat
+// gauge means the gauge is a stale sample.
 constexpr const char* kDegradeSourceCensus = "guardian_census";
+// "guardian_census_device" is the per-device unrepresented-pending read
+// (unrepresented_pending_for_agent, #7217). It is a separate source on purpose:
+// that read fails hard on the request path (REST 503 / MCP error) and publishes
+// no gauge, so folding it into "guardian_census" would make request noise mask a
+// real gauge freeze and would make a per-device 503 read as a stale gauge.
+constexpr const char* kDegradeSourceCensusDevice = "guardian_census_device";
+// SQLSTATE 57014 (query_canceled) from the per-device read's statement timeout:
+// the retained pending backlog is too large for the time budget, so a retry fails
+// identically. Counted on kDegradeSourceCensusDevice only.
+constexpr const char* kReasonStatementTimeout = "statement_timeout";
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
 // Mirrors InventoryStore's constants.
@@ -3204,7 +3210,8 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
     // comes from one hashed semi-join over the pending pairs; a correlated EXISTS per census row
     // measured about ten times slower at 100k rows. The drill-down is one rule, where EXISTS rides
     // idx_gse_pending (rule_id leading) per returned row. The flag covers REPRESENTED pairs only: a
-    // pending event whose pair has no census row is invisible here.
+    // pending event whose pair has no census row is invisible here
+    // (unrepresented_pending_for_agent reads those).
     std::string sql;
     std::vector<std::string> params;
     if (rule_id.empty()) {
@@ -3597,9 +3604,12 @@ GuaranteedStateStore::pending_projection_count_checked() const {
 // Pairs of one device with a retained pending event and no census row (#7217). The represented-pair
 // reads (agent_rule_statuses*, errored/uncertain_rule_count) cannot show these: with no census row
 // the pair is invisible to them. There is no live-rule join on purpose: a pending event can outlive
-// its rule through the #6829 race, and that is exactly the evidence this read discloses. Every
-// failure is std::unexpected and counted on the census source; a zero is only ever a real answer.
-std::expected<UnrepresentedPendingSummary, std::string>
+// its rule through the #6829 race, and that is exactly the evidence this read discloses. An
+// engaged-empty filter is answered without touching the store; every other failure is
+// std::unexpected and counted on kDegradeSourceCensusDevice, never a zero. A statement timeout
+// (SQLSTATE 57014) is told apart from the other failures (kStatementTimeout): it is deterministic
+// for a given backlog, so the callers must not advertise a retry.
+std::expected<UnrepresentedPendingSummary, UnrepresentedPendingError>
 GuaranteedStateStore::unrepresented_pending_for_agent(
     const std::string& agent_id, const std::optional<std::vector<std::string>>& rule_filter) const {
     static DegradeSampler sampler;
@@ -3607,39 +3617,56 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
     if (rule_filter && rule_filter->empty())
         return UnrepresentedPendingSummary{};
     const auto degrade = [this](const char* reason, const char* what, const std::string& detail) {
-        if (const auto d = note_read_degrade(metrics_, reason, kDegradeSourceCensus, sampler);
+        if (const auto d = note_read_degrade(metrics_, reason, kDegradeSourceCensusDevice, sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::unrepresented_pending_for_agent: {}: {}", what,
                          ::yuzu::log_key_token(detail));
     };
+    const auto unavailable = [](std::string message) {
+        return std::unexpected(UnrepresentedPendingError{UnrepresentedPendingFault::kUnavailable,
+                                                         std::move(message)});
+    };
     if (!open_) {
         degrade(kReasonStoreNotOpen, "store not open", "");
-        return std::unexpected("database not open");
+        return unavailable("database not open");
     }
     if (unrepresented_pending_fault_ && unrepresented_pending_fault_()) {
         degrade(kReasonQueryError, "injected fault", "");
-        return std::unexpected("query failed: injected fault");
+        return unavailable("query failed: injected fault");
     }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         degrade(kReasonPoolTimeout, "pool acquire timed out", "");
-        return std::unexpected("no database connection: " + pool_.last_error());
+        return unavailable("no database connection: " + pool_.last_error());
     }
     PGconn* conn = lease.get();
     pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
     if (begin.status() != PGRES_COMMAND_OK) {
         degrade(kReasonQueryError, "BEGIN failed", PQerrorMessage(conn));
-        return std::unexpected(std::string("BEGIN failed: ") + PQerrorMessage(conn));
+        return unavailable(std::string("BEGIN failed: ") + PQerrorMessage(conn));
     }
     pg::PgTxn txn(conn);
-    pg::PgResult timeout =
-        pg::exec_params(conn, "SET LOCAL statement_timeout = '5s'", std::vector<std::string>{});
+    pg::PgResult timeout = pg::exec_params(
+        conn, std::format("SET LOCAL statement_timeout = '{}ms'", unrepresented_pending_timeout_ms_).c_str(),
+        std::vector<std::string>{});
     if (timeout.status() != PGRES_COMMAND_OK) {
         degrade(kReasonQueryError, "statement_timeout failed", PQresultErrorMessage(timeout.get()));
-        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(timeout.get())));
+        return unavailable("query failed: " + std::string(PQresultErrorMessage(timeout.get())));
     }
     // DISTINCT pairs of this device, minus any with a census row; the window count is taken before
-    // the LIMIT, so the count is exact while the id list is capped.
+    // the LIMIT, so the count is exact while the id list is capped. The order is BYTE order
+    // (COLLATE "C"), so which ids survive the cap is identical on every cluster whatever its locale.
+    //
+    // NO index is built for this read, deliberately (owner ruling 2026-11-06). Nothing indexes agent_id
+    // WITHIN the pending partition: idx_gse_pending is (rule_id, agent_id) WHERE projection_pending,
+    // so agent_id is its second column, and idx_gse_agent_time reaches a device's rows but visits
+    // every event of it, pending or not. Measured on PG16/17/18 with ~125k pending of 530k events
+    // and with 1.2M pending, every plan took under 100 ms. RE-OPEN when the pending backlog grows
+    // past that measured size, which shows up as a 'statement timeout' log line from this function
+    // or a rising yuzu_server_guardian_read_degrade_total{source="guardian_census_device",
+    // reason="statement_timeout"}. The fix is a partial (agent_id, rule_id) WHERE projection_pending
+    // index, carried into the UP-14 server PR's v5 migration or #7147; the boot index-shape check
+    // in the schema DO block (idx_gse_pending) must learn it in the same change.
     std::vector<std::string> params{agent_id};
     std::string sql = "WITH q AS (SELECT DISTINCT e.rule_id "
                       "FROM guaranteed_state_store.guaranteed_state_events e "
@@ -3654,21 +3681,34 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
     }
     sql += "AND NOT EXISTS (SELECT 1 FROM guaranteed_state_store.guardian_agent_rule_status c "
            "WHERE c.agent_id = e.agent_id AND c.rule_id = e.rule_id)) "
-           "SELECT rule_id, count(*) OVER () AS total FROM q ORDER BY rule_id LIMIT " +
+           "SELECT rule_id, count(*) OVER () AS total FROM q ORDER BY rule_id COLLATE \"C\" LIMIT " +
            std::to_string(kUnrepresentedPendingIdCap);
     pg::PgResult res = pg::exec_params(conn, sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        degrade(kReasonQueryError, "query failed", PQresultErrorMessage(res.get()));
-        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+        const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        const std::string msg = PQresultErrorMessage(res.get());
+        if (state && std::string_view(state) == "57014") {
+            // Count first, then log: the counter is the signal that must never be skipped.
+            if (const auto d =
+                    note_read_degrade(metrics_, kReasonStatementTimeout, kDegradeSourceCensusDevice, sampler);
+                d.should_log)
+                spdlog::warn("GuaranteedStateStore::unrepresented_pending_for_agent: statement timeout "
+                             "after {} ms: the retained pending backlog is too large for this per-device "
+                             "read, so retrying fails identically until the backlog shrinks: {}",
+                             unrepresented_pending_timeout_ms_, ::yuzu::log_key_token(msg));
+            return std::unexpected(UnrepresentedPendingError{
+                UnrepresentedPendingFault::kStatementTimeout, "statement timeout: " + msg});
+        }
+        degrade(kReasonQueryError, "query failed", msg);
+        return unavailable("query failed: " + msg);
     }
     UnrepresentedPendingSummary out;
     const int rows = PQntuples(res.get());
     out.rule_ids.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i) {
+    for (int i = 0; i < rows; ++i)
         out.rule_ids.emplace_back(PQgetvalue(res.get(), i, 0));
-        if (i == 0)
-            out.count = to_i64(PQgetvalue(res.get(), 0, 1));
-    }
+    if (rows > 0)
+        out.count = to_i64(PQgetvalue(res.get(), 0, 1));
     return out;
 }
 
