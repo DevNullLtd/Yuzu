@@ -102,7 +102,12 @@ struct Harness {
     // Non-empty models a service-scoped API token: the deny stub then writes the 403 and returns true.
     std::string session_scope_service;
     std::vector<std::string> deny_actions;
-    std::expected<access::EnforcementView, std::string> enforce_result{access::EnforcementView{true, false, false}};
+    std::expected<access::EnforcementView, std::string> enforce_result{
+        access::EnforcementView{.enabled = true, .degraded = false, .may_toggle = false}};
+    // The advisory authority answer the page is drawn from (server.cpp binds the real one). Every
+    // session it was asked about is kept, so a case can pin WHO the hint was computed for.
+    RbacAdminHint hint_result{RbacAdminHint::kMay};
+    std::vector<auth::Session> hint_asked;
     std::string perms_asked_role;
     std::expected<std::vector<Permission>, std::string> perms_result{std::vector<Permission>{
         perm("Tag", "Read"), perm("Tag", "Write")}};
@@ -178,6 +183,10 @@ struct Harness {
             perms_asked_role = r;
             return perms_result;
         };
+        d.rbac_admin_hint_fn = [this](const auth::Session& s) {
+            hint_asked.push_back(s);
+            return hint_result;
+        };
         return d;
     }
     void wire() { access::register_access_routes(sink, deps()); }
@@ -199,6 +208,7 @@ TEST_CASE("access routes: registration fails fast when any dependency is unbound
         [](access::Deps& d) { d.list_assignments_fn = nullptr; },
         [](access::Deps& d) { d.enforcement_state_fn = nullptr; },
         [](access::Deps& d) { d.deny_service_scoped_fn = nullptr; },
+        [](access::Deps& d) { d.rbac_admin_hint_fn = nullptr; },
     };
     for (const auto& f : unbind) {
         Harness h;
@@ -619,34 +629,46 @@ TEST_CASE("access routes: an unread grant table is a 200 red box with no audit r
     CHECK(h.audits.empty());
 }
 
-TEST_CASE("access routes: Assign is offered to a local account admin only, with the closed role list",
+TEST_CASE("access routes: Assign is offered when the hint says kMay, with the closed role list",
           "[access][routes]") {
     Harness h;
     // The catalogue holds ITServiceOwner and a custom role; neither is offered.
     h.roles_result = std::vector<RbacRole>{role("Administrator", "d"), role("ITServiceOwner", "d"),
                                            role("Operator", "d"), role("Auditor.eu", "d"),
                                            role("PlatformEngineer", "d"), role("ApiTokenManager", "d"),
-                                           role("Viewer", "d"), role("Reviewer", "d")};
+                                           role("Viewer", "d"), role("Reviewer", "d"),
+                                           role("ForensicsAnalyst", "d")};
     h.wire();
     auto res = h.sink.dispatch("GET", "/fragments/access/roles/assignments");
     REQUIRE(res);
-    // The literal six, in catalogue order. A fixed list on purpose: comparing with the array the
+    // The literal seven, in catalogue order. A fixed list on purpose: comparing with the array the
     // code reads would stay green if someone added ITServiceOwner to it.
     CHECK_THAT(res->body, ContainsSubstring("data-roles=\"Administrator,Operator,PlatformEngineer,"
-                                            "ApiTokenManager,Viewer,Reviewer\""));
+                                            "ApiTokenManager,Viewer,Reviewer,ForensicsAnalyst\""));
     CHECK_THAT(res->body, !ContainsSubstring("ITServiceOwner,"));
     CHECK_THAT(res->body, !ContainsSubstring("Auditor.eu"));
 
-    // A Reviewer-style caller (account role user) reads the table and is offered nothing, and the
-    // catalogue is not even read for them.
+    // kMayNot (a Reviewer-style caller, or an account admin with no durable grant under
+    // enforcement) reads the table and is offered nothing, and the catalogue is not even read.
     Harness r;
-    r.session_role = auth::Role::user;
+    r.hint_result = RbacAdminHint::kMayNot;
     r.wire();
     res = r.sink.dispatch("GET", "/fragments/access/roles/assignments");
     REQUIRE(res);
     CHECK_THAT(res->body, ContainsSubstring("<table data-assignments"));
     CHECK_THAT(res->body, !ContainsSubstring("data-act="));
+    CHECK_THAT(res->body, !ContainsSubstring("Assign role"));
     CHECK(r.roles_calls == 0);
+
+    // kUnconfirmed draws Assign disabled with the reason, and does not read the catalogue either.
+    Harness c;
+    c.hint_result = RbacAdminHint::kUnconfirmed;
+    c.wire();
+    res = c.sink.dispatch("GET", "/fragments/access/roles/assignments");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("disabled title=\"" + std::string(access::kAdminUnconfirmed) + "\""));
+    CHECK_THAT(res->body, !ContainsSubstring("data-act="));
+    CHECK(c.roles_calls == 0);
 
     // An unreadable catalogue disables the button with a reason instead of offering nothing silently.
     Harness u;
@@ -657,23 +679,37 @@ TEST_CASE("access routes: Assign is offered to a local account admin only, with 
     CHECK_THAT(res->body, ContainsSubstring("disabled title=\"The role list could not be read"));
 }
 
-TEST_CASE("access routes: no hint for an SSO, token, MCP or engine-class session", "[access][routes]") {
+TEST_CASE("access routes: the hint is asked about the REAL session, and its answer alone decides the controls",
+          "[access][routes]") {
     struct Case {
         const char* source;
+        const char* kind;
         const char* tier;
     };
-    for (const Case c : {Case{"oidc", ""}, Case{"saml", ""}, Case{"api_token", ""}, Case{"mcp_token", "operator"},
-                         Case{"local", "readonly"}}) {
-        INFO(c.source << "/" << c.tier);
+    for (const Case c : {Case{"local", "human", ""}, Case{"oidc", "human", ""}, Case{"saml", "human", ""},
+                         Case{"api_token", "human", ""}, Case{"mcp_token", "human", "operator"}}) {
+        INFO(c.source << "/" << c.kind << "/" << c.tier);
         Harness h;
+        h.hint_result = RbacAdminHint::kMayNot; // whatever the session class, the answer decides
         h.session_source = c.source;
+        h.session_kind = c.kind;
         h.session_mcp_tier = c.tier;
         h.wire();
-        const auto res = h.sink.dispatch("GET", "/fragments/access/roles/assignments");
-        REQUIRE(res);
-        CHECK(res->status == 200);
-        CHECK_THAT(res->body, !ContainsSubstring("data-act=\"assign\""));
-        CHECK_THAT(res->body, !ContainsSubstring("data-act=\"unassign\""));
+        for (const char* path : {"/fragments/access/roles/assignments", "/fragments/access/enforcement"}) {
+            const auto res = h.sink.dispatch("GET", path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK_THAT(res->body, !ContainsSubstring("data-act=\"assign\""));
+            CHECK_THAT(res->body, !ContainsSubstring("data-act=\"unassign\""));
+            CHECK_THAT(res->body, !ContainsSubstring("data-act=\"enforce\""));
+        }
+        REQUIRE(h.hint_asked.size() == 2);
+        for (const auto& s : h.hint_asked) {
+            CHECK(s.username == "alice");
+            CHECK(s.auth_source == c.source);
+            CHECK(s.principal_kind == c.kind);
+            CHECK(s.mcp_tier == c.tier);
+        }
     }
 }
 
@@ -738,34 +774,44 @@ TEST_CASE("access routes: an unreadable RBAC store is a 200 red box with no stor
     CHECK_THAT(res->body, !ContainsSubstring("PGRES"));
 }
 
-TEST_CASE("access routes: the switch is live only for a local account admin on a cookie session",
+TEST_CASE("access routes: the switch follows the hint: live, disabled as not permitted, or disabled as unconfirmed",
           "[access][routes]") {
     struct Case {
-        auth::Role role;
-        const char* source;
-        const char* kind;
-        const char* tier;
+        RbacAdminHint hint;
         bool live;
+        bool unconfirmed;
     };
     const Case cases[] = {
-        {auth::Role::admin, "local", "human", "", true},
-        {auth::Role::user, "local", "human", "", false},
-        {auth::Role::admin, "oidc", "human", "", false},
-        {auth::Role::admin, "local", "engine", "", false},
-        {auth::Role::admin, "local", "human", "operator", false},
+        {RbacAdminHint::kMay, true, false},
+        {RbacAdminHint::kMayNot, false, false},
+        {RbacAdminHint::kUnconfirmed, false, true},
     };
     for (const auto& c : cases) {
-        INFO(c.source << "/" << c.kind << "/" << c.tier);
+        INFO(static_cast<int>(c.hint));
         Harness h;
-        h.session_role = c.role;
-        h.session_source = c.source;
-        h.session_kind = c.kind;
-        h.session_mcp_tier = c.tier;
+        h.hint_result = c.hint;
         h.wire();
         const auto res = h.sink.dispatch("GET", "/fragments/access/enforcement");
         REQUIRE(res);
         CHECK((res->body.find("data-act=\"enforce\"") != std::string::npos) == c.live);
+        CHECK((res->body.find(std::string(access::kAdminUnconfirmed)) != std::string::npos) == c.unconfirmed);
+        CHECK((res->body.find("Only a durable Administrator can change this.") != std::string::npos) ==
+              (!c.live && !c.unconfirmed));
     }
+}
+
+TEST_CASE("access routes: a degraded enforcement view never asks for, or draws, the switch hint",
+          "[access][routes]") {
+    Harness h;
+    h.enforce_result =
+        access::EnforcementView{.enabled = true, .degraded = true, .may_toggle = false};
+    h.hint_result = RbacAdminHint::kMay;
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/enforcement");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("Unconfirmed"));
+    CHECK_THAT(res->body, !ContainsSubstring("<input"));
+    CHECK(h.hint_asked.empty());
 }
 
 TEST_CASE("access routes: the wiring in server.cpp uses the checked reads and the display accessors only",
@@ -800,13 +846,23 @@ TEST_CASE("access routes: the wiring in server.cpp uses the checked reads and th
     const auto dg = blk.find("rbac_store_->rbac_enabled_view_degraded()");
     REQUIRE(dg != std::string::npos);
     CHECK(en < dg);
+    // The switch and the Assign button are drawn from the ONE advisory composition of the
+    // administrator predicate and the regime check, on the REST surface (the controls call the
+    // REST routes). A stub, or the base account role, bound here would put the old lie back.
+    CHECK_THAT(blk, ContainsSubstring(".rbac_admin_hint_fn"));
+    CHECK_THAT(blk, ContainsSubstring("yuzu::server::rbac_admin_hint("));
+    CHECK_THAT(blk, ContainsSubstring("yuzu::server::RbacAdminSurface::kRest"));
+    CHECK_THAT(blk, !ContainsSubstring("RbacAdminSurface::kMcp"));
 
-    // The routed A2/A1 row reserves these two predicates; neither renderer nor routes may call them.
+    // The routed A2/A1 row reserves these predicates for server.cpp's wiring lambda; neither the
+    // renderer nor the routes may call them, nor include the header that pulls in the stores.
     for (const char* file : {"access_routes.cpp", "access_render.cpp", "access_routes.hpp", "access_render.hpp"}) {
         INFO(file);
         const std::string text = slurp(fs::path(YUZU_SERVER_SRC_DIR) / file);
         CHECK_THAT(text, !ContainsSubstring("is_rbac_administrator("));
         CHECK_THAT(text, !ContainsSubstring("rbac_enforcement_label("));
+        CHECK_THAT(text, !ContainsSubstring("rbac_admin_hint("));
+        CHECK_THAT(text, !ContainsSubstring("#include \"rbac_admin_predicate.hpp\""));
         // The closed role list is reached through its accessor, never the array.
         CHECK_THAT(text, !ContainsSubstring("kRbacAssignableRoles"));
     }

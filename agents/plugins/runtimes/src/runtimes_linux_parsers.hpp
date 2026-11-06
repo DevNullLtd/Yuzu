@@ -6,7 +6,8 @@
  * Two halves: a PORTABLE pure layer (failure tokens, errno -> token maps, path
  * helpers) that compiles on every OS, and a WALK SHELL (`#if !defined(_WIN32)`,
  * because agents/shared/posix_dir_walk.hpp is POSIX-only) holding
- * `dotnet_rows_at` / `jvm_rows_at` and the injected-root leg body
+ * `dotnet_rows_at` / `jvm_rows_at` / `python_rows_at` (and the walk layer the macOS python walk
+ * reuses, runtimes_macos_parsers.hpp) and the injected-root leg body
  * `run_linux_at`.
  *
  * WHAT IS READ (<root> + a literal, rung 1, zero subprocess):
@@ -17,8 +18,13 @@
  *           <d>/release (parse_release_file). A home with no `release` file but a
  *           bin/java or jre/bin/java (some distro OpenJDK 8 packages, e.g. Ubuntu and
  *           Rocky, ship none) is reported with an unknown version and `release_missing`.
+ *   python  usr/bin, usr/local/bin and var/usrlocal/bin (rpm-ostree hosts, where /usr/local is a
+ *           symlink to ../var/usrlocal): the file NAMES `python3.<minor>` (regular files only). The
+ *           version is major.minor from the name; the patch level is not read (it needs the
+ *           interpreter) and that limit is documented, not a constraint token. A symlinked
+ *           `python3.X` entry (a distro alias) is skipped, the alias rule below.
  *   NOT walked: any other location (an Oracle-RPM /usr/java, tarball installs under
- *   /usr/local or a home directory). "None found" covers the roots above only.
+ *   /usr/local or a home directory; a venv or pyenv python). "None found" covers the roots above only.
  *
  * SYMLINK SAFETY. Every directory is opened O_RDONLY|O_DIRECTORY|O_NOFOLLOW
  * (private copy of autoruns_macos.cpp's open_dir_no_follow_checked /
@@ -79,6 +85,7 @@
 
 #include "runtimes_legs.hpp"
 #include "runtimes_parsers.hpp"
+#include "runtimes_python_parsers.hpp"
 
 #include <network_fstype.hpp> // yuzu::shared::is_network_fstype (agents/shared)
 
@@ -231,6 +238,13 @@ inline constexpr std::array<std::string_view, 3> kDotnetRoots{"usr/share/dotnet"
 // jvm dispatch would report `symlink_refused` for opt/java; with it the link is a covered alias.
 inline constexpr std::array<std::string_view, 4> kJvmRoots{"usr/lib/jvm", "opt/java", "usr/lib64/jvm",
                                                            "var/opt/java"};
+// python: the distro interpreters (/usr/bin) and a source build's `make install` (/usr/local/bin). The
+// sibling alias rule applies: a symlinked /usr/local naming the other candidate is a covered alias.
+// var/usrlocal/bin: on rpm-ostree hosts (Fedora CoreOS, Silverblue, RHCOS, RHEL Edge) /usr/local is a
+// symlink to ../var/usrlocal, so without this candidate every python dispatch would report
+// `symlink_refused` for usr/local/bin; with it the link is a covered alias.
+inline constexpr std::array<std::string_view, 3> kPythonRoots{"usr/bin", "usr/local/bin",
+                                                              "var/usrlocal/bin"};
 
 /// Lexically normalises a root-relative path: empty and `.` components dropped,
 /// `..` pops one. nullopt when a `..` would climb above the root. Pure text --
@@ -514,7 +528,7 @@ inline bool push_row(std::vector<std::string>& rows, std::string&& row, WalkBudg
     return true;
 }
 
-enum class EntryType { directory, symlink, other };
+enum class EntryType { directory, symlink, regular, other };
 
 struct EntryInfo {
     std::string name;
@@ -545,6 +559,7 @@ inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc, W
         info.name = std::string{e->d_name};
         info.type = S_ISDIR(st.st_mode)   ? EntryType::directory
                     : S_ISLNK(st.st_mode) ? EntryType::symlink
+                    : S_ISREG(st.st_mode) ? EntryType::regular
                                           : EntryType::other;
         out.push_back(std::move(info));
         return true;
@@ -806,6 +821,38 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
     return rows;
 }
 
+/// python: single-level listing of <root>/{usr/bin,usr/local/bin,var/usrlocal/bin}; every REGULAR
+/// file named exactly `python3.<minor>` is a row
+/// `python|unmodelled|3.<minor>|/usr/bin/python3.<minor>|-`. A symlink (`python3`, a distro alias),
+/// `python3.12-config`, `python3.12m` and anything else produce nothing.
+/// The version is major.minor from the NAME: the patch level is not read (it would take running the
+/// interpreter), and a missing patch level is a documented limit of this leg, never a constraint
+/// token. The only walk here is the one listing per root, on one WalkBudget shared by all roots.
+[[nodiscard]] inline std::vector<std::string> python_rows_at(
+    const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
+    const WalkConfig& cfg = {}) {
+    using namespace walk;
+    std::vector<std::string> rows;
+    WalkBudget budget{cfg.limits};
+    const std::string root_s = root.string();
+    for (const std::string_view rel : kPythonRoots) {
+        if (budget.exhausted) break;
+        const DirHandle dir = open_path(root_s, rel, kPythonRoots, cfg, acc);
+        if (!dir) continue;
+        const std::string logical = "/" + std::string{rel};
+        for (const auto& e : list_entries(dir.get(), acc, budget)) {
+            if (e.type != EntryType::regular) continue;
+            const auto version = python3_minor_from_name(e.name);
+            if (!version) continue;
+            PythonRecord rec;
+            rec.version = *version;
+            rec.install_path = join_logical(logical, e.name);
+            if (!push_row(rows, python_row(rec), budget, acc)) break;
+        }
+    }
+    return rows;
+}
+
 /// The Linux leg's dispatch: the rows for action `a` under `root`, failures
 /// recorded in `acc`. run_linux_at is this plus emit_read; both live here so the
 /// action -> walk -> emit wiring is unit-testable without linking the plugin TU.
@@ -816,6 +863,7 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
     switch (a) {
     case Action::dotnet: return dotnet_rows_at(root, acc, cfg);
     case Action::jvm:    return jvm_rows_at(root, acc, cfg);
+    case Action::python: return python_rows_at(root, acc, cfg);
     }
     acc.add_failure("internal_error");
     return {};

@@ -10,6 +10,26 @@
 #   Server --> ClickHouse(:8123)          (analytics)
 #   Prometheus --> Server(:8080) + Gateway(:9568)  (metrics)
 #   Grafana --> Prometheus + ClickHouse   (dashboards)
+#
+# Started by scripts/docker-start-UAT.sh, which generates the Grafana admin
+# password, keeps it in .uat/grafana-admin-password (0600 where the filesystem
+# honours it) and prints it. Run by hand, every `docker compose` command (`down`
+# included) needs (#4817):
+#   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+# and UAT_CONFIG (the server config path the launcher normally sets). Keep the
+# same value across shells (or use a .env); for `down`, `ps` and `logs` any
+# non-empty password and any absolute or ./-prefixed UAT_CONFIG path work. An
+# existing grafana-uat-data volume keeps its old password (admin/admin if it
+# predates #4817) until `down -v` or
+#   docker compose exec grafana grafana cli admin reset-admin-password '<new>'
+# UAT ONLY - Grafana and ClickHouse are published on every interface.
+#
+# Gateway image: yuzu-gateway:latest must be built from this checkout (or be from
+# the first release containing the yuzu_gw grpc_listeners shape): the mounted
+# gateway-sys.config uses that shape. An older image ignores it, binds no listener
+# and still answers /healthz and /readyz with 200, so the stack looks up while no
+# agent can connect. Image and config are an atomic pair (see "Upgrading the
+# Gateway" in docs/user-manual/upgrading.md).
 
 services:
   # ── Yuzu Server (gateway mode) ─────────────────────────────────────────
@@ -122,6 +142,13 @@ services:
   # ── Erlang Gateway ─────────────────────────────────────────────────────
   gateway:
     image: yuzu-gateway:latest
+    # Planned stop: the gateway ends its agent sessions and sends their
+    # DISCONNECTED notices to the server before it exits, within
+    # shutdown_flush_budget_ms (default 20 s), then stops its processes. The
+    # Docker default (10 s before SIGKILL) would cut that short; 40 s covers the
+    # budget with margin. Raise both together (docs/user-manual/gateway.md,
+    # "Planned stop").
+    stop_grace_period: 40s
     container_name: yuzu-uat-gateway
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server
@@ -179,7 +206,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Required, no default (#4817): Grafana's built-in default is admin/admin.
+      - GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD to a strong random value, e.g. openssl rand -hex 16}
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
       - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
     volumes:

@@ -2,7 +2,7 @@
 """Docs lint: advice to restart the gateway after a peer-authorization refusal stays CONDITIONAL.
 
 A gateway restart disconnects every agent the node holds, and on agent builds without the #5183
-fix (in no release yet) released agents then stay wedged. So every place that tells an operator to
+fix (shipped in 0.15.0) released agents then stay wedged. So every place that tells an operator to
 restart a gateway must carry its caveat next to the instruction, not in a different section:
 
   1. the `5183` caveat token (the agent-side reconnect fix the restart depends on, matched with
@@ -105,8 +105,10 @@ MIN_MATCHES = {
     "docs/operations/troubleshooting.md": 2,
     "docs/pki-architecture.md": 3,
     "docs/security-reviews/gateway-peer-authz-minimal-2026-10-07.md": 3,
-    "changelog.d/5565-gateway-peer-authz.security.md": 1,
-    "docs/prometheus/yuzu-alerts.yml": 3,
+    # (the 0.15.0 promote moved the former changelog.d/5565-gateway-peer-authz.security.md fragment into
+    # CHANGELOG.md; fragments are transient and CHANGELOG.md is not a lint surface: it holds older sections
+    # written before this lint and unrelated gateway-restart bullets)
+    "docs/prometheus/yuzu-alerts.yml": 4,
     "deploy/docker/docker-compose.reference-gateway.yml": 0,  # comments carry no restart advice today
     "deploy/systemd/yuzu-server.service": 0,                  # (listed so a future one is checked)
 }

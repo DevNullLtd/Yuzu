@@ -336,7 +336,11 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     if (pending_at_entry != Pending::none) {
         std::optional<std::vector<StoredResponse>> resp;
         if (d_.response_store)
-            resp = d_.response_store->query(pending_command_id, ResponseQuery{.agent_id = agent_id});
+            // #4990: internal consumer. Polls the reply to the reconciler's own quarantine
+            // dispatch (the closed protective set), never an operator read surface.
+            resp = d_.response_store->query(pending_command_id,
+                                            ResponseTierFilter::unrestricted_internal_consumer(),
+                                            ResponseQuery{.agent_id = agent_id});
         if (!resp) {
             // #3425 review, sharpened at Gate 5 (gate4-response-store-
             // degradation-freezes-timeout): pending_since is deliberately

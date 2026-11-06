@@ -7,8 +7,8 @@
 ## collide across replicas). Deliberately does NOT include the C++ server,
 ## Postgres, or an agent — those exercise the SEPARATE server<->gateway
 ## upstream and agent<->gateway concerns this rig is not testing. A gateway
-## boots and serves fine with no reachable upstream (grpcbox client channels
-## connect lazily; a missing server just means repeated, logged, harmless
+## boots and serves fine with no reachable upstream (the upstream client channel
+## reconnects in the background; a missing server just means repeated, logged, harmless
 ## ProxyRegister/heartbeat failures) — this rig only proves gateway<->gateway
 ## cluster formation in isolation.
 ##
@@ -32,12 +32,27 @@
 ## configuration needed for the cluster to form.
 services:
   gateway:
-    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.1}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.15.0}
+    # Planned stop: the gateway ends its agent sessions and sends their
+    # DISCONNECTED notices to the server before it exits, within
+    # shutdown_flush_budget_ms (default 20 s), then stops its processes. The
+    # Docker default (10 s before SIGKILL) would cut that short; 40 s covers the
+    # budget with margin. Raise both together (docs/user-manual/gateway.md,
+    # "Planned stop").
+    stop_grace_period: 40s
     # NO container_name: (Compose refuses to scale a named service) and NO
     # host-published ports (they would collide across replicas — nothing
     # outside this Compose network needs to reach a specific replica by
     # host port; use `docker exec` for the demo, as above).
     restart: unless-stopped
+    # Bound the gateway's stdout: a persistent upstream TLS failure logs per
+    # redial attempt (docs/user-manual/gateway.md), and the default json-file
+    # driver has no size cap.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     environment:
       # Demo-only: a real cluster needs a REAL cookie identical across every
       # node (the boot guard's minimum-length floor, #4555, refuses a short

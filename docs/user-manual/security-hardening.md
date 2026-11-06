@@ -80,6 +80,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
 | 50055 | TCP | Inbound | Gateway upstream (mutual TLS plus an SPKI public-key pin of the gateway's key, or an acknowledged-disabled plaintext rig) | Gateway hosts only |
+| 50063 | TCP | Inbound | Gateway management (server to gateway command fan-out; mutual TLS plus a peer pin) | Server hosts only; never publish it |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
@@ -111,8 +112,9 @@ Run each component under its own system user:
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
-> the agent listener (`transport_opts` with `verify => verify_none`,
-> `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
+> the agent listener (a `tls` map in its `{yuzu_gw, grpc_listeners}` entry with
+> `verify => verify_none`, `fail_if_no_peer_cert => false`; see
+> `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
 > cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
@@ -122,17 +124,26 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
   an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
   end to end), with the gateway agent listener itself running the one-way TLS above.
   A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
-  `:50051` is no longer a supported way to protect this edge: the gateway binds each
-  agent's heartbeats to the connection that opened its session, and such a proxy can
-  spread one agent's calls over several connections (see
-  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
+  `:50051` is a supported way to protect this edge only when it keeps each client
+  connection on its own backend connection for as long as the client connection lives
+  (see [Keeping each agent on one backend connection](gateway.md#keeping-each-agent-on-one-backend-connection)):
+  the gateway binds each agent's heartbeats to the connection that opened its session,
+  and a proxy that pools backend connections can spread one agent's calls over several
+  connections (see [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
 - keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
   terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
-`{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. The server's gateway-upstream service additionally requires an
+`{https,...}`). The canonical answer for this hop: mutual TLS with the SPKI pin below is
+enforced **by the server**; the gateway's own check is only that it will talk TLS to a server it
+has verified. A plaintext upstream (`http`) is a lab/UAT posture and needs the server's explicit
+acknowledgement flag (`--insecure-gateway-peer`). The gateway refuses to boot (fails closed) on
+the legacy `{grpcbox, [{client, ...}]}` key, on any `https` endpoint without `verify_peer` and a
+`cacertfile` / `cacerts` of its own, and on a channel that lists both `http` and `https`
+endpoints; a gateway that boots without a client certificate is refused by the server.
+Production is `https`, `verify_peer`, a CA-pinned `cacertfile`, and a client certificate and key.
+The server's gateway-upstream service additionally requires an
 authorized gateway peer: the gateway's client certificate must carry `serverAuth`, be inside
 its validity window and have a public key that matches a configured SPKI pin (automatic on
 the generated default certificates, explicit with `--gateway-peer-pin` /
@@ -149,6 +160,13 @@ Direct agent→server connections (no gateway) use TLS. Full detail + the deploy
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
 The agent listener authenticates the gateway to agents, not agents to the gateway.
+Requesting a client certificate on this edge is a configuration change that enforces
+nothing yet, and enforcing one needs a separate design (see
+[Moving the agent edge to mutual TLS](gateway.md#moving-the-agent-edge-to-mutual-tls)).
+The address the gateway reports for an agent is the TCP peer unless the listener is told
+which proxies to trust, and it discards whatever the agent sent (a forged address passes
+through an older gateway that does not: upgrade every gateway; see
+[Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy)).
 The gateway admits an agent `Heartbeat` only on the connection that opened the
 session's `Subscribe` stream, and only for a session that gateway node holds
 (a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
@@ -159,15 +177,48 @@ disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
-run commands on every connected agent. Its secure shape is strict mTLS **plus a
-peer pin** (#1422): the listener's `auth_fun` accepts only a client cert whose
-key matches `{yuzu_gw, mgmt_peer_pins}` (your server's cert) AND carries the
-`serverAuth` EKU — a CA-issued cert alone (any agent's leaf, the gateway's own
-leaf) is rejected with `UNAUTHENTICATED`. The gateway **refuses to boot** when a
+run commands on every connected agent. Its secure shape is strict mTLS **plus peer
+authorization** (#1422, #6016): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert that carries the
+`serverAuth` EKU AND is admitted by `{yuzu_gw, mgmt_peer_auth_mode}`: its key matches
+`{yuzu_gw, mgmt_peer_pins}` (your server's cert), or it carries the server identity URI SAN
+`yuzu://<install>/server` that the install CA puts on the server's built-in certificate, or either,
+depending on the mode (unset means `pin`, so an upgrade changes nothing; the identity is never implied by a missing key; the shipped reference configs set `identity` with no pin; bring-your-own certificates must set `pin`) — a CA-issued cert alone (any agent's leaf, the gateway's own
+leaf) is rejected with `UNAUTHENTICATED`. A pin needs the server's private key; the identity needs only a
+certificate the install CA signed with that URI, so a deployment that guards the CA key separately from
+the server key should stay in `pin` mode or use `identity` with a pin (which requires both). The identity also trusts the issuing CA's issuance policy: do not enable it where the listener's `cacertfile` is a corporate CA that lets a requester choose a URI SAN with serverAuth (stay in `pin`), and an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (a bundle, or an empty, unreadable or half-written file) refuses to boot unless the mode is `identity` with a pin configured (`identity_over_ca_bundle`). A serial
+deny-list, `mgmt_peer_denied`, refuses a withdrawn certificate in every mode and is read at boot (a change
+takes effect at the next gateway restart, which disconnects the node's agents; a gateway rolled back to a
+pre-#6016 binary does not honour it). Revoking the server certificate in the CA inventory removes its command-plane access only on a gateway that sets `{yuzu_gw, mgmt_crl_source}`: that gateway reads the CA's CRL (verified by signature against the management listener's CA, fetched over verified TLS) and refuses a listed serial with `crl_revoked` within `mgmt_crl_refresh_ms` of the server publishing it, with no restart, and refuses every stream (`revocation_unknown`, `revocation_stale`) when it holds no usable CRL or one past `nextUpdate` plus `mgmt_crl_grace_s`. A gateway with no source reads no CRL, so for it withdrawal is a serial in `mgmt_peer_denied` plus a gateway restart, which disconnects the node's agents, and agents without the #5183 fix stay wedged; the boot logs a WARN for that case. See "Withdrawing a server certificate" in [gateway.md](gateway.md). The gateway **refuses to boot** when a
 network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
-for pin configuration and rotation.
+for pin configuration and rotation, and "Authorizing the server by its identity" and
+`docs/adr/2004-gateway-mgmt-server-identity.md` for the identity modes.
+
+**Firewall the management port (known, accepted limitation).** The management listener
+holds at most 256 connections (`limits.max_connections`), and that is a file-descriptor
+bound, not protection. Before the TLS handshake, anyone with layer-4 reach to the port can
+hold a slot for up to the 10 s handshake timeout; after the handshake, any holder of a
+certificate issued by the install CA (every enrolled agent has one) can hold it for as long
+as `PING`s keep the connection busy, because peer authorization (pin and/or identity) runs later, per stream. About
+256 held connections would stop the server making **new** connections to the gateway;
+connections already established are unaffected. The gateway does not fix this; you must
+restrict `:50063` (and any alternative port set by `YUZU_GW_MGMT_PORT`) so that only the
+server replicas can reach it, set the management listener's `listen.ip` to the management
+interface's address so the port is not bound on the agent-facing interface, and where you can,
+multi-home the server so that the interface it uses for gateway management traffic is not
+the one that faces agents or the database. The shipped composes do not publish it, and the
+gateway cannot verify the firewall or the interface separation. To detect a flood, count
+`ss -Htn state established '( sport = :50063 )'` on the gateway host against the number of
+server replicas, and watch `yuzu_server_gateway_forward_total{status="unavailable"}` on the
+server (commands dropped after three attempts; an alert on its `increase` is recommended and
+none ships). To recover, block the source at the firewall; a process restart does not
+clear it. The agent listener has the matching
+residual risk: its 60000-connection ceiling bounds file descriptors, but a peer that
+completes the handshake and keeps sending can hold connections open and fill it, after which
+new connections wait in the kernel backlog (agents already connected are unaffected until
+they reconnect). Limit connections per source address at the L4 balancer or firewall; see
+[Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
 ## Secret Management
 
@@ -206,6 +257,12 @@ For HashiCorp Vault integration, use a wrapper script that fetches secrets at st
 export YUZU_OIDC_CLIENT_SECRET=$(vault kv get -field=secret secret/yuzu/oidc)
 exec /usr/local/bin/yuzu-server "$@"
 ```
+
+## Random-number failure during MFA enrolment
+
+If the host's random source fails while the server is generating an MFA TOTP secret, a recovery code or a recovery code's salt, the server refuses the request and issues nothing: no TOTP secret, no recovery codes and no partial enrolment. An enrolment being confirmed at that moment is rolled back and the existing recovery codes stay valid. The operator sees a retryable "Authentication store is temporarily unavailable" message (HTTP `503` at sign-in) and can retry once the host recovers. Stored enrolments and recovery codes are untouched.
+
+These attempts are audited with a `detail` starting `csprng_unavailable: ` and counted in `yuzu_secure_random_failure_total{site="mfa_enroll"|"mfa_recovery"}`, separately from a database outage. The same random source also mints sign-in and session tokens, and those draws are **not** counted or audited: if the source is wholly dead, new sign-ins fail with a bare `500` (already-established sessions keep working, but an action that mints a random identifier, such as dispatching a command from the dashboard, can fail too), and the only signals are the sign-in error rate and the server log. At the enrolment confirm step the session is minted after the enrolment has committed, so a failure there leaves the account enrolled with recovery codes the user never saw; regenerate them from Settings. See [Secret-minting failure metric](metrics.md#secret-minting-csprng-failure-metric) and the [response runbook](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503).
 
 ## Rate Limiting
 
@@ -352,7 +409,7 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
 ## Database Security
 
 - SQLite databases use WAL mode for concurrent access
-- The TAR database uses `PRAGMA secure_delete = ON` to zero deleted pages
+- The Echo database uses `PRAGMA secure_delete = ON` to zero deleted pages
 - Protect database files with filesystem permissions: `chmod 600 *.db`
 - For encryption at rest, use filesystem-level encryption:
   - Linux: LUKS on the data partition
@@ -386,11 +443,15 @@ Five classes that used to appear on this list no longer belong on it:
   is `SecretCodec`-encrypted as of the `RuntimeConfigStore` Postgres migration
   (ADR-0060) — same KEK-pairing backup rule as MFA secrets above: back the
   database and the `--ca-dir` keys directory up together.
-- **Session tokens** have no durable storage on any substrate. Sessions are
-  in-memory-authoritative (`AuthManager::sessions_`); the Postgres cutover
-  dropped the SQLite-era `sessions` table outright rather than migrating it, so
-  there is no session-token column to encrypt — or to leak in a dump. A restart
-  is itself a fleet-wide session revocation.
+- **Session tokens** are never stored. Operator sessions are durable rows in the
+  `session_store` Postgres schema (`SessionStore`, HA WS-1/1a), keyed by the
+  SHA-256 hash of the token, with `AuthManager::sessions_` as a generation-gated
+  validate cache, so there is no session-token column to encrypt — or to leak in
+  a dump. Sessions survive a server restart, so a restart is **not** a session
+  revocation: use `DELETE /api/v1/sessions?username=<name>` (force sign-out of
+  one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere). The
+  all-operators emergency procedure is in
+  [Auth database recovery](../ops-runbooks/auth-db-recovery.md#sessions-are-durable).
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
   are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
   requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
@@ -417,14 +478,52 @@ Plugins not listed or with a hash mismatch are rejected before any code executes
 The agent deduplicates commands by `command_id` so a captured or redelivered command cannot re-execute an action. Deduplication is **durable**: it is backed by a small SQLite store (`command_dedup.db`) in the agent's data directory, so protection survives an agent **restart**, not just a reconnect (HA delivery-matrix WS-0, ADR-2002).
 
 - **Terminal-outcome replay.** When a command's outcome has been recorded, a redelivery replays the **original terminal frame** — its real status, exit code, and structured error — instead of a generic rejection. This closes the "effect-once, result-maybe-lost" gap where a dropped acknowledgement of a completed command would otherwise discard its real result. The terminal frame carries the *outcome*, not the command's streamed stdout (that output is sent during execution and is not re-sent on replay). A terminal frame larger than 64 KiB has its output field replaced by a fixed marker in the store, to bound on-disk growth — status, exit code, and (bounded) error are preserved.
-- **In-flight duplicate.** A command still executing (or one that was mid-execution when the agent last stopped) is answered with a non-terminal `RUNNING` frame (output `"duplicate command still in flight"`) and is **never re-executed** — re-running a possibly-destructive command is deliberately avoided. This is *effectively-once*, not exactly-once.
+- **In-flight duplicate.** A command still executing (or one that was mid-execution when the agent last stopped) is answered with a non-terminal `RUNNING` frame (output `"duplicate command still in flight"`) and is **never re-executed** (apart from the cases described under Retention and Corrupt store recovery below) — re-running a possibly-destructive command is deliberately avoided. This is *effectively-once*, not exactly-once.
 - **Guardian control exemption.** Commands to the reserved `__guard__` plugin (real-time Guardian control/reconcile signals, not endpoint command executions) are deliberately **exempt** from deduplication — they are idempotent control messages meant to be re-applied, so they always run.
 - **Retention.** The store keeps the most recent commands (a fixed-size, clock-free ring); an outcome older than the retention window is forgotten, after which a redelivery would run again. The server generates a unique `command_id` per invocation, so legitimate commands are never affected.
-- **Degraded (fail-open) mode.** If the store cannot be opened or written (e.g. a full disk), the agent continues executing commands **undeduplicated** rather than refusing them (so a single disk fault does not drop the endpoint out of remote-control reach). This is surfaced, not silent: the `yuzu.dedup_degraded` heartbeat tag reports an agent whose store never **opened**, and the `yuzu.dedup_claim_errors` / `dedup_record_errors` / `dedup_release_errors` counters report **post-open write failures** (a full disk after boot) — together an operator can detect an agent running without replay protection. (Fleet-wide `yuzu_fleet_*` gauges and an alert derived from these tags land with the HA observability workstream.)
+- **Degraded (fail-open) mode.** If the store cannot be opened or written (e.g. a full disk; a store that is merely *corrupt* is recovered instead, see the next bullet), the agent continues executing commands **undeduplicated** rather than refusing them (so a single disk fault does not drop the endpoint out of remote-control reach). The agent reports these conditions on its heartbeat: the `yuzu.dedup_degraded` tag reports an agent whose store never **opened**, and the `yuzu.dedup_claim_errors` / `dedup_record_errors` / `dedup_release_errors` counters report **post-open write failures** (a full disk after boot). The server derives fleet gauges from them and a sample alert for the open-failure case; see [Fleet monitoring of the dedup store](#fleet-monitoring-of-the-dedup-store). That is best-effort and partial: the alert covers only a store that failed to open (a store that opened and later failed writes is visible only on the latched `..._claim_erroring` gauge, which has no alert), and the gauges do not see old agents or agents offline for more than 90 s, so they are not evidence that replay protection is in force.
+- **Corrupt store recovery.** If `command_dedup.db` is so corrupt that it cannot be opened (for example a file that is not a database after a disk fault or a partial restore), the agent moves it aside and starts a fresh store, instead of staying in degraded mode until someone deletes the file.
+  - **What and where.** The corrupt file becomes `command_dedup.db.corrupt-<unix-epoch-seconds>` in the data directory, with `-<n>` appended if that name is taken and any non-empty `-wal`/`-shm`/`-journal` files alongside as `<that name>-wal` and so on. The number is the time of the recovery in Unix seconds: `date -r N` on macOS, `date -d @N` on Linux.
+  - **What you lose.** **The command history in the corrupt file is lost**, so a command that already ran and is redelivered afterwards may run again.
+  - **How you see it.** The agent logs an error naming the quarantined file, increments the agent-local counter `yuzu_agent_dedup_quarantined_total`, and reports the `yuzu.dedup_quarantined` heartbeat tag. `yuzu.dedup_degraded` stays `0` because protection is active again. The tag is a per-process value, so it returns to 0 when the agent restarts even though the quarantined files remain; the log line and the files themselves are the lasting record.
+  - **What is kept.** Only the **newest 3** quarantined files are kept; older ones are removed automatically at the end of each recovery. They hold the same saved command responses as the live store (status, exit code and short error text, not streamed output), so treat them as sensitive as a precaution. Once reviewed they are safe to delete: remove every file matching `<data-dir>/command_dedup.db.corrupt-*`, which includes the `-wal`, `-shm` and `-journal` files that travelled with them. A normal uninstall does not remove them.
+  - **What is not replaced.** A file that still opens but has a few damaged pages is deliberately **not** replaced (that would discard commands that are still running); the agent keeps using it and only the commands that hit a damaged page run undeduplicated, counted in `yuzu.dedup_claim_errors`.
+  - **If it cannot recover.** If the file cannot be moved aside (for example a read-only directory), or the fresh store cannot be created afterwards (for example a full disk), the agent falls back to degraded mode as described above and `yuzu.dedup_degraded` is `1`; in the second case the history is already lost and the error names the kept file. Fix the directory's permissions or free the space, or move the file away by hand, and restart the agent. Repeated `.corrupt-*` files on one endpoint mean the disk is corrupting the file on successive boots; check that disk.
+  - **Unsupported.** Running two agent processes against one data directory is not supported; recovery protects the quarantined evidence from being overwritten, not the live store from the other process.
 
-No configuration is required — replay protection is always active.
+No configuration is required — replay protection is on by default (see Degraded mode and Corrupt store recovery for the cases where it is not in force).
 
 > **Changed in this release (automation/SIEM):** older agents rejected a redelivered command with a `REJECTED` response whose reason was `"command replay rejected: duplicate command_id"`. That fixed string **no longer exists** on the terminal path — a duplicate now replays the command's *real* terminal status (or an in-flight `RUNNING`). Any detection rule that keyed on the old rejection string must be updated. See the corresponding entry in `docs/user-manual/upgrading.md`.
+
+### Fleet monitoring of the dedup store
+
+Because the degraded mode is fail-open, an agent can run for a long time without replay protection and nothing on the endpoint tells the operator. The server therefore derives fleet gauges from the agents' heartbeat tags (full reference: [Agent command-dedup store telemetry](metrics.md#agent-command-dedup-store-telemetry-3663)):
+
+- `yuzu_fleet_agents_dedup_store_degraded` — agents whose store could not be **opened**. This is the one live reading, and it drives the `YuzuDedupStoreDegraded` alert (a degradation spanning more than 10 minutes fires it; severity warning).
+- `yuzu_fleet_agents_dedup_claim_erroring`, `..._record_erroring`, `..._release_erroring`, `..._record_terminal_missing`, `..._replaying` — agents whose per-process counter is above zero **since their last restart**. They latch until the agent restarts, so they are for investigation, not paging, and have no alert.
+- `yuzu_fleet_dedup_rows_max` — the largest store, in rows, as an approximate hint. A healthy value tops out near 20,500 (the 20,000-row terminal ring plus one prune interval); sustained values above about 25,000 are worth investigating (in-flight rows from crashed commands are never evicted). It can over-read after a burst of released claims, and one agent can forge it.
+- `yuzu_fleet_agents_dedup_reporting` / `..._tag_rejected` — how many agents are being measured, and how many sent a malformed value.
+
+**`YuzuDedupStoreDegraded` is a sample rule** in `docs/prometheus/yuzu-alerts.yml`. It is a control only once you load that file into your Prometheus and route `severity=warning` in Alertmanager; neither is done by any compose or Helm file the project ships. Until then the gauges on `/metrics` are the only evidence.
+
+**What this does not tell you:**
+
+1. A store that **opened and later failed writes** (a full disk after boot) leaves `store_degraded` at 0. It shows only on the latched `..._claim_erroring` gauge, which has no alert (tracked in #6932).
+2. The population is agents with a heartbeat in the **last 90 seconds**. An offline agent, or one that heartbeats slower than 90 s, drops out of every count; a degraded agent that goes offline leaves the count without having been fixed. Keep `--heartbeat` below 90 s, preferably 60 s or less.
+3. Each core replica exports only the agents attached to it: sum the counts across replicas, but take the **max** of `yuzu_fleet_dedup_rows_max`. During a failover one agent can be counted on two replicas for a few minutes, so the alert says "about N".
+4. Agents that predate these tags are invisible, and so is an agent whose row count could not be read when its store opened (it reports no `yuzu.dedup_rows`, which looks the same). `yuzu_fleet_agents_dedup_reporting` is the denominator; a 0 elsewhere means nothing until it is close to your fleet size.
+5. An agent whose heartbeat carries more than 512 status tags (or an oversized tag) has all of its tags dropped by the gateway and vanishes from every dedup count above. The gateway counts it as `yuzu_gw_heartbeat_buffer_dropped_total{reason="heartbeat_oversize"}`; no shipped alert watches it yet (#6934).
+6. A quiet graph is **not** evidence that replay protection is in force.
+
+**When `YuzuDedupStoreDegraded` fires:** *(preview-grade: the fleet count tells you how many agents are affected, not which; locating them is manual until #6931.)*
+
+1. **Find the endpoints.** There is no page or API yet that lists them (tracked in #6931), so the alert's count tells you how many to find. Search the agent logs for `Failed to open command dedup store`, or check the data directory on a suspect host.
+2. **Fix the cause:** a full or read-only data directory, or a permissions fault on `command_dedup.db` (see "Corrupt store recovery" above for a corrupt file, which the agent recovers by itself).
+3. **Restart the agent.** A restart does not re-send an in-flight operator command to it: an agent that is offline receives no queued commands, so a command running when you restart is lost, not repeated (by code reading; a chaos run to measure it is tracked in #6935). But while an endpoint has no durable dedup record, a command redelivered to it by **any** path is not absorbed: the server tries a gateway forward up to three times with the same command id, and a scheduled command can be re-driven after a fault (the undelivered backlog is visible as `yuzu_server_command_outbox_pending`, but it counts every undelivered occurrence and does not identify re-drives). You cannot see from the product whether a redelivery is in flight, so do not delay the fix for it; restarting after the fix restores protection for later commands.
+4. **Expect up to about 45 seconds** between the restart and the count dropping (the agent sends its first heartbeat one interval after it starts, 30 s by default, then the server sweeps every 15 s), and about 5 minutes more for the alert to resolve, so it can still fire for an agent that was just fixed. If the agent stays offline for more than 90 seconds it leaves the count without having been fixed, which looks the same as a fix.
+5. **"Resolved"** means the agent is back, counted in `yuzu_fleet_agents_dedup_reporting`, with `store_degraded` at 0.
+
+**Known gap:** an agent that recovered from a *corrupt* store (see "Corrupt store recovery" above) loses its replay history but is not degraded, so none of the gauges above counts it. It reports the per-process `yuzu.dedup_quarantined` heartbeat tag, which the server does not read and which returns to 0 when the agent restarts while the quarantined files stay on the endpoint. A fleet gauge for it needs a restart-surviving marker designed together with its consumer (tracked in #6933).
 
 ## Device Quarantine
 
@@ -651,8 +750,8 @@ Two consequences worth planning for:
   it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
   incident, disable or remove the rules instead; see
   [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
-- **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
-  fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
+- **Four server-internal pushes are also exempt, and you should know they exist.** The Echo
+  fleet-topology snapshot request (`echo.fleet_snapshot`), the Guardian rule push
   (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
   sync (`__sync__.now`) continue to reach a contained device. This is deliberate — gating the Guardian push would stop a quarantined device
   receiving the enforcement rules that make containment meaningful — but it means the containment
@@ -668,7 +767,7 @@ Two consequences worth planning for:
 
   | Channel | What it can do on a contained device |
   |---|---|
-  | `tar.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
+  | `echo.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
   | `asset_tags.sync` | Writes device tags. No code execution. |
   | `__sync__.now` | Requests an on-demand inventory sync — it arms the agent's existing sync scheduler and nothing else. No code execution beyond the plugin's existing daily-sync path. |
   | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |

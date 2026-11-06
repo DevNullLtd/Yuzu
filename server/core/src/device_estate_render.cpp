@@ -38,9 +38,10 @@ std::string render_stored_data_panel(const StoredDataView& v) {
     const std::string confirm_value = v.hostname.empty() ? v.agent_id : v.hostname;
     std::string h = "<section id=\"hw-stored-data\" class=\"hw-panel\" style=\"margin-top:18px\">"
                     "<div class=\"hw-hd\"><h2>Stored data</h2></div><div class=\"ci-sec\">";
-    h += "<p>Removing stored data erases what Yuzu holds about this device from seven stores: "
+    h += "<p>Removing stored data erases what Yuzu holds about this device from eight stores: "
          "generic inventory, installed software, device configuration item, application "
-         "performance, detected licences, application usage, and the endpoint presence row. "
+         "performance, detected licences, application usage, the endpoint presence row, "
+         "and fleet certificates. "
          "It cannot be undone.</p>"
          "<p>It does <b>not</b> unenrol the device. If the agent is still connected it will "
          "report again and the data will come back. Tags, custom properties, quarantine records "

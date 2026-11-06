@@ -25,6 +25,9 @@ void attach_device_ci(std::vector<InventoryDeviceRow>& rows,
         row.ci_arch = ci.arch;
         row.ci_domain = ci.domain;
         row.ci_primary_mac = ci.primary_mac;
+        row.ci_chassis_asset_tag = ci.chassis_asset_tag;
+        row.ci_chassis_serial = ci.chassis_serial;
+        row.ci_board_serial = ci.board_serial;
     }
 }
 

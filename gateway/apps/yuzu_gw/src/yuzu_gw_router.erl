@@ -67,10 +67,10 @@ start_link() ->
 %% CommandRequest field. See agent.proto CommandRequest.dispatch_tag.
 -spec send_command([binary()], map(), map()) -> {ok, reference()} | {error, term()}.
 send_command(AgentIds, CommandReq, Opts) ->
-    %% Called from the grpcbox handler of the management listener. A call that
+    %% Called from the handler process of the management listener. A call that
     %% exits (this process not running, or restarting) exits the CALLER with a
     %% reason that embeds the call and so CommandReq (plugin parameters, which
-    %% may be secrets), and grpcbox logs it: see yuzu_gw_safe_call. The default
+    %% may be secrets), and that reason would be logged: see yuzu_gw_safe_call. The default
     %% 5000 ms call timeout is kept.
     yuzu_gw_safe_call:call(?SERVER, {send_command, AgentIds, CommandReq, Opts},
                            5000, router_unavailable).
@@ -80,6 +80,8 @@ send_command(AgentIds, CommandReq, Opts) ->
 %%%===================================================================
 
 init([]) ->
+    %% A restarted router starts with none in flight (the old one's are gone).
+    report_inflight(#{}),
     {ok, #state{fanouts = #{}}}.
 
 handle_call({send_command, AgentIds, CommandReq, Opts}, {CallerPid, _Tag}, State) ->
@@ -144,9 +146,9 @@ handle_call({send_command, AgentIds, CommandReq, Opts}, {CallerPid, _Tag}, State
                 timeout_ref = TRef,
                 started_at  = StartedAt
             },
-            {reply, {ok, FanoutRef}, State#state{
-                fanouts = maps:put(FanoutRef, Fanout, State#state.fanouts)
-            }}
+            Fanouts = maps:put(FanoutRef, Fanout, State#state.fanouts),
+            report_inflight(Fanouts),
+            {reply, {ok, FanoutRef}, State#state{fanouts = Fanouts}}
     end;
 
 handle_call(_Request, _From, State) ->
@@ -171,7 +173,9 @@ handle_info({fanout_timeout, FanoutRef}, #state{fanouts = Fanouts} = State) ->
                                                      skipped => S,
                                                      timed_out => TimedOut,
                                                      duration_ms => Duration}},
-            {noreply, State#state{fanouts = maps:remove(FanoutRef, Fanouts)}};
+            Rest = maps:remove(FanoutRef, Fanouts),
+            report_inflight(Rest),
+            {noreply, State#state{fanouts = Rest}};
         error ->
             {noreply, State}
     end;
@@ -193,9 +197,9 @@ handle_info({fanout_terminal, FanoutRef, _AgentId}, #state{fanouts = Fanouts} = 
                                       skipped => F#fanout.skipped,
                                       timed_out => 0,
                                       duration_ms => Duration}},
-                    {noreply, State#state{
-                        fanouts = maps:remove(FanoutRef, Fanouts)
-                    }};
+                    Rest = maps:remove(FanoutRef, Fanouts),
+                    report_inflight(Rest),
+                    {noreply, State#state{fanouts = Rest}};
                 false ->
                     {noreply, State#state{
                         fanouts = maps:put(FanoutRef, F#fanout{received = R2}, Fanouts)
@@ -211,6 +215,11 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%% The fan-outs in flight, reported whenever the number changes (a gauge kept
+%% by the process that owns the map, so no other process asks this one).
+report_inflight(Fanouts) ->
+    telemetry:execute([yuzu, gw, router, fanouts], #{inflight => map_size(Fanouts)}, #{}).
 
 %% @doc The timeout of a fanout, in seconds, from the caller's
 %% `timeout_seconds': a value in 1..3600 is used, a larger one is clamped to

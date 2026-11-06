@@ -1,6 +1,6 @@
 # Management Groups
 
-Management groups organize devices into a hierarchy for scoped access control and targeted operations. They support both static membership (manually assigned) and dynamic membership (auto-populated by a scope expression).
+Management groups organize devices into a hierarchy for scoped access control and targeted operations. They support both static membership (manually assigned) and dynamic membership (a group that stores a scope expression; Yuzu fills only some dynamic groups from it, see the concepts table below).
 
 ## Concepts
 
@@ -9,9 +9,9 @@ Management groups organize devices into a hierarchy for scoped access control an
 | **Management group** | A named container for devices, with optional parent/child relationships. |
 | **Root group** | The built-in "All Devices" group (ID `000000000000`) is auto-created on server startup. It cannot be deleted or re-parented. Every newly enrolled agent is automatically added to this group. |
 | **Static membership** | Agents are explicitly added to or removed from the group by an operator. |
-| **Dynamic membership** | A scope expression (e.g., `ostype == "Windows" AND tag:department == "Finance"`) determines membership. Matching agents are included automatically. |
+| **Dynamic membership** | A scope expression (e.g., `ostype == "Windows" AND tag:department == "Finance"`) is stored with the group. Yuzu computes members from it only for the auto-created `Service: {name}` groups, and only once: the members are the agents carrying that `service` tag at the moment the group is created, and later tag writes do not add or remove members; the root group is filled at enrollment. For any other dynamic group created through the API the expression is stored but members are not computed, so add them with `POST /api/v1/management-groups/{id}/members`. |
 | **Hierarchy** | Groups form a tree with a maximum depth of 5 levels below the root (root + 5 child levels). Role assignments on a parent group cascade to all children. |
-| **Service groups** | When a `service` tag is set on an agent, Yuzu auto-creates a `Service: {name}` management group containing all agents with that tag. |
+| **Service groups** | When a `service` tag is set on an agent and no group of that name exists, Yuzu auto-creates a `Service: {name}` management group containing the agents that carry that tag at that moment. Membership is a snapshot taken at creation and is not refreshed afterwards. |
 | **Visibility filtering** | Non-admin users only see agents that belong to management groups where they hold a role assignment. Global administrators see all agents regardless of group membership. |
 
 ## Root Group
@@ -52,7 +52,7 @@ For example, if `jane.ops` holds the Operator role on the "London Office" group,
 > **When RBAC is disabled (the default posture):** management-group role
 > assignments are **not** consulted. Every authenticated user sees the full
 > enrolled agent set, matching the legacy-admin "full access" behaviour. The
-> dashboard agent list, the `/api/agents` endpoint, and the TAR fleet scan all
+> dashboard agent list, the `/api/agents` endpoint, and the Echo fleet scan all
 > draw from this path. If you later **enable** RBAC, visibility immediately
 > becomes role-scoped — ensure users have appropriate management-group role
 > assignments *before* enabling RBAC in production (see "Enabling RBAC" in
@@ -137,14 +137,14 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
   -H "Content-Type: application/json" \
   -d '{
     "name": "All Windows Endpoints",
-    "description": "Auto-populated with all Windows agents",
+    "description": "Windows endpoints (members added by hand)",
     "parent_id": "mg_all_devices",
     "membership_type": "dynamic",
     "scope_expression": "ostype == \"Windows\""
   }'
 ```
 
-The `scope_expression` uses the same syntax as the scope engine. Common operators:
+The `scope_expression` is stored with the group and written back by reads. Yuzu does **not** evaluate it to fill a group created this way: the new group has no members until you add them with `POST /api/v1/management-groups/{id}/members`. The expression is written in scope engine syntax, shown here for reference. Examples of that syntax:
 
 | Expression | Matches |
 |---|---|
@@ -252,6 +252,8 @@ Returns `200 OK`:
 }
 ```
 
+Switching to `dynamic` stores the expression but does not compute members. The existing members stay as they are and nothing adds or removes members from the expression afterwards.
+
 ### Delete a Group
 
 ```bash
@@ -301,7 +303,7 @@ Returns `201 Created`:
 }
 ```
 
-This endpoint is intended for static membership groups. For dynamic groups, membership is controlled by the scope expression and refreshed via `refresh_dynamic_membership`.
+This endpoint is intended for static membership groups. For a dynamic group the server computes members only for the root group (filled at enrollment) and, as a one-time snapshot at creation, for the `Service: {name}` groups it creates itself when a `service` tag is first written; for any other dynamic group created through the API, members are not computed from the scope expression.
 
 ### Remove a Member
 
@@ -320,7 +322,7 @@ Returns `200 OK`:
 }
 ```
 
-Only removes static membership records. Dynamic membership entries (added by scope expression evaluation) are not removed by this endpoint.
+Only removes static membership records. Dynamic membership entries (the root group's enrollment members and the one-time snapshot of a `Service: {name}` group) are not removed by this endpoint.
 
 ## Role Delegation
 
@@ -407,7 +409,7 @@ The caller must be a global Administrator or hold `ITServiceOwner` on the target
 
 ## Service Groups
 
-When an agent's `service` tag is set (e.g., via the asset tagging API), Yuzu auto-creates a management group named `Service: {value}`. All agents sharing that service tag are automatically included.
+When an agent's `service` tag is set (e.g., via the asset tagging API), Yuzu auto-creates a management group named `Service: {value}` if none exists. The group starts with the agents that carry that service tag at the moment it is created. Membership is a snapshot: a group that already exists is left unchanged, so tagging or untagging an agent later does not add it to or remove it from the group. To add an agent to the group, use `POST /api/v1/management-groups/{id}/members`.
 
 ```bash
 # Tag an agent with a service
@@ -421,7 +423,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tags \
   }'
 ```
 
-This creates (or updates) the group `Service: SAP` with `agent_lon_srv_01` as a member. The group uses dynamic membership internally with scope expression `tag:service == "SAP"` -- any agent tagged with `service = "SAP"` is included.
+If the group `Service: SAP` does not exist yet, this creates it with the agents tagged `service = "SAP"` (here `agent_lon_srv_01`) as members. If it already exists, the call leaves its membership unchanged. The group is stored as dynamic with scope expression `tag:service == "SAP"`, but Yuzu does not re-evaluate that expression after the group is created.
 
 ## Practical Example: Regional Delegation
 
@@ -465,7 +467,9 @@ Now `emea.lead` can manage all devices in EMEA, and members of the `emea-helpdes
 
 ## Dashboard Management
 
-Management groups are managed through the **Settings** page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.
+The **Groups and enrolment** page (`/groups`, Estate) shows the management groups read-only: the tree with each group's type and member count, the selected group's details (parent, description, who created it and when, and the stored rule of a rule-based group, that is, one of type `dynamic`), and its member list. A group's members are shown only within the viewer's scope, and the panel says so without stating how many were left out. A panel that cannot be read says so with a Retry button rather than showing an empty tree or "0 members". Membership of a rule-based group is not kept up to date from its rule, so such a group may show no members; the Dynamic membership row under Concepts describes how each kind is filled.
+
+Groups are created and deleted through the **Settings** page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.
 
 From the Settings page, administrators can:
 

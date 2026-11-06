@@ -43,6 +43,7 @@ import itertools
 import json
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -111,11 +112,16 @@ vm.runInContext(fs.readFileSync(srcPath, 'utf8'), sandbox, { filename: srcPath }
     sandbox.__configs = input.configs;
     const out = vm.runInContext('__configs.map(c => generateCompose(c))', sandbox);
     process.stdout.write(JSON.stringify({ composes: out }));
+  } else if (mode === 'env') {
+    sandbox.__configs = input.configs;
+    const out = vm.runInContext('__configs.map(c => generateEnv(c))', sandbox);
+    process.stdout.write(JSON.stringify({ envs: out }));
   } else {
     await vm.runInContext('generate()', sandbox);
     process.stdout.write(JSON.stringify({
       alerts,
       compose: el('compose-output').textContent,
+      env: el('env-output').textContent,
     }));
   }
 })().catch(e => { console.error(e && e.stack || e); process.exit(2); });
@@ -187,7 +193,7 @@ def run_node(mode, payload):
         driver.write_text(DRIVER, encoding="utf-8")
         proc = subprocess.run([NODE, str(driver), str(GENERATE_JS), mode],
                               input=json.dumps(payload), capture_output=True,
-                              text=True, timeout=60)
+                              text=True, encoding="utf-8", timeout=60)
     if proc.returncode != 0:
         raise AssertionError(f"node driver failed ({proc.returncode}):\n{proc.stderr}")
     return json.loads(proc.stdout)
@@ -367,5 +373,200 @@ class ComposeWizardCerts(unittest.TestCase):
                 self.assertIn(TLS_DIR, out["alerts"][0])
 
 
+# #4817: the wizard used to default the Grafana admin password to `admin` and
+# write whatever was chosen into the generated YAML as a literal. The compose
+# must instead require ${YUZU_GRAFANA_ADMIN_PASSWORD:?...} (the same rule as the
+# tracked composes, test_compose_default_credentials.py), the secret must live
+# only in .env, and generate() must refuse an empty value or `admin`.
+INDEX_HTML = ROOT / "tools" / "compose-wizard" / "index.html"
+GRAFANA_PASS = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+
+@unittest.skipIf(NODE is None, "node is not installed")
+class ComposeWizardGrafanaPassword(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from test_compose_default_credentials import check as grafana_check
+        cls.grafana_check = staticmethod(grafana_check)
+        cls.config = dict(BASE_CONFIG, tlsMode="default", persistentVolumes=True,
+                          pgBundled=True, pgMode="bundled", grafanaPass=GRAFANA_PASS)
+        cls.compose = run_node("compose", {"configs": [cls.config]})["composes"][0]
+        cls.env = run_node("env", {"configs": [cls.config]})["envs"][0]
+
+    def test_compose_requires_the_variable(self):
+        self.assertIn("grafana:", self.compose)
+        self.assertEqual(self.grafana_check(self.compose), [])
+        self.assertIn("${YUZU_GRAFANA_ADMIN_PASSWORD:?", self.compose)
+
+    def test_secret_only_in_env(self):
+        self.assertNotIn(GRAFANA_PASS, self.compose,
+                         "the Grafana password is written into the compose YAML")
+        self.assertIn(f"YUZU_GRAFANA_ADMIN_PASSWORD={GRAFANA_PASS}\n", self.env + "\n")
+
+    def test_checker_rejects_the_pre_4817_compose(self):
+        broken = re.sub(r"GF_SECURITY_ADMIN_PASSWORD=.*",
+                        "GF_SECURITY_ADMIN_PASSWORD=admin", self.compose)
+        self.assertNotEqual(broken, self.compose)
+        self.assertTrue(self.grafana_check(broken))
+
+    def test_index_html_has_no_default_password(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        m = re.search(r'<input[^>]*\bid="grafana-pass"[^>]*>', html)
+        self.assertIsNotNone(m, "no grafana-pass input in index.html")
+        value = re.search(r'\bvalue="([^"]*)"', m.group(0))
+        self.assertTrue(value is None or value.group(1) == "",
+                        f"grafana-pass has a default value: {m.group(0)}")
+        self.assertIn("genSecret('grafana-pass')", html)
+
+    def _generate(self, **overrides):
+        fields = dict(FORM_FIELDS, **{"tls-mode": "default", "include-grafana": True,
+                                      "grafana-port": "3000"})
+        fields.update(overrides)
+        return run_node("generate", {"fields": fields})
+
+    def test_generate_refuses_empty_or_admin(self):
+        for value in ("", "admin", "ADMIN", "  admin  "):
+            with self.subTest(value=value):
+                out = self._generate(**{"grafana-pass": value})
+                self.assertEqual(out["compose"], "", f"generate() emitted a compose for {value!r}")
+                self.assertEqual(len(out["alerts"]), 1, out["alerts"])
+                self.assertIn("Grafana", out["alerts"][0])
+
+    # #4817 review: the value is written unquoted to .env. Compose expands `$`, drops
+    # everything after ` #`, strips surrounding whitespace and treats a leading
+    # quote as quoting, so these would silently become a different password.
+    DOTENV_HOSTILE = ["pa$$word", "a$b", "${X}", "abc #def", "a b", " lead", "trail ",
+                      "a\tb", "a\nb", "a\rb", "a\x00b", "'abc'", '"abc"', "ab'c", 'ab"c',
+                      "caf\u00e9-password"]
+    DOTENV_SAFE = ["0f1e2d3c4b5a6978", "abc#def", "#abc", "a\\b", "a;b", "a=b", "a!b",
+                   "{x}", "%x%", "~x", "`x`", "a&b|c<d>e", "Pass-Word_1.2+3@4:5,6/7?8*9"]
+
+    def test_generate_refuses_dotenv_hostile_values(self):
+        for value in self.DOTENV_HOSTILE:
+            with self.subTest(value=value):
+                out = self._generate(**{"grafana-pass": value})
+                self.assertEqual(out["compose"], "", f"generate() emitted a compose for {value!r}")
+                self.assertEqual(len(out["alerts"]), 1, out["alerts"])
+                self.assertIn("Grafana", out["alerts"][0])
+
+    def test_generate_accepts_dotenv_safe_values(self):
+        for value in self.DOTENV_SAFE:
+            with self.subTest(value=value):
+                out = self._generate(**{"grafana-pass": value})
+                self.assertEqual(out["alerts"], [])
+                self.assertIn(f"YUZU_GRAFANA_ADMIN_PASSWORD={value}\n", out["env"] + "\n")
+
+    def test_accepted_values_round_trip_through_compose(self):
+        has_compose = shutil.which("docker") is not None and subprocess.run(
+            ["docker", "compose", "version"], capture_output=True, timeout=60).returncode == 0
+        if not has_compose:
+            if os.environ.get("YUZU_REQUIRE_DOCKER") == "1":
+                self.fail("YUZU_REQUIRE_DOCKER=1 but `docker compose` is not available")
+            self.skipTest("docker compose is not available")
+        # Oracle: Compose's own .env parser (no daemon needed) must give Grafana
+        # exactly the password the wizard accepted.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_wizard_env_") as d:
+            compose = Path(d) / "c.yml"
+            compose.write_text("services:\n  g:\n    image: busybox\n    environment:\n"
+                               "      - P=${YUZU_GRAFANA_ADMIN_PASSWORD:?x}\n")
+            for value in self.DOTENV_SAFE:
+                with self.subTest(value=value):
+                    out = self._generate(**{"grafana-pass": value})
+                    line = next(l for l in out["env"].splitlines()
+                                if l.startswith("YUZU_GRAFANA_ADMIN_PASSWORD="))
+                    env_file = Path(d) / ".env"
+                    env_file.write_text(line + "\n")
+                    env = {k: v for k, v in os.environ.items()
+                           if k != "YUZU_GRAFANA_ADMIN_PASSWORD"}
+                    proc = subprocess.run(
+                        ["docker", "compose", "--env-file", str(env_file), "-f", str(compose),
+                         "config", "--format", "json"],
+                        capture_output=True, text=True, env=env, timeout=60)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    got = json.loads(proc.stdout)["services"]["g"]["environment"]["P"]
+                    self.assertEqual(got, value)
+
+    def test_generate_accepts_a_strong_value(self):
+        out = self._generate(**{"grafana-pass": GRAFANA_PASS})
+        self.assertEqual(out["alerts"], [])
+        self.assertEqual(self.grafana_check(out["compose"]), [])
+        self.assertNotIn(GRAFANA_PASS, out["compose"])
+        self.assertIn(f"YUZU_GRAFANA_ADMIN_PASSWORD={GRAFANA_PASS}", out["env"])
+
+    def test_generate_ignores_the_field_without_grafana(self):
+        out = self._generate(**{"include-grafana": False, "grafana-pass": ""})
+        self.assertEqual(out["alerts"], [])
+        self.assertNotIn("YUZU_GRAFANA_ADMIN_PASSWORD", out["compose"] + out["env"])
+
+
+# The gateway's sys.config is embedded in the generated compose, where nothing
+# parses it until a container boots. The gateway's own boot decisions are Erlang,
+# and this test must run where there is no Erlang (docs-lint), so the check is
+# split on a golden file per TLS mode (tests/fixtures/compose-wizard/):
+#
+#   * here (node only): the block the wizard emits equals the golden, byte for byte;
+#   * gateway/apps/yuzu_gw/test/yuzu_gw_config_posture_tests.erl (Erlang only, the
+#     gateway CI leg): each golden passes yuzu_gw_app:evaluate_listeners/1 and
+#     evaluate_mgmt_posture/3, so a shape the gateway refuses fails there, not at
+#     `docker compose up`.
+#
+# A wizard change that alters the block fails here until the goldens are
+# regenerated, and the regenerated goldens then face the gateway's checks.
+GOLDEN_DIR = ROOT / "tests" / "fixtures" / "compose-wizard"
+GOLDEN_MODES = ("plaintext", "operator")
+REGENERATE = "python3 tests/test_compose_wizard.py --regenerate-gateway-goldens"
+
+
+def golden_path(tls_mode):
+    return GOLDEN_DIR / f"gateway-sys.config.{tls_mode}"
+
+
+def emitted_gateway_sys_config(tls_mode):
+    """The sys.config block the wizard puts in the compose for a gateway stack:
+    the lines under `gateway-sys-config:` / `content: |`, up to the first line
+    indented less than the block, with the block's indent removed."""
+    cfg = make_config(tls_mode, True, True)
+    cfg["gateway"] = True
+    text = run_node("compose", {"configs": [cfg]})["composes"][0]
+    lines = text.splitlines()
+    start = lines.index("  gateway-sys-config:") + 2
+    block = []
+    for line in lines[start:]:
+        if line.strip() and not line.startswith("      "):
+            break
+        block.append(line[6:])
+    return "\n".join(block).rstrip("\n") + "\n"
+
+
+def regenerate_gateway_goldens():
+    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+    for tls_mode in GOLDEN_MODES:
+        golden_path(tls_mode).write_text(emitted_gateway_sys_config(tls_mode),
+                                         encoding="utf-8", newline="\n")
+        print(f"wrote {golden_path(tls_mode).relative_to(ROOT)}")
+
+
+@unittest.skipIf(NODE is None, "node is not installed")
+class ComposeWizardGatewayGoldens(unittest.TestCase):
+    def test_emitted_sys_config_equals_the_golden_files(self):
+        for tls_mode in GOLDEN_MODES:
+            with self.subTest(tls_mode=tls_mode):
+                path = golden_path(tls_mode)
+                self.assertTrue(path.is_file(), f"missing golden {path}; run: {REGENERATE}")
+                golden = path.read_bytes().decode("utf-8")
+                self.assertEqual(
+                    emitted_gateway_sys_config(tls_mode), golden,
+                    f"the gateway sys.config the wizard emits for tlsMode={tls_mode} no "
+                    f"longer equals {path.relative_to(ROOT)}. If the change is intended, "
+                    f"regenerate the goldens with:\n  {REGENERATE}\n"
+                    f"and run the gateway posture tests (they check the goldens against "
+                    f"the gateway's boot decisions).")
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if sys.argv[1:] == ["--regenerate-gateway-goldens"]:
+        if NODE is None:
+            raise SystemExit("node is required to regenerate the goldens")
+        regenerate_gateway_goldens()
+    else:
+        unittest.main(verbosity=2)

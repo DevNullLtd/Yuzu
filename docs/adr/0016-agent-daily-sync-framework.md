@@ -31,17 +31,17 @@ Two existing constraints shape the design:
 - **Thin central (ADR-0004).** Most device data stays on the per-agent edge
   warehouse; central Postgres holds only what fleet-wide queries need.
 
-### Why not "TAR first"
+### Why not "Echo first"
 
-The initial instinct was to land this in the agent's local **TAR** edge
-warehouse and pull it centrally. Rejected: TAR is **pull-only by design** and
+The initial instinct was to land this in the agent's local **Echo** edge
+warehouse and pull it centrally. Rejected: Echo is **pull-only by design** and
 **event-shaped** (it records *change events*, e.g. PR #1620's `$Software`
-source records install/uninstall/upgrade deltas). TAR answers *"what changed,
+source records install/uninstall/upgrade deltas). Echo answers *"what changed,
 when"* on the edge. Our goal is *"what is installed now, daily, in central
-Postgres."* Routing a full daily snapshot through TAR would require building a
-new push/export transport that contradicts TAR's no-push philosophy, and TAR's
+Postgres."* Routing a full daily snapshot through Echo would require building a
+new push/export transport that contradicts Echo's no-push philosophy, and Echo's
 delta shape does not match a full-snapshot need. The two are **complementary,
-not substitutes**: this framework owns *current state, central*; TAR owns
+not substitutes**: this framework owns *current state, central*; Echo owns
 *change history, edge*. PR #1620 is out of scope here and lives or dies on its
 own merits.
 
@@ -56,7 +56,7 @@ is **source #1**; the seam is built right so further sources (and a future
 ### 1. Vehicle — direct push over `ReportInventory`
 Reuse the dormant `AgentService.ReportInventory(InventoryReport) → InventoryAck`
 RPC. `InventoryReport.plugin_data` is already a generic `map<string,bytes>`
-envelope (key = data-type, value = opaque blob). No TAR involvement.
+envelope (key = data-type, value = opaque blob). No Echo involvement.
 
 ### 2. Generic per-source framework (agent)
 A small, source-agnostic seam:
@@ -74,13 +74,16 @@ A small, source-agnostic seam:
 - Persist `last_sync_ts` + `last_hash` per source in the agent **`KvStore`**
   (`agents/core/src/kv_store.cpp`, `kv_store.db`), namespace `__sync__` — the
   same agent-core state store Guardian uses (namespace `__guardian__`).
-  Explicitly **not** TAR: TAR is a *plugin-owned, append-only* capture
+  Explicitly **not** Echo: Echo is a *plugin-owned, append-only* capture
   warehouse; this is *mutable agent-core* KV state, and core must not depend on
   a plugin's DB being loaded/healthy.
 - **Startup policy:** first-run or overdue (gone past one interval while
   offline) → one catch-up sync after a *short random startup delay* (so a
   mass-deploy or a site's Monday-morning power-on does not herd); otherwise wait
-  for the next phase fire.
+  for the next phase fire. *(Amended by the Update of 2026-11-04 below: "overdue"
+  means a `next_fire` more than 15 minutes late, not a full interval, and the
+  catch-up is spread over 30 minutes; the 10 minute startup delay stays for a first
+  run.)*
 
 > **Update (2026-10-04, #5327):** a source whose collect yields nothing records
 > `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
@@ -161,7 +164,7 @@ Therefore we **coexist, not replace**:
   future high-query sources get their own typed table in this store. Built per
   the `OfflineEndpointStore` template + ADR-0012 + the postgres-store-playbook:
   - **Current-state only** (replace on change). No history in central PG —
-    change-history stays an edge/TAR concern (ADR-0004 boundary).
+    change-history stays an edge/Echo concern (ADR-0004 boundary).
   - **Normalized relational rows**, **no JSONB/GIN** — honors the
     "migrate off Postgres easily" constraint. Generic parent
     `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` +
@@ -253,14 +256,14 @@ Therefore we **coexist, not replace**:
 
 ## Alternatives considered
 
-- **TAR-first + central pull** — rejected (pull-only, event-shaped; see Context).
+- **Echo-first + central pull** — rejected (pull-only, event-shaped; see Context).
 - **JSONB blob + GIN index** — rejected (Postgres lock-in; clunky range
   filters; conflicts with the migrate-off-PG constraint).
 - **Always send the full list** — rejected (abandons network-kindness).
 - **Server-dispatched daily schedule** — rejected (daily fleet fan-out; the
   agent-push model matches the RPC's purpose and self-staggers).
 - **Full version history in central PG** — rejected for v1 (fattest; contradicts
-  thin-central; history is TAR's edge concern).
+  thin-central; history is Echo's edge concern).
 
 ## Relationship to other ADRs
 - **ADR-0004** (edge warehouses / thin central) — this framework's
@@ -268,7 +271,7 @@ Therefore we **coexist, not replace**:
 - **ADR-0006/0008** (Postgres substrate) — `InventoryStore` is born-on-PG.
 - **ADR-0012** (server Postgres store contract) — `InventoryStore` follows it;
   recorded as a prioritized net-new store in `docs/postgres-migration-ladder.md`.
-- **PR #1620 / `$Software` TAR source** — complementary edge change-history,
+- **PR #1620 / `$Software` Echo source** — complementary edge change-history,
   not a substitute for this framework.
 
 ## Updates
@@ -444,6 +447,20 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > cycle, like `pkg_inventory.packages`. The same product also appears as an
 > `installed_apps` `app`/`windows` row; the two are not de-duplicated.
 
+> **Update (2026-10-29):** `middleware.ibm_mq` is collected as ecosystem `ibm_mq`,
+> kind `app`. Name, publisher and kind come from the `middleware` plugin's product
+> table, never from the row; `version` is VRM (version.release.modification), the
+> fix-pack level not being visible in the installer metadata the agent reads.
+> The collector row sets `ConstrainedPolicy::drop_source`, a per-row policy and the
+> exception to the norm above that a source which cannot answer skips the cycle: a
+> `constrained` answer contributes zero rows and the cycle continues with every
+> other source. Because the cycle's aggregate replaces the agent's stored
+> inventory, that source's stored rows are removed server-side by the replace until
+> it answers again, and the server sees no signal (`skip_reason` stays empty; the
+> agent logs one warn line). The policy exists for a steady-state constraint that
+> is a permission fact, where skipping the cycle would freeze every other source
+> for ever.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
@@ -471,16 +488,17 @@ Mechanics:
   classification: `install_location` is
   operator-tier — an ordinary stored Response (90-day default retention, no
   per-subject erasure, not covered by `--inventory-disable`), never in this
-  blob — and can name an account's home directory
+  v2 blob — and can name an account's home directory
   (`/Users/<account>/...`, `C:/Users/<name>/...`). §8's finding — that the
   sync neither crawls a logged-in user's hive nor `~/Applications` — is about
   the sync and the Windows `HKCU` path specifically; it does not extend to
   `list`: on macOS the shared `system_profiler` scan `list`/`list_inventory`
   both run CAN list entries under `/Users/<account>/Applications` (4 of the
   323 rows in the committed macOS sample), so `list` may name a home
-  directory. Any change that puts `install_location` into a hashed or synced
-  blob (the component-inventory collection's blob v3, ADR-0028) must re-open
-  §8's classification first. `list`/`list_inventory` keep their
+  directory. §8's classification was re-opened for the server store of blob v3
+  (the 2026-11-04 Update, "Slot 13 is stored on v3 only"); the change that
+  starts SENDING slot 13 (ADR-0028) must honour its outcome before an agent
+  emits it. `list`/`list_inventory` keep their
   `Inventory:Read`/`ExecuteGate::None` tier; `list_per_user`'s AdminOrApproval
   gate exists for profile enumeration, which `list` does not do (CC6.3
   decision recorded here).
@@ -523,8 +541,8 @@ header banner in `agents/plugins/app_usage/src/app_usage_parsers.hpp` are the
 per-file contracts; this entry is the routed-concerns.md pointer's full text
 (kept here, not duplicated inline in that file, to stay under its per-file
 character budget — see `docs/instruction-file-standard.md`'s placement
-ladder). The plugin reads TAR's `usage` fold read-only (`PRAGMA query_only`,
-`SQLITE_OPEN_READONLY`) — it never writes `tar.db`. Four clauses, all
+ladder). The plugin reads Echo's `usage` fold read-only (`PRAGMA query_only`,
+`SQLITE_OPEN_READONLY`) — it never writes `echo.db`. Four clauses, all
 CATASTROPHIC-IF-VIOLATED:
 
 1. **No pid, command line or user name is ever emitted.** `usage_daily_user`
@@ -537,12 +555,626 @@ CATASTROPHIC-IF-VIOLATED:
    the producer's backslash-pipe escape sequence — changing one side without
    the other silently corrupts or drops rows whose executable name contains a
    delimiter character.
-3. **A `tar_config` read failure must map to `Errored`, never `Enabled`.**
+3. **An `echo_config` read failure must map to `Errored`, never `Enabled`.**
    `source_state_from_config`'s tri-state (Enabled/Disabled/Errored) mirrors
-   TAR's own `canonical_source_enabled` #560 fix; defaulting a read failure to
+   Echo's own `canonical_source_enabled` #560 fix; defaulting a read failure to
    `Enabled` is the opposite of fail-closed.
 4. **Never send an empty blob for a constrained capture.** Skip the sync cycle
    instead — an empty blob reads server-side as "genuinely zero usage" on a
    host that is actually constrained or disabled, which is a false negative a
    downstream consumer cannot distinguish from real data.
   exposure (already derivable from the existing `os_info` source).
+
+### 2026-10-29 — `device_ci` blob v2 (store and ingest)
+
+The server now accepts and stores a versioned `device_ci` blob. This entry is the
+binding wire contract for the agent-side writer change and records the store-side
+rules. **Server-first rollout:** a v1 server cannot read a v2 blob (it would
+store `\x02` + the manufacturer and nack every cycle), so every serving replica upgrades
+before any agent emits v2; the agent-side change may additionally gate emission on an
+ack-advertised capability. No proto change.
+
+**Layout.** `blob := 0x02 scalar_record list_record*`; every record is 0x1F-separated
+and 0x1E-terminated. A blob whose first byte is not `0x02` parses exactly as before (v1).
+
+| Part | Contents |
+|---|---|
+| `scalar_record` | positions 0-21 = the frozen v1 fields (unchanged order); positions 22-32 appended: `chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`, `board_vendor`, `board_product`, `board_serial`, `board_source`, `machine_id_hash`, `machine_id_algorithm`, `machine_id_source`. Missing trailing positions stay blank; extras are ignored. |
+| status record | `status` 1F `<section>` 1F `<level>` 1F `<reason>` — one per registered section, including the three status-only ones (`chassis`, `baseboard`, `machine_id`, whose values are the appended scalars). Last wins. An unregistered section is ignored. |
+| list row | `<kind>` 1F `<c1>` ... `<cn>` — columns per kind below. A short row is padded blank, extra fields are ignored, an unknown kind is ignored. Each blob's ignored tokens (unknown kinds and sections, the scalar record, status records or kinds that carried extra fields) are named in one debug log line, so version skew is diagnosable. |
+| blob ceiling | 96 KiB (98,304 bytes) total, on the server and, equal by contract, on the agent (`kDeviceCiMaxBlobBytes` in `device_ci_kinds.hpp` and in `sync_source_device_ci.hpp`; the two binaries share no header, so each side's test pins its own constant to the literal 98304). The v1 agent's cap moves from 64 KiB to 96 KiB with it; that is behaviour-neutral, as its record is about 1 KiB. Derived from the section registry below, not from a transport limit: a p99 large host is about 25 KiB, and every kind at its row cap with a p99.9-wide row sums to about 75 KiB (table below). A conforming sender never reaches the ceiling (see "A host over the caps"). Every field is clamped to 1,024 bytes. |
+
+Section registry (one declaration, `server/core/src/device_ci_kinds.hpp`, shared by the
+parser and the store; the agent-side v2 writer MUST apply the same caps). The row budget is the
+declared p99.9 row width in wire bytes (kind token, separators and the record terminator
+included): a budget, not a bound. The 1,024-byte field clamp bounds each field and the
+ceiling bounds the blob.
+
+| Section / row kind | Columns | Row cap | Row budget (B) | Cap x budget (B) |
+|---|---|---|---|---|
+| `chassis`, `baseboard`, `machine_id` | status only | n/a | n/a | n/a |
+| `cpu` | idx, model, cores, threads, clock_mhz, socket_designation, stepping | 32 | 96 | 3,072 |
+| `dimm` | slot, size_mb, type, speed_mhz, manufacturer, part_number, serial | 64 | 96 | 6,144 |
+| `disk` | idx, model, size_gb, media_type, interface | 128 | 64 | 8,192 |
+| `swap` | device, total_mb, source | 16 | 56 | 896 |
+| `volume` | volume, mount_points, device, fstype, total_bytes, detail | 128 | 144 | 18,432 |
+| `partition` | disk, partition, size_bytes, type, mount_points, detail | 192 | 120 | 23,040 |
+| `topology` | topo_kind, name, uuid, members, detail | 96 | 144 | 13,824 |
+| rows subtotal | | | | 73,600 |
+| scalar record + status records | declared budget | | | 3,072 |
+| registry-derived total | 74.9 KiB, 78.0% of the 98,304-byte ceiling | | | 76,672 |
+
+A `static_assert` in `device_ci_kinds.hpp` holds that total to at most 80% of the ceiling, so
+changing a cap or a budget fails the build until the ceiling is reconsidered on both the server
+and the agent. A second `static_assert` keeps every row budget between the shortest possible row
+and the clamp-bound row, and at or above the measured width recorded beside it (`row_floor`), so
+a budget cannot be cut below a width actually observed to dodge the 80% line.
+
+The `partition` and `topology` budgets are assumed widths: no Linux or macOS captures exist yet
+(a Windows `partition` capture does: 76 to 85 wire bytes against the 95 floor, 2026-11-04), so they
+are re-measured when the storage legs land (`swap` has no capture either, its legs being planned, and
+its floor is its shortest possible row). `topology`'s cap is 96, not the 192 starting target,
+because 192 x 144 B would put the registry-derived total past the 80% line.
+
+**A host over the caps (sender contract).** The agent v2 writer implements this contract (see
+the 2026-11-01 entry below). The sender keeps the first N rows of each kind (N = the kind's row
+cap) in a fixed sorted order, so the blob and its hash are stable day to day, and marks the
+section `constrained` with kept-of-total counts in its reason (a token distinct from the
+server's own `server_cap:<cap>`). If the blob would still exceed the ceiling it trims whole
+sections' tail rows, least valuable first: `topology`, `partition`, `volume`, `dimm`, `disk`,
+`cpu`, `swap` (swap last; see the 2026-11-01 entry), each trimmed section staying `constrained`
+with its kept-of-total. The scalar record and
+the per-section status records are never trimmed (together about 2-3 KiB, budgeted at 3 KiB), so
+a record always fits and the base fields always land. Trimmed rows are not stored: the daily
+record is a bounded summary, the live actions return the full data, and the daily record keeps
+no history. Any later report or search over these tables must present a `constrained` host as
+incomplete, not as one with fewer rows. The server drops and nacks `need_full` a blob over the
+ceiling as a backstop for a non-conforming sender only (its base fields then never land); each
+such drop writes one warn log line (`device_ci: oversized blob from agent=...`) and counts
+`yuzu_inventory_ingest_total{source="device_ci",outcome="dropped"}`.
+
+**Plugin-action to section mapping (agent-side writer obligation).** The section identifier on
+the wire is always the row-kind token, never the plugin action name: `chassis`->`chassis`,
+`baseboard`->`baseboard`, `machine_id`->`machine_id`, `swap`->`swap`, `volumes`->`volume`,
+`partitions`->`partition`, `topology`->`topology`. `partitions`->`partition` is the one
+rename. Fibre Channel and iSCSI tables are deferred: no column contract exists yet, so
+they land as an additive store migration with their own PR.
+
+**`swap.used_mb` is excluded** from the daily row — it is volatile telemetry that changes
+every cycle, the same hash-stability rule as the 2026-06-30 entry. The on-demand action
+still reports it.
+
+**Truncation is disclosed, not silent.** Rows past a kind's cap are dropped and the
+section is persisted with level `constrained` and reason `server_cap:<cap>` (appended with
+`;` after a non-empty incoming reason), so a hash-only acknowledgement of an unchanged blob
+never presents a bounded projection as complete.
+
+**The machine ID ships only as a hash.** `machine_id_hash` must be lower-case hex (any
+length — the algorithm is open) or `-` when absent. Any other value, such as a raw
+GUID or `IOPlatformUUID`, is blanked and the `machine_id` section is persisted `constrained`
+with reason `server:machine_id_shape` (appended with `;` after a non-empty incoming reason),
+through the same disclosure path as the row caps. The limit is stated plainly: this rejects
+UUID/GUID shapes but cannot detect a raw hex id such as `/etc/machine-id`.
+
+**Hash, per version.** v1 keeps the positional 22-field join byte-for-byte (the v1
+cross-pin constants are untouched), so an old agent never loops on `need_full`. v2's
+canonical hash is the sha256 of the received blob bytes, set by the parser: the agent's
+canonical bytes are the blob, so the server carries no re-serialisation to drift (a
+cap or clamp mismatch would otherwise store the server's bounded view and storm
+`need_full`). The "raw-byte hashing must be done for all sources together" note above
+concerns changing v1 semantics and does not apply to a new format. A digest failure yields
+a v2 record with an empty hash; the store refuses it (`kError`, nack `need_full`) rather
+than store under a placeholder. A v1 agent whose manufacturer begins with byte `0x02` is
+read as v2. Its blob is its canonical bytes, so the server's sha256 of the received bytes
+equals the hash the agent claims and there is no `need_full` loop. The record is stored as v2
+with no sections and blank appended scalars, and the manufacturer loses that leading byte (it
+was taken for the version byte). The next cycle's hash-only report matches and is touched, so
+the record does not self-heal until the value changes or the agent emits v2. This is not a
+real DMI/WMI value.
+
+**Store.** Migration 2 is additive: `blob_version` plus the 11 scalars on `device_ci`, a
+`device_ci_section` status table and one typed table per list kind, each referencing
+`device_ci` with `ON DELETE CASCADE` (so decommission stays one `DELETE`). A full payload
+of either version replaces the parent row and every child row in ONE transaction under a
+per-agent advisory lock (key prefixed `device_ci:` so it never collides with the software
+store's per-agent lock); any failure rolls back with the previous set intact and nacks
+`need_full`. A v1 full replaces the child set with the empty set. The sections read runs in
+one REPEATABLE READ transaction so a replacement committing mid-read cannot mix generations.
+
+**Rollback.** Do not run an older server after migration 2. An older server keeps working
+on the migrated database (the new columns default blank and the child tables cascade), but its
+v1 full neither rewrites the v2 columns nor deletes the child rows. If you must, expect stale
+chassis, board and machine-id values and stale child rows to be served as current until each
+agent's next full report on the upgraded server.
+
+**Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
+serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
+account or a personal label as the OS reports it, so the agent redacts such entries before sending
+(2026-11-01 entry, "Mount points (personal data)"). As of the 2026-11-04 entry at the end of this
+file (H.7), the sections are served on REST and MCP behind the audited `inventory.device.ci` read.
+
+### 2026-11-01 — `device_ci` blob v2 (agent writer)
+
+The agent now emits the v2 record defined in the 2026-10-29 entry. This entry records
+what the writer does and the order in which a fresh deployment brings its components up.
+
+**v2 is emitted unconditionally.** There is no capability negotiation and no agent-side
+fallback flag; this supersedes the 2026-10-29 sentence that the agent change "may
+additionally gate emission on an ack-advertised capability". The class "a host that cannot
+produce v2" is empty by construction: an older hardware plugin (`unknown action`, rc 1), a
+missing `disk_actions` plugin and every planned leg each become a typed section status, so the
+22 base fields always land. The v1 writer is unchanged and stays byte-pinned; the v2 scalar
+record is the same clamp-join over 33 fields, and its first 22 fields equal the v1 blob.
+
+**Independent optional sections.** The 15 original actions keep abort-on-failure (a failed
+required action skips the cycle). The seven added with v2 (`chassis`, `baseboard`, `swap`,
+`machine_id`, and `disk_actions` `volumes`, `partitions`, `topology`) never abort it. All ten
+section-bearing actions, including the three that already existed (`processors`, `memory`,
+`disks`), map to a section status from the ABI4 typed result:
+
+| Source | Level | Reason |
+|---|---|---|
+| typed OK or undeclared | `ok` | typed provenance, else the plugin's own status-row token (`-` is empty), else empty |
+| typed CONSTRAINED | `constrained` | same |
+| typed UNAVAILABLE | `unavailable` | same (a planned leg reads `<os>:planned`) |
+| typed PERMISSION_DENIED | `permission_denied` | same |
+| rc != 0 | `unavailable` | `agent:action_absent` when the output starts `unknown action`, else `agent:rc=<n>` |
+| capture truncated | `unavailable` | `agent:truncated` |
+| `disk_actions` not loaded | `unavailable` | `agent:plugin_not_loaded` |
+| Windows `volumes` | `unavailable` | `agent:windows_volumes_unbounded` (the action is not run; see below) |
+| a mount point was redacted | `constrained` | `agent:mount_points_redacted`, placed before any plugin reason |
+
+**No rows from a failed section.** A section whose level is `unavailable` or
+`permission_denied` carries its status record and no rows, and its appended scalar positions
+stay blank. Nothing from a failed, truncated, absent or refused capture is projected, and the
+cap token below can never promote such a section to `constrained`.
+
+**Mount points (personal data).** The `volume` and `partition` mount-point column is forwarded as
+the OS reports it, so a volume folder-mounted under a user profile (`C:\Users\<name>\...`,
+`/Users/<name>/...`) or an APFS volume mounted at `/Volumes/<label>` would put an account name or
+a personal label into a record stored centrally on every cycle. The statement "machine-scope (no
+username/SID/user path)" in the data-classification paragraph above therefore holds for this column
+only because the writer minimises it: before the blob is built, every entry that lies under
+`/Users`, `/home`, `/Documents and Settings` or `/Volumes` is replaced with `[redacted]`. The match
+ignores case, reads `\` as `/`, ignores a leading drive letter and looks through a
+`/System/Volumes/Data` prefix, which macOS can use to spell the firmlinked user tree. The boot volume's label is user-chosen, so every
+`/Volumes` entry goes. A piece that is not a path (the tail of a label that held a comma) is
+replaced with it. A section in which any entry was replaced is `constrained` with
+`agent:mount_points_redacted`, placed before any plugin reason so the reason clamp cannot drop it.
+Drive letters, `/`, the `/System/Volumes/*` volumes themselves and any other folder mount pass
+through as the OS reported them, so the column can still name a folder an administrator chose; it is
+minimised, not proven free of names. Not covered by this paragraph: those other folder mounts; the
+user-chosen roots the Linux legs will report once they emit mount points (`/media/<user>`,
+`/run/media/<user>`), which the leg that adds them must add to the roots table and to this paragraph;
+free text in the other columns once a leg fills them with user-chosen labels; and the v1 `hostname`,
+`domain` and `ou` fields, which name a machine and are frozen. Redaction removes one route to a personal
+name. It does not change the stable-identifier capability (serial, UUID, MAC, chassis, board) that makes
+works-council review applicable, and it is not a consent mechanism: `--inventory-disable` remains the only
+control over the collection. The serial, board-serial and DIMM-serial columns of the 2026-10-29 "Personal data" paragraph
+are unchanged.
+
+**Windows `volumes` is not run.** The Windows `volumes` leg issues synchronous `DeviceIoControl`
+calls on handles opened without a deadline (`disk_actions_win.cpp`, "BOUNDING"). The daily sync runs
+on the thread the agent joins on reconnect and on shutdown, so one wedged drive would leave the
+endpoint unable to reconnect or to stop cleanly. Until those calls have a bound, the Windows writer
+does not run the action: the `volume` section is `unavailable` with `agent:windows_volumes_unbounded`
+and carries no rows. The operator-triggered `volumes` action is unchanged. The Windows
+`partitions` leg reads `Win32_DiskPartition` and `Win32_LogicalDiskToPartition`, and cross-checks the
+drive letters against `Win32_LogicalDisk`, through the bounded WMI helper (`agents/shared/wmi_bounded.hpp`, per-call deadlines), so it runs on the sync thread; only
+Windows `topology` is status-only (`windows:planned`). No other section is affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
+calls have no deadline, #3925) is closed. The reason is expected on every Windows host and needs no
+operator action; the operator-triggered `volumes` action still works there.
+
+**Pipes inside a field.** The plugins write a literal `|` as `\|` and fold a literal `\` to `/`
+(`safe_output_field`). The writer splits the list rows and the three scalar groups on an unescaped
+pipe and unescapes before the clamp, so a pipe in a label or a firmware string stays in its field and
+moves no later column. The 22 v1 positions keep the raw split: their bytes are frozen.
+
+**Caps and the reserved reason slot.** Rows are projected to the wire columns, sorted
+lexicographically on the wire row (so the blob and its hash do not depend on the plugin's
+emission order), and the first N are kept (N = the kind's row cap, equal to the server's). A
+section over its cap is `constrained` with ONE token, `agent_cap:<kept>/<total>`, appended to the
+reason after `;` when a reason exists. The base reason is clamped to the field clamp minus the
+token's maximum width, so the composed reason always fits the 1,024-byte field contract and the
+server's clamp cannot cut the disclosure. A later ceiling trim replaces the token; a record never
+carries two. The token is distinct from the server's own `server_cap:<n>`. `swap` drops
+`used_mb` (volatile); the hardware disk sentinel row and the `disk_actions` volume
+placeholder (volume name `-`) are not rows.
+
+**Ceiling trim.** If the blob still exceeds the 96 KiB ceiling, tail rows are popped kind by
+kind in the order `topology`, `partition`, `volume`, `dimm`, `disk`, `cpu`, `swap`, each trimmed
+kind `constrained` with its final kept-of-total. This clarifies the six-kind order recorded
+above: `swap` is appended last so the sender's termination proof holds for every registered
+row-bearing kind (the scalar record and status records are never trimmed, and their clamp-bound
+worst case is `static_assert`ed under the ceiling on both sides). In practice the earlier kinds
+absorb any realistic overflow first, so `swap` is a defensive tail.
+
+**Component order in a fresh deployment.** The server of this build is brought up before agents of
+the same build enroll, and every replica is on that build. The deployment contract (a fresh
+database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
+cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.
+
+### 2026-11-04 — `installed_software` blob v3 (sections) and schema v10: store and ingest
+
+This entry records the server half: the v3 wire grammar the ingest seam accepts, the store
+columns and tables it fills, and the rules the agent writer (a later change) must reproduce
+byte for byte. The v2 path is unchanged and still owns every blob that does not start with the
+v3 header. No shipped agent sends v3 yet.
+
+**Wire (same `plugin_data` and `content_hashes` key, `installed_software`).** Record 0 is the
+header `0x1F "v3" 0x1E`: an empty first field, which the v2 parser drops (it ignores a record
+with an empty name), so no v2 record can collide with it. A blob that does not start with exactly
+those four bytes is v2, including a v2 blob whose first product is named `v3`. After the header
+every record is `0x1E`-terminated with `0x1F`-separated fields, and the first field is the record
+kind:
+
+| Record | Fields after the kind | Meaning |
+|---|---|---|
+| `S` | `facet`, `status`, `base`, `token`, `duration_ms`, `bytes_read` | opens a section |
+| `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, *slot 14 (reserved, empty)*, `package_id`, `source` | an install row |
+| `-` | `row_hash` | a deletion by row hash (64 lowercase hex); parsed and validated, applied by a later change |
+| `comp` | `kind`, `name`, `version`, `version_source`, `path`, `size`, `mtime`, `anchor_app` | a component row; `version_source` is one of `filename`, `pom`, `manifest`, `metadata`, `package_json`, `pe`, `elf`, `macho`, `unreadable`; parsed and validated, stored by a later change |
+
+`facet` is a `kSoftwareSources` value (the collector source) or `component_inventory`, 1 to 64
+characters of `[a-z0-9_.]`. `status` is `full`, `delta`, `constrained`, `timeout`, `oversize`,
+`not_collected` or `disabled`; only `full` and `delta` sections carry records. `duration_ms` and
+`bytes_read` are agent-reported diagnostics: anything that is not plain digits reads as 0. Every
+field passes the v2 field step: scrub to valid UTF-8 first (U+FFFD for each invalid byte), then
+clamp to 1,024 bytes on a codepoint boundary. A `+` row's `source` must equal its section's
+`facet`. Caps bound the retained records per call: 3 MiB of blob (unchanged), 32 sections, 20,000 `+` rows, 20,000 `-`
+records, 20,000 `comp` records. A refused section gives its records back, so a call can parse more than
+20,000 in total; the 3 MiB and 32-section caps still bound the work, and refused rows never reach Postgres.
+
+**Every record is terminated, the last one too.** A blob whose final record lacks its `0x1E` was
+cut off: a truncated row refuses the section it sits in (`unterminated`; the complete rows
+before it in that section are not applied alone), and a truncated `S` record or one before any
+section cannot be attributed to a facet, so it fails the whole blob. The agent writer terminates
+every record.
+
+**No NUL byte in any record.** A record that holds a `0x00` byte refuses the section it is in
+(`nul_byte`). NUL is valid UTF-8, so the field scrub would keep it, and both hashes (the section
+hash and `instance_key`) would be taken over it; but the text bound to Postgres cannot carry a
+NUL, so the stored row would read without it while its keys were computed with it. Two rows
+(`AB` and `A\0B`) would then be stored identically under different keys, and the stored section
+hash could not be reproduced from the stored rows. The refusal is a v3 grammar rule, and the
+writer contract: **the agent writer must never emit a NUL byte in any field of any record.** The
+v2 parser is unchanged.
+
+**Containment.** A grammar violation inside a section refuses that section only: a `+`, `-` or
+`comp` record in a status-only section; a `-` record in a `full` section; a `+` source other
+than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown status, facet or
+record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
+per-call cap; a record holding a NUL byte; a final record with no terminator. The rest of a refused section is skipped to the next `S`, and the other sections
+still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
+any section, a header with no section after it, an `S` record whose facet is empty or outside
+the charset, more than 32 sections, over 3 MiB): the ingest seam answers the whole-source `installed_software` nack and counts
+`dropped`, like an over-cap v2 blob.
+
+**Nack form.** `InventoryAck.need_full` is a `repeated string`, so the per-section nack is
+`installed_software:<facet>` with no proto change. The whole-source `installed_software` stays
+the nack for a hash-only claim the server cannot match and for an unattributable v3 blob.
+
+**Section hash.** `canonical_section_hash(rows)` is the SHA-256 hex of the section's rows,
+sorted and de-duplicated, each written as all 16 wire slots (slot 14 empty, and no conditional
+tail: unlike the v2 hash, `package_id` and `source` are always written), `0x1F`-joined and
+`0x1E`-terminated. The sort walks the stored fields in wire order: `name`, `version`,
+`publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`,
+`signature_status`, `distro_id`, `distro_version`, `install_location`, `package_id`, `source`,
+byte-wise. An honest-empty `full` section hashes the empty string. The hash is over the
+**stored form** of each row: the field step above (scrub to UTF-8, then clamp) has already run,
+and the rows are sorted and de-duplicated, so an agent that mirrors it hashes the scrubbed and
+clamped fields, never the raw bytes it collected. The pinned vectors are the test cases
+`canonical_section_hash is order and duplicate independent, 16 slots always, pinned` and
+`v3_report_hash sorts by facet in byte order, carries the v3: prefix, pinned` in
+`tests/unit/server/test_software_inventory_store.cpp`; a writer is correct when it reproduces
+them.
+
+**Report hash.** The value stored in `inventory_state.content_hash` for a v3 agent, and the value
+a v3 agent claims in a hash-only report, is `v3:` followed by the SHA-256 hex of
+`facet 0x1F section_hash 0x1E` for every facet the server holds, sorted by facet in byte order.
+A facet is held when its `software_facet_state` row has status `full` or `delta` and a
+non-empty section hash. It is recomputed from that table after every v3 call, never from the
+call's own sections, so a first contact split over several calls converges to the hash a single
+call produces. A facet reporting a status-only status (`constrained`, `timeout`, `oversize`,
+`not_collected`, `disabled`) is not in the hash until a `full` section confirms it again, though
+its rows are kept. The `v3:` prefix means a v2 hash-only claim (plain hex) can never match a v3
+state, and the other way round; each side asks for a full report.
+
+**Apply rules** (`apply_installed_software_v3`, one transaction under the same per-agent
+advisory lock as the v2 replace):
+
+- *First v3 contact.* If the stored report hash does not start with `v3:` (or there is none),
+  every `installed_software` row and every facet state row of the agent is deleted first, so no
+  v2 leftover survives. A call that applies nothing (every section refused, or only `delta`
+  sections) does not do this.
+- *`full`.* Deletes the agent's rows of that facet, inserts the section's rows with their
+  derived keys, and upserts the facet state (status, token, recomputed section hash,
+  `last_confirmed_at`, duration, bytes). An honest-empty section deletes the facet's rows.
+- *Status-only.* Upserts status, token, duration, bytes and `enabled` (false only for
+  `disabled`). Rows, the stored section hash and `last_confirmed_at` are left alone.
+- *`delta`.* Not applied. Answered with a per-section nack whatever its base: a base that is
+  not the stored section hash is a plain `need_full`, a matching base is counted as
+  `delta_unsupported` and logged (sampled), because delta apply is not built. The agent falls
+  back to a full section, so nothing is lost. The `-` records are parsed and validated here and
+  applied with the delta apply path.
+- *`component_inventory`.* Grammar-validated; its facet state is recorded with an empty section
+  hash (this store holds no component rows), so it never enters the report hash. The nack is keyed
+  on the section's STATUS, not on its record count: every `full` or `delta` component section is
+  answered `need_full`, including an honest-empty `full` one, and only a status-only one is a
+  complete report. An agent that reports the facet `full` therefore resends it on every cycle until
+  the component store lands. That is safe by the delivery order: the server's component apply ships
+  before any agent sends the section, so no fleet is left in the permanent resend.
+- *Refused sections.* A refused section is skipped before any write, so its previously held
+  rows, facet state and section hash stay as they were, and the report hash still includes that
+  held section hash. A facet the agent refuses permanently therefore keeps its old rows and is
+  nacked `need_full` on every cycle until the agent is fixed (`YuzuInventorySectionIngestRefused`
+  alerts on it); this is by design, not a stuck state to repair on the server.
+- *Report state.* `inventory_state` (the report hash and `last_seen`) is written only by a call
+  that wrote at least one section's state: a `full`, a status-only or a `component_inventory`
+  section. A call made up only of `delta` and refused sections is a nack, not a received report:
+  it leaves the hash and `last_seen` alone, and the full section the agent sends on the resend
+  is what advances them.
+- *Failure.* A SQL failure rolls the whole call back and every section in it that was not
+  refused is answered `error` and nacked. A v2 full report additionally deletes the agent's
+  `software_facet_state` rows, and `delete_agent` deletes them too.
+
+**Slot 13 is stored on v3 only.** `install_location` (wire slot 13) is stored from the v3 `+`
+record. The v2 path still parses and discards it, so a v2 row's location is always empty and the
+v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on both paths, so
+#5186 is closed for slot 13 only.
+
+*§8 outcome for slot 13 (this change re-opens §8 for the server store).* `install_location` is
+operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
+directory, so it is classified like the `list` column above. It is erased on decommission
+(`delete_agent` deletes the rows), and nothing in this change reads it back (no route, tool, page
+or log line carries it). The server stores it as sent after the field step, without minimisation,
+so **the agent writer must not send per-user paths**: that precondition is owned by the change
+that starts sending slot 13, which must also test that no profile path is emitted.
+
+**`install_type` and `install_scope`.** Both are derived by the server at insert time and are
+never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
+`package_manager`, `optional_feature`, `runtime`, `middleware`, `component`, `driver`, or `''`
+for a row not yet derived. The source decides it: `installed_apps.list_inventory` → `installer`,
+except that a row of ecosystem `deb`, `rpm`, `apk` or `pacman` (the same collector lists the Linux
+packages) is `package_manager`, so the same package reads the same with or without a source;
+`pkg_inventory.managers` and `pkg_inventory.packages` → `package_manager`;
+`pkg_inventory.store_packages` → `store`; `windows_optional_features.list` →
+`optional_feature`; `msi_packages.list_inventory` → `msi`; `runtimes.python` → `runtime`;
+`middleware.ibm_mq` → `middleware`. A row with an empty source (a pre-tail agent) falls back by
+ecosystem: `msi` → `msi`, `optional_feature` → `optional_feature`, `python` → `runtime`,
+`ibm_mq` → `middleware`, `snap` and
+`flatpak` → `store`, `brew`, `rpm`, `deb`, `apk`, `pacman` → `package_manager`, `windows`, `macos`,
+`macos_pkgutil` → `installer`, anything else `''`. `component` and `driver` are reserved for the
+component and drivers facets; no source maps to them yet. The table has a compile-time
+totality check over `kSoftwareSources`, so a new collector cannot ship without an install type.
+The `pkg_inventory.managers` presence row is stored in `installed_software` today, so it is typed
+`package_manager` like the packages it manages; it is not exempted by name. `install_scope` is
+`machine` or `user`; collection is machine-scope only, so the server writes `machine`.
+
+**`purl`.** A Package URL per row, composed by the server (`purl_compose.hpp`, `compose_purl`)
+from fields already on the `+` record and stored in `installed_software.purl`. It is not on the
+wire and in neither hash, so the agent and the v2 path are untouched. Only the v3 apply path
+sets it: a row from a v2 report carries an empty `purl` until its device's first v3 report (the
+`install_location` coexistence rule). It is built to the Package-URL specification (ECMA-427,
+Clause 5 and the `alpm`, `apk`, `brew`, `deb`, `rpm` type definitions of the purl-spec
+repository) and is `''` wherever the specification registers no type for the ecosystem: a type
+is never invented. `purl_type_for` (the title normalisation pack's ecosystem table) is the one
+source of the type. Rules common to all types: UTF-8 bytes percent-encoded except
+`A-Z a-z 0-9 . - _ ~ :`; qualifier keys sorted, empty values dropped; `''` when the name or the
+version is empty, when a required namespace has no source, and when the result would exceed 2048
+bytes (never truncated).
+
+| Ecosystem | Result | Notes |
+|---|---|---|
+| `deb` | `pkg:deb/<distro_id>/<name>@[<epoch>:]<version>[-<revision>]?arch=&distro=` | name lowercased |
+| `rpm` | `pkg:rpm/<distro_id>/<name>@<version>[-<release>]?arch=&distro=&epoch=` | name keeps its case; epoch is a qualifier |
+| `apk` | `pkg:apk/<distro_id>/<name>@<version>[-r<pkgrel>]?arch=&distro=` | the agent stores pkgrel without apk's `r` |
+| `pacman` | `pkg:alpm/<distro_id>/<name>@[<epoch>:]<pkgver>[-<pkgrel>]?arch=` | rolling: no distro qualifier |
+| `brew` formula | `pkg:brew/<name>@<version>` | default tap; `@` in a name is `%40` |
+| `brew` cask | `pkg:brew/homebrew/cask/<name>@<version>` | the Homebrew presence row gets no purl |
+| `windows`, `macos`, `macos_pkgutil`, `msi`, `snap`, `flatpak`, `optional_feature`, `python`, `ibm_mq` | `''` | no registered type; `python` rows are interpreter installs, not PyPI distributions |
+
+The namespace is the lower-cased `/etc/os-release` ID (`distro_id`). `distro` is
+`<distro_id>-<distro_version>` and only when both are known. `arch` is the stored architecture
+when non-empty, except for `brew`, whose type defines no `arch` qualifier. An index (`installed_software_purl_idx`, a partial btree `WHERE purl <> ''`) and
+`SoftwareInventoryStore::find_by_purl` serve exact lookups; no route, tool or page reads the
+column yet.
+
+**Keys, and why the uniqueness is not the identity.** Two keys are derived in one place (the
+store's `derive_install_keys`) on both insert paths:
+
+- `instance_key` is the SHA-256 hex of the row's single canonical record (the section-hash
+  serialisation of that one row). Rows are sorted and de-duplicated before insert, so it is
+  unique per agent by construction. It is the value a `-` record names. A partial unique index on
+  `(agent_id, instance_key) WHERE instance_key <> ''` enforces it.
+- `identity_key` is `norm_key(name, publisher)`, `0x1F`, `version`, `0x1F`, `arch`, `0x1F`, the
+  install location lower-cased with trailing path separators stripped (empty on v2 rows). It is
+  stored and **not** unique and not indexed; it is the key a later consolidation step will use.
+
+This deviates from the spec row, which asked for a `UNIQUE (agent_id, identity_key, removed_at)`.
+The Update of 2026-10-17 above records that one MSI product is listed by both
+`msi_packages.list_inventory` and `installed_apps.list_inventory` and that the two rows are not
+de-duplicated. They share an identity, so an identity-keyed unique constraint would reject the
+first v10 ingest of every Windows host that has an MSI product. `removed_at` belongs to the
+deletion-tracking change and is not added here.
+
+**Migration v10** (`docs/postgres-migration-ladder.md`, `SoftwareInventoryStore` row): six
+columns on `installed_software` (`install_type`, `install_scope` default `machine`,
+`install_location`, `identity_key`, `instance_key`, `purl`; constant defaults, no rewrite); two CHECK
+constraints (`install_type` in the vocabulary above or `''`, `install_scope` in `machine`,
+`user`) added `NOT VALID` (`''` is the "not derived" value of `install_type`); the partial unique index
+above and the partial btree `installed_software_purl_idx` on `(purl) WHERE purl <> ''`; and the new `software_facet_state (agent_id, facet, status, token, section_hash, enabled,
+last_confirmed_at, duration_ms, bytes_read, updated_at)` table, primary key `(agent_id, facet)`.
+The index builds are not online: they hold `ACCESS EXCLUSIVE` for their duration, under the same
+fresh-database hard-cutover ruling of 2026-10-24 (not v7's basis; see the ladder and the playbook's
+recorded-exception register). In a fresh deployment the table is empty, so the
+build returns at once; the ladder row keeps the measured build time over a populated table as a
+hazard note only.
+
+**Partitioning decision: `installed_software` stays a plain table.** No measurement exists (the
+partitioning spike was skipped). Hash-partitioning by `agent_id` needs the non-transactional
+migration kind that is not built (`app_perf_daily_store.hpp`, the ladder), would rewrite the
+table under `ACCESS EXCLUSIVE` at a size past the v7 ceiling of 2-4M rows, and would turn the one
+measured query, the `installed_software_name_idx` seek, into a scan of every partition. The
+decision is reversible and is revisited when a measurement exists.
+
+**Observability.** Each section bumps `yuzu_inventory_section_ingest_total{facet,outcome}`
+(`outcome`: `stored`, `status_only`, `need_full`, `delta_unsupported`, `rejected`, `error`; `facet`
+is a collector source, `component_inventory`, or `unknown`, never the agent's raw string). The
+apply is timed under `yuzu_inventory_ingest_duration_seconds{source="installed_software",phase="v3"}`,
+and the source-level
+`yuzu_inventory_ingest_total` outcome is `stored`, `need_full`, `error` or `dropped`. The
+agent-reported per-section duration and bytes live in the facet state row, not in Prometheus
+labels.
+
+**Hand-off to the delta apply and the agent writer.** Two facts the next changes must carry.
+`instance_key` hashes the row's whole 16-slot record, so adding a slot to that record re-keys
+every stored row once, so the agent writer and the server move together on it. Until the
+delta apply and the component store exist, every `delta` section and every `full` or `delta`
+`component_inventory` section (even one with no records) is answered `need_full`; the agent writer's golden-vector parity
+test must reproduce the section hash, the report hash and the hash membership rule above
+byte for byte, including that a facet whose status moves from `full` to a status-only status
+(for example `disabled`) leaves the report hash while its rows are kept.
+
+Three further facts belong to the agent change that sends v3. (1) The shipped
+`SyncScheduler::apply_ack` (`agents/core/src/sync_scheduler.cpp`) matches `need_full` by the
+exact source name, so the per-section token `installed_software:<facet>` reads as a clean sync:
+the scheduler must treat any `installed_software:*` token as a nack of the source, or a
+refused or delta section is never resent. (2) Sequencing is same-build only: every server
+replica of the build is up before the agents of that build enroll, and this ADR records no
+behaviour of the record against an earlier server. (3) `ConstrainedPolicy::drop_source` (the 2026-10-29 Update) removes the source's
+rows on a constrained read under v2, because the full replace omits them; under v3 the same
+read is a status-only section and the rows are kept, so the writer must send `full` (honest
+empty) to retire a facet's rows and not a status. The first v3 call of a device that applies a section also deletes
+all its v2 rows first, so it should carry `full` for every facet it holds.
+
+**Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
+writer; any read surface returning the new columns (the existing reads select the old columns
+only; `find_by_purl` is a store method with no caller).
+
+### 2026-11-04 — sync-now parameters, the installed-software window, and overdue catch-up
+
+This amends the trigger text of section 3 and the `__sync__.now` reserved-command contract. No
+proto field is added: both new inputs are entries in the command's existing string `parameters`
+map, and the wire, the KV keys and the heartbeat tags are unchanged.
+
+- **`__sync__.now` parameters.** `source` accepts `all`, one name, or a comma-separated list. The
+  list is all-or-nothing: any unknown name fails the command (exit 2, naming the valid set) and
+  arms nothing. `delay_max_s` is an integer from 0 to 86400; absent or 0 is the immediate path.
+  When it is above 0 the agent still forces a full report, but fires it at a stable per-agent
+  offset in `[0, delay_max_s)` from the request instead of at once; a source already armed to
+  fire sooner keeps the sooner time, so a repeated request never delays it. A malformed or
+  out-of-range value fails the command (exit 2); a present but empty value is malformed. The
+  existing `stagger_seconds` field stays ignored for `__sync__`. The server sends neither
+  `delay_max_s` nor a source list yet, so an operator's sync-now is immediate today.
+- **The sender's audit row.** The change that adds the server-side sender records `delay_max_s`
+  and the target source list in the dispatch's audit row. The sender and the agent are the same
+  build, so it needs no version or capability gate.
+- **Installed-software window.** `installed_software` is scheduled inside a nightly window of
+  01:00 to 05:00 in the machine's local time, at a stable per-agent moment
+  (`fnv1a(agent:window:source)` over the window length, to the second); a source without a window
+  fires at a phase offset of its interval. The skip backoff of #5327 is capped at that moment rather than at
+  the next phase slot. It governs the regular daily sync only: the first sync after enrolment,
+  skip-ladder and `need_full` retries, catch-up and an operator's sync-now can fall outside it.
+  The window is a compile-time default carried by the source; there is no channel to change it
+  per fleet yet, and a settings push is deferred. "Local" is the machine's own clock and time
+  zone: an agent with no zone configured (a container, a VDI image, a service with `TZ` unset)
+  runs on UTC and gets 01:00 to 05:00 UTC, which can be working hours where its users are. A
+  local time that does not exist (a spring-forward gap) resolves forward, an ambiguous one
+  (fall-back) resolves to whichever instant the C library chooses. A machine that is off or
+  asleep through its window syncs at its next wake (see catch-up) and then returns to the next
+  window. A source's full resend floor (7 days) is checked at its fire time, so across a
+  spring-forward change the seventh day's fire is an hour short of it and the full send lands on
+  the eighth: the floor is 7 to 8 days. Sources without a window keep the interval and phase-slot cadence.
+- **Capacity.** A window concentrates the day's reports. A fleet in one time zone reports
+  within four hours rather than across twenty-four: about 70 `ReportInventory` calls a second per
+  million agents at the peak, against about 12 for the uniform spread (six times), and zones
+  overlap less than a uniform spread would. Hash-skip is unchanged, so most of those calls carry
+  a hash only; the blob goes out for a changed source, at the 7 to 8 day floor and for an
+  operator-forced sync. The handler takes a per-agent lock and no fleet-wide one, and nothing
+  rate-limits it; these figures are arithmetic from the window length, not measurements, and
+  pool sizing against them has not been measured.
+- **Catch-up.** A persisted `next_fire` more than `kMaxTickSeconds` (15 minutes) in the past,
+  which a live agent never has, or more than two days ahead (a clock stepped back, a restored
+  VM, a corrupt value: no interval plus window reaches two days), is re-armed to now plus a
+  stable offset in `[0, 30 min)`. It is checked on every batch pass, so it covers both a restart
+  and a tick that runs long after the previous one (sleep and resume). It changes the schedule
+  only: `last_hash` and `force_full` are untouched, so a catch-up sync is hash-only unless the
+  source changed. An overdue source is spread rather than fired at once, which is the startup policy section 3
+  describes. First-run jitter (10 minutes) is unchanged. After a mass reboot or
+  a server outage every overdue agent reports within 30 minutes: about 550 calls a second per
+  million agents (eight times the in-window peak). The 30 minute spread is a constant and does
+  not scale with the fleet.
+- **Forced syncs and outages.** An operator-forced sync is outside catch-up only while its pass
+  is current. If the forced pass finds nothing to send or its send fails, `next_fire` stays at
+  the request time and the batch pass retries every 30 seconds, but only for 15
+  minutes; catch-up then re-arms it to a stable offset in `[0, 30 min)` and the 30 second retries
+  resume from there, with `force_full` kept so the sync is still full. The same applies to any
+  source whose send keeps failing: during a long outage an agent retries in 15 minute bursts
+  separated by a pause of up to 30 minutes.
+  A server that comes back is reached within about 30 seconds if the agent is mid-burst and
+  otherwise within 30 minutes; a sync-now that failed on first send can arrive up to about
+  45 minutes after it was requested (15 minutes to notice, up to 30 of spread).
+- **Staleness.** A windowed source's consecutive daily syncs are 24 hours apart, 23 or 25 across
+  a clock change, because the moment is fixed in local time; a machine that missed its window
+  reports at its next wake. With the 45 minutes above, both stay inside the 48 hour "two missed
+  daily cycles" staleness threshold of `docs/user-manual/inventory.md`, and the freshness gauge
+  keys on server receipt time, so no freshness expectation is weakened.
+
+### 2026-11-04 — `device_ci` read surface on REST and MCP (H.7)
+
+`GET /api/v1/hardware/{id}` and the MCP tool
+`get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
+The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
+served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
+level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
+generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
+(`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
+unreadable`; it is never a `200` with an empty sections list.
+
+Each table-backed section's status row also records `row_count` (migration v3, additive and
+nullable): the number of child rows the full replace actually inserted for it, taken from the insert in
+the same transaction and never from the agent. The read side compares it with the rows it reads in the
+same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
+restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
+rows that were read are still served.
+
+The status row also records `content_digest` (the same migration v3, additive and nullable): the
+SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
+count, row count, then each row's position and cells, with any NUL byte in a cell skipped because the
+store cannot keep one), computed by the server from the rows it inserts in the same transaction,
+never taken from the agent. It is stored as `v1:<64 hex>`: the prefix names the preimage layout, and a
+stored digest that is a well-formed digest of a different layout version (`v<n>:` with a non-empty
+remainder, n one to six digits, not 1, no leading zero) is treated as unverified, never as a mismatch; every other
+non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex, a malformed version,
+`v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
+same-count edit read as complete. A later layout change or a registry column change (see the warning in
+`device_ci_kinds.hpp`) can therefore be rolled out under a new prefix without raising a false integrity
+alarm on every stored row. One pure function
+(`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
+read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
+row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
+and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
+reason. The rows that were read are still served, but they are not the values the agent reported. A
+lost row is reported by the count token alone, since it changes the digest too. This is an integrity
+check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
+tables can also rewrite the digest column, and the digest covers the rows only, not the section's
+level or reason. It closes the same-count content drift that the count alone could not see (finding
+`up2r-up-3`). A status-only section (chassis, baseboard, machine_id) and a section written before v3
+store NULL for both, are not verified, and read exactly as before.
+Only a full replace records the count and repairs a mismatched section: a device whose hash is
+unchanged sends only a hash, which leaves the rows alone, so this happens on a hardware change, an
+operator Sync now of the device record (`POST /api/v1/hardware/{id}/sync`; the fleet-wide route and the
+MCP `sync_hardware_software` tool re-send installed software only and do not repair a section), or the
+weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
+for up to a week after upgrade. The wire format and the agent are unchanged. Migration 3 is a single
+additive `ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, ADD COLUMN IF
+NOT EXISTS content_digest TEXT NULL` (the digest column is folded into v3 because v3 had not shipped;
+the runner is gated on the recorded version only, so a development database that already recorded the
+earlier row-count-only v3 must be reset with `UPDATE public.schema_meta SET version = 2 WHERE store =
+'device_inventory_store';` and a server restart, or recreated). The rollback note above
+holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
+there, so the sections it writes are unverified until a v3 server next does a full replace for that
+device.

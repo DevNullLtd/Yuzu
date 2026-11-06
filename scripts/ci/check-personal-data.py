@@ -54,8 +54,9 @@ control characters in the path escaped.
 Shrink-only ratchet: `--ratchet` (CI) compares the baseline against its
 merge-base version (`--base`, default origin/dev; the same shape as
 check-governance-ledger.py); any (path, detector) whose max_hits rose, or any
-new entry, fails. A baseline absent at the base (the PR introducing it) is
-skipped with a notice.
+new entry, fails. A file git detects as RENAMED between the merge-base and HEAD
+keeps its allowance under its new path, so moving a baselined file is not growth.
+A baseline absent at the base (the PR introducing it) is skipped with a notice.
 
 Exit: 0 clean, 1 new hits (or stale under --strict-baseline), 2 usage/error.
 """
@@ -421,6 +422,17 @@ def scan_repo(root: str):
     return hits, skipped
 
 
+def renamed_paths(root: str, mb: str):
+    """{old path: new path} for files git detects as renamed between mb and HEAD.
+    Only git-detected renames qualify (default -M, 50% similarity); a move git cannot pair stays a
+    new entry, which fails closed. -l5000 raises git's exhaustive-rename-detection limit; past it git
+    skips inexact detection (and warns on stderr, which is left visible in the CI log)."""
+    out = subprocess.run(["git", "-C", root, "diff", "-z", "-M", "-l5000", "--name-status",
+                          "--diff-filter=R", mb, "HEAD", "--"], check=True,
+                         stdout=subprocess.PIPE).stdout.decode("utf-8", "surrogateescape").split("\0")
+    return dict(zip(out[1::3], out[2::3]))  # -z renames: "R<score>", old, new
+
+
 def ratchet(root: str, base: str, counts_now):
     """Shrink-only check of the baseline vs its merge-base version.
     -> (problem lines, notice or None). Raises CalledProcessError if the base
@@ -431,7 +443,8 @@ def ratchet(root: str, base: str, counts_now):
                           capture_output=True)
     if show.returncode != 0:
         return [], f"ratchet skipped: {BASELINE_REL} does not exist at the merge-base"
-    old = {(e["path"], e["detector"]): int(e["max_hits"])
+    renamed = renamed_paths(root, mb)
+    old = {(renamed.get(e["path"], e["path"]), e["detector"]): int(e["max_hits"])
            for e in json.loads(show.stdout.decode("utf-8")).get("entries", [])}
     problems = []
     for (p, d), n in sorted(load_baseline(root).items()):

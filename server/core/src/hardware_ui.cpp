@@ -229,6 +229,11 @@ std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
     return h;
 }
 
+/// One newest-wins sync scope for the list's requests: the search box (`this:replace` on #hw-q)
+/// and every sort header / pager button (`#hw-q:replace`) share #hw-q's xhr slot. `this:abort`
+/// dropped a request issued while another was in flight, losing the operator's latest click.
+constexpr std::string_view kHwSyncScope = "#hw-q:replace";
+
 std::string sortable_th(const char* label, HwSortKey key, const HardwareListQuery& q) {
     const bool active = parse_hw_sort_key(q.sort) == key;
     const bool next_desc = active ? !q.desc : false;
@@ -239,7 +244,7 @@ std::string sortable_th(const char* label, HwSortKey key, const HardwareListQuer
     std::string indicator = active ? (q.desc ? " &#9660;" : " &#9650;") : "";
     return std::string("<th class=\"sortable\" hx-get=\"") + esc(list_url(nq, false, true)) +
            "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-           "hx-sync=\"this:abort\">" + label + indicator + "</th>";
+           "hx-sync=\"" + std::string{kHwSyncScope} + "\">" + label + indicator + "</th>";
 }
 
 std::string chip(const char* label, const std::string& value, const HardwareListQuery& q,
@@ -318,13 +323,13 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
         pq.offset = q.offset >= q.limit ? q.offset - q.limit : 0;
         h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(pq, false, true)) +
              "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-             "hx-sync=\"this:abort\">Prev</button>";
+             "hx-sync=\"" + std::string{kHwSyncScope} + "\">Prev</button>";
     }
     if (q.offset + q.limit < total_matching) {
         HardwareListQuery nq = q; nq.offset = q.offset + q.limit;
         h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(nq, false, true)) +
              "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-             "hx-sync=\"this:abort\">Next</button>";
+             "hx-sync=\"" + std::string{kHwSyncScope} + "\">Next</button>";
     }
     h += "</div>";
     return h;
@@ -356,7 +361,7 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bo
         const std::string ram = ci_ram_gb(d.ci_ram_bytes);
         return ram.empty() ? std::string("<span class=\"hw-grey\">&mdash;</span>") : ram;
     }();
-    // IP (round-3 item 10): the ONLY source is the live TAR fleet-snapshot cache —
+    // IP (round-3 item 10): the ONLY source is the live Echo fleet-snapshot cache —
     // online-only, honestly "—" once offline rather than a stale last-known value.
     const std::string ip_cell = d.ips.empty()
         ? "<span class=\"hw-grey\">&mdash;</span>"
@@ -535,6 +540,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     // keystroke. `changed`/`delay:` are plain token parsing (no eval), so they degrade
     // safely instead of silently. The input also lives OUTSIDE `#hw-results`, targeted
     // by every other control via `hx-include`, so its own swap can never destroy it.
+    // hx-sync="this:replace" is this element's side of kHwSyncScope: th/pager requests sync on #hw-q.
     h += "<input id=\"hw-q\" type=\"search\" class=\"hw-search\" name=\"q\" value=\"" + esc(q.q) +
          "\" placeholder=\"Search hostname, serial, model, CPU&hellip;\" hx-get=\"" +
          esc(list_url([&] { HardwareListQuery nq = q; nq.offset = 0; return nq; }(), false, true)) +
@@ -819,12 +825,15 @@ std::string render_hardware_software_lens(const std::string& agent_id,
     if (!software)
         return "<div class=\"gp-banner hw-degrade\"><b>Installed software unavailable.</b> The software "
                "inventory store could not be read. Retry shortly.</div>";
+    // The Software page's host view for this device (the hash is read client-side).
+    const std::string open_link = "<a class=\"gp-link\" href=\"/software#host=" +
+                                  url_query_value(agent_id) + "\">Open in Software</a>";
     if (software->empty()) {
         if (!online)
             return "<div class=\"hw-empty\">No installed-software inventory on record (device is "
-                   "offline and has not synced).</div>";
-        return "<div class=\"hw-empty\">No installed-software inventory synced yet for this device."
-               "<div style=\"margin-top:.5rem\">" +
+                   "offline and has not synced). " + open_link + "</div>";
+        return "<div class=\"hw-empty\">No installed-software inventory synced yet for this device. " +
+               open_link + "<div style=\"margin-top:.5rem\">" +
                sync_button(agent_id, "installed_software", "software", sync, "Sync now") +
                "</div></div>";
     }
@@ -842,7 +851,7 @@ std::string render_hardware_software_lens(const std::string& agent_id,
     else
         summary += ", last synced " + esc(format_iso_utc(*software_last_seen));
     std::string h = "<div class=\"hw-panel\"><div class=\"hw-page\" id=\"hw-sw-summary\">" + summary +
-                    (truncated ? " (list truncated)" : "") + "</div>"
+                    (truncated ? " (list truncated)" : "") + " &middot; " + open_link + "</div>"
                     "<div class=\"hw-tools\"><input class=\"hw-search\" "
                     "placeholder=\"Filter installed software…\" oninput=\"gpSearch(this)\" "
                     "data-gpf=\"hwsw\"></div>";

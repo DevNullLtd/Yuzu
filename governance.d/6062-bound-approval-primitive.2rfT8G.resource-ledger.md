@@ -92,7 +92,7 @@ unconditionally are unrelated to this diff.
 **Coverage statement above is superseded.** At `07cf67812` the author ran, locally and against
 Postgres 18: the Linux focus group and `--suite server` (27/27), MSVC (0 errors, approval filter
 403 cases, server suite 24/24, docs suite with two load-only lint timeouts that pass alone),
-Apple Clang (server, tar and agent suites), ASan+UBSan over the whole server suite (13,058
+Apple Clang (server, echo and agent suites), ASan+UBSan over the whole server suite (13,058
 cases, no reports) and TSan over the whole server suite (no ThreadSanitizer reports; one
 unrelated timing flake in `test_rbac_account_lifecycle_guard.cpp`, which passes alone and which
 this branch does not touch). The TSan binary leaves out `test_same_site_write_gate.cpp`, which

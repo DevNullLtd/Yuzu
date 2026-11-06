@@ -118,6 +118,27 @@ TEST_CASE("Security page: CSP-safe and keeps a revealed secret out of htmx histo
     CHECK(count_of(html, "id=\"toast-container\"") == 1);
 }
 
+TEST_CASE("Security page: an error toast carries a close control and the others do not",
+          "[settings][security_page]") {
+    const std::string html = kSettingsSecurityHtml;
+    const auto at = html.find("function showToast(message, level)");
+    REQUIRE(at != std::string::npos);
+    const auto end = html.find("document.body.addEventListener('showToast'", at);
+    REQUIRE(end != std::string::npos);
+    const std::string fn = html.substr(at, end - at);
+    // The close button is built only for the error level (an error toast is never removed on a
+    // timer, so each failed retry would otherwise stack another permanent one), reaches the page
+    // through textContent, and removes its own toast.
+    CHECK_THAT(fn, ContainsSubstring("if (level === 'error') {"));
+    CHECK_THAT(fn, ContainsSubstring("close.textContent = '\\u00d7';"));
+    CHECK_THAT(fn, ContainsSubstring("close.onclick = function () { t.remove(); };"));
+    CHECK_THAT(fn, ContainsSubstring("t.appendChild(close);"));
+    // Success and warning keep their timers; nothing was added to them.
+    CHECK_THAT(fn, ContainsSubstring("if (level !== 'error') setTimeout(function () { "
+                                     "t.remove(); }, level === 'warning' ? 8000 : 4000);"));
+    CHECK_THAT(fn, !ContainsSubstring("innerHTML"));
+}
+
 TEST_CASE("Security page: the swap override is scoped to HTML bodies from the four panels",
           "[settings][security_page]") {
     const std::string html = kSettingsSecurityHtml;

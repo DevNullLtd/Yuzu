@@ -18,7 +18,7 @@
 %%%
 %%% Real:  yuzu_gw_registry (needs pg + ETS — all_register_reqs/0 reads
 %%%        straight from the table).
-%%% Mocks: grpcbox_client, telemetry.
+%%% Mocks: yuzu_grpc_client, telemetry.
 %%%
 %%% #1197 adds the targeted path: the server's unknown-session verdict
 %%% (BatchHeartbeatResponse.unknown_session_ids) reaches
@@ -33,6 +33,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_registration_replay_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include("../src/yuzu_grpc_client.hrl").
 
 -export([log/2]).  %% logger handler callback, see capture_logs/1
 
@@ -57,16 +58,18 @@ replay_test_() ->
      fun setup/0,
      fun cleanup/1,
      [
-      {"reconnect re-proxies every registered agent",
+      {"a full replay re-proxies every registered agent",
        fun reconnect_replays_all_agents/0},
-      {"reconnect with zero agents sends no replay rpc",
+      {"a full replay with zero agents sends no replay rpc",
        fun reconnect_zero_agents_no_rpc/0},
-      {"agent deregistered before reconnect is not replayed",
+      {"agent deregistered before a full replay is not replayed",
        fun deregistered_agent_not_replayed/0},
       {"replayed payload is byte-identical to stored request",
        fun replay_payload_is_verbatim/0},
-      {"half_open to closed transition triggers replay",
-       fun half_open_recovery_triggers_replay/0},
+      {"a success after a failure while closed replays nothing",
+       fun closed_recovery_replays_nothing/0},
+      {"the half_open to closed transition replays nothing",
+       fun half_open_recovery_replays_nothing/0},
       {"HA WS-4 4.4: an ADOPTED replay re-announces CONNECTED",
        fun adopted_replay_reannounces_connected/0},
       {"HA WS-4 4.4: a SUPERSEDED replay counts as breaker success and "
@@ -110,8 +113,20 @@ verdict_replay_test_() ->
         fun targeted_unhealthy_status_replay_counts_as_a_failure/0),
       t("E10 the heartbeat trigger is labelled heartbeat",
         fun triggered_event_is_labelled_heartbeat/0),
-      t("E10 breaker recovery through proxy_register/1 is labelled breaker",
-        fun triggered_event_is_labelled_breaker/0),
+      t("E10 a recovery through proxy_register/1 triggers no replay",
+        fun recovery_triggers_no_replay/0),
+      t("a verdict naming at least half its batch replays every agent (server_lost_state)",
+        fun majority_verdict_replays_every_agent/0),
+      t("a verdict naming less than half its batch replays only the named sessions",
+        fun minority_verdict_replays_only_the_named/0),
+      t("in a small fleet one unknown session of a batch of one replays every agent",
+        fun small_fleet_single_unknown_replays_every_agent/0),
+      t("a large fleet needs more unknown sessions as evidence (the floor)",
+        fun large_fleet_needs_the_floor/0),
+      t("within a minute of a full replay a verdict replays only the named sessions",
+        fun full_replay_cooldown/0),
+      t("a flush verdict naming its whole batch replays every agent end to end",
+        fun flush_majority_verdict_replays_every_agent/0),
       t("E12 4096 junk ids none held: no rpc, no queue, no stamp, 4096 not_local",
         fun junk_verdict_is_all_not_local/0),
       t("E12b a cast of 5000 ids is cut to 4096 at the boundary; a non-list is ignored",
@@ -124,12 +139,10 @@ verdict_replay_test_() ->
         fun missing_session_index_keeps_upstream_alive/0),
       t("E16b the registry stopped mid drip aborts the drip without a crash",
         fun registry_stopped_mid_drip_aborts_without_crash/0),
-      t("E17 a breaker replay during a targeted drip is dropped, the drip completes",
-        fun breaker_replay_during_targeted_drip_is_dropped/0),
+      t("E17 a breaker replay during a targeted replay walks the rest of the registry once",
+        fun breaker_replay_during_targeted_drip_walks_the_rest/0),
       t("E18 registration_replay_triggered fires once per appending cast",
         fun triggered_fires_once_per_appending_cast/0),
-      t("E19 notify pressure holds the head queued and unstamped until a slot frees",
-        fun notify_pressure_holds_the_head_unstamped/0),
       t("E20 accepted=false: disconnect, no reannounce, breaker success, stamped",
         fun rejected_replay_disconnects_without_reannounce/0),
       t("E20 a missing accepted key still means accepted",
@@ -146,8 +159,8 @@ verdict_replay_test_() ->
         fun flush_verdict_reaches_the_targeted_replay/0),
       t("E7 flush errors never reach the breaker",
         fun flush_errors_never_reach_the_breaker/0),
-      t("E8 a truncated verdict replays only the listed session",
-        fun truncated_verdict_replays_only_the_listed_session/0),
+      t("E8 a truncated verdict is evidence the server lost its state: every agent",
+        fun truncated_verdict_replays_every_agent/0),
       t("E24 the replay lines carry an agent id without raw control characters",
         fun replay_lines_carry_no_raw_control_characters/0),
       t("E24b the skip of a reconnected agent carries its id without raw control characters",
@@ -186,6 +199,14 @@ verdict_breaker_test_() ->
       t("E22 queue depth drops to zero when the drip aborts on an open breaker",
         fun queue_depth_is_zero_after_circuit_abort/0)
      ]}.
+
+%% A held-notification cap of 20: a replay waits for notify headroom.
+verdict_notify_headroom_test_() ->
+    {foreach,
+     fun() -> setup([{notify_pending_max, 20}]) end,
+     fun cleanup/1,
+     [t("E19 a full held-notification store holds the replay, unstamped, until it drains",
+        fun notify_pressure_holds_the_head_unstamped/0)]}.
 
 %% Session guard 100 ms.
 verdict_guard_test_() ->
@@ -240,10 +261,10 @@ verdict_env_test_() ->
         fun env_queue_max_invalid_falls_back/0),
       t("a queue cap inside 1..1000000 is kept",
         fun env_queue_max_valid_is_kept/0),
-      t("an out of range or non integer replay spacing falls back to the default with a warning",
-        fun env_spacing_invalid_falls_back/0),
-      t("a replay spacing inside 0..60000 is kept",
-        fun env_spacing_valid_is_kept/0)
+      t("an out of range or non integer replay start jitter falls back to the default with a warning",
+        fun env_jitter_invalid_falls_back/0),
+      t("a replay start jitter inside 0..60000 is kept",
+        fun env_jitter_valid_is_kept/0)
      ]}.
 
 setup() ->
@@ -256,7 +277,7 @@ setup(Env) ->
     yuzu_gw_test_registry:ensure(),
 
     %% Clean up stale mocks from prior modules.
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
     catch meck:unload(yuzu_gw_agent),
 
@@ -279,7 +300,7 @@ setup(Env) ->
     persistent_term:put(?DUMMYK, ets:new(replay_test_dummies, [public, bag])),
     persistent_term:erase(?SUBK),
 
-    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
     %% Default: every RPC succeeds. Individual tests override this.
     mock_unary(fun default_rpc/3),
     meck:new(telemetry, [passthrough, no_link]),
@@ -310,7 +331,13 @@ setup(Env) ->
     application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 5),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 150),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 1000),
-    application:set_env(yuzu_gw, registration_replay_spacing_ms, 3),
+    %% One replay worker at a time: these tests pin the order-dependent rules
+    %% of the targeted path (dedup, the guard, skips at pop, aborts, depth),
+    %% which a single worker makes deterministic. Parallel replay is covered by
+    %% yuzu_gw_replay_concurrency_tests. No start jitter, so a full replay
+    %% starts at once.
+    application:set_env(yuzu_gw, upstream_replay_concurrency, 1),
+    application:set_env(yuzu_gw, registration_replay_start_jitter_ms, 0),
     lists:foreach(fun({K, V}) -> application:set_env(yuzu_gw, K, V) end, Env),
 
     {ok, UpPid} = yuzu_gw_upstream:start_link(),
@@ -327,13 +354,16 @@ cleanup(UpPid) ->
                   yuzu_gw_registry:all_agents()),
     wait_until(fun() -> yuzu_gw_registry:agent_count() =:= 0 end, 2000),
     kill_dummies(),
-    meck:unload([grpcbox_client, telemetry, yuzu_gw_agent]),
+    meck:unload([yuzu_grpc_client, telemetry, yuzu_gw_agent]),
     persistent_term:erase(?SUBK),
     persistent_term:erase(?LOGK),
     %% The two verdict replay tunables are read once in init/1; do not leak
     %% them.
     application:unset_env(yuzu_gw, registration_replay_session_guard_ms),
     application:unset_env(yuzu_gw, registration_replay_queue_max),
+    application:unset_env(yuzu_gw, upstream_replay_concurrency),
+    application:unset_env(yuzu_gw, registration_replay_start_jitter_ms),
+    application:unset_env(yuzu_gw, notify_pending_max),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 150),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 1000),
     ok.
@@ -346,19 +376,12 @@ reconnect_replays_all_agents() ->
     N = 4,
     Agents = register_n_agents(N),
 
-    %% Drive a closed-state recovery: one failing RPC (below threshold,
-    %% circuit stays closed), then reset history, then a succeeding RPC.
-    %% The success-after-failure is the reconnect signal.
-    cause_one_failure(),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
-    %% The trigger RPC itself succeeds and is a ProxyRegister.
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    start_full_replay(),
 
-    %% Replay drips one ProxyRegister per registered agent. Plus the
-    %% trigger call itself => N + 1 ProxyRegister RPCs total.
-    ok = wait_for_proxy_register_count(N + 1, 3000),
+    %% One ProxyRegister per registered agent.
+    ok = wait_for_proxy_register_count(N, 3000),
 
     %% Every registered agent's stored request must appear in the
     %% replayed set (the trigger request is distinct and excluded).
@@ -371,17 +394,14 @@ reconnect_zero_agents_no_rpc() ->
     %% No agents registered at all.
     ?assertEqual(0, count_test_agents()),
 
-    cause_one_failure(),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    start_full_replay(),
 
-    %% Only the trigger RPC — the replay finds nothing to re-proxy.
-    %% Give the (empty) replay cast time to be processed.
-    ok = wait_for_proxy_register_count(1, 2000),
+    %% The replay finds nothing to re-proxy and ends.
+    ok = wait_until(fun() -> up_get(replay_walk) =:= idle end, 2000),
     timer:sleep(80),  %% would-be drip window; nothing should arrive
-    ?assertEqual(1, proxy_register_count()).
+    ?assertEqual(0, proxy_register_count()).
 
 deregistered_agent_not_replayed() ->
     N = 3,
@@ -393,15 +413,14 @@ deregistered_agent_not_replayed() ->
     yuzu_gw_registry:deregister_agent(DroppedId),
     wait_until(fun() -> yuzu_gw_registry:lookup(DroppedId) =:= error end, 2000),
 
-    cause_one_failure(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    start_full_replay(),
 
-    %% N-1 surviving agents + the trigger call.
-    ok = wait_for_proxy_register_count(N, 3000),
+    %% The N-1 surviving agents.
+    ok = wait_for_proxy_register_count(N - 1, 3000),
     timer:sleep(80),  %% let any stray drip step land before asserting
-    ?assertEqual(N, proxy_register_count()),
+    ?assertEqual(N - 1, proxy_register_count()),
 
     Replayed = proxy_register_requests(),
     %% The dropped agent's request is absent...
@@ -426,47 +445,62 @@ replay_payload_is_verbatim() ->
     ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess-verbatim">>,
                                          [<<"svc">>], <<"verbatim-host">>, Req),
 
-    cause_one_failure(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    start_full_replay(),
 
-    ok = wait_for_proxy_register_count(2, 3000),  %% trigger + 1 replay
+    ok = wait_for_proxy_register_count(1, 3000),
     Replayed = proxy_register_requests(),
     ?assert(lists:member(Req, Replayed)),
     kill_dummy(Pid).
 
-half_open_recovery_triggers_replay() ->
-    %% Drive the full circuit trip: 5 consecutive failures -> open, wait
-    %% for the half_open timer, then succeed the probe. The half_open ->
-    %% closed transition must also trigger the replay.
-    N = 2,
-    Agents = register_n_agents(N),
+%% #5695: a recovery says the upstream answers again, not that it lost what it
+%% knew. One failed call and a success used to replay every agent; now nothing
+%% is replayed, the run of failures is reset, and no replay is triggered.
+closed_recovery_replays_nothing() ->
+    _ = register_n_agents(3),
+    cause_one_failure(),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(1, up_get(cb_failures)),
+    meck:reset(yuzu_grpc_client),
+    succeed_rpcs(),
+    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    assert_no_replay(),
+    ?assertEqual(0, up_get(cb_failures)).
 
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+%% The same for the half_open -> closed transition: the breaker opened (5
+%% failures), the probe succeeds and closes it, and nothing is replayed.
+half_open_recovery_replays_nothing() ->
+    _ = register_n_agents(2),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     lists:foreach(fun(_) ->
         _ = yuzu_gw_upstream:proxy_register(trigger_req())
     end, lists:seq(1, 5)),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
-
-    %% Wait for the open -> half_open timer (150ms reset).
     ok = wait_until(fun() ->
         yuzu_gw_upstream:circuit_state() =:= half_open
     end, 2000),
-
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
-    %% This probe succeeds: half_open -> closed, which schedules replay.
     {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    assert_no_replay().
 
-    ok = wait_for_proxy_register_count(N + 1, 3000),
-    Replayed = proxy_register_requests(),
-    lists:foreach(fun({_Id, Req}) ->
-        ?assert(lists:member(Req, Replayed))
-    end, Agents).
+%% Nothing replayed and no replay started: the trigger call is the only
+%% ProxyRegister, no walk is pending or running, no worker is in flight and no
+%% registration_replay_triggered event was emitted. The replay start jitter is
+%% 0 in this fixture, so a replay the success had started would be visible by
+%% the time two calls to the upstream have been answered and 100 ms passed.
+assert_no_replay() ->
+    _ = yuzu_gw_upstream:circuit_state(),
+    timer:sleep(100),
+    _ = yuzu_gw_upstream:circuit_state(),
+    ?assertEqual(idle, up_get(replay_walk)),
+    ?assertEqual(#{}, up_get(replay_pids)),
+    ?assertEqual(1, proxy_register_count()),
+    ?assertEqual([], [E || {event, ?EV_TRIG, _, _} = E <- entries()]).
 
 adopted_replay_reannounces_connected() ->
     %% HA WS-4 4.4 (`#4246` #6): a successful ADOPT-S replay must tell the
@@ -483,13 +517,11 @@ adopted_replay_reannounces_connected() ->
     SessionId = <<"sess-", Id/binary>>,
     ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, [<<"svc">>], <<"host">>, Req),
 
-    cause_one_failure(),
-    meck:reset(grpcbox_client),
-    %% Distinguish the trigger RPC (always succeeds, kicking off the
-    %% replay) from THIS agent's own replayed request (verbatim-equal to
-    %% Req, per replay_payload_is_verbatim's own precedent) by CONTENT —
-    %% Path is identical ("ProxyRegister") for both.
-    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    %% Answer THIS agent's own replayed request (verbatim-equal to Req, per
+    %% replay_payload_is_verbatim's own precedent) with its session, by
+    %% CONTENT: another agent's replay gets another session.
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, IncomingReq, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -499,9 +531,9 @@ adopted_replay_reannounces_connected() ->
                 end
         end
     end),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    start_full_replay(),
 
-    ok = wait_for_proxy_register_count(2, 3000), %% trigger + 1 replay
+    ok = wait_until(fun() -> proxy_register_count() >= 1 end, 3000),
     ok = wait_until(fun() -> length(meck:history(yuzu_gw_agent)) > 0 end, 2000),
     ReannounceCalls = [{P, S} || {_, {yuzu_gw_agent, reannounce, [P, S]}, _}
                                      <- meck:history(yuzu_gw_agent)],
@@ -527,10 +559,9 @@ adopted_replay_leaves_session_binding() ->
     ?assertMatch([_], RowsBefore),
     ?assertMatch([_], RouteBefore),
 
-    cause_one_failure(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     meck:reset(telemetry),
-    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, IncomingReq, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -540,8 +571,8 @@ adopted_replay_leaves_session_binding() ->
                 end
         end
     end),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
-    ok = wait_for_proxy_register_count(2, 3000), %% trigger + 1 replay
+    start_full_replay(),
+    ok = wait_until(fun() -> proxy_register_count() >= 1 end, 3000),
     %% The replay step has finished once it has reported its own telemetry,
     %% which it does after the re-announce.
     ok = wait_until(fun() ->
@@ -573,34 +604,36 @@ superseded_replay_forces_reconnect() ->
     ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, [<<"svc">>], <<"host">>, Req),
 
     cause_one_failure(),
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, IncomingReq, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
                 case IncomingReq of
-                    %% ?GRPC_STATUS_FAILED_PRECONDITION (grpcbox.hrl) is the
+                    %% ?GRPC_STATUS_BIN_FAILED_PRECONDITION (yuzu_grpc_client.hrl) is the
                     %% BINARY digit string <<"9">> — the raw grpc-status
-                    %% trailer value (grpcbox_client_stream.erl reads it
+                    %% trailer value (yuzu_grpc_client.erl reads it
                     %% straight off the HTTP/2 header, never converting to
                     %% an integer). Using the integer 9 here (as the
                     %% pre-existing proxy_register_error test's OWN mock
                     %% does for a different status) would silently miss
-                    %% do_replay_one's `Status =:= ?GRPC_STATUS_FAILED_PRECONDITION`
+                    %% do_replay_one's `Status =:= ?GRPC_STATUS_BIN_FAILED_PRECONDITION`
                     %% guard and fall through to the generic error branch.
                     Req -> {error, {<<"9">>, <<"session superseded; reconnect">>}, #{}};
                     _   -> {ok, #{session_id => <<"ok">>}, #{}}
                 end
         end
     end),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    start_full_replay(),
 
-    ok = wait_for_proxy_register_count(2, 3000), %% trigger + 1 replay attempt
+    ok = wait_until(fun() -> proxy_register_count() >= 1 end, 3000),
     ok = wait_until(fun() -> length(meck:history(yuzu_gw_agent)) > 0 end, 2000),
     DisconnectCalls = [P || {_, {yuzu_gw_agent, disconnect, [P]}, _}
                                 <- meck:history(yuzu_gw_agent)],
     ?assert(lists:member(Pid, DisconnectCalls)),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    %% A breaker SUCCESS: the failure cause_one_failure/0 left is reset.
+    ok = wait_until(fun() -> up_get(cb_failures) =:= 0 end, 2000),
     kill_dummy(Pid).
 
 %%%===================================================================
@@ -644,10 +677,15 @@ count_test_agents() ->
 %%% Helpers — circuit breaker driving
 %%%===================================================================
 
+%% Start a full replay by hand (the replay_registrations cast; a breaker
+%% recovery no longer starts one, #5695).
+start_full_replay() ->
+    ok = gen_server:cast(yuzu_gw_upstream, replay_registrations).
+
 %% One failing RPC. With threshold 5 the circuit stays closed but
 %% cb_failures becomes 1 — the precondition for closed-state recovery.
 cause_one_failure() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     {error, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
@@ -655,7 +693,7 @@ cause_one_failure() ->
 
 %% Make every subsequent RPC succeed.
 succeed_rpcs() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"ok">>}, #{}}
     end).
 
@@ -663,10 +701,10 @@ succeed_rpcs() ->
 %%% Helpers — meck history inspection
 %%%===================================================================
 
-%% All ProxyRegister request payloads currently in grpcbox_client history.
+%% All ProxyRegister request payloads currently in yuzu_grpc_client history.
 proxy_register_requests() ->
-    [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _}
-                <- meck:history(grpcbox_client),
+    [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _}
+                <- meck:history(yuzu_grpc_client),
             is_binary(Path),
             binary:match(Path, <<"ProxyRegister">>) =/= nomatch].
 
@@ -898,20 +936,104 @@ triggered_event_is_labelled_heartbeat() ->
     ?assertEqual([#{count => 1}], triggers(heartbeat)),
     ?assertEqual([], triggers(breaker)).
 
-%% The breaker trigger is driven through proxy_register/1, the way a real
-%% recovery is, not through a replay. The per-step event keeps its shape.
-triggered_event_is_labelled_breaker() ->
+%% #5695: a recovery driven through proxy_register/1, the way a real one is,
+%% replays nothing and triggers nothing (it used to be labelled breaker).
+recovery_triggers_no_replay() ->
     watch(),
     _ = bind_agent(<<"e10b">>),
     cause_one_failure(),
     mock_unary(fun default_rpc/3),
     {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
-    await(fun() -> replay_hdrs() =/= [] end),
+    sync(),
+    timer:sleep(100),
     await_idle(),
-    ?assertEqual([#{count => 1}], triggers(breaker)),
-    ?assertEqual([], triggers(heartbeat)),
-    ?assertEqual([{#{replayed => 1, queue_depth => 0}, #{}}],
-                 [E || {M, _} = E <- events(?EV_REPLAY), maps:get(replayed, M) > 0]).
+    ?assertEqual([], replay_hdrs()),
+    ?assertEqual([], [M || {M, _} <- events(?EV_TRIG)]).
+
+%% #5695: the server does not know two of the three sessions of a batch of
+%% three: evidence it lost its state. The two named are replayed first, then a
+%% full walk replays the third (the walk skips the two, inside the guard), one
+%% registration_replay_triggered{server_lost_state}. The per-step event keeps
+%% its shape.
+majority_verdict_replays_every_agent() ->
+    watch(),
+    [A1, A2, A3] = [bind_agent(S) || S <- [<<"mv1">>, <<"mv2">>, <<"mv3">>]],
+    ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)], #{batch => 3}),
+    await(fun() -> length(replay_hdrs()) >= 3 end),
+    await_idle(),
+    ?assertEqual(lists:sort([sid(A1), sid(A2), sid(A3)]), lists:sort(replay_hdrs())),
+    ?assertEqual(3, proxy_count()),
+    ?assertEqual([#{count => 1}], triggers(heartbeat)),
+    ?assertEqual([#{count => 1}], triggers(server_lost_state)),
+    ?assertEqual(3, length([E || {M, _} = E <- events(?EV_REPLAY), maps:get(replayed, M) > 0])).
+
+%% Two unknown of a batch of five: those two agents, not the server's state.
+minority_verdict_replays_only_the_named() ->
+    watch(),
+    [A1, A2, _A3] = [bind_agent(S) || S <- [<<"nv1">>, <<"nv2">>, <<"nv3">>]],
+    ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)], #{batch => 5}),
+    await(fun() -> length(replay_hdrs()) >= 2 end),
+    sync(),
+    timer:sleep(50),
+    await_idle(),
+    ?assertEqual(lists:sort([sid(A1), sid(A2)]), lists:sort(replay_hdrs())),
+    ?assertEqual([], triggers(server_lost_state)).
+
+%% Three agents (the floor is 1 below 128 agents): the only heartbeat of a
+%% batch is unknown, so every agent is replayed now rather than each when its
+%% own next heartbeat is listed.
+small_fleet_single_unknown_replays_every_agent() ->
+    watch(),
+    [A1, A2, A3] = [bind_agent(S) || S <- [<<"sv1">>, <<"sv2">>, <<"sv3">>]],
+    ok = yuzu_gw_upstream:replay_sessions([sid(A1)], #{batch => 1}),
+    await(fun() -> length(replay_hdrs()) >= 3 end),
+    await_idle(),
+    ?assertEqual(lists:sort([sid(A1), sid(A2), sid(A3)]), lists:sort(replay_hdrs())),
+    ?assertEqual([#{count => 1}], triggers(server_lost_state)).
+
+%% 192 agents: the floor is 3 (one per 64 agents held). Two unknown of a
+%% batch of two is not enough; three of three is.
+large_fleet_needs_the_floor() ->
+    watch(),
+    %% One connection key per agent: a connection holds at most 8 sessions.
+    Agents = [begin
+                  Id = unique_id(iolist_to_binary(["lf", integer_to_list(I)])),
+                  Sid = <<"sess-", Id/binary>>,
+                  ok = yuzu_gw_registry:register_agent(Id, spawn_dummy(), Sid, [<<"svc">>],
+                                                       <<"host">>, agent_req(Id), {lf, I}),
+                  #{id => Id, sid => Sid}
+              end || I <- lists:seq(1, 192)],
+    [A1, A2, A3 | _] = Agents,
+    ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)], #{batch => 2}),
+    await(fun() -> length(replay_hdrs()) >= 2 end),
+    sync(),
+    timer:sleep(50),
+    await_idle(),
+    ?assertEqual(2, length(replay_hdrs())),
+    ?assertEqual([], triggers(server_lost_state)),
+    ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2), sid(A3)], #{batch => 3}),
+    await(fun() -> length(replay_hdrs()) >= 192 end),
+    await_idle(),
+    ?assertEqual(192, length(lists:usort(replay_hdrs()))),
+    ?assertEqual([#{count => 1}], triggers(server_lost_state)).
+
+%% A full replay just ended: a second verdict with the same evidence replays
+%% only the sessions it names, not every agent again.
+full_replay_cooldown() ->
+    watch(),
+    [A1, A2, A3] = [bind_agent(S) || S <- [<<"cd1">>, <<"cd2">>, <<"cd3">>]],
+    ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)], #{batch => 2}),
+    await(fun() -> length(replay_hdrs()) >= 3 end),
+    await_idle(),
+    [B1, B2, _B3] = [bind_agent(S) || S <- [<<"cd4">>, <<"cd5">>, <<"cd6">>]],
+    ok = yuzu_gw_upstream:replay_sessions([sid(B1), sid(B2)], #{batch => 2}),
+    await(fun() -> length(replay_hdrs()) >= 5 end),
+    sync(),
+    timer:sleep(50),
+    await_idle(),
+    ?assertEqual(lists:sort([sid(A1), sid(A2), sid(A3), sid(B1), sid(B2)]),
+                 lists:sort(replay_hdrs())),
+    ?assertEqual([#{count => 1}], triggers(server_lost_state)).
 
 %% E12: 4096 well formed ids, none held. Nothing is queued, stamped or sent.
 junk_verdict_is_all_not_local() ->
@@ -1112,22 +1234,24 @@ registry_stopped_mid_drip_aborts_without_crash() ->
         flush_exits()
     end.
 
-%% E17: a breaker-triggered full replay cast arrives while a targeted drip has
-%% entries queued. The existing in-flight rule drops it; the drip completes
-%% and the unnamed third agent is never replayed (a full replay would send it).
-breaker_replay_during_targeted_drip_is_dropped() ->
+%% E17: a full replay (asked for by hand, trigger manual) arrives while a
+%% targeted replay is running. The full walk is not dropped (it must reach
+%% every agent, not only the ones a verdict happened to name), and the sessions
+%% the targeted replay already sent are inside the guard window, so the walk
+%% skips them: each agent is replayed once, the unnamed third one by the walk.
+breaker_replay_during_targeted_drip_walks_the_rest() ->
     watch(),
-    [A1, A2, _A3] = [bind_agent(S) || S <- [<<"e17a">>, <<"e17b">>, <<"e17c">>]],
+    [A1, A2, A3] = [bind_agent(S) || S <- [<<"e17a">>, <<"e17b">>, <<"e17c">>]],
     mock_gated([sid(A1)]),
     ok = yuzu_gw_upstream:replay_sessions([sid(A1), sid(A2)]),
     await_msg({rpc_entered, sid(A1)}),
     ok = gen_server:cast(yuzu_gw_upstream, replay_registrations),
     release(sid(A1)),
-    await(fun() -> length(replay_hdrs()) >= 2 end),
+    await(fun() -> length(replay_hdrs()) >= 3 end),
     await_idle(),
-    ?assertEqual([sid(A1), sid(A2)], replay_hdrs()),
-    ?assertEqual(2, proxy_count()),
-    ?assertEqual([], triggers(breaker)).
+    ?assertEqual([sid(A1), sid(A2), sid(A3)], replay_hdrs()),
+    ?assertEqual(3, proxy_count()),
+    ?assertEqual([#{count => 1}], triggers(manual)).
 
 %% E18: the event counts appending casts, not sessions. A cast that appends
 %% nothing (inside the guard, or not local) emits none.
@@ -1145,11 +1269,12 @@ triggered_fires_once_per_appending_cast() ->
     ?assertEqual([#{count => 1}], triggers(heartbeat)),
     ?assertEqual(2, length(replay_hdrs())).
 
-%% E19: ten notify workers are held in their rpc, so the notify budget is
-%% full. The head of the queue is retried, not popped, and is not stamped;
-%% once one worker finishes the head replays. The two barrier calls guarantee
-%% that at least one retry has run before the assertions: the first reply
-%% follows the cast, the second follows the replay_next the cast scheduled.
+%% E19: ten notify workers are held in their rpc (each holds a slot of the cap
+%% back: its event may come back) and ten more notifications are held, so the
+%% store (cap 20) is at half its cap: every adopted replay makes its agent
+%% re-send CONNECTED, so the replay waits for headroom. The queued entry
+%% is not popped and not stamped. Once a worker finishes, a held notification is
+%% sent, the store drops below half and the replay runs.
 notify_pressure_holds_the_head_unstamped() ->
     watch(),
     A = bind_agent(<<"e19">>),
@@ -1159,17 +1284,20 @@ notify_pressure_holds_the_head_unstamped() ->
                        {ok, #{}, #{}};
                   (M, R, H) -> default_rpc(M, R, H)
                end),
+    Notify = fun(I) ->
+                 ok = yuzu_gw_upstream:notify_stream_status(
+                        <<"notify-agent-", (integer_to_binary(I))/binary>>,
+                        <<"notify-session">>, connected, <<"peer">>, <<"home">>)
+             end,
     Workers = [begin
-                   ok = yuzu_gw_upstream:notify_stream_status(
-                          <<"notify-agent-", (integer_to_binary(I))/binary>>,
-                          <<"notify-session">>, connected, <<"peer">>, <<"home">>),
+                   Notify(I),
                    receive {notify_entered, W} -> W
                    after 3000 -> erlang:error({notify_worker_not_started, I})
                    end
                end || I <- lists:seq(1, 10)],
+    [Notify(I) || I <- lists:seq(11, 20)],
     try
         ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
-        sync(),
         sync(),
         ?assertMatch([{_, _, _}], up_get(replay_queue)),
         ?assertEqual(0, proxy_count()),
@@ -1179,7 +1307,8 @@ notify_pressure_holds_the_head_unstamped() ->
         await_idle(),
         ?assertEqual([sid(A)], replay_hdrs())
     after
-        [W ! release || W <- Workers]
+        [W ! release || W <- Workers],
+        [receive {notify_entered, W} -> W ! release after 0 -> ok end || _ <- lists:seq(1, 10)]
     end.
 
 %% E20: the server answers OK but with accepted=false. The agent is
@@ -1656,9 +1785,12 @@ flush_verdict_reaches_the_targeted_replay() ->
     Buf = start_buffer(),
     try
         A1 = bind_agent(<<"f1a">>),
-        _ = bind_agent(<<"f1b">>),
-        mock_batch(#{acknowledged_count => 1, unknown_session_ids => [sid(A1)]}),
-        ok = flush_one(),
+        A2 = bind_agent(<<"f1b">>),
+        A3 = bind_agent(<<"f1c">>),
+        %% One unknown of a batch of three: not evidence the server lost its
+        %% state, so only the named session is replayed.
+        mock_batch(#{acknowledged_count => 3, unknown_session_ids => [sid(A1)]}),
+        ok = flush_sessions([A1, A2, A3]),
         await(fun() -> replay_hdrs() =/= [] end),
         await_idle(),
         ?assertEqual([sid(A1)], replay_hdrs()),
@@ -1697,22 +1829,42 @@ flush_errors_never_reach_the_breaker() ->
         stop_buffer(Buf)
     end.
 
-%% E8: truncated=true with a short list replays that list only; it never
-%% starts a full replay (the second agent stays untouched) and is counted.
-truncated_verdict_replays_only_the_listed_session() ->
+%% E8: truncated=true says the server did not know more than 4096 sessions of
+%% the batch: evidence it lost its state (#5695), so the listed session is
+%% replayed and then every other agent; the truncation is counted.
+truncated_verdict_replays_every_agent() ->
     watch(),
     Buf = start_buffer(),
     try
         A1 = bind_agent(<<"f8a">>),
-        _ = bind_agent(<<"f8b">>),
+        A2 = bind_agent(<<"f8b">>),
         mock_batch(#{acknowledged_count => 0, unknown_session_ids => [sid(A1)],
                      unknown_session_ids_truncated => true}),
         ok = flush_one(),
-        await(fun() -> replay_hdrs() =/= [] end),
+        await(fun() -> length(replay_hdrs()) >= 2 end),
         await_idle(),
-        ?assertEqual([sid(A1)], replay_hdrs()),
-        ?assertEqual(1, proxy_count()),
+        ?assertEqual([sid(A1), sid(A2)], replay_hdrs()),
+        ?assertEqual(2, proxy_count()),
+        ?assertEqual([#{count => 1}], triggers(server_lost_state)),
         ?assertEqual([#{count => 1}], [M || {M, _} <- events(?EV_TRUNC)])
+    after
+        stop_buffer(Buf)
+    end.
+
+%% The heartbeat buffer hands the verdict over with the size of its batch: two
+%% heartbeats flushed, both sessions unknown, so every agent this node holds
+%% (a third one too) is replayed.
+flush_majority_verdict_replays_every_agent() ->
+    watch(),
+    Buf = start_buffer(),
+    try
+        [A1, A2, A3] = [bind_agent(S) || S <- [<<"fm1">>, <<"fm2">>, <<"fm3">>]],
+        mock_batch(#{acknowledged_count => 2, unknown_session_ids => [sid(A1), sid(A2)]}),
+        ok = flush_sessions([A1, A2]),
+        await(fun() -> length(replay_hdrs()) >= 3 end),
+        await_idle(),
+        ?assertEqual(lists:sort([sid(A1), sid(A2), sid(A3)]), lists:sort(replay_hdrs())),
+        ?assertEqual([#{count => 1}], triggers(server_lost_state))
     after
         stop_buffer(Buf)
     end.
@@ -1796,7 +1948,7 @@ session_replayed_again_after_guard_expiry() ->
     ?assertEqual([sid(A1), sid(A1)], replay_hdrs()).
 
 %% A1 is replayed by a verdict and then leaves; A2 arrives; the guard window
-%% passes; a breaker recovery replays A2 only. The drain prunes A1's expired
+%% passes; a full replay (asked for by hand) replays A2 only. The drain prunes A1's expired
 %% stamp and stamps A2.
 stale_stamps_are_pruned_after_a_breaker_only_drain() ->
     watch(),
@@ -1810,9 +1962,7 @@ stale_stamps_are_pruned_after_a_breaker_only_drain() ->
     _ = sys:get_state(yuzu_gw_registry),
     A2 = bind_agent(<<"e21q">>),
     wait_elapsed(Stamped, 100),
-    cause_one_failure(),
-    mock_unary(fun default_rpc/3),
-    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+    ok = gen_server:cast(yuzu_gw_upstream, replay_registrations),
     await(fun() -> lists:member(sid(A2), replay_hdrs()) end),
     await_idle(),
     ?assertEqual([sid(A2)], maps:keys(up_get(recent_replays))).
@@ -1854,13 +2004,13 @@ env_queue_max_valid_is_kept() ->
      || V <- [1, 7, 1000000]],
     ok.
 
-env_spacing_invalid_falls_back() ->
-    [env_case(registration_replay_spacing_ms, Bad, replay_spacing, 20, invalid)
+env_jitter_invalid_falls_back() ->
+    [env_case(registration_replay_start_jitter_ms, Bad, replay_jitter_ms, 1000, invalid)
      || Bad <- [-5, 60001, 1.5, foo, <<"20">>, "20"]],
     ok.
 
-env_spacing_valid_is_kept() ->
-    [env_case(registration_replay_spacing_ms, V, replay_spacing, V, valid)
+env_jitter_valid_is_kept() ->
+    [env_case(registration_replay_start_jitter_ms, V, replay_jitter_ms, V, valid)
      || V <- [0, 1, 60000]],
     ok.
 
@@ -1988,6 +2138,13 @@ stop_buffer(Pid) ->
     catch gen_server:stop(Pid, shutdown, 2000),
     ok.
 
+%% Queue one heartbeat for each agent and flush, one batch.
+flush_sessions(Agents) ->
+    [yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => sid(A),
+                                                sent_at => #{millis_epoch => 1700000000000}})
+     || A <- Agents],
+    yuzu_gw_heartbeat_buffer:flush_sync().
+
 %% Queue one heartbeat and flush. The cast and the call come from this
 %% process, so the flush sees the heartbeat.
 flush_one() ->
@@ -2004,14 +2161,13 @@ mock_batch(Resp) ->
 %%% Helpers: mocks and the call log
 %%%===================================================================
 
-%% Install a logging grpcbox_client:unary mock. Fun(Method, Req, SessionHdr)
+%% Install a logging yuzu_grpc_client:unary mock. Fun(Method, Req, SessionHdr)
 %% returns the unary result; Method is the last path segment and SessionHdr is
-%% the x-yuzu-session-id outgoing metadata or `undefined'.
+%% the x-yuzu-session-id request metadata (the Meta map) or `undefined'.
 mock_unary(Fun) ->
-    meck:expect(grpcbox_client, unary, fun(Ctx, Path, Req, _Def, _Opts) ->
+    meck:expect(yuzu_grpc_client, unary, fun(Meta, Path, Req, _Def, _Opts) ->
         Method = lists:last(binary:split(Path, <<"/">>, [global])),
-        Hdr = maps:get(<<"x-yuzu-session-id">>,
-                       grpcbox_metadata:from_outgoing_ctx(Ctx), undefined),
+        Hdr = maps:get(<<"x-yuzu-session-id">>, Meta, undefined),
         log({rpc, Method, Req, Hdr}),
         Fun(Method, Req, Hdr)
     end).
@@ -2021,8 +2177,8 @@ default_rpc(<<"ProxyRegister">>, _Req, Hdr) when is_binary(Hdr) ->
 default_rpc(_Method, _Req, _Hdr) ->
     {ok, #{}, #{}}.
 
-%% ProxyRegister for a gated session blocks, inside the upstream process,
-%% until the test calls release/1; every other rpc succeeds.
+%% ProxyRegister for a gated session blocks, inside its replay worker, until
+%% the test calls release/1; every other rpc succeeds.
 mock_gated(GatedHdrs) ->
     mock_gated(GatedHdrs, fun default_rpc/3).
 
@@ -2034,14 +2190,18 @@ mock_gated(GatedHdrs, After) ->
         end
     end).
 
+%% The gated process (the replay worker the RPC runs in) is recorded before the
+%% test is told, so release/1 always finds it.
 gate(Hdr) ->
+    ets:insert(persistent_term:get(?DUMMYK), {gate, Hdr, self()}),
     notify({rpc_entered, Hdr}),
     receive {release, Hdr} -> ok
     after 10000 -> ok
     end.
 
 release(Hdr) ->
-    whereis(yuzu_gw_upstream) ! {release, Hdr},
+    [Pid ! {release, Hdr} || {gate, H, Pid} <- ets:lookup(persistent_term:get(?DUMMYK), gate),
+                             H =:= Hdr],
     ok.
 
 %% Make the calling process the one the mocks notify.
@@ -2149,15 +2309,15 @@ sync() ->
     _ = yuzu_gw_upstream:circuit_state(),
     ok.
 
-%% The drip is finished: queue empty twice with a call in between. The call
-%% matters: a cast sent from inside the last step (a replay trigger) is in the
-%% mailbox before that step's state is readable, so a second read after a
-%% round trip would show the queue it seeded.
+%% The replay is finished: nothing queued, no walk, no worker in flight (so
+%% every worker's result has been handled), twice with a call in between. The
+%% call matters: a cast sent while the last result was handled (a replay
+%% trigger) is in the mailbox before that state is readable, so a second read
+%% after a round trip would show the replay it started.
 await_idle() ->
-    await(fun() ->
-        up_get(replay_queue) =:= []
-            andalso begin sync(), up_get(replay_queue) =:= [] end
-    end).
+    Idle = fun() -> up_get(replay_queue) =:= [] andalso up_get(replay_walk) =:= idle
+                        andalso up_get(replay_pids) =:= #{} end,
+    await(fun() -> Idle() andalso begin sync(), Idle() end end).
 
 %% Sleep until the monotonic clock is past T0 + Ms. Waiting out a time window
 %% is the point of the caller; it is not a guess at how long something takes.

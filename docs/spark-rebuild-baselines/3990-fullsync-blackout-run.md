@@ -91,10 +91,10 @@ repeats were correctly recognized as valid versus wrongly voided, which is exact
 early attempts under-counted valid samples so badly.
 
 1. **Partial-plugin rebuild crash (rig ops, not a product defect).** The first rebuild
-   compiled only the `yuzu-agent` target, leaving `agents/plugins/tar/tar.dll` at its stale
+   compiled only the `yuzu-agent` target, leaving `agents/plugins/echo/echo.dll` at its stale
    pre-rebuild build. The mismatched core-vs-plugin vintage crashed the agent deterministically
    ~16s after boot - momentarily misdiagnosed as a regression in the just-merged PR #4017
-   (power-capture source) before an empirical rebuild-and-retest (rebuilding `tar` too)
+   (power-capture source) before an empirical rebuild-and-retest (rebuilding `echo` too)
    disproved that and reproduced a stable agent past the crash point. No GitHub issue filed.
    Corrected instruction: a rebuild that moves to a new `origin/dev` tip must rebuild the FULL
    plugin set, not just the agent target.
@@ -185,7 +185,7 @@ this uncontrolled scale, for this specific measurand.
 
 **A separate, real effect found at this catalogue size, worth recording even though it isn't
 part of B**: on restart into the **legacy** backend at N=5652, the agent registered with the
-server successfully but then produced NO further log output (Guardian OR the unrelated TAR
+server successfully but then produced NO further log output (Guardian OR the unrelated Echo
 triggers) for **~6 minutes**, while `(Get-Process yuzu-agent).CPU` grew by under 1.5s of CPU
 time across that whole window (near-idle, not a busy spin) and the process held **~5683
 threads / ~28,500 OS handles** - roughly one thread and five handles per armed legacy guard.

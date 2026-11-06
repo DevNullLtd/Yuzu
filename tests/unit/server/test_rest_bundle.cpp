@@ -17,6 +17,7 @@
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -54,7 +55,7 @@ struct DispatchCall {
 };
 
 struct AuditRow {
-    std::string verb, result, type, id;
+    std::string verb, result, type, id, detail;
 };
 
 struct BundleHarness {
@@ -63,8 +64,12 @@ struct BundleHarness {
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
+    /// #4990: the caller's Forensics visibility for the collate read (admin by default).
+    yuzu::server::test::ForensicsCaller forensics;
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
+    /// #4990: when set, the audit write for THIS verb fails (returns false); others persist.
+    std::string fail_audit_verb;
     std::string principal = "alice";
     bool is_admin = true;
     int dispatch_sent = 1;
@@ -104,9 +109,9 @@ struct BundleHarness {
                           const std::string&) -> bool { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& verb,
                                const std::string& result, const std::string& type,
-                               const std::string& id, const std::string&) -> bool {
-            audits.push_back({verb, result, type, id});
-            return true;
+                               const std::string& id, const std::string& detail) -> bool {
+            audits.push_back({verb, result, type, id, detail});
+            return verb != fail_audit_verb;
         };
 
         RestApiV1::CommandDispatchFn dispatch_fn;
@@ -136,6 +141,7 @@ struct BundleHarness {
             };
         }
 
+        yuzu::server::test::wire_forensics(api, forensics);
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr, store.is_open() ? &store : nullptr,
@@ -177,8 +183,9 @@ struct BundleHarness {
     }
 
     void put_response(const std::string& correlation, const std::string& command_id, int st,
-                      const std::string& output) {
+                      const std::string& output, const std::string& plugin = {}) {
         StoredResponse r;
+        r.plugin = plugin;
         r.execution_id = correlation;
         r.instruction_id = command_id;
         r.agent_id = "agent-1";
@@ -567,4 +574,186 @@ TEST_CASE("POST /api/v1/bundles: a body nested past the depth limit is rejected 
     h.post("/api/v1/bundles", body, status);
     CHECK(status == 400);
     CHECK(h.calls.empty()); // never reached command_dispatch_fn
+}
+
+TEST_CASE("GET /api/v1/bundles/{id}: a Forensics step's output follows the caller's Forensics tier "
+          "(#4990)",
+          "[pg][bundle][rest][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    int status = 0;
+    auto disp = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}]})",
+        status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.put_response(exec_id, "cmd-browser_inventory-profiles", 1, "marker-4990-rest-bundle",
+                   yuzu::server::test::kForensicsPlugin);
+    h.put_response(exec_id, "cmd-os_info-uptime", 1, "up 3d", "os_info");
+
+    SECTION("a dispatcher without Forensics:Read: the Forensics step shows no output") {
+        h.forensics.viewer();
+        auto a = h.get("/api/v1/bundles/" + exec_id, status);
+        REQUIRE(status == 200);
+        CHECK(a["data"]["steps"][0]["output"] == "");
+        CHECK(a["data"]["steps"][1]["output"] == "up 3d");
+        CHECK(a["data"]["received"] == 1);
+    }
+    SECTION("a holder sees the output") {
+        h.forensics.admin();
+        auto a = h.get("/api/v1/bundles/" + exec_id, status);
+        REQUIRE(status == 200);
+        CHECK(a["data"]["steps"][0]["output"] == "marker-4990-rest-bundle");
+        CHECK(a["data"]["steps"][1]["output"] == "up 3d");
+    }
+}
+
+TEST_CASE("GET /api/v1/bundles/{id}: an Unknown Forensics decision is a retryable 503, not a hidden step "
+          "(#4990)",
+          "[pg][bundle][rest][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    int status = 0;
+    auto disp = h.post("/api/v1/bundles",
+                       R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})",
+                       status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.put_response(exec_id, "cmd-os_info-uptime", 1, "up 3d", "os_info");
+
+    h.forensics.unknown();
+    auto refused = h.get("/api/v1/bundles/" + exec_id, status);
+    REQUIRE(status == 503);
+    CHECK(refused["error"]["retry_after_ms"] == 5000);
+    CHECK(refused.dump().find("up 3d") == std::string::npos);
+
+    h.forensics.viewer(); // control: a Denied decision collates the ordinary step
+    auto ok = h.get("/api/v1/bundles/" + exec_id, status);
+    CHECK(status == 200);
+    CHECK(ok["data"]["steps"][0]["output"] == "up 3d");
+}
+
+// ── #4990: bundle collation audits a served Forensics step (surface=bundle) ─────────────────────
+
+namespace {
+
+std::vector<AuditRow> forensics_audit_rows(const std::vector<AuditRow>& a) {
+    std::vector<AuditRow> out;
+    for (const auto& r : a)
+        if (r.verb == "response.forensics.read")
+            out.push_back(r);
+    return out;
+}
+
+/// Dispatch a two-step bundle (one Forensics step, one ordinary step) and store both responses.
+std::string forensics_bundle(BundleHarness& h) {
+    int status = 0;
+    auto disp = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}]})",
+        status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.put_response(exec_id, "cmd-browser_inventory-profiles", 1, "marker-4990-rest-audit",
+                   yuzu::server::test::kForensicsPlugin);
+    h.put_response(exec_id, "cmd-os_info-uptime", 1, "up 3d", "os_info");
+    return exec_id;
+}
+
+} // namespace
+
+TEST_CASE("GET /api/v1/bundles/{id}: serving a Forensics step writes exactly one "
+          "response.forensics.read row with surface=bundle (#4990)",
+          "[pg][bundle][rest][forensics_tier][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    const auto exec_id = forensics_bundle(h);
+    int status = 0;
+
+    SECTION("a holder gets the output and exactly one audit row") {
+        h.forensics.admin();
+        h.audits.clear();
+        auto a = h.get("/api/v1/bundles/" + exec_id, status);
+        REQUIRE(status == 200);
+        CHECK(a["data"]["steps"][0]["output"] == "marker-4990-rest-audit");
+        const auto rows = forensics_audit_rows(h.audits);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].type == "Execution");
+        CHECK(rows[0].id == exec_id);
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=bundle");
+    }
+    SECTION("a non-holder gets no Forensics output and no audit row") {
+        h.forensics.viewer();
+        h.audits.clear();
+        auto a = h.get("/api/v1/bundles/" + exec_id, status);
+        REQUIRE(status == 200);
+        CHECK(a["data"]["steps"][0]["output"] == "");
+        CHECK(a["data"]["steps"][1]["output"] == "up 3d");
+        CHECK(forensics_audit_rows(h.audits).empty());
+    }
+    SECTION("a failed audit write is a 503 with Sec-Audit-Failed and no output") {
+        h.forensics.admin();
+        h.fail_audit_verb = "response.forensics.read";
+        auto res = h.sink.dispatch("GET", "/api/v1/bundles/" + exec_id, "");
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(res->body.find("marker-4990-rest-audit") == std::string::npos);
+        CHECK(res->body.find("up 3d") == std::string::npos);
+    }
+    SECTION("a failed audit write does not refuse a collation that served no Forensics output") {
+        h.forensics.viewer();
+        h.fail_audit_verb = "response.forensics.read";
+        auto a = h.get("/api/v1/bundles/" + exec_id, status);
+        CHECK(status == 200);
+        CHECK(a["data"]["steps"][1]["output"] == "up 3d");
+    }
+}
+
+TEST_CASE("GET /api/v1/bundles/{id}: a bundle with no Forensics step writes no "
+          "response.forensics.read row (#4990)",
+          "[pg][bundle][rest][forensics_tier][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    int status = 0;
+    auto disp = h.post("/api/v1/bundles",
+                       R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})",
+                       status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.put_response(exec_id, "cmd-os_info-uptime", 1, "up 3d", "os_info");
+
+    h.forensics.admin();
+    h.audits.clear();
+    auto a = h.get("/api/v1/bundles/" + exec_id, status);
+    REQUIRE(status == 200);
+    CHECK(a["data"]["steps"][0]["output"] == "up 3d");
+    CHECK(forensics_audit_rows(h.audits).empty());
+    CHECK(has_audit(h.audits, "bundle.collate", "Execution")); // the ordinary row is unchanged
+}
+
+TEST_CASE("GET /api/v1/bundles/{id}: a Forensics step with no response yet writes no row (#4990)",
+          "[pg][bundle][rest][forensics_tier][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    int status = 0;
+    auto disp = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"}]})",
+        status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.forensics.admin();
+    h.audits.clear();
+    auto a = h.get("/api/v1/bundles/" + exec_id, status);
+    REQUIRE(status == 200);
+    CHECK(a["data"]["steps"][0]["state"] == "pending");
+    CHECK(forensics_audit_rows(h.audits).empty()); // nothing was served, so nothing is audited
 }

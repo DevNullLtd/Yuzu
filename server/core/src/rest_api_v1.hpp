@@ -24,6 +24,8 @@
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
+#include "event_emit.hpp"     // EmitEventFn: the httplib adapter half (execution_mutation.hpp takes only the request-free hook)
+#include "execution_mutation.hpp" // cancel/rerun twins: the shared admit-audit-effect sequence + its test seam
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
@@ -33,6 +35,7 @@
 #include "product_pack_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
@@ -278,13 +281,13 @@ public:
     /// is deliberate:
     ///
     ///   - Routes whose primary authorization is the per-target `scoped_perm_fn`
-    ///     gate (POST /api/v1/bundles, the TAR retention purge, the live device
+    ///     gate (POST /api/v1/bundles, the Echo retention purge, the live device
     ///     query) thread this in as a SECOND, independent confinement check —
     ///     defense-in-depth. Unwired substitutes a present-EMPTY set (deny-all),
     ///     NEVER nullopt: ADR-0033 §1 forbids reading a missing derivation as
     ///     "no filter". `scoped_perm_fn` already 500s when IT is unwired, so the
     ///     primary gate reports the misconfiguration.
-    ///   - The async result-set producers (`from-tar-query`,
+    ///   - The async result-set producers (`from-echo-query`,
     ///     `from-instruction-result`, `{id}/re-eval`) admit on a bare GLOBAL
     ///     `perm_fn("Execution","Execute")` and dispatch by scope/broadcast, so
     ///     this derivation is their ONLY per-device authorization — the PRIMARY
@@ -607,8 +610,8 @@ public:
     /// Guardian rule create/update/delete/push, software package create,
     /// software deploy start, user delete/role-change, and the engine-principal
     /// and RBAC assignment routes). The routes that need step-up are classified
-    /// in step_up_policy.hpp; for those, the central check in server.cpp's
-    /// pre-request handler (step_up_gate.hpp) evaluates the same decision
+    /// in step_up_policy.hpp; for those, the central check in the post-read
+    /// stage `server.cpp` installs (step_up_gate.hpp) evaluates the same decision
     /// BEFORE the handler runs, ahead of the handler's own permission and
     /// its own cross-site copy (a cookie write has already met the server-wide
     /// same-site gate in pre-routing), and this functor repeats it from that
@@ -716,6 +719,20 @@ public:
     /// `set_engine_principal_store`.
     void set_user_exists_fn(UserExistsFn fn) { user_exists_fn_ = std::move(fn); }
 
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). MUST be called
+    /// BEFORE `register_routes()`, same timing contract as `set_engine_principal_store`.
+    /// Unset (nullptr, a test harness) fails closed: the response routes refuse every row
+    /// (`tier_filter_for`), so a harness that reads responses must wire it.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
+    /// #4990 - the resolver behind the response routes' Forensics tier (see
+    /// `forensics_visibility.hpp`). Same timing contract as `set_forensics_plugin_set`: BEFORE
+    /// `register_routes()`. Unset resolves to present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
+
     /// #4981 PR-2 — see `ScopeEvaluateFn`'s doc comment above. MUST be called
     /// BEFORE `register_routes()`, same timing contract as
     /// `set_engine_principal_store`. Unset (`{}`, the default) makes
@@ -729,6 +746,21 @@ public:
     /// `device_ids` is supplied (misconfiguration) — a request with no
     /// `device_ids` is unaffected either way.
     void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
+
+    /// TEST SEAM for POST /api/v1/executions/{id}/cancel and .../rerun. Production leaves this
+    /// unset and the routes bind `make_tracker_mutation_ports(execution_tracker)`; a test that
+    /// has no Postgres sets fake ports instead. MUST be called BEFORE `register_routes()`. An
+    /// unwired set of ports (the default) is ignored, never used as "no store".
+    void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
+        execution_mutation_ports_ = std::move(ports);
+    }
+
+    /// The platform event emitter (`ServerImpl::emit_event`) for the routes whose LEGACY siblings
+    /// publish an event: POST /api/v1/executions/{id}/cancel -> `execution.completed`,
+    /// POST /api/v1/executions/{id}/rerun -> `execution.created` (see
+    /// `apply_execution_mutation`). Best effort; unset = no event. MUST be called BEFORE
+    /// `register_routes()`.
+    void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
 
     /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
     /// EXPLICITLY instead of re-resolving it from the request's session.
@@ -835,10 +867,14 @@ private:
     AuditAsSessionFn audit_as_session_fn_;
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
     PasswordChangeDeps password_deps_;
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
+    ExecutionMutationPorts execution_mutation_ports_; // see set_execution_mutation_ports_for_test
+    EmitEventFn emit_event_fn_;                       // see set_emit_event_fn
 };
 
 } // namespace yuzu::server

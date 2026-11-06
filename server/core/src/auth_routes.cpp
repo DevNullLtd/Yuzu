@@ -24,6 +24,7 @@
 #include "http_route_sink.hpp"
 #include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter (not a store outage)
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
 #include "step_up_gate.hpp"
@@ -62,6 +63,11 @@ constexpr std::size_t kMaxJustificationLength = 1024;
 // pre-seeded in server.cpp. Any error that is not is_store_unavailable() must
 // never reach a 503 degrade site, so the default ("query_error") is a
 // belt-and-braces fallback, not an expected path.
+//
+// #6995: `AuthDBError::EntropyUnavailable` MUST NEVER be passed here. It is inside
+// is_store_unavailable() (so it stays a fail-closed 503) but is not a store outage, and the
+// default arm would silently label it `query_error` -- the misattribution that change removed.
+// The one caller tests is_entropy_failure() first and counts the fault elsewhere.
 [[nodiscard]] const char* degrade_reason(AuthDBError e) noexcept {
     switch (e) {
     case AuthDBError::StoreBusy:
@@ -391,6 +397,13 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
             // admin). get_user_role() queries the current role on every call, so
             // a creator who's been demoted since the token was issued will
             // produce a user-role session.
+            //
+            // #4068: both NotFound and DbError floor to Role::user HERE ON
+            // PURPOSE - flooring only lowers privilege, so it is safe in either
+            // case, and a 503 on every token request during a PG blip is a much
+            // larger behaviour change. A DbError is still signalled by
+            // `yuzu_auth_get_user_role_store_error_total` (incremented inside
+            // get_user_role()).
             auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
             synth.role = legacy_role.value_or(auth::Role::user);
         }
@@ -733,6 +746,29 @@ bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response
     return require_permission(req, res, securable_type, operation);
 }
 
+bool AuthRoutes::probe_permission_unavailable_aware(const httplib::Request& req,
+                                                    httplib::Response& res,
+                                                    const std::string& securable_type,
+                                                    const std::string& operation) {
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
+    return require_permission_impl(req, res, securable_type, operation,
+                                   RbacDegradeMapping::UnavailableAs503);
+}
+
+void AuthRoutes::respond_rbac_unavailable(const httplib::Request& req, httplib::Response& res,
+                                          const std::string& securable_type,
+                                          const std::string& operation, const char* who) {
+    audit_log(req, "auth.permission_required", "denied", "", "",
+              std::string(who) + " denied: RBAC unavailable resolving " + securable_type + ":" +
+                  operation);
+    res.status = 503;
+    // A transient store outage is retryable, and no `.permission`: granting it does not fix an
+    // outage, so naming it would advertise a self-remediation that cannot work.
+    res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                      detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                    "application/json");
+}
+
 ListReadGate AuthRoutes::require_global_list_read(const httplib::Request& req,
                                                   httplib::Response& res,
                                                   const std::string& securable_type,
@@ -772,6 +808,16 @@ AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
                                     const std::string& securable_type,
                                     const std::string& operation) {
+    // Every route keeps ADR-0041's documented answer: an RBAC read that could not be completed
+    // is a 403 (deny-on-degrade). Only the Forensics-tier resolver opts into the 503 mapping.
+    return require_permission_impl(req, res, securable_type, operation,
+                                   RbacDegradeMapping::DenyAs403);
+}
+
+bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& securable_type,
+                                         const std::string& operation,
+                                         RbacDegradeMapping degrade) {
     auto session = require_auth(req, res);
     if (!session)
         return false;
@@ -798,7 +844,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.permission_required", "denied", "", "",
@@ -810,8 +856,30 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                             "application/json");
             return false;
         }
-        if (!rbac_store_->is_rbac_enabled() ||
-            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+        // The engine decision is `engine_grant_checked`, the same chokepoint the list-read and
+        // fleet-read engine gates use. It reads the grant only on a view proven fresh and
+        // enforced; a view proven fresh and disabled admits nothing; a degraded view, whose
+        // enforcement state cannot be confirmed, is refused without reading a grant, because
+        // RBAC may be genuinely off and an engine has no legacy fallback to land on. Engine
+        // authority stays RBAC-only: an engine is admitted solely through that check, never
+        // through a legacy or service-scoped path. `engine_unavailable` is set when the answer
+        // could not be completed (a failed grant read or an unconfirmed state), so the opt-in
+        // retryable answer surfaces; the default stays 403.
+        bool engine_unavailable = false;
+        bool engine_admitted = false;
+        {
+            const auto checked =
+                engine_grant_checked(rbac_store_, session->username, securable_type, operation);
+            engine_unavailable = !checked && degrade == RbacDegradeMapping::UnavailableAs503;
+            engine_admitted = checked.value_or(false);
+        }
+        if (!engine_admitted) {
+            if (engine_unavailable) {
+                // Opt-in only: still refused, but as the retryable outage it is, not as a
+                // definitive missing grant. The default stays 403.
+                respond_rbac_unavailable(req, res, securable_type, operation, "engine principal");
+                return false;
+            }
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied " + securable_type + ":" + operation);
             res.status = 403;
@@ -972,7 +1040,15 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // This is the SAME predicate the ADR-0017 per-row scope filters key on, so the
     // gate and the filter can never disagree on a corrupt store.
     if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
-        if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
+        const auto checked =
+            rbac_store_->check_permission_checked(session->username, securable_type, operation);
+        if (!checked && degrade == RbacDegradeMapping::UnavailableAs503) {
+            // Opt-in only (the Forensics-tier resolver): a read that could not be completed is a
+            // retryable outage, not a missing grant. Every other route takes the 403 below.
+            respond_rbac_unavailable(req, res, securable_type, operation, "RBAC");
+            return false;
+        }
+        if (!checked.value_or(false)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
@@ -1141,7 +1217,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
@@ -1356,10 +1432,26 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // `check_scoped_permission` on the dead handle rather than falling through to
     // the legacy Read-allow.
     if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
-        if (!rbac_store_->check_scoped_permission(session->username, securable_type, operation,
-                                                  agent_id, mgmt_group_store_)) {
-            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                      "RBAC denied " + securable_type + ":" + operation);
+        // #3739: the checked variant tells a degrade-driven deny (a store read failed) from a
+        // definitive one, so the durable audit row can too. The RESPONSE is unchanged either way:
+        // a degraded scoped check is still a fail-closed 403 (ADR-0041 deny-on-degrade), not a 503.
+        // The detail keeps the `RBAC denied` prefix (a denial either way) and adds a greppable
+        // `read degraded:` token that does NOT reuse the 503 forms' "RBAC read degraded resolving
+        // the ITServiceOwner ceiling" phrase (upgrading.md's runbook keys on that phrase).
+        const auto scoped = rbac_store_->check_scoped_permission_checked(
+            session->username, securable_type, operation, agent_id, mgmt_group_store_);
+        if (!scoped.has_value() || !*scoped) {
+            std::string denial_detail = "RBAC denied " + securable_type + ":" + operation;
+            if (!scoped.has_value()) {
+                const char* source =
+                    scoped.error() == kRbacErrMgmtGroupReadDegraded ? "mgmt_group_store"
+                                                                    : "rbac_store";
+                denial_detail += std::string(" (read degraded: ") + source + ")";
+            }
+            // target_type/target_id/detail spelled out: passing the id and the message
+            // positionally lands the id in `target_type` and the message in `target_id` (#3219).
+            audit_log(req, "auth.scoped_permission_required", "denied", "Agent", agent_id,
+                      denial_detail);
             res.status = 403;
             const std::string perm = securable_type + ":" + operation;
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
@@ -1459,7 +1551,7 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // default-deny). authorize_list_read's own legacy-open branch would
     // otherwise hand an engine credential fleet-wide read the moment RBAC is
     // disabled; resolve engine sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");
@@ -1611,11 +1703,12 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // principal_class_of(req) above can only distinguish by credential
         // presentation (bearer token → "agent"), which mislabels an engine
         // principal's bearer-token requests. Re-stamp from the resolved
-        // session's persisted principal_kind so engine-principal actions are
-        // audited truthfully as "engine" (design §6 / adr-1005-execution-plan
+        // session's engine classification (Session::is_engine()) so
+        // engine-principal actions are audited truthfully as "engine"
+        // (design §6 / adr-1005-execution-plan
         // Decision 9 — the AuditStore column reports it now; the HTTP metric
         // is deferred to 4.5).
-        if (session->principal_kind == "engine") {
+        if (session->is_engine()) {
             event.principal_class = "engine";
         }
     }
@@ -1730,7 +1823,7 @@ bool AuthRoutes::audit_log_for_session(const httplib::Request& req, const auth::
     // and, via `make_audit_event_for_principal`, the session correlator and source fields.
     return audit_log_for_principal(req, action, result, session.username, principal_role,
                                    target_type, target_id, detail,
-                                   session.principal_kind == "engine" ? "engine" : std::string{});
+                                   session.is_engine() ? "engine" : std::string{});
 }
 
 AuthRoutes::AuditAsSessionFn AuthRoutes::audit_as_session_fn() {
@@ -2565,6 +2658,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // never a generic 500 that could be confused with a
                 // harmless one-off. No session is minted either way.
                 const bool store_unavailable = is_store_unavailable(init.error());
+                // #6995: a CSPRNG fault is still a fail-closed 503, but no query FAILED, so it is
+                // counted in yuzu_secure_random_failure_total and NOT in the store-outage
+                // counters below. The response itself (503, Retry-After: 2, retry_after_ms) is
+                // deliberately UNCHANGED from #4763 so callers see no new status or header; the
+                // 2 s hint is store-derived and is not tuned for a possibly persistent fault.
+                const bool entropy_unavailable = is_entropy_failure(init.error());
                 res.status = store_unavailable ? 503 : 500;
                 if (store_unavailable)
                     res.set_header("Retry-After", "2"); // #2396 honest backoff hint (503 only)
@@ -2574,7 +2673,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                            {.retry_after_ms = 2000})
                         : detail::a4_error(res, "Could not initiate MFA enrollment"),
                     "application/json");
-                if (store_unavailable) {
+                if (entropy_unavailable) {
+                    mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteEnroll);
+                } else if (store_unavailable) {
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
                             .increment();
@@ -2587,7 +2688,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
                 audit_log_for_principal(req, "mfa.enroll.required", "error", username,
                                         auth::role_to_string(*role_opt), "User", username,
-                                        store_unavailable
+                                        entropy_unavailable
+                                            ? "csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
+                                              "fail-closed)"
+                                        : store_unavailable
                                             ? "mfa_init_enrollment: secret/store unavailable "
                                               "(fail-closed)"
                                             : "mfa_init_enrollment failed");
@@ -3097,8 +3201,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         std::vector<std::string> recovery_codes;
         bool verified = false;
         bool store_unavailable = false;
+        bool entropy_unavailable = false; // #6995: store_unavailable, but a CSPRNG fault
         bool already_enrolled = false;
         bool credential_changed = false;
+        bool enrollment_cancelled = false;
         if (is_totp) {
             // #5342 Gate 8 (F2): bind the enrolment to the credential this
             // pending login PROVED (the B4 hash carry) — a password change or
@@ -3116,10 +3222,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // race (or it was enrolled before this pending token committed).
                 // NOT a wrong code and NOT an outage — handled distinctly below so
                 // it neither burns a pending attempt nor emits a false
-                // store-unavailable signal (#3777, CC7.2). (A bare disable+re-init
-                // WITHOUT a subsequent winning verify leaves mfa_enrolled_at NULL,
-                // so it does NOT reach here — it stays fail-closed WriteFailed→503.)
+                // store-unavailable signal (#3777, CC7.2).
                 already_enrolled = true;
+            } else if (r.error() == AuthDBError::MfaEnrollmentCancelled) {
+                // The provisional secret this code was verified against is no longer
+                // the stored one (#3808): cleared or replaced by a disable, a
+                // re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
+                // rewrap. The database cannot tell those apart, so nothing below
+                // may name a cause. Benign: nothing was enrolled. NOT a store
+                // outage — MfaEnrollmentCancelled is outside is_store_unavailable(),
+                // so no 503 / degrade counter — and NOT a wrong code. Handled
+                // distinctly below.
+                enrollment_cancelled = true;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
                 // NEVER be treated as "wrong code" here either — same
@@ -3127,6 +3241,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // this only routes to a distinct fail-closed 503 below
                 // instead of burning an attempt on a transient outage.
                 store_unavailable = true;
+                entropy_unavailable = is_entropy_failure(r.error());
             }
         }
 
@@ -3161,22 +3276,49 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
+        if (enrollment_cancelled) {
+            // The provisional enrollment changed under this verify. The pending
+            // token was move-erased on take-ownership above and is NOT
+            // re-inserted: its provisional secret is gone or replaced, so it is
+            // spent and the operator must sign in again to start over. No session
+            // is minted. Audited as its own benign outcome — never mfa.enroll.failed
+            // (a bad code) nor the kCritical store-unavailable event. The detail
+            // states only the observed fact, in the key=value style of
+            // `step_up_proof=...`: a SIEM or auditor reading a named cause would
+            // look for a matching mfa.disabled row that may never have existed.
+            audit_log_for_principal(req, "mfa.enroll.cancelled", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "reason=provisional_secret_changed; nothing enrolled");
+            res.status = 409;
+            res.set_content(detail::a4_error(res, "MFA enrollment was cancelled or replaced; "
+                                                  "sign in again to start over"),
+                            "application/json");
+            return;
+        }
+
         if (store_unavailable) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
-            if (auto* m = auth_mgr_.metrics_registry()) {
+            if (entropy_unavailable) {
+                // #6995: the recovery-code draw faulted and the enrolment rolled back.
+                mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteRecovery);
+            } else if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                     .increment();
             }
             audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "mfa_verify_enrollment: secret/store unavailable "
-                                    "(fail-closed, no session minted)");
+                                    entropy_unavailable
+                                        ? "csprng_unavailable: mfa_recovery (mfa_verify_enrollment, "
+                                          "fail-closed, enrollment rolled back, no session minted)"
+                                        : "mfa_verify_enrollment: secret/store unavailable "
+                                          "(fail-closed, no session minted)");
             emit_event("mfa.enroll.failed", req,
                        {{"source_ip", req.remote_addr},
                         {"username", entry.username},
-                        {"reason", "store_unavailable"}},
+                        {"reason", entropy_unavailable ? "csprng_unavailable"
+                                                       : "store_unavailable"}},
                        {}, Severity::kCritical);
             return;
         }
@@ -5120,17 +5262,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // governance round (UP-6/UP-7/cons-N2) — source-scope the eligibility
         // grant: `is_elevation_eligible` above keyed on the raw principal
         // STRING alone, so a session whose principal happens to collide
-        // with an eligible row's username (a crafted SAML NameID equal to
-        // `oidc:<iss>#<sub>`, or a legacy `identity_source='local'` row
-        // literally named `oidc:x#y` that somehow has
-        // `elevation_eligible=1`) would otherwise borrow that row's grant.
+        // with an eligible row's username (a legacy `identity_source='local'`
+        // row literally named `oidc:x#y` that somehow has
+        // `elevation_eligible=1`, or any future source that mints a principal
+        // string another source also uses) would otherwise borrow that row's
+        // grant. SAML principals always begin `saml:` (saml_principal_id), so
+        // a SAML NameID alone cannot produce an `oidc:` or local name; this is
+        // defence in depth, not a closed SAML attack.
         // Require the row's `identity_source` to MATCH the session's own
-        // `auth_source`: an OIDC session may only elevate an
-        // `identity_source='oidc'` row; every other session (local,
-        // and — until SAML provisioning exists — saml) requires
-        // `identity_source='local'`. Read fresh via `get_user` rather than
-        // trusting anything cached on `session` (SQLite is the source of
-        // truth for identity_source).
+        // `auth_source`: a direct mapping (`local` to `local`, `oidc` to
+        // `oidc`, `saml` to `saml`), never an "oidc or else local" fallback
+        // (see the comparison below). Read fresh via `get_user` rather than
+        // trusting anything cached on `session` (the auth store, Postgres,
+        // is the source of truth for identity_source).
         auto row = db->get_user(session->username);
         if (!row) {
             audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
@@ -5142,13 +5286,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         // The eligible row's `identity_source` must equal the session's own
         // `auth_source` — a DIRECT mapping (`local`↔`local`, `oidc`↔`oidc`,
-        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session therefore
-        // expects `identity_source=="saml"`, which no row carries today (SAML
-        // is not provisioned — #1852 fast-follow), so SAML is fail-closed at
-        // this gate; and a SAML NameID crafted to collide with a `local` (or
-        // `oidc`) row can no longer satisfy it. This keeps the guard correct
-        // when SAML provisioning + SAML-MFA land, without a rework (Hermes
-        // cyber-review finding, #1852 hardening).
+        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session expects
+        // `identity_source=="saml"`, which no row carries today (SAML is not
+        // provisioned; #1852 fast-follow). Today a SAML session never gets
+        // this far: it has no `auth.users` row, so `is_elevation_eligible`
+        // above answers "not eligible" and it is refused there. This gate is
+        // what stays correct when SAML provisioning + SAML-MFA land: a SAML
+        // session can only ever spend a row whose `identity_source` is
+        // `saml`, never a `local` or `oidc` one (Hermes cyber-review finding,
+        // #1852 hardening).
         //
         // An `engine_token` session (design doc §6/§9) never reaches this
         // comparison at all: `POST /api/v1/elevate` is COOKIE-session only
@@ -5196,7 +5342,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // enforced structurally, plus the `!row` deny two branches up). Were
         // it ever to arrive here, `session->auth_source == "oidc"` is false
         // for "engine_token", so it takes the local-session `else` branch
-        // below (line ~2840), which requires local TOTP enrollment the
+        // below, which requires local TOTP enrollment the
         // engine principal's non-existent `users` row can never satisfy —
         // denied either way.
         const bool oidc_amr_proof = session->auth_source == "oidc" &&

@@ -10,7 +10,7 @@
  * legacy UI contract reads as the whole fleet), and reaches agents through
  * `ServerImpl::dispatch_confined` rather than `/api/command`. Every
  * Destructive row that does not additionally carry
- * `ExecuteGate::AdminOrApproval` — `tar.purge_source`, `registry.delete_key`,
+ * `ExecuteGate::AdminOrApproval` — `echo.purge_source`, `registry.delete_key`,
  * `filesystem.delete_lines`, `tags.clear`, `storage.clear`, … — was
  * fleet-targetable from it by any holder of the declared securable.
  *
@@ -85,7 +85,7 @@ const CommandCapabilityRegistry& real_registry() {
 /// hold their expected class in `catalogue anchors` — if the catalogue ever
 /// reclassifies one, that case fails loudly instead of these tests quietly
 /// becoming about nothing.
-constexpr std::pair<const char*, const char*> kDestructive{"tar", "purge_source"};
+constexpr std::pair<const char*, const char*> kDestructive{"echo", "purge_source"};
 constexpr std::pair<const char*, const char*> kReadOnly{"os_info", "os_version"};
 constexpr std::pair<const char*, const char*> kMutating{"tags", "set"};
 
@@ -99,7 +99,7 @@ struct AuditRow {
 
 /// Make `agents` visible to kUser via a group on which kUser holds a role —
 /// `get_visible_agents` is that role-scoped join. Copied in shape from
-/// `test_dashboard_tar_fragments.cpp`'s helper of the same name.
+/// `test_dashboard_echo_fragments.cpp`'s helper of the same name.
 void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::string> agents) {
     ManagementGroup g;
     g.name = "All Devices";
@@ -127,6 +127,8 @@ struct ExecHarness {
 
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
+    /// #3619: false = the audit store refuses every row (both callbacks read it live).
+    bool audit_ok{true};
 
     /// What `resolve_fn` maps the typed instruction to. Set per test.
     std::pair<std::string, std::string> resolve_to{};
@@ -146,9 +148,14 @@ struct ExecHarness {
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
+        // ONE sink behind both callbacks, as production wires ONE `audit_log` (server.cpp).
         auto audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string&, const std::string&,
-                               const std::string& d) { audits.push_back({a, r, d}); };
+                               const std::string& d) {
+            audits.push_back({a, r, d});
+            return audit_ok;
+        };
+        routes.set_persist_audit_fn(audit_fn);
         DashboardRoutes::DispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string& scope,
@@ -179,7 +186,7 @@ struct ExecHarness {
                                /*instruction_store=*/nullptr);
         // One registration pass only — two would register every route twice
         // and first-match-wins would serve handlers bound to the first call.
-        // #4027: +1 for GET /api/v1/tar/retention-paused.
+        // #4027: +1 for GET /api/v1/echo/retention-paused.
         REQUIRE(sink.route_count() == 13);
 
         if (wire_classifier)
@@ -456,4 +463,33 @@ TEST_CASE("dashboard execute: the gate reads the DECODED scope param, not the ra
     CHECK(contains(res->body, std::string(yuzu::server::kDestructiveNoVisibleAgentMessage)));
     CHECK(!contains(res->body, std::string(yuzu::server::kDestructiveUntargetedMessage)));
     CHECK(h.rejected_metric() == 0.0);
+}
+
+// ── (#3619) A refusal row the store does not persist ────────────────────────
+
+TEST_CASE("dashboard execute audit (#3619): a Destructive refusal whose denied row is not stored "
+          "is still refused, never dispatched, and is flagged on the response",
+          "[server][dashboard][execute][destructive][audit][security][3619]") {
+    ExecHarness h;
+    h.resolve_to = {kDestructive.first, kDestructive.second};
+    h.audit_ok = false;
+
+    auto res = h.post("instruction=purge&scope=__all__");
+
+    CHECK(h.calls.empty());
+    CHECK(contains(res->body, std::string(yuzu::server::kDestructiveUntargetedMessage)));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("dashboard execute audit (#3619): an unwired classifier refusal whose denied row is not "
+          "stored is flagged on the response",
+          "[server][dashboard][execute][destructive][audit][3619]") {
+    ExecHarness h(/*mg=*/nullptr, /*wire_classifier=*/false);
+    h.resolve_to = {kReadOnly.first, kReadOnly.second};
+    h.audit_ok = false;
+
+    auto res = h.post("instruction=version&scope=agent-1");
+
+    CHECK(h.calls.empty());
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }

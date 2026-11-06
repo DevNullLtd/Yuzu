@@ -602,6 +602,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_json   TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_digest TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS excluded_roots TEXT NOT NULL DEFAULT '';"},
+        // v4 (Echo rename, upgrade window): approvals follow the renamed definition ids and the
+        // renamed plugin. request_json / request_digest are deliberately NOT rewritten: the digest
+        // binds the frozen request text, so editing the text would orphan its digest.
+        {4,
+         "UPDATE approvals SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
+         "UPDATE approvals SET target_plugin = 'echo' WHERE target_plugin = 'tar';"},
     };
     return kMigrations;
 }
@@ -654,15 +661,25 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
                         const std::string& scope_expression, const std::string& schedule_id,
                         ApprovalOrigin origin, std::string target_plugin,
                         std::string target_action) {
-    // A surface whose tickets bind a request cannot be minted unbound: the redeemer
-    // would find an empty request_json and nothing for the reviewer to have seen.
-    if (requires_bound_request(origin))
-        return std::unexpected(std::string{kBoundRequestRequiredMessage});
-    auto r = submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin,
-                         /*bound=*/nullptr, std::move(target_plugin), std::move(target_action));
+    auto r = submit_typed(definition_id, submitted_by, scope_expression, schedule_id, origin,
+                          std::move(target_plugin), std::move(target_action));
     if (!r)
         return std::unexpected(std::move(r.error().message));
     return std::move(*r);
+}
+
+std::expected<std::string, SubmitError>
+ApprovalManager::submit_typed(const std::string& definition_id, const std::string& submitted_by,
+                              const std::string& scope_expression, const std::string& schedule_id,
+                              ApprovalOrigin origin, std::string target_plugin,
+                              std::string target_action) {
+    // A surface whose tickets bind a request cannot be minted unbound: the redeemer
+    // would find an empty request_json and nothing for the reviewer to have seen.
+    if (requires_bound_request(origin))
+        return std::unexpected(
+            SubmitError{SubmitFailure::kInvalidRequest, std::string{kBoundRequestRequiredMessage}});
+    return submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin,
+                       /*bound=*/nullptr, std::move(target_plugin), std::move(target_action));
 }
 
 std::expected<std::string, SubmitError>
@@ -1082,20 +1099,40 @@ std::expected<int, StoreReadError> ApprovalManager::pending_count_checked() cons
     return static_cast<int>(to_i64(col(res.get(), 0, 0)));
 }
 
-int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
-    if (!open_ || submitted_by.empty())
+std::expected<int, StoreReadError>
+ApprovalManager::pending_count_for_checked(const std::string& submitted_by) const {
+    if (!open_) {
+        spdlog::warn("ApprovalManager::pending_count_for_checked degraded: store not open");
+        return std::unexpected(StoreReadError{"database not open"});
+    }
+    // No principal can hold a pending approval under an empty name: a genuine zero, not a fault.
+    if (submitted_by.empty())
         return 0;
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return 0;
+    if (!lease) {
+        spdlog::warn("ApprovalManager::pending_count_for_checked degraded: pool exhausted");
+        return std::unexpected(
+            StoreReadError{"approval store temporarily unavailable (pool exhausted)"});
+    }
 
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
+    // UNEXPIRED pending rows only. submit()'s lazy sweep flips a pending row past the TTL to
+    // 'expired' (`submitted_at < db_now - ttl`), but only when a submit runs: until then a stale
+    // row is still `pending` and would count against the cap, locking a principal with 25 of them
+    // out of every approval-gated tool even though all of them are stale. The predicate is
+    // the exact complement of the sweep's, on the same database clock.
+    const std::string count_sql =
         "SELECT COUNT(*) FROM approval_manager.approvals "
-        "WHERE status = 'pending' AND submitted_by = $1",
-        std::vector<std::string>{submitted_by});
-    if (res.status() != PGRES_TUPLES_OK)
-        return 0;
+        "WHERE status = 'pending' AND submitted_by = $1 "
+        "AND submitted_at >= (" + std::string(kDbNowEpochSql) + " - $2::bigint)";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), count_sql.c_str(),
+        std::vector<std::string>{submitted_by, std::to_string(kApprovalTicketTtlSeconds)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ApprovalManager::pending_count_for_checked degraded: query failed: {}",
+                     PQresultErrorMessage(res.get()));
+        return std::unexpected(StoreReadError{
+            std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
+    }
     return static_cast<int>(to_i64(col(res.get(), 0, 0)));
 }
 

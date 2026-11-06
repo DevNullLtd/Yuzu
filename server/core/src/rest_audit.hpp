@@ -38,7 +38,11 @@
 /// A null / empty `audit_fn` means the deployment runs audit-off; that is NOT
 /// a persistence failure, so the kernel returns `true` and sets no header —
 /// the established `AuditFn` contract (callers that fail closed must keep
-/// serving when audit is simply disabled).
+/// serving when audit is simply disabled). One deliberate exception is a
+/// mutation's `attempted` row (`DashboardRoutes::audit_attempted`, #3619): it
+/// refuses on an unwired sink, because the mutation must not run without a
+/// row; production always wires the sink there (`server.cpp`), and audit-off
+/// still reports the row as persisted from inside `audit_log`.
 ///
 /// **`result` semantics (#4858) — read this before assuming "success" means
 /// "data was shown".** The bool returned by `try_persist_audit`/
@@ -211,8 +215,8 @@ template <class AuditFn>
         try_persist_audit(audit_fn, req, action, result, target_type, target_id, detail);
     // Set the flag at most once per response. httplib's set_header EMPLACES into a
     // header multimap (append, not replace), so a route that calls this helper more
-    // than once on the same `res` — the tar.dns.read + tar.arp.read pair and the
-    // per-source tar.sources.configure loop — would emit duplicate `Sec-Audit-Failed`
+    // than once on the same `res` — the echo.dns.read + echo.arp.read pair and the
+    // per-source echo.sources.configure loop — would emit duplicate `Sec-Audit-Failed`
     // field-lines if several audits failed. The guard keeps the header idempotent for
     // a strict downstream parser; single-call callers are unaffected (#1647 follow-up).
     if (!persisted && !res.has_header("Sec-Audit-Failed"))

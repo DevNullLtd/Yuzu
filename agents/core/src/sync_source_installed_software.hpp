@@ -5,13 +5,16 @@
 /// agent sync framework. Collects the machine-wide installed-software inventory
 /// by invoking the inventory actions in-process (`LocalDispatcher`) and renders
 /// them into the canonical wire form the server expects. The actions (one table
-/// in the .cpp; a new inventory action adds one row + one pure adapter):
+/// in the .cpp, whose columns are plugin, action, adapter, `accept_partial` and
+/// the `constrained` policy; a new inventory action adds one row + one pure adapter):
 ///   installed_apps.list_inventory           blob contract v2 rows
 ///   pkg_inventory.packages                  Homebrew formulae/casks (ecosystem `brew`)
 ///   pkg_inventory.managers                  one `homebrew` presence row
 ///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
 ///   windows_optional_features.list          every DISM feature, state in `version`
 ///   msi_packages.list_inventory             machine-context MSI products (ecosystem `msi`)
+///   runtimes.python                         installed Python interpreters (ecosystem `python`)
+///   middleware.ibm_mq                       installed IBM MQ (ecosystem `ibm_mq`; name and publisher from the product table)
 /// Every row carries `source` = "<plugin>.<action>". NO per-user data (machine
 /// scope only — no PII).
 
@@ -38,7 +41,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -55,22 +58,45 @@ struct SwEntry {
 /// Loaded plugins by `descriptor->name`, as the collector consumes them.
 using SyncPluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::less<>>;
 
+/// What a `constrained` status answer does to its action (the `constrained` column of the
+/// collector's action table; the status row itself is parsed by
+/// agents/shared/inventory_status_row.hpp). The collector's cycle is all-or-nothing, so a source
+/// that cannot answer skips the report -- except `drop_source`, which exists for the middleware
+/// rows only.
+enum class ConstrainedPolicy {
+    /// The action fails the cycle: a partial roster would delete stored rows.
+    fail,
+    /// The rows are kept (status ok, reason = the status token) iff at least one PRESENT data
+    /// row of the action's kind was seen, mapped or not; zero such rows still fails.
+    keep_rows_if_present_seen,
+    // drop_source: the source contributes zero rows and the cycle continues. The cycle's aggregate
+    // replaces the agent's whole stored inventory (server/core/src/software_inventory_store.cpp
+    // replace: DELETE agent rows + INSERT), so rows withheld this cycle are
+    // REMOVED from the stored inventory until the source recovers: a constrained cycle shows as
+    // the source's rows missing plus its warn line, never as stale rows. For the middleware rows
+    // only: their steady-state constraint is a permission fact, and failing the whole cycle would
+    // freeze every other source for ever.
+    drop_source,
+};
+
 /// Result of a pure action adapter. `ok` with zero entries is a legitimate
 /// answer ("brew present, no formulae"); `unsupported` = the action answered
 /// "not on this OS" (skipped silently); `failed` = skip the whole cycle.
-/// `ok` with a non-empty `reason` = constrained managers answer whose present
-/// row is kept. Collector rules: a constrained managers answer is ok iff at
-/// least one PRESENT manager row was seen, whether or not it maps to an entry
-/// (Linux dpkg/apt rows map to nothing but are still evidence the read worked;
-/// zero present rows still fails); a constrained store_packages or packages
-/// answer always fails (a partial roster would delete stored rows); typed PARTIAL completeness
-/// skips the cycle unless the action opts in (an in-band `unsupported` answer
-/// wins first); an absent plugin is warned.
+/// `ok` with a non-empty `reason` = constrained answer whose rows are kept
+/// (ConstrainedPolicy::keep_rows_if_present_seen). Collector rules, per the table's
+/// `constrained` column: a constrained managers answer is ok iff at least one PRESENT manager
+/// row was seen, whether or not it maps to an entry (Linux dpkg/apt rows map to nothing but are
+/// still evidence the read worked; zero present rows still fails); a constrained
+/// store_packages, packages or msi list_inventory answer always fails (a partial roster would
+/// delete stored rows); typed PARTIAL completeness skips the cycle unless the action opts in
+/// (an in-band `unsupported` answer wins first); an absent plugin is warned. `withheld` =
+/// a constrained answer under ConstrainedPolicy::drop_source: zero entries, `reason` = the status
+/// tokens, the source is skipped and the cycle continues.
 struct AdaptedRows {
-    enum class Status { ok, unsupported, failed };
+    enum class Status { ok, unsupported, failed, withheld };
     Status status{Status::ok};
     std::vector<SwEntry> entries;
-    std::string reason; // failed: why (logged); ok: the constraint token of the kept row
+    std::string reason; // failed/withheld: why (logged); ok: the constraint token of the kept row
 };
 
 /// Parse `installed_apps` `list_inventory` output (pipe-delimited
@@ -83,18 +109,25 @@ struct AdaptedRows {
 /// rejects an over-cap host.
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 
+/// The four status-row adapters below (pkg_inventory managers / packages / store_packages and
+/// msi_packages list_inventory) take the action's ConstrainedPolicy from its table row: the
+/// collector passes the row's `constrained` column, and a test passes the same value so it
+/// exercises what the collector runs.
+///
 /// Adapt `pkg_inventory` `managers` output (`status|managers|<level>|...` plus
 /// `manager|<name>|<present|unavailable>|<version or ->|...` rows). HOMEBREW
 /// ONLY today: one presence row {name=homebrew, kind=app, ecosystem=brew} per
 /// `present` homebrew row (the collector's dedup collapses a dual-prefix Mac to
 /// one); any other manager name is dropped. The Linux/Windows managers legs must
 /// add their own mapping deliberately (manager facts belong to facet rows).
-YUZU_EXPORT AdaptedRows parse_pkg_inventory_managers_output(const std::string& out);
+YUZU_EXPORT AdaptedRows parse_pkg_inventory_managers_output(const std::string& out,
+                                                            ConstrainedPolicy policy);
 
 /// Adapt `pkg_inventory` `packages` output (`status|packages|<level>|...` plus
 /// `package|homebrew|<id>|<version>|<formula|cask>`): formula -> kind `pkg`,
 /// cask -> kind `app`, ecosystem `brew`.
-YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& out);
+YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& out,
+                                                            ConstrainedPolicy policy);
 
 /// Adapt `pkg_inventory` `store_packages` output (`status|store_packages|<level>|...`
 /// plus nine-token `package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or
@@ -102,15 +135,26 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 /// `snap`, version from snap.yaml, release = revision; flatpak -> ecosystem
 /// `flatpak`, version EMPTY (the branch is a ref, not a version), release =
 /// commit, arch. kind `app` iff the row's kind is `app`, else `pkg`.
-YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out);
+YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
+                                                                  ConstrainedPolicy policy);
 
 /// Adapt `msi_packages` `list_inventory` output (`status|list_inventory|<level>|...` plus
 /// five-token `inv|<product_code>|<name>|<version>|<publisher>`). Each row becomes
 /// {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
 /// (no case normalisation). An empty name is seen-not-mapped. The producer strips `|`,
-/// tab, CR, LF and NUL from the fields, so no unescape is needed. `constrained` fails the
-/// action (a partial roster would delete stored msi rows); `unsupported` is skipped.
-YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out);
+/// tab, CR, LF and NUL from the fields, so no unescape is needed. The collector's table row
+/// fails a `constrained` answer (a partial roster would delete stored msi rows); `unsupported`
+/// is skipped.
+YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
+                                                                 ConstrainedPolicy policy);
+
+/// Adapt `runtimes` `python` output (`status|python|<level>|...` plus five-token
+/// `python|<flavour>|<version or ->|<install_path or ->|<vendor or ->`). Each row becomes
+/// {name=Python, kind=app, ecosystem=python}; `-` version -> empty, flavour/path/vendor dropped.
+/// On Linux the version is major.minor only (the patch level needs the interpreter). The
+/// collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer withholds
+/// these rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM
@@ -118,6 +162,16 @@ YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::stri
 /// #5186 territory). `feature|unsupported|...` -> unsupported;
 /// `feature|unavailable|<token>` or no feature rows at all -> failed.
 YUZU_EXPORT AdaptedRows parse_windows_optional_features_output(const std::string& out);
+
+/// Adapt `middleware` product output for the product table row `action` names (`status|<id>|<level>|...`
+/// plus six-token `<id>|<title>|<name>|<version or ->|<install_path>|<edition or ->`). A row maps
+/// to {name=title, publisher=vendor, kind, ecosystem} from agents/shared/middleware_products.hpp
+/// ONLY when its title column equals the table title; any other row is dropped and counted, its
+/// siblings kept. install_path and edition are not carried. An unknown `action` -> failed.
+/// The collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer
+/// contributes no rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_middleware_output(const std::string& out, std::string_view action,
+                                                ConstrainedPolicy policy);
 
 /// The action table's (plugin, action) names in table order, as views into static literals —
 /// for the descriptor pin test (tests/unit/test_inventory_sync_action_table.cpp).

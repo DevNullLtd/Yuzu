@@ -19,6 +19,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "typed_inventory_sources.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -90,6 +91,19 @@ void inventory_reset() {
     InventoryStore store{pool};                                                                    \
     REQUIRE(store.is_open())
 
+// Rows for one plugin, counted in SQL rather than through the store's reads,
+// which exclude typed sources (ADR-0070 D12).
+std::int64_t raw_row_count(PgPool& pool, const std::string& plugin) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = pg::exec_params(lease.get(),
+                               "SELECT COUNT(*) FROM inventory_store.inventory_data "
+                               "WHERE plugin = $1",
+                               std::vector<std::string>{plugin});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return std::stoll(PQgetvalue(res.get(), 0, 0));
+}
+
 // Wall-clock now, mirroring the store's internal `now_secs()` — used only to
 // bound assertions on the store's own clamping, never to construct fixture
 // data that would itself need clamping.
@@ -123,20 +137,38 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     auto g = store.get("a", "p");
     CHECK(!g.has_value());
     CHECK(g.error() == yuzu::server::InventoryReadError::kDegraded);
+    // A typed source name on a broken store is a degrade too, never "absent": the
+    // read filter must not turn a failure into a quiet 404 (chaos CH-3).
+    auto typed = store.get("a", "device_ci");
+    CHECK(!typed.has_value());
+    CHECK(typed.error() == yuzu::server::InventoryReadError::kDegraded);
     CHECK_FALSE(store.delete_agent("a"));       // ingest/delete: fail-soft, false, no crash
-    CHECK_FALSE(store.delete_source("app_usage")); // same, keyed on plugin instead of agent
+    CHECK(!store.purge_typed_sources_batch(10));
+    // CH-2: a failing pass reports failure (never throws), counts it once, removes nothing,
+    // and leaves the reads filtered/degraded rather than empty-looking.
+    yuzu::MetricsRegistry purge_metrics;
+    store.set_metrics(&purge_metrics);
+    InventoryStore::TypedPurgeOptions fast;
+    fast.pause = fast.backoff = std::chrono::milliseconds{0};
+    const auto failed = store.drain_typed_sources(fast);
+    CHECK(failed.status == InventoryStore::TypedPurgeStatus::kFailed);
+    CHECK(failed.rows == 0);
+    CHECK_FALSE(failed.cause.empty());
+    CHECK(purge_metrics.counter("yuzu_inventory_typed_purge_failures_total").value() == 1.0);
+    CHECK(purge_metrics.counter("yuzu_inventory_typed_purge_rows_total").value() == 0.0);
+    CHECK(!store.get_agent_inventory("a").has_value());
     store.upsert("a", "p", "{}", 1);            // fail-soft: does not throw
 }
 
 TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][inventory]") {
     INVENTORY_SHARED(store, pool);
 
-    store.upsert("agent-1", "installed_software", R"({"n":1})", 1000);
-    store.upsert("agent-1", "device_ci", R"({"n":2})", 1000);
-    store.upsert("agent-2", "installed_software", R"({"n":3})", 2000);
+    store.upsert("agent-1", "hardware_info", R"({"n":1})", 1000);
+    store.upsert("agent-1", "os_info", R"({"n":2})", 1000);
+    store.upsert("agent-2", "hardware_info", R"({"n":3})", 2000);
 
     SECTION("get: found, absent, degrade-free") {
-        auto found = store.get("agent-1", "installed_software");
+        auto found = store.get("agent-1", "hardware_info");
         REQUIRE(found.has_value());
         REQUIRE(found->has_value());
         CHECK((*found)->data_json == R"({"n":1})");
@@ -148,8 +180,8 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
     }
 
     SECTION("upsert replaces an existing (agent_id, plugin) row") {
-        store.upsert("agent-1", "installed_software", R"({"n":99})", 5000);
-        auto found = store.get("agent-1", "installed_software");
+        store.upsert("agent-1", "hardware_info", R"({"n":99})", 5000);
+        auto found = store.get("agent-1", "hardware_info");
         REQUIRE(found.has_value());
         REQUIRE(found->has_value());
         CHECK((*found)->data_json == R"({"n":99})");
@@ -164,7 +196,7 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
         CHECK(by_agent->size() == 2);
 
         InventoryQuery q2;
-        q2.plugin = "installed_software";
+        q2.plugin = "hardware_info";
         auto by_plugin = store.query(q2);
         REQUIRE(by_plugin.has_value());
         CHECK(by_plugin->size() == 2);
@@ -208,7 +240,7 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
         REQUIRE(tables.has_value());
         bool found_installed = false;
         for (const auto& t : *tables) {
-            if (t.plugin == "installed_software") {
+            if (t.plugin == "hardware_info") {
                 found_installed = true;
                 CHECK(t.agent_count == 2); // agent-1 + agent-2
             }
@@ -223,9 +255,9 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
     }
 
     SECTION("upsert rejects a blank agent_id/plugin (GDPR orphan guard, IS5/UP-7)") {
-        store.upsert("", "installed_software", R"({"x":1})", 1000);
+        store.upsert("", "hardware_info", R"({"x":1})", 1000);
         store.upsert("agent-blank-plugin", "  ", R"({"x":1})", 1000);
-        auto blank_id = store.get("", "installed_software");
+        auto blank_id = store.get("", "hardware_info");
         REQUIRE(blank_id.has_value());
         CHECK_FALSE(blank_id->has_value()); // never written
         auto blank_plugin = store.get_agent_inventory("agent-blank-plugin");
@@ -235,22 +267,22 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
 
     SECTION("upsert never lets an older report overwrite a newer row (stale guard, IS6/UP-8)") {
         // agent-1/installed_software is already seeded at collected_at=1000.
-        store.upsert("agent-1", "installed_software", R"({"n":"older"})", 500); // older: rejected
-        auto after_older = store.get("agent-1", "installed_software");
+        store.upsert("agent-1", "hardware_info", R"({"n":"older"})", 500); // older: rejected
+        auto after_older = store.get("agent-1", "hardware_info");
         REQUIRE(after_older.has_value());
         REQUIRE(after_older->has_value());
         CHECK((*after_older)->data_json == R"({"n":1})");
         CHECK((*after_older)->collected_at == 1000);
 
-        store.upsert("agent-1", "installed_software", R"({"n":"same-instant"})",
+        store.upsert("agent-1", "hardware_info", R"({"n":"same-instant"})",
                      1000); // equal: still updates
-        auto after_equal = store.get("agent-1", "installed_software");
+        auto after_equal = store.get("agent-1", "hardware_info");
         REQUIRE(after_equal.has_value());
         REQUIRE(after_equal->has_value());
         CHECK((*after_equal)->data_json == R"({"n":"same-instant"})");
 
-        store.upsert("agent-1", "installed_software", R"({"n":"newer"})", 2000); // newer: updates
-        auto after_newer = store.get("agent-1", "installed_software");
+        store.upsert("agent-1", "hardware_info", R"({"n":"newer"})", 2000); // newer: updates
+        auto after_newer = store.get("agent-1", "hardware_info");
         REQUIRE(after_newer.has_value());
         REQUIRE(after_newer->has_value());
         CHECK((*after_newer)->data_json == R"({"n":"newer"})");
@@ -278,29 +310,263 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
     }
 }
 
-TEST_CASE("InventoryStore delete_source erases one plugin across all agents, leaves others intact",
+TEST_CASE("InventoryStore purge_typed_sources_batch deletes only typed rows, bounded and idempotent",
           "[pg][inventory]") {
     INVENTORY_SHARED(store, pool);
 
-    store.upsert("agent-1", "app_usage", R"({"n":1})", 1000);
-    store.upsert("agent-2", "app_usage", R"({"n":2})", 1000);
-    store.upsert("agent-1", "installed_software", R"({"n":3})", 1000);
+    for (int i = 0; i < 5; ++i)
+        store.upsert("agent-" + std::to_string(i), "app_usage", R"({"n":1})", 1000);
+    store.upsert("agent-0", "certificate_inventory", R"({"n":2})", 1000);
+    store.upsert("agent-0", "hardware_info", R"({"n":3})", 1000);
+    REQUIRE(raw_row_count(pool, "app_usage") == 5);
 
-    CHECK(store.delete_source("app_usage"));
+    InventoryStore::TypedPurgeOptions opt;
+    opt.batch_rows = 2;
+    opt.pause = opt.backoff = std::chrono::milliseconds{0};
+    using St = InventoryStore::TypedPurgeStatus;
 
-    auto agent1 = store.get_agent_inventory("agent-1");
-    REQUIRE(agent1.has_value());
-    CHECK(agent1->size() == 1);
-    CHECK((*agent1)[0].plugin == "installed_software");
+    SECTION("a batch never exceeds max_rows") {
+        auto n = store.purge_typed_sources_batch(4);
+        REQUIRE(n.has_value());
+        CHECK(*n == 4);
+        CHECK(raw_row_count(pool, "app_usage") + raw_row_count(pool, "certificate_inventory") == 2);
+    }
+    SECTION("looping drains everything typed and leaves generic rows") {
+        std::int64_t total = 0;
+        for (int guard = 0; guard < 10; ++guard) {
+            auto n = store.purge_typed_sources_batch(4);
+            REQUIRE(n.has_value());
+            if (*n == 0)
+                break;
+            total += *n;
+        }
+        CHECK(total == 6);
+        CHECK(raw_row_count(pool, "app_usage") == 0);
+        CHECK(raw_row_count(pool, "certificate_inventory") == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
+        auto again = store.purge_typed_sources_batch(4); // idempotent: a successful 0
+        REQUIRE(again.has_value());
+        CHECK(*again == 0);
+    }
+    SECTION("a zero or negative bound is a no-op, not a failure") {
+        CHECK(store.purge_typed_sources_batch(0) == std::optional<std::int64_t>{0});
+        CHECK(store.purge_typed_sources_batch(-5) == std::optional<std::int64_t>{0});
+        CHECK(raw_row_count(pool, "app_usage") == 5);
+    }
+    SECTION("drain drains a multi-batch backlog, reports completed and the total") {
+        yuzu::MetricsRegistry m;
+        store.set_metrics(&m);
+        const auto r = store.drain_typed_sources(opt); // 6 rows -> 3 batches
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+        CHECK(raw_row_count(pool, "app_usage") == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
+        CHECK(m.counter("yuzu_inventory_typed_purge_rows_total").value() == 6.0);
+        CHECK(m.counter("yuzu_inventory_typed_purge_failures_total").value() == 0.0);
+    }
+    SECTION("drain stops between batches: predicate false once then true runs exactly one batch") {
+        int polls = 0;
+        const auto r = store.drain_typed_sources(opt, [&] { return polls++ >= 1; });
+        CHECK(r.status == St::kStopped);
+        CHECK(r.rows == 2);
+        CHECK(raw_row_count(pool, "app_usage") + raw_row_count(pool, "certificate_inventory") == 4);
+    }
+    SECTION("drain with an already-true predicate runs no batch") {
+        const auto r = store.drain_typed_sources(opt, [] { return true; });
+        CHECK(r.status == St::kStopped);
+        CHECK(r.rows == 0);
+        CHECK(raw_row_count(pool, "app_usage") == 5);
+    }
+}
 
-    auto agent2 = store.get_agent_inventory("agent-2");
-    REQUIRE(agent2.has_value());
-    CHECK(agent2->empty());
+TEST_CASE("InventoryStore drain_typed_sources retries, halves, rescans once and never calls a "
+          "peer-locked backlog completed",
+          "[pg][inventory]") {
+    INVENTORY_SHARED(store, pool);
+    using St = InventoryStore::TypedPurgeStatus;
+    for (int i = 0; i < 6; ++i)
+        store.upsert("agent-" + std::to_string(i), "app_usage", R"({"n":1})", 1000);
+    InventoryStore::TypedPurgeOptions opt;
+    opt.pause = opt.backoff = std::chrono::milliseconds{0};
 
-    CHECK_FALSE(store.delete_source("")); // empty-name guard
+    SECTION("a failing batch halves down to the floor, succeeds, and the pass completes") {
+        opt.batch_rows = 64;
+        opt.min_batch_rows = 8;
+        opt.max_attempts = 3;
+        std::vector<int> sizes;
+        opt.test_fail_batch = [&](int n) {
+            sizes.push_back(n);
+            return sizes.size() <= 3; // fail the first three attempts
+        };
+        const auto r = store.drain_typed_sources(opt);
+        REQUIRE(sizes.size() >= 4);
+        CHECK(sizes[0] == 64);
+        CHECK(sizes[1] == 32);
+        CHECK(sizes[2] == 16);
+        CHECK(sizes[3] == 8);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+    }
+    SECTION("attempts are bounded: always-failing gives up after max_attempts retries") {
+        opt.batch_rows = 64;
+        opt.min_batch_rows = 20;
+        opt.max_attempts = 2;
+        std::vector<int> sizes;
+        opt.test_fail_batch = [&](int n) {
+            sizes.push_back(n);
+            return true;
+        };
+        yuzu::MetricsRegistry m;
+        store.set_metrics(&m);
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kFailed);
+        CHECK(sizes == std::vector<int>{64, 32, 20}); // halving stops at the floor
+        CHECK(r.cause.find("injected batch failure") != std::string::npos);
+        CHECK(r.rows == 0);
+        CHECK(raw_row_count(pool, "app_usage") == 6);
+        CHECK(m.counter("yuzu_inventory_typed_purge_failures_total").value() == 1.0);
+    }
+    SECTION("the from-the-start rescan runs exactly once") {
+        opt.batch_rows = 10; // one batch takes all six; then cursor-zero, rescan-zero
+        int calls = 0;
+        opt.test_fail_batch = [&](int) {
+            ++calls;
+            return false;
+        };
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+        CHECK(calls == 3);
+    }
+    SECTION("non-consecutive failures do not accumulate: the failure count resets on success") {
+        opt.batch_rows = 2;
+        opt.max_attempts = 1;
+        int calls = 0;
+        opt.test_fail_batch = [&](int) {
+            ++calls;
+            return calls == 1 || calls == 3; // fail, ok, fail, ok ... never twice in a row
+        };
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+    }
+    SECTION("the rescan finds a stray row written behind the cursor") {
+        opt.batch_rows = 10;
+        int calls = 0;
+        opt.test_fail_batch = [&](int) {
+            if (++calls == 2) // the cursor is past agent-5; a row lands behind it
+                store.upsert("agent-0", "device_ci", R"({"n":9})", 1000);
+            return false;
+        };
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 7);
+        CHECK(raw_row_count(pool, "device_ci") == 0);
+    }
+    SECTION("rows locked by a peer end the pass as failed, never completed; unlocking drains") {
+        auto peer = pool.acquire();
+        REQUIRE(peer);
+        struct RollbackGuard { // never leave the peer's lock held if a REQUIRE throws
+            PGconn* c;
+            ~RollbackGuard() { pg::PgResult rb{PQexec(c, "ROLLBACK")}; }
+        } guard{peer.get()};
+        pg::PgResult begin{PQexec(peer.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        pg::PgResult lock{PQexec(peer.get(),
+                                 "SELECT 1 FROM inventory_store.inventory_data "
+                                 "WHERE plugin = 'app_usage' FOR UPDATE")};
+        REQUIRE(lock.status() == PGRES_TUPLES_OK);
 
-    // Idempotent: a 0-row delete of an already-purged source still commits.
-    CHECK(store.delete_source("app_usage"));
+        opt.max_attempts = 1;
+        const auto blocked = store.drain_typed_sources(opt);
+        CHECK(blocked.status == St::kFailed);
+        CHECK(blocked.cause.find("locked") != std::string::npos);
+        CHECK(blocked.rows == 0);
+        CHECK(raw_row_count(pool, "app_usage") == 6);
+
+        pg::PgResult rb{PQexec(peer.get(), "ROLLBACK")};
+        const auto freed = store.drain_typed_sources(opt);
+        CHECK(freed.status == St::kCompleted);
+        CHECK(freed.rows == 6);
+    }
+}
+
+TEST_CASE("InventoryStore reads never return a typed source's stray row (ADR-0070 D12)",
+          "[pg][inventory]") {
+    INVENTORY_SHARED(store, pool);
+
+    // A stray typed row, as an older server (or one rolled back below the change
+    // that made the source typed) would have written it, beside a generic row.
+    for (const auto typed : yuzu::server::kTypedInventorySources)
+        store.upsert("agent-1", std::string(typed), R"({"stray":true})", 1000);
+    store.upsert("agent-1", "hardware_info", R"({"n":1})", 1000);
+    REQUIRE(raw_row_count(pool, "certificate_inventory") == 1);
+
+    SECTION("get reads a typed source as absent, not degraded") {
+        for (const auto typed : yuzu::server::kTypedInventorySources) {
+            auto row = store.get("agent-1", std::string(typed));
+            REQUIRE(row.has_value());
+            CHECK_FALSE(row->has_value());
+        }
+        auto generic = store.get("agent-1", "hardware_info");
+        REQUIRE(generic.has_value());
+        CHECK(generic->has_value());
+    }
+    SECTION("query and get_agent_inventory return only the generic row") {
+        auto rows = store.get_agent_inventory("agent-1");
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().plugin == "hardware_info");
+
+        InventoryQuery q;
+        q.plugin = "certificate_inventory"; // asking for it by name does not reach it
+        auto named = store.query(q);
+        REQUIRE(named.has_value());
+        CHECK(named->empty());
+    }
+    SECTION("stray typed rows never consume the query limit or flag truncation") {
+        InventoryQuery q;
+        q.agent_id = "agent-1";
+        // One above the generic row count: with the filter, one candidate (not at the
+        // limit, so not truncated); without it, the six stray rows would fill the
+        // limit and flag truncation (#2633's exact-at-cap rule).
+        q.limit = 2;
+        bool truncated = true;
+        auto rows = store.query(q, &truncated);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().plugin == "hardware_info");
+        CHECK_FALSE(truncated);
+    }
+    SECTION("the purge removes every typed source's rows and leaves the generic row") {
+        // arch-A2: covers every kTypedInventorySources member, seeded above.
+        for (const auto typed : yuzu::server::kTypedInventorySources)
+            REQUIRE(raw_row_count(pool, std::string(typed)) == 1);
+        InventoryStore::TypedPurgeOptions opt;
+        opt.batch_rows = 2;
+        opt.pause = opt.backoff = std::chrono::milliseconds{0};
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == InventoryStore::TypedPurgeStatus::kCompleted);
+        CHECK(r.rows == static_cast<std::int64_t>(yuzu::server::kTypedInventorySources.size()));
+        for (const auto typed : yuzu::server::kTypedInventorySources)
+            CHECK(raw_row_count(pool, std::string(typed)) == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
+    }
+    SECTION("delete_agent erases typed stray rows too, not just the visible ones") {
+        CHECK(store.delete_agent("agent-1"));
+        for (const auto typed : yuzu::server::kTypedInventorySources)
+            CHECK(raw_row_count(pool, std::string(typed)) == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 0);
+    }
+    SECTION("list_tables and count leave typed sources out") {
+        auto tables = store.list_tables();
+        REQUIRE(tables.has_value());
+        REQUIRE(tables->size() == 1);
+        CHECK(tables->front().plugin == "hardware_info");
+        auto total = store.count();
+        REQUIRE(total.has_value());
+        CHECK(*total == 1);
+    }
 }
 
 TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server receipt "
@@ -311,12 +577,12 @@ TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server rece
     const std::int64_t now_before = test_now_secs();
     const std::int64_t far_future = now_before + 10'000'000;
 
-    store.upsert("agent-clamp", "installed_software", R"({"n":1})", far_future);
+    store.upsert("agent-clamp", "hardware_info", R"({"n":1})", far_future);
     const std::int64_t now_after = test_now_secs();
 
     // Read via both single-record `get` and the list-shaped
     // `get_agent_inventory` — the clamp must hold on both read paths.
-    auto found = store.get("agent-clamp", "installed_software");
+    auto found = store.get("agent-clamp", "hardware_info");
     REQUIRE(found.has_value());
     REQUIRE(found->has_value());
     CHECK((*found)->data_json == R"({"n":1})");
@@ -333,8 +599,8 @@ TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server rece
     // predicate (its real collected_at could never reach the far-future
     // stored value). With the clamp, an honest report at ~now for the same
     // (agent, plugin) must still land.
-    store.upsert("agent-clamp", "installed_software", R"({"n":2})", 0 /* now */);
-    auto landed = store.get("agent-clamp", "installed_software");
+    store.upsert("agent-clamp", "hardware_info", R"({"n":2})", 0 /* now */);
+    auto landed = store.get("agent-clamp", "hardware_info");
     REQUIRE(landed.has_value());
     REQUIRE(landed->has_value());
     CHECK((*landed)->data_json == R"({"n":2})"); // lands — the regression net for the freeze bug
@@ -347,10 +613,10 @@ TEST_CASE("InventoryStore upsert: an older report after a fresh one is suppresse
     yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
 
-    store.upsert("agent-stale", "installed_software", R"({"n":"fresh"})", 10'000); // T
-    store.upsert("agent-stale", "installed_software", R"({"n":"older"})", 9'900); // T-100: rejected
+    store.upsert("agent-stale", "hardware_info", R"({"n":"fresh"})", 10'000); // T
+    store.upsert("agent-stale", "hardware_info", R"({"n":"older"})", 9'900); // T-100: rejected
 
-    auto row = store.get("agent-stale", "installed_software");
+    auto row = store.get("agent-stale", "hardware_info");
     REQUIRE(row.has_value());
     REQUIRE(row->has_value());
     CHECK((*row)->data_json == R"({"n":"fresh"})"); // unchanged
@@ -364,9 +630,9 @@ TEST_CASE("InventoryStore query: the truncated out-param signals a capped read (
           "[pg][inventory]") {
     INVENTORY_SHARED(store, pool);
 
-    store.upsert("agent-t1", "installed_software", R"({"n":1})", 1000);
-    store.upsert("agent-t2", "installed_software", R"({"n":2})", 2000);
-    store.upsert("agent-t3", "installed_software", R"({"n":3})", 3000);
+    store.upsert("agent-t1", "hardware_info", R"({"n":1})", 1000);
+    store.upsert("agent-t2", "hardware_info", R"({"n":2})", 2000);
+    store.upsert("agent-t3", "hardware_info", R"({"n":3})", 3000);
 
     SECTION("limit below the row count returns the cap and sets truncated=true") {
         InventoryQuery q;

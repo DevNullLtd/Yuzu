@@ -183,7 +183,7 @@ TEST_CASE("services: parse_launchctl_list on a truncated/zero-line capture repor
     // plugin's own independent parser had no header-shape check and no
     // empty-input check at all: a truncated/zero-line capture parsed as a
     // clean "0 services" success, the identical defect class UP2-2 fixed
-    // for TAR at HIGH in round 2.
+    // for Echo at HIGH in round 2.
     auto result = parse_launchctl_list("", false);
     CHECK(result.services.empty());
     CHECK(result.malformed);

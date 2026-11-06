@@ -59,7 +59,7 @@ against ADR-0018/ADR-0019 below):
 `installed_software` source (ADR-0016). Cross-platform.
 
 ### V1.2 Process / listener / connection snapshot :white_check_mark: `T1`
-`tar` plugin `fleet_snapshot.v1` (`agents/plugins/tar/src/tar_fleet_snapshot.cpp`) —
+`echo` plugin `fleet_snapshot.v1` (`agents/plugins/echo/src/echo_fleet_snapshot.cpp`) —
 processes, listeners, 4-tuple connections with owning PID. Feeds V5.
 
 ### V1.3 Per-OS package identity (typed identity emit) :large_orange_diamond: `T1`

@@ -332,19 +332,20 @@ TEST_CASE("writer: the Apps projection is refused with a remediation naming tier
     CHECK(r.status == St::Invalid);
     CHECK(r.message == "unparseable at tiers.excellent: unknown key");
     CHECK(r.remediation.find("tiers.edges") != std::string::npos);
+    CHECK(r.remediation.find("model") != std::string::npos);
     REQUIRE(w.rows.size() == 1);
     CHECK(w.rows[0].detail["field"] == "tiers.excellent");
     CHECK(w.cas_calls == 0);
 }
 
-TEST_CASE("writer: version 2 is refused with the reader's own wording",
+TEST_CASE("writer: version 3 is refused with the reader's own wording",
           "[dex][score_policy_writer]") {
     World w;
-    const auto r = w.put("default", R"({"version":2})");
+    const auto r = w.put("default", R"({"version":3})");
     CHECK(r.status == St::Invalid);
-    CHECK(r.message == "unsupported_version at version: 2 above the supported 1");
+    CHECK(r.message == "unsupported_version at version: 3 above the supported 2");
     // The refusal says what to do: a rolling upgrade can leave a newer document stored.
-    CHECK(r.remediation.find("version 1") != std::string::npos);
+    CHECK(r.remediation.find("version 2") != std::string::npos);
     CHECK(r.remediation.find("leave the stored document alone") != std::string::npos);
 }
 
@@ -385,6 +386,40 @@ TEST_CASE("writer: a validator refusal names its token and group", "[dex][score_
     CHECK(r.message == "edges_not_descending at tiers.edges");
 }
 
+TEST_CASE("writer: model refusals name the model group and the override index",
+          "[dex][score_policy_writer]") {
+    struct Case {
+        const char* body;
+        const char* message;
+        const char* field;
+    };
+    const Case cases[] = {
+        {R"({"version":2,"model":{"per_device_event_cap":0}})", "event_cap_out_of_range at model",
+         "model"},
+        {R"({"version":2,"model":{"interval_confidence":0.3}})",
+         "interval_confidence_out_of_range at model", "model"},
+        // The inherited global full ratio (3.0) is below this override's start: the write path
+        // validates the override as merged onto the global policy.
+        {R"({"version":2,"overrides":[{"image":"a.exe","model":{"regression_start_ratio":5}}]})",
+         "regression_ratios_not_ascending at overrides[0].model", "overrides[0].model"},
+        {R"({"version":2,"overrides":[{"image":"a.exe","model":{"interval_confidence":0.9}}]})",
+         "unparseable at overrides[0].model.interval_confidence: unknown key",
+         "overrides[0].model.interval_confidence"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.body);
+        World w;
+        const auto r = w.put("default", c.body);
+        CHECK(r.status == St::Invalid);
+        CHECK(r.message == c.message);
+        CHECK(r.remediation.empty());
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].result == "denied");
+        CHECK(w.rows[0].detail["field"] == c.field);
+        CHECK(w.cas_calls == 0);
+    }
+}
+
 TEST_CASE("writer: a read failure is 503 with no audit row and no store write",
           "[dex][score_policy_writer]") {
     World w;
@@ -414,7 +449,7 @@ TEST_CASE("writer: dry_run validates and checks the precondition and stores noth
         CHECK(w.rows[0].detail["dry_run"] == true);
     }
     SECTION("an invalid document is 400, recorded as a refused dry run") {
-        CHECK(w.put("default", R"({"version":2})", std::string("true")).status == St::Invalid);
+        CHECK(w.put("default", R"({"version":3})", std::string("true")).status == St::Invalid);
         REQUIRE(w.rows.size() == 1);
         CHECK(w.rows[0].result == "denied");
         CHECK(w.rows[0].detail["dry_run"] == true);
@@ -601,7 +636,7 @@ TEST_CASE("writer: only attempted and success and validate rows carry the docume
         lean(w.rows[0], nullptr);
     }
     SECTION("an invalid document: denied, no byte count") {
-        REQUIRE(w.put("default", R"({"version":2})").status == St::Invalid);
+        REQUIRE(w.put("default", R"({"version":3})").status == St::Invalid);
         REQUIRE(w.rows.size() == 1);
         lean(w.rows[0], nullptr);
     }
@@ -1017,4 +1052,51 @@ TEST_CASE("writer: the answer never claims the policy was left unchanged",
         CHECK(r.message.find("not changed") == std::string::npos);
         CHECK(r.message.find("was not applied") == std::string::npos);
     }
+}
+
+// -- AP-2.17 model parameters --------------------------------------------------
+
+TEST_CASE("writer: a version-2 body with a non-default cap is stored as version 2",
+          "[dex][score_policy_writer]") {
+    World w;
+    const auto r = w.put("default", R"({"version":2,"model":{"per_device_event_cap":6}})");
+    REQUIRE(r.status == St::Ok);
+    REQUIRE(w.stored.has_value());
+    CHECK(json::parse(*w.stored)["version"] == 2);
+    CHECK(json::parse(*w.stored)["model"]["per_device_event_cap"] == 6);
+    CHECK(w.cas_text == *w.stored);
+    CHECK(r.in_force.revision == dex_score_policy_revision(*w.stored));
+    CHECK(r.in_force.policy.model.per_device_event_cap == 6);
+    REQUIRE(w.provider->current());
+    CHECK(w.provider->current()->policy.model.per_device_event_cap == 6);
+}
+
+TEST_CASE("writer: a version-2 body whose model equals the defaults stores the version-1 text",
+          "[dex][score_policy_writer]") {
+    World w;
+    const std::string with_model =
+        R"({"version":2,"tiers":{"edges":{"excellent":95}},"model":{"per_device_event_cap":5,)"
+        R"("regression_full_ratio":3.0,"regression_start_ratio":1.0,"interval_confidence":0.95}})";
+    const std::string without = R"({"tiers":{"edges":{"excellent":95}}})";
+    const auto a = w.put("default", with_model);
+    REQUIRE(a.status == St::Ok);
+    const std::string stored_a = *w.stored;
+    CHECK(json::parse(stored_a)["version"] == 1);
+    CHECK(stored_a.find("model") == std::string::npos);
+
+    World v;
+    REQUIRE(v.put("default", without).status == St::Ok);
+    CHECK(*v.stored == stored_a); // byte-identical, so the same revision
+}
+
+TEST_CASE("writer: a model in a version-1 body is refused and so is a bad model value",
+          "[dex][score_policy_writer]") {
+    World w;
+    const auto a = w.put("default", R"({"model":{"per_device_event_cap":6}})");
+    CHECK(a.status == St::Invalid);
+    CHECK(a.message == "unparseable at model: requires version 2");
+    const auto b = w.put("default", R"({"version":2,"model":{"per_device_event_cap":0}})");
+    CHECK(b.status == St::Invalid);
+    CHECK(b.message == "event_cap_out_of_range at model");
+    CHECK(w.cas_calls == 0);
 }

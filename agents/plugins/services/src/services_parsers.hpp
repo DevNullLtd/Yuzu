@@ -21,12 +21,12 @@
  * macOS's parse_launchctl_list() (governance A0 round-4, CA-1/pd-6) no
  * longer runs its own independent tab-split/header-skip loop: it converges
  * onto the shared raw row decoder + structural validator
- * (agents/shared/launchctl_list.hpp, the same A0 lift TAR's
- * tar_service_parsers.hpp already converged onto), which is the ONLY thing
+ * (agents/shared/launchctl_list.hpp, the same A0 lift Echo's
+ * echo_service_parsers.hpp already converged onto), which is the ONLY thing
  * this file's former copy was missing -- a header-shape check and an
  * empty-input check. Without either, a truncated/zero-line `launchctl list`
  * capture parsed as a clean "0 services" success, the identical defect class
- * UP2-2 (round 2) fixed for TAR at HIGH. See parse_launchctl_list's own doc
+ * UP2-2 (round 2) fixed for Echo at HIGH. See parse_launchctl_list's own doc
  * comment below for the mapping details.
  */
 #pragma once
@@ -176,7 +176,7 @@ struct LaunchdListResult {
 /// Converged onto the shared raw-row decoder + structural validator
 /// (agents/shared/launchctl_list.hpp) rather than this file's own former
 /// independent tab-split/header-skip loop (governance A0 round-4, CA-1/pd-6)
-/// -- mirrors tar_service_parsers.hpp's launchctl_rows_to_services(): a thin
+/// -- mirrors echo_service_parsers.hpp's launchctl_rows_to_services(): a thin
 /// mapper from yuzu::shared::LaunchctlRow's raw pid/status facts onto this
 /// file's LaunchdEntry (string) vocabulary, not a second parse. pid/status
 /// round-trip through the shared decoder's std::from_chars pass -- byte-

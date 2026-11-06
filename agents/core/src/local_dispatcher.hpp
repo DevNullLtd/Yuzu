@@ -4,7 +4,7 @@
  * local_dispatcher.hpp — agent-side in-process plugin dispatch.
  *
  * #1001 / arch-S3: PR 10 introduced an agent snapshot pump that needs
- * to invoke `tar.fleet_snapshot` locally and harvest its JSON payload
+ * to invoke `echo.fleet_snapshot` locally and harvest its JSON payload
  * without touching the gRPC channel. The first implementation hand-wired
  * a `capture` pointer onto CommandContextImpl and branched
  * `flush_output_locked` on `capture != nullptr` to avoid null-deref on

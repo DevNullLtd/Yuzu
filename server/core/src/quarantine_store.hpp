@@ -41,6 +41,8 @@
 /// `legacy_sqlite_probe::warn_if_legacy_rows` over `quarantine_records` instead — silent
 /// unless real rows are found, never blocks boot.
 
+#include "quarantine_types.hpp"
+
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -67,36 +69,6 @@ namespace yuzu::server {
 /// prefix must not silently regress every classified 503 back to 400 —
 /// callers key off the shared constant, never a local copy of the literal.
 inline constexpr const char* kQuarantineDbErrorPrefix = "db_error: ";
-
-struct QuarantineRecord {
-    // #3425 governance Gate 4 (unhappy-path, Finding A): the row's own
-    // primary key — NOT exposed on REST/MCP (wire surfaces stay unchanged),
-    // used ONLY to scope `mark_endpoint_applied`/`mark_endpoint_confirmed`'s
-    // guarded UPDATE to the SPECIFIC record a dispatch/status-read was
-    // actually about. `agent_id`+`status='active'` alone is not a stable
-    // identity: a release-then-requarantine sequence lands a NEW active row
-    // for the same `agent_id` while a reconcile cycle for the OLD row is
-    // still in flight, and without `id` scoping the stamp write silently
-    // lands on the NEW row (whose whitelist was never actually dispatched).
-    std::int64_t id{0};
-    std::string agent_id;
-    std::string status; // "active" or "released"
-    std::string quarantined_by;
-    std::int64_t quarantined_at{0};
-    std::int64_t released_at{0};
-    std::string whitelist; // comma-separated IPs
-    std::string reason;
-    // Schema v2 (#3425): 0 = never, matching `released_at`'s existing
-    // never-happened sentinel on this same table — no optional plumbing.
-    // Written ONLY by QuarantineContainmentReconciler. `last_applied_at` is
-    // set when a system re-dispatch of the STORED whitelist is accepted by
-    // the plugin registry (agents_reached > 0); `last_confirmed_at` is set
-    // only after a FOLLOW-UP `quarantine.status` read reports `state|active`
-    // — dispatch acceptance is not proof of endpoint containment (the same
-    // distinction `quarantine_dispatch_decision.hpp` draws for the MCP path).
-    std::int64_t last_applied_at{0};
-    std::int64_t last_confirmed_at{0};
-};
 
 class QuarantineStore {
 public:

@@ -10,7 +10,7 @@
 #
 #   tests-build-agent-linux_x64/yuzu_agent_tests
 #   tests-build-server-linux_x64/yuzu_server_tests
-#   tests-build-tar-linux_x64/yuzu_tar_tests
+#   tests-build-echo-linux_x64/yuzu_echo_tests
 #
 # Each entry is a symlink to the live build output, so it stays current
 # across rebuilds without the script having to run again. Invoked
@@ -79,7 +79,7 @@ fi
 # ── Link each component's test binary ─────────────────────────────────────
 # Add a new component by appending its short name here. The binary is
 # expected at <BUILD_TESTS_DIR>/yuzu_<component>_tests[.exe].
-COMPONENTS=(agent server tar)
+COMPONENTS=(agent server echo)
 
 linked=0
 skipped=0

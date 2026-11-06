@@ -138,7 +138,17 @@ public:
     /// per application and per version. `degraded` = null store, failed read,
     /// invalid score policy or unreadable stored policy: the handler must refuse
     /// it, never render it as an empty or perfect list.
-    [[nodiscard]] virtual DexAppsModel apps(const std::string& window) const = 0;
+    /// Scoped to `platform_scope` (all|windows|macos|linux): the population and every
+    /// figure are over that scope's online devices. An unknown token is degraded
+    /// (`invalid_scope`), never defaulted to a platform.
+    [[nodiscard]] virtual DexAppsModel apps(const std::string& window,
+                                            const std::string& platform_scope) const = 0;
+
+    /// The Windows scope, the behaviour before the platform argument. REST and MCP pass the scope
+    /// explicitly and default to all; this form is for callers that mean Windows.
+    [[nodiscard]] DexAppsModel apps(const std::string& window) const {
+        return apps(window, kDexAppsScopeWindows);
+    }
 
     /// GET /api/v1/dex/catalogue?os=&window= — the Catalogue View 1 family
     /// cards + fleet coverage + the "Other (uncatalogued)" list (ADR-0031

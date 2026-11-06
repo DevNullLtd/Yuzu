@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -100,6 +101,35 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     CHECK(result.rc == 0);
     CHECK(result.captured.find("probe_status|") != std::string::npos);
 
+    // The typed ABI4 status the dispatch reported must be the one the probe_status
+    // lines imply: a refusal is PERMISSION_DENIED, any other failed surface
+    // CONSTRAINED, an all-ok run leaves it UNDECLARED. Derived here from the output
+    // text, independently of surface_result_status.
+    //
+    // What this pins: the mapping, but only on a host that actually has a refused
+    // or failed surface. On a clean host (every CI runner) only the UNDECLARED arm
+    // runs, which a dropped propagate_surface_status call also yields, so this does
+    // not catch that deletion there. Delivery of the typed status through both the
+    // list and surfaces actions is closed by the real-host refusal probe recorded
+    // in the PR body, and the precedence by the pure seam in test_licensing_parsers.cpp.
+    {
+        INFO("full captured output: " << result.captured);
+        const bool refused =
+            result.captured.find("|error|cert_permission_denied") != std::string::npos;
+        const bool errored = result.captured.find("|error|") != std::string::npos;
+        if (refused) {
+            CHECK(result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+            CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+            CHECK(result.result_provenance == "license_scan:permission_denied");
+        } else if (errored) {
+            CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+            CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+            CHECK(result.result_provenance == "license_scan:surface_error");
+        } else {
+            CHECK(result.result_status == YUZU_RESULT_STATUS_UNDECLARED);
+        }
+    }
+
 #ifdef __linux__
     // Only on Linux does this dispatch reach the migrated code. pkg_metadata is
     // the surface licensing_linux.cpp's runner migration rewrote, and
@@ -118,7 +148,56 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     // attempted.
     INFO("full captured output: " << result.captured);
     CHECK(result.captured.find("probe_status|pkg_metadata|ok|") != std::string::npos);
+
+    // entitlement_certs is read in-process (licensing_x509.hpp): the
+    // surface always reports, the retired openssl-CLI token can never appear,
+    // and on a host without /etc/pki/entitlement the line is exactly the
+    // structural-empty success -- an absent directory is ENOENT, not an error.
+    CHECK(result.captured.find("probe_status|entitlement_certs|") != std::string::npos);
+    CHECK(result.captured.find("openssl_unavailable") == std::string::npos);
+    std::error_code ec;
+    if (!std::filesystem::exists("/etc/pki/entitlement", ec) && !ec) {
+        CHECK(result.captured.find("probe_status|entitlement_certs|ok|0") != std::string::npos);
+    }
 #endif
+}
+
+TEST_CASE("license_scan plugin: capability descriptors declare each leg's support level",
+          "[license_scan][descriptor]") {
+    // REQUIRE, not a WARN-and-skip: a load failure or a missing descriptor is the
+    // regression this test exists to catch (same reasoning as the dispatch test above).
+    auto plugin = load_license_scan_plugin();
+    REQUIRE(plugin.has_value());
+
+    const auto* d = plugin->descriptor;
+    REQUIRE(d->action_descriptors != nullptr);
+    REQUIRE(d->action_descriptor_count == 2);
+
+    // Both actions run the same run_platform_surfaces(), so both declare identical legs.
+    bool saw_list = false;
+    bool saw_surfaces = false;
+    for (std::size_t i = 0; i < d->action_descriptor_count; ++i) {
+        const auto& a = d->action_descriptors[i];
+        REQUIRE(a.action != nullptr);
+        const std::string_view name{a.action};
+        INFO("action " << name);
+        REQUIRE((name == "list" || name == "surfaces"));
+        (name == "list" ? saw_list : saw_surfaces) = true;
+
+        // Linux: pkg_metadata is classification-only and RHEL entitlement readability is
+        // unmeasured, so CONSTRAINED -- at rung 2 because pkg_metadata still goes through
+        // the bounded argv runner (the entitlement read is in-process).
+        CHECK(a.linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(a.linux_leg.rung == 2);
+        // macOS: filesystem glob + in-process XML and bplist00 plist decoding.
+        CHECK(a.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(a.macos_leg.rung == 1);
+        // Windows: WMI + registry, unchanged.
+        CHECK(a.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(a.windows_leg.rung == 1);
+    }
+    CHECK(saw_list);
+    CHECK(saw_surfaces);
 }
 
 #endif // !_WIN32

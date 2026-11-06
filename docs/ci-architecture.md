@@ -177,6 +177,21 @@ code.
 
 ## Gates outside the tier ladder
 
+### Browser smoke (`/test` Phase 5, `tests/puppeteer/ui-smoke.mjs`)
+
+A local gate in `/test`, not a CI job. It drives a headless browser against the running
+dashboard: it crawls every route the shell nav links to (200, the `Content-Security-Policy`
+header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
+discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
+directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
+and runs four scenarios (stubbed where they write: those requests are answered in the browser,
+so nothing reaches the server). The gate first runs
+`ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
+layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
+older `Puppeteer` gate is warn-only); a missing `tests/puppeteer/node_modules/puppeteer`
+records SKIP with the `npm ci` hint. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
+`tests/puppeteer/README.md` covers running it by hand.
+
 ### Release re-publish guard (`release-guard`, #5282)
 
 The first job in `release.yml`. It refuses any run whose ref is not a tag
@@ -292,7 +307,7 @@ where each lives.
 Every Linux native artifact carries the glibc / libstdc++ floor of the host
 that built it by accident (#5143). The gate makes the floor an explicit,
 committed promise and measures every build against it. It is specified by
-ADR-2003 (Proposed, PR #5631; the ADR is not on `dev` yet). **In S0 it is
+ADR-2003 (Accepted, PR #5631). **In S0 it is
 report-only: nothing it finds can fail a build or a release.** S2 turns it on.
 
 - **The script** runs `objdump -T` and `readelf -d` over every ELF under a
@@ -318,7 +333,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
   `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
   `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
-  measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
+  measurement. Changing one is a floor decision (ADR-2003, accepted in PR #5631:
   "Floor review rule"), not a tuning edit. A typo in a family key would silently
   ungate that family (families absent from `max` are only reported), so the
   loader requires `GLIBC`, the script reports a measured family one edit away
@@ -362,7 +377,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   deterministic (sorted, no timestamps or paths): a refresh diffs cleanly. A
   set whose scan was incomplete (a PROBLEM, an unreadable or unscanned ELF)
   carries an `incomplete` list; the committed baseline has none. The
-  floor-review rule in ADR-2003 (Proposed, PR #5631) says when to refresh it.
+  floor-review rule in ADR-2003 (Accepted, PR #5631) says when to refresh it.
 - **Release wiring.** `release.yml`'s `build-linux` job runs the script
   report-only on the staged tarball contents right after "Package archive"
   (agent set, then server set) in a `continue-on-error` step, and uploads the
@@ -695,6 +710,22 @@ when the matrix is skipped, and fails red rather than hanging if the classifier
 itself dies. **Only with that stub are the five contexts safe to add to branch
 protection.**
 
+**`gateway-base-index` job (#6711).** The same workflow also runs one plain (non-matrix)
+job, "Gateway builder index matches runtime Alpine", whenever the classifier says the
+image surface changed. It runs `scripts/ci/check-gateway-base-index.py` on a hosted
+runner with no Docker: it fetches the pinned `erlang:28-alpine` index from Docker Hub
+(anonymous, retried, body hashed against the pinned digest) and fails when a platform
+on `Dockerfile.gateway`'s `# yuzu:gateway-platforms` marker (today `linux/amd64`) is not
+annotated as built on the runtime stage's Alpine release. That is the early check on a
+Dependabot digest refresh; the build's abi-guard stays the build-time enforcement.
+Exit 1 is a mismatch, 2 an unreadable registry or a body that is not the pinned digest (the
+log says whether a re-run can help), 3 an input the script does not understand. A skipped
+plain job satisfies a required check, so it needs no stub. To disable the networked
+check, put `if: false` on the job (and take it out of branch protection first if it was
+ever made required). Keep the script, `tests/test_gateway_base_index.py` and
+the `docs-lint.yml` "Gateway base index lint" step: that test also holds the executed
+arch-guard contract for `Dockerfile.gateway`.
+
 The PR matrix reuses release.yml's local buildcache **read-only** (`cache-from`
 with no `cache-to`), so it never evicts release layers and adds no cache directory
 `cache-prune.yml` doesn't know about. Inside `release.yml` the verification build
@@ -804,15 +835,78 @@ of reading as NOT TESTED.
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
 (`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
-the build under test pass the flag: `scripts/integration-test.sh` (in both its plaintext and
-`--tls` branches), `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh`
-and the locally built full, sanitizer and viz UAT composes. None of them exercises a pinned
-gateway hop, and no workflow under `.github/` invokes `integration-test.sh` (it runs from
-`scripts/run-tests.sh`); running its `--tls` branch with a real pinned gateway leaf is a deferred
-follow-up. The pre-release `integration` job (`scripts/ci/qa-stack.sh`) starts no server itself:
-it runs this checkout's reference-gateway template on the release's published images, so any
-acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
-image older than the flag ignores), not in the script.
+the build under test pass the flag: `scripts/integration-test.sh` in its plaintext mode,
+`scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh` and the locally built
+full, sanitizer and viz UAT composes. None of those exercises a pinned gateway hop. One rig does:
+`scripts/integration-test.sh --tls` runs the server on its generated default certificates with no
+acknowledgement, so it enforces the automatic pin of its own `default-gateway.pem`, and the gateway
+release dials it over `https` with `verify_peer` and that leaf as its client certificate; the
+reverse hop (server to the gateway's management listener) is pinned there too. The `linux`
+job runs it as the step "Gateway real-wire test (pinned TLS)" (below). The pre-release `integration`
+job (`scripts/ci/qa-stack.sh`) starts no server itself: it runs this checkout's reference-gateway
+template on the release's published images, so any acknowledgement or pin that rig needs belongs in
+that template (an environment variable, which an image older than the flag ignores), not in the
+script.
+
+**Gateway real-wire gate (#5652, #5653).** The gateway's unit tests mock the upstream client
+(`meck` on `yuzu_grpc_client`), so on their own they cannot show that a call site and the real client
+still agree. The `linux` job's gcc-15/debug leg therefore runs `scripts/integration-test.sh --tls
+--free-ports --gateway-ct`: the real `yuzu-server` under test, the gateway built as the prod
+release (`rebar3 as prod release`, started with `foreground` on a generated `sys.config` that has
+the production shape of `deploy/docker/reference-gateway-sys.config`) and one real `yuzu-agent`
+(agent to gateway over one-way TLS), then `yuzu_gw_real_upstream_SUITE` (Common Test) against that
+same server. The hop is pinned over TLS: the suite presents the gateway leaf the server auto-pins,
+and a valid leaf of the same CA that is not pinned must be refused with `UNAUTHENTICATED` (counted as
+`not_pinned`). The suite pairs every upstream call site (`ProxyRegister`, `BatchHeartbeat`,
+`ProxyInventory`, `NotifyStreamStatus`, `ForwardGuardianMessage`) with the real client and reads the
+effect back from the server (the decoded reply, or the server's `/metrics` for the two casts), checks
+the error shapes (a server status as `{error, {Status, Message}}`, a non-200 HTTP response as the
+`http_error` text, which needs an in-VM cowboy answering 502 because the real server never sends one),
+and forces a registration replay: the server must adopt the agent's existing session (read back
+through its answer to a heartbeat for that session), and a presented session it did not mint must
+tear the agent down. A swapped request marshal function, a lost `x-yuzu-session-id` header or
+`{error, _}` returned where `{http_error, _}` belongs each fails a named case (checked by mutating
+the gateway source and rerunning the suite).
+
+The same run covers the **management hop**, server to gateway (`:50063`, the privileged command
+plane; the symptom of #5175 was every `SendCommand` reaching the server as `Socket closed`). The
+gateway's management listener runs in the production posture, in the shipped mode by default: strict mutual TLS
+(`verify_peer` + `fail_if_no_peer_cert`), `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and
+`mgmt_peer_auth_mode = identity` with no `mgmt_peer_pins` (the shipped form since release N+1, #6016: the
+gateway derives the identity from the single-certificate `default-ca.pem` and requires `serverAuth`);
+`YUZU_GW_MGMT_AUTH_MODE=identity_or_pin` is the one setting that differs from the shipped
+posture: it runs the transition mode, also pinning `<server default-server.pem>`. The shipped configurations (resolved and judged by the real boot-guard
+functions) are also covered by the eunit module `yuzu_gw_config_posture_tests`; the server is pointed at it with `--gateway-command-addr` and
+presents its own default leaf. Three layers check it. (1) The script dispatches `os_info.os_name` to
+the real agent through the server's REST API (admin login, `POST /api/command`, poll
+`/api/responses/{id}`): one round trip, then 300 commands, 16 at a time, whose streams all share the
+server's single management connection; every one must return the agent's SUCCESS and the server's
+`yuzu_server_gateway_forward_total` must count all 301 as `ok` and none under any failure status (the
+REST per-IP limit is raised for this server with `--rate-limit 10000`; at the default 100 requests/s the
+limiter answers 429 for most of the burst and the commands never overlap). (2)
+`yuzu_gw_real_mgmt_SUITE` dials the listener itself: the pinned leaf is served, and the server identity cases (#6016, in the `identity_or_pin` mode the script configures) are covered too: the real server leaf is admitted by identity, a renewed-key leaf and a same-key re-issue carrying the identity are served, and a leaf carrying another install's identity is refused; the gateway's own
+leaf and an enrolled agent's leaf, both valid certificates of the same CA, get `UNAUTHENTICATED` and
+move `yuzu_gw_mgmt_auth_rejected_total` by `pin_mismatch` and `missing_server_auth_eku`; a peer with
+no certificate gets no call; a command to the real agent returns its SUCCESS with output; 300
+`SendCommand` streams (50 in flight) over ONE connection all complete; a command to an agent that
+is not connected ends OK with a FAILURE frame; a fan-out whose 1 s deadline passes before the agent
+(held 4 s by `delay_seconds`) answers ends OK without that answer and the connection still serves;
+100 streams cancelled with `RST_STREAM` while the agent holds them leave the connection and gateway
+serving. (3) After all of it the script greps the gateway log for `function_clause`, `CRASH REPORT`,
+`=ERROR REPORT`, a supervisor termination or any `[error]` line, and the server log for `Socket
+closed` or a failed `Gateway SendCommand`. Checked by mutation: pinning the gateway's leaf instead
+of the server's fails the REST round trip and the burst, and listing the gateway's leaf as a second
+pin fails `unpinned_leaf_is_refused`. It cannot skip: the script has no skip path, a missing
+prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
+(server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
+identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
+allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
+`runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
+fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
+the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+condition) and the Common Test logs, never the run's throwaway CA or agent keys. The burst's own log
+(`mgmt_driver.log`) is among the uploaded `*.log` files.
 
 **Gateway peer authorization gates.** Four pieces enforce it in CI. (1) The `linux` job in
 `ci.yml` installs the `postgresql-client` apt package (it provides `psql`) and runs the step
@@ -960,10 +1054,10 @@ telemetry start step exports the same values for already-running listeners.
 Wee Tam's 4 runners are CCD-pinned, but affinity partitions only **cores** — not
 DRAM bandwidth, the disk, or the Defender minifilter. So when several Windows jobs
 run their **test** phase at the same time, the heavy unit-test suites
-(`server ~[pg]`/`[pg]`, `agent`, `tar`) slow roughly linearly and hit their meson
+(`server ~[pg]`/`[pg]`, `agent`, `echo`) slow roughly linearly and hit their meson
 timeouts: per-runner telemetry (`ci_test_suites`) measured `server ~[pg]` at
 c0≈289 s → c2≈467 s → c4≈603 s — a **guaranteed** timeout once ≥4 test phases
-overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`tar` suites overall.
+overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`echo` suites overall.
 `fork()`/VFS/page-cache and no AV minifilter keep Big Tam's (Linux) per-op cost
 lower than Wee Tam's — but a prior revision of this section claimed Big Tam
 "scales flat" and needed no gate at all, which was never actually true; see
@@ -994,6 +1088,71 @@ invocation selects `--suite platform` instead of `--suite docs` (the
 `docs` suite is Linux-only, "Test suites by leg" below) and its
 `assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
 label still fails loud.
+
+`Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
+`YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
+cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
+`YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
+`YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
+scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node` and `HKCU\Software`; the
+local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registry_local_dispatcher.cpp:228,248`) are
+outside the scan.
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
+`scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
+other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
+the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
+could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
+because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a
+tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
+removes it.
+
+Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*` key whose run is no longer in
+progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
+with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
+both follow a registry link and can delete its target.
+
+**Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
+`YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A
+real-time session outlives its process until something stops it, so a test process that is killed (a meson timeout),
+crashes or is cancelled leaves its session running, and the four runner agents share one OS identity, so the leak is
+shared state. On 2026-11-05 `logman query -ets` on Wee Tam showed one such session for a dead pid while `echo unit
+tests` failed on every Windows run waiting for its own registry event (#7173, #7135); the leg passed in the two runs
+after the session was stopped by hand. Whether the leak is the cause is not established (35 of the 64 system sessions
+were in use, so the limit was not reached, and no mechanism by which a dead session starves a new one is known), so
+the guard is preventive and the root-cause question stays on #7135.
+The Windows job runs `scripts/ci/stop-dead-etw-sessions.ps1` three times, each step capped at 5 minutes: `Self-test
+the ETW leaked-session cleanup` before the suite (canned `logman` output with injected liveness and stop functions,
+plus one arm that runs the host `pwsh` as a short-lived child to prove the call timeout: it starts and stops no ETW
+session and writes plain `selftest note:` lines, never an annotation), `Stop ETW sessions leaked by dead Yuzu test
+processes (pre-test)` before `Test (non-pg suites)`, and a `(post-test)` run under `always()` after the registry
+leftover assertion, so a session leaked by this job's own killed or cancelled test process is stopped and logged
+against this job rather than the next one. Each real run logs the total session count (limit 64, `::warning` from 48)
+and the Yuzu count. It stops a session by exact name only when the name matches `^Yuzu[A-Za-z]*Etw-[0-9]+$`
+(case-sensitive) and its pid is not a running process, so a live job on another runner slot keeps its session and no
+system or Defender session is ever matched; a liveness probe that fails for any reason other than "no such process"
+counts as alive. The pid is checked a second time just before `logman stop`, which only guards against a flip between
+the two checks; the window is not closed, which is safe because a live owner's session always has a live pid. It never
+fails the job: a listing or stop error is a `::warning` and the script exits 0. Every `logman` call runs in a child
+process that is killed after 45 s, inside a 180 s budget for the whole run, so a wedged ETW service costs a step at
+most about three minutes and then warns; the 5-minute step cap is only a backstop. "Never fails" describes the
+script's own logic: the step envelope can still fail the job (`pwsh` missing, or a failed self-test arm, which is
+deliberate: a broken guard should be loud). A listing with fewer than 3 session rows (a healthy box lists its kernel
+loggers) is treated as not understood and stops nothing. A stop that fails is checked against a fresh listing, and a
+session that has gone (a concurrent job stopped it first) is logged as gone. A successful stop is also annotated as a
+`::warning`, deliberately, so a leak shows on the job, and each run appends its counts to the job summary. `logman` is
+run from the Windows system directory only: if it is not there, nothing is stopped. *Acceptance check, one-off:* in
+the first three Windows runs after this change merges, read the `ETW sessions (pre-test):` line (`N total (system
+limit 64), M Yuzu`). A green run whose log instead shows `could not list sessions`, `listing not understood`, `timed
+out` or `could not stop leaked ETW session` means the guard is not working there; those are warnings, not failures,
+and nothing pages anyone, so someone must look. Residuals: a pid reused by an unrelated live process keeps its session
+until that process exits (and a leak whose pid was reused persists until a check happens to find that pid free); a
+process killed after the post-test step leaves its session for the next job's pre-test step; output the parser does
+not understand (a non-English Windows) stops nothing and warns; a session name of about 39 characters or more would be
+undercounted in the total (the Yuzu names are about 30). A name outside `^Yuzu[A-Za-z]*Etw-[0-9]+$`, such as one with
+a digit before `Etw`, is left alone. If the guard is itself broken, recover by hand on the runner host: `logman query
+-ets`, then `logman stop <exact name> -ets` for a `Yuzu*Etw-<pid>` session whose pid is not running, with no job
+running on any of the four slots. `nightly.yml`'s `windows-asan` job runs only the `agent` suite, whose tests do not
+start the echo session, so it needs no such step.
 
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
@@ -1174,7 +1333,7 @@ within-job `--num-processes` pool was shared by ALL ~32 registered tests, not
 just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
 no `--suite`/name filter at all. Fix: split the Test step into 3
 `flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`) — 21 tests
-across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run first, then
+across 5 cheap suites (`agent`/`docs`/`proto`/`echo`/`gateway`) run first, then
 the 3 non-pg server tests, both uncapped (neither touches Postgres) — status as
 of that day; see "Within-job cap extended to the non-pg step" at the end of
 this section for what changed; the 8 pg
@@ -1456,7 +1615,7 @@ shard by under the 25% bar (a re-cut must cut the longest shard by more than a q
 and C 110.5 s (-15%), and moving `[pg][auth_db]` from pg M to B gives B 205.4 s
 and M 319.0 s (-17%). The pre-move shards were not re-run on Windows, so the
 pg move's own Windows effect is not measured; re-cut from the per-case
-durations the CI job summary now carries. The tar writer and drain spin bounds were not
+durations the CI job summary now carries. The echo writer and drain spin bounds were not
 measured on Windows either, and nothing here claims it.
 
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
@@ -1826,7 +1985,7 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   the `Ok:`, `Fail:` and `Skipped:` lines: Ok 100, Fail 0, Skipped 5 for the first
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
-  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, tar
+  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, echo
   90 s, `gateway eunit` and `gateway ct` 600 s.
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
@@ -1844,7 +2003,7 @@ applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
-240 s for the harness, 192 s for an agent shard, 72 s for tar); and the entry
+240 s for the harness, 192 s for an agent shard, 72 s for echo); and the entry
 count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
 guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green
@@ -2413,9 +2572,12 @@ test file or script itself, not behind a meson guard. Those nine carry the
 
 Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
 (not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
-everything but `--no-suite docs`. The two dual-labelled node tests
-(`shell bell script behaviour`, `tokens page rotate behaviour`; `['server', 'docs']`)
-therefore no longer run on Windows or macOS, by intent.
+everything but `--no-suite docs`. The five dual-labelled node tests
+(`shell bell script behaviour`, `tokens page rotate behaviour`,
+`echo timeline script behaviour`, `mcp http adapter behaviour` and
+`swagger page behaviour`; `['server', 'docs']`)
+therefore no longer run on Windows or macOS, by intent. Like its siblings, the
+`mcp http adapter behaviour` test skips (exit 77) wherever `node` is absent.
 Before moving an entry, grep the docs-suite tests, Python and shell, for a
 Windows- or macOS-positive branch: `skipUnless(... win32`,
 `if sys.platform == "win32":` guarding assertions, a Python ternary on

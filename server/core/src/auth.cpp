@@ -164,7 +164,22 @@ std::string role_to_string(Role r) {
 }
 
 Role string_to_role(const std::string& s) {
-    return s == "admin" ? Role::admin : Role::user;
+    if (s == "admin")
+        return Role::admin;
+    if (s == "user")
+        return Role::user;
+    // #4072: role_to_string() only ever returns "admin" or "user", so anything else
+    // is drift (a botched migration, a hand edit of auth.users.role, a corrupt cfg
+    // line), never a legitimate value. It still floors to Role::user - failing safe,
+    // never granting - but must not do so silently: a quiet demotion hides the
+    // corruption. log_key_token (not log_token): the value is DB/file-sourced and is
+    // logged inside quotes, so it must be length-capped and have control bytes and
+    // Unicode line separators folded (CWE-117).
+    spdlog::warn("string_to_role: unrecognized role value '{}' - resolving to Role::user "
+                 "(fail-safe); check the stored role source (auth.users.role, a session row "
+                 "or the legacy config file) for corruption or a migration gap",
+                 ::yuzu::log_key_token(s));
+    return Role::user;
 }
 
 std::filesystem::path default_config_path() {
@@ -664,20 +679,45 @@ void AuthManager::maybe_refresh_session_generation() const {
         note_session_store_degrade("generation_refresh");
         return;
     }
-    bool advanced = false;
+    bool changed = false;
     {
         std::lock_guard<std::mutex> g(session_gen_mtx_);
         last_successful_session_gen_refresh_ms_ = steady_now_ms(); // bounded stale-serve anchor
-        if (!session_gen_valid_ || *gen > cached_session_gen_) {
+        // ANY difference from the cached value is a change, a LOWER one included
+        // (#6079). A point-in-time restore or a failover to a lagging standby
+        // can leave the stored counter below this replica's cached value; a
+        // forward-only `>` test would keep the old value, miss every later
+        // revocation (the counter climbs from the lower base) and keep serving
+        // cached sessions, bounded only by the 8 h absolute lifetime. This
+        // replica never writes `cached_session_gen_` on a local mutation (its
+        // own bump is observed by this same poll like any other), so an
+        // unchanged read is the only no-op and there is no clear loop. The gate
+        // above only stamps a timestamp before the unlocked read, so a read
+        // slower than the interval lets a second poll start; if they finish out
+        // of order the stale one re-adopts the older value and the next poll
+        // adopts the newer one again: up to two extra clears. Over-clearing
+        // only forces durable re-reads, never drops a durable row
+        // (a session held only in this cache, whose write-through failed, is
+        // lost on a clear, which is fail-closed). The generation read MUST come
+        // from the primary: a reader answered by alternating nodes with
+        // different counters clears the cache on every flip (at most once per
+        // replica per poll interval), an availability cost, never a bypass.
+        // KNOWN RESIDUAL: a counter that is EXACTLY equal to the cached value at
+        // the poll (restored to it, or regressed and climbed back to it between
+        // two polls) is indistinguishable from "no change" and is not detected
+        // here; a counter that passed it differs and is. The recovery runbook
+        // keeps "restart every replica" as defence in depth.
+        if (!session_gen_valid_ || *gen != cached_session_gen_) {
             cached_session_gen_ = *gen;
             session_gen_valid_ = true;
-            advanced = true;
+            changed = true;
         }
     }
-    if (advanced) {
-        // A mutation landed (possibly on another replica) — drop the whole cache
-        // so the next lookup re-reads authoritative state. Cleared under mu_,
-        // which is never held together with session_gen_mtx_.
+    if (changed) {
+        // The generation moved (a mutation landed, possibly on another replica,
+        // or the counter regressed): drop the whole cache so the next lookup
+        // re-reads authoritative state. Cleared under mu_, which is never held
+        // together with session_gen_mtx_.
         std::unique_lock lock(mu_);
         sessions_.clear();
     }
@@ -1498,6 +1538,11 @@ void AuthManager::lapse_elevation_for_test(const std::string& token,
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
 }
 
+void AuthManager::expire_session_generation_poll_for_test() {
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    last_session_gen_refresh_ms_ = steady_now_ms() - kSessionGenRefreshMs - 1;
+}
+
 void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
     role_recheck_race_hook_for_test_ = std::move(hook);
 }
@@ -1685,11 +1730,38 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     return session_copy;
 }
 
+DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
+                                                    std::string_view expected_username) const {
+    if (!session_store_) {
+        // A serving process always has a SessionStore (the server refuses to start without
+        // Postgres), so this is a wiring fault. No database clock exists to age a proof on,
+        // and the replica's clocks must not stand in for it: unavailable, never "no proof".
+        spdlog::error("read_durable_mfa_proof: no SessionStore attached - failing closed");
+        return {DurableMfaProof::Source::kUnavailable, 0, 0};
+    }
+    if (token.empty() || token.size() > kMaxSessionTokenLength)
+        return {DurableMfaProof::Source::kAbsent, 0, 0};
+    auto found = session_store_->find(hash_token(token));
+    if (!found) {
+        spdlog::warn("read_durable_mfa_proof: durable session lookup degraded ({})",
+                     found.error().message);
+        note_session_store_degrade("validate");
+        return {DurableMfaProof::Source::kUnavailable, 0, 0};
+    }
+    if (!found->has_value())
+        return {DurableMfaProof::Source::kAbsent, 0, 0};
+    const auto& f = found->value();
+    if (f.row.username != expected_username)
+        return {DurableMfaProof::Source::kAbsent, 0, 0};
+    return {DurableMfaProof::Source::kRow, f.row.mfa_verified_ms, f.db_now_ms};
+}
+
 std::optional<Session> AuthManager::validate_session_durable(const std::string& token,
                                                              bool idle_enabled) const {
     // Refresh cross-replica cache coherence BEFORE consulting the cache: a
     // create/invalidate/elevate/mfa mutation on any replica advances the durable
-    // generation, which clears this replica's now-stale cache.
+    // generation (a restore or failover can also lower it); either change clears
+    // this replica's now-stale cache.
     maybe_refresh_session_generation();
 
     const std::string key = hash_token(token);
@@ -2267,7 +2339,8 @@ std::size_t AuthManager::report_stale_cfg_credentials() {
     return stale;
 }
 
-std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
+std::expected<Role, AuthManager::GetUserRoleError>
+AuthManager::get_user_role(const std::string& username) const {
     // Gate 3 governance BLOCKING finding (cpp-safety), fix shape confirmed via
     // Sol/codex opine: this was a pure `users_` cache read with NO AuthDB
     // fallback at all - completely independent of authenticate()/
@@ -2319,8 +2392,10 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
         if (!db_user) {
             // Gate 3 re-review follow-up (cpp-expert + authdb, converged): log
             // a genuine store error distinctly from a plain not-found, so a PG
-            // outage that silently floors every legacy-token session to
-            // Role::user (auth_routes.cpp's `.value_or(Role::user)`) leaves an
+            // outage - which floors every legacy-token session to Role::user
+            // (auth_routes.cpp's `.value_or(Role::user)`) and, since #4068,
+            // makes the Settings create/role-change routes and SCIM
+            // active:false answer 503 - leaves an
             // operational trail instead of zero diagnostic signal - mirrors
             // find_user_or_hydrate's own UserNotFound-vs-DbError split in this
             // same file.
@@ -2333,29 +2408,27 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
                 db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
-                              "a genuine miss) - returning nullopt",
+                              "a genuine miss) - returning DbError",
                               ::yuzu::log_key_token(username));
                 // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
-                // invisible exactly while the store is already stressed (the
-                // scenario that matters). This is the ONLY caller-visible signal
-                // that auth_routes.cpp's `.value_or(Role::user)` is about to
-                // floor a legacy-token-authenticated request's role down - narrows
-                // the observability gap; the honest fix (this call returning
-                // std::expected so callers can distinguish "not found" from
-                // "store degraded" and respond accordingly, e.g. 503 instead of a
-                // silent floor) touches 6 call sites and is a follow-up, not this
-                // metric.
+                // invisible exactly while the store is already stressed. The
+                // counter stays (auth_routes.cpp's legacy-token synthesis still
+                // floors to Role::user on DbError and has no other signal);
+                // since #4068 the error channel ALSO lets every other caller
+                // respond to a store error explicitly instead of reading it as
+                // "not found".
                 if (metrics_)
                     metrics_->counter("yuzu_auth_get_user_role_store_error_total").increment();
+                return std::unexpected(GetUserRoleError::DbError);
             }
-            return std::nullopt;
+            return std::unexpected(GetUserRoleError::NotFound);
         }
         return db_user->role;
     }
     std::shared_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end())
-        return std::nullopt;
+        return std::unexpected(GetUserRoleError::NotFound);
     return it->second.role;
 }
 

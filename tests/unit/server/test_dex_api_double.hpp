@@ -49,7 +49,8 @@ public:
         const std::string& agent_id, const std::string& event_id)>;
     using AppFn = std::function<yuzu::server::DexAppModel(const std::string& process_name,
                                                            const std::string& window)>;
-    using AppsFn = std::function<yuzu::server::DexAppsModel(const std::string& window)>;
+    using AppsFn = std::function<yuzu::server::DexAppsModel(const std::string& window,
+                                                            const std::string& platform_scope)>;
     using CatalogueFn = std::function<yuzu::server::DexCatalogueModel(
         const std::string& os_filter, const std::string& window)>;
     using CatalogueGroupFn = std::function<std::optional<yuzu::server::DexCatalogueGroupModel>(
@@ -121,13 +122,15 @@ public:
         return app_fn_(process_name, window);
     }
 
-    [[nodiscard]] yuzu::server::DexAppsModel apps(const std::string& window) const override {
+    using DexApi::apps; // the 2-arg override must not hide the 1-arg forwarder
+    [[nodiscard]] yuzu::server::DexAppsModel apps(const std::string& window,
+                                                  const std::string& platform_scope) const override {
         if (!apps_fn_) {
             yuzu::server::DexAppsModel m;
             m.window = window;
             return m;
         }
-        return apps_fn_(window);
+        return apps_fn_(window, platform_scope);
     }
 
     [[nodiscard]] yuzu::server::DexCatalogueModel

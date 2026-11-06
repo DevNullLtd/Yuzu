@@ -269,7 +269,7 @@
   "version": "0.1.0",
   "where_the_data_goes": [
     "**MCP / REST.** No definition YAML exists for `example` (no file under `content/definitions/` sets `plugin: example`), so there is no `definition_id` to discover via `discover_instructions`/`get_definition` or run via `execute_instruction` today — `ping` and `echo` are unreachable from the MCP/REST surface until a definition is authored. The only paths that load this plugin today are the plugin-capture driver (`PluginHandle::load` + `LocalDispatcher::run`, used for the samples below) and direct test/tooling loads of the shared library.",
-    "**Not consumed by** daily-sync, the TAR warehouse, DEX, or metrics — nothing schedules this plugin; it runs only when explicitly loaded.",
+    "**Not consumed by** daily-sync, the Echo warehouse, DEX, or metrics — nothing schedules this plugin; it runs only when explicitly loaded.",
     "**Sensitivity.** Both actions carry no host state — `ping`'s row is a fixed literal and `echo`'s row is only the operator-supplied `message` parameter echoed back; nothing about the device, an account, or installed software is read or reported.",
     "**Siblings:** none — a standalone ABI/host reference plugin, not part of an inventory family (`example_plugin.cpp:1-6`)."
   ]

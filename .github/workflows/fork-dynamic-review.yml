@@ -72,8 +72,8 @@ jobs:
           echo "/tmp/yuzu-review-venv/bin" >> "$GITHUB_PATH"
 
       # OTP + rebar3 for the gateway tests. Without them meson's
-      # `find_program('rebar3', required: false)` silently skips `gateway
-      # eunit` / `gateway ct`, and this leg would claim a green `meson test`
+      # `find_program('rebar3', required: false)` silently skips the `gateway
+      # eunit shard A/B` / `gateway ct` tests, and this leg would claim a green `meson test`
       # without having run the gateway (#4800, #4841). Same pin as ci.yml's
       # Linux leg and release.yml. The runner is a GitHub-hosted, ephemeral
       # VM, so ImageOS is auto-detected and setup-beam's tool cache is

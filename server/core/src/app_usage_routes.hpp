@@ -13,8 +13,8 @@
 ///
 /// AUTH: a scoped `Forensics`/`Read` gate on the agent (`scoped_perm_fn`, the
 /// `SleRoutes`/`device_routes` precedent — tier + management group, 403
-/// outside scope). Per-device app-usage data is Administrator-only by design
-/// (`Forensics` is deliberately absent from the seeded Viewer read-list,
+/// outside scope). Per-device app-usage data is held by default only by Administrator and
+/// the read-only ForensicsAnalyst role (`Forensics` is deliberately absent from the seeded Viewer read-list,
 /// docs/authz-model.md §4) — see `test_authz_topology_floor.cpp` for the
 /// RBAC-off/RBAC-on matrix this gate depends on. Per-device scope is
 /// MANDATORY — fail CLOSED (503 `scope gate not configured`) if the gate is

@@ -24,13 +24,15 @@
  * render_results and its inputs (instruction_store_, response_store_) are
  * private; the DashboardResultsColumnsTestAccess friend seam
  * (dashboard_routes.hpp) wires them without standing up an HTTP server, same
- * shape as test_dashboard_tar_retention.cpp's seam.
+ * shape as test_dashboard_echo_retention.cpp's seam.
  */
 
 #include "dashboard_routes.hpp"
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_export_cap_guard.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 #include "url_attr_scan.hpp"
 
@@ -79,6 +81,9 @@ yuzu::test::PgTestTemplate dashboard_cols_instr_tpl{
 // register_routes' own parameter instead of this friend seam.
 struct DashboardResultsColumnsTestAccess {
     DashboardRoutes routes;
+    // #4990: these renderer-level cases are not about the Forensics tier (the route-level cases in
+    // test_dashboard_results_fragment.cpp are), so the default reads every row; a tier case sets it.
+    ResponseTierFilter tier = ResponseTierFilter::unrestricted_internal_consumer();
 
     void set_stores(InstructionStore* is, ResponseStore* rs) {
         routes.instruction_store_ = is;
@@ -89,7 +94,7 @@ struct DashboardResultsColumnsTestAccess {
     }
     std::string render(const std::string& command_id, const std::string& plugin,
                        const std::string& definition_id = {}) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
     }
@@ -98,27 +103,46 @@ struct DashboardResultsColumnsTestAccess {
     std::string render_reflected(const std::string& command_id, const std::string& plugin,
                                  const std::string& text_query,
                                  const std::string& definition_id) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, text_query, definition_id);
     }
     std::string render_filtered(const std::string& command_id, const std::string& plugin,
                                 const std::vector<FacetFilter>& filters,
                                 const std::string& definition_id = {}) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50, filters,
                                      /*text_query=*/"", definition_id);
     }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
-                                   const std::string& username = {}) {
-        return routes.render_filter_bar(command_id, plugin, /*definition_id=*/{},
+                                   const std::string& username = {},
+                                   const std::string& definition_id = {}) {
+        return routes.render_filter_bar(command_id, tier, plugin, definition_id,
                                         /*template_id=*/{}, username);
+    }
+    // Full view control: sort/page/per_page/filters/Search/template, for the sync, count and
+    // pagination-stamp pins (#5677 / #5700 / #6075).
+    std::string render_view(const std::string& command_id, const std::string& plugin,
+                            const std::string& sort_col, const std::string& sort_dir, int page,
+                            int per_page, const std::vector<FacetFilter>& filters,
+                            const std::string& text_query, const std::string& template_id = {}) {
+        return routes.render_results(command_id, tier, plugin, sort_col, sort_dir, page, per_page,
+                                     filters, text_query, /*definition_id=*/"", template_id);
+    }
+    std::optional<DashboardRoutes::TextMatch>
+    agents_matching(const std::string& command_id, const std::string& plugin,
+                    const std::string& text_query) {
+        return routes.agents_matching_text(command_id, tier, plugin, {}, text_query);
+    }
+    DashboardRoutes::MatchingResponses load(const std::string& command_id,
+                                            const std::vector<FacetFilter>& filters) {
+        return routes.load_matching_responses(command_id, tier, filters);
     }
     // #1712 / #3290 Phase 2 — the fleet-read gate's composed
     // meet(management-group, service-scope) VisibleSet.
     std::string render_scoped(const std::string& command_id, const std::string& plugin,
                               const yuzu::server::authz::VisibleSet& scope) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", /*definition_id=*/"",
                                      /*template_id=*/"", /*visible_columns=*/{}, scope);
@@ -555,16 +579,17 @@ TEST_CASE("render_filter_bar route: dispatched through TestRouteSink, the "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
-    // test_dashboard_tar_fragments.cpp:106-180): `sink` declared LAST so it
+    // test_dashboard_echo_fragments.cpp:106-180): `sink` declared LAST so it
     // is destroyed FIRST, while `routes` -- whose `this` its handlers
     // captured -- is still alive.
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
@@ -640,12 +665,13 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
@@ -666,6 +692,66 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
     // BR-002: same cross-operator shared-cache concern as filter-bar.
     CHECK(res->get_header_value("Cache-Control") == "no-store, private");
     CHECK(res->get_header_value("Vary") == "Cookie");
+}
+
+// #4990: an Unknown Forensics decision must not show a number computed over a partial row set.
+TEST_CASE("create-group-form route: an Unknown Forensics decision shows the count as unavailable, "
+          "not a number",
+          "[pg][server][dashboard][create_group_form][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-create-group-unknown";
+    for (const char* agent : {"agent-1", "agent-2"}) {
+        StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.plugin = "registry";
+        r.output = "match";
+        rs.store(r);
+    }
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "testuser";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn = [](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
+                                           const std::string&, const std::string&,
+                                           const std::string&, const std::string&) { return true; };
+    struct SinkHarness {
+        yuzu::server::test::ForensicsCaller forensics;
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+    yuzu::server::test::wire_forensics(h.routes, h.forensics);
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &rs, /*mgmt_group_store=*/nullptr,
+                             /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+                             /*caller_fn=*/DashboardRoutes::CallerFn{},
+                             /*resolve_fn=*/DashboardRoutes::ResolveFn{}, &metrics,
+                             /*instruction_store=*/nullptr);
+    const std::string url =
+        "/fragments/create-group-form?command_id=" + command_id + "&plugin=registry&f_output=match";
+
+    h.forensics.unknown();
+    auto unk = h.sink.Get(url);
+    REQUIRE(unk != nullptr);
+    CHECK(unk->status == 200);
+    CHECK(contains(unk->body, "agent count unavailable"));
+    CHECK_FALSE(contains(unk->body, "agents will be added"));
+
+    h.forensics.admin(); // control: a resolved decision shows the real count
+    auto ok = h.sink.Get(url);
+    REQUIRE(ok != nullptr);
+    CHECK(contains(ok->body, "2 agents will be added"));
 }
 
 // #5623: a filter value over the ingest bound is not indexed in newly stored responses, so the
@@ -699,11 +785,12 @@ TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes repl
                                          const std::string&, const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
                                            const std::string&, const std::string&,
-                                           const std::string&, const std::string&) {};
+                                           const std::string&, const std::string&) { return true; };
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &rs, /*mgmt_group_store=*/nullptr,
                              /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
                              /*agents_json_fn=*/[] { return std::string{"[]"}; },
@@ -783,11 +870,12 @@ TEST_CASE("create-group-form route: an over-bound filter on a degraded store sho
                                          const std::string&, const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
                                            const std::string&, const std::string&,
-                                           const std::string&, const std::string&) {};
+                                           const std::string&, const std::string&) { return true; };
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &bad_rs,
                              /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
                              /*tag_store=*/nullptr, /*event_bus=*/nullptr,
@@ -869,12 +957,13 @@ TEST_CASE("create-group-form route: a JIT-elevated session sees the "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
@@ -940,12 +1029,13 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
@@ -979,10 +1069,11 @@ TEST_CASE("render_results: request-reflected values are query-encoded in the sor
     const std::string html = acc.render_reflected("cmd 1", plugin, q, "d/../e");
     const auto urls = yuzu::test::url_attr_values(html);
 
+    // #5677: the Search term is NOT baked into the link; the live filter bar supplies it through
+    // hx-include, so the link names only the identity of the view.
     const std::string want =
         "/fragments/results?command_id=cmd%201&plugin=" + yuzu::server::url_query_value(plugin) +
-        "&sort=agent&dir=desc&page=1&per_page=50&definition_id=d%2F..%2Fe&q=" +
-        yuzu::server::url_query_value(q);
+        "&sort=agent&dir=desc&page=1&per_page=50&definition_id=d%2F..%2Fe";
     CHECK(yuzu::test::has_url(urls, want));
     // The raw reflected markup never reaches the page, and nothing was escaped twice.
     CHECK_FALSE(contains(html, "<b>"));
@@ -993,7 +1084,8 @@ TEST_CASE("render_results: request-reflected values are query-encoded in the sor
         if (u.rfind("/fragments/results?", 0) == 0) {
             // one query string, exactly the parameters the renderer itself appended
             CHECK(std::count(u.begin(), u.end(), '#') == 0);
-            CHECK(std::count(u.begin(), u.end(), '&') == 7);
+            CHECK(std::count(u.begin(), u.end(), '&') == 6);
+            CHECK_FALSE(contains(u, "&q="));
         }
     }
 }
@@ -1057,6 +1149,258 @@ TEST_CASE("render_results: the chart URL encodes the command id and is omitted f
     for (const std::string id : {std::string(".."), std::string("."), std::string("%2e%2e")}) {
         const auto html = acc.render_filtered(id, "registry", {}, *created);
         CHECK(html.find("yuzu-chart-card") == std::string::npos);
+    }
+}
+
+namespace {
+
+// One stored frame for `agent` (ResponseStore::store is a plain INSERT per frame, so calling
+// this twice for one agent leaves TWO rows owned by that agent).
+void store_frame(ResponseStore& rs, const std::string& command_id, const std::string& agent,
+                 const std::string& output) {
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = agent;
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.plugin = "registry";
+    r.output = output;
+    rs.store(r);
+}
+
+} // namespace
+
+// #5677 items 1+2: one newest-wins scope for every results control, and the links name only the
+// identity of the view -- the live filters come from the filter bar, never from a baked URL.
+TEST_CASE("render_results: sort and pager controls share the filter-bar sync scope and bake no "
+          "filter state into their links",
+          "[pg][server][dashboard][render_results][sync]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string cmd = "cmd-sync-1";
+    store_frame(rs, cmd, "agent-1", "same");
+    store_frame(rs, cmd, "agent-2", "same");
+    store_frame(rs, cmd, "agent-3", "same");
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+
+    // Page 2 of 3 at one line per page: Prev and Next both render. A column filter, a Search term
+    // and a template are all in play, and none may reach a sort/pager URL.
+    const std::string html =
+        acc.render_view(cmd, "registry", "agent", "asc", /*page=*/2, /*per_page=*/1,
+                        {FacetFilter{.col_idx = 0, .value = "same"}}, "sam", "tpl1");
+
+    // Agent + Output headers, Prev, Next; the Create Group button (a filter is applied) joins the
+    // same scope but is not a sort/pager link.
+    constexpr std::size_t kControls = 4;
+    CHECK(count_occurrences(html, "hx-sync=\"#filter-bar:replace\"") == kControls + 1);
+    CHECK(count_occurrences(html, "hx-include=\"#filter-bar\"") == kControls);
+    CHECK_FALSE(contains(html, "this:abort"));
+    CHECK(contains(html, ">Prev</button>"));
+    CHECK(contains(html, ">Next</button>"));
+
+    std::size_t results_urls = 0;
+    for (const auto& u : yuzu::test::url_attr_values(html)) {
+        if (u.rfind("/fragments/results?", 0) != 0)
+            continue;
+        ++results_urls;
+        CHECK_FALSE(contains(u, "f_"));
+        CHECK_FALSE(contains(u, "q="));
+        CHECK_FALSE(contains(u, "template_id"));
+    }
+    CHECK(results_urls == kControls);
+}
+
+// #5700: the Search term is part of the group definition and of the agent count.
+TEST_CASE("render_results: a Search term alone offers Create Group over exactly the agents it "
+          "matches",
+          "[pg][server][dashboard][render_results][group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string cmd = "cmd-q-1";
+    store_frame(rs, cmd, "agent-1", "alpha");
+    store_frame(rs, cmd, "agent-2", "beta");
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+
+    SECTION("a matching Search term: one result, one agent, a button carrying q and the sync scope") {
+        const auto html = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, {}, "alp");
+        CHECK(contains(html, "1 result across 1 agent"));
+        CHECK(contains(html, "Create Group from 1 Agent</button>"));
+        const auto urls = yuzu::test::url_attr_values(html);
+        CHECK(yuzu::test::has_url(
+            urls, "/fragments/create-group-form?command_id=" + cmd + "&plugin=registry&q=alp"));
+        for (const auto& u : urls) {
+            if (u.rfind("/fragments/create-group-form", 0) == 0)
+                CHECK_FALSE(contains(u, "f_"));
+        }
+        CHECK(contains(html, "class=\"btn-create-group\""));
+        // The button is a results-page control: it joins the newest-wins scope.
+        const auto btn = html.find("class=\"btn-create-group\"");
+        REQUIRE(btn != std::string::npos);
+        CHECK(html.find("hx-sync=\"#filter-bar:replace\"", btn) != std::string::npos);
+    }
+    SECTION("a Search term with no hit offers no button") {
+        const auto html = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, {}, "zzz");
+        CHECK_FALSE(contains(html, "btn-create-group"));
+    }
+    SECTION("no filter and no Search term offers no button") {
+        const auto html = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, {}, "");
+        CHECK(contains(html, "2 results across 2 agents"));
+        CHECK_FALSE(contains(html, "btn-create-group"));
+    }
+}
+
+// A stored row is one frame, so one agent can own several. "across N agents" counts agents.
+TEST_CASE("render_results: the agent count is distinct agents, not stored rows",
+          "[pg][server][dashboard][render_results][group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string cmd = "cmd-distinct-1";
+    store_frame(rs, cmd, "agent-1", "one");
+    store_frame(rs, cmd, "agent-1", "two");
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+
+    const auto unfiltered = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, {}, "");
+    CHECK(contains(unfiltered, "2 results across 1 agent"));
+    const auto searched = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, {}, "o");
+    CHECK(contains(searched, "2 results across 1 agent"));
+}
+
+// #6075 / the client summary refresh reads these stamps.
+TEST_CASE("render_results: #result-pagination carries the view, also when empty",
+          "[pg][server][dashboard][render_results][sync]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+
+    const auto html =
+        acc.render_view("cmd-stamp-1", "registry", "output", "desc", 1, 25, {}, "");
+    CHECK(contains(html, "<nav id=\"result-pagination\" hx-swap-oob=\"true\" "
+                         "data-sort=\"output\" data-dir=\"desc\" "
+                         "data-page=\"1\" data-per-page=\"25\">"));
+}
+
+// A filtered read longer than the row cap used to be silently cut at 10,000 rows.
+TEST_CASE("load_matching_responses: the filtered read reports a cut at the row cap",
+          "[pg][server][dashboard][render_results][truncation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string cmd = "cmd-trunc-1";
+    store_frame(rs, cmd, "agent-1", "same");
+    store_frame(rs, cmd, "agent-2", "same");
+    store_frame(rs, cmd, "agent-3", "same");
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+    const std::vector<FacetFilter> filters{FacetFilter{.col_idx = 0, .value = "same"}};
+
+    SECTION("cap below the match count: truncated, one row fewer than the matches") {
+        yuzu::test::ResultsRowCapGuard cap{2};
+        const auto loaded = acc.load(cmd, filters);
+        CHECK_FALSE(loaded.store_degraded);
+        CHECK(loaded.result_truncated);
+        CHECK(loaded.responses.size() == 2);
+        const auto html = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, filters, "");
+        CHECK(contains(html, "data-result-truncated=\"true\""));
+    }
+    SECTION("cap equal to the match count: complete") {
+        yuzu::test::ResultsRowCapGuard cap{3};
+        const auto loaded = acc.load(cmd, filters);
+        CHECK_FALSE(loaded.result_truncated);
+        CHECK(loaded.responses.size() == 3);
+        const auto html = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, filters, "");
+        CHECK_FALSE(contains(html, "data-result-truncated"));
+    }
+    SECTION("the unfiltered read honours the same cap") {
+        yuzu::test::ResultsRowCapGuard cap{2};
+        const auto loaded = acc.load(cmd, {});
+        CHECK_FALSE(loaded.store_degraded);
+        CHECK(loaded.result_truncated);
+        yuzu::test::ResultsRowCapGuard roomy{3};
+        CHECK_FALSE(acc.load(cmd, {}).result_truncated);
+    }
+}
+
+TEST_CASE("agents_matching_text: one entry per matching agent, however many rows match",
+          "[pg][server][dashboard][render_results][truncation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string cmd = "cmd-amt-1";
+    store_frame(rs, cmd, "agent-1", "alpha");
+    store_frame(rs, cmd, "agent-1", "alpine");
+    store_frame(rs, cmd, "agent-2", "beta");
+    store_frame(rs, cmd, "agent-3", "alpha");
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+
+    const auto match = acc.agents_matching(cmd, "registry", "alp");
+    REQUIRE(match.has_value());
+    CHECK_FALSE(match->truncated);
+    CHECK(std::set<std::string>(match->ids.begin(), match->ids.end()) ==
+          std::set<std::string>{"agent-1", "agent-3"});
+    CHECK(match->ids.size() == 2); // agent-1 owns two matching rows but appears once
+}
+
+TEST_CASE("render_filter_bar: every control joins the newest-wins scope; the form drops a "
+          "refresh issued mid-request; the View switch appears only with an equals default",
+          "[pg][server][dashboard][render_results][sync]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string cmd = "cmd-bar-1";
+    store_frame(rs, cmd, "agent-1", "alpha");
+    store_frame(rs, cmd, "agent-2", "beta");
+
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    auto make_def = [&](const std::string& name, const std::string& op) {
+        auto def = make_list_profiles_definition();
+        def.name = name;
+        def.response_templates_spec =
+            R"([{"id":"vw1","name":"v","default":false,"filters":[{"column":"Output","op":")" +
+            op + R"(","value":"x"}]}])";
+        auto id = is.create_definition(def);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    const auto equals_def = make_def("bar-equals", "equals");
+    const auto contains_def = make_def("bar-contains", "contains");
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+
+    SECTION("no definition: no View select, no switch; Output + Search controls use the scope") {
+        const auto html = acc.render_filter_bar(cmd, "registry");
+        CHECK(contains(html, "<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"this:drop\">"));
+        CHECK_FALSE(contains(html, "queue"));
+        CHECK_FALSE(contains(html, "closest form:abort"));
+        CHECK_FALSE(contains(html, "view_filters"));
+        // Output dropdown + Search box.
+        CHECK(count_occurrences(html, "hx-sync=\"#filter-bar:replace\"") == 2);
+        CHECK(count_occurrences(html, "hx-get=\"/fragments/results\"") == 2);
+    }
+    SECTION("an equals default renders the per-request switch, itself in the scope") {
+        const auto html = acc.render_filter_bar(cmd, "registry", "", equals_def);
+        CHECK(contains(html, "name=\"view_filters\" value=\"off\""));
+        CHECK(contains(html, "View without saved filters"));
+        // View select + switch + Output dropdown + Search box.
+        CHECK(count_occurrences(html, "hx-sync=\"#filter-bar:replace\"") == 4);
+        CHECK(count_occurrences(html, "hx-get=\"/fragments/results\"") == 4);
+        CHECK_FALSE(contains(html, "closest form:abort"));
+    }
+    SECTION("a non-equals default offers no switch (nothing it could switch off)") {
+        const auto html = acc.render_filter_bar(cmd, "registry", "", contains_def);
+        CHECK_FALSE(contains(html, "view_filters"));
     }
 }
 

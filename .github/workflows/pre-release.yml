@@ -211,7 +211,7 @@ jobs:
           persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead
@@ -447,7 +447,7 @@ jobs:
   # - fedora:42, gateway: the bundled OTP crypto NIF needs OpenSSL SM4
   #   symbols Red Hat's OpenSSL lacks (#5171).
   #
-  # NON-GATING legs (matrix.experimental, ADR-2003 (Proposed, PR #5631) slice
+  # NON-GATING legs (matrix.experimental, ADR-2003 (Accepted, PR #5631) slice
   # S0): rockylinux:8 (the agent's glibc 2.28 floor) and amazonlinux:2023 are
   # expected to FAIL on the 0.14.x artefacts until the EL8-built agent lands
   # (ADR-2003 S2). They run so the gap is measured on every pre-release.
@@ -1159,7 +1159,7 @@ jobs:
           persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead
@@ -1238,7 +1238,7 @@ jobs:
           persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead
@@ -1459,7 +1459,7 @@ jobs:
           persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead

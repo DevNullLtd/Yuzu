@@ -154,6 +154,7 @@ struct Win32HiveFileProbe final : HiveFileProbe {
         BY_HANDLE_FILE_INFORMATION info{};
         if (!GetFileInformationByHandle(leaf.h, &info)) return failure_code(GetLastError());
         out.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+        out.links = info.nNumberOfLinks;
 
         PSID owner = nullptr;
         PSECURITY_DESCRIPTOR sd = nullptr;

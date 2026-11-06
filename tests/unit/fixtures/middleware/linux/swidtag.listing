@@ -1,0 +1,64 @@
+# ls -ln of /opt/mqm/swidtag in each IBM MQ Advanced for Developers image (names verbatim)
+# image icr.io/ibm-messaging/mq:latest (10.0.1.0-r1)
+drwxr-xr-x 2 1001 0 4096 Oct  1 12:47 /opt/mqm/swidtag
+-r--r--r-- 1 1001 0  689 Oct  1 12:47 ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-10.0.1.swidtag
+# image icr.io/ibm-messaging/mq:9.3.5.1-r2 (the .swidtag file; the directory also holds 21 *.mqtag files, listed in provenance.txt)
+drwxr-xr-x 1 1001 0 4096 May 10  2024 /opt/mqm/swidtag
+-r--r--r-- 1 1001 0 687 May 10  2024 ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-9.3.5.swidtag
+
+# image icr.io/ibm-messaging/mq:9.2.5.0-r3 (sha256:febe3fbf180fd844e9d94fb48b954b84a0f20a0c1dd6052f3ce4e1545d379c9a), verbatim: ls -ln /opt/mqm/swidtag
+total 88
+-r--r--r-- 1 1001 0 575 May 12  2022 IBM_MQ-9.2.5.mqtag
+-r--r--r-- 1 1001 0 525 May 12  2022 IBM_MQ_Advanced-9.2.5.mqtag
+-r--r--r-- 1 1001 0 557 May 12  2022 IBM_MQ_GSKit-8.0.55.mqtag
+-r--r--r-- 1 1001 0 587 May 12  2022 IBM_MQ_JRE-1.8.0.mqtag
+-r--r--r-- 1 1001 0 578 May 12  2022 IBM_MQ_Java_Messaging-9.2.5.mqtag
+-r--r--r-- 1 1001 0 608 May 12  2022 IBM_MQ_Messages_Brazilian_Portuguese-9.2.5.mqtag
+-r--r--r-- 1 1001 0 604 May 12  2022 IBM_MQ_Messages_Chinese_Simplified-9.2.5.mqtag
+-r--r--r-- 1 1001 0 606 May 12  2022 IBM_MQ_Messages_Chinese_Traditional-9.2.5.mqtag
+-r--r--r-- 1 1001 0 578 May 12  2022 IBM_MQ_Messages_Czech-9.2.5.mqtag
+-r--r--r-- 1 1001 0 580 May 12  2022 IBM_MQ_Messages_French-9.2.5.mqtag
+-r--r--r-- 1 1001 0 580 May 12  2022 IBM_MQ_Messages_German-9.2.5.mqtag
+-r--r--r-- 1 1001 0 586 May 12  2022 IBM_MQ_Messages_Hungarian-9.2.5.mqtag
+-r--r--r-- 1 1001 0 582 May 12  2022 IBM_MQ_Messages_Italian-9.2.5.mqtag
+-r--r--r-- 1 1001 0 584 May 12  2022 IBM_MQ_Messages_Japanese-9.2.5.mqtag
+-r--r--r-- 1 1001 0 580 May 12  2022 IBM_MQ_Messages_Korean-9.2.5.mqtag
+-r--r--r-- 1 1001 0 580 May 12  2022 IBM_MQ_Messages_Polish-9.2.5.mqtag
+-r--r--r-- 1 1001 0 582 May 12  2022 IBM_MQ_Messages_Russian-9.2.5.mqtag
+-r--r--r-- 1 1001 0 582 May 12  2022 IBM_MQ_Messages_Spanish-9.2.5.mqtag
+-r--r--r-- 1 1001 0 564 May 12  2022 IBM_MQ_Runtime-9.2.5.mqtag
+-r--r--r-- 1 1001 0 564 May 12  2022 IBM_MQ_Samples-9.2.5.mqtag
+-r--r--r-- 1 1001 0 573 May 12  2022 IBM_MQ_WebUI-9.2.5.mqtag
+-r--r--r-- 1 1001 0 686 May 12  2022 ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-9.2.5.swidtag
+
+# image icr.io/ibm-messaging/mq:9.1.5.0-r2 (sha256:84d87c8b4291a2142882f8d06b94110f14a7212429087503daa56c1d92611187), verbatim: ls -ln /opt/mqm/swidtag
+total 88
+-r--r--r-- 1 1001 0 561 May 27  2020 IBM_MQ-9.1.5.mqtag
+-r--r--r-- 1 1001 0 511 May 27  2020 IBM_MQ_Advanced-9.1.5.mqtag
+-r--r--r-- 1 1001 0 543 May 27  2020 IBM_MQ_GSKit-8.0.55.mqtag
+-r--r--r-- 1 1001 0 573 May 27  2020 IBM_MQ_JRE-1.8.0.mqtag
+-r--r--r-- 1 1001 0 564 May 27  2020 IBM_MQ_Java_Messaging-9.1.5.mqtag
+-r--r--r-- 1 1001 0 594 May 27  2020 IBM_MQ_Messages_Brazilian_Portuguese-9.1.5.mqtag
+-r--r--r-- 1 1001 0 590 May 27  2020 IBM_MQ_Messages_Chinese_Simplified-9.1.5.mqtag
+-r--r--r-- 1 1001 0 592 May 27  2020 IBM_MQ_Messages_Chinese_Traditional-9.1.5.mqtag
+-r--r--r-- 1 1001 0 564 May 27  2020 IBM_MQ_Messages_Czech-9.1.5.mqtag
+-r--r--r-- 1 1001 0 566 May 27  2020 IBM_MQ_Messages_French-9.1.5.mqtag
+-r--r--r-- 1 1001 0 566 May 27  2020 IBM_MQ_Messages_German-9.1.5.mqtag
+-r--r--r-- 1 1001 0 572 May 27  2020 IBM_MQ_Messages_Hungarian-9.1.5.mqtag
+-r--r--r-- 1 1001 0 568 May 27  2020 IBM_MQ_Messages_Italian-9.1.5.mqtag
+-r--r--r-- 1 1001 0 570 May 27  2020 IBM_MQ_Messages_Japanese-9.1.5.mqtag
+-r--r--r-- 1 1001 0 566 May 27  2020 IBM_MQ_Messages_Korean-9.1.5.mqtag
+-r--r--r-- 1 1001 0 566 May 27  2020 IBM_MQ_Messages_Polish-9.1.5.mqtag
+-r--r--r-- 1 1001 0 568 May 27  2020 IBM_MQ_Messages_Russian-9.1.5.mqtag
+-r--r--r-- 1 1001 0 568 May 27  2020 IBM_MQ_Messages_Spanish-9.1.5.mqtag
+-r--r--r-- 1 1001 0 550 May 27  2020 IBM_MQ_Runtime-9.1.5.mqtag
+-r--r--r-- 1 1001 0 550 May 27  2020 IBM_MQ_Samples-9.1.5.mqtag
+-r--r--r-- 1 1001 0 559 May 27  2020 IBM_MQ_WebUI-9.1.5.mqtag
+-r--r--r-- 1 1001 0 686 May 27  2020 ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-9.1.5.swidtag
+
+# REGISTERED install: ubuntu:24.04 + IBM MQ Advanced for Developers 9.4.5.0 debs (ibmmq-runtime, ibmmq-gskit, ibmmq-server), verbatim: ls -ln /opt/mqm/swidtag
+total 16
+-r--r--r-- 1 999 1001 578 Jan 21  2026 IBM_MQ-9.4.5.mqtag
+-r--r--r-- 1 999 1001 559 Jan 21  2026 IBM_MQ_GSKit-9.0.0.mqtag
+-r--r--r-- 1 999 1001 567 Jan 21  2026 IBM_MQ_Runtime-9.4.5.mqtag
+-r--r--r-- 1 999 1001 687 Jan 21  2026 ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-9.4.5.swidtag

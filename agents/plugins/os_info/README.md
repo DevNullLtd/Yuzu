@@ -20,12 +20,12 @@ Every leg is native in-process (ADR-3002 rung 1, zero subprocesses) — includin
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow / live panel] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[os_info.execute]
-  EX --> WIN[Windows leg<br/>Reg*W CurrentVersion + RtlGetVersion<br/>GetNativeSystemInfo + GetTickCount64]
-  EX --> MAC[macOS leg<br/>SystemVersion.plist + sysctlbyname<br/>uname(2) + sysctl KERN_BOOTTIME]
-  EX --> LIN[Linux leg<br/>/etc/os-release + /proc/version<br/>uname(2) + /proc/uptime]
-  WIN & MAC & LIN --> ROWS[key\|value rows<br/>UNDECLARED status] --> RS[(ResponseStore)] --> API[REST /api/responses · live JSON]
+  OP["Operator / workflow / live panel"] --> SRV["Server - authz: Inventory.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["os_info.execute"]
+  EX --> WIN["Windows leg - Reg*W CurrentVersion + RtlGetVersion, GetNativeSystemInfo + GetTickCount64"]
+  EX --> MAC["macOS leg - SystemVersion.plist + sysctlbyname, uname(2) + sysctl KERN_BOOTTIME"]
+  EX --> LIN["Linux leg - /etc/os-release + /proc/version, uname(2) + /proc/uptime"]
+  WIN & MAC & LIN --> ROWS["key|value rows, UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses, live JSON"]
 ```
 
 ## OS capability
@@ -105,7 +105,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 - **Instruction result.** Rows land in the ResponseStore over the agent's command-response channel; `os_info` is in the `kKeyValuePlugins` set (`server/core/src/result_parsing.hpp:63`), so SSE row rendering, ResponseStore facet extraction, and DashboardRoutes fragment rendering all render it as an `Agent · Key · Value` table.
 - **Live snapshot / device dashboard.** `uptime` is one of two allow-listed "Get live info" kinds (`server/core/src/live_kinds.hpp:43`, `resolve_kind("uptime") → LiveKind{"os_info","uptime",...}`), dispatched as a real, deliberately **untracked** instruction (no `ExecutionTracker` row — `server/core/src/server.cpp:19704`) and rendered as a KPI tile (`server/core/src/device_routes.hpp:130`). Reachable via `POST /api/v1/dex/devices/{id}/live?kind=uptime` (`server/core/src/rest_api_v1.cpp:10424-10437`).
 - **Pre-flight (`/auto`) gate.** `os_version` and `os_arch` are two of the five blocking Slice-1 checks, parsed by raw pipe-field index — bypassing `result.columns` entirely (`server/core/src/preflight_parse.hpp:13-15,51-52`).
-- **Not consumed by** daily-sync, the TAR warehouse, or typed inventory: `is_typed_inventory_source` (`server/core/src/typed_inventory_sources.hpp:22-26`) lists only `installed_software`, `app_perf`, `device_ci`, `software_licensing` — `os_info` is absent, so its result never lands in a typed daily-sync store.
+- **Not consumed by** daily-sync, the Echo warehouse, or typed inventory: `is_typed_inventory_source` (`server/core/src/typed_inventory_sources.hpp:22-26`) lists only `installed_software`, `app_perf`, `device_ci`, `software_licensing` — `os_info` is absent, so its result never lands in a typed daily-sync store.
 - **Sensitivity.** Rows carry only OS name/version/build/architecture and uptime — no device id, MAC, hostname, username, or installed-software identifier appears in any field.
 - **Siblings:** `device_identity` (the typed `device_ci` daily-sync source), `hardware.*` (also a `kKeyValuePlugins` entry).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.os_info.uptime")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}` for an instruction dispatch; `/api/v1/dex/devices/{id}/live?kind=uptime` for the live KPI path.

@@ -471,7 +471,7 @@ over a limit makes execute answer `500`):
 
 `enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
 poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
-that route does not read `enabled`.
+that route does not read `enabled`, and neither do its v1 and MCP twins.
 
 ### Replacing a stored parameter schema
 
@@ -580,7 +580,7 @@ Yuzu supports three approval modes that control whether an execution requires hu
 
 ### Rules
 
-- **Submitter cannot approve.** The user who submits an execution request cannot be the one to approve it. A different user with the appropriate role must review it.
+- **Submitter cannot approve.** The account that submits an execution request cannot be the one to approve it. A different account with the appropriate role must review it (the check compares account names; see the known limitation under [Who can approve](#who-can-approve)).
 - **Comments are supported.** Both approve and reject actions accept an optional comment for the audit trail.
 - **Pending count.** The API provides a pending approval count for dashboard badges and automation polling.
 
@@ -596,11 +596,11 @@ spec:
 
 When a user (or MCP tool) executes an instruction that requires approval:
 
-1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
+1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). This is true on every surface, MCP included: a `pending_approval` answer from `execute_instruction_definition` carries the same kind of instruction-origin ticket, and no surface can redeem it, so re-calling the tool with that `approval_id` does not run the instruction. Only an MCP tier ticket is redeemable: when the supervised tier itself holds a call for approval (an `execute_instruction` or similar call answered with `approval_required` (-32006)), the client re-calls the same tool with that `approval_id` once a person has approved it, and that call runs. A definition whose `approval_mode` is not `auto` therefore cannot be run through the execute routes or tools until #6064 lands (this limit predates the v1 and MCP twins).
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
-3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
+3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab (a rejected request is never run; an approved instruction-origin ticket is recorded but not dispatched, as in step 1). On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
-The submitter cannot approve their own request. A different user with the appropriate role must review it.
+The submitting account cannot approve its own request. A different account with the appropriate role must review it (the check compares account names; see the known limitation under [Who can approve](#who-can-approve)).
 
 ### Who can approve
 
@@ -612,50 +612,92 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   local account or OIDC single sign-on, and the request must carry that session cookie. An API token or an MCP
   token is refused with `403` and an A4 error envelope, however much it is permitted to do
   elsewhere.
-- **A fresh MFA step-up.** Approve and reject are step-up endpoints, like token creation and role
-  changes. If the session's MFA proof is older than `--mfa-step-up-window-secs` (default 300), the
-  request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
-  inline, and a script posts the code to `/login/mfa/stepup` and retries (see
-  [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). **Read
-  "fresh MFA step-up" with its limit.** As on every step-up endpoint, the gate cannot demand a factor
-  an account does not have, so it passes without a second factor for: a local account with no
-  enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and
-  `admin-only` for admins, make login force enrolment first, so in practice this is any account under
-  `optional` and a non-admin under `admin-only`); an SSO account whose identity provider did not
-  assert MFA (`amr`), **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for
-  a non-admin role); and any session when `--mfa-step-up-window-secs=0`. To make a fresh factor
-  mandatory for every approver, run with `--mfa-enforcement=required`, and know its prerequisite and
-  cost first: your identity provider must assert an MFA-method `amr` for approvers, and an SSO session
-  without one gets `401` and loops through re-sign-in at EVERY step-up endpoint (token creation, user and
-  role management, Guardian writes, software deploy, JIT elevation), not only approval, so check `amr`
-  before you enable it; the way back is restarting the server in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an
-  `amr`-less OIDC admin is still gated under `admin-only` (see
-  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
-  [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). Every local user must also enrol at
-  login. SAML users are refused at step-up gates in every mode, so `required` does not change that. A requirement that the approver
-  specifically holds an enrolled factor, whatever the enforcement mode, is tracked in #6079.
+- **An enrolled MFA factor and a fresh proof (#6079).** Approve and reject are covered by the central
+  step-up check that token creation and role changes use, but that check passes an account that
+  has no factor to ask for, and a disabled window switches it off. The server therefore also requires the reviewer's own session to show a
+  second-factor proof made within the approver window (the window is `--mfa-step-up-window-secs`
+  when that is between 1 and 300, and 300 when it is `0`, negative or above 300, so 300 seconds is a
+  ceiling and a lower setting shortens it; it does not depend on `--mfa-enforcement`; the age is measured on the
+  database clock against the proof stored with your session, so a paused virtual machine or a resumed host cannot
+  extend it). What counts depends on how you signed in:
+  - **Local account.** The account must have an enrolled TOTP factor, or the decision is refused with
+    `403` and `approver_assurance_required:mfa_not_enrolled`. If the proof is older than the window the
+    request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
+    inline, and a script posts the code to `/login/mfa/stepup` and retries (see
+    [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
+    made before the account's current enrolment does not count: if MFA was disabled and enrolled again,
+    enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
+    the decision is refused: with step-up on (the default) the central check answers first with `401`
+    `MFA step-up required`, and `403` `approver_assurance_required:account_unavailable` appears only with
+    `--mfa-step-up-window-secs=0` (or when the account is removed in the middle of the request). Either way, sign in again or contact an administrator.
+  - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
+    method claim (`amr`) from your identity provider, on an ID token issued within the approver window
+    (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is lower). "Fresh" here means the
+    provider issued an ID token with an MFA `amr` within the window; the MFA itself may predate the token,
+    because the provider can reuse its own session. You are **not** asked for a
+    second factor again when you approve; real re-authentication at approval time is a planned
+    follow-up. A sign-in with no MFA `amr` (or an ID token with no usable `iat`) is refused with `403` and
+    `approver_assurance_required:mfa_proof_missing`; sign in again through your identity provider with
+    MFA, or ask an administrator to have the provider require MFA for approvers and report it in `amr`. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. With step-up on and `--mfa-enforcement`
+    protecting your role (`required`, or `admin-only` for an administrator), a sign-in with no MFA `amr` is
+    answered first by the central step-up check with a `401` that sends you back to your identity provider, so a
+    provider that never asserts an MFA `amr` loops instead of showing `mfa_proof_missing`. If the replica that took your
+    sign-in ran ahead of the database clock, so that your stored proof is dated after the database clock, you are refused
+    with `503` (`the approver's identity-provider MFA proof is dated after the database clock`, no retry hint) and signing
+    in again does not help: an administrator must correct clock synchronisation between the Yuzu server hosts and the
+    database host (the dashboard shows you the message and the remediation together; see [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
+    An older proof is a
+    `401` whose `challenge_url` is `/auth/oidc/start`; the Approvals dialog follows that challenge by
+    sending the browser through your identity provider, which abandons the decision you were
+    making, so reopen the request and decide it again after you return.
+  - **SAML.** Refused with `403` (#4935). With step-up on (the default) the central check's generic `403`
+    "MFA step-up is not available for SAML sessions in this release" answers first; the typed
+    `approver_assurance_required:saml_mfa_unsupported` appears only with `--mfa-step-up-window-secs=0`.
+
+  On a default install (RBAC enforcement off, `--mfa-enforcement=optional`) the only approvers are
+  administrators, and an administrator who has not enrolled a factor in Settings is refused
+  `mfa_not_enrolled`, so enrol each administrator before the first approval is needed.
+
+  A non-admin approver cannot enrol itself in the default modes. Local enrolment happens at sign-in only
+  for accounts that `--mfa-enforcement` protects (`optional` protects nobody; `admin-only` protects
+  administrators), and the enrolment routes in Settings are administrator-only. A non-admin who holds
+  `Approval:Approve` (the seeded `Operator` role does) is therefore, with RBAC enforcement on, refused
+  `mfa_not_enrolled` until an administrator enrols them (by a temporary enrolment sign-in window, or by promoting the account to
+  administrator just long enough to enrol and then demoting it); see "Enrolling a non-admin approver" in the
+  [recovery runbook](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver), which also
+  lists each path's consequences. Make sure at least one enrolled, authorised approver exists
+  who is not the submitter of each request, or nothing can be decided. Break-glass accounts are enrolled
+  by validation and get no exemption. With RBAC enforcement off (the shipped default) the legacy gate requires
+  the `admin` role for approving, so a non-admin is refused `403` "admin role required" before the MFA check and
+  enrolling them achieves nothing until RBAC enforcement is turned on. Self-service enrolment for non-admins is
+  a planned follow-up.
 - **A human principal.** An engine principal is never admitted.
 - **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
   (HTTP 400, audited as denied).
+  **Known limitation: one person with two identities counts as two reviewers.** The check compares the
+  reviewer's account name with the submitter's account name, nothing more. A person who holds both a local
+  account and a single sign-on identity, or two single sign-on identities, is two different names to the
+  server, so that person can submit a request under one identity and approve it under the other (each
+  identity still needs its own enrolled MFA factor and fresh proof). This behaviour predates #6079 and was
+  left out of its scope by the owner; resolving every identity to one person is a planned
+  follow-up. Until then, do not rely on the reviewer check as proof that two different humans were involved
+  where users can hold more than one identity.
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
-  signed in through SAML is refused with `403` while step-up is on. Approvers who use SAML cannot
-  approve until they sign in with a local account or OIDC, or step-up is disabled (next point).
+  signed in through SAML is refused with `403` whatever `--mfa-step-up-window-secs` is set to (with step-up on, the central check's generic `403` answers first; with it off, the approver rule's `saml_mfa_unsupported`; before
+  #6079, setting it to `0` admitted a SAML approver; it no longer does). Approvers who use SAML cannot
+  approve until they sign in with a local account or OIDC.
   **A deployment where every approver signs in through SAML has no working approver path** until
-  they are given an OIDC provider or a local account, or you accept losing step-up fleet-wide with
-  `--mfa-step-up-window-secs=0`. Under `--auth-mode=sso-only` the only local sign-in left is the
-  break-glass account, which is not a substitute. This is a known limitation, tracked in #6098 (the
-  SAML step-up decision is #4935).
-- **If you disable step-up, assurance drops.** `--mfa-step-up-window-secs=0` turns the step-up gate
-  off for approve and reject along with every other step-up endpoint. Approval then requires only an
-  interactive session with the permission. Do not run that way if approvals are a control you rely
-  on; if you must, have a person review every `approval.approve` audit row with `result=success`
-  and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each
-  decision writes a `result=attempted` row first, and a decision whose outcome row failed to write
-  leaves only that `attempted` row; see [Audit Log](audit-log.md)).
+  they are given an OIDC provider or a local account. Under `--auth-mode=sso-only` the only local
+  sign-in left is the break-glass account, which is not a substitute. This is a known limitation,
+  tracked in #6098 (the SAML step-up decision is #4935).
+- **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The setting turns the step-up
+  gate off for the other step-up endpoints, but approve and reject keep their enrolled-factor and
+  300-second proof requirement. A decision made before the upgrade gains no retroactive assurance;
+  see [Upgrading](upgrading.md) for how to review those.
 
 **MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
-(a browser cookie session that reaches `/mcp/v1/` is refused too). This is an exception
+(a browser cookie session is refused at `/mcp/v1/` before any tool runs, because it carries no MCP tier). This is an exception
 recorded in ADR-1005's exception ledger (entry 2026-10-18): human review is a human-session act. The tools stay registered, and listing
 pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
 unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still
@@ -676,14 +718,13 @@ with a signed-in session.
   submission, so an aged approved request keeps showing `approved` until then although it can no
   longer be used (tracked in #6098).
 
-**If the dialog says you do not have permission.** The Approvals dialog shows that one message for
-every `403`. The causes, in the order the server checks them: the request carried no same-site
+**If the dialog says you do not have permission.** For an approver refusal (`approver_assurance_required:<reason>`, whether a class or an MFA refusal) the Approvals dialog shows the refusal's own remediation text, which names the next step. For any other `403` it shows the generic "You do not have permission" text, and the response's own message names the cause. The causes, in the order the server checks them: the request carried no same-site
 `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the public address is not
 listed in `--csrf-trusted-origin`; the server-wide same-site check answers this first, before any
 step-up); you signed in through SAML while step-up is on (the central step-up check, before the
-route handler); in the handler, you lack `Approval:Approve`. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
-route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
-in a toast on a `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
+route handler); then, in the handler, you lack `Approval:Approve`; your account has no
+enrolled MFA factor; your account has been deleted or deactivated; your single sign-on login carried no MFA claim; or you signed in through SAML with step-up switched off (`--mfa-step-up-window-secs=0`), which the approver rule still refuses. The Approve and Reject buttons are a
+render hint only: an unenrolled or SAML session is shown them and the route still refuses it. The Approvals tab on Instructions has no dialog: on a `403` it shows the same remediation text in a toast for an approver refusal and the server's message for any other `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
 as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.
 
 ### Approval API
@@ -828,7 +869,8 @@ request per occurrence and hold at the due time. Approving the ticket fires
 the run within one poller cycle; rejecting it skips that occurrence, and the
 next occurrence submits a fresh request. Approvals follow the standard
 four-eyes rule, so the schedule's creator cannot approve their own scheduled
-runs. Poller health is observable via the `yuzu_schedule_fires_total`,
+runs under the same account name (the check compares account names, not
+people; see the known limitation under [Who can approve](#who-can-approve)). Poller health is observable via the `yuzu_schedule_fires_total`,
 `yuzu_schedule_fire_failures_total`, `yuzu_schedule_approvals_submitted_total`
 and `yuzu_schedule_tick_errors_total` counters.
 
@@ -960,6 +1002,8 @@ curl -s -b cookies.txt \
 ```
 
 The `scope` field controls which agents are included. Set `"scope": "failed_only"` to target only agents that reported failure; any other value (or omitting the field) reruns all agents.
+
+**What a rerun does.** It creates a new `pending` execution record linked to the original; it does not send anything to any device. The REST v1 route `POST /api/v1/executions/{id}/rerun` and the MCP tool `record_execution_rerun` do the same, take a boolean `failed_only` instead of the `scope` string, and answer `dispatched_to_devices: false`. Likewise `POST /api/v1/executions/{id}/cancel` and `cancel_execution` only mark the execution cancelled; they do not stop a command a device already received. See `docs/user-manual/rest-api.md`.
 
 ### Cancel
 
@@ -1281,6 +1325,8 @@ curl -s -b cookies.txt \
 
 > **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.
 
+**Versioned and MCP twins (#2146).** `POST /api/v1/instructions/{id}/execute` and the MCP tool `execute_instruction_definition` run the same pipeline with the same `agent_ids` / `scope` / `params` and the same `approval_mode` rules, with these differences from the route above: the v1 response is wrapped as `{"data": {...}, "meta": {"api_version": "v1"}}` and every error carries an A4 envelope with a machine-readable `reason`; a call is audited `requested` BEFORE it dispatches and refused with `503` if that row cannot be stored (the legacy route audits after the send); the `202` body adds `approval_mode`; zero agents reached is an error with a `reason` (`400` for `invalid_scope`, `503` otherwise) rather than the legacy untyped `503`; the check order puts the dispatch authorization (`403`/`400` with a `reason`) and the destructive-targeting rules (`400` `destructive_untargeted` / `forensic_untargeted`, `404` `destructive_no_visible_target`) before the definition's approval, so a call that is refused for those reasons never queues an approval. A definition id holding a control character (a byte below `0x20` or equal to `0x7F`, NUL included) or not valid UTF-8 (reachable on REST, where the HTTP layer percent-decodes the path to raw bytes) is refused before the definition is looked up (`400` / `-32602`, `reason` `invalid_definition_id`, a `denied` audit row, nothing queued or dispatched); the legacy route does not apply that check. A dispatch that throws part-way answers `500` / `-32603` `dispatch_exception` with no retry hint, and names the execution row it left running as the typed field `error.execution_id` (`error.data.execution_id` on MCP) plus, when known, the lower-bound count of agents already sent the command as `error.agents_sent` (`error.data.agents_sent`; a gateway-routed agent counts once its command is queued for forwarding, which can still fail): check that execution's results or close it with `cancel_execution` before running the definition again. Like the legacy route, neither twin reads the definition's `enabled` flag. The MCP twin does not stream progress, and a definition whose `approval_mode` is not `auto` answers `pending_approval` for an operator-tier or a supervised-tier token alike: a tier's auto-approval or consumed ticket never stands in for the definition's own approval, and a supervised token's ticket never lifts the admin-or-approval requirement of the definition's `plugin.action` either: a non-administrator is refused with `approval_required` (permanent, no ticket minted). See the [REST API reference](rest-api.md) and the [MCP guide](mcp.md).
+
 #### List definitions (v1 endpoint)
 
 ```
@@ -1428,13 +1474,14 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
-Approve and reject need a signed-in session cookie, a fresh MFA step-up (which an account with no
-enrolled factor passes, #6079) and a same-site `Origin`/`Referer`; an API or MCP token is refused
+Approve and reject need a signed-in session cookie, an enrolled MFA factor with a fresh proof (#6079) and a
+same-site `Origin`/`Referer`; an API or MCP token is refused
 with `403`. See
 [Who can approve](#who-can-approve) and the error table in the [REST API reference](rest-api.md).
 
-The reviewer must be a different operator than the submitter — self-approval
-is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
+The reviewer's account must differ from the submitter's (account names are compared, so
+one person holding two identities is not caught; see [Who can approve](#who-can-approve)): self-approval
+with the same account is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
 and the denied attempt is recorded in the audit log. The `comment` is capped at
 4,000 bytes (HTTP 400 beyond that).
 
@@ -1568,9 +1615,9 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. The drawer's responses table, its live updates and the page detail omit the rows of Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`) for a caller without `Forensics:Read`, with no marker, and the failure preview of such a command is a short machine token; see "Forensics-tier rows" in `rest-api.md`. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitting account cannot review its own request (account names are compared; see [Who can approve](#who-can-approve)). A pending row you submitted shows a "You submitted this" hint saying another reviewer must approve, instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
 **Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
 
@@ -1676,6 +1723,7 @@ Reads are gated on `InstructionDefinition:Read`, mutations on `InstructionDefini
 **Limitations operators should expect:**
 
 - **Equals-op only in dashboard auto-apply.** The dashboard's filter map is exact-match; `contains`/`starts_with`/`ends_with` filters in a template are stored and returned by REST but the dashboard only auto-applies the `equals` clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded.
+- **The View's equals filters are defaults, not locks.** Tick **View without saved filters** (shown next to the View dropdown when a template carries an `equals` filter) to show the results without them. While the box is ticked, the table and its sort, page and Search requests skip the View's filters; untick it to bring them back. It never drops a filter you set yourself, and a new command starts with it unticked.
 - **Detail drawer ignores the column subset.** The expandable per-row detail drawer always shows every parsed field — hiding values there would defeat its "expand for full record" purpose.
 - **Dashboard YAML editor strips `spec.responseTemplates`.** Same caveat as `spec.visualization`. Author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints.
 
@@ -1697,4 +1745,4 @@ These will be expressed as additional YAML DSL constructs within an InstructionD
 
 ### Product Packs (Phase 7.9)
 
-Signed distribution bundles containing instruction sets, definitions, policy fragments, and documentation. Product packs will use Ed25519 signatures with a trust chain anchored to an organization root key. Import will support staged review before activation.
+Signed distribution bundles containing instruction sets, definitions, policy fragments, and documentation. Product packs already carry Ed25519 signatures: a pack's signature is verified at install against the key inside the pack, a pack that fails verification is rejected, and an unsigned pack is refused unless the server runs with `--allow-unsigned-packs`. A trust chain anchored to an organization root key, and staged review before activation, are still planned.

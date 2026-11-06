@@ -78,7 +78,7 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
         return LiveKind{"network_diag", "connections", "Active connections",
                         "device.live.connections"};
     if (kind == "capture_sources")
-        return LiveKind{"tar", "status", "Capture sources", "device.live.capture_sources"};
+        return LiveKind{"echo", "status", "Capture sources", "device.live.capture_sources"};
     if (kind == "disk")
         return LiveKind{"disk_space", "free", "Disk space", "device.live.disk"};
 
@@ -385,11 +385,11 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         return body;
     }
 
-    if (kind == "capture_sources") { // tar status: config|<src>_enabled|v, config|<src>_live_rows|N
+    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_live_rows|N
         // Display order + presentation metadata. The server does NOT link the agent's
-        // tar_schema_registry, so source name/$-table/category are held here; we only
+        // echo_schema_registry, so source name/$-table/category are held here; we only
         // render a row for a source the agent actually reported (its `<src>_enabled` key
-        // is present in tar/status), so an older agent without arp/dns shows no phantom
+        // is present in echo/status), so an older agent without arp/dns shows no phantom
         // rows. Hand-maintained — the os-capability-matrix "will drift; durable fix =
         // generate from machine-readable metadata" situation, tracked as a follow-up.
         struct Meta { const char* name; const char* dollar; const char* category; };
@@ -398,7 +398,8 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             {"service", "Service", "Inventory"}, {"user", "User", "Identity"},
             {"perf", "Perf", "Performance"},     {"procperf", "ProcPerf", "Performance"},
             {"netqual", "NetQual", "Network"},   {"module", "Module", "Inventory"},
-            {"arp", "ARP", "Network"},           {"dns", "DNS", "Network"}};
+            {"arp", "ARP", "Network"},           {"dns", "DNS", "Network"},
+            {"registry", "Registry", "System"}};
         std::unordered_map<std::string, std::string> cfg;
         for (const auto& l : lines) {
             if (!l.starts_with("config|")) continue;
@@ -967,8 +968,8 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         };
         if (with_output) {
             if (with_output->output.starts_with("error|")) {
-                // 300, matching the sibling site in tar_tree_routes.cpp. Both
-                // render the SAME `tar status` reply, and the storage-offline
+                // 300, matching the sibling site in echo_tree_routes.cpp. Both
+                // render the SAME `echo status` reply, and the storage-offline
                 // line is 231 chars (287 when the read path is gone too), so a
                 // 200-byte cap truncated it mid-sentence and dropped "Restart
                 // the agent to recover." -- the operator got the problem

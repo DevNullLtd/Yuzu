@@ -80,6 +80,8 @@ std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
 /// down", which is the right answer: both are "cannot answer right now").
 /// `agent_scope`: `nullopt` = unfiltered (global grant / elevated / RBAC
 /// off); engaged (including empty) = filter to exactly these agents.
+/// `tier` (#4990): the Forensics tier of the READER. The count is over facet values of stored
+/// output, so it must not count agents whose only matching rows are withheld from the caller.
 ///
 /// Count semantics are unchanged by #5623: an exact-match value longer than
 /// `kMaxFacetValueBytes` (response_store.hpp), measured in its stored form, is not indexed in
@@ -87,8 +89,8 @@ std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
 /// not say so itself; callers pair it with `unindexed_filter_keys` (above) and
 /// report that additively.
 std::optional<std::int64_t>
-group_agent_count_preview(ResponseStore* store, const std::string& command_id,
-                          const std::vector<FacetFilter>& filters,
+group_agent_count_preview(ResponseStore* store, const ResponseTierFilter& tier,
+                          const std::string& command_id, const std::vector<FacetFilter>& filters,
                           const std::optional<std::vector<std::string>>& agent_scope);
 
 } // namespace yuzu::server

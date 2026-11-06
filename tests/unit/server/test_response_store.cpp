@@ -10,6 +10,8 @@
 
 #include "response_store.hpp"
 
+#include "response_cap_rules.hpp"
+
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -29,6 +31,9 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
+#include <set>
+#include <unordered_set>
 
 #include <libpq-fe.h>
 
@@ -39,6 +44,12 @@
 #include <vector>
 
 using namespace yuzu::server;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -120,8 +131,8 @@ TEST_CASE("ResponseStore: bad-path constructor (unroutable DSN) is closed",
     ResponseStore store(bad_pool);
     REQUIRE_FALSE(store.is_open());
     // Reads degrade to nullopt; ingest/reap are silent no-ops.
-    CHECK_FALSE(store.query("cmd-x").has_value());
-    CHECK(store.total_count() == 0);
+    CHECK_FALSE(store.query("cmd-x", kAllRows).has_value());
+    CHECK(store.total_count(kAllRows) == 0);
     store.store(StoredResponse{}); // must not throw/crash
     store.reap_expired();          // must not throw/crash
 }
@@ -139,7 +150,7 @@ TEST_CASE("ResponseStore: store and retrieve", "[pg][response_store]") {
     resp.output = "hostname|WORKSTATION-01";
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-abc123");
+    auto results = store.get_by_instruction("cmd-abc123", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].instruction_id == "cmd-abc123");
@@ -170,7 +181,7 @@ TEST_CASE("ResponseStore: an embedded NUL in instruction_id is dropped, not sile
 
     // Must NOT appear under the truncated-to prefix "victim-instruction" —
     // that would be exactly the forgery-via-truncation UP-5 describes.
-    auto results = store.get_by_instruction("victim-instruction");
+    auto results = store.get_by_instruction("victim-instruction", kAllRows);
     REQUIRE(results.has_value());
     CHECK(results->empty());
 }
@@ -195,11 +206,11 @@ TEST_CASE("ResponseStore: an embedded NUL in execution_id or plugin is also drop
     r2.plugin = std::string("real-plugin") + '\0' + "junk";
     store.store(r2);
 
-    auto results1 = store.get_by_instruction("cmd-exec-nul");
+    auto results1 = store.get_by_instruction("cmd-exec-nul", kAllRows);
     REQUIRE(results1.has_value());
     CHECK(results1->empty());
 
-    auto results2 = store.get_by_instruction("cmd-plugin-nul");
+    auto results2 = store.get_by_instruction("cmd-plugin-nul", kAllRows);
     REQUIRE(results2.has_value());
     CHECK(results2->empty());
 }
@@ -223,7 +234,7 @@ TEST_CASE("ResponseStore: an embedded NUL in agent_id is also dropped, not silen
 
     ResponseQuery q;
     q.agent_id = "victim-agent";
-    auto results = store.query("cmd-agent-nul", q);
+    auto results = store.query("cmd-agent-nul", kAllRows, q);
     REQUIRE(results.has_value());
     CHECK(results->empty());
 }
@@ -242,7 +253,7 @@ TEST_CASE("ResponseStore: multiple responses same instruction", "[pg][response_s
         store.store(resp);
     }
 
-    auto results = store.get_by_instruction("cmd-multi");
+    auto results = store.get_by_instruction("cmd-multi", kAllRows);
     REQUIRE(results.has_value());
     CHECK(results->size() == 5);
 }
@@ -263,7 +274,7 @@ TEST_CASE("ResponseStore: query with agent_id filter", "[pg][response_store]") {
 
     ResponseQuery q;
     q.agent_id = "agent-a";
-    auto results = store.query("cmd-filter", q);
+    auto results = store.query("cmd-filter", kAllRows, q);
     REQUIRE(results.has_value());
     CHECK(results->size() == 2);
 }
@@ -289,7 +300,7 @@ TEST_CASE("ResponseStore: query with status filter", "[pg][response_store]") {
 
     ResponseQuery q;
     q.status = 2;
-    auto results = store.query("cmd-status", q);
+    auto results = store.query("cmd-status", kAllRows, q);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].output == "fail");
@@ -312,12 +323,12 @@ TEST_CASE("ResponseStore: query with limit and offset", "[pg][response_store]") 
     ResponseQuery q;
     q.limit = 3;
     q.offset = 0;
-    auto page1 = store.query("cmd-page", q);
+    auto page1 = store.query("cmd-page", kAllRows, q);
     REQUIRE(page1.has_value());
     CHECK(page1->size() == 3);
 
     q.offset = 3;
-    auto page2 = store.query("cmd-page", q);
+    auto page2 = store.query("cmd-page", kAllRows, q);
     REQUIRE(page2.has_value());
     CHECK(page2->size() == 3);
 }
@@ -340,11 +351,11 @@ TEST_CASE("ResponseStore: a negative limit is sanitized, not a degrade",
 
     ResponseQuery q;
     q.limit = -1;
-    auto out = store.query("cmd-negfix", q);
+    auto out = store.query("cmd-negfix", kAllRows, q);
     REQUIRE(out.has_value()); // NOT a degrade
     CHECK(out->size() == 1);
 
-    auto out2 = store.query_by_execution("nonexistent-exec", q);
+    auto out2 = store.query_by_execution("nonexistent-exec", kAllRows, q);
     REQUIRE(out2.has_value()); // engaged-empty (unknown execution_id), not a degrade
 }
 
@@ -353,7 +364,7 @@ TEST_CASE("ResponseStore: empty query returns an engaged-empty vector, not a deg
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool);
-    auto results = store.get_by_instruction("nonexistent");
+    auto results = store.get_by_instruction("nonexistent", kAllRows);
     REQUIRE(results.has_value());
     CHECK(results->empty());
 }
@@ -362,7 +373,7 @@ TEST_CASE("ResponseStore: total_count", "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool);
-    REQUIRE(store.total_count() == 0);
+    REQUIRE(store.total_count(kAllRows) == 0);
 
     StoredResponse resp;
     resp.instruction_id = "cmd-count";
@@ -371,7 +382,7 @@ TEST_CASE("ResponseStore: total_count", "[pg][response_store]") {
     resp.output = "ok";
     store.store(resp);
 
-    REQUIRE(store.total_count() == 1);
+    REQUIRE(store.total_count(kAllRows) == 1);
 }
 
 TEST_CASE("ResponseStore: error_detail stored", "[pg][response_store]") {
@@ -387,7 +398,7 @@ TEST_CASE("ResponseStore: error_detail stored", "[pg][response_store]") {
     resp.error_detail = "plugin not found";
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-err");
+    auto results = store.get_by_instruction("cmd-err", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].error_detail == "plugin not found");
@@ -405,7 +416,7 @@ TEST_CASE("ResponseStore: large output stored", "[pg][response_store]") {
     resp.output = std::string(100000, 'X');
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-large");
+    auto results = store.get_by_instruction("cmd-large", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].output.size() == 100000);
@@ -431,7 +442,7 @@ TEST_CASE("ResponseStore: invalid-UTF-8 output is sanitized to U+FFFD, not dropp
     resp.error_detail = std::string(1, '\xfe') + "err";
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-badutf8");
+    auto results = store.get_by_instruction("cmd-badutf8", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1); // present, not silently dropped
     CHECK((*results)[0].output == "\xEF\xBF\xBD" "binary");
@@ -460,7 +471,7 @@ TEST_CASE("ResponseStore: facets are derived post-sanitize (invalid-UTF-8 value 
     resp.output = std::string("high|") + '\xff' + "category|title|detail";
     store.store(resp);
 
-    auto facets = store.facet_values("cmd-facet-badutf8", /*col_idx=*/1);
+    auto facets = store.facet_values("cmd-facet-badutf8", kAllRows, /*col_idx=*/1);
     REQUIRE(facets.has_value());
     REQUIRE(facets->size() == 1); // derived, not dropped
     CHECK((*facets)[0].value == "\xEF\xBF\xBD" "category");
@@ -494,7 +505,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status sanitizes error_detail (inval
                                              bad_err, "exec-1", /*plugin_result_status=*/0);
     CHECK(fr == ResponseStore::FinalizeResult::Updated); // row finalized, not lost to 22021
 
-    auto results = store.get_by_instruction("cmd-finalize-badutf8");
+    auto results = store.get_by_instruction("cmd-finalize-badutf8", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].status == 2);
@@ -551,7 +562,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status truncates an over-cap error_d
                                                  big, "exec-1", /*plugin_result_status=*/0);
         CHECK(fr == ResponseStore::FinalizeResult::Updated);
 
-        auto results = store.get_by_instruction("cmd-final-overcap");
+        auto results = store.get_by_instruction("cmd-final-overcap", kAllRows);
         REQUIRE(results.has_value());
         REQUIRE(results->size() == 1);
         const std::string& stored = (*results)[0].error_detail;
@@ -572,7 +583,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status truncates an over-cap error_d
         REQUIRE(store.finalize_terminal_status("cmd-final-exact", "agent-1", /*status=*/2, exact,
                                                "exec-1", /*plugin_result_status=*/0) ==
                 ResponseStore::FinalizeResult::Updated);
-        auto at_cap = store.get_by_instruction("cmd-final-exact");
+        auto at_cap = store.get_by_instruction("cmd-final-exact", kAllRows);
         REQUIRE(at_cap.has_value());
         REQUIRE(at_cap->size() == 1);
         CHECK((*at_cap)[0].error_detail == exact); // <= cap: no marker, no cut
@@ -582,7 +593,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status truncates an over-cap error_d
         REQUIRE(store.finalize_terminal_status("cmd-final-over", "agent-1", /*status=*/2, over,
                                                "exec-1", /*plugin_result_status=*/0) ==
                 ResponseStore::FinalizeResult::Updated);
-        auto above = store.get_by_instruction("cmd-final-over");
+        auto above = store.get_by_instruction("cmd-final-over", kAllRows);
         REQUIRE(above.has_value());
         REQUIRE(above->size() == 1);
         const auto& e = (*above)[0].error_detail;
@@ -595,7 +606,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status truncates an over-cap error_d
         auto fr = store.finalize_terminal_status("cmd-final-short", "agent-1", /*status=*/2, msg,
                                                  "exec-1", /*plugin_result_status=*/0);
         CHECK(fr == ResponseStore::FinalizeResult::Updated);
-        auto results = store.get_by_instruction("cmd-final-short");
+        auto results = store.get_by_instruction("cmd-final-short", kAllRows);
         REQUIRE(results.has_value());
         REQUIRE(results->size() == 1);
         CHECK((*results)[0].error_detail == msg);
@@ -617,7 +628,7 @@ TEST_CASE("ResponseStore: timestamp ordering", "[pg][response_store]") {
         store.store(resp);
     }
 
-    auto results = store.get_by_instruction("cmd-order");
+    auto results = store.get_by_instruction("cmd-order", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 3);
     // DESC ordering
@@ -643,7 +654,7 @@ TEST_CASE("ResponseStore: query with time range", "[pg][response_store]") {
     ResponseQuery q;
     q.since = 200;
     q.until = 400;
-    auto results = store.query("cmd-range", q);
+    auto results = store.query("cmd-range", kAllRows, q);
     REQUIRE(results.has_value());
     CHECK(results->size() == 3);
 }
@@ -682,16 +693,16 @@ TEST_CASE("ResponseStore: ResponseQuery since and until are presence-tracked so 
     window.until = 200;
 
     const auto rows_via = [&](const ResponseQuery& q) {
-        auto a = store.query("cmd-presence", q);
-        auto b = store.query_by_execution("exec-presence", q);
-        auto c = store.query_bounded("cmd-presence", q, std::nullopt, 1u << 20);
+        auto a = store.query("cmd-presence", kAllRows, q);
+        auto b = store.query_by_execution("exec-presence", kAllRows, q);
+        auto c = store.query_bounded("cmd-presence", kAllRows, q, std::nullopt, 1u << 20);
         REQUIRE(a.has_value());
         REQUIRE(b.has_value());
         REQUIRE(c.has_value());
         AggregationQuery aq;
         aq.group_by = "status";
         aq.op = AggregateOp::Count;
-        auto d = store.aggregate("cmd-presence", aq, q);
+        auto d = store.aggregate("cmd-presence", kAllRows, aq, q);
         REQUIRE(d.has_value());
         int64_t agg_total = 0;
         for (const auto& g : *d)
@@ -729,10 +740,10 @@ TEST_CASE("ResponseStore: multiple instructions", "[pg][response_store]") {
         store.store(resp);
     }
 
-    CHECK(store.get_by_instruction("cmd-1")->size() == 1);
-    CHECK(store.get_by_instruction("cmd-2")->size() == 1);
-    CHECK(store.get_by_instruction("cmd-99")->size() == 0);
-    CHECK(store.total_count() == 3);
+    CHECK(store.get_by_instruction("cmd-1", kAllRows)->size() == 1);
+    CHECK(store.get_by_instruction("cmd-2", kAllRows)->size() == 1);
+    CHECK(store.get_by_instruction("cmd-99", kAllRows)->size() == 0);
+    CHECK(store.total_count(kAllRows) == 3);
 }
 
 TEST_CASE("ResponseStore: ttl_expires_at set from retention", "[pg][response_store]") {
@@ -747,7 +758,7 @@ TEST_CASE("ResponseStore: ttl_expires_at set from retention", "[pg][response_sto
     resp.output = "ok";
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-ttl");
+    auto results = store.get_by_instruction("cmd-ttl", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].ttl_expires_at > 0);
@@ -766,7 +777,7 @@ TEST_CASE("ResponseStore: custom ttl_expires_at preserved", "[pg][response_store
     resp.ttl_expires_at = 999999;
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-custom-ttl");
+    auto results = store.get_by_instruction("cmd-custom-ttl", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].ttl_expires_at == 999999);
@@ -789,7 +800,7 @@ TEST_CASE("ResponseStore PR2: execution_id default empty for legacy writers",
     // Caller did NOT set execution_id — legacy / out-of-band path.
     store.store(r);
 
-    auto rows = store.get_by_instruction("cmd-legacy-1");
+    auto rows = store.get_by_instruction("cmd-legacy-1", kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].execution_id.empty());
@@ -808,7 +819,7 @@ TEST_CASE("ResponseStore PR2: execution_id round-trip when stamped at write",
     r.execution_id = "exec-aaaa-bbbb-cccc-dddd-eeee";
     store.store(r);
 
-    auto rows = store.get_by_instruction("cmd-pr2-1");
+    auto rows = store.get_by_instruction("cmd-pr2-1", kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].execution_id == "exec-aaaa-bbbb-cccc-dddd-eeee");
@@ -836,12 +847,12 @@ TEST_CASE("ResponseStore PR2: query_by_execution returns only matching exec",
     b.execution_id = "exec-B";
     store.store(b);
 
-    auto from_a = store.query_by_execution("exec-A");
+    auto from_a = store.query_by_execution("exec-A", kAllRows);
     REQUIRE(from_a.has_value());
     REQUIRE(from_a->size() == 1);
     CHECK((*from_a)[0].output == "from-exec-A");
 
-    auto from_b = store.query_by_execution("exec-B");
+    auto from_b = store.query_by_execution("exec-B", kAllRows);
     REQUIRE(from_b.has_value());
     REQUIRE(from_b->size() == 1);
     CHECK((*from_b)[0].output == "from-exec-B");
@@ -861,7 +872,7 @@ TEST_CASE("ResponseStore PR2: query_by_execution rejects empty sentinel (engaged
     // execution_id stays empty.
     store.store(r);
 
-    auto rows = store.query_by_execution("");
+    auto rows = store.query_by_execution("", kAllRows);
     REQUIRE(rows.has_value());
     CHECK(rows->empty());
 }
@@ -891,7 +902,7 @@ TEST_CASE("ResponseStore PR2: query_by_execution honours agent_id + since/until 
     SECTION("agent_id filter") {
         ResponseQuery q;
         q.agent_id = "agent-B";
-        auto rows = store.query_by_execution("exec-1", q);
+        auto rows = store.query_by_execution("exec-1", kAllRows, q);
         REQUIRE(rows.has_value());
         REQUIRE(rows->size() == 1);
         CHECK((*rows)[0].output == "B-150-fail");
@@ -900,7 +911,7 @@ TEST_CASE("ResponseStore PR2: query_by_execution honours agent_id + since/until 
         ResponseQuery q;
         q.since = 110;
         q.until = 180;
-        auto rows = store.query_by_execution("exec-1", q);
+        auto rows = store.query_by_execution("exec-1", kAllRows, q);
         REQUIRE(rows.has_value());
         REQUIRE(rows->size() == 1);
         CHECK((*rows)[0].output == "B-150-fail");
@@ -908,13 +919,13 @@ TEST_CASE("ResponseStore PR2: query_by_execution honours agent_id + since/until 
     SECTION("status filter") {
         ResponseQuery q;
         q.status = 2;
-        auto rows = store.query_by_execution("exec-1", q);
+        auto rows = store.query_by_execution("exec-1", kAllRows, q);
         REQUIRE(rows.has_value());
         REQUIRE(rows->size() == 1);
         CHECK((*rows)[0].status == 2);
     }
     SECTION("scope of exec-2 doesn't bleed into exec-1") {
-        auto rows = store.query_by_execution("exec-1");
+        auto rows = store.query_by_execution("exec-1", kAllRows);
         REQUIRE(rows.has_value());
         REQUIRE(rows->size() == 3);
         for (const auto& r : *rows)
@@ -947,7 +958,7 @@ TEST_CASE("ResponseStore: distinct_agent_ids returns sorted distinct agents",
     store.store(mk_agg_resp("instr-1", "agent-b", 0));
     store.store(mk_agg_resp("instr-2", "agent-z", 0)); // other instruction
 
-    auto ids = store.distinct_agent_ids("instr-1");
+    auto ids = store.distinct_agent_ids("instr-1", kAllRows);
     REQUIRE(ids.has_value());
     REQUIRE(ids->size() == 3);
     CHECK((*ids)[0] == "agent-a");
@@ -956,7 +967,7 @@ TEST_CASE("ResponseStore: distinct_agent_ids returns sorted distinct agents",
     // Genuinely-empty (instruction has no rows) is an ENGAGED empty vector, NOT
     // nullopt — nullopt is reserved for a store-read error so the caller can fail
     // closed on error without conflating it with "no agents" (#1634 UP-2).
-    auto none = store.distinct_agent_ids("nope");
+    auto none = store.distinct_agent_ids("nope", kAllRows);
     REQUIRE(none.has_value());
     CHECK(none->empty());
 }
@@ -984,14 +995,14 @@ TEST_CASE("ResponseStore: aggregate scope excludes out-of-scope rows from totals
     };
 
     SECTION("nullopt scope = legacy-open: all rows counted") {
-        auto rs = store.aggregate("instr-1", aq, {}, std::nullopt);
+        auto rs = store.aggregate("instr-1", kAllRows, aq, {}, std::nullopt);
         REQUIRE(rs.has_value());
         CHECK(count_for(*rs, "0") == 2);
         CHECK(count_for(*rs, "1") == 1);
     }
 
     SECTION("subset scope: only in-scope agents fold into the totals") {
-        auto rs = store.aggregate("instr-1", aq, {}, AggregateScope{{"agent-1"}});
+        auto rs = store.aggregate("instr-1", kAllRows, aq, {}, AggregateScope{{"agent-1"}});
         REQUIRE(rs.has_value());
         // agent-1 is the only in-scope agent → status 0 count is 1, not 2.
         CHECK(count_for(*rs, "0") == 1);
@@ -1000,7 +1011,7 @@ TEST_CASE("ResponseStore: aggregate scope excludes out-of-scope rows from totals
     }
 
     SECTION("empty scope set = visible to no one: zero rows, never silently unfiltered") {
-        auto rs = store.aggregate("instr-1", aq, {}, AggregateScope{std::vector<std::string>{}});
+        auto rs = store.aggregate("instr-1", kAllRows, aq, {}, AggregateScope{std::vector<std::string>{}});
         REQUIRE(rs.has_value());
         CHECK(rs->empty());
     }
@@ -1035,7 +1046,7 @@ TEST_CASE("ResponseStore: query pushes scope into SQL before LIMIT, not post-fet
 
     ResponseQuery q;
     q.limit = 1;
-    auto rows = store.query("instr-cap", q, AggregateScope{{"agent-visible"}});
+    auto rows = store.query("instr-cap", kAllRows, q, AggregateScope{{"agent-visible"}});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].agent_id == "agent-visible");
@@ -1059,7 +1070,7 @@ TEST_CASE("ResponseStore: query_by_execution pushes scope into SQL before LIMIT 
 
     ResponseQuery q;
     q.limit = 1;
-    auto rows = store.query_by_execution("exec-cap", q, AggregateScope{{"agent-visible"}});
+    auto rows = store.query_by_execution("exec-cap", kAllRows, q, AggregateScope{{"agent-visible"}});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].agent_id == "agent-visible");
@@ -1079,7 +1090,7 @@ TEST_CASE("ResponseStore: aggregate scope applies to SUM, not just COUNT (#1634)
     aq.op = AggregateOp::Sum;
     aq.op_column = "status";
 
-    auto rs = store.aggregate("instr-1", aq, {}, AggregateScope{{"agent-1"}});
+    auto rs = store.aggregate("instr-1", kAllRows, aq, {}, AggregateScope{{"agent-1"}});
     REQUIRE(rs.has_value());
     REQUIRE(rs->size() == 1);
     CHECK((*rs)[0].group_value == "agent-1");
@@ -1102,13 +1113,13 @@ TEST_CASE("ResponseStore: aggregate scope AND filter.agent_id compose — out-of
 
     ResponseQuery filter;
     filter.agent_id = "agent-2";
-    auto rs = store.aggregate("instr-1", aq, filter, AggregateScope{{"agent-1"}});
+    auto rs = store.aggregate("instr-1", kAllRows, aq, filter, AggregateScope{{"agent-1"}});
     REQUIRE(rs.has_value());
     CHECK(rs->empty());
 
     ResponseQuery filter_ok;
     filter_ok.agent_id = "agent-1";
-    auto rs_ok = store.aggregate("instr-1", aq, filter_ok, AggregateScope{{"agent-1"}});
+    auto rs_ok = store.aggregate("instr-1", kAllRows, aq, filter_ok, AggregateScope{{"agent-1"}});
     REQUIRE(rs_ok.has_value());
     int64_t total = 0;
     for (const auto& r : *rs_ok)
@@ -1134,7 +1145,7 @@ TEST_CASE("ResponseStore: query/aggregate scope applies past 10000 agents, no si
     big_scope[10000] = "agent-real";
 
     ResponseQuery q;
-    auto rows = store.query("instr-bigscope", q, AggregateScope{big_scope});
+    auto rows = store.query("instr-bigscope", kAllRows, q, AggregateScope{big_scope});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].agent_id == "agent-real");
@@ -1142,7 +1153,7 @@ TEST_CASE("ResponseStore: query/aggregate scope applies past 10000 agents, no si
     AggregationQuery aq;
     aq.group_by = "agent_id";
     aq.op = AggregateOp::Count;
-    auto rs = store.aggregate("instr-bigscope", aq, {}, AggregateScope{big_scope});
+    auto rs = store.aggregate("instr-bigscope", kAllRows, aq, {}, AggregateScope{big_scope});
     REQUIRE(rs.has_value());
     REQUIRE(rs->size() == 1);
     CHECK((*rs)[0].group_value == "agent-real");
@@ -1161,7 +1172,7 @@ TEST_CASE("ResponseStore: scope agent id containing a double-quote is escaped, n
     store.store(mk_agg_resp("instr-escape", "agent-other", 0)); // OUT of scope
 
     ResponseQuery q;
-    auto rows = store.query("instr-escape", q, AggregateScope{{tricky_agent}});
+    auto rows = store.query("instr-escape", kAllRows, q, AggregateScope{{tricky_agent}});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].agent_id == tricky_agent);
@@ -1177,12 +1188,12 @@ TEST_CASE("ResponseStore: distinct_agent_ids / aggregate return nullopt on a clo
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
     ResponseStore store(bad_pool);
     REQUIRE_FALSE(store.is_open());
-    auto ids = store.distinct_agent_ids("instr-1");
+    auto ids = store.distinct_agent_ids("instr-1", kAllRows);
     CHECK_FALSE(ids.has_value());
     AggregationQuery aq;
     aq.group_by = "status";
     aq.op = AggregateOp::Count;
-    CHECK_FALSE(store.aggregate("instr-1", aq).has_value());
+    CHECK_FALSE(store.aggregate("instr-1", kAllRows, aq).has_value());
 }
 
 // ── Facets ─────────────────────────────────────────────────────────────────
@@ -1204,7 +1215,7 @@ TEST_CASE("ResponseStore: facet cascade — deleting the parent response removes
     r.status = 1;
     r.output = "ok";
     store.store(r);
-    auto rows = store.get_by_instruction("cmd-facet");
+    auto rows = store.get_by_instruction("cmd-facet", kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     const int64_t response_id = (*rows)[0].id;
@@ -1233,7 +1244,7 @@ TEST_CASE("ResponseStore: retention_days=0 disables TTL", "[pg][response_store][
     for (int i = 0; i < 5; ++i)
         store.store(mk_agg_resp("cmd-noreap", "agent-" + std::to_string(i), 1));
     store.reap_expired();
-    CHECK(store.total_count() == 5);
+    CHECK(store.total_count(kAllRows) == 5);
     CHECK(store.responses_reaped_total() == 0);
 }
 
@@ -1248,7 +1259,7 @@ TEST_CASE("ResponseStore: reap_expired deletes rows past ttl_expires_at, keeps f
         store.store(mk_agg_resp("fresh-" + std::to_string(i), "agent-a", 1));
     for (int i = 0; i < 3; ++i)
         store.store(mk_agg_resp("stale-" + std::to_string(i), "agent-a", 1));
-    CHECK(store.total_count() == 6);
+    CHECK(store.total_count(kAllRows) == 6);
 
     exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = 1 WHERE "
                        "instruction_id LIKE 'stale-%'");
@@ -1256,14 +1267,14 @@ TEST_CASE("ResponseStore: reap_expired deletes rows past ttl_expires_at, keeps f
     // expiring(3) < datable(6): not would_wipe — a clean pass drains immediately.
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 3);
-    CHECK(store.total_count() == 3);
+    CHECK(store.total_count(kAllRows) == 3);
     for (int i = 0; i < 3; ++i) {
-        auto out = store.get_by_instruction("fresh-" + std::to_string(i));
+        auto out = store.get_by_instruction("fresh-" + std::to_string(i), kAllRows);
         REQUIRE(out.has_value());
         CHECK(out->size() == 1);
     }
     for (int i = 0; i < 3; ++i) {
-        auto out = store.get_by_instruction("stale-" + std::to_string(i));
+        auto out = store.get_by_instruction("stale-" + std::to_string(i), kAllRows);
         REQUIRE(out.has_value());
         CHECK(out->empty());
     }
@@ -1297,13 +1308,13 @@ TEST_CASE("ResponseStore: reap_expired declines once on an all-expired (would_wi
     // First pass: declines (would_wipe) — nothing reaped, the anomaly recorded.
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 0);
-    CHECK(store.total_count() == 3); // still present — the decline held
+    CHECK(store.total_count(kAllRows) == 3); // still present — the decline held
     CHECK(gc_meta_anomaly_count() == "1");
 
     // Second pass: suppressed repeat (same fact set) — drains, capped.
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 3);
-    CHECK(store.total_count() == 0);
+    CHECK(store.total_count(kAllRows) == 0);
     CHECK(gc_meta_anomaly_count() == "1"); // not cleared by a suppressed-repeat drain
 
     store.store(mk_agg_resp("fresh", "agent-a", 1));
@@ -1346,7 +1357,7 @@ TEST_CASE("ResponseStore: reap_expired declines once on a missing anchor with pa
     // declines (NoAnchor), zero deletes, and anchors the reading.
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 0);
-    CHECK(store.total_count() == 2); // both rows survive — the decline held
+    CHECK(store.total_count(kAllRows) == 2); // both rows survive — the decline held
     CHECK(reaped("declined_no_anchor") == 1.0);
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
                                  "'last_anomaly_facts'") == "1");
@@ -1355,7 +1366,7 @@ TEST_CASE("ResponseStore: reap_expired declines once on a missing anchor with pa
     // genuinely expired row, the survivor stays.
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 1);
-    CHECK(store.total_count() == 1);
+    CHECK(store.total_count(kAllRows) == 1);
     CHECK(reaped("swept") == 1.0);
 }
 
@@ -1398,7 +1409,7 @@ TEST_CASE("ResponseStore #2691: a fast replica cannot sweep a row that is still 
     // FIXED: replica B's own clock cannot move the verdict — "still-live" is
     // still live by PostgreSQL's own clock, so both rows survive and the
     // pass is a clean no-op, not a silent sweep.
-    CHECK(replica_a.total_count() == 2);
+    CHECK(replica_a.total_count(kAllRows) == 2);
     CHECK(metrics.counter("yuzu_server_response_reap_passes_total", {{"result", "swept"}})
               .value() == 0.0);
 
@@ -1447,7 +1458,7 @@ TEST_CASE("ResponseStore: reap_expired caps a large expired batch at kReapCapPer
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 10001); // second pass drains the remainder
 
-    CHECK(store.total_count() == 1); // only "cap-live" survives
+    CHECK(store.total_count(kAllRows) == 1); // only "cap-live" survives
 }
 
 // #2691 (Doomgoose finding #6): the parent-row delete is chunked
@@ -1484,7 +1495,7 @@ TEST_CASE("ResponseStore: reap_expired deletes correctly across a chunk boundary
 
     store.reap_expired();
     CHECK(store.responses_reaped_total() == kRows);
-    CHECK(store.total_count() == 1); // only "chunk-live" survives
+    CHECK(store.total_count(kAllRows) == 1); // only "chunk-live" survives
 
     const auto reaped = [&](const char* result) {
         return metrics.counter("yuzu_server_response_reap_passes_total", {{"result", result}})
@@ -1542,7 +1553,7 @@ TEST_CASE("ResponseStore: reap_expired facet pre-drain spans more than one batch
 
     store.reap_expired();
     CHECK(store.responses_reaped_total() == kRows);
-    CHECK(store.total_count() == 1); // only "facetchunk-live" survives
+    CHECK(store.total_count(kAllRows) == 1); // only "facetchunk-live" survives
 
     // #2691 (Gate 8 architect): the assertions above pass identically
     // whether the explicit pre-drain loop ran OR was a silent no-op that let
@@ -1592,7 +1603,7 @@ TEST_CASE("ResponseStore: reap_expired skips quietly when a sibling holds the ad
 
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 0);
-    CHECK(store.total_count() == 1); // nothing deleted — the sibling held the lock
+    CHECK(store.total_count(kAllRows) == 1); // nothing deleted — the sibling held the lock
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
                                  "'last_pass_now'") == "0"); // never reached the stamp
 
@@ -1624,14 +1635,14 @@ TEST_CASE("ResponseStore: reap_expired declines once on a clock reading ahead of
 
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 0); // declined: prev_unusable (BadState)
-    CHECK(store.total_count() == 3);
+    CHECK(store.total_count(kAllRows) == 3);
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
                                  "'last_anomaly_facts'") == "1");
 
     // Self-healed: the stamp reap_expired() just wrote is an honest reading.
     store.reap_expired();
     CHECK(store.responses_reaped_total() == 2);
-    CHECK(store.total_count() == 1);
+    CHECK(store.total_count(kAllRows) == 1);
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
                                  "'last_anomaly_facts'") == "0"); // consumed/cleared
 }
@@ -1661,7 +1672,7 @@ TEST_CASE("ResponseStore: reap bound scales with a >120d retention (no false wou
     // the expired row drains — with a fixed 120d bound the live row would fall
     // out of `datable`, trip would_wipe, and this pass would decline (0 reaped).
     CHECK(store.responses_reaped_total() == 1);
-    CHECK(store.total_count() == 1); // only the live row survives
+    CHECK(store.total_count(kAllRows) == 1); // only the live row survives
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
                                  "'last_anomaly_facts'") == "0"); // no anomaly recorded
 }
@@ -1729,7 +1740,7 @@ TEST_CASE("ResponseStore: reap that hits the cap with an empty backlog records s
     CHECK(store.responses_reaped_total() == 10000);
     CHECK(reaped("swept") == 1.0);
     CHECK(reaped("capped") == 0.0); // NOT a false backlog page
-    CHECK(store.total_count() == 1); // only the live row
+    CHECK(store.total_count(kAllRows) == 1); // only the live row
 }
 
 // R3: an embedded NUL is valid ASCII to sanitize_utf8_strict, but PG TEXT can't
@@ -1751,7 +1762,7 @@ TEST_CASE("ResponseStore: embedded NUL is defanged, output past it is not trunca
     resp.error_detail = std::string("e") + '\0' + "x";
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-nul");
+    auto results = store.get_by_instruction("cmd-nul", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     // "after" survived — NOT truncated at the NUL — with the NUL as U+FFFD.
@@ -1778,7 +1789,7 @@ TEST_CASE("ResponseStore: sanitize_pg_text handles leading/trailing/adjacent NUL
     resp.output = std::string("\0mid\0\0end\0", 10);
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-nul-edges");
+    auto results = store.get_by_instruction("cmd-nul-edges", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].output ==
@@ -1805,7 +1816,7 @@ TEST_CASE("ResponseStore: output past the ingest cap is truncated with a marker"
     resp.output = std::string(kOverCap, 'x');
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-overcap");
+    auto results = store.get_by_instruction("cmd-overcap", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].output.size() < kOverCap); // genuinely truncated
@@ -1818,7 +1829,7 @@ TEST_CASE("ResponseStore: output past the ingest cap is truncated with a marker"
     small.status = 1;
     small.output = std::string(1000, 'y');
     store.store(small);
-    auto small_results = store.get_by_instruction("cmd-undercap");
+    auto small_results = store.get_by_instruction("cmd-undercap", kAllRows);
     REQUIRE(small_results.has_value());
     REQUIRE(small_results->size() == 1);
     CHECK((*small_results)[0].output.size() == 1000);
@@ -1850,7 +1861,7 @@ TEST_CASE("ResponseStore: facet cardinality is capped independently of output si
     resp.output = output;
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-facetcap");
+    auto results = store.get_by_instruction("cmd-facetcap", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     // The full (untruncated) output still persists on the response row —
@@ -1887,11 +1898,11 @@ TEST_CASE("ResponseStore: wide facet set (>64 distinct values) all persist via b
     resp.output = out;
     store.store(resp);
 
-    auto facets = store.facet_values("cmd-wide", /*col_idx=*/1);
+    auto facets = store.facet_values("cmd-wide", kAllRows, /*col_idx=*/1);
     REQUIRE(facets.has_value());
     CHECK(facets->size() == 200); // every distinct category landed
     // The response row itself is present.
-    auto results = store.get_by_instruction("cmd-wide");
+    auto results = store.get_by_instruction("cmd-wide", kAllRows);
     REQUIRE(results.has_value());
     CHECK(results->size() == 1);
 }
@@ -1958,14 +1969,14 @@ TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets
     store.store(resp);
 
     // The response row and its output are intact.
-    auto rows = store.get_by_instruction("cmd-facet-toolong");
+    auto rows = store.get_by_instruction("cmd-facet-toolong", kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].output == output);
 
     auto facet_set = [&](int col) {
         std::vector<std::string> v;
-        auto f = store.facet_values("cmd-facet-toolong", col);
+        auto f = store.facet_values("cmd-facet-toolong", kAllRows, col);
         REQUIRE(f.has_value());
         for (const auto& fv : *f)
             v.push_back(fv.value);
@@ -1982,10 +1993,10 @@ TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets
     CHECK(facet_set(3) == std::vector<std::string>{"detail-a", "detail-b"});
 
     // A filter on the at-bound title finds the agent: the value is stored whole.
-    auto at_bound_agents = store.facet_agent_ids("cmd-facet-toolong", {FacetFilter{2, at_bound}});
+    auto at_bound_agents = store.facet_agent_ids("cmd-facet-toolong", kAllRows, {FacetFilter{2, at_bound}});
     REQUIRE(at_bound_agents.has_value());
     CHECK(*at_bound_agents == std::vector<std::string>{"agent-1"});
-    auto at_bound_count = store.facet_agent_count("cmd-facet-toolong",
+    auto at_bound_count = store.facet_agent_count("cmd-facet-toolong", kAllRows,
                                                   {FacetFilter{2, at_bound}}, std::nullopt);
     REQUIRE(at_bound_count.has_value());
     CHECK(*at_bound_count == 1);
@@ -2074,7 +2085,7 @@ TEST_CASE("ResponseStore: the facet cap keeps the most frequent facets, determin
     auto stored_set = [&](const std::string& instruction_id) {
         std::map<std::tuple<int, std::string>, int> got;
         for (int col = 0; col < 4; ++col) {
-            auto f = store.facet_values(instruction_id, col);
+            auto f = store.facet_values(instruction_id, kAllRows, col);
             REQUIRE(f.has_value());
             for (const auto& fv : *f)
                 got[{col, fv.value}] = static_cast<int>(fv.line_count);
@@ -2130,10 +2141,10 @@ TEST_CASE("ResponseStore: a failed facet batch is counted and the response row p
     resp.output = "high|cat|" + incompressible_text(600, 9) + "|detail\n";
     store.store(resp);
 
-    auto rows = store.get_by_instruction(resp.instruction_id);
+    auto rows = store.get_by_instruction(resp.instruction_id, kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1); // the response row persisted
-    auto f = store.facet_values(resp.instruction_id, 0);
+    auto f = store.facet_values(resp.instruction_id, kAllRows, 0);
     REQUIRE(f.has_value());
     CHECK(f->empty()); // the whole facet batch was rolled back
     CHECK(dropped_count(metrics, "batch_failed") == 4.0); // 4 facets lost
@@ -2189,7 +2200,7 @@ TEST_CASE("ResponseStore: a failed COMMIT drops the response and publishes no fa
 
     store.store(make("cmd-commit-fail"));
 
-    auto failed = store.get_by_instruction("cmd-commit-fail");
+    auto failed = store.get_by_instruction("cmd-commit-fail", kAllRows);
     REQUIRE(failed.has_value());
     CHECK(failed->empty()); // the whole response, not just its facets, was rolled back
     CHECK(ingest_dropped("query_error") == 1.0);
@@ -2200,7 +2211,7 @@ TEST_CASE("ResponseStore: a failed COMMIT drops the response and publishes no fa
     // Control: the same output under another id commits, and the counters DO move, so the
     // zeros above cannot come from a counter that never fires.
     store.store(make("cmd-commit-ok"));
-    auto ok = store.get_by_instruction("cmd-commit-ok");
+    auto ok = store.get_by_instruction("cmd-commit-ok", kAllRows);
     REQUIRE(ok.has_value());
     CHECK(ok->size() == 1);
     CHECK(ingest_dropped("query_error") == 1.0); // unchanged
@@ -2324,12 +2335,12 @@ TEST_CASE("ResponseStore: the facet value bound counts sanitized bytes, not char
     resp.output = output;
     store.store(resp);
 
-    auto rows = store.get_by_instruction("cmd-facet-bytes");
+    auto rows = store.get_by_instruction("cmd-facet-bytes", kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1); // the response row persisted
 
     // Column 2 (title) carries the long value on every line. The three kept ones persist.
-    auto titles = store.facet_values("cmd-facet-bytes", 2);
+    auto titles = store.facet_values("cmd-facet-bytes", kAllRows, 2);
     REQUIRE(titles.has_value());
     std::vector<std::string> got;
     for (const auto& fv : *titles)
@@ -2340,7 +2351,7 @@ TEST_CASE("ResponseStore: the facet value bound counts sanitized bytes, not char
     CHECK(got == want);
 
     // The categories (column 1) all persist: only the long values are excluded.
-    auto cats = store.facet_values("cmd-facet-bytes", 1);
+    auto cats = store.facet_values("cmd-facet-bytes", kAllRows, 1);
     REQUIRE(cats.has_value());
     CHECK(cats->size() == 7);
 
@@ -2379,24 +2390,24 @@ TEST_CASE("ResponseStore: a filter with a NUL or invalid UTF-8 byte finds the st
 
     for (const auto& cat : {nul_cat, bad_cat, at_bound}) {
         FacetFilter f{/*col_idx=*/1, cat};
-        auto agents = store.facet_agent_count("cmd-facet-typed-bytes", {f});
+        auto agents = store.facet_agent_count("cmd-facet-typed-bytes", kAllRows, {f});
         REQUIRE(agents.has_value()); // not a degrade
         CHECK(*agents == 1);
-        auto lines = store.facet_line_count("cmd-facet-typed-bytes", {f});
+        auto lines = store.facet_line_count("cmd-facet-typed-bytes", kAllRows, {f});
         REQUIRE(lines.has_value());
         CHECK(*lines == 1);
         // The other binders share append_facet_filters; pin them individually too.
-        auto ids = store.facet_agent_ids("cmd-facet-typed-bytes", {f});
+        auto ids = store.facet_agent_ids("cmd-facet-typed-bytes", kAllRows, {f});
         REQUIRE(ids.has_value());
         CHECK(*ids == std::vector<std::string>{"agent-1"});
-        auto rids = store.facet_response_ids("cmd-facet-typed-bytes", {f});
+        auto rids = store.facet_response_ids("cmd-facet-typed-bytes", kAllRows, {f});
         REQUIRE(rids.has_value());
         CHECK(rids->size() == 1);
     }
 
     // A value over the bound in stored form was not indexed: a clean zero, not a degrade.
     FacetFilter over{/*col_idx=*/1, over_bound};
-    auto none = store.facet_agent_count("cmd-facet-typed-bytes", {over});
+    auto none = store.facet_agent_count("cmd-facet-typed-bytes", kAllRows, {over});
     REQUIRE(none.has_value());
     CHECK(*none == 0);
 }
@@ -2421,23 +2432,23 @@ TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish deg
     store.store(resp);
 
     FacetFilter match{/*col_idx=*/1, "cat-a"};
-    auto count = store.facet_agent_count("cmd-facetcount", {match});
+    auto count = store.facet_agent_count("cmd-facetcount", kAllRows, {match});
     REQUIRE(count.has_value());
     CHECK(*count == 1); // one distinct agent
 
-    auto lines = store.facet_line_count("cmd-facetcount", {match});
+    auto lines = store.facet_line_count("cmd-facetcount", kAllRows, {match});
     REQUIRE(lines.has_value());
     CHECK(*lines == 2); // two matching lines
 
     // A genuinely non-matching filter is a real 0, not a degrade.
     FacetFilter no_match{/*col_idx=*/1, "cat-nonexistent"};
-    auto zero_count = store.facet_agent_count("cmd-facetcount", {no_match});
+    auto zero_count = store.facet_agent_count("cmd-facetcount", kAllRows, {no_match});
     REQUIRE(zero_count.has_value());
     CHECK(*zero_count == 0);
 
     // Empty filters: genuine 0 (no scoped count to report), not a degrade —
     // matches BOTH functions' documented "no filter -> no scoped count" rule.
-    auto empty_filter_count = store.facet_agent_count("cmd-facetcount", {});
+    auto empty_filter_count = store.facet_agent_count("cmd-facetcount", kAllRows, {});
     REQUIRE(empty_filter_count.has_value());
     CHECK(*empty_filter_count == 0);
 
@@ -2446,8 +2457,8 @@ TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish deg
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
     ResponseStore bad_store(bad_pool);
     REQUIRE_FALSE(bad_store.is_open());
-    CHECK_FALSE(bad_store.facet_agent_count("cmd-facetcount", {match}).has_value());
-    CHECK_FALSE(bad_store.facet_line_count("cmd-facetcount", {match}).has_value());
+    CHECK_FALSE(bad_store.facet_agent_count("cmd-facetcount", kAllRows, {match}).has_value());
+    CHECK_FALSE(bad_store.facet_line_count("cmd-facetcount", kAllRows, {match}).has_value());
 }
 
 // ── CC-07 typed plugin result status (PR1.1 finding F11) ───────────────────
@@ -2478,7 +2489,7 @@ TEST_CASE("ResponseStore: plugin_result_status round-trips through store/read (C
     resp.output = "firewall|blocked";
     store.store(resp);
 
-    auto results = store.get_by_instruction("cmd-cc07");
+    auto results = store.get_by_instruction("cmd-cc07", kAllRows);
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].status == 1);
@@ -2493,7 +2504,7 @@ TEST_CASE("ResponseStore: plugin_result_status round-trips through store/read (C
     silent.output = "no typed status";
     store.store(silent);
 
-    auto both = store.get_by_instruction("cmd-cc07");
+    auto both = store.get_by_instruction("cmd-cc07", kAllRows);
     REQUIRE(both.has_value());
     REQUIRE(both->size() == 2);
     int declared = 0, undeclared = 0;
@@ -2529,7 +2540,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status writes the typed status onto 
     running.output = "streamed line";
     store.store(running);
 
-    auto before = store.get_by_instruction("cmd-final");
+    auto before = store.get_by_instruction("cmd-final", kAllRows);
     REQUIRE(before.has_value());
     REQUIRE(before->size() == 1);
     REQUIRE((*before)[0].plugin_result_status == 0);
@@ -2539,7 +2550,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status writes the typed status onto 
                                               /*plugin_result_status=*/4);
     REQUIRE(res == ResponseStore::FinalizeResult::Updated);
 
-    auto after = store.get_by_instruction("cmd-final");
+    auto after = store.get_by_instruction("cmd-final", kAllRows);
     REQUIRE(after.has_value());
     REQUIRE(after->size() == 1);
     CHECK((*after)[0].status == 2);
@@ -2585,7 +2596,7 @@ TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count return only the 
     store.store(b);
 
     std::vector<std::string> scope_a{"agent-A"};
-    auto values = store.facet_values("cmd-facet-scope-partial", /*col_idx=*/1, scope_a);
+    auto values = store.facet_values("cmd-facet-scope-partial", kAllRows, /*col_idx=*/1, scope_a);
     REQUIRE(values.has_value());
     REQUIRE(values->size() == 2); // "mem" (agent-B only) must not appear
     // ORDER BY SUM(line_count) DESC: "net" (2) before "disk" (1).
@@ -2595,7 +2606,7 @@ TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count return only the 
     CHECK((*values)[1].line_count == 1);
 
     FacetFilter net_filter{/*col_idx=*/1, "net"};
-    auto count = store.facet_agent_count("cmd-facet-scope-partial", {net_filter}, scope_a);
+    auto count = store.facet_agent_count("cmd-facet-scope-partial", kAllRows, {net_filter}, scope_a);
     REQUIRE(count.has_value());
     CHECK(*count == 1); // agent-B also matches "net" but is out of scope
 }
@@ -2613,18 +2624,18 @@ TEST_CASE("ResponseStore: an engaged-empty agent_scope short-circuits to success
     REQUIRE_FALSE(store.is_open());
 
     // facet_values: unscoped (nullopt, the default) still degrades...
-    CHECK_FALSE(store.facet_values("cmd-x", /*col_idx=*/0).has_value());
+    CHECK_FALSE(store.facet_values("cmd-x", kAllRows, /*col_idx=*/0).has_value());
     // ...but an engaged empty scope is success-empty, not degrade.
-    auto scoped_values = store.facet_values("cmd-x", /*col_idx=*/0, std::vector<std::string>{});
+    auto scoped_values = store.facet_values("cmd-x", kAllRows, /*col_idx=*/0, std::vector<std::string>{});
     REQUIRE(scoped_values.has_value());
     CHECK(scoped_values->empty());
 
     // facet_agent_count: a non-empty filters vector defeats the unrelated
     // "no filter -> 0" short-circuit, isolating the scope short-circuit.
     FacetFilter any_filter{/*col_idx=*/0, "anything"};
-    CHECK_FALSE(store.facet_agent_count("cmd-x", {any_filter}).has_value());
+    CHECK_FALSE(store.facet_agent_count("cmd-x", kAllRows, {any_filter}).has_value());
     auto scoped_count =
-        store.facet_agent_count("cmd-x", {any_filter}, std::vector<std::string>{});
+        store.facet_agent_count("cmd-x", kAllRows, {any_filter}, std::vector<std::string>{});
     REQUIRE(scoped_count.has_value());
     CHECK(*scoped_count == 0);
 }
@@ -2653,9 +2664,9 @@ TEST_CASE("ResponseStore: std::nullopt agent_scope on facet_values/facet_agent_c
     b.output = "high|net|t3|d3\nhigh|mem|t4|d4";
     store.store(b);
 
-    auto legacy_values = store.facet_values("cmd-facet-scope-nullopt", /*col_idx=*/1);
+    auto legacy_values = store.facet_values("cmd-facet-scope-nullopt", kAllRows, /*col_idx=*/1);
     auto explicit_nullopt_values =
-        store.facet_values("cmd-facet-scope-nullopt", /*col_idx=*/1, std::nullopt);
+        store.facet_values("cmd-facet-scope-nullopt", kAllRows, /*col_idx=*/1, std::nullopt);
     REQUIRE(legacy_values.has_value());
     REQUIRE(explicit_nullopt_values.has_value());
     REQUIRE(legacy_values->size() == explicit_nullopt_values->size());
@@ -2675,9 +2686,9 @@ TEST_CASE("ResponseStore: std::nullopt agent_scope on facet_values/facet_agent_c
     CHECK(found_net);
 
     FacetFilter net_filter{/*col_idx=*/1, "net"};
-    auto legacy_count = store.facet_agent_count("cmd-facet-scope-nullopt", {net_filter});
+    auto legacy_count = store.facet_agent_count("cmd-facet-scope-nullopt", kAllRows, {net_filter});
     auto explicit_nullopt_count =
-        store.facet_agent_count("cmd-facet-scope-nullopt", {net_filter}, std::nullopt);
+        store.facet_agent_count("cmd-facet-scope-nullopt", kAllRows, {net_filter}, std::nullopt);
     REQUIRE(legacy_count.has_value());
     REQUIRE(explicit_nullopt_count.has_value());
     CHECK(*legacy_count == *explicit_nullopt_count);
@@ -2709,14 +2720,14 @@ TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count apply the WHOLE 
     std::vector<std::string> big_scope(10001, "no-such-agent");
     big_scope[10000] = "agent-cap";
 
-    auto values = store.facet_values("cmd-facet-scope-cap", /*col_idx=*/1, big_scope);
+    auto values = store.facet_values("cmd-facet-scope-cap", kAllRows, /*col_idx=*/1, big_scope);
     REQUIRE(values.has_value());
     REQUIRE(values->size() == 1);
     CHECK((*values)[0].value == "net");
     CHECK((*values)[0].line_count == 2);
 
     FacetFilter net_filter{/*col_idx=*/1, "net"};
-    auto count = store.facet_agent_count("cmd-facet-scope-cap", {net_filter}, big_scope);
+    auto count = store.facet_agent_count("cmd-facet-scope-cap", kAllRows, {net_filter}, big_scope);
     REQUIRE(count.has_value());
     CHECK(*count == 1);
 }
@@ -2755,7 +2766,7 @@ TEST_CASE("ResponseStore query_bounded keeps only the rows under the payload cap
 
     ResponseQuery q;
     q.limit = 100;
-    auto r = store.query_bounded("cmd-bounded", q, std::nullopt, 200 * 1024);
+    auto r = store.query_bounded("cmd-bounded", kAllRows, q, std::nullopt, 200 * 1024);
     REQUIRE(r.has_value());
     CHECK(r->rows.size() == 4);
     CHECK(r->byte_cap_hit);
@@ -2770,7 +2781,7 @@ TEST_CASE("ResponseStore query_bounded keeps only the rows under the payload cap
     CHECK(r->result_bytes < 1024u * 1024u);
 
     // The plain query() fetches all 40, which is exactly what the bound avoids.
-    auto all = store.query("cmd-bounded", q);
+    auto all = store.query("cmd-bounded", kAllRows, q);
     REQUIRE(all.has_value());
     CHECK(all->size() == 40);
 }
@@ -2789,17 +2800,17 @@ TEST_CASE("ResponseStore query_bounded payload cap boundary is strict and exact"
     q.limit = 100;
     // Row 3's PRECEDING cumulative size is 20. Under a cap of 20 it is NOT strictly
     // below, so it is dropped (2 rows, cut); under 21 it is kept (3 rows, no cut).
-    auto cut = store.query_bounded("cmd-edge", q, std::nullopt, 20);
+    auto cut = store.query_bounded("cmd-edge", kAllRows, q, std::nullopt, 20);
     REQUIRE(cut.has_value());
     CHECK(cut->rows.size() == 2);
     CHECK(cut->byte_cap_hit);
-    auto fit = store.query_bounded("cmd-edge", q, std::nullopt, 21);
+    auto fit = store.query_bounded("cmd-edge", kAllRows, q, std::nullopt, 21);
     REQUIRE(fit.has_value());
     CHECK(fit->rows.size() == 3);
     CHECK_FALSE(fit->byte_cap_hit);
 
     // A cap of 0 still serves the first row (progress) and flags the cut.
-    auto zero = store.query_bounded("cmd-edge", q, std::nullopt, 0);
+    auto zero = store.query_bounded("cmd-edge", kAllRows, q, std::nullopt, 0);
     REQUIRE(zero.has_value());
     CHECK(zero->rows.size() == 1);
     CHECK(zero->byte_cap_hit);
@@ -2816,14 +2827,14 @@ TEST_CASE("ResponseStore query_bounded row_cap_hit is exact not size equals limi
 
     ResponseQuery q;
     q.limit = 5; // exactly as many rows as exist: NOT a cut
-    auto exact = store.query_bounded("cmd-rowcap", q, std::nullopt, 1 << 20);
+    auto exact = store.query_bounded("cmd-rowcap", kAllRows, q, std::nullopt, 1 << 20);
     REQUIRE(exact.has_value());
     CHECK(exact->rows.size() == 5);
     CHECK_FALSE(exact->row_cap_hit);
     CHECK_FALSE(exact->byte_cap_hit);
 
     q.limit = 4; // one more row exists beyond the limit: a cut
-    auto cut = store.query_bounded("cmd-rowcap", q, std::nullopt, 1 << 20);
+    auto cut = store.query_bounded("cmd-rowcap", kAllRows, q, std::nullopt, 1 << 20);
     REQUIRE(cut.has_value());
     CHECK(cut->rows.size() == 4);
     CHECK(cut->row_cap_hit);
@@ -2846,7 +2857,7 @@ TEST_CASE("ResponseStore query_bounded counts a byte cut only among rows within 
     // the limit. Only the row cap fired; an `rn <= limit` guard missing from the cut count
     // would also report a byte cut here (candidate 3's preceding size is exactly 20).
     q.limit = 2;
-    auto row_only = store.query_bounded("cmd-within", q, std::nullopt, 20);
+    auto row_only = store.query_bounded("cmd-within", kAllRows, q, std::nullopt, 20);
     REQUIRE(row_only.has_value());
     CHECK(row_only->rows.size() == 2);
     CHECK(row_only->row_cap_hit);
@@ -2855,7 +2866,7 @@ TEST_CASE("ResponseStore query_bounded counts a byte cut only among rows within 
     // limit 3, cap 20: candidate 3 is within the limit but its preceding size (20) is not
     // below the cap -> dropped (byte cut), and a fourth candidate exists (row cut): both fire.
     q.limit = 3;
-    auto both = store.query_bounded("cmd-within", q, std::nullopt, 20);
+    auto both = store.query_bounded("cmd-within", kAllRows, q, std::nullopt, 20);
     REQUIRE(both.has_value());
     CHECK(both->rows.size() == 2);
     CHECK(both->row_cap_hit);
@@ -2873,7 +2884,7 @@ TEST_CASE("ResponseStore query_bounded survives a limit of INT_MAX (limit + 1 do
 
     ResponseQuery q;
     q.limit = std::numeric_limits<int>::max();
-    auto r = store.query_bounded("cmd-intmax", q, std::nullopt, 1 << 20);
+    auto r = store.query_bounded("cmd-intmax", kAllRows, q, std::nullopt, 1 << 20);
     // nullopt here would be the "integer out of range" degrade the bigint placeholder fixes.
     REQUIRE(r.has_value());
     CHECK(r->rows.size() == 3);
@@ -2893,7 +2904,7 @@ TEST_CASE("ResponseStore query_bounded reports result_bytes 0 for a zero-row res
 
     ResponseQuery q;
     q.limit = 10;
-    auto none = store.query_bounded("cmd-no-rows", q, std::nullopt, 1 << 20);
+    auto none = store.query_bounded("cmd-no-rows", kAllRows, q, std::nullopt, 1 << 20);
     REQUIRE(none.has_value());
     CHECK(none->rows.empty());
     CHECK_FALSE(none->row_cap_hit);
@@ -2903,7 +2914,7 @@ TEST_CASE("ResponseStore query_bounded reports result_bytes 0 for a zero-row res
     CHECK(none->result_bytes == 0);
 
     // The same call with a matching row reports a non-zero size (the field is live).
-    auto one = store.query_bounded("cmd-other", q, std::nullopt, 1 << 20);
+    auto one = store.query_bounded("cmd-other", kAllRows, q, std::nullopt, 1 << 20);
     REQUIRE(one.has_value());
     CHECK(one->rows.size() == 1);
     CHECK(one->result_bytes > 0);
@@ -2924,7 +2935,7 @@ TEST_CASE("ResponseStore query_bounded applies scope before the cut and breaks t
     // Whole set = 600 bytes, cap 250 would cut it; agent-a's 3 rows (300 bytes) with a
     // cap of 301 all fit ONLY if the scope is applied before the cut.
     AggregateScope only_a = std::vector<std::string>{"agent-a"};
-    auto scoped = store.query_bounded("cmd-scope", q, only_a, 301);
+    auto scoped = store.query_bounded("cmd-scope", kAllRows, q, only_a, 301);
     REQUIRE(scoped.has_value());
     CHECK(scoped->rows.size() == 3);
     CHECK_FALSE(scoped->byte_cap_hit);
@@ -2936,7 +2947,7 @@ TEST_CASE("ResponseStore query_bounded applies scope before the cut and breaks t
 
     // An engaged EMPTY scope is fail-closed: zero rows, never an unfiltered read.
     AggregateScope none = std::vector<std::string>{};
-    auto empty = store.query_bounded("cmd-scope", q, none, 1 << 20);
+    auto empty = store.query_bounded("cmd-scope", kAllRows, q, none, 1 << 20);
     REQUIRE(empty.has_value());
     CHECK(empty->rows.empty());
     CHECK_FALSE(empty->byte_cap_hit);
@@ -3135,4 +3146,816 @@ TEST_CASE("response facet metrics: server.cpp still calls seed_response_facet_me
 #endif
     const auto src = read_text(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     CHECK(has_live_call(src, "seed_response_facet_metrics"));
+}
+
+// ── #4990: the Forensics tier on every read ──────────────────────────────────
+//
+// One instruction, six rows: two non-Forensics CONTROL rows (plugin "echo", agents A and B) and four
+// Forensics-plugin rows (agents A, B, A again under a MIXED-CASE plugin name, and C, an agent whose
+// only row is Forensics). A test with only Forensics rows cannot tell filtering from an empty store,
+// so the control rows are load-bearing. Every public read is asserted against EXACT rows/counts for
+// the four filter states: unrestricted, exclude+nullopt, exclude+present-empty, exclude+subset.
+
+namespace {
+
+using KeyList = std::vector<std::string>;
+
+const ForensicsPluginSet& tier_plugin_set() {
+    static const ForensicsPluginSet s = *ForensicsPluginSet::from_names(
+        {"app_usage", "browser_inventory", "execution_artifacts", "privacy_permissions",
+         "remote_access_audit"});
+    return s;
+}
+
+// "<agent>|<output>" identifies a row independent of its generated id.
+constexpr const char* kK1 = "agent-A|ctl|a1";       // echo (control)
+constexpr const char* kK2 = "agent-B|ctl|b1";       // echo (control)
+constexpr const char* kK3 = "agent-A|forensic|a1";  // execution_artifacts
+constexpr const char* kK4 = "agent-B|forensic|b1";  // app_usage
+constexpr const char* kK5 = "agent-A|forensic|a2";  // Browser_Inventory (mixed case)
+constexpr const char* kK6 = "agent-C|forensic|c1";  // app_usage, agent with ONLY a Forensics row
+
+const std::map<std::string, int64_t>& tier_timestamps() {
+    static const std::map<std::string, int64_t> m{{kK1, 100}, {kK2, 101}, {kK3, 102},
+                                                  {kK4, 103}, {kK5, 104}, {kK6, 105}};
+    return m;
+}
+
+constexpr const char* kTierInstr = "instr-tier";
+constexpr const char* kTierExec = "exec-tier";
+
+void seed_tier_matrix(ResponseStore& store) {
+    struct Row { const char* agent; const char* plugin; const char* output; const char* key; };
+    const Row rows[] = {
+        {"agent-A", "echo", "ctl|a1", kK1},
+        {"agent-B", "echo", "ctl|b1", kK2},
+        {"agent-A", "execution_artifacts", "forensic|a1", kK3},
+        {"agent-B", "app_usage", "forensic|b1", kK4},
+        {"agent-A", "Browser_Inventory", "forensic|a2", kK5},
+        {"agent-C", "app_usage", "forensic|c1", kK6},
+    };
+    for (const auto& r : rows) {
+        StoredResponse sr;
+        sr.instruction_id = kTierInstr;
+        sr.execution_id = kTierExec;
+        sr.agent_id = r.agent;
+        sr.plugin = r.plugin;
+        sr.output = r.output;
+        sr.status = 1;
+        sr.timestamp = tier_timestamps().at(r.key);
+        store.store(sr);
+    }
+}
+
+std::string row_key(const StoredResponse& r) { return r.agent_id + "|" + r.output; }
+
+KeyList keys_of(const std::vector<StoredResponse>& rows) {
+    KeyList k;
+    for (const auto& r : rows)
+        k.push_back(row_key(r));
+    std::ranges::sort(k);
+    return k;
+}
+
+KeyList sorted(KeyList k) {
+    std::ranges::sort(k);
+    return k;
+}
+
+std::string agent_of(const std::string& key) { return key.substr(0, key.find('|')); }
+// Output field 0: "ctl" or "forensic".
+std::string field0_of(const std::string& key) {
+    const auto a = key.find('|');
+    return key.substr(a + 1, key.find('|', a + 1) - a - 1);
+}
+
+struct TierCase {
+    const char* name;
+    ResponseTierFilter filter;
+    KeyList expect; // sorted
+};
+
+std::vector<TierCase> tier_cases() {
+    const auto& set = tier_plugin_set();
+    return {
+        {"unrestricted_internal_consumer", ResponseTierFilter::unrestricted_internal_consumer(),
+         sorted({kK1, kK2, kK3, kK4, kK5, kK6})},
+        {"exclude+nullopt", ResponseTierFilter::exclude(set, std::nullopt),
+         sorted({kK1, kK2, kK3, kK4, kK5, kK6})},
+        {"exclude+present-empty", ResponseTierFilter::exclude(set, authz::deny_all()),
+         sorted({kK1, kK2})},
+        // #4990 (W1): per-agent subsets are unsupported and fail closed, so a non-empty subset
+        // reads exactly what present-empty reads: no Forensics row of ANY agent, named or not.
+        {"exclude+subset{A} (unsupported: fails closed)",
+         ResponseTierFilter::exclude(
+             set, authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}}),
+         sorted({kK1, kK2})},
+        {"exclude+subset{A,C} (unsupported: fails closed)",
+         ResponseTierFilter::exclude(
+             set, authz::VisibleSet{std::unordered_set<std::string>{"agent-A", "agent-C"}}),
+         sorted({kK1, kK2})},
+    };
+}
+
+KeyList forensic_keys(const KeyList& expect) {
+    KeyList out;
+    for (const auto& k : expect)
+        if (field0_of(k) == "forensic")
+            out.push_back(k);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("ResponseStore tier: row reads return exactly the permitted rows",
+          "[pg][response_store][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_tier_matrix(store);
+
+    // Sanity: the seed is what the matrix assumes (6 rows, nothing filtered).
+    REQUIRE(store.total_count(kAllRows) == 6);
+
+    // id <-> key map from the unrestricted view.
+    std::map<std::string, int64_t> id_of;
+    {
+        auto all = store.query(kTierInstr, kAllRows);
+        REQUIRE(all.has_value());
+        for (const auto& r : *all)
+            id_of[row_key(r)] = r.id;
+        REQUIRE(id_of.size() == 6);
+    }
+
+    for (const auto& c : tier_cases()) {
+        INFO("filter state: " << c.name);
+
+        {
+            INFO("read: query");
+            auto rows = store.query(kTierInstr, c.filter);
+            REQUIRE(rows.has_value());
+            CHECK(keys_of(*rows) == c.expect);
+        }
+        {
+            INFO("read: query_by_execution");
+            auto rows = store.query_by_execution(kTierExec, c.filter);
+            REQUIRE(rows.has_value());
+            CHECK(keys_of(*rows) == c.expect);
+        }
+        {
+            INFO("read: get_by_instruction");
+            auto rows = store.get_by_instruction(kTierInstr, c.filter);
+            REQUIRE(rows.has_value());
+            CHECK(keys_of(*rows) == c.expect);
+        }
+        {
+            INFO("read: query_by_ids");
+            std::vector<int64_t> ids;
+            for (const auto& [k, id] : id_of)
+                ids.push_back(id);
+            auto rows = store.query_by_ids(ids, c.filter);
+            REQUIRE(rows.has_value());
+            // A filtered id is dropped exactly like an unknown id.
+            CHECK(keys_of(*rows) == c.expect);
+            // A single permitted/forbidden id.
+            auto one = store.query_by_ids({id_of.at(kK3)}, c.filter);
+            REQUIRE(one.has_value());
+            const bool permitted = std::ranges::find(c.expect, std::string(kK3)) != c.expect.end();
+            CHECK(one->size() == (permitted ? 1u : 0u));
+        }
+        {
+            INFO("read: query pages over the filtered set");
+            // LIMIT/OFFSET apply AFTER the tier: pages of 2 reassemble exactly the permitted set,
+            // and only the last page may be short (a post-fetch filter would return short pages).
+            KeyList seen;
+            std::size_t pages = 0;
+            for (int offset = 0;; offset += 2) {
+                ResponseQuery q;
+                q.limit = 2;
+                q.offset = offset;
+                auto page = store.query(kTierInstr, c.filter, q);
+                REQUIRE(page.has_value());
+                if (page->empty())
+                    break;
+                ++pages;
+                if (offset + 2 < static_cast<int>(c.expect.size()))
+                    CHECK(page->size() == 2);
+                for (const auto& r : *page)
+                    seen.push_back(row_key(r));
+                REQUIRE(pages < 10);
+            }
+            CHECK(sorted(seen) == c.expect);
+            CHECK(pages == (c.expect.size() + 1) / 2);
+            // limit 1 returns the newest PERMITTED row, never an empty page.
+            ResponseQuery one;
+            one.limit = 1;
+            auto top = store.query(kTierInstr, c.filter, one);
+            REQUIRE(top.has_value());
+            REQUIRE(top->size() == 1);
+            int64_t best = -1;
+            std::string best_key;
+            for (const auto& k : c.expect)
+                if (tier_timestamps().at(k) > best) {
+                    best = tier_timestamps().at(k);
+                    best_key = k;
+                }
+            CHECK(row_key((*top)[0]) == best_key);
+        }
+        {
+            INFO("read: query with an agent scope");
+            // The tier and the management-group scope compose: both narrow, neither widens.
+            AggregateScope scope = std::vector<std::string>{"agent-A"};
+            auto rows = store.query(kTierInstr, c.filter, {}, scope);
+            REQUIRE(rows.has_value());
+            KeyList expect;
+            for (const auto& k : c.expect)
+                if (agent_of(k) == "agent-A")
+                    expect.push_back(k);
+            CHECK(keys_of(*rows) == expect);
+        }
+    }
+}
+
+TEST_CASE("ResponseStore tier: query_bounded caps are computed over the permitted set",
+          "[pg][response_store][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_tier_matrix(store);
+
+    for (const auto& c : tier_cases()) {
+        INFO("filter state: " << c.name);
+        const std::size_t n = c.expect.size();
+        REQUIRE(n >= 2);
+
+        {
+            INFO("read: whole set fits");
+            ResponseQuery q;
+            q.limit = 100;
+            auto b = store.query_bounded(kTierInstr, c.filter, q, std::nullopt, 1u << 20);
+            REQUIRE(b.has_value());
+            CHECK(keys_of(b->rows) == c.expect);
+            CHECK_FALSE(b->row_cap_hit);
+            CHECK_FALSE(b->byte_cap_hit);
+        }
+        {
+            INFO("read: limit equals the permitted count");
+            // Exactly `n` permitted rows: not a cap hit. An unfiltered count (6) would flag one for
+            // every restricted state, which is the oracle this closes.
+            ResponseQuery q;
+            q.limit = static_cast<int>(n);
+            auto b = store.query_bounded(kTierInstr, c.filter, q, std::nullopt, 1u << 20);
+            REQUIRE(b.has_value());
+            CHECK(keys_of(b->rows) == c.expect);
+            CHECK_FALSE(b->row_cap_hit);
+        }
+        {
+            INFO("read: limit below the permitted count");
+            ResponseQuery q;
+            q.limit = static_cast<int>(n) - 1;
+            auto b = store.query_bounded(kTierInstr, c.filter, q, std::nullopt, 1u << 20);
+            REQUIRE(b.has_value());
+            CHECK(b->rows.size() == n - 1);
+            CHECK(b->row_cap_hit);
+        }
+        {
+            INFO("read: byte cap over the permitted set");
+            ResponseQuery q;
+            q.limit = 100;
+            auto b = store.query_bounded(kTierInstr, c.filter, q, std::nullopt, /*cap=*/1);
+            REQUIRE(b.has_value());
+            CHECK(b->rows.size() == 1); // the first row is always kept
+            CHECK(b->byte_cap_hit);
+            CHECK_FALSE(b->row_cap_hit);
+        }
+    }
+}
+
+TEST_CASE("ResponseStore tier: aggregate, distinct agents and total_count",
+          "[pg][response_store][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_tier_matrix(store);
+
+    for (const auto& c : tier_cases()) {
+        INFO("filter state: " << c.name);
+
+        {
+            INFO("read: aggregate by agent");
+            AggregationQuery aq;
+            aq.group_by = "agent_id";
+            auto res = store.aggregate(kTierInstr, c.filter, aq);
+            REQUIRE(res.has_value());
+            std::map<std::string, int64_t> got;
+            for (const auto& r : *res)
+                got[r.group_value] = r.count;
+            std::map<std::string, int64_t> expect;
+            for (const auto& k : c.expect)
+                ++expect[agent_of(k)];
+            CHECK(got == expect);
+        }
+        {
+            INFO("read: aggregate by status");
+            AggregationQuery aq;
+            aq.group_by = "status";
+            auto res = store.aggregate(kTierInstr, c.filter, aq);
+            REQUIRE(res.has_value());
+            REQUIRE(res->size() == 1);
+            CHECK((*res)[0].group_value == "1");
+            CHECK((*res)[0].count == static_cast<int64_t>(c.expect.size()));
+        }
+        {
+            INFO("read: distinct_agent_ids");
+            std::set<std::string> expect;
+            for (const auto& k : c.expect)
+                expect.insert(agent_of(k));
+            const std::vector<std::string> want(expect.begin(), expect.end());
+            auto a = store.distinct_agent_ids(kTierInstr, c.filter);
+            REQUIRE(a.has_value());
+            CHECK(*a == want);
+            auto b = store.distinct_agent_ids_by_execution(kTierExec, c.filter);
+            REQUIRE(b.has_value());
+            CHECK(*b == want);
+        }
+        {
+            INFO("read: total_count");
+            CHECK(store.total_count(c.filter) == c.expect.size());
+        }
+    }
+
+    {
+        INFO("an agent whose only rows are Forensics is not enumerable without the tier");
+        // agent-C has a single app_usage row: present-empty must not even reveal it exists.
+        auto none = store.distinct_agent_ids(
+            kTierInstr, ResponseTierFilter::exclude(tier_plugin_set(), authz::deny_all()));
+        REQUIRE(none.has_value());
+        CHECK(std::ranges::find(*none, std::string("agent-C")) == none->end());
+        auto all = store.distinct_agent_ids(kTierInstr, kAllRows);
+        REQUIRE(all.has_value());
+        CHECK(std::ranges::find(*all, std::string("agent-C")) != all->end());
+    }
+}
+
+TEST_CASE("ResponseStore tier: facet reads never surface a withheld row's output",
+          "[pg][response_store][security][forensics][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_tier_matrix(store);
+
+    std::map<std::string, int64_t> id_of;
+    {
+        auto all = store.query(kTierInstr, kAllRows);
+        REQUIRE(all.has_value());
+        for (const auto& r : *all)
+            id_of[row_key(r)] = r.id;
+    }
+    const std::vector<FacetFilter> forensic_filter{{.col_idx = 0, .value = "forensic"}};
+
+    for (const auto& c : tier_cases()) {
+        INFO("filter state: " << c.name);
+        const KeyList forensic = forensic_keys(c.expect);
+
+        {
+            INFO("read: facet_values");
+            auto fv = store.facet_values(kTierInstr, c.filter, /*col_idx=*/0);
+            REQUIRE(fv.has_value());
+            std::map<std::string, int64_t> got;
+            for (const auto& v : *fv)
+                got[v.value] = v.line_count;
+            std::map<std::string, int64_t> expect;
+            for (const auto& k : c.expect)
+                ++expect[field0_of(k)];
+            CHECK(got == expect);
+            // The distinct value itself is the leak: "forensic" must be absent, not zero-counted.
+            if (forensic.empty())
+                CHECK(got.count("forensic") == 0);
+            // The control value is always present (the store is not simply empty).
+            CHECK(got.count("ctl") == 1);
+        }
+        {
+            INFO("read: facet_values with an agent scope");
+            const std::optional<std::vector<std::string>> scope =
+                std::vector<std::string>{"agent-A", "agent-B"};
+            auto fv = store.facet_values(kTierInstr, c.filter, 0, scope);
+            REQUIRE(fv.has_value());
+            std::map<std::string, int64_t> got;
+            for (const auto& v : *fv)
+                got[v.value] = v.line_count;
+            std::map<std::string, int64_t> expect;
+            for (const auto& k : c.expect)
+                if (agent_of(k) != "agent-C")
+                    ++expect[field0_of(k)];
+            CHECK(got == expect);
+        }
+        {
+            INFO("read: facet_agent_ids");
+            std::set<std::string> expect;
+            for (const auto& k : forensic)
+                expect.insert(agent_of(k));
+            auto ids = store.facet_agent_ids(kTierInstr, c.filter, forensic_filter);
+            REQUIRE(ids.has_value());
+            CHECK(std::set<std::string>(ids->begin(), ids->end()) == expect);
+            // Control filter: always answered.
+            auto ctl = store.facet_agent_ids(kTierInstr, c.filter, {{.col_idx = 0, .value = "ctl"}});
+            REQUIRE(ctl.has_value());
+            CHECK(std::set<std::string>(ctl->begin(), ctl->end()) ==
+                  std::set<std::string>{"agent-A", "agent-B"});
+        }
+        {
+            INFO("read: facet_agent_count");
+            std::set<std::string> expect;
+            for (const auto& k : forensic)
+                expect.insert(agent_of(k));
+            auto n = store.facet_agent_count(kTierInstr, c.filter, forensic_filter);
+            REQUIRE(n.has_value());
+            CHECK(*n == static_cast<int64_t>(expect.size()));
+            const std::optional<std::vector<std::string>> scope =
+                std::vector<std::string>{"agent-A"};
+            auto scoped = store.facet_agent_count(kTierInstr, c.filter, forensic_filter, scope);
+            REQUIRE(scoped.has_value());
+            CHECK(*scoped == (expect.count("agent-A") ? 1 : 0));
+        }
+        {
+            INFO("read: facet_line_count");
+            auto n = store.facet_line_count(kTierInstr, c.filter, forensic_filter);
+            REQUIRE(n.has_value());
+            CHECK(*n == static_cast<int64_t>(forensic.size()));
+        }
+        {
+            INFO("read: facet_response_ids");
+            std::set<int64_t> expect;
+            for (const auto& k : forensic)
+                expect.insert(id_of.at(k));
+            auto ids = store.facet_response_ids(kTierInstr, c.filter, forensic_filter);
+            REQUIRE(ids.has_value());
+            CHECK(std::set<int64_t>(ids->begin(), ids->end()) == expect);
+            // Paged: limit 1 still lands on a permitted id when one exists.
+            auto first = store.facet_response_ids(kTierInstr, c.filter, forensic_filter, 1, 0);
+            REQUIRE(first.has_value());
+            CHECK(first->size() == (expect.empty() ? 0u : 1u));
+        }
+    }
+}
+
+TEST_CASE("ResponseStore tier: plugin names are bound, never interpolated",
+          "[pg][response_store][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_tier_matrix(store);
+
+    const auto hostile_set = *ForensicsPluginSet::from_names({"o'brien", "x\"; DROP TABLE y; --"});
+    const auto f = ResponseTierFilter::exclude(hostile_set, authz::deny_all());
+    // Nothing in the store matches those names, so everything is permitted; the point is that the
+    // statement parsed and ran (nullopt would mean a SQL error / degrade).
+    auto rows = store.query(kTierInstr, f);
+    REQUIRE(rows.has_value());
+    CHECK(rows->size() == 6);
+    CHECK(store.total_count(f) == 6);
+}
+
+TEST_CASE("ResponseStore tier: a filter with no plugin set wired refuses every row on every read",
+          "[pg][response_store][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_tier_matrix(store);
+    const auto f = ResponseTierFilter::refuse_unwired();
+    const std::vector<FacetFilter> ctl{{.col_idx = 0, .value = "ctl"}};
+
+    // Control: the same store is not simply empty.
+    REQUIRE(store.total_count(kAllRows) == 6);
+
+    auto rows = store.query(kTierInstr, f);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+    auto by_exec = store.query_by_execution(kTierExec, f);
+    REQUIRE(by_exec.has_value());
+    CHECK(by_exec->empty());
+    ResponseQuery q;
+    q.limit = 100;
+    auto bounded = store.query_bounded(kTierInstr, f, q, std::nullopt, 1u << 20);
+    REQUIRE(bounded.has_value());
+    CHECK(bounded->rows.empty());
+    CHECK_FALSE(bounded->row_cap_hit);
+    AggregationQuery aq;
+    aq.group_by = "agent_id";
+    auto agg = store.aggregate(kTierInstr, f, aq);
+    REQUIRE(agg.has_value());
+    CHECK(agg->empty());
+    auto agents = store.distinct_agent_ids(kTierInstr, f);
+    REQUIRE(agents.has_value());
+    CHECK(agents->empty());
+    CHECK(store.total_count(f) == 0);
+    auto fv = store.facet_values(kTierInstr, f, 0);
+    REQUIRE(fv.has_value());
+    CHECK(fv->empty());
+    auto fa = store.facet_agent_ids(kTierInstr, f, ctl);
+    REQUIRE(fa.has_value());
+    CHECK(fa->empty());
+    auto fc = store.facet_agent_count(kTierInstr, f, ctl);
+    REQUIRE(fc.has_value());
+    CHECK(*fc == 0);
+    auto fr = store.facet_response_ids(kTierInstr, f, ctl);
+    REQUIRE(fr.has_value());
+    CHECK(fr->empty());
+    auto all = store.query(kTierInstr, kAllRows);
+    REQUIRE(all.has_value());
+    std::vector<int64_t> ids;
+    for (const auto& r : *all)
+        ids.push_back(r.id);
+    auto by_ids = store.query_by_ids(ids, f);
+    REQUIRE(by_ids.has_value());
+    CHECK(by_ids->empty());
+
+    // The remaining three reads of the 14, each with an unrestricted control on the same data.
+    auto gbi_all = store.get_by_instruction(kTierInstr, kAllRows);
+    REQUIRE(gbi_all.has_value());
+    CHECK(gbi_all->size() == 6);
+    auto gbi = store.get_by_instruction(kTierInstr, f);
+    REQUIRE(gbi.has_value());
+    CHECK(gbi->empty());
+
+    auto da_all = store.distinct_agent_ids_by_execution(kTierExec, kAllRows);
+    REQUIRE(da_all.has_value());
+    CHECK(da_all->size() == 3);
+    auto da = store.distinct_agent_ids_by_execution(kTierExec, f);
+    REQUIRE(da.has_value());
+    CHECK(da->empty());
+
+    auto lc_all = store.facet_line_count(kTierInstr, kAllRows, ctl);
+    REQUIRE(lc_all.has_value());
+    CHECK(*lc_all > 0);
+    auto lc = store.facet_line_count(kTierInstr, f, ctl);
+    REQUIRE(lc.has_value());
+    CHECK(*lc == 0);
+}
+
+// ── Per-(instruction, agent) row cap (#561) ──────────────────────────────────
+
+TEST_CASE("per_agent_cap_admits decision table", "[response_store][cap]") {
+    // Below the cap everything is admitted, terminal or not.
+    CHECK(per_agent_cap_admits(0, 4, false, false));
+    CHECK(per_agent_cap_admits(3, 4, true, true));
+    // At the cap a RUNNING frame is refused.
+    CHECK_FALSE(per_agent_cap_admits(4, 4, false, false));
+    // At the cap the first terminal frame is admitted; a second is refused.
+    CHECK(per_agent_cap_admits(4, 4, true, false));
+    CHECK_FALSE(per_agent_cap_admits(4, 4, true, true));
+}
+
+namespace {
+StoredResponse cap_frame(const std::string& instruction, const std::string& agent, int status,
+                         const std::string& execution_id = "") {
+    StoredResponse r;
+    r.instruction_id = instruction;
+    r.agent_id = agent;
+    r.status = status;
+    r.execution_id = execution_id;
+    r.output = "frame";
+    return r;
+}
+
+// The pair's retained rows, oldest first (by id).
+std::vector<StoredResponse> pair_rows(const ResponseStore& store, const std::string& instruction,
+                                      const std::string& agent) {
+    auto all = store.get_by_instruction(instruction, kAllRows);
+    REQUIRE(all.has_value());
+    std::vector<StoredResponse> rows;
+    for (const auto& r : *all)
+        if (r.agent_id == agent)
+            rows.push_back(r);
+    std::sort(rows.begin(), rows.end(),
+              [](const StoredResponse& a, const StoredResponse& b) { return a.id < b.id; });
+    return rows;
+}
+
+std::size_t cap_rows(const ResponseStore& store, const std::string& instruction,
+                     const std::string& agent) {
+    return pair_rows(store, instruction, agent).size();
+}
+
+double cap_dropped(yuzu::MetricsRegistry& metrics, const char* reason = "per_agent_cap") {
+    return metrics.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}})
+        .value();
+}
+
+// Member order is load-bearing: the store borrows the pool and keeps a pointer to the metrics, so
+// both outlive it.
+struct CapFixture {
+    PgPool pool;
+    yuzu::MetricsRegistry metrics;
+    ResponseStore store;
+    CapFixture(const std::string& dsn, int cap)
+        : pool{{.conninfo = dsn, .size = 4}}, store(pool, 0, nullptr, cap) {
+        REQUIRE(store.is_open());
+        store.set_metrics(&metrics);
+    }
+};
+} // namespace
+
+TEST_CASE("ResponseStore: rows per (instruction, agent) are capped and counted",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 1.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 0.0); // a cap refusal is never a query_error
+}
+
+TEST_CASE("ResponseStore: a capped pair's row before the gap ends with the row-cap marker",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+    // The marker text is the operator-visible contract (response-store.md): pin the literal.
+    const std::string marker = "\n...[rows past per-agent cap dropped]";
+
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-mark", "agent-1", 0));
+    f.store.store(cap_frame("cmd-mark", "agent-2", 0)); // a different pair, below its cap
+
+    auto rows = pair_rows(f.store, "cmd-mark", "agent-1");
+    REQUIRE(rows.size() == 4);
+    for (std::size_t i = 0; i + 1 < rows.size(); ++i)
+        CHECK(rows[i].output == "frame"); // only the newest retained row carries the marker
+    CHECK(rows.back().output == "frame" + marker);
+    CHECK(pair_rows(f.store, "cmd-mark", "agent-2").front().output == "frame");
+
+    // A further refusal leaves exactly one marker (the UPDATE is idempotent).
+    f.store.store(cap_frame("cmd-mark", "agent-1", 0));
+    rows = pair_rows(f.store, "cmd-mark", "agent-1");
+    REQUIRE(rows.size() == 4);
+    CHECK(rows.back().output == "frame" + marker);
+    CHECK(cap_dropped(f.metrics) == 2.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 0.0);
+
+    // "Newest" is by row timestamp (what the executions drawer orders by), not insertion order:
+    // the marker lands on the ts=300 row even though two rows were inserted after it.
+    for (const int64_t ts : {200, 300, 100, 150, 250}) {
+        auto frame = cap_frame("cmd-mark", "agent-3", 0);
+        frame.timestamp = ts;
+        f.store.store(frame);
+    }
+    const auto agent3 = pair_rows(f.store, "cmd-mark", "agent-3");
+    REQUIRE(agent3.size() == 4);
+    for (const auto& r : agent3)
+        CHECK(r.output == (r.timestamp == 300 ? "frame" + marker : std::string("frame")));
+
+    // The overflow terminal row is NOT marked at insert: rows == cap is reachable with zero drops,
+    // so the marker stays on the row before the gap. Interleaved, with cap 4: 4 RUNNING, 1 refused
+    // (marks row 4), a terminal frame with output (admitted, lands newer and unmarked), 1 refused
+    // (marks the terminal too, since frames were refused after it).
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-mark", "agent-4", 0));
+    f.store.store(cap_frame("cmd-mark", "agent-4", 1));
+    rows = pair_rows(f.store, "cmd-mark", "agent-4");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[3].output == "frame" + marker); // the row before the gap
+    CHECK(rows[4].output == "frame");          // the admitted terminal row, not marked at insert
+
+    f.store.store(cap_frame("cmd-mark", "agent-4", 0));
+    rows = pair_rows(f.store, "cmd-mark", "agent-4");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[3].output == "frame" + marker);
+    CHECK(rows[4].output == "frame" + marker);
+}
+
+TEST_CASE("ResponseStore: a marker that cannot be written drops the frame as a query_error",
+          "[pg][response_store][cap]") {
+    // Fail-closed branch of the marker UPDATE (the only UPDATE store() issues on `responses`): a trigger that
+    // raises fails that statement alone, the INSERT path is untouched, so this discriminates the
+    // marker failure from every other store() failure.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-mark-fail", "agent-1", 0));
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION response_store.fail_marker_update() RETURNS trigger "
+             "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected'; END $$; "
+             "CREATE TRIGGER fail_marker_update BEFORE UPDATE ON response_store.responses "
+             "FOR EACH ROW EXECUTE FUNCTION response_store.fail_marker_update()");
+
+    f.store.store(cap_frame("cmd-mark-fail", "agent-1", 0));
+
+    CHECK(cap_rows(f.store, "cmd-mark-fail", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 0.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 1.0);
+}
+
+TEST_CASE("ResponseStore: the first terminal frame beyond the cap lands, a second is refused",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-cap-term", "agent-1", 0));
+    f.store.store(cap_frame("cmd-cap-term", "agent-1", 1));
+    CHECK(cap_rows(f.store, "cmd-cap-term", "agent-1") == 5);
+    CHECK(cap_dropped(f.metrics) == 0.0);
+
+    f.store.store(cap_frame("cmd-cap-term", "agent-1", 1));
+    CHECK(cap_rows(f.store, "cmd-cap-term", "agent-1") == 5);
+    CHECK(cap_dropped(f.metrics) == 1.0);
+}
+
+TEST_CASE("ResponseStore: an out-of-range terminal status is capped like any terminal frame",
+          "[pg][response_store][cap]") {
+    // CommandResponse.Status is an open proto3 enum and the ingest callers cast it unchecked, so a
+    // negative value is "terminal" (status != 0). The admit predicate and the terminal-exists probe
+    // must agree on that, or every such frame past the cap is admitted forever.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-cap-neg", "agent-1", 0));
+    for (int i = 0; i < 6; ++i)
+        f.store.store(cap_frame("cmd-cap-neg", "agent-1", -1));
+
+    CHECK(cap_rows(f.store, "cmd-cap-neg", "agent-1") == 5); // the cap + one overflow terminal
+    CHECK(cap_dropped(f.metrics) == 5.0);
+}
+
+TEST_CASE("ResponseStore: a capped stream finalizes in place and replay cannot grow the pair",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 1.0);
+
+    CHECK(f.store.finalize_terminal_status("cmd-fin", "agent-1", 1, "", "exec-1", 0) ==
+          ResponseStore::FinalizeResult::Updated);
+    auto rows = f.store.get_by_instruction("cmd-fin", kAllRows);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 4);
+    for (const auto& r : *rows)
+        CHECK(r.status == 1);
+
+    // A terminal frame with output now finds a terminal row: refused as a replay.
+    f.store.store(cap_frame("cmd-fin", "agent-1", 1, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 2.0);
+    // And a late RUNNING frame is refused too.
+    f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 3.0);
+}
+
+TEST_CASE("ResponseStore: the row cap is per (instruction, agent) pair",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 2);
+
+    for (int i = 0; i < 2; ++i)
+        f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+    const double before = cap_dropped(f.metrics);
+
+    f.store.store(cap_frame("cmd-cap", "agent-2", 0));  // other agent, same instruction
+    f.store.store(cap_frame("cmd-other", "agent-1", 0)); // same agent, other instruction
+
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-2") == 1);
+    CHECK(cap_rows(f.store, "cmd-other", "agent-1") == 1);
+    CHECK(cap_dropped(f.metrics) == before);
+
+    // The filled pair itself is still refused (fails under a revert of the cap).
+    f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-1") == 2);
+    CHECK(cap_dropped(f.metrics) == before + 1.0);
+}
+
+TEST_CASE("ResponseStore: migration v4 creates the per-pair index", "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT count(*) FROM pg_indexes WHERE schemaname='response_store' AND "
+                       "indexname='idx_resp_instr_agent_status'") == "1");
+
+    // The ordered key is what serves the terminal probe's `status` range, so a same-named index on
+    // other columns, in another order, partial or not valid must fail here. Column names (not
+    // attnums) so a future column reorder in CREATE TABLE cannot false-fail it.
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT string_agg(a.attname::text, ',' ORDER BY k.ord) "
+                       "FROM pg_class c "
+                       "JOIN pg_index i ON i.indexrelid = c.oid "
+                       "CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) "
+                       "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+                       "WHERE c.relname = 'idx_resp_instr_agent_status' "
+                       "AND c.relnamespace = 'response_store'::regnamespace "
+                       "AND i.indrelid = 'response_store.responses'::regclass "
+                       "AND i.indisvalid AND i.indpred IS NULL") ==
+          "instruction_id,agent_id,status");
 }

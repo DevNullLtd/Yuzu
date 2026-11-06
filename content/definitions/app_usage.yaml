@@ -1,11 +1,11 @@
 ## App Usage Definitions
-## Read-only, machine-scope application usage inventory derived from TAR's
-## usage fold (usage_daily / usage_daily_user / usage_live inside tar.db).
+## Read-only, machine-scope application usage inventory derived from Echo's
+## usage fold (usage_daily / usage_daily_user / usage_live inside echo.db).
 ## No pid, cmdline, or user name is ever surfaced by this source — user
 ## identity is folded into a COUNT(DISTINCT user) only, and open-run state
-## is a plain count. Default-ON: this reads TAR's own default-on usage
-## fold; it requires no separate opt-in beyond TAR itself and
-## `usage_enabled` (tar_config, default true).
+## is a plain count. Default-ON: this reads Echo's own default-on usage
+## fold; it requires no separate opt-in beyond Echo itself and
+## `usage_enabled` (echo_config, default true).
 ## Plugin: app_usage | Actions: summary, last_used, foreground
 ##
 ## Gated behind the Forensics securable (Administrator / approval-gated) —
@@ -14,9 +14,9 @@
 ## plugin_action_catalogue_app_usage.hpp.
 ##
 ## RETENTION: every timestamp field below (first_seen/last_seen) is
-## MIN/MAX over the usage_daily rows currently retained by TAR (31-day
-## default window; TAR prunes usage_daily on its own retention cadence).
-## Never described as spanning every run ever recorded — once TAR's retention prunes a day's rows, this
+## MIN/MAX over the usage_daily rows currently retained by Echo (31-day
+## default window; Echo prunes usage_daily on its own retention cadence).
+## Never described as spanning every run ever recorded — once Echo's retention prunes a day's rows, this
 ## source has no way to see past them.
 
 ---
@@ -28,15 +28,15 @@ metadata:
   version: 1.0.0
   description: >
     Machine-scope summary of application run activity over a window of
-    days, aggregated from TAR's usage_daily table, within TAR's retained
+    days, aggregated from Echo's usage_daily table, within Echo's retained
     usage window (31 days by default). One row per executable: run_count,
     total_seconds, first_seen, last_seen, distinct_users (a
     COUNT(DISTINCT user) only — no user name ever leaves the agent's
     SQLite database), superseded_runs, and expired_runs. Preceded by one
     meta row carrying the fold's own health counters (coverage window,
     open runs, unmatched stops, clock anomalies, capture gaps, feeder
-    state). If the machine's TAR usage source is disabled, or the host's
-    TAR schema predates this table, this reports an explicit constrained
+    state). If the machine's Echo usage source is disabled, or the host's
+    Echo schema predates this table, this reports an explicit constrained
     reason rather than an empty result.
   tags: [forensics, usage, inventory]
 
@@ -95,12 +95,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: first_seen
         type: int64
-        description: 'Unix timestamp of the earliest run within TAR''s retained usage window (not every run ever recorded — rows older than TAR''s retention are already gone). Values: unix seconds.'
+        description: 'Unix timestamp of the earliest run within Echo''s retained usage window (not every run ever recorded — rows older than Echo''s retention are already gone). Values: unix seconds.'
         example: 1717200000
         platforms: [windows, linux, darwin]
       - name: last_seen
         type: int64
-        description: 'Unix timestamp of the most recent run within TAR''s retained usage window. Values: unix seconds.'
+        description: 'Unix timestamp of the most recent run within Echo''s retained usage window. Values: unix seconds.'
         example: 1717286400
         platforms: [windows, linux, darwin]
       - name: distinct_users
@@ -146,14 +146,14 @@ metadata:
   displayName: App Last Used
   version: 1.0.0
   description: >
-    Per-executable last/first-seen within TAR's retained usage window
+    Per-executable last/first-seen within Echo's retained usage window
     (31 days by default, not every run ever recorded) plus a trailing-30-day
-    run_count/total_seconds window, aggregated from TAR's usage_daily
+    run_count/total_seconds window, aggregated from Echo's usage_daily
     table. Optional `exe` parameter narrows the result to one executable,
-    normalised with the same rule TAR uses to write exe_key (lowercased
+    normalised with the same rule Echo uses to write exe_key (lowercased
     basename, trimmed). Machine scope only — no pid, cmdline, or user name
     is ever surfaced. Reports `constrained|usage_feeder_disabled` (or
-    `usage_feeder_errored`) instead of data when TAR's own usage fold is not
+    `usage_feeder_errored`) instead of data when Echo's own usage fold is not
     actually advancing (its process or usage collector is off), since this
     action has no separate health row to carry that signal. The unfiltered
     form is capped at 5000 executables and appends a trailing
@@ -177,7 +177,7 @@ spec:
         displayName: Executable
         description: >
           Optional executable name (or path — only the basename is used)
-          to narrow the result to. Omit to return every executable TAR
+          to narrow the result to. Omit to return every executable Echo
           has recorded within its retained usage window.
 
   result:
@@ -190,12 +190,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: last_seen
         type: int64
-        description: 'Unix timestamp of the most recent run within TAR''s retained usage window. Values: unix seconds.'
+        description: 'Unix timestamp of the most recent run within Echo''s retained usage window. Values: unix seconds.'
         example: 1717286400
         platforms: [windows, linux, darwin]
       - name: first_seen
         type: int64
-        description: 'Unix timestamp of the earliest run within TAR''s retained usage window. Values: unix seconds.'
+        description: 'Unix timestamp of the earliest run within Echo''s retained usage window. Values: unix seconds.'
         example: 1717200000
         platforms: [windows, linux, darwin]
       - name: run_count_30d

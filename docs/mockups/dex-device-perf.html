@@ -15,9 +15,9 @@
      countable from machine-health `dex.device.perf.query`; W0 kill-switch
      seam). Never bundled with the machine-health click.
    - Empty per-app result renders the SOFT truthful message: the operator-SQL
-     authorizer correctly hides tar.db `config`, so the server cannot
+     authorizer correctly hides echo.db `config`, so the server cannot
      distinguish "procperf disabled" (the default) from "enabled, no rollup
-     yet". The crisp disabled state needs a tar-plugin `source_state`
+     yet". The crisp disabled state needs an echo-plugin `source_state`
      registry-known meta table — FILED AS FOLLOW-UP, not F2a.
    - Percentile strips compare the device's CURRENT heartbeat yuzu.perf_*
      values against the CURRENT fleet/cohort distributions from registry
@@ -29,7 +29,7 @@
    - Each per-app row -> the EXISTING app reliability drill
      (/fragments/dex/app?name=...) — per-app perf and per-app
      crashes/hangs cross-link, closing the row-27 loop.
-   - "Open in TAR console" on the panel header -> the TAR page with the
+   - "Open in Echo console" on the panel header -> the Echo page with the
      canned $Perf_Hourly query prefilled, for operators who want raw SQL.
   GRAFANA: device-level perf is NOT exported to Prometheus (cardinality +
   the agent-metrics-via-heartbeat principle) — Grafana reaches per-device/
@@ -38,7 +38,7 @@
   Use the toggle button in section (b) to flip loaded/empty.
 
   Invariants carried over from the live panel (dex_routes.cpp):
-   - Click-to-load stays: each route dispatches a real tar.sql to the device
+   - Click-to-load stays: each route dispatches a real echo.sql to the device
      and probes Execution:Execute (denial is audit-logged), so it must be an
      operator action, not a page-view side effect.
    - Raw samples never leave the device until this on-demand, per-device,
@@ -118,7 +118,7 @@
 
   <!-- ───── (panel as loaded after the "Load performance" click) ───── -->
   <div class="sech">Device performance (hourly, on-device warehouse) &middot; last 48 h
-    <a style="float:right;font-size:.62rem;text-transform:none;letter-spacing:0" title="opens the TAR console with the canned $Perf_Hourly query prefilled">open in TAR console &rarr;</a></div>
+    <a style="float:right;font-size:.62rem;text-transform:none;letter-spacing:0" title="opens the Echo console with the canned $Perf_Hourly query prefilled">open in Echo console &rarr;</a></div>
   <div class="spgrid" id="sparks"></div>
 
   <!-- ───── (a) vs fleet / vs cohort ───── -->
@@ -187,7 +187,7 @@
     (2) <b>Percentile strips</b> are now-vs-now against registry distributions; no new storage, no extra
     federated query (&ldquo;vs cohort over time&rdquo; is F2b-era territory).
     (3) <b>Empty state is the soft truthful message</b> (above, toggled); the crisp
-    enabled/disabled distinction needs the tar-plugin <code>source_state</code> meta table &mdash;
+    enabled/disabled distinction needs the echo-plugin <code>source_state</code> meta table &mdash;
     filed as a follow-up at F2a PR time.
     (4) The signal-history section of the device page is untouched by F2 &mdash; this mockup only covers the
     perf panel below it.

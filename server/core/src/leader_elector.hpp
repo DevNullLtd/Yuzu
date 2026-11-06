@@ -14,11 +14,35 @@
 /// primary failover). So leadership is NOT proven by "I hold the lock" — it is
 /// proven by a **monotonically-increasing epoch**:
 ///
-///   * On each successful acquire, the elector mints a fresh epoch from a
-///     Postgres SEQUENCE (`leader_epoch_seq`) and records it as
+///   * On each successful acquire, the elector mints a fresh epoch,
+///     `GREATEST((GREATEST(timeline, prev >> 32) << 32) + nextval(leader_epoch_seq),
+///     prev + 1)` (the packed term, `(GREATEST(timeline, prev >> 32) << 32) + nextval`), and records it as
 ///     `leader_state.current_leader_epoch` — done ON the lock-owning
 ///     connection, so mutual exclusion guarantees only the true holder writes
 ///     it, and each new leader's epoch is strictly greater than any prior one.
+///     The TIMELINE (the Postgres WAL timeline of the primary written to, #6535)
+///     is in the epoch because a bare sequence is not monotonic across a LOSSY
+///     promotion: the promoted standby can lack the latest mint and re-mint a
+///     value a paused ex-leader holds. Every promotion starts a new timeline
+///     whatever WAL was lost, so the re-minted epoch differs. The surviving
+///     `leader_state` row is also a FLOOR (`GREATEST(packed, prev_epoch + 1)`,
+///     with the packed timeline itself `GREATEST(real, prev_epoch >> 32)`), so a
+///     restore / pg_upgrade / cutover onto a lower timeline, or an older
+///     sequence, can never mint below it (the enablement store orders epochs).
+///     A sequence BEHIND the row (a cutover or table-only restore) is advanced at the first
+///     floored mint, best-effort; that election and the next stay exposed.
+///     NOT covered (canonical list: ADR-2002 §3 "Update (2026-11-01, #6535)"):
+///     two live primaries (the fence is per database), a restore that loses the
+///     leader_state row, a lossy promotion while the row pins a higher timeline
+///     than the real one (only the sequence separates epochs there; the elector
+///     warns), same-timeline loss (crash recovery with an unflushed mint), a
+///     physical-snapshot restore without archive recovery, promotion tooling that
+///     skips the previous timeline's history or a PITR that reuses a timeline, and
+///     a rolling upgrade or downgrade across #6535.
+///     Epochs are therefore >= 2^32; the sequence is capped at 2^32-1
+///     (migration v2; `ALTER SEQUENCE ... RESTART` is a safe remedy because of
+///     the floor) and a timeline outside 1..2^31-1 is refused, both as the
+///     `epoch_record` acquire failure.
 ///   * Every LEADER-DRIVEN side-effecting claim (the slice-3.3 command outbox,
 ///     on an ORDINARY pooled connection) embeds the `epoch_fence_sql()` predicate
 ///     (`current_leader_epoch == expected_epoch`) INTO its claim's WRITE
@@ -57,7 +81,9 @@
 #include "pg/pg_raii.hpp"
 #include "pg/pg_session_advisory_lock.hpp"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -74,14 +100,95 @@ inline constexpr const char* kLeaderElectorStore = "leader_elector";
 /// background leader"; per-family leadership is deliberately NOT built).
 inline constexpr const char* kServerBackgroundLeaderLock = "server_background_leader";
 
+/// WS-11 (#4014): the CLOSED sets of causes the elector counts, with their
+/// exported label values. These arrays are the single source of truth for the
+/// `cause` label of `yuzu_server_leader_acquire_failures_total` /
+/// `yuzu_server_leader_lost_total` (`leader_metrics.hpp` seeds and publishes
+/// from them), so a count site, the exporter and the docs cannot drift.
+///
+/// An acquire FAILURE is an infrastructure fault. The normal follower outcome
+/// -- another replica holds the advisory lock (try-lock answered 'f') -- is
+/// DELIBERATELY not a failure and has no cause here.
+enum class AcquireFailure : std::size_t {
+    Connect = 0,     ///< No usable dedicated connection (open failed / fail-closed config).
+    LockQuery,       ///< The try-lock QUERY itself failed (transport error, not 't'/'f').
+    LockGuard,       ///< Lock granted but the release guard could not be constructed.
+    EpochRecord,     ///< Lock granted but the epoch could not be minted/recorded/parsed.
+};
+inline constexpr std::size_t kAcquireFailureCount = 4;
+inline constexpr std::array<const char*, kAcquireFailureCount> kAcquireFailureLabels = {
+    "connect", "lock_query", "lock_guard", "epoch_record"};
+
+/// Why leadership that WAS held was dropped. A failed heartbeat always drops
+/// leadership, so `LivenessFailed` is also the heartbeat-failure count.
+enum class LeadershipLoss : std::size_t {
+    LivenessFailed = 0, ///< The heartbeat / already-leader `SELECT 1` failed.
+    Resigned,           ///< Voluntary `resign()` while leading.
+};
+inline constexpr std::size_t kLeadershipLossCount = 2;
+inline constexpr std::array<const char*, kLeadershipLossCount> kLeadershipLossLabels = {
+    "liveness_failed", "resigned"};
+
+// A hand-written count and a hand-written label list can drift apart: a brace
+// list shorter than its std::array leaves the tail slots nullptr, which would
+// become `std::string(nullptr)` when the exporter builds the `cause` label at
+// boot. These asserts catch a count that disagrees with the CURRENT last
+// enumerator and any missing/empty label. They do not catch a new enumerator
+// appended after the current last one without bumping the count (that would index
+// the cause arrays out of bounds); test_leader_metrics.cpp's "every cause
+// enumerator has a count site" test covers that direction at run time.
+namespace leader_label_detail {
+template <std::size_t N>
+constexpr bool all_labels_present(const std::array<const char*, N>& labels) {
+    for (const char* label : labels)
+        if (label == nullptr || label[0] == '\0')
+            return false;
+    return true;
+}
+} // namespace leader_label_detail
+static_assert(static_cast<std::size_t>(AcquireFailure::EpochRecord) + 1 == kAcquireFailureCount,
+              "kAcquireFailureCount must equal the number of AcquireFailure enumerators");
+static_assert(static_cast<std::size_t>(LeadershipLoss::Resigned) + 1 == kLeadershipLossCount,
+              "kLeadershipLossCount must equal the number of LeadershipLoss enumerators");
+static_assert(leader_label_detail::all_labels_present(kAcquireFailureLabels),
+              "every AcquireFailure needs a non-empty exported label");
+static_assert(leader_label_detail::all_labels_present(kLeadershipLossLabels),
+              "every LeadershipLoss needs a non-empty exported label");
+
 class LeaderElector {
 public:
+    /// A point-in-time copy of the elector's observability state (WS-11, #4014).
+    /// Plain values: a consumer holds no reference to the elector, so it cannot
+    /// reach a `mu_`-taking accessor (`is_open()`) from a scrape path.
+    struct Stats {
+        bool leader = false;
+        std::int64_t epoch = 0;         ///< Epoch this process leads at; 0 when not leading.
+        std::uint64_t acquired = 0;     ///< Leadership acquisitions by this process.
+        std::array<std::uint64_t, kAcquireFailureCount> acquire_failed{}; ///< By AcquireFailure.
+        std::array<std::uint64_t, kLeadershipLossCount> lost{};           ///< By LeadershipLoss.
+        /// `steady_clock` nanoseconds (since its epoch) of the last query the
+        /// dedicated connection answered successfully; 0 = never.
+        std::int64_t last_ok_steady_ns = 0;
+    };
+
+    /// Monotonic "now" in the units and clock of `Stats::last_ok_steady_ns` (never
+    /// 0: 0 is that field's "never answered" sentinel). The ONE place the elector
+    /// stamps and a scrape-time age computation read the clock, so they cannot
+    /// disagree on the clock or the unit.
+    [[nodiscard]] static std::int64_t steady_now_ns() noexcept;
+
     struct Config {
         std::string dsn;       ///< DSN for the dedicated coordination connection.
         std::string holder_id; ///< This process's identity (e.g. a boot-time random hex).
         /// The logical leadership key. Validated to `[a-z][a-z0-9_]{0,47}`;
         /// an invalid value leaves the elector permanently non-open (fail-closed).
         std::string lock_name = kServerBackgroundLeaderLock;
+        /// TEST SEAM (#6535) -- production never sets this (`server.cpp` leaves it
+        /// `nullopt`). Replaces the Postgres timeline the epoch mint reads, so a
+        /// test can simulate a promotion (timeline bump) without a second cluster.
+        /// A bound integer, never SQL text: nothing here can be spliced into the
+        /// mint statement.
+        std::optional<std::int64_t> timeline_override_for_test;
     };
 
     explicit LeaderElector(Config cfg);
@@ -130,6 +237,20 @@ public:
     /// call when not leader. Leaves the connection open.
     void resign();
 
+    /// WS-11 (#4014): a lock-free snapshot of the observability counters and the
+    /// leadership belief. NEVER takes `mu_` (the election loop holds it across
+    /// blocking libpq calls; a /metrics scrape must not be able to stall behind
+    /// one -- the same rule as `is_leader()`/`epoch()`), so it is safe to call
+    /// from a scrape handler. Counters are relaxed atomics: each value is
+    /// individually exact, the set is not a single atomic cut (fine for
+    /// monotonic counters read by `increase()`).
+    ///
+    /// `is_leader` here is the replica's BELIEF (the attempt gate), not proof of
+    /// leadership: correctness is the epoch fence in a leader-driven claim's
+    /// write. `last_ok_steady_ns` is what makes a stale belief visible -- it stops
+    /// advancing when the dedicated connection stops answering.
+    [[nodiscard]] Stats stats() const noexcept;
+
     /// THE FENCE, as an SQL boolean expression to EMBED in a side-effecting
     /// claim's WRITE statement (its `WHERE`/guard). Returns SQL of the form:
     ///   ((SELECT current_leader_epoch FROM leader_elector.leader_state
@@ -176,32 +297,48 @@ public:
     [[nodiscard]] static std::string epoch_fence_sql(const std::string& lock_name,
                                                      std::int64_t epoch);
 
-    /// The schema migrations for this store (version 1: `leader_epoch_seq` +
-    /// `leader_state`). Exposed for tests and for the migration ladder.
+    /// The schema migrations for this store (v1: `leader_epoch_seq` + `leader_state`;
+    /// v2, #6535: the sequence's 32-bit MAXVALUE). Exposed for tests and the migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
 
 private:
     bool connect_locked();          ///< (Re)establish the dedicated connection + run migrations.
-    void drop_leadership_locked();  ///< Release the lock guard and clear the cached epoch.
+    /// Release the lock guard and clear the cached epoch. With a `cause`, counts a
+    /// leadership LOSS -- but only if leadership was actually held (`epoch_` set),
+    /// so a drop on a follower or in an aborted acquire can never inflate it.
+    void drop_leadership_locked(std::optional<LeadershipLoss> cause = std::nullopt);
+    void note_ok_locked() noexcept;  ///< Stamp "the connection just answered a query".
 
     Config cfg_;
     bool name_valid_ = false;                 ///< cfg_.lock_name passed validation.
     pg::PgAdvisoryLockKey lock_key_;          ///< Derived from cfg_.lock_name.
+    /// The epoch-mint statement's bound parameters ($1 lock name, $2 holder, $3 test timeline
+    /// override as text or empty), built once in the constructor (exec_params still copies
+    /// them per call; see the constructor note on the residual bad_alloc window).
+    std::vector<std::string> mint_params_;
 
     mutable std::mutex mu_;
     pg::PgConn conn_;                          ///< Dedicated, never-recycled (declared BEFORE the guard).
     std::optional<pg::PgSessionAdvisoryLockGuard> lock_guard_; ///< Held only while leader.
     std::optional<std::int64_t> epoch_;        ///< Epoch of the current leadership, if any (writer state, under mu_).
     bool open_ = false;
+    std::int64_t last_logged_timeline_ = 0;    ///< Last timeline logged at info (under mu_).
 
     /// Lock-free publish channel for `is_leader()`/`epoch()` (slice 3.2, #4013):
-    /// `0` = not leader; `>= 1` = leader at that epoch (minted epochs start at 1,
-    /// so `0` is an unambiguous sentinel). The election loop stores this under
-    /// `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
+    /// `0` = not leader; `>= 1` = leader at that epoch (a minted epoch is >= 2^32 since
+    /// #6535 and always positive, so `0` is an unambiguous sentinel). The election loop
+    /// stores this under `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
     /// release-ordered; readers load it with acquire and never touch `mu_`, so a
     /// libpq probe stalled under `mu_` cannot block a worker tick's leadership
     /// read. `epoch_` above stays the writer's authoritative state under `mu_`.
     std::atomic<std::int64_t> live_epoch_{0};
+
+    // WS-11 (#4014) observability counters. Written only under `mu_` (plain
+    // fetch_add, no new locking), read lock-free by `stats()`.
+    std::atomic<std::uint64_t> acquired_{0};
+    std::array<std::atomic<std::uint64_t>, kAcquireFailureCount> acquire_failed_{};
+    std::array<std::atomic<std::uint64_t>, kLeadershipLossCount> lost_{};
+    std::atomic<std::int64_t> last_ok_steady_ns_{0}; ///< 0 = never answered.
 };
 
 } // namespace yuzu::server

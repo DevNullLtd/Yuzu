@@ -1,1 +1,0 @@
-- CI test steps now append a per-invocation duration summary (meson entries and the slowest Catch2 cases) to the job summary; the `docs` suite runs on Linux only and OS-contract tests moved to a new `platform` suite that runs on every leg (#4884).

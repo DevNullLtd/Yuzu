@@ -22,6 +22,10 @@
  *   package|homebrew|<id>|<version>|<formula|cask>
  *   package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<active|inactive|unknown>
  *
+ * The status row is formatted (and read back by the installed-software
+ * collector) by the shared yuzu::shared helper in agents/shared/inventory_status_row.hpp;
+ * only the data rows are this plugin's.
+ *
  * Every free-text field goes through yuzu::util::safe_output_field (a trailing
  * backslash or a pipe in an OS-supplied value can never shift a column).
  * `status` tokens follow the repo convention ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$
@@ -54,6 +58,7 @@
 #include <yuzu/string_utils.hpp>
 
 #include <constraint_accumulator.hpp>
+#include <inventory_status_row.hpp>
 
 #include <algorithm>
 #include <cerrno>
@@ -170,17 +175,6 @@ enum class StoreState { active, inactive, unknown };
     return "unknown";
 }
 
-enum class StatusLevel { supported, constrained, unsupported };
-
-[[nodiscard]] constexpr std::string_view status_level_token(StatusLevel l) noexcept {
-    switch (l) {
-    case StatusLevel::supported:   return "supported";
-    case StatusLevel::constrained: return "constrained";
-    case StatusLevel::unsupported: return "unsupported";
-    }
-    return "constrained";
-}
-
 // ── tokens ───────────────────────────────────────────────────────────────
 
 /// Fixed tokens for the by-design unsupported outcomes and the planned legs.
@@ -233,22 +227,11 @@ inline constexpr std::string_view kDetailIoError = "io_error";
 // Formatters take already-computed values, make no decisions and return the
 // row WITHOUT a trailing newline (append_output() inserts the separator).
 
-/// status|<action>|<level>|<tokens or ->
-[[nodiscard]] inline std::string format_status_row(std::string_view action, StatusLevel level,
-                                                   std::string_view tokens) {
-    std::string out = "status|";
-    out += yuzu::util::safe_output_field(action);
-    out += '|';
-    out += status_level_token(level);
-    out += '|';
-    out += tokens.empty() ? std::string{"-"} : yuzu::util::safe_output_field(tokens);
-    return out;
-}
-
-/// status|<action>|unsupported|<token>
+/// status|<action>|unsupported|<token>. The status row itself is formatted by
+/// yuzu::shared::format_status_row (inventory_status_row.hpp).
 [[nodiscard]] inline std::string unsupported_status_row(std::string_view action,
                                                         std::string_view token) {
-    return format_status_row(action, StatusLevel::unsupported, token);
+    return yuzu::shared::format_status_row(action, yuzu::shared::StatusLevel::unsupported, token);
 }
 
 /// Builder for the `facts` field: `k=v;k=v`, or "-" when empty. Keys and

@@ -1,8 +1,14 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash 5cadaa03e74e
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 1000 · leg-hash 10a510136fd8
 == action=dotnet
 status|dotnet|supported|-
-[result_status] OK / FULL /
+[result_status] OK / FULL / 
 
 == action=jvm
 status|jvm|supported|-
-[result_status] OK / FULL /
+[result_status] OK / FULL / 
+
+== action=python
+status|python|supported|-
+python|unmodelled|3.14|/usr/bin/python3.14|-
+[result_status] OK / FULL / 
+

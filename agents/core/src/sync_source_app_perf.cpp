@@ -75,11 +75,11 @@ std::string build_app_perf_query(std::int64_t window_start, std::int64_t today_s
     // Column order here IS the wire/parse contract (parse_app_perf_sql_output reads
     // positionally). Sample-weighted averages reconstruct the true daily mean from
     // procperf_hourly's per-hour AVG×COUNT; max-of-max for peaks; SUM for counts.
-    // $ProcPerf_Hourly is translated to procperf_hourly by the TAR sql validator.
+    // $ProcPerf_Hourly is translated to procperf_hourly by the Echo sql validator.
     // `AND NOT is_kthread` excludes Linux kernel threads (PF_KTHREAD) and the
     // Windows System process (pid 4) from the daily app-perf-over-time
-    // history — see tar_proc_perf.hpp's "Kernel-thread marker" note. This is
-    // the ONLY consumer that filters on the flag: the live TAR procperf tiers
+    // history — see echo_proc_perf.hpp's "Kernel-thread marker" note. This is
+    // the ONLY consumer that filters on the flag: the live Echo procperf tiers
     // this query reads FROM keep kernel threads unfiltered by design.
     return std::format(
         "SELECT name, version, (hour_ts/86400)*86400 AS day, "
@@ -214,13 +214,13 @@ std::string render_app_perf_blob(std::vector<AppPerfRow> rows) {
     return blob;
 }
 
-SyncSource make_app_perf_source(const YuzuPluginDescriptor* tar_descriptor) {
+SyncSource make_app_perf_source(const YuzuPluginDescriptor* echo_descriptor) {
     SyncSource src;
     src.name = "app_perf";
     src.interval = std::chrono::hours{24};
-    src.collect = [tar_descriptor]() -> std::optional<std::pair<std::string, std::string>> {
-        if (tar_descriptor == nullptr) {
-            spdlog::debug("sync: TAR plugin not loaded — app_perf source idle");
+    src.collect = [echo_descriptor]() -> std::optional<std::pair<std::string, std::string>> {
+        if (echo_descriptor == nullptr) {
+            spdlog::debug("sync: Echo plugin not loaded — app_perf source idle");
             return std::nullopt;
         }
         const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -233,13 +233,13 @@ SyncSource make_app_perf_source(const YuzuPluginDescriptor* tar_descriptor) {
         const YuzuParam params[1] = {{"sql", sql.c_str()}};
         LocalDispatcher dispatcher;
         LocalDispatcher::Result r =
-            dispatcher.run(tar_descriptor, "sql", std::span<const YuzuParam>(params, 1));
+            dispatcher.run(echo_descriptor, "sql", std::span<const YuzuParam>(params, 1));
         if (r.rc != 0) {
-            spdlog::warn("sync: TAR 'sql' rc={} for app_perf rollup — skipping this cycle", r.rc);
+            spdlog::warn("sync: Echo 'sql' rc={} for app_perf rollup — skipping this cycle", r.rc);
             return std::nullopt;
         }
         if (r.truncated) {
-            spdlog::warn("sync: TAR 'sql' app_perf output truncated at the capture cap — "
+            spdlog::warn("sync: Echo 'sql' app_perf output truncated at the capture cap — "
                          "skipping this cycle");
             return std::nullopt;
         }

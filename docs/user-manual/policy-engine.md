@@ -151,6 +151,59 @@ Policies can be scoped to specific management groups. When a policy is bound
 to a group, only agents that are members of that group (or its descendant
 groups) are subject to the policy's compliance checks.
 
+`managementGroups` takes management group **ids** (the 12-character id the
+server assigns, e.g. `abc123def456`), not display names: a name matches no
+group, so the policy would target nothing. An entry that cannot be a group id
+(it holds a space or other punctuation outside letters, digits and `_ . : * -`)
+is refused with `400` (#2123; malformed lists are covered below). A non-empty `managementGroups` list replaces the
+policy's `scope` for targeting.
+
+### YAML line endings, comments and lists
+
+Policy and fragment YAML is read by the server's own line scanner (#2123):
+
+- **Line endings:** LF, CRLF (Windows) and a lone CR are all line breaks, so a
+  file authored on Windows reads exactly like its LF copy.
+- **Comments and blank lines** may appear anywhere inside a block, at any
+  indent; they never end the block.
+- **Inline lists** (`tags: [prod, pci]`) must open and close on the **same
+  line**. For several lines use a block list of `- item` lines.
+- **Block lists:** keep every `- item` line at the same indent. A `- item` line
+  out of line with the others, or an item continued on the next line, makes
+  the list unreadable as written, and the policy is refused with `400` rather
+  than stored with a different scope. The same applies when a list is followed
+  directly by another list's next item: end the list with another key first.
+  A line missing its `- `,
+  an empty-string item (`- ""`), and a `- item` line indented to
+  `selector:`'s own column, are refused the same way.
+- A single value where a list is expected (`tags: prod`,
+  `managementGroups: abc123def456`) is refused: write `tags: [prod]` or a
+  `- prod` line. `tags: null` (or `~`) on its own means no tags; followed by
+  `- item` lines, as with a value or an inline list followed by them, it is
+  refused.
+- A key is read only as the **first word on its line**: `scope:` inside a
+  one-line value (`description: "see scope: x"`) or a comment is not the
+  policy's scope. A line inside a multi-line `description: |` block can
+  still be read as a key (see below).
+- **Not yet refused** (tracked on #2123), so avoid them: a list line indented
+  at or shallower than `scope:` itself, a `- item` written after another key
+  (such as `platform:` under `selector:`, or any key after
+  `managementGroups:`), tab characters in indentation, a `scope:` or
+  `managementGroups:` line inside a multi-line `description: |` block, a
+  null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`),
+  a quoted key (`"tags":`) or a space before the colon (`tags :`), neither
+  of which is read as the key, a block-scalar value (`platform: >`), a
+  duplicate key (the server reads the first, a YAML parser the last), a
+  flow-mapped selector (`selector: {tags: [prod]}`), and a compact
+  `triggers:` list. Each can still drop or replace an entry without an
+  error, leaving the policy targeting a broader, narrower or different
+  device set than its YAML says. A lone CR is also a line break to the
+  server, but terminals and diffs render it as nothing, so a key after one
+  is read without showing on its own line. Keep a list's `- item` lines
+  together, directly under their key, write keys unquoted with the colon
+  straight after the name, each key once, in block style, indent with spaces
+  only, and keep those key names out of multi-line descriptions.
+
 ### Example Policy YAML
 
 ```yaml
@@ -166,7 +219,8 @@ spec:
     - type: interval
       interval_seconds: 300
   managementGroups:
-    - eu-production-servers
+    # the eu-production-servers group's id (ids, not names)
+    - 3f9c2a7b1e04
   inputs:
     severity_threshold: "high"
 ```
@@ -219,7 +273,7 @@ The policy engine tracks compliance status per agent per policy. Each
 |---|---|
 | `compliant` | Check passed -- the endpoint is in the desired state |
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
-| `unknown` | Not yet evaluated, status invalidated, or the agent did not respond to a check within the grace window |
+| `unknown` | Not yet evaluated, status invalidated, the agent did not respond to a check within the grace window, or the check instruction runs a Forensics-tier plugin (see below) |
 | `fixing` | Fix instruction is currently running |
 | `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`) |
 
@@ -251,6 +305,27 @@ Verdict semantics: a plugin failure / timeout / rejection → `error`; a
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 
+**A check that runs a Forensics-tier plugin scores `unknown`.** The evaluator
+reads each check's stored response with every Forensics-tier plugin
+(`app_usage`, `browser_inventory`, `execution_artifacts`,
+`privacy_permissions`, `remote_access_audit`; the set is derived from the
+capability catalogue) excluded, because the verdict and the first bytes of the
+check output are shown to readers who do not hold `Forensics:Read`. Such a
+policy therefore shows `unknown` for every agent with an empty `check_result`,
+and never a verdict from, or a stored copy of, Forensics output. `unknown`
+there says nothing about the device. A Forensics-tier plugin is not a suitable
+policy check. The check instruction is still dispatched to the endpoints and the
+plugin's response row is still stored (it is readable only through the
+`Forensics:Read` tier and kept for the response retention window, 90 days by
+default); only the verdict and `check_result` are withheld. A separate
+follow-up (#6065) tracks the dispatch-side authorization of policy checks.
+
+This release stores no check output for such a policy, so there is nothing to
+clean up for it; deleting a policy (`DELETE /api/policies/{id}`, `Policy:Delete`)
+removes its status rows as before. The deployment assumption behind this is the
+hard-cutover contract in the [upgrade guide](upgrading.md): a fresh database with
+no data imported from earlier builds.
+
 Implementation/lifecycle: the thread is `PolicyEvaluator`
 (`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared
 `command_dispatch_fn`; per-agent verdicts are written via
@@ -279,9 +354,9 @@ use-after-free guard any shutdown refactor must preserve.
 > **Scope of the guarantee.** The claim prevents two replicas from independently *claiming* the
 > same `(policy, agent)` target only when both are running the **same schema version**. During a
 > rolling upgrade across the migration boundary, an old binary that predates the durable claim can
-> transiently run alongside a new one; that mixed-version window is gated today by issue #4014
-> (which blocks running a second production replica) pending a durable cluster-capability admission
-> gate. The exposure is one-directional — a row written by an old binary carries claim-generation
+> transiently run alongside a new one; that mixed-version window is covered today only by the safe-to-scale gate
+> (`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a durable
+> cluster-capability admission gate (#6528). The exposure is one-directional — a row written by an old binary carries claim-generation
 > `0`, a value a new binary never mints for its own claims. Separately, the guarantee is
 > effectively-once, not exactly-once (consistent with ADR-2002): a replica that pauses for longer
 > than `fixing_stale_seconds` between winning the claim and actually sending a command over gRPC —
@@ -546,7 +621,7 @@ spec:
     - type: <interval|file_change|service_status|event_log|registry|startup>
       interval_seconds: <seconds>
   managementGroups:
-    - <group-name-or-id>
+    - <group-id>
   inputs:
     <key>: <value>
 ```

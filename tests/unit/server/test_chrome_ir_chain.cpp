@@ -17,7 +17,7 @@
  *   • The chain is driven in-process with a REAL ResultSetStore + a FAKE command
  *     dispatch (records args, returns a configurable sent-count) — the same
  *     pattern as test_rest_result_sets_async.cpp. There is no running agent, so
- *     the two async producers (tar_query / instruction_result) land `pending`
+ *     the two async producers (echo_query / instruction_result) land `pending`
  *     and are materialised by calling ResultSetStore::materialize() directly,
  *     standing in for the server's maintenance thread.
  *   • The ground set uses the direct create endpoint as a deterministic stand-in
@@ -247,18 +247,18 @@ TEST_CASE("chrome-ir: composable-scope chain — lineage, audit, pin-prevents-GC
     CHECK(j1["data"]["status"] == "materialized");
     CHECK(j1["data"]["device_count"] == 3);
 
-    // ── Step 2: narrow within rs1 via a TAR SQL query → pending; then materialise
+    // ── Step 2: narrow within rs1 via an Echo SQL query → pending; then materialise
     //            (two agents returned ≥1 row). Dispatch must be scoped to the parent set. ──
     const std::string b2 =
         std::string(
             R"({"name":"windows-chrome-vulnerable","sql":"SELECT pid FROM process_live WHERE name='chrome.exe'","parent_id":")") +
         rs1 + R"("})";
-    auto j2 = h.post("/api/v1/result-sets/from-tar-query", b2, st);
+    auto j2 = h.post("/api/v1/result-sets/from-echo-query", b2, st);
     REQUIRE(st == 202);
     const auto rs2 = j2["data"]["id"].get<std::string>();
     CHECK(j2["data"]["status"] == "pending");
     REQUIRE(h.calls.size() == 1);
-    CHECK(h.calls.back().plugin == "tar");
+    CHECK(h.calls.back().plugin == "echo");
     CHECK(h.calls.back().scope_expr == "from_result_set:" + rs1); // scoped to the parent set
     REQUIRE(h.store->materialize(rs2, {"win-1", "win-2"}).has_value());
 

@@ -43,6 +43,10 @@ struct TrackerScope {
         REQUIRE(tracker->is_open());
         if (bus != nullptr)
             tracker->set_event_bus(bus);
+        // The tracker's records are the only record source from here on: a harness's
+        // prefix-labelling fake (test_provenance_fake.hpp) is cleared, so a frame whose command id
+        // was never recorded is unverified exactly as in production.
+        svc->override_command_record_lookup({});
         svc->set_execution_tracker(tracker.get());
     }
     ~TrackerScope() {

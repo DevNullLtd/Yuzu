@@ -2641,6 +2641,101 @@ TEST_CASE("ApprovalManager: query_checked and pending_count_checked report a gen
     CHECK(!count_checked.error().sqlstate.empty());
 }
 
+TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the store never opened "
+          "or a query fails, and counts per submitter otherwise (up8-1)",
+          "[pg][approval_manager][approval][up8-1]") {
+    SECTION("happy path: per submitter, pending only, empty name is a genuine zero") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.submit("d1", "alice", "s1", "", ApprovalOrigin::kInstruction).has_value());
+        REQUIRE(mgr.submit("d2", "alice", "s2", "", ApprovalOrigin::kMcp).has_value());
+        REQUIRE(mgr.submit("d3", "bob", "s3", "", ApprovalOrigin::kInstruction).has_value());
+        auto a = mgr.pending_count_for_checked("alice");
+        REQUIRE(a.has_value());
+        CHECK(*a == 2); // all origins count: the cap bounds the principal's share of the queue
+        auto b = mgr.pending_count_for_checked("bob");
+        REQUIRE(b.has_value());
+        CHECK(*b == 1);
+        auto none = mgr.pending_count_for_checked("carol");
+        REQUIRE(none.has_value());
+        CHECK(*none == 0);
+        auto empty = mgr.pending_count_for_checked("");
+        REQUIRE(empty.has_value());
+        CHECK(*empty == 0);
+    }
+    SECTION("a pending row older than the TTL is not counted even before submit's sweep expires it") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.submit("d1", "alice", "s1", "", ApprovalOrigin::kInstruction).has_value());
+        {
+            auto lease = mgr_bundle.pool().acquire();
+            REQUIRE(lease);
+            // 25 stale rows for alice (aged past the TTL) and one just inside the window: only
+            // the unexpired ones may count.
+            pg::PgResult res = pg::exec_params(
+                lease.get(),
+                "INSERT INTO approval_manager.approvals "
+                "(id, definition_id, status, submitted_by, submitted_at) "
+                "SELECT 'stale-' || gs, 'def-stale', 'pending', 'alice', "
+                "extract(epoch from now())::bigint - $1::bigint - 60 "
+                "FROM generate_series(1, 25) AS gs",
+                std::vector<std::string>{std::to_string(yuzu::server::kApprovalTicketTtlSeconds)});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+            pg::PgResult edge = pg::exec_params(
+                lease.get(),
+                "INSERT INTO approval_manager.approvals "
+                "(id, definition_id, status, submitted_by, submitted_at) "
+                "VALUES ('edge-1', 'def-edge', 'pending', 'alice', "
+                "extract(epoch from now())::bigint - $1::bigint + 300)",
+                std::vector<std::string>{std::to_string(yuzu::server::kApprovalTicketTtlSeconds)});
+            REQUIRE(edge.status() == PGRES_COMMAND_OK);
+        }
+        auto a = mgr.pending_count_for_checked("alice");
+        REQUIRE(a.has_value());
+        CHECK(*a == 2); // d1 and the row 300 s inside the window; the 25 stale ones do not count
+        // The sweep has NOT run (no submit since): the stale rows are still status 'pending'.
+        CHECK(mgr.pending_count() == 27);
+    }
+    SECTION("a query failure is an error") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.is_open());
+        {
+            auto lease = mgr_bundle.pool().acquire();
+            REQUIRE(lease);
+            pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                               std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        auto checked = mgr.pending_count_for_checked("alice");
+        REQUIRE_FALSE(checked.has_value());
+        CHECK(checked.error().message.find("read failed") != std::string::npos);
+        CHECK(!checked.error().sqlstate.empty());
+    }
+}
+
+TEST_CASE("ApprovalManager: submit_typed reports a full queue as kQueueFull and a good submit as "
+          "an id; submit() keeps its message-only shape",
+          "[pg][approval_manager][approval][queue-full]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto ok = mgr.submit_typed("d-ok", "alice", "s", "", ApprovalOrigin::kMcp);
+    REQUIRE(ok.has_value());
+    // A surface that binds a request cannot be minted unbound, typed as an invalid request.
+    auto bound = mgr.submit_typed("d-b", "alice", "s", "", ApprovalOrigin::kGuardianDeploy);
+    REQUIRE_FALSE(bound.has_value());
+    CHECK(bound.error().kind == SubmitFailure::kInvalidRequest);
+
+    yuzu::test::seed_pending(bundle.pool(), "qf-", ApprovalManager::kMaxPendingApprovals,
+                             /*age_seconds=*/60);
+    auto full = mgr.submit_typed("d-full", "alice", "s2", "", ApprovalOrigin::kInstruction);
+    REQUIRE_FALSE(full.has_value());
+    CHECK(full.error().kind == SubmitFailure::kQueueFull);
+    auto legacy = mgr.submit("d-full2", "alice", "s3", "", ApprovalOrigin::kInstruction);
+    REQUIRE_FALSE(legacy.has_value());
+    CHECK(legacy.error().find("queue is full") != std::string::npos);
+}
+
 TEST_CASE("ApprovalManager: query_checked happy path matches query()'s fields",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;

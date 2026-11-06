@@ -55,13 +55,15 @@ a review question into a compile-time impossibility.
 
 ### The exemplar: `discover_routes.{hpp,cpp}`
 
-`server/core/src/discover_routes.hpp` (158 lines) declares five pure builder functions —
+`server/core/src/discover_routes.hpp` declares six pure builder functions —
 `build_permissions_catalog`, `build_instructions_catalog`, `build_routes_catalog`,
-`scope_kinds_catalog`, `build_plugins_catalog` — each taking only the store/registry it needs and
-returning a `DiscoveryDoc { std::string json; std::string etag; }`. The file header states the
-intent explicitly:
+`scope_kinds_catalog`, `plugin_docs_catalog`, `build_plugins_catalog` — each taking only the
+store/registry it needs and returning a `DiscoveryDoc { std::string json; std::string etag; }`.
+`DiscoveryDoc` and the one builder declared outside `discover_routes.hpp`, `build_routes_catalog`,
+are declared in `server/core/src/discover_catalog_types.hpp`, which `discover_routes.hpp`
+re-includes; the other five stay in `discover_routes.hpp`. The file header states the intent explicitly:
 
-> "The five builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
+> "The six builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
 > store/registry pointer passed in — and are declared here specifically so `mcp_server.cpp` can
 > call the SAME functions for the mirrored `discover_*` MCP tools... REST and MCP therefore cannot
 > drift from each other by construction."
@@ -204,6 +206,29 @@ audit verb, full `parameters`, and every realistic `responses` status (200/400/4
 `Sec-Audit-Failed` header block on any audited route — see the `"/network/devices"` path item for
 the header-documentation shape).
 
+Three more things the entry must carry, because the served document is read by code generators
+and by the `/swagger` page as well as by people:
+
+- **`operationId`.** Every operation has one, unique across the document: the lower-case method,
+  then the path (without the `/api/v1` base) in PascalCase, with each path parameter written as
+  `By` plus its name. `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is
+  `postHardwareByIdSync`, `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. A
+  new operation follows the same rule. Two tests in `tests/unit/server/test_openapi_spec_completeness.cpp`
+  check uniqueness: `openapi_spec_json(): every operation has a unique and well-formed operationId`
+  (which also checks presence and shape) and `openapi documents: every operation has a unique
+  operationId in both forms`.
+- **Group guides.** Prose for a group lives in the guide of the matching top-level `tags` entry
+  under `x-yuzu-guide`, not inside an operation. `GET /api/v1/openapi.json` leaves the guides out
+  and `?guides=true` includes them; the MCP resource `yuzu://openapi` and the discover tools serve
+  only the form without them.
+- **Unserved routes.** An operation that is documented but not registered on a running server,
+  because the store behind it is not started, carries an `x-yuzu-unavailable` string on the
+  operation saying so. The `/swagger` page labels such operations unavailable, and the route
+  catalog (`GET /api/v1/discover/routes`, MCP `discover_routes`) repeats the string as an
+  `unavailable` field on that row. A route that is registered must not carry it. When a store
+  becomes wired in `server.cpp`, remove its markers in the same change:
+  `tests/test_unavailable_store_wiring.py` fails if they disagree.
+
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
 `"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes where a present-empty value selects rows with no
@@ -336,7 +361,14 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
    `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
    in `tests/unit/server/test_mcp_dispatch_coverage.cpp`, and a new `mcp_tool*.hpp` sets
-   `kToolHeaderFiles` there, in the same change.
+   `kToolHeaderFiles` there, in the same change. The seam-closure CI gate
+   (`scripts/ci/check-seam-closure.py`, "MCP registry lane") additionally include-closure-checks every
+   `mcp_tools_*.cpp`, the three shared `mcp_tool*.hpp` headers and the seven store-free `*_types.hpp`
+   headers against its store-header patterns, pins the file count (`MCP_REGISTRY_EXPECTED_TU_COUNT`, with
+   `EXPECTED_MCP_REGISTRY_TU_COUNT` and `EXPECTED_MCP_REGISTRY_CPPS` in its self-test — and
+   `MCP_REGISTRY_HEADERS` / `MCP_REGISTRY_TYPES_HEADERS` for a new shared or types header — which also
+   cross-checks the count against `MIN_REGISTRY_FILES` and `kRegistryDomainFiles`), and checks that each
+   `<domain>_tool_records()` accessor declared in `mcp_tool_registry.hpp` has its `mcp_tools_<domain>.cpp`.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a
@@ -353,18 +385,21 @@ cannot scan, and the retry-hints check also fails closed on a missing `handle_<n
 
 **Limits, stated plainly.** A handler gets no store, registry or agent access. What it can reach is
 `ctx.deps`, a `ToolDeps` (`mcp_tool_deps.hpp`) of provider closures: the `fleet_read_fn` gate, the
-domain-verb `audit_fn`, and the same roster, CI-detail, DEX-score and quarantine-list closures the REST
-`HardwareRoutes` receives (one instance wired into both in `server.cpp`), so a twin reuses the route's
-composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
+domain-verb `audit_fn`, the same roster, CI-detail, DEX-score and quarantine-list closures the REST
+`HardwareRoutes` receives (one instance wired into both in `server.cpp`), and the `/crypto` closures (five
+forwards to the `CryptoApi` instance `CryptoRoutes` serves, `crypto_access_fn`, and `username_fn`, which
+re-resolves the caller's username from the request because the registry path carries no session), so a
+twin reuses the route's composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
 may be empty: a handler checks both and answers an internal error, never an empty result. A tool that
-needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn`) still belongs on the legacy path, and a lexical
+needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn` and a closure meeting the criterion in `mcp_tool_deps.hpp`: a pure forward of the REST twin's own `*Api` method, the gate stays central, the handler audits "attempted" first and refuses to run without a sink) still belongs on the legacy path, and a lexical
 test fails an `mcp_tools_*.cpp` that includes a `*_store.hpp`, `agent_registry.hpp`, `mcp_server.hpp`,
 `auth_db*` or `pg/` header. Tools are compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
 `registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
 tools in tool-name order (sorted once in `build_catalogue`), so a migration does not move a tool; clients
 key by name, and `tools/list` advertises `listChanged:false`. The legacy path above remains valid, and is
-the only path for every tool not yet moved (the first moved tool is `discover_routes`, in
-`mcp_tools_discovery.cpp`); #2422 is not closed by this seam alone.
+the only path for every tool not yet moved (`discover_routes`, in `mcp_tools_discovery.cpp`, was the first;
+the seven `/crypto` tools, in `mcp_tools_crypto.cpp`, are the pilot carve of the multi-family
+`mcp_server.cpp`); #2422 is not closed by this seam alone.
 
 ### Tier vs RBAC — and the lesson already paid for once
 
@@ -399,16 +434,17 @@ by something broader, the fix is always a new operation string — never a tool-
 ### A fifth registration point: `requires_approval()`
 
 `tier_allows()` decides *whether* a supervised-tier token may call a tool at all; a separate
-function, `requires_approval(mcp_tier, securable_type, operation)` (`mcp_policy.hpp:97`), decides
+function, `requires_approval(mcp_tier, securable_type, operation)` (in `mcp_policy.hpp`), decides
 *whether that call must go through the maker-checker approval workflow first* — checked, per its
 own doc comment, "AFTER `tier_allows()` returns true." **It is not derived from anything else — it
 is its own hard-coded, exact-match `(securable_type, operation)` list** (supervised tier:
 `Execution:Execute`, any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`,
-`UserManagement:Write`, `ManagementGroup:Write`; operator tier: `Tag:Delete` only —
-`mcp_policy.hpp:105-158`). A pair that is destructive in the everyday sense but **absent** from this
-list runs un-approved at supervised tier, full stop — there is no fallback heuristic ("Write implies
-approval" is not the rule; `ApiToken:Write` itself is not in the list, deliberately, per the comment
-at `mcp_policy.hpp:124-151`).
+`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; operator
+tier: `Tag:Delete` only; read the supervised branch of `requires_approval()` in `mcp_policy.hpp`
+for the current list, which this paragraph can fall behind). A pair that is destructive in the
+everyday sense but **absent** from this list runs un-approved at supervised tier, full stop: there
+is no fallback heuristic ("Write implies approval" is not the rule; `ApiToken:Rotate` is
+deliberately absent from the list, with its rationale in the comment after the `ApiToken:Write` line in that branch).
 
 **This means a twin PR for a destructive action-twin must explicitly decide, and state in the tool
 description, whether its `(securable_type, operation)` pair belongs in `requires_approval()`** — not
@@ -724,7 +760,7 @@ see §5 for which chokepoints apply.
    handler makes, and in the other direction a gate call in a derived MCP handler for a pair other than
    the tool's declared one is a finding too (for rows with a REST object twin; an MCP-only tool or a
    handler that shares a dispatch branch is not held to it); a route whose gate the script cannot read
-   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; both tables are shrink-only) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
+   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; that table and `GATE_PARITY_KNOWN_MISMATCHES` are each pinned to an exact size, `GATE_PARITY_NO_GATE_MAX` and `GATE_PARITY_KNOWN_MISMATCHES_MAX`: a pin is lowered in the change that retires an entry and raised only under a ruling recorded in ADR-1005) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
    block, and a new or changed `mcp_tool*.hpp`: a store/query-fault branch needs a retry hint or a
    `// retry-hint-exempt:` comment).
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
@@ -917,14 +953,15 @@ before any of the table edits below.
 
 Next, the decision §3's "fifth registration point"
 calls out explicitly: `SoftwareDeployment:Execute` is **not** in `requires_approval()`'s hard-coded
-supervised-tier list today (verified — the full list is `Execution:Execute`, any `Delete`,
-`Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
-`ManagementGroup:Write`; `mcp_policy.hpp:105-121`). Starting a deployment pushes a package to live
+supervised-tier list today (verified; the list at the time of writing is `Execution:Execute`,
+any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
+`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; read the supervised branch of
+`requires_approval()` in `mcp_policy.hpp` for the current one). Starting a deployment pushes a package to live
 endpoints — REST gates the equivalent action behind an MFA step-up (`step_up_fn`,
 `rest_api_v1.cpp:9053`) precisely because it is consequential. The twin PR's job is to make that
 call explicitly rather than silently ship an unapproved supervised-tier action: add
 `if (securable_type == "SoftwareDeployment" && operation == "Execute") return true;` to the
-supervised-tier block in `requires_approval()` (`mcp_policy.hpp:105`), with a short comment
+supervised-tier block in `requires_approval()` (`mcp_policy.hpp`), with a short comment
 recording the REST-parity rationale (matching the style of the existing entries there) — this is
 the MCP-native answer to a step-up gate MCP tokens cannot satisfy interactively (they're
 non-interactive; see the engine-principal tools' "platform-wide MCP step-up exemption" note,
@@ -932,7 +969,7 @@ non-interactive; see the engine-principal tools' "platform-wide MCP step-up exem
 leaving it implicit).
 
 ```cpp
-// mcp_policy.hpp:105 -- add to the supervised-tier block in requires_approval():
+// mcp_policy.hpp -- add to the supervised-tier block in requires_approval():
 if (securable_type == "SoftwareDeployment" && operation == "Execute") return true;
 // Deployment start pushes a package to live endpoints -- REST parity with its
 // step_up_fn MFA gate (rest_api_v1.cpp POST .../start); MCP tokens are non-interactive,

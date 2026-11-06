@@ -78,6 +78,28 @@ jobs:
       - name: Split interlock tripwire self-test
         run: python3 tests/test_split_interlock_tripwire_selftest.py
 
+      # #4990: stored-response reads and the Forensics tier. The exact set of ResponseStore read
+      # methods (each must take a ResponseTierFilter) and the exact set of
+      # unrestricted_internal_consumer() call sites are frozen in the tripwire; a new read or a new
+      # internal-consumer site fails until it is classified in a reviewed change. The self-test runs
+      # the checks against mutated sources and proves each mutation is caught.
+      - name: Response store read tripwire (#4990)
+        run: python3 -I tests/test_response_store_read_tripwire.py
+
+      - name: Response store read tripwire self-test (#4990)
+        run: python3 -I tests/test_response_store_read_tripwire_selftest.py
+
+      # #4990: server.cpp keeps wiring the Forensics plugin set and the visibility resolver into
+      # every surface that reads stored responses. A route class built without them fails closed
+      # and would silently lose Forensics rows for every caller, so no unit test notices a
+      # dropped line; this lexical gate does. The self-test deletes each required statement in
+      # memory and proves the gate names it.
+      - name: Forensics tier wiring gate (#4990)
+        run: python3 -I tests/test_forensics_tier_wiring_lexical.py
+
+      - name: Forensics tier wiring gate self-test (#4990)
+        run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
+
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
       # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
@@ -125,8 +147,8 @@ jobs:
       # item 1): a family's presentation/handler TUs must not reach a store
       # directly. check-seam-closure.py walks each declared family TU's
       # transitive #include closure and fails on any store-layer header found
-      # in it (see the script's module docstring for the "sound proxy, two
-      # acknowledged escapes" scope statement). Pure lexical source-tree
+      # in it (see the script's module docstring for the "sound proxy" scope
+      # statement and its list of what is NOT caught). Pure lexical source-tree
       # analysis, no build deps — belongs beside the other preflight gates in
       # this job, same as the sibling check-api-parity.py gate (ci.yml).
       - name: Seam-closure gate (ADR-0031 WS-A4 item 1)
@@ -138,6 +160,11 @@ jobs:
       # above is evidence the gate actually discriminates, not that it always
       # passes. Mirrors the split interlock self-test's shape immediately above.
       - name: Seam-closure gate self-test
+        # The include-parser fixtures are cross-checked against GNU g++ -MM -MG; docs-lint's
+        # ubuntu-24.04 image has one, so require it rather than silently skipping the oracle
+        # (qa-4 precedent, the link-gate self-test below).
+        env:
+          YUZU_REQUIRE_TOOLCHAIN: "1"
         run: python3 tests/test_seam_closure_selftest.py
 
       # check-seam-closure.py's LINK-level twin, scripts/ci/check_core_
@@ -191,6 +218,11 @@ jobs:
       # Docker.
       - name: Gateway image abi-guard
         run: python3 tests/test_gateway_abi_guard.py
+      # #6711: the gateway image is amd64-only; the lint that keeps its pinned
+      # builder index honest, run against fixture indexes (the registry read is
+      # in docker-healthcheck-invariants.yml).
+      - name: Gateway base index lint
+        run: python3 tests/test_gateway_base_index.py
       - name: QA-stack gateway crash signatures
         run: python3 tests/test_qa_stack_crash_pat.py
       # #5420: the Compose Wizard's generated composes keep /etc/yuzu/certs
@@ -202,6 +234,14 @@ jobs:
         run: |
           node --version
           YUZU_REQUIRE_NODE=1 python3 tests/test_compose_wizard.py
+
+      # The /swagger page's renderer runs under node against a fake DOM. The meson entry
+      # skips without node, so run it here on the hosted image and fail rather than skip
+      # if node is missing.
+      - name: Swagger page behaviour
+        run: |
+          node --version
+          YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
 
       # Changelog promote --append (#5221): folds post-promotion hotfix
       # fragments into an already-promoted release section. Stdlib only.
@@ -215,6 +255,12 @@ jobs:
       # escaping) and mutation-tests itself. Stdlib only.
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
+
+      # Gateway scrape (#5695): every shipped Prometheus config, and every
+      # compose stack that runs a Prometheus next to a gateway, scrapes the
+      # gateway's metrics port. Stdlib only.
+      - name: Gateway Prometheus scrape lint
+        run: python3 -I tests/test_gateway_prometheus_scrape.py
 
       # Release artifact gate (#5242): the expected SBOM set in
       # scripts/check-release-artifacts.sh includes the three chisel images,
@@ -395,6 +441,10 @@ jobs:
   prometheus-rules:
     name: Prometheus alert rules
     runs-on: ubuntu-24.04
+    # HISTORY - the 30 -> 45 derivation for #2340 PR-4, kept for its method.
+    # Every figure in it (480s per gate, ~1185s for step 1, ~915s for step 2,
+    # ~2100s, 45 minutes / 2700s, ~1.29x) is superseded by the 45 -> 55
+    # paragraph below, which holds the CURRENT numbers.
     # 30 -> 45 for #2340 PR-4: marker-extraction added a SECOND full gate()
     # to step 1 (the shipped RULES/TESTS pair, then the extracted
     # yuzu-guardian-journal group - CH-2 + CH-5-PROM), each up to 4x120s
@@ -416,12 +466,20 @@ jobs:
     # margin matching the prior 1800/1410 ratio. Sizing to the TYPICAL
     # combined runtime measured locally is what the original 10->15 bump did,
     # and is exactly the gap that let step 2 ship with a per-call ceiling the
-    # job budget could not actually survive. A THIRD sweep scenario grows
-    # step 2 by another ~360s, or a THIRD gate on step 1 adds another ~480s:
-    # re-derive this number in that PR, don't inherit it (see the warning
-    # next to `SCENARIO_ALERTS` in `blind_band_sweep.py`, and
-    # run_promtool_tests.py's own pull_with_retry() comment).
-    timeout-minutes: 45
+    # job budget could not actually survive. (End of the history paragraph.)
+    # 45 -> 55 for #7191: the two `promtool test rules` calls per gate went
+    # from 120s to 240s (one of four shards intermittently ran past 120s), so a
+    # gate is 120 + 240 + 240 + 120 = 720s and step 1 is now ~1665s worst case
+    # (225 + 720x2). Step 2 is unchanged at ~945s: the 195s pull ladder, the
+    # 30s daemon probe and 720s of sweep (the ~915s above left the probe out).
+    # Sum ~2610s (43.5 min); 55 minutes (3300s) leaves ~690s, a ~1.26x margin,
+    # close to the ~1.29x the 45-minute value kept over the earlier sum.
+    # A THIRD sweep scenario grows step 2 by another ~360s, or a THIRD gate on
+    # step 1 adds another ~720s: re-derive this number in that PR, don't
+    # inherit it (see the warning next to `SCENARIO_ALERTS` in
+    # `blind_band_sweep.py`, and run_promtool_tests.py's own pull_with_retry()
+    # comment). Re-derive it too if a call limit changes again.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

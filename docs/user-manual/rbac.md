@@ -44,7 +44,7 @@ Recommended order for a fresh install:
 > visibility has at least one management-group role assignment. With RBAC
 > **disabled**, all authenticated users see the full enrolled fleet. Turning RBAC
 > **on** immediately applies role-scoped visibility — a user without a
-> management-group role assignment will see **no agents** (including on the TAR
+> management-group role assignment will see **no agents** (including on the Echo
 > fleet scan), and the role-grant endpoints themselves require an existing group
 > role, which can be a chicken-and-egg lockout. The broadest grant is an
 > `ITServiceOwner` role on the root "All Devices" group; see
@@ -98,12 +98,13 @@ Recommended order for a fresh install:
 > prior "corrupt `rbac.db` fails open" behavior); watch the
 > `yuzu_server_rbac_read_degrade_total` metric. In that degraded state, device
 > visibility falls back to the role-scoped path for every caller, so agents stop
-> appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
+> appearing in the dashboard list, `/api/agents`, and Echo fleet scans rather than
 > the whole fleet being exposed. **The same fail-closed posture covers MOST
 > response/execution readers (#1634):** `query_responses`, `aggregate_responses`,
-> `GET /api/v1/executions/{id}/visualization`, and the legacy `GET /api/responses/{id}`
+> and the legacy `GET /api/responses/{id}`
 > / `/aggregate` / `/export` surfaces return **zero rows** (the legacy aggregate
-> returns `503`) on a corrupt store rather than reopening the cross-operator
+> returns `503`), and `GET /api/v1/executions/{id}/visualization` answers `503`,
+> on a corrupt store rather than reopening the cross-operator
 > fleet-wide read.
 >
 > **The dashboard's facet/scope surfaces are covered too, on a narrower anchor
@@ -111,18 +112,23 @@ Recommended order for a fresh install:
 > **):** `GET /fragments/results/filter-bar` (facet dropdown values + line
 > counts) and `GET /fragments/create-group-form` (matching-agent count) scope
 > their aggregate queries in SQL against the caller's `Response:Read`-visible
-> agent set. `POST /api/dashboard/group-from-results` fetches its matching id
+> agent set (for the form's count with a Search term, in the server after the read,
+> as the POST does). `POST /api/dashboard/group-from-results` fetches its matching id
 > list unscoped, then intersects it in C++ against that same visible set
 > before materialising group membership, audits any ids the intersection
 > drops, and — if every id is dropped — returns the same "no agents match"
 > response as a genuine no-match (the caller cannot tell a filtered result
 > from an empty one). All three resolve the visible set via
 > `RbacStore::visible_agents_for_permission` (deny-aware, management-group
-> hierarchy expanded, permission-specific to `Response:Read`).
+> hierarchy expanded, permission-specific to `Response:Read`). A request that
+> carries a Search term (the results page's free-text box, `q`) also needs
+> `Response:Read`, the same admission the results table uses, because it matches
+> stored output content; filters alone need only `ManagementGroup:Write`.
 >
 > A degraded **management-group** store fails **closed** here too: an
-> empty visible set makes the two GETs return success-empty without the
-> query ever reaching the response store, and makes `group-from-results`
+> empty visible set makes the two GETs return success-empty (for a
+> filters-only request without the query reaching the response store; a Search
+> term is matched first and the result then scoped to empty), and makes `group-from-results`
 > report "no agents match." A degraded **RBAC** store behaves differently —
 > it never reaches this scoping at all, because each route's own flat
 > admission gate (below) denies with `403` first, the same as any other
@@ -130,7 +136,24 @@ Recommended order for a fresh install:
 > existing rendering instead — a disabled "unavailable" dropdown on the
 > filter bar, "agent count unavailable (store degraded)" on the
 > create-group form, and `503` from `group-from-results` — since that
-> failure is orthogonal to agent visibility.
+> failure is orthogonal to agent visibility. Separately, when the server cannot determine
+> whether the caller may read Forensics-tier rows (#4990), `group-from-results` creates nothing and
+> answers `200`; the operator sees a constant error toast ("The permission check for this action
+> could not be completed. Nothing was created. Retry shortly."), delivered in an `HX-Trigger`
+> `showToast` header because the create-group form swaps no response body into the page (the response
+> body carries the same text for every caller, but htmx does not display it for this form). The store-degraded case above answers `503`
+> with its own error toast ("Agent count unavailable. The response store could not be read. Nothing
+> was created. Retry shortly.") on the same channel, and also creates nothing.
+> When the `group.create_from_results` `attempted` audit row cannot be stored (#3619, ADR-0033
+> §9: the row is written after every check above and before the group is created),
+> `group-from-results` answers `503` with `Sec-Audit-Failed: true` and the toast "The audit record
+> could not be stored. Nothing was created. Retry once the audit store recovers.", and creates
+> nothing. Because that write can wait on the audit store, the session, `ManagementGroup:Write`
+> and the visible agent set are decided again after it: a session that is gone answers `401`, a
+> withdrawn `ManagementGroup:Write` grant the permission gate's refusal (normally `403`),
+> and a visible set that no longer holds any matched
+> agent the `422` above; each creates nothing and records `group.create_from_results` `failure`
+> (`session_revoked`, `permission_revoked name=<group name>`, `scope_revoked`).
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat
@@ -309,15 +332,15 @@ admitted; the floor never overrides a live RBAC grant.)
 |---|---|
 | `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*`, and the lighter-weight live grant-table listing `GET /api/v1/rbac/roles/assignments` (+ MCP `list_rbac_role_assignments`) — same securable, same sensitivity class, not a management-group-confined view |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
-| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
+| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools, and the two dashboard views over the same list: the Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) and the principal panels of the Access **Tokens and principals** page. The Settings panel decides on the same permission test as the REST route: with RBAC on, an account administrator without the grant is refused (the panel says so) and a non-administrator who holds it, such as a `Viewer`, is admitted, although the `/settings` page itself stays administrator-only. It differs from the route in the ways listed once in [upgrading](upgrading.md), none of which admits a caller the route refuses. The panel's `200` responses (the roster and its in-page notes) are sent with `Cache-Control: no-store, private` and `Vary: Cookie`, and the `403` it sends an engine session or an MCP-tier token with `Cache-Control: no-store`; the REST route sends neither header (not one of the listed differences, which cover permission, refusal, store-failure and audit). |
 | `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` (service-scoped tokens are refused with `403` on both: the `ITServiceOwner` ceiling does not hold this pair) |
 | `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
 | `TlsConfig:Read` (#4028) | TLS settings read-twins, `GET /api/v1/settings/tls` and `GET /api/v1/settings/https` |
 | `PluginSigning:Read` (#4028) | Plugin trust-bundle distribution, `GET /api/v2/agent/plugin-policy` (#4144 — there is deliberately no `/api/v1/settings/plugin-signing` route; the v1 predecessor stayed on `require_admin`) |
 | `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
-| `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2), per-app privacy-permission grants and per-account SSH access (`remote_access_audit`) |
-| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource |
+| `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2), per-app privacy-permission grants and per-account SSH access (`remote_access_audit`); also the stored responses of those Forensics-tier plugins on every response read path (REST, MCP, dashboard), which are served only to a caller holding it |
+| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource; and the dashboard views that quote the audit trail's text, including the revoke Detail of the Settings **Engine Principals** panel, the revocation detail of the Access **Tokens and principals** page, the Access audit log and sample fragments (`/fragments/access/audit/log`, `/fragments/access/audit/sample`) and the Dashboard activity panel (`/fragments/dashboard/activity`, which first requires the Administrator account role and then the grant) |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
@@ -492,12 +515,18 @@ Settings uses, so the two stay equivalent.
   with the number of grants on record (before the 2000-row display cap), exactly as the REST call
   does; if that row cannot be saved the panel is still drawn and the response carries
   `Sec-Audit-Failed`. A grant table that cannot be read is a red message, never an empty table.
-- **Assign and remove a role.** On an administrator account the panel offers **Assign role** (a
-  username and one of the six fleet-wide roles; ITServiceOwner needs a management group and is not
+- **Assign and remove a role.** For a caller the server would admit, the panel offers **Assign role** (a
+  username and one of the seven fleet-wide roles; ITServiceOwner needs a management group and is not
   offered; the account does not have to exist yet) and **Remove** on a grant. These call
   `POST` and `DELETE /api/v1/rbac/roles/{name}/assignments`, which need a durable Administrator
-  and a fresh MFA check; the page only shows or hides the controls from your account role, and the
-  server's refusal (last administrator, your own Administrator grant, the enforcement-regime
+  and a fresh MFA check. Whether the controls are drawn is decided by the same check those routes
+  apply (the durable-Administrator rule, then the enforcement-regime check), asked again every time
+  the panel loads, not by your account role: with enforcement on, an account whose role is `user`
+  but which holds the Administrator grant is offered the controls, and an account administrator
+  without the grant is not. If that check cannot be answered (a store is unavailable) the **Assign role**
+  button is drawn disabled with "Your administrator authority could not be confirmed. Reload to try
+  again." rather than hidden, and the per-row **Remove** controls are left out. The drawn controls are a hint only: every click is checked again by the
+  server, and its refusal (last administrator, your own Administrator grant, the enforcement-regime
   guard) is shown as it came. Only a plain local username can be removed here; a group, SSO or
   engine grant reads "Not removable here". After a server error the panel reloads, because the
   change may have taken effect. The change can take a moment to appear on other servers.
@@ -511,14 +540,57 @@ Settings uses, so the two stay equivalent.
   persist, the page says so and waits for you to choose to continue instead of redirecting at once.
   "Sign out all other sessions" is shown as not available yet.
 - **Turning enforcement on or off.** The **RBAC enforcement** panel shows the current setting to
-  every signed-in user (the same value `GET /api/v1/me` reports) and gives an administrator
-  account an **Enforce roles** switch. The switch always shows what the server holds: clicking it
+  every signed-in user (the cached view that `GET /api/v1/me` reports as `rbac_enabled`, plus an unconfirmed state that `/me` cannot show) and gives a durable
+  Administrator (the same check as above) an **Enforce roles** switch. For anyone else the switch is disabled with
+  "Only a durable Administrator can change this."; when the authority check cannot be answered it is disabled
+  with "Your administrator authority could not be confirmed. Reload to try again." The switch always shows what the server holds: clicking it
   asks for confirmation, then (when your second-factor check is stale) for an MFA code, and then the panel is redrawn from the server, so a
   cancelled confirmation or a refusal leaves it where it was. The server's refusals (you would
   not remain an administrator, or the source regime does not recognise you) are shown with their
   remediation text. When the server cannot confirm the setting the panel says **Unconfirmed**
   instead of On or Off; it treats enforcement as on until it can. See "Enabling RBAC" for the
-  lockout guards.
+  lockout guards. An administrator who signs in through single sign-on always sees the switch
+  disabled: the controls need a local account that holds the `Administrator` grant (see
+  "SSO-only fleets" under Enabling RBAC). After **Assign role** or **Remove** only the Role
+  assignments panel reloads, so the switch can lag (for example after you grant yourself
+  `Administrator`): reload the page once.
+- **Why is a control disabled or missing?** The Assign role button, the per-row Remove controls
+  and the Enforce roles switch are drawn from the server's own check, so the cause is one of
+  these:
+  1. Enforcement is off. The `Administrator` grant is inert while it is off; the account must be
+     an active local administrator account (the check reads the RBAC store for the regime and
+     the authentication database for the account). The RBAC enforcement panel shows which
+     regime applies; `rbac_enabled` in `GET /api/v1/me` is the server's cached view of the
+     switch, can lag a change, and does not report the could-not-confirm state.
+  2. Enforcement is on and the account does not hold the fleet-wide `Administrator` grant, as
+     with an account administrator created after RBAC was enabled. Another Administrator assigns
+     it. The affected account often cannot read the Role assignments panel itself (it needs
+     `AccessReview:Read`), so another Administrator has to check its grants there or in the
+     access-review export.
+  3. The session is not a local account with an active row. SSO administrators, MCP-tier and
+     service-scoped tokens and engine credentials are never offered the controls, and JIT
+     elevation does not count. An account whose role is `user` that holds the grant sees the
+     controls but still reads "not available to your account" on the Users and Account panels,
+     which need the `Administrator` account role.
+  4. The controls are disabled with "Your administrator authority could not be confirmed.
+     Reload to try again.": a store behind the check did not answer. Both stores matter in
+     both regimes: with enforcement on the check reads your grants from the RBAC store, with
+     enforcement off it reads your account from the authentication database. For an admitted
+     caller a second check then reads the enforcement flag from the RBAC store and, with
+     enforcement on, the `Administrator` grants joined to the active local accounts (RBAC and
+     authentication tables together), or, with enforcement off, the active local administrator
+     accounts only, with no grant read. So an outage of either store produces it in either
+     regime. Check the pool alerts first (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`;
+     `/readyz` stays green under pure pool saturation), then the `YuzuRbacReadDegraded`
+     alert and `yuzu_server_rbac_read_degrade_total`. The hint's own reads (the grants, the regime check
+     and the account read) log no warning and may not move that counter, so a flat counter and
+     a quiet log do not mean the stores are healthy; only other reads that coincide with the
+     outage, such as `RbacStore` warnings from unrelated requests, warn.
+  5. The switch is live but the server answers `409` with a remediation. The hint decides who
+     may attempt the change, not whether it would leave you an administrator: with enforcement
+     off, a local administrator with no `Administrator` grant turning enforcement on ("assign
+     yourself Administrator first"), and with enforcement on, a `user`-role account holding the
+     grant turning it off. Nothing changes; follow the remediation text.
 - **Checking your own permission.** **Check your own permission** asks the server whether your
   role grants an area and operation (for example `UserManagement` and `Read`). It checks role
   grants only; while enforcement is off access follows your account role, so Denied does not by
@@ -539,6 +611,36 @@ Settings uses, so the two stay equivalent.
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".
 
+## Managing groups from the dashboard
+
+The **Groups and enrolment** page (`/groups`, in the **Estate** section of the sidebar) reads the
+management-group tree, one group's details and its members. These three panels are read-only.
+Creating, changing and deleting groups stays in Settings and the REST API. The roles held on a
+group are not on this page yet.
+
+- **Groups list and details** need the `ManagementGroup:Read` permission, the same check as
+  `GET /api/v1/management-groups`. Every holder sees every group's name, type and member count.
+- **Members** go through the fleet-read check (ADR-0017). A caller whose visibility is narrowed
+  to some management groups sees only the members inside that visibility. The panel says "Only
+  members within your scope are shown." and counts only the rows it shows; it never reveals how
+  many were left out.
+- **A refused panel** says it is not available to the account. It does not break the others.
+
+What each kind of caller sees (RBAC enforcement off is the default install):
+
+| Caller | Groups list and details | Members |
+|---|---|---|
+| Administrator, or a session elevated to it | Yes | All |
+| Legacy `user` account, RBAC enforcement off | Yes | All |
+| Viewer, RBAC on | Yes | Those in their scope |
+| `ITServiceOwner` on the root group (global) | Yes | Those in their scope |
+| `ITServiceOwner` on one group only | No (`403`) | Those in their scope if the fragment is called directly; the page cannot reach it because the list is refused |
+| Operator scoped to a group | No (`403`): Operator holds no `ManagementGroup` permission | Not reachable |
+| Service-scoped API token, RBAC on | No (`403`) | Those within the token's service scope |
+
+A page of "not available" notes is therefore the honest result for an operator who is scoped to a
+group and holds no global `ManagementGroup:Read`: the page cannot offer a "my groups" view.
+
 ## Concepts
 
 | Concept | Description |
@@ -552,7 +654,7 @@ Settings uses, so the two stay equivalent.
 
 ## System Roles
 
-Seven roles are created automatically and cannot be deleted:
+Eight roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
@@ -562,7 +664,22 @@ Seven roles are created automatically and cannot be deleted:
 | **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
 | **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes 20 of the 38 securable types, including UserManagement, Security, ApiToken, AccessReview and EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 24 securable types (24 permissions) — an explicit allow-list in `rbac_store.cpp`'s seed, *not* “everything except” | Helpdesk staff, auditors, read-only dashboards |
-| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant |
+| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant. A reviewer cannot decide a `user` grant held under their own username, or an engine principal they owned when the campaign opened, and a recorded decision is final. Group grants, a person's other accounts and later ownership changes are not checked, and the control needs at least two people able to attest (see `docs/auth-architecture.md` "Periodic access reviews", Known limits) |
+| **ForensicsAnalyst** | Read on Forensics, Response, Execution and Inventory (4 permissions). No Execute and no write of any kind | Read-only analysts of Forensics-tier response rows. Fleet-wide assignable only; cannot dispatch; not part of any other role |
+
+### The ForensicsAnalyst role
+
+`ForensicsAnalyst` is the delegable read tier for the stored rows of Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), which only a caller holding `Forensics:Read` is served (see the `Forensics` and `Response` rows under "Securable Types"). Without it, the only built-in holder of `Forensics:Read` is `Administrator`, so there would be no way to give an analyst these rows short of administrator rights or writing the grants by hand in PostgreSQL.
+
+- **Read-only.** Exactly four permissions: `Forensics:Read`, `Response:Read`, `Execution:Read` and `Inventory:Read`. It holds no `Execute` and no write of any kind, so it cannot dispatch a command, and it is part of no other role.
+- **Fleet-wide assignment only.** Assign it with `POST /api/v1/rbac/roles/ForensicsAnalyst/assignments`, the MCP `assign_rbac_role` tool or the **Assign role** control on the Users and roles page (see "Fleet-Wide Role Assignment" below). Assigning it at management-group scope is not offered: the scoped assignment routes accept only `Operator` and `Viewer`.
+- **Not for engine principals.** It is a built-in (system) role, and the engine-principal assignment gate refuses a built-in role, so an engine principal cannot be given the seeded role. The one exception is a hand-made non-system role of the same name (see "Created at server start" below), which the gate does not recognize as built-in.
+- **Inert while RBAC enforcement is off.** The legacy permission fallback is unchanged and `Forensics:Read` stays administrator-only until enforcement is on; a stored assignment is neither erased nor honored in that state, and takes effect again when enforcement is switched back on. See "Enabling RBAC".
+- **Breadth: assign it as a high-sensitivity read role.** `Response:Read` is fleet-wide and covers the stored responses of every plugin, including the usage-class `device.live.*` results (process tree, active connections, logged-in users, DNS resolver cache), and `Inventory:Read` reaches the device configuration-item inventory (serial number, system UUID, MAC addresses) fleet-wide. These are the minimum the tier needs to interpret a forensic row, and the `Viewer` role already holds both (and `Execution:Read`), so over a `Viewer` the role adds only `Forensics:Read`; but an analyst can read all of it, so include the role in access reviews as such.
+- **Collection stays approval-gated.** The role lets its holder read what was collected; it does not let them collect. A user holding `Operator` plus `ForensicsAnalyst` passes the permission step of a Forensics-plugin dispatch, but the dispatch is still `AdminOrApproval`: a caller who is not an effective administrator needs an approval ticket. A user holding only `ForensicsAnalyst` cannot dispatch at all: `POST /api/command` refuses with `403` at the `Execution:Execute` gate, and on the MCP `execute_instruction` tool at the supervised tier the approval step runs before the tool's own permission check, so an approval ticket can be spent by a call that is then refused for the same reason (an ordering that already applied to any caller lacking `Execution:Execute`).
+- **API tokens.** A token carries its creator's authority. A plain API token and an MCP-tier token (a read is permitted at every tier) created by a global `Forensics:Read` holder carry that global read. A service-scoped token never carries it, even when its creator holds the role. There is no management-group scoped read tier: only a global `Forensics:Read` admits Forensics rows, whichever kind of caller asks, and a `Forensics:Read` grant scoped to a management group (which can only be written by hand in PostgreSQL, an unsupported route that does not pass through the server and so is not recorded in the in-product audit log or covered by the guards on the assignment routes) reads nothing from the stored-response surfaces. The one other consumer of such a grant is the per-device application-usage read (`GET /api/v1/forensics/agents/{id}/app-usage` and MCP `get_agent_app_usage`), a different data set with its own per-device scoped gate that still honors a group-scoped `Forensics:Read` for devices in the group. The scoped assignment routes accept only `Operator` and `Viewer`, and engine principals cannot hold a scoped assignment. No role that can be assigned at management-group scope, and not `ITServiceOwner`, holds `Forensics:Read` (a unit test pins this); adding a scoped tier would need a production authoring path, a fresh review and end-to-end tests. A token or MCP caller without a global `Forensics:Read` also leaves one `auth.permission_required` denied audit row per read of stored responses; an interactive browser sign-in does not.
+- **Per plugin, not per kind of data.** The role unlocks the stored rows of the five Forensics-tier plugins only. Other plugins can return comparable information (file, registry, WMI or event-log reads, for example) under their own securables, and their stored rows stay under `Response:Read`.
+- **Created at server start.** The role is created by the idempotent seed pass that runs at every server start, with no migration, and is assigned to nobody. If a role named `ForensicsAnalyst` that is not a built-in role already exists (it can only have been created by hand in PostgreSQL), it is kept as it is, the four grants are NOT added to it (so its existing holders gain no `Forensics:Read`), and the server logs one error naming the role at start-up; the built-in role is then unavailable until the hand-made role is removed and the server restarted. To find it, list the roles (`GET /api/v1/rbac/roles`) and look for `ForensicsAnalyst` with `is_system` false, and its holders with `GET /api/v1/rbac/roles/assignments`. While the collision exists, assigning `ForensicsAnalyst` through `POST /api/v1/rbac/roles/ForensicsAnalyst/assignments` or `assign_rbac_role` is refused as a name collision (409 on REST, an invalid-params error on MCP, audited). There is no product route to remove a role, so the remedy is direct SQL on the `rbac_store` schema, which is unsupported and not audited: create a replacement role under another name first if its holders need one, then `DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst' AND NOT is_system`, which also removes the role's grants and assignments (they reference the role by name with `ON DELETE CASCADE`, and a role with grants cannot be renamed); a hand `DELETE` does not bump the RBAC generation, so restart every serving replica afterwards. If the seed's role check cannot be completed at start-up, the four grants are withheld for that boot and added at the next one (an error is logged). Grants an earlier build already merged into such a role are not removed. Because that role is not a built-in role, the engine-principal bar above does not apply to it, so review its assignments and grants.
 
 ## Securable Types
 
@@ -573,7 +690,7 @@ Seven roles are created automatically and cannot be deleted:
 | `InstructionDefinition` | YAML-defined instruction templates |
 | `InstructionSet` | Grouped collections of instructions |
 | `Execution` | Running or completed instruction instances |
-| `Response` | Instruction response data |
+| `Response` | Instruction response data (rows written by Forensics-tier plugins additionally need `Forensics:Read`) |
 | `Schedule` | Cron-style recurring instruction schedules |
 | `Approval` | Approval workflow entries |
 | `ManagementGroup` | Hierarchical device groups |
@@ -589,8 +706,8 @@ Seven roles are created automatically and cannot be deleted:
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
-| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Administrator-only by default (absent from the Viewer read-list; the stored results follow `Response:Read`); every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
-| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (seven per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, and the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`) in one grant, replacing a hand-maintained per-store conjunction. |
+| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Held by default by Administrator and by the read-only `ForensicsAnalyst` role (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
+| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (eight per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`, and the fleet certificate inventory, whose own read securable arrives with the certificate read surface) in one grant, replacing a hand-maintained per-store conjunction. |
 | `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
 | `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
 | `Workflow` | Multi-step workflow definitions and executions |
@@ -609,9 +726,9 @@ Seven roles are created automatically and cannot be deleted:
 
 ### Not RBAC-gated: per-operator result sets
 
-Result sets (scope-walking capability §30, `docs/scope-walking-design.md`) are **ownership-scoped, not RBAC-gated** — the RBAC toggle above has no effect on them, whether it is on or off. This is a deliberate phase-1 design (design §4.1), not an oversight, and it is unaffected by [#5047](https://github.com/Tr3kkR/Yuzu/issues/5047)'s fix below.
+Result sets (scope-walking capability §30, `docs/scope-walking-design.md`) are **ownership-scoped, not RBAC-gated** — the RBAC toggle above has no effect on them, whether it is on or off, except the members read (see below), which is also gated on `Infrastructure:Read` when RBAC is enforced. This is a deliberate phase-1 design (design §4.1), not an oversight, and it is unaffected by [#5047](https://github.com/Tr3kkR/Yuzu/issues/5047)'s fix below.
 
-The 8 routes/tools in this family authorize purely on `owner_principal == session.username`:
+The 8 routes/tools in this family authorize on `owner_principal == session.username`, with one exception: the members read (`GET /api/v1/result-sets/{id}/members`, `get_result_set_members`) also needs `Infrastructure:Read`, which under RBAC enforcement, of the built-in roles, only `Administrator` and `ITServiceOwner` hold (a custom role can be granted it):
 
 | REST | MCP tool | Dashboard fragment |
 |---|---|---|
@@ -624,15 +741,15 @@ The 8 routes/tools in this family authorize purely on `owner_principal == sessio
 | `POST /api/v1/result-sets/{id}/unpin` | `unpin_result_set` | `POST /fragments/result-sets/{id}/unpin` |
 | `DELETE /api/v1/result-sets/{id}` | `delete_result_set` | `POST /fragments/result-sets/{id}/delete` |
 
-`ResultSet` appearing as a `target_type` in audit rows, and the `Infrastructure:Write`/`Infrastructure:Delete` labels the 4 write tools (`create_result_set`/`pin_result_set`/`unpin_result_set`/`delete_result_set`) carry internally — the other 4 tools in the table above carry `Infrastructure:Read`, unaffected by any of this — are **not** a real RBAC securable or grant — they are borrowed labels used only to bucket the tools into the MCP tier/approval belt below (see "MCP tier/approval belt" below); naming them as a `.permission` an operator could self-remediate with would be a false claim, so the 403 body for a denial on this surface never does.
+`ResultSet` appearing as a `target_type` in audit rows, and the `Infrastructure:Write`/`Infrastructure:Delete` labels the 4 write tools (`create_result_set`/`pin_result_set`/`unpin_result_set`/`delete_result_set`) carry internally — the other 4 tools in the table above carry the label `Infrastructure:Read`; for list, get and lineage it is tier-bucketing only, and for `get_result_set_members` it is also a real check (see above) — are **not** a real RBAC securable or grant — they are borrowed labels used only to bucket the tools into the MCP tier/approval belt below (see "MCP tier/approval belt" below); naming them as a `.permission` an operator could self-remediate with would be a false claim, so the 403 body for a denial on this surface never does.
 
 **No admin override.** `ResultSetStore::delete_set`/`pin`/`unpin` take only an id — there is no admin-bypass parameter, and every caller (REST's `load_owned`, MCP's `rs_load_owned`, the dashboard fragments' `rs_get_owned`) runs the ownership check before calling any of them. The one owner-blind path is `gc_sweep()`, the background TTL reaper — not an operator-triggered action, and it never deletes a pinned set.
 
-**MCP tier/approval belt (added by #5047).** Ownership is the primary — and, for an untiered caller, only — gate on this surface. But the 4 write operations (create/pin/unpin/delete) also carry the same MCP tier/approval enforcement every RBAC-gated route gets (`AuthRoutes::require_tier_policy`, extracted from `require_permission`): a `readonly`-tier bearer cannot reach any of them, an `operator`-tier bearer cannot reach any of them (`Infrastructure:Write`/`:Delete` are not on `tier_allows()`'s operator allow-list), and a `supervised`-tier bearer's `delete` requires an approval ticket (`Infrastructure:Delete` is on `requires_approval()`'s list; create/pin/unpin are not). Before #5047 this belt applied on the MCP transport only — a tiered bearer could reach the identical REST/dashboard-fragment route and skip it entirely, since these routes have no `perm_fn`/RBAC gate to carry the belt. #5047 wires the belt into all 8 write sites (4 REST + 4 fragments) so a token cannot bypass its tier by switching endpoints (#520), matching MCP's own C8 chokepoint exactly. This belt is **not** RBAC — an empty-tier caller (a plain cookie session, or an API token minted with no `mcp_tier`) is untouched by it either way, which is the separate, already-tracked, open design question [#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) tracks, not this fix.
+**MCP tier/approval belt (added by #5047).** Ownership is the primary — and, for an untiered caller, with the single exception of the members read, only — gate on this surface. But the 4 write operations (create/pin/unpin/delete) also carry the same MCP tier/approval enforcement every RBAC-gated route gets (`AuthRoutes::require_tier_policy`, extracted from `require_permission`): a `readonly`-tier bearer cannot reach any of them, an `operator`-tier bearer cannot reach any of them (`Infrastructure:Write`/`:Delete` are not on `tier_allows()`'s operator allow-list), and a `supervised`-tier bearer's `delete` requires an approval ticket (`Infrastructure:Delete` is on `requires_approval()`'s list; create/pin/unpin are not). Before #5047 this belt applied on the MCP transport only — a tiered bearer could reach the identical REST/dashboard-fragment route and skip it entirely, since these routes have no `perm_fn`/RBAC gate to carry the belt. #5047 wires the belt into all 8 write sites (4 REST + 4 fragments) so a token cannot bypass its tier by switching endpoints (#520), matching MCP's own C8 chokepoint exactly. This belt is **not** RBAC — an empty-tier caller (a plain cookie session, or an API token minted with no `mcp_tier`) is untouched by it on REST and the dashboard fragments. On MCP that caller class no longer exists: since [#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) `/mcp/v1/` refuses any credential with no MCP tier, so the belt is complete on the MCP transport.
 
-**The producers ARE RBAC-gated.** The routes/tools that reach into fleet data to *mint* a result set are a different surface, with real securables: `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, and `reevaluate_result_set` all gate on `Execution:Execute` with the caller's confined dispatch-visible set (ADR-0033 §2); `create_result_set_from_inventory_query` gates on `Inventory:Read` via the ADR-0017 admit-and-confine fleet-read chokepoint (its MCP `kToolSecurity` row is labelled `Inventory:Write`, but that is tier-bucketing only — the actual RBAC check is `Inventory:Read`, matching its REST twin). None of these four is affected by the ownership-only posture above.
+**The producers ARE RBAC-gated.** The routes/tools that reach into fleet data to *mint* a result set are a different surface, with real securables: `create_result_set_from_echo_query`, `create_result_set_from_instruction_result`, and `reevaluate_result_set` all gate on `Execution:Execute` with the caller's confined dispatch-visible set (ADR-0033 §2); `create_result_set_from_inventory_query` gates on `Inventory:Read` via the ADR-0017 admit-and-confine fleet-read chokepoint (its MCP `kToolSecurity` row is labelled `Inventory:Write`, but that is tier-bucketing only — the actual RBAC check is `Inventory:Read`, matching its REST twin). None of these four is affected by the ownership-only posture above.
 
-[#1207](https://github.com/Tr3kkR/Yuzu/issues/1207) tracks giving `ResultSet` a real RBAC securable for cross-operator sharing. When it lands, ownership must remain sufficient on its own — an operator's own result sets stay theirs whether or not they hold the new securable — and the grant must be **additive** (owner **OR** grant admits, never owner **AND** grant), so it only ever *widens* who can reach a set, never narrows an owner's own access. Sharing must be its own distinct, separately-gated operation, not a side effect of a broader grant. It must also cover the scope-expression resolver — the `from_result_set:<id>` evaluation path a shared set's grantee needs to actually *target* it (dispatch/policy/TAR scope evaluation, a code surface distinct from the CRUD routes: `scope_engine.cpp`, `scope_yaml.cpp`, `dispatch_scope_ladder.hpp`) — in addition to all three CRUD surfaces above (REST, MCP, and the 6 dashboard fragments); the CRUD surfaces alone let a grantee *see* a shared set without letting them *use* it in a scope.
+[#1207](https://github.com/Tr3kkR/Yuzu/issues/1207) tracks giving `ResultSet` a real RBAC securable for cross-operator sharing. When it lands, ownership must remain sufficient on its own — an operator's own result sets stay theirs whether or not they hold the new securable — and the grant must be **additive** (owner **OR** grant admits, never owner **AND** grant), so it only ever *widens* who can reach a set, never narrows an owner's own access. Sharing must be its own distinct, separately-gated operation, not a side effect of a broader grant. It must also cover the scope-expression resolver — the `from_result_set:<id>` evaluation path a shared set's grantee needs to actually *target* it (dispatch/policy/Echo scope evaluation, a code surface distinct from the CRUD routes: `scope_engine.cpp`, `scope_yaml.cpp`, `dispatch_scope_ladder.hpp`) — in addition to all three CRUD surfaces above (REST, MCP, and the 6 dashboard fragments); the CRUD surfaces alone let a grantee *see* a shared set without letting them *use* it in a scope.
 
 ## Operations
 
@@ -642,9 +759,9 @@ The 8 routes/tools in this family authorize purely on `owner_principal == sessio
 | `Write` | Create or modify a resource |
 | `Delete` | Remove a resource |
 | `Execute` | Run an instruction against devices |
-| `Approve` | Approve or reject a pending approval request. Holding `Approval:Approve` is necessary but not sufficient: the reviewer must also be on an interactive cookie session (local or OIDC) with a fresh MFA step-up, and must not be an API-token, MCP-token or engine session, nor a SAML session while step-up is on (see `instructions.md`, "Who can approve"). The step-up gate can only ask for a factor the account has, so it passes without a second factor in three cases: a local account with no enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and `admin-only` for admins, make login force enrolment, so in practice this is any account under `optional` and a non-admin under `admin-only`); an OIDC session whose identity provider asserted no `amr` proof, unless `--mfa-enforcement=required` (under `admin-only` it still passes for a non-admin role); and any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the OIDC case only if the identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, so verify `amr` before enabling it (the way back is restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). It also makes every local user enrol at login. Requiring an enrolled factor of the approver in every mode is tracked in #6079. |
+| `Approve` | Approve or reject a pending approval request. Holding `Approval:Approve` is necessary but not sufficient: the reviewer must also be on an interactive cookie session (local or OIDC), must have an **enrolled MFA factor with a fresh proof** (#6079, at most 300 seconds old and tighter if `--mfa-step-up-window-secs` is set between `1` and `299`), and must not be an API-token, MCP-token or engine session, a SAML session, or the submitter (see `instructions.md`, "Who can approve", and `authentication.md`, "Approver MFA requirement"). A local account with no enrolled factor is refused `mfa_not_enrolled`; an OIDC session whose sign-in carried no MFA `amr` is refused `403` `mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not protect the role), whereas a proof older than the window gets the `401` step-up with `challenge_url=/auth/oidc/start`; a live session whose account is deleted, deactivated or has an invalid username is refused (typed `account_unavailable` only with `--mfa-step-up-window-secs=0` or when the account is removed in the middle of the request; with step-up on, the central check normally answers `401` `MFA step-up required` first). The seeded `Operator` role holds `Approval:Approve`, and a non-admin cannot enrol itself under `--mfa-enforcement=optional` or `admin-only`, so an administrator must enrol each non-admin approver first (see [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)). `--mfa-enforcement` and `--mfa-step-up-window-secs` do not weaken this (the window is `min(setting, 300)`, and 300 when the setting is `0`). |
 | `Push` | Distribute an existing rule set to scoped agents. Consumed **only** by `GuaranteedState` REST handlers and seeded **only** on `GuaranteedState` — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on `GuaranteedState` alone. |
-| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog` (see "The authorization topology floor" below). |
+| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog`; a holder cannot attest a `user` grant held under their own username or an engine principal they owned when the campaign opened, and the application refuses to change a recorded decision (the limits are listed in `docs/auth-architecture.md` "Periodic access reviews") (see "The authorization topology floor" below). |
 | `Rotate` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a human-owned API token. Consumed **only** by `ApiToken` REST/MCP handlers and seeded **only** on `ApiToken`, to the same two roles that already hold `ApiToken:Write` (`Administrator`, `ApiTokenManager`) — deliberately a separate operation from `Write` so a narrower MCP-tier allowance can be granted for rotation without also widening token-mint access. |
 
 ## Permission Resolution
@@ -775,9 +892,15 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/rbac/roles
       "description": "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)",
       "is_system": true,
       "created_at": 1710849600
+    },
+    {
+      "name": "ForensicsAnalyst",
+      "description": "Read forensic-tier response rows (Forensics:Read) plus the ordinary response, execution and inventory reads needed to interpret them; read-only, cannot dispatch (#4990)",
+      "is_system": true,
+      "created_at": 1710849600
     }
   ],
-  "pagination": { "total": 7, "start": 0, "page_size": 50 },
+  "pagination": { "total": 8, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -811,7 +934,7 @@ curl -s -b cookies.txt \
 
 Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role **creation** are planned but **not yet implemented** — there is no HTMX Settings UI fragment for this either (`settings_routes.cpp` has no RBAC role-CRUD registration). Currently, a genuinely NEW custom role can only be created directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
 
-**Assigning one of the 6 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 7th built-in role, is assignable only at management-group scope — see "Scoped Role Assignments"). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
+**Assigning one of the 7 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 8th built-in role, is assignable only at management-group scope — see "Scoped Role Assignments"). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
 
 **Planned endpoints (not yet available):**
 
@@ -823,7 +946,7 @@ Custom roles can be created programmatically via `RbacStore::create_role()` and 
 
 ### Fleet-Wide Role Assignment (Built-in Roles)
 
-An Administrator can grant or revoke one of the 6 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
+An Administrator can grant or revoke one of the 7 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`, `ForensicsAnalyst`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
 
 Changing the sign-in provider settings (`POST /api/settings/oidc`, and `PUT /api/config/{key}` for the `oidc_*` keys) needs the caller's own administrator role (the account's own legacy role must be `admin`; an RBAC Administrator grant alone does not count): a session that is administrator only through a temporary elevation is refused, because the provider decides who becomes an administrator at the next SSO login.
 
@@ -851,8 +974,8 @@ These two examples send `Origin` because a session-cookie call without a same-si
 Key constraints:
 
 - **`principal_type` must be `"user"`.** Group-scoped fleet-wide assignment is not supported yet — `rbac_store.group_members` is written solely by IdP group-sync, so a group-held grant would make the IdP the admin-authority source, a decision not made by this surface.
-- **`ITServiceOwner` is explicitly rejected**, not silently mis-assigned. Its 92-permission grant is designed around the holder being CONFINED to devices tagged with their IT Service — but that confinement is enforced entirely by `ManagementGroupStore::get_visible_agents`, which reads only the group-scoped `management_group_roles` table, never `principal_roles` (this surface's only write target). A fleet-wide `ITServiceOwner` grant would resolve unconfined/global on every type-level permission check while showing the holder zero visible devices on any per-device list read — wrong both ways. Assign `ITServiceOwner` via the management-group role route instead (see "Scoped Role Assignments" below).
-- **Only the 6 named roles above are accepted** — enforced against a closed allow-list (`rbac_assignable_roles.hpp`), not "any role that happens to exist in the store". A pre-existing custom role (`is_system=false`, creatable only via direct SQL today — `RbacStore::create_role` has no route caller) is rejected exactly like an unknown role name. An unknown/custom role name and `ITServiceOwner` all return the identical client-facing rejection message — the specific reason is recorded in the audit log only, so a caller cannot enumerate the role catalog by diffing error text.
+- **`ITServiceOwner` is explicitly rejected**, not silently mis-assigned. Its 92-permission grant is designed around the holder being CONFINED to the member devices of the management group they hold the role on (for a `Service: {name}` group, a snapshot of the devices tagged at the time the group was created) — but that confinement is enforced entirely by `ManagementGroupStore::get_visible_agents`, which reads only the group-scoped `management_group_roles` table, never `principal_roles` (this surface's only write target). A fleet-wide `ITServiceOwner` grant would resolve unconfined/global on every type-level permission check while showing the holder zero visible devices on any per-device list read — wrong both ways. Assign `ITServiceOwner` via the management-group role route instead (see "Scoped Role Assignments" below).
+- **Only the 7 named roles above are accepted** — enforced against a closed allow-list (`rbac_assignable_roles.hpp`), not "any role that happens to exist in the store". A pre-existing custom role (`is_system=false`, creatable only via direct SQL today — `RbacStore::create_role` has no route caller) is rejected exactly like an unknown role name, except that a non-system role holding the name of a built-in role is refused with a distinct `409` (REST) or invalid params (MCP) naming the collision (see "Role name collision" in the upgrade guide). An unknown/custom role name and `ITServiceOwner` all return the identical client-facing rejection message — the specific reason is recorded in the audit log only, so a caller cannot enumerate the role catalog by diffing error text.
 - **A caller may not revoke the fleet's last remaining `Administrator` grant through this surface.** The store-level guard runs inside the same transaction as the delete, so two concurrent revokes cannot both succeed and leave zero administrators. It counts only `principal_type='user'` rows that ALSO name a currently-active `auth.users` account — a grant naming a nonexistent, deactivated, or (soft-)deleted username is never treated as a survivor.
   - **A principal reactivated while an unassign is in flight is caught (Doomgoose external review, PR #4985).** The guard first locks the candidate Administrator grant rows (`FOR UPDATE OF pr`) and deliberately does not lock the candidate set of `auth.users` rows, because that would serialize unassigns against unrelated logins and role changes. A grant whose account was deactivated at that moment is therefore excluded from that snapshot and could be reactivated by an independent transaction (for example an account reactivation) before the delete runs. After the delete, in the same transaction, and only when the removed grant was not already among the counted rows, the guard re-reads the deleted principal's own `auth.users` row with `FOR UPDATE`: a reactivation that has already committed is seen, one still in flight makes the guard wait and re-read it, and one that starts later blocks until this transaction finishes. If the reactivated principal is the fleet's only real Administrator, the removal is refused. This is closed for an existing account only. One case remains outside the guard: a pre-provisioned grant whose `auth.users` row is created concurrently (there is no row to lock), tracked at #4966. Deactivating a surviving Administrator is guarded separately, takes the same grant-row locks in the same order, and is described under "Last-Administrator guard for account deactivation and demotion" below. A lock wait is bounded by the database pool's lock timeout (10 seconds by default; the pool does not inject it when the DSN sets its own `options` or `PGOPTIONS` is set, and the wait is then bounded only if that setting, or the server or role default, sets a `lock_timeout`); on timeout nothing is deleted, the REST route answers `503`, and the MCP twin answers an internal error with a retry hint.
   - **This guard covers only THIS route's own unassign path.** Deactivating or deleting an account, and demoting a local `admin` account, are guarded by a separate rule, described under "Last-Administrator guard for account deactivation and demotion" below. Neither rule proves that anyone can sign in.
@@ -914,7 +1037,7 @@ Nothing is dropped silently:
 1. **Serialization is per process.** Group mutations are serialized within one server process. When more than one server replica runs, send SCIM provisioning traffic to a single replica. `POST /Groups` does not take the per-process group lock (`PUT`, `PATCH` and `DELETE` do).
 2. **There is no reconcile, and a re-send does not reach a member who has already left the group.** A failed or refused write IS reported: the group's success row says `recompute=incomplete` and a `scim.group.recompute_incomplete` summary row names the members. But re-sending the same `PUT` or `PATCH` recomputes only the old and the current members of the group at that moment, so it re-derives skipped promotions and undetermined members that are still in the group and can never re-derive a member who has left it. A retried `DELETE` never reaches the recompute (the group is gone: `404`, or an idempotent `204`), and an identity provider's next sync sends no change for a member who is already out. For a **refused**, **failed** or **undetermined** demotion of a member who has left the group, demote the member by hand with `POST /api/settings/users/{username}/role` and `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than the member, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session (an account with MFA enrolled also needs a fresh step-up: a proof older than `--mfa-step-up-window-secs`, default 300 s, answers `401` with `meta.mfa_step_up_required`, and a fresh password plus TOTP login counts; an account with no MFA enrolled is not challenged under the default `--mfa-enforcement=optional`; a SAML session gets `403`) or an administrator API token (`Authorization: Bearer` or `X-Yuzu-Token`), which is never challenged for step-up. For a refused one, a second active local administrator account has to exist first; see "If the guard refuses an action you intend" below, which also gives the break-glass exit when no administrator session can pass step-up); a later change that names the user through another group they belong to also re-derives their role. A skipped **promotion** is the exception: a re-send of a `PUT` or `PATCH` retries it while the member is in the group, a `DELETE` never can. *Crash breadcrumb:* once a `PUT`, `PATCH` or `DELETE` has committed the membership change and either removed at least one member or renamed the group so that the admin-group match flips (the rename changes the role of every current member), the server writes ONE log line at WARN level before the first role change and flushes the log right after it: `SCIM: Group scim_id=<id> membership change committed; role recompute starting for <N> removed member(s): <ids>[,+M more]`; when the rename flips the match the line ends `; the group rename changes the admin-group match and <K> current member(s) will be recomputed`, and the removed-members part is absent if nobody was removed. WARN is written at the default log level and at `--log-level warn`, not at `error` or `off`. It names the first 20 removed members by SCIM ID (not by username: it performs no store read, so a degraded store cannot delay it) and `<N>` is the exact count; it is not written by `POST` or by a change that removed nobody and did not flip the match of a group that still has members (an add-only change writes none, and neither does a flipping rename of an empty group; a re-send recovers it), and it is also written on the idempotent already-gone path of a `DELETE`, which is reachable only through a cross-process race. Without `--log-file` the line goes to stdout (with `--log-file`, to stderr and the file); journald and container logs capture both, and only the null-logger fallback writes to stderr directly. The flush precedes the recompute, so the line survives a `SIGKILL` once written to the sink in use (a file sink may still hold a copy that was not yet written; the copy the console stream already took is not lost), but not power loss or a kernel panic (there is no fsync); a failure to write it never blocks the recompute. Crash signature, by where the process stopped: before the membership commit, nothing changed; after the commit and before the breadcrumb, no record of the removed members (these two cannot be told apart by signature: a commit whose acknowledgement was lost also leaves nothing); mid-recompute, the breadcrumb (only when members were removed or the rename flips the match; an add-only change writes none and a re-send recovers) and the per-member rows written so far, with no summary row, no `recompute=` marker and no Group success row; after the recompute and before the Group success row, the breadcrumb (when one applies), the per-member rows and any summary row, roles as the recompute left them (read the summary row), and no Group success row. A failed final read of the group after the recompute looks the same: a `PUT` then writes a failure row with an empty detail and answers `500`, and a `PATCH` writes no row. Per-member rows written before a crash persist. After any unclean restart, compare the identity provider's admin-group membership with the Yuzu roles and demote the difference. To replace the ONLY administrator, add the new administrator in one Group change and remove the old one in a second; one change that does both demotes the old administrator first, the guard refuses (no other administrator exists yet) and the old administrator has to be demoted by hand.
 3. **A large or slow request holds locks.** A Group request recomputes every affected member and can be slow on a large group or a slow store; the HTTP request and the per-process group lock (taken by `PUT`, `PATCH` and `DELETE`, not by `POST`) are held meanwhile. There is no time bound on the loop.
-4. **A failed Group `POST` leaves an empty group.** If a `POST` fails after the group row is created, the empty group remains and a retry answers `409`.
+4. **A failed Group `POST` can leave an empty group, but not for a store outage during member resolution.** A Group `POST` resolves its members before it creates the group row, so a store failure there answers `503` and creates nothing (the retry creates the group normally, `201`; there is no rollback). A `POST` that fails later, when the membership cannot be persisted (`500` `failed to persist group membership`), leaves the empty group in place and a retry answers `409` until it is removed.
 5. **A deactivate request can answer `404`.** Deactivation of an account whose role is not `user` is refused with `404` until the role is corrected.
 6. **`POST /Users` re-provision ignores the recompute result.** The revive path recomputes the one user but does not report an incomplete outcome; an undetermined result there leaves only a log line, with no audit row and no counter. The other revive paths (`PATCH` and `PUT` with `active:true`) do not recompute the group role at all, so an inactive member added to the admin group stays `user` until the next Group change (this predates the last-Administrator guard).
 7. **A deactivation whose SCIM mirror write failed is not retried to convergence.** The auth account is already deactivated, the request answers `500`, the SCIM resource still reads `active=true`, and the identity provider's retry answers `404` (the role guard finds no active account), so the mirror stays stale until it is reconciled ([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214), and the follow-up tracked in #5673). Every identity provider retry also hits the role guard: it answers `404`, writes a `scim.user.provenance_denied` audit row and increments `yuzu_scim_provenance_denied_total`, which drives the shipped `YuzuScimProvenanceDenied` alert (`increase(...[1h]) > 0`, severity warning): it fires, and stays firing while the retries continue. There is no hand remedy today (no route and no SQL statement is documented for it) until #5214 and #5673 land.
@@ -992,7 +1115,7 @@ Assign this role alongside any other roles. Because deny overrides allow, the us
 | `POST` | `/api/v1/rbac/roles` | Create a custom role | Planned |
 | `PUT` | `/api/v1/rbac/roles/{name}` | Update a role | Planned |
 | `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role | Planned |
-| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 6 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
+| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 7 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
 | `DELETE` | `/api/v1/rbac/roles/{name}/assignments/{principal_id}` | Unassign a fleet-wide role from a human user (A2) | Implemented |
 | `PUT` | `/api/v1/rbac/enforcement` | Enable or disable RBAC enforcement fleet-wide (A1) | Implemented |
 | `GET` | `/api/v1/rbac/roles/assignments` | Fleet-wide "who currently holds which role" — the complete grant table, gated `AccessReview:Read` (see the securable table below) | Implemented |

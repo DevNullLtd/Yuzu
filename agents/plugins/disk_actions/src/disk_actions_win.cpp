@@ -85,16 +85,21 @@
 #endif
 
 #include <win_str.hpp>
+#include <wmi_bounded.hpp>
 
 #include "disk_actions_legs.hpp"
 #include "disk_actions_parsers.hpp"
+#include "disk_actions_partitions.hpp"
+#include <planned_leg.hpp>
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::disk_actions {
@@ -864,6 +869,132 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         }
     }
     return 0;
+}
+
+// partitions: Win32_DiskPartition (rows) + Win32_LogicalDiskToPartition (drive letters), with a
+// Win32_LogicalDisk cross-check on those letters, all through the bounded WMI helper
+// (agents/shared/wmi_bounded.hpp). Each call has a deadline, so none can wedge the daily-sync
+// thread indefinitely (the sync-thread boundedness rule in
+// docs/adr/0016-agent-daily-sync-framework.md; the DeviceIoControl-based `volumes` leg is the one
+// still withheld there, #3925). The pure layer (disk_actions_partitions.hpp) owns the row grammar,
+// the outcome contract and the Level -> typed-status mapping; this function owns the queries,
+// applying that status, and the rule that no exception crosses the plugin ABI (the SDK trampoline
+// has no catch).
+//
+// All three classes live in root\cimv2, which grants Authenticated Users local access; the leg was
+// measured under a non-admin NT SERVICE virtual account (README: "Windows partitions").
+//
+// `topology` stays planned: no Windows source has been ruled for it.
+namespace {
+
+// classify_wmi_error_token spells wmi_bounded's stage prefixes as literals (it must stay
+// OS-header-free); pin them so a renamed prefix fails the Windows build instead of silently
+// misclassifying a stage (mirrors firmware_posture_win.cpp and app_control_win.cpp).
+static_assert(std::string_view{yuzu::shared::wmi::error_tokens::kWmiConnectFailedPrefix} ==
+                      "wmi_connect_failed_" &&
+                  std::string_view{yuzu::shared::wmi::error_tokens::kWmiQueryFailedPrefix} ==
+                      "wmi_query_failed_" &&
+                  std::string_view{yuzu::shared::wmi::error_tokens::kWmiNextFailedPrefix} ==
+                      "wmi_next_failed_",
+              "classify_wmi_error_token's stage prefixes must match wmi_bounded.hpp's error_tokens");
+
+// Larger than the device-record ceiling for the kind (192 partition rows, device_ci_kinds.hpp):
+// the writer trims to its own cap, and a host past this many partitions reports row_cap.
+constexpr std::size_t kPartitionRowCap = 256;
+
+// A handful of rows is expected, so the enumeration stage is bounded at 15 s rather than the
+// helper's 60 s (the connect stage keeps the helper's own max-wait bound; it has no millisecond
+// knob), so this is bounded, not instantaneous. Three queries run back to back on the sync thread
+// (the later two only when the earlier answered).
+constexpr std::uint64_t kPartitionEnumerationDeadlineMs = 15000;
+
+partitions::QueryOutcome run_partition_query(const wchar_t* wql) {
+    yuzu::shared::wmi::BoundedQueryOptions opts;
+    opts.row_cap = kPartitionRowCap;
+    opts.enumeration_deadline_ms = kPartitionEnumerationDeadlineMs;
+    auto r = yuzu::shared::wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql, opts);
+    partitions::QueryOutcome out;
+    out.rows = std::move(r.rows);
+    out.truncated = r.truncated;
+    out.rows_before_error = r.rows_before_error;
+    if (r.error)
+        out.error = *r.error;
+    return out;
+}
+
+/// Apply the report to the context. The typed status goes FIRST and in its own guard: if a later
+/// write throws, the result already says what kind of read this was (an UNDECLARED status would be
+/// derived as a clean success from rc 0). `wrote_any` flips once the first line is out.
+void report_partitions(yuzu::CommandContext& ctx, const partitions::Report& rep, bool& wrote_any) {
+    const partitions::TypedStatus typed = partitions::typed_status(rep.level);
+    if (typed.declare) {
+        // The typed seam transmits the short provenance token (the reason text goes to spdlog).
+        const std::string_view provenance = rep.reason.empty() ? std::string_view{"windows:partitions"}
+                                                               : std::string_view{rep.reason};
+        switch (typed.status) {
+        case YUZU_RESULT_STATUS_PERMISSION_DENIED:
+            mark_result_denied(ctx, provenance, "the partition query was refused");
+            break;
+        case YUZU_RESULT_STATUS_UNAVAILABLE:
+            mark_result_unavailable(ctx, provenance,
+                                    "WMI reports the partition class missing (a damaged repository)");
+            break;
+        default:
+            mark_result_partial(ctx, provenance);
+            break;
+        }
+    }
+    ctx.write_output(rep.status_row);
+    wrote_any = true;
+    for (const std::string& row : rep.data_rows)
+        ctx.write_output(row);
+}
+
+} // namespace
+
+int emit_partitions(yuzu::CommandContext& ctx) {
+    bool wrote_any = false;
+    try {
+        const auto parts =
+            run_partition_query(L"SELECT DeviceID, DiskIndex, Index, Size, Type FROM Win32_DiskPartition");
+        // Each later query runs only if the one before it answered: its result would not be used
+        // otherwise, and a second failing call just spends the sync thread's time. The local
+        // fixed-disk drive letters are the cross-check on the association (see build_report).
+        partitions::QueryOutcome links;
+        std::optional<partitions::QueryOutcome> disks; // nullopt = cross-check not run
+        if (parts.error.empty())
+            links = run_partition_query(L"SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition");
+        if (parts.error.empty() && links.error.empty())
+            disks = run_partition_query(L"SELECT DeviceID, DriveType FROM Win32_LogicalDisk WHERE DriveType = 3");
+        report_partitions(ctx, partitions::build_report(parts, links, disks), wrote_any);
+    } catch (...) {
+        // Reached only by an allocation failure or a bug. The section must still say it failed:
+        // an exception here would unwind through the plugin trampoline, which does not catch.
+        // The typed status FIRST and straight through the SDK (no logging before it: a formatting
+        // allocation that throws would skip it, and an UNDECLARED result with rc 0 is derived as a
+        // clean success), then the log line, then -- only if no line is out yet, so a section never
+        // carries two status rows -- the row. Each step has its own guard.
+        try {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "windows:partitions:internal_error");
+        } catch (...) {
+        }
+        try {
+            spdlog::warn("disk_actions: degraded read (windows:partitions:internal_error)");
+        } catch (...) {
+        }
+        if (!wrote_any) {
+            try {
+                ctx.write_output("status|partitions|constrained|windows:partitions:internal_error");
+            } catch (...) {
+            }
+        }
+    }
+    return 0;
+}
+
+int emit_topology(yuzu::CommandContext& ctx) {
+    return yuzu::shared::report_planned(ctx, "topology");
 }
 
 } // namespace yuzu::disk_actions

@@ -59,8 +59,21 @@ public:
         return build_dex_app_model(store_, process_name, window, since_of(window), nullptr);
     }
 
-    [[nodiscard]] DexAppsModel apps(const std::string& window) const override {
-        // The policy first: an unavailable policy answers without a fleet snapshot, and a
+    [[nodiscard]] DexAppsModel apps(const std::string& window,
+                                    const std::string& platform_scope) const override {
+        // The scope first: an unknown token fails closed, before any policy or fleet work.
+        const std::string scope = dex_normalize_apps_scope(platform_scope);
+        if (scope.empty()) {
+            DexAppsModel m;
+            m.window = window;
+            m.degraded = true;
+            m.degraded_reason = "invalid_scope";
+            // Constant text, never the caller's token; one line per interval.
+            if (refusal_warn_throttle_.should_warn("invalid_scope"))
+                spdlog::warn("DexApi::apps: platform scope refused (invalid_scope)");
+            return m;
+        }
+        // The policy next: an unavailable policy answers without a fleet snapshot, and a
         // policy read that stalls cannot leave a stale snapshot behind it.
         DexPolicyInForce in_force; // empty policy_fn_: the shipped defaults
         if (policy_fn_) {
@@ -68,7 +81,7 @@ public:
             if (!p) {
                 // One line per interval, not per request: an unreadable store would
                 // otherwise write one warning for every Apps read.
-                if (policy_warn_throttle_.should_warn("score_policy_unavailable"))
+                if (refusal_warn_throttle_.should_warn("score_policy_unavailable"))
                     spdlog::warn("DexApi::apps: score policy unavailable: {}", p.error());
                 else
                     spdlog::debug("DexApi::apps: score policy unavailable: {}", p.error());
@@ -81,17 +94,12 @@ public:
             in_force = std::move(*p);
         }
         // Absent FleetFn = unknown population (nullopt), not zero. The population
-        // is the connected Windows agents' own ids, so the store draws the share
+        // is the scope's connected agents' own ids, so the store draws the share
         // numerators from the same set it is divided by.
         std::optional<std::vector<std::string>> online;
-        if (fleet_fn_) {
-            DexFleet snapshot = fleet_fn_();
-            online.emplace();
-            for (auto& [id, os] : snapshot.connected_agents)
-                if (os == "windows")
-                    online->push_back(std::move(id));
-        }
-        return build_dex_apps_model(store_, window, since_of(window), online, in_force);
+        if (fleet_fn_)
+            online.emplace(dex_apps_online_ids(fleet_fn_(), scope));
+        return build_dex_apps_model(store_, window, since_of(window), scope, online, in_force);
     }
 
     [[nodiscard]] DexCatalogueModel catalogue(const std::string& os_filter,
@@ -166,7 +174,7 @@ private:
     GuaranteedStateStore* store_; ///< nullable — builders degrade; builder-less reads guard
     FleetFn fleet_fn_;
     DexScorePolicyFn policy_fn_;
-    mutable RefusalLogThrottle policy_warn_throttle_; ///< bounds the policy-unavailable warning
+    mutable RefusalLogThrottle refusal_warn_throttle_; ///< bounds the repeated-refusal warnings (score_policy_unavailable, invalid_scope)
 };
 
 std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn,

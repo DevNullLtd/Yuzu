@@ -290,6 +290,73 @@ TEST_CASE("error_json_a4: envelope carries remediation hint when present",
     REQUIRE(body.find(R"("remediation":"request Execution:Read")") != std::string::npos);
 }
 
+// Exact-bytes goldens for the A4 error builder. The substring cases above pin the
+// presence of fields; these pin the whole wire body, key order and the JSON string
+// escaping. error_json_a4 lives in rest_a4_envelope.cpp with its own private JSON
+// object builder (rest_api_v1.cpp and mcp_server.cpp keep theirs), so any change to
+// this builder's wire bytes must fail here.
+TEST_CASE("error_json_a4: exact wire bytes for every overload", "[events][envelope][a4][golden]") {
+    // 1. No-retry overload: retry_after_ms is ALWAYS a key (A4), null when unset;
+    //    remediation is omitted when empty.
+    CHECK(detail::error_json_a4(404, "execution not found", "req-abc-1") ==
+          R"json({"error":{"code":404,"message":"execution not found","correlation_id":"req-abc-1","retry_after_ms":null},"meta":{"api_version":"v1"}})json");
+
+    // 2. Concrete-retry overload: 5000 with a remediation hint, and 0 (a concrete
+    //    number, not "unset") with an empty remediation.
+    CHECK(detail::error_json_a4(503, "store degraded", "req-r-1", std::int64_t{5000},
+                                "retry shortly") ==
+          R"json({"error":{"code":503,"message":"store degraded","correlation_id":"req-r-1","retry_after_ms":5000,"remediation":"retry shortly"},"meta":{"api_version":"v1"}})json");
+    CHECK(detail::error_json_a4(503, "store degraded", "req-r-2", std::int64_t{0}, "") ==
+          R"json({"error":{"code":503,"message":"store degraded","correlation_id":"req-r-2","retry_after_ms":0},"meta":{"api_version":"v1"}})json");
+
+    // 3. Full A4ErrorOpts form: every optional field, in emission order.
+    detail::A4ErrorOpts full;
+    full.retry_after_ms = 250;
+    full.remediation = "ask an approver";
+    full.permission = "Execution:Execute";
+    full.approval_id = "ap-1";
+    full.status_url = "/api/v1/approvals/ap-1";
+    CHECK(detail::error_json_a4(409, "approval required", "req-o-1", full) ==
+          R"json({"error":{"code":409,"message":"approval required","correlation_id":"req-o-1","retry_after_ms":250,"remediation":"ask an approver","permission":"Execution:Execute","approval_id":"ap-1","status_url":"/api/v1/approvals/ap-1"},"meta":{"api_version":"v1"}})json");
+
+    // 3b. approval_id and status_url are independent fields: each is emitted
+    //     without the other.
+    detail::A4ErrorOpts approval_only;
+    approval_only.approval_id = "ap-2";
+    CHECK(detail::error_json_a4(409, "approval required", "req-o-3", approval_only) ==
+          R"json({"error":{"code":409,"message":"approval required","correlation_id":"req-o-3","retry_after_ms":null,"approval_id":"ap-2"},"meta":{"api_version":"v1"}})json");
+    detail::A4ErrorOpts status_only;
+    status_only.status_url = "/api/v1/approvals/ap-3";
+    CHECK(detail::error_json_a4(409, "approval required", "req-o-4", status_only) ==
+          R"json({"error":{"code":409,"message":"approval required","correlation_id":"req-o-4","retry_after_ms":null,"status_url":"/api/v1/approvals/ap-3"},"meta":{"api_version":"v1"}})json");
+
+    // 4. Only the permission specialisation set: nothing else leaks in.
+    detail::A4ErrorOpts perm_only;
+    perm_only.permission = "Execution:Read";
+    CHECK(detail::error_json_a4(403, "denied", "req-o-2", perm_only) ==
+          R"json({"error":{"code":403,"message":"denied","correlation_id":"req-o-2","retry_after_ms":null,"permission":"Execution:Read"},"meta":{"api_version":"v1"}})json");
+}
+
+TEST_CASE("error_json_a4: JSON string escaping in message, correlation id and remediation",
+          "[events][envelope][a4][golden]") {
+    // Quote, backslash, LF, a raw 0x01 control byte (-> the 6-char escape for U+0001), TAB, CR, BS, FF,
+    // then 0x1a and 0x1f (control bytes whose hex digits include a letter, which pins
+    // the lowercase `%04x` form, and the top of the < 0x20 range). 0x7f (DEL) and a
+    // UTF-8 sequence (U+00E9) are NOT escaped: they pass through as raw bytes.
+    const std::string message = std::string("q\"b\\n\n") + std::string(1, '\x01') +
+                                "t\t|\r\b\f" + std::string(1, '\x1a') +
+                                std::string(1, '\x1f') + std::string(1, '\x7f') + "\xc3\xa9";
+    // Ordinary (non-raw) literals on purpose: MSVC 14.44 rejected the raw-string form
+    // of this expectation (C2017/C3850 on its quote and control-character escapes).
+    const std::string expected =
+        std::string("{\"error\":{\"code\":400,\"message\":\"q\\\"b\\\\n\\n\\u0001t\\t|\\r\\b\\f"
+                    "\\u001a\\u001f") +
+        std::string(1, '\x7f') + "\xc3\xa9" +
+        "\",\"correlation_id\":\"c\\\"\\t1\",\"retry_after_ms\":null,\"remediation\":\"r\\n\"},"
+        "\"meta\":{\"api_version\":\"v1\"}}";
+    CHECK(detail::error_json_a4(400, message, "c\"\t1", "r\n") == expected);
+}
+
 TEST_CASE("make_correlation_id: monotonic + unique within a process", "[events][envelope][a4]") {
     auto a = detail::make_correlation_id();
     auto b = detail::make_correlation_id();
@@ -714,7 +781,7 @@ TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[pg][ev
     // documented OpenAPI surface. The text-shape check is enough — the
     // JSON parse is exercised by the OpenAPI ecosystem, not here.
     REQUIRE(res->body.find(R"("/events":)") != std::string::npos);
-    REQUIRE(res->body.find("agentic-first JSON Server-Sent Events") != std::string::npos);
+    REQUIRE(res->body.find("Authenticated JSON Server-Sent Events channel") != std::string::npos);
     REQUIRE(res->body.find("Execution:Read") != std::string::npos);
 }
 
@@ -770,9 +837,12 @@ TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
     // BLOCKING.
     REQUIRE(res->body.find(R"("ExecutionSseEvent":)") != std::string::npos);
     REQUIRE(res->body.find(R"("A4ErrorEnvelope":)") != std::string::npos);
-    REQUIRE(res->body.find(R"("$ref": "#/components/schemas/ExecutionSseEvent")") !=
+    // The served document is re-serialised compact, so compare the refs on the
+    // compact form and not on the spacing of the source literal.
+    const auto compact = nlohmann::json::parse(res->body).dump();
+    REQUIRE(compact.find(R"("$ref":"#/components/schemas/ExecutionSseEvent")") !=
             std::string::npos);
-    REQUIRE(res->body.find(R"("$ref": "#/components/schemas/A4ErrorEnvelope")") !=
+    REQUIRE(compact.find(R"("$ref":"#/components/schemas/A4ErrorEnvelope")") !=
             std::string::npos);
 }
 

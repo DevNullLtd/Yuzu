@@ -56,14 +56,14 @@ std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
 }
 
 std::optional<std::int64_t>
-group_agent_count_preview(ResponseStore* store, const std::string& command_id,
-                          const std::vector<FacetFilter>& filters,
+group_agent_count_preview(ResponseStore* store, const ResponseTierFilter& tier,
+                          const std::string& command_id, const std::vector<FacetFilter>& filters,
                           const std::optional<std::vector<std::string>>& agent_scope) {
     if (filters.empty())
         return std::int64_t{0}; // genuine: no filter -> no scoped count (matches the fragment)
     if (!store)
         return std::nullopt; // unconfigured — same posture as a degraded store
-    return store->facet_agent_count(command_id, filters, agent_scope);
+    return store->facet_agent_count(command_id, tier, filters, agent_scope);
 }
 
 } // namespace yuzu::server

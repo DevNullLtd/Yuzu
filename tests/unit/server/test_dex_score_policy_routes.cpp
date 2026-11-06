@@ -201,6 +201,7 @@ TEST_CASE("score-policy routes: GET returns the policy in force with its ETag an
         CHECK_FALSE(j["data"].contains("fault"));
         CHECK(res->get_header_value("ETag") == "\"default\"");
         CHECK(j["data"]["document"]["version"] == 1);
+        CHECK_FALSE(j["data"]["document"].contains("model"));
     }
     SECTION("a stored policy") {
         h.stored = doc_with_excellent(95.0);
@@ -213,11 +214,11 @@ TEST_CASE("score-policy routes: GET returns the policy in force with its ETag an
         CHECK(j["data"]["document"]["tiers"]["edges"]["excellent"] == 95.0);
     }
     SECTION("a stored invalid text: defaults with the fault, and its own revision") {
-        h.stored = R"({"version":2})";
+        h.stored = R"({"version":3})";
         const auto res = h.send("GET", kPath);
         const auto j = json::parse(res->body);
         CHECK(j["data"]["source"] == "default");
-        CHECK(j["data"]["fault"] == "unsupported_version at version: 2 above the supported 1");
+        CHECK(j["data"]["fault"] == "unsupported_version at version: 3 above the supported 2");
         CHECK(j["data"]["revision"] == dex_score_policy_revision(*h.stored));
     }
     SECTION("an unreadable store is a 503 with retry_after_ms, never a default policy") {
@@ -365,6 +366,87 @@ TEST_CASE("score-policy routes: PUT happy path answers 200 with the new revision
     CHECK(h.rows[0].result == "attempted");
     CHECK(h.rows[1].result == "success");
     CHECK(h.stored == body);
+}
+
+namespace {
+// Non-canonical on purpose: the answer must show the canonical, defaults-filled document.
+constexpr const char* kModelBody =
+    R"({"version":2,"model":{"per_device_event_cap":7,"regression_start_ratio":1.5},)"
+    R"("overrides":[{"image":"Foo.EXE","model":{"per_device_event_cap":2}}]})";
+
+void check_model_document(const json& d) {
+    REQUIRE(d.contains("version"));
+    REQUIRE(d.contains("model"));
+    REQUIRE(d.contains("overrides"));
+    CHECK(d["version"] == 2);
+    CHECK(d["model"]["per_device_event_cap"] == 7);
+    CHECK(d["model"]["regression_start_ratio"] == 1.5);
+    CHECK(d["model"]["regression_full_ratio"] == 3.0);  // default filled in
+    CHECK(d["model"]["interval_confidence"] == 0.95);   // default filled in
+    CHECK(d["model"].size() == 4);
+    REQUIRE(d["overrides"].size() == 1);
+    CHECK(d["overrides"][0]["image"] == "foo.exe");
+    CHECK(d["overrides"][0]["model"] == json{{"per_device_event_cap", 2}});
+}
+} // namespace
+
+TEST_CASE("score-policy routes: model parameters round-trip PUT then GET with their values and "
+          "defaults",
+          "[server][routes][dex][score_policy]") {
+    Harness h;
+    SECTION("real write then GET") {
+        const auto put = h.send("PUT", kPath, kModelBody, Harness::if_match("default"));
+        REQUIRE(put->status == 200);
+        const auto pj = json::parse(put->body);
+        check_model_document(pj["data"]["document"]);
+        REQUIRE(h.stored.has_value());
+        const auto expected = dex_score_policy_validate_text(kModelBody);
+        REQUIRE(expected.has_value());
+        CHECK(*h.stored == dex_score_policy_canonical(*expected));
+        CHECK(pj["data"]["revision"] == dex_score_policy_revision(*h.stored));
+
+        const auto get = h.send("GET", kPath);
+        REQUIRE(get->status == 200);
+        const auto gj = json::parse(get->body);
+        CHECK(gj["data"]["document"] == pj["data"]["document"]);
+        CHECK(gj["data"]["revision"] == pj["data"]["revision"]);
+        CHECK(get->get_header_value("ETag") == put->get_header_value("ETag"));
+
+        // A PUT of what GET returned is a fixed point: same text, same revision.
+        const auto again = h.send("PUT", kPath, gj["data"]["document"].dump(),
+                                  Harness::if_match(gj["data"]["revision"].get<std::string>()));
+        REQUIRE(again->status == 200);
+        CHECK(json::parse(again->body)["data"]["revision"] == gj["data"]["revision"]);
+        CHECK(*h.stored == dex_score_policy_canonical(*expected));
+    }
+    SECTION("dry run reports the model and stores nothing") {
+        const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true", kModelBody,
+                                Harness::if_match("default"));
+        REQUIRE(res->status == 200);
+        const auto j = json::parse(res->body);
+        CHECK(j["data"]["dry_run"] == true);
+        check_model_document(j["data"]["document"]);
+        CHECK_FALSE(h.stored.has_value());
+        CHECK(h.cas_calls == 0);
+        REQUIRE(h.rows.size() == 1);
+        CHECK(h.rows[0].action == "dex.score_policy.validate");
+        // The audit row records exactly the canonical text a real write would store.
+        const auto expected = dex_score_policy_validate_text(kModelBody);
+        REQUIRE(expected.has_value());
+        CHECK(json::parse(h.rows[0].detail)["document"] ==
+              json::parse(dex_score_policy_canonical(*expected)));
+    }
+    SECTION("a model in a version 1 document is refused") {
+        const auto res = h.send("PUT", kPath, R"({"model":{"per_device_event_cap":7}})",
+                                Harness::if_match("default"));
+        CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["error"]["message"] ==
+              "unparseable at model: requires version 2");
+        REQUIRE(h.rows.size() == 1);
+        CHECK(h.rows[0].result == "denied");
+        CHECK(json::parse(h.rows[0].detail)["field"] == "model");
+        CHECK(h.cas_calls == 0);
+    }
 }
 
 TEST_CASE("score-policy routes: a dry run's ETag is the current revision and not the would-be one",

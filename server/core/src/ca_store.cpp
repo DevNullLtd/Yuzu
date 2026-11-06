@@ -1414,6 +1414,35 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
     return r;
 }
 
+std::expected<std::optional<CrlFreshness>, std::string> CaStore::latest_crl_freshness() {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT version, next_update, published_at FROM ca_store.ca_crl_versions "
+        "ORDER BY version DESC LIMIT 1",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "latest_crl_freshness failed: " + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<CrlFreshness>{std::nullopt};
+    // to_i64 maps NULL to 0, which the expiry alert would read as "expired in 1970": a NULL in
+    // either column (the schema says NOT NULL; a dropped constraint or a bad restore could break
+    // that) is a read failure, so the gauge keeps its last value instead.
+    if (PQgetisnull(res.get(), 0, 1) || PQgetisnull(res.get(), 0, 2))
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "latest_crl_freshness: NULL next_update or published_at");
+    CrlFreshness f;
+    f.version = to_i64(PQgetvalue(res.get(), 0, 0));
+    f.next_update = to_i64(PQgetvalue(res.get(), 0, 1));
+    f.published_at = to_i64(PQgetvalue(res.get(), 0, 2));
+    return std::optional<CrlFreshness>{f};
+}
+
 std::expected<CrlVersionRecord, CaStore::PublishFailure>
 CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint,
                           const std::string& issuer_key_id,

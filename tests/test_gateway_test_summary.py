@@ -351,9 +351,12 @@ class WrapperWiring(unittest.TestCase):
         self.assertIsNotNone(m)
         deadlines = {k: int(v) for k, v in re.findall(r'"(\w+)":\s*(\d+)', m.group(1))}
         meson = _read(MESON)
+        # eunit is registered once per shard from a foreach, so its name is
+        # built by concatenation; the one timeout there covers every shard.
+        names = {'eunit': r"test\('gateway eunit shard ' \+", 'ct': r"test\('gateway ct',"}
         for suite in ('eunit', 'ct'):
             with self.subTest(suite=suite):
-                t = re.search(r"test\('gateway %s',.*?timeout:\s*(\d+)" % suite, meson, re.S)
+                t = re.search(names[suite] + r".*?timeout:\s*(\d+)", meson, re.S)
                 self.assertIsNotNone(t, f"meson test 'gateway {suite}' not found")
                 self.assertIn(suite, deadlines)
                 # Leave room for the dump + kill + 15s wait in _run_streamed.
@@ -381,9 +384,14 @@ class AssertGatewayTests(unittest.TestCase):
                                   capture_output=True, text=True).returncode
 
     def test_verdicts(self):
-        both = [{'name': 'gateway eunit'}, {'name': 'gateway ct'}, {'name': 'x'}]
-        self.assertEqual(self._run(both), 0)
-        self.assertEqual(self._run([{'name': 'gateway eunit'}]), 1)
+        names = ['gateway eunit shard A', 'gateway eunit shard B', 'gateway ct']
+        every = [{'name': n} for n in names] + [{'name': 'x'}]
+        self.assertEqual(self._run(every), 0)
+        for missing in names:
+            with self.subTest(missing=missing):
+                self.assertEqual(self._run([t for t in every if t['name'] != missing]), 1)
+        # The pre-shard single entry no longer satisfies the check.
+        self.assertEqual(self._run([{'name': 'gateway eunit'}, {'name': 'gateway ct'}]), 1)
         self.assertEqual(self._run([]), 1)
         self.assertEqual(self._run(None), 1)   # not configured / unreadable
 

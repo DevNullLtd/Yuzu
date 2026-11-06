@@ -100,7 +100,7 @@ inline std::string json_escape(std::string_view in) {
 /// Agent replies are newline-separated records, so a byte-count truncation of
 /// the RAW output is wrong in both directions. Too small and it cuts the
 /// operator's recovery instruction mid-sentence; too large and it runs past the
-/// newline and renders the head of the NEXT record as debris -- `tar status`'s
+/// newline and renders the head of the NEXT record as debris -- `echo status`'s
 /// offline reply is `error|...` followed by `storage_state|offline`, and a
 /// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
 /// the property that holds whatever the message length becomes.
@@ -272,9 +272,25 @@ inline std::string html_escape(const std::string& s) {
 /// html-escaped, json-escaped). The mapping itself is yuzu::log_token in
 /// common/include/yuzu/log_token.hpp, shared with the agent so the rule can't drift; this
 /// name stays as the audit-detail spelling for its call sites (server.cpp CA audits,
-/// tar_tree_routes.cpp).
+/// echo_tree_routes.cpp).
 [[nodiscard]] inline std::string audit_token(std::string_view s) {
     return ::yuzu::log_token(s); // shared mapping: common/include/yuzu/log_token.hpp
+}
+
+/// Put a store or driver error text on ONE line for use inside an audit detail. libpq error
+/// messages end with a newline and often carry a second CONTEXT line, so a suffix appended
+/// after one (`; credentials_revoked=N`) would land on its own physical line and a log reader
+/// would miss it. Each CR or LF becomes a space (a CRLF pair therefore gives two) and trailing
+/// space and tab are dropped; nothing else is changed (use `audit_token` for a caller-supplied
+/// value, which is stricter).
+[[nodiscard]] inline std::string flatten_audit_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s)
+        out += (c == '\r' || c == '\n') ? ' ' : c;
+    while (!out.empty() && (out.back() == ' ' || out.back() == '\t'))
+        out.pop_back();
+    return out;
 }
 
 /// Percent-decode a URL-encoded string (also handles + as space).
@@ -959,17 +975,8 @@ inline bool form_value_supplied(const std::string& body, const std::string& key)
     return false;
 }
 
-/// Extract plugin name from a command_id string (format: "plugin-timestamp").
-inline std::string extract_plugin(const std::string& command_id) {
-    auto dash = command_id.find('-');
-    if (dash != std::string::npos) {
-        return command_id.substr(0, dash);
-    }
-    return command_id;
-}
-
 // ============================================================================
-// Time formatting and now-epoch — used by the executions surface and the TAR
+// Time formatting and now-epoch — used by the executions surface and the Echo
 // dashboard. Both surfaces standardise on UTC; relative time goes in the cell
 // text, ISO-8601 UTC goes in the title= attribute for forensic copy/paste.
 // Mixing local time anywhere is a known failure mode (BST/UTC drift).

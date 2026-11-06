@@ -70,7 +70,8 @@ class ManagementGroupStore; // forward declaration
 /// cannot be answered. They are a CONTRACT with `authz::ceiling_degrade_reason`
 /// (authz_gates.cpp), which maps a failed ceiling read to a `yuzu_server_rbac_read_degrade_total`
 /// reason label by matching these prefixes: every producer and that mapping use these
-/// constants, never a re-typed literal. A failed query is `"query failed: "` followed by the
+/// constants, never a re-typed literal. (`kRbacErrMgmtGroupReadDegraded` below is the one
+/// exception: that mapping never sees it.) A failed query is `"query failed: "` followed by the
 /// libpq message and has no constant (it is the label mapping's fallthrough).
 inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
 inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
@@ -79,6 +80,14 @@ inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker 
 /// cached-disabled view), so no grant read was attempted.
 inline constexpr std::string_view kRbacErrEnforcementUnconfirmed =
     "rbac enforcement state unconfirmed";
+/// `check_scoped_permission_checked` (#3739): the scoped decision needed the management-group
+/// store (`get_assignments_for_principal` via `resolve_perm_groups`, `get_agent_groups`,
+/// `get_ancestor_ids`) and that read degraded (ADR-0042). The exact reason (`store_not_open` /
+/// `pool_acquire_timeout` / `query_error`) is carried by
+/// `yuzu_server_mgmt_group_read_degrade_total{reason}`, not by this text. NOT consumed by
+/// `authz::ceiling_degrade_reason` (the ceiling path never reaches the scoped check); its only
+/// consumer is the audit-source label in `AuthRoutes::require_scoped_permission`.
+inline constexpr std::string_view kRbacErrMgmtGroupReadDegraded = "management group read degraded";
 
 struct RbacRole {
     std::string name;
@@ -652,25 +661,49 @@ public:
                               const std::vector<std::pair<std::string, std::string>>& asserted);
 
     // ── Authorization check ──────────────────────────────────────────────
-    /// FAIL-CLOSED: false (deny) on store-not-open / pool timeout / query error.
+    /// FAIL-CLOSED: false (deny) on store-not-open / pool timeout / query error. This is the
+    /// Boolean compatibility wrapper over `check_permission_checked` (`value_or(false)`), so every
+    /// existing caller keeps the same fail-closed answer.
     bool check_permission(const std::string& username, const std::string& securable_type,
                           const std::string& operation) const;
 
-    /// Checked twin of `check_permission`: the SAME decision (it is the implementation; the
-    /// plain form is `.value_or(false)`), but a closed store, an open circuit breaker, a pool
-    /// lease timeout or a failed role / permission query is `unexpected(reason)` instead of a
-    /// bare `false`, so a caller that must not read a failure as "no grant" (the list-read
-    /// gates, via `ListReadAuthorization::read_failed`) can tell them apart. A cached verdict
-    /// is returned without a read, as before. A genuine "no roles" or "no allow" is `false`.
+    /// The same decision with an unavailable authorization read told apart from a definitive
+    /// denial: `true` = granted, `false` = definitively denied (no allow, an explicit deny, or a
+    /// healthy EMPTY role set), `unexpected(msg)` = the answer could not be determined (extend,
+    /// never fork; mirrors `role_permission_allowed_checked`). The error text is
+    /// `kRbacErrStoreNotOpen`, `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, or
+    /// `"query failed: ..."` (the role read or the permission read). A cache hit is answered first,
+    /// before the breaker, exactly as for `check_permission`. A real role-query failure is counted
+    /// under `yuzu_server_rbac_read_degrade_total{reason="query_error"}` and booked as a breaker
+    /// FAILURE; a healthy empty role set is neither. Only a caller that can act on "unavailable"
+    /// differently from "denied" (the Forensics-tier resolver through
+    /// `AuthRoutes::probe_permission_unavailable_aware`) should use this; every other caller uses
+    /// the Boolean wrapper. The list-read gates (`authorize_list_read`, via
+    /// `ListReadAuthorization::read_failed`) and `engine_grant_checked` also use it.
     [[nodiscard]] std::expected<bool, std::string>
     check_permission_checked(const std::string& username, const std::string& securable_type,
                              const std::string& operation) const;
 
     /// Scoped permission check: first tries global, then checks group-scoped
-    /// roles. FAIL-CLOSED: false on any store error.
+    /// roles. FAIL-CLOSED: false on any store error. Boolean compatibility wrapper over
+    /// `check_scoped_permission_checked` (`value_or(false)`), like `check_permission`.
     bool check_scoped_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation, const std::string& agent_id,
                                  const ManagementGroupStore* mgmt_store) const;
+
+    /// The same decision with a degrade-driven denial told apart from a definitive one (#3739):
+    /// `true` = granted, `false` = definitively denied (no grant among the reads that completed,
+    /// an explicit deny-group hit, an empty reachable set, or no mgmt store / agent id wired AND
+    /// no earlier read failed), `unexpected(msg)` = the answer is a deny BECAUSE a read failed.
+    /// `msg` is `kRbacErrMgmtGroupReadDegraded` when the FIRST failed read belonged to the
+    /// management-group store (the assignments, member or ancestor reads), otherwise the
+    /// RBAC-side error text (`kRbacErr*` or `"query failed: ..."`). An ALLOW and an explicit
+    /// deny-group hit are returned as such even if an earlier read degraded. The decision itself
+    /// is identical to the Boolean wrapper's.
+    [[nodiscard]] std::expected<bool, std::string>
+    check_scoped_permission_checked(const std::string& username, const std::string& securable_type,
+                                    const std::string& operation, const std::string& agent_id,
+                                    const ManagementGroupStore* mgmt_store) const;
 
     // ── ADR-0017 admit-then-filter list gate ─────────────────────────────
     /// The single chokepoint for list/fan-out reads of per-agent data under
@@ -793,12 +826,17 @@ private:
     [[nodiscard]] bool load_enabled_flag();
 
     /// Collect all role names for a principal (direct user grant + via group
-    /// membership + direct engine-principal grant, §4.1) using `conn`. Returns
-    /// empty on a query error (fail-closed: an empty role set denies).
-    std::vector<std::string> collect_roles(void* conn, const std::string& username) const;
-    /// Checked twin: a failed query is `unexpected`, not an empty role set.
+    /// membership + direct engine-principal grant, §4.1) using `conn`. A healthy query that finds
+    /// no role is `expected(empty)`; a failed query is `unexpected("query failed: ...")`, never
+    /// an empty set. Does no accounting: use `collect_roles_accounted`.
+    std::expected<std::vector<std::string>, std::string> collect_roles(void* conn,
+                                                                        const std::string& username) const;
+
+    /// `collect_roles` plus the failure accounting every caller needs: a failed read bumps
+    /// `yuzu_server_rbac_read_degrade_total{reason="query_error"}`, logs (sampled) and is noted as
+    /// a breaker failure. The success (including an empty set) is left for the caller to book.
     std::expected<std::vector<std::string>, std::string>
-    collect_roles_checked(void* conn, const std::string& username) const;
+    collect_roles_accounted(void* conn, const std::string& username) const;
 
     // ── ADR-0017 shared list-gate resolver (INV-7) ───────────────────────
     struct PermGroups {
@@ -1053,18 +1091,23 @@ enum class RbacEnforcementLabel {
 /// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
 
-/// The ONE grant decision of the two checked-read engine arms (`AuthRoutes::require_list_read`
-/// and the fleet-read gate): an engine principal's only authority is an explicit RBAC grant,
-/// so it is never admitted on a fresh disabled view. (A cached-ENABLED view that is stale
-/// still reads the grant: the documented fail-closed asymmetry above, not covered here.)
-/// The engine arms of `require_permission` and `require_scoped_permission` are deliberately
-/// plain deny-on-degrade (ADR-0041, #6437) and do not use this.
+/// The ONE grant decision of the checked-read engine arms: `AuthRoutes::require_list_read`,
+/// the fleet-read gate and (#4990) `AuthRoutes::require_permission`. An engine principal's only
+/// authority is an explicit RBAC grant, so it is never admitted on a fresh disabled view. (A
+/// cached-ENABLED view that is stale still reads the grant: the documented fail-closed
+/// asymmetry above, not covered here.) The engine arm of `require_scoped_permission` alone is
+/// deliberately plain deny-on-degrade (ADR-0041, #6437) and does not use this. The
+/// username-keyed visibility resolvers (`engine_aware_visibility.hpp`,
+/// `RbacStore::authorize_list_read`, `compose_exec_visible`, `schedule_arming_check.hpp`)
+/// keep `rbac_enforcement_in_effect()` (#6204): they only narrow or decide dispatch
+/// permission, and they are not changed here.
 ///
 /// One `rbac_enforcement_label()` snapshot decides: `kEnabled` returns
 /// `check_permission_checked()` (a failed read is the error); `kDisabled` returns `false`
 /// (a genuine "no": RBAC is off and the view is fresh); `kDegraded` returns an error (the
 /// enforcement state could not be confirmed, a stale cached-disabled view included), so the
-/// caller answers a retryable 503 instead of a terminal 403. It admits exactly when the
+/// caller answers a retryable 503 instead of a terminal 403 (`require_permission` answers
+/// the 503 only under its opt-in mapping and keeps the 403 by default). It admits exactly when the
 /// raw `is_rbac_enabled()` accessor did and the grant read succeeds, so the SET OF INPUTS
 /// THAT ADMIT is unchanged; only which non-admitting answer is given differs (the
 /// admission-input-set test that the `RbacEnforcementLabel` doc above sets for a new

@@ -3,6 +3,10 @@
 
 #include "hardware_list_model.hpp"
 
+#include "device_ci_section_digest.hpp" // the one digest function the store also writes with
+#include "device_ci_kinds.hpp" // the section registry: kind order and declared columns (constexpr only)
+#include "tag_store.hpp" // TagStore::validate_key - the .cpp only; the header stays store-free (#6558)
+
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <algorithm>
@@ -26,6 +30,11 @@ std::string to_lower_ascii(std::string_view s) {
 }
 
 bool is_blank_sentinel(const std::string& s) { return s.empty() || s == "unknown"; }
+
+/// The blank sentinel PLUS the agent's literal `-` ("no value"): the v2 identifier scalars
+/// (chassis, board, machine id) and list-row cells can carry it, and it must read as "not
+/// reported" (JSON null, never a search term), exactly as the older fields' empty/`unknown` do.
+bool is_ci_placeholder(const std::string& s) { return is_blank_sentinel(s) || s == "-"; }
 
 // Local OS-token -> display-label mapping (this pure model must not pull in a UI
 // translation unit just for it).
@@ -113,6 +122,12 @@ std::string hw_search_haystack(const InventoryDeviceRow& row) {
     add(row.ci_os_build);
     add(row.ci_domain);
     add(row.ci_arch);
+    // v2 identifiers (H.7). These can hold the agent's `-` "nothing here" placeholder (an agent
+    // that predates the v2 writer, or a plugin that has no value), which must never be a search
+    // term: `q=-` would otherwise match every such device.
+    for (const std::string* part : {&row.ci_chassis_asset_tag, &row.ci_chassis_serial, &row.ci_board_serial})
+        if (!is_ci_placeholder(*part))
+            add(*part);
     add(row.agent_version);
     add(row.arch);
     for (const auto& ip : row.ips) add(ip);
@@ -175,6 +190,81 @@ nlohmann::json ci_json(const std::string& s) {
     if (is_blank_sentinel(s))
         return nullptr;
     return s;
+}
+
+/// As `ci_json`, for the v2 scalars: the `-` placeholder is also "not reported".
+nlohmann::json ci_json_ph(const std::string& s) {
+    if (is_ci_placeholder(s))
+        return nullptr;
+    return s;
+}
+
+/// One list-row cell: empty or `-` is null. `unknown` is kept - for a row it is a value the
+/// device reported (a DIMM type), not a missing one.
+nlohmann::json ci_cell_json(const std::string& s) {
+    if (s.empty() || s == "-")
+        return nullptr;
+    return s;
+}
+
+/// The declared columns of a list kind (`kDeviceCiSections[i].columns`), split on `,`.
+std::vector<std::string_view> ci_columns(const DeviceCiSectionDef& def) {
+    std::vector<std::string_view> out;
+    std::string_view cols = def.columns;
+    while (!cols.empty()) {
+        const auto comma = cols.find(',');
+        out.push_back(cols.substr(0, comma));
+        if (comma == std::string_view::npos)
+            break;
+        cols.remove_prefix(comma + 1);
+    }
+    return out;
+}
+
+/// `ci.sections`: one entry per section the device reported, in registry order. `complete` is true
+/// only for level `ok` after the row-count and content-digest checks (`verify_section_content`).
+/// Rows are served only for `ok` and `constrained` (a constrained section is a bounded or partial
+/// projection, so its `complete:false` is the whole point); every other level - `unavailable`,
+/// `permission_denied`, or a level this server does not know - renders its reason and no rows,
+/// even if rows were somehow stored.
+nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
+                                const std::vector<DeviceCiSection>& sections) {
+    nlohmann::json out = nlohmann::json::array();
+    for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i) {
+        const DeviceCiSectionDef& def = kDeviceCiSections[i];
+        const auto it = std::ranges::find(sections, std::string_view(def.section), &DeviceCiSection::kind);
+        if (it == sections.end())
+            continue; // not reported by this blob: absent from the array, never a fabricated empty section
+        nlohmann::json source = nullptr;
+        if (std::string_view(def.section) == "chassis")
+            source = ci_json_ph(ci.chassis_source);
+        else if (std::string_view(def.section) == "baseboard")
+            source = ci_json_ph(ci.board_source);
+        else if (std::string_view(def.section) == "machine_id")
+            source = ci_json_ph(ci.machine_id_source);
+        // The served level/reason: the stored status reconciled with the rows actually read
+        // (count, then content digest). A downgrade only ever moves ok -> constrained, so the
+        // row-serving test below is unchanged by it.
+        const SectionVerdict verdict = def.table != nullptr ? verify_section_content(*it)
+                                                            : SectionVerdict{it->level, it->reason};
+        nlohmann::json rows = nlohmann::json::array();
+        if (def.table != nullptr && (it->level == "ok" || it->level == "constrained")) {
+            const auto cols = ci_columns(def);
+            for (const auto& r : it->rows) {
+                nlohmann::json row = nlohmann::json::object();
+                for (std::size_t c = 0; c < cols.size(); ++c)
+                    row[std::string(cols[c])] = c < r.size() ? ci_cell_json(r[c]) : nlohmann::json(nullptr);
+                rows.push_back(std::move(row));
+            }
+        }
+        out.push_back({{"kind", def.section},
+                       {"status", verdict.level.empty() ? nlohmann::json(nullptr) : nlohmann::json(verdict.level)},
+                       {"reason", ci_json_ph(verdict.reason)},
+                       {"source", std::move(source)},
+                       {"complete", verdict.level == "ok"},
+                       {"rows", std::move(rows)}});
+    }
+    return out;
 }
 
 /// `ci_ram_bytes` etc. are decimal strings; render as a JSON integer when parseable,
@@ -738,9 +828,32 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
             {"os_version", ci_json(ci.os_version)},     {"os_build", ci_json(ci.os_build)},
             {"arch", ci_json(ci.arch)},                 {"first_seen", ci.first_seen},
             {"last_seen", ci.last_seen},
+            // v2 identity scalars (H.7). Null on a v1 record and on a section the agent could not read.
+            {"chassis_type", ci_json_ph(ci.chassis_type)},
+            {"chassis_serial", ci_json_ph(ci.chassis_serial)},
+            {"chassis_asset_tag", ci_json_ph(ci.chassis_asset_tag)},
+            {"chassis_source", ci_json_ph(ci.chassis_source)},
+            {"board_vendor", ci_json_ph(ci.board_vendor)},
+            {"board_product", ci_json_ph(ci.board_product)},
+            {"board_serial", ci_json_ph(ci.board_serial)},
+            {"board_source", ci_json_ph(ci.board_source)},
+            {"machine_id_hash", ci_json_ph(ci.machine_id_hash)},
+            {"machine_id_algorithm", ci_json_ph(ci.machine_id_algorithm)},
+            {"machine_id_source", ci_json_ph(ci.machine_id_source)},
+            // [] = nothing stored (or not read). A failed sections read never reaches this
+            // serializer: both surfaces answer their retryable error first
+            // (`hardware_ci_sections_unreadable`), so ci.sections null is not emitted by REST or
+            // MCP today; the null arm only keeps the serializer total.
+            {"sections", detail.ci_sections ? ci_sections_json(ci, *detail.ci_sections) : nlohmann::json(nullptr)},
         };
         out["ci_state"] = "found";
     }
+
+    // "degraded": the sections read failed, or `ci` itself could not be read so none was made.
+    // "absent": nothing stored (a v1 agent or no record) - NOT "the device has none".
+    out["sections_state"] = hardware_ci_sections_unreadable(detail) || !detail.ci.has_value() ? "degraded"
+                            : detail.ci_sections->empty()                                      ? "absent"
+                                                                                                : "found";
 
     if (!detail.software) {
         out["software"] = nullptr;
@@ -825,6 +938,80 @@ void apply_identity_read(HardwareCiDetail& detail,
         detail.identity = std::move(*ident);
     else
         detail.identity_degraded = true;
+}
+
+void apply_ci_with_sections_read(HardwareCiDetail& detail,
+                                 std::expected<DeviceCiWithSections, CiReadError> read) {
+    if (!read) {
+        // The record read itself failed: `ci` is the error, and no sections read was made.
+        detail.ci = std::unexpected(read.error());
+        detail.ci_sections = {};
+        return;
+    }
+    detail.ci = std::move(read->record);
+    if (read->sections_failed) {
+        // The record answered but its sections did not: keep the error (never flatten it to an
+        // empty list), so the REST route 503s and the MCP twin answers the same retryable error.
+        detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+        return;
+    }
+    detail.ci_sections = std::vector<DeviceCiSection>{};
+    // Only a v2 record carries sections; a v1 record (or no record) leaves the empty list.
+    if (*detail.ci && (*detail.ci)->blob_version >= 2) {
+        detail.ci_sections = std::move((*detail.ci)->sections);
+        (*detail.ci)->sections.clear(); // moved-from: the sections live in `ci_sections` alone
+    }
+}
+
+namespace {
+
+/// True iff the section carries a persisted count, serves rows, and the rows read disagree with it.
+bool row_count_disagrees(const DeviceCiSection& section) {
+    if (!section.row_count.has_value())
+        return false; // not verifiable
+    if (section.level != "ok" && section.level != "constrained")
+        return false; // no rows by contract: nothing to reconcile
+    return static_cast<long long>(section.rows.size()) != static_cast<long long>(*section.row_count);
+}
+
+/// ok -> constrained (constrained stays) and `token` appended after any existing reason, once.
+void downgrade_with(SectionVerdict& v, std::string_view token) {
+    v.level = "constrained";
+    if (v.reason.find(token) == std::string::npos) {
+        if (!v.reason.empty())
+            v.reason += ';';
+        v.reason += token;
+    }
+}
+
+} // namespace
+
+SectionVerdict verify_section_row_count(const DeviceCiSection& section) {
+    SectionVerdict v{section.level, section.reason};
+    if (row_count_disagrees(section))
+        downgrade_with(v, kSectionRowCountMismatchReason);
+    return v;
+}
+
+SectionVerdict verify_section_content(const DeviceCiSection& section) {
+    SectionVerdict v = verify_section_row_count(section);
+    if (row_count_disagrees(section))
+        return v; // the count already reports the loss; a lost row always changes the digest too
+    if (!section.content_digest.has_value())
+        return v; // not verifiable: served as the count rule left it
+    if (classify_stored_digest(*section.content_digest) == StoredDigestForm::kOtherLayout)
+        return v; // a well-formed digest of another layout version: unverified. Anything else that
+                  // is not the current form falls through to the comparison and mismatches.
+    if (section.level != "ok" && section.level != "constrained")
+        return v; // no rows by contract: nothing to hash
+    const auto idx = device_ci_section_index(section.kind);
+    if (!idx || kDeviceCiSections[*idx].table == nullptr)
+        return v; // not a table-backed registered kind: no digest to compare
+    const auto computed = section_content_digest(kDeviceCiSections[*idx], section.rows);
+    if (computed.has_value() && *computed == *section.content_digest)
+        return v;
+    downgrade_with(v, kSectionContentDigestMismatchReason);
+    return v;
 }
 
 } // namespace yuzu::server

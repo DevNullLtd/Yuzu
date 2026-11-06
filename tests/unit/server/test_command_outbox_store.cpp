@@ -171,11 +171,15 @@ TEST_CASE("CommandOutboxStore[pg]: opens and migrates", "[command_outbox][pg][st
 TEST_CASE("CommandOutboxStore: the v2 migration carries the 300 s statement timeout (#6096)",
           "[command_outbox][store][migration][6096]") {
     const auto& migs = CommandOutboxStore::migrations();
-    REQUIRE(migs.size() == 2);
-    CHECK(migs.back().version == 2);
-    CHECK(migs.back().sql.rfind("SET LOCAL statement_timeout = '300s';", 0) == 0);
-    CHECK(migs.back().sql.find("outbox_approval_idx") != std::string::npos);
+    REQUIRE(migs.size() == 3);
+    CHECK(migs[1].version == 2);
+    CHECK(migs[1].sql.rfind("SET LOCAL statement_timeout = '300s';", 0) == 0);
+    CHECK(migs[1].sql.find("outbox_approval_idx") != std::string::npos);
     CHECK(migs.front().version == 1);
+    // v3 is the Echo rename's one-line plugin-name rewrite (idempotent, scan lifted off the cap).
+    CHECK(migs.back().version == 3);
+    CHECK(migs.back().sql.rfind("SET LOCAL statement_timeout = 0;", 0) == 0);
+    CHECK(migs.back().sql.find("plugin = 'echo' WHERE plugin = 'tar'") != std::string::npos);
 }
 
 // #6096: the schedule runner's spent-ticket ledger reads.
@@ -247,7 +251,9 @@ TEST_CASE("CommandOutboxStore[pg]: the v2 migration adds the approval index to a
             "INSERT INTO public.schema_meta (store, version, upgraded_at) "
             "  VALUES ('command_outbox_store', 1, extract(epoch FROM now())::bigint);"
             "INSERT INTO outbox (occurrence_id, command_id, source, plugin, action, approval_id) "
-            "  VALUES ('s:1', 'c1', 'schedule_runner', 'p', 'a', 'tkt-a');";
+            "  VALUES ('s:1', 'c1', 'schedule_runner', 'p', 'a', 'tkt-a'),"
+            // A pre-rename pending fire naming the retired plugin: v3 moves it to `echo`.
+            "         ('s:2', 'c2', 'schedule_runner', 'tar', 'query', '');";
         yuzu::server::pg::PgResult r{PQexec(conn.get(), v1.c_str())};
         REQUIRE(r.ok());
     }
@@ -266,7 +272,14 @@ TEST_CASE("CommandOutboxStore[pg]: the v2 migration adds the approval index to a
     yuzu::server::pg::PgResult ver{PQexec(
         conn.get(), "SELECT version FROM public.schema_meta WHERE store = 'command_outbox_store'")};
     REQUIRE(ver.status() == PGRES_TUPLES_OK);
-    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "3"); // the ladder runs on through v3
+
+    // Echo rename v3: the legacy `tar` row is rewritten, the control row is untouched.
+    yuzu::server::pg::PgResult plug{PQexec(
+        conn.get(), "SELECT string_agg(occurrence_id || '=' || plugin, ',' ORDER BY occurrence_id) "
+                    "FROM command_outbox_store.outbox")};
+    REQUIRE(plug.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(plug.get(), 0, 0)) == "s:1=p,s:2=echo");
 
     auto spent = store.occurrences_for_approval("tkt-a");
     REQUIRE(spent.has_value());

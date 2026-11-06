@@ -79,6 +79,19 @@ const char* const kSettingsSecurityPageTemplate =
       var t = document.createElement('div');
       t.className = 'toast toast-' + (level || 'info');
       t.textContent = message;
+      if (level === 'error') {
+        /* An error toast is never removed on a timer, and a failed retry adds another: give it
+           a close control (the same markup as the Settings page's toast). */
+        var close = document.createElement('button');
+        close.textContent = '\u00d7';
+        close.setAttribute('aria-label', 'Dismiss');
+        close.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;' +
+          'margin-left:auto;font-size:1.2rem;padding:0 0 0 var(--sp-3);';
+        close.onclick = function () { t.remove(); };
+        t.style.display = 'flex';
+        t.style.alignItems = 'center';
+        t.appendChild(close);
+      }
       c.appendChild(t);
       if (level !== 'error') setTimeout(function () { t.remove(); }, level === 'warning' ? 8000 : 4000);
     }

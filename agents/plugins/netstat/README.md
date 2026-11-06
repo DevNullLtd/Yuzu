@@ -22,15 +22,15 @@ Neither action takes parameters, sets a typed result status, filters by protocol
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>dispatches definition] --> SRV[Server<br/>authz: Infrastructure.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host]
-  HOST --> EX[netstat.execute]
-  EX --> WIN[Windows leg<br/>GetExtendedTcpTable/UdpTable<br/>+ QueryFullProcessImageNameW]
-  EX --> MAC[macOS leg<br/>libproc via macos_socket_walk.hpp]
-  EX --> LIN[Linux leg<br/>/proc/net/tcp,udp[6] + /proc/pid/fd]
-  WIN & MAC & LIN --> ROWS[pipe rows,<br/>UNDECLARED result status]
-  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day retention)]
-  RS --> API[REST /api/responses · dashboard table]
+  OP["Operator / workflow dispatches definition"] --> SRV["Server - authz: Infrastructure.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"]
+  HOST --> EX["netstat.execute"]
+  EX --> WIN["Windows leg - GetExtendedTcpTable/UdpTable + QueryFullProcessImageNameW"]
+  EX --> MAC["macOS leg - libproc via macos_socket_walk.hpp"]
+  EX --> LIN["Linux leg - /proc/net/tcp,udp[6] + /proc/pid/fd"]
+  WIN & MAC & LIN --> ROWS["pipe rows, UNDECLARED result status"]
+  ROWS -->|"CommandResponse"| RS[("ResponseStore - 90-day retention")]
+  RS --> API["REST /api/responses, dashboard table"]
 ```
 
 ## OS capability
@@ -99,7 +99,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention — `docs/yaml-dsl-spec.md:194`, `response_store.hpp:167`), queryable at `/api/responses/{id}` and dashboard-rendered: `netstat_list` uses a static 8-column schema (`result_parsing.hpp:56`), while `attribution`'s 9-column schema is resolved from the content-definition `result` schema instead of a static entry (`result_parsing.hpp:50-55`).
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping `server/` and `agents/plugins/tar/` for `netstat` finds only the dashboard-schema and command-catalogue sites above; nothing runs on a schedule.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — grepping `server/` and `agents/plugins/echo/` for `netstat` finds only the dashboard-schema and command-catalogue sites above; nothing runs on a schedule.
 - **Sensitivity.** `netstat_list` rows carry local/remote IPs and a bare `pid` — enough to fingerprint the device's active network identity, but nothing else. `attribution` rows add `process_name`/`process_path`, which name installed software and, for a per-user-profile install, can embed a person's account name in the path (the macOS sample below shows a VS Code extension path under `/Users/jsmith/...`).
 - **Siblings:** `network_diag` (connection/socket diagnostics), `netprobe` (active reachability probes), the retired `sockwho` (folded into `attribution`, #3403).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.network.netstat_attribution")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.

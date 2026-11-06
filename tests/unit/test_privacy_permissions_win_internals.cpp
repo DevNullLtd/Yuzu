@@ -494,8 +494,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a hive file over the s
     CHECK(guard.before_load(hd.file.wstring()) == "hive_oversized");
 }
 
-TEST_CASE("privacy_permissions win: HiveFileGuard refuses a reparse-point or hard-linked sidecar "
-          "and an over-cap sidecar count, and accepts a regular one",
+TEST_CASE("privacy_permissions win: HiveFileGuard refuses a hard-linked hive file or sidecar and a "
+          "reparse-point sidecar and an over-cap sidecar count and accepts a regular one",
           "[privacy_permissions][win_internals]") {
     HiveDir hd;
     const std::string sid = own_sid_string();
@@ -509,9 +509,31 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a reparse-point or har
         CHECK(guard.before_load(hd.file.wstring()) == "");
     }
     SECTION("a hard-linked sidecar is refused") {
-        if (!CreateHardLinkW(log1.c_str(), hd.file.c_str(), nullptr))
+        // Linked to another file, not the hive: a second name on the hive itself is the leaf's
+        // own refusal (hive_hardlinked), which outranks every sidecar fact.
+        const fs::path other = hd.dir / "other.bin";
+        { std::ofstream(other, std::ios::binary) << "log"; }
+        if (!CreateHardLinkW(log1.c_str(), other.c_str(), nullptr))
             SKIP("the temp volume cannot hard-link (win32 " << GetLastError() << ")");
         CHECK(guard.before_load(hd.file.wstring()) == "hive_sidecar_hardlinked");
+    }
+    SECTION("a hard-linked hive file is refused, by either of its names (SG-1)") {
+        const fs::path alias = hd.dir / "alias.bin";
+        if (!CreateHardLinkW(alias.c_str(), hd.file.c_str(), nullptr))
+            SKIP("the temp volume cannot hard-link (win32 " << GetLastError() << ")");
+        CHECK(guard.before_load(hd.file.wstring()) == "hive_hardlinked");
+        win::RetentionBudget budget2;
+        Win32HiveFileProbe probe2;
+        auto guard2 = make_guard(probe2, budget2, sid);
+        CHECK(guard2.before_load(alias.wstring()) == "hive_hardlinked");
+        win::LeafFacts leaf;
+        REQUIRE(probe2.leaf_facts(alias.wstring(), leaf) == 0);
+        CHECK(leaf.links == 2); // the production probe reads nNumberOfLinks from the leaf handle
+        fs::remove(alias);
+        win::RetentionBudget budget3;
+        Win32HiveFileProbe probe3;
+        auto guard3 = make_guard(probe3, budget3, sid);
+        CHECK(guard3.before_load(hd.file.wstring()).empty()); // back to one name: accepted
     }
     SECTION("a dangling symlink sidecar is refused and its target is never created") {
         const fs::path target = hd.dir / "dangling.bin";

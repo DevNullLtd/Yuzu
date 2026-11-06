@@ -145,14 +145,15 @@
 #include "confined_sink_scan.hpp"
 #include "source_scan.hpp"
 
-using yuzu::test::wiring_scan::find_confined_dispatch_sink_sites;
-using yuzu::test::wiring_scan::kFieldWindow;
-using yuzu::test::wiring_scan::kTypeName;
 using yuzu::test::source_scan::line_of;
 using yuzu::test::source_scan::read_text_file;
+using yuzu::test::source_scan::strip_comments;
 using yuzu::test::source_scan::strip_line_comments;
 using yuzu::test::source_scan::stripped_source;
 using yuzu::test::source_scan::stripped_source_loads;
+using yuzu::test::wiring_scan::find_confined_dispatch_sink_sites;
+using yuzu::test::wiring_scan::kFieldWindow;
+using yuzu::test::wiring_scan::kTypeName;
 
 namespace {
 
@@ -893,4 +894,92 @@ TEST_CASE("engine_aware_visibility.hpp: each resolver reads enforcement exactly 
         CHECK(body.find(names[i]) != std::string::npos);
         CHECK(count_enforcement_reads(body) == 1);
     }
+}
+
+// ── strip_comments self-test (#6079 qe-1, cs-N2) ────────────────────────────
+// The comment-free scans (comment_free_source) are only as honest as this lexer, so it is
+// pinned on engineered inputs, independent of whatever server.cpp contains on a given day.
+namespace {
+std::size_t newlines_in(std::string_view t) {
+    return static_cast<std::size_t>(std::count(t.begin(), t.end(), '\n'));
+}
+} // namespace
+
+TEST_CASE("strip_comments: comment markers inside literals are not comments",
+          "[wiring_order][strip_comments]") {
+    CHECK(strip_comments(R"T(s = "http://x /* y */"; // tail
+int a;)T") == R"T(s = "http://x /* y */"; 
+int a;)T");
+    // A raw string whose body holds `)"` and a `//`: only its own delimiter closes it.
+    CHECK(strip_comments(R"T(auto r = R"x(a )" // not a comment )x"; // real
+)T") == R"T(auto r = R"x(a )" // not a comment )x"; 
+)T");
+    // Encoding-prefixed raw strings are raw strings.
+    CHECK(strip_comments("a = u8R\"(p // q)\"; // c\n") == "a = u8R\"(p // q)\"; \n");
+    CHECK(strip_comments("a = LR\"(p // q)\"; // c\n") == "a = LR\"(p // q)\"; \n");
+}
+
+TEST_CASE("strip_comments: character literals and escapes do not derail the lexer",
+          "[wiring_order][strip_comments]") {
+    // A quote character literal must not open a string, a backslash literal must not escape
+    // its closing quote.
+    CHECK(strip_comments("char a = '\"'; char b = '\\\\'; // c\nint z;") ==
+          "char a = '\"'; char b = '\\\\'; \nint z;");
+    // An escaped backslash before the closing quote: the comment after it is a comment.
+    CHECK(strip_comments("s = \"\\\\\"; // c\nt;") == "s = \"\\\\\"; \nt;");
+    // An encoding prefix on a character literal keeps it a literal.
+    CHECK(strip_comments("x = L'\"'; // c\ny = \"z\"; // d") == "x = L'\"'; \ny = \"z\"; ");
+}
+
+TEST_CASE("strip_comments: a digit separator is not a character literal",
+          "[wiring_order][strip_comments]") {
+    CHECK(strip_comments("int n = 30'000; // note\nint k;") == "int n = 30'000; \nint k;");
+    CHECK(strip_comments("int n = 0xFF'FF'00; // note\nint k;") == "int n = 0xFF'FF'00; \nint k;");
+    CHECK(strip_comments("auto d = 1'000'000ull; /* x */ int k;") ==
+          "auto d = 1'000'000ull;   int k;");
+    // Had the separator opened a literal, the comment marker below would have been read as
+    // literal text and survived.
+    CHECK(strip_comments("n = 5'000; // \"quoted\"\nm;") == "n = 5'000; \nm;");
+}
+
+TEST_CASE("strip_comments: a raw-string opener needs a token boundary",
+          "[wiring_order][strip_comments]") {
+    // `BAR"(" ` is the identifier BAR then an ordinary string; reading `R"(` as a raw opener
+    // would swallow the comment (and the next line) into a fake raw string.
+    CHECK(strip_comments("BAR\"(\" // c\nx = \")\";") == "BAR\"(\" \nx = \")\";");
+    // A malformed delimiter (a space) is not a raw opener either.
+    CHECK(strip_comments("R\"a b(\" // c\n") == "R\"a b(\" \n");
+}
+
+TEST_CASE("strip_comments: a backslash continues a line comment onto the next line",
+          "[wiring_order][strip_comments]") {
+    const std::string in = "a; // c \\\nstill comment\nb;";
+    const std::string out = strip_comments(in);
+    CHECK(out == "a; \n\nb;");
+    CHECK(newlines_in(out) == newlines_in(in));
+    // CRLF line ends continue it too.
+    CHECK(strip_comments("a; // c \\\r\nstill\r\nb;") == "a; \n\nb;");
+    // A backslash that is not at the line end does not.
+    CHECK(strip_comments("a; // c \\ d\nb;") == "a; \nb;");
+}
+
+TEST_CASE("strip_comments: block comments, an unterminated one, and line preservation",
+          "[wiring_order][strip_comments]") {
+    CHECK(strip_comments("a/* x\ny */b") == "a\n b");
+    const std::string open = "a; /* never closed\nb;\nc;";
+    const std::string out = strip_comments(open);
+    CHECK(out == "a; \n\n ");
+    CHECK(newlines_in(out) == newlines_in(open));
+    CHECK(strip_comments("") == "");
+    CHECK(strip_comments("/") == "/");
+}
+
+TEST_CASE("strip_comments: server.cpp keeps its line count and is a fixed point",
+          "[wiring_order][strip_comments]") {
+    const std::string raw = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(raw.size() > 100000); // not vacuous: the real file
+    const std::string once = strip_comments(raw);
+    CHECK(newlines_in(once) == newlines_in(raw));
+    CHECK(once.size() < raw.size());
+    CHECK(strip_comments(once) == once);
 }

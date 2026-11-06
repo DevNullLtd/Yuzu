@@ -1,0 +1,32 @@
+%% -*- mode: erlang -*-
+%% rebar3 config for ONE shard of the gateway EUnit suite. Read only when
+%% scripts/test_gateway.py runs `eunit --shard K/N` (the Meson
+%% `gateway eunit shard <X>` tests): the wrapper points REBAR_CONFIG at this
+%% file and passes the shard's modules, comma-separated, in
+%% YUZU_GW_EUNIT_SHARD_MODULES. Every other rebar3 run reads rebar.config as
+%% usual and never sees this file.
+%%
+%% The result is rebar.config unchanged plus one `eunit_tests` entry, which
+%% rebar3 runs when no test is named on the command line. Each module is
+%% wrapped in `{spawn, {module, M}}` so it runs in its own test process, as
+%% it does under the whole-suite `rebar3 eunit --dir apps/yuzu_gw/test`
+%% (eunit wraps each module of a directory in its own setup group). The
+%% `--module m1,m2` command-line form is NOT equivalent: it runs every module
+%% in ONE shared process, so a link one module leaves behind kills a later
+%% module's tests (measured: a shard cancelled in yuzu_gw_planned_stop_tests'
+%% setup with `::shutdown`). Why the module list is faithful to `--dir`:
+%% scripts/gateway_eunit_shards.py.
+%%
+%% SCRIPT is bound by rebar3 to this file's path; CONFIG (the terms of a
+%% sibling `eunit_shard.config`, which does not exist) is ignored.
+Base = case file:consult(filename:join(filename:dirname(SCRIPT), "rebar.config")) of
+           {ok, Terms} -> Terms;
+           {error, Reason} -> erlang:error({eunit_shard_config, rebar_config_unreadable, Reason})
+       end,
+Mods = [list_to_atom(M)
+        || M <- string:lexemes(os:getenv("YUZU_GW_EUNIT_SHARD_MODULES", ""), ",")],
+case Mods of
+    [] -> erlang:error({eunit_shard_config, no_modules_in_YUZU_GW_EUNIT_SHARD_MODULES});
+    _ -> ok
+end,
+lists:keystore(eunit_tests, 1, Base, {eunit_tests, [{spawn, {module, M}} || M <- Mods]}).

@@ -23,7 +23,7 @@ You are the first agent consulted when planning cross-module changes. You design
 ## Responsibilities
 
 - **Cross-module changes** — Review any change spanning >2 directories. Evaluate whether new logic belongs in an existing module or warrants a new one.
-- **Proto backward compatibility** — Guard protobuf field number stability. No field removals. No field type changes. Deprecate with `reserved` statements.
+- **Proto backward compatibility** — Guard protobuf field number stability. No field type changes. Nothing is ever deleted from a `.proto` — not fields, oneofs, enum values, messages, enums, RPCs, services or files, and not even with `reserved` (owner ruling 2026-10-26, #6555). Retire by ceasing to use it and marking it `[deprecated = true]` / `option deprecated = true;` where protobuf has that option (a oneof has none: deprecate its fields). Moving a type to another file counts as a deletion. `deprecated` is metadata only, so a security-motivated RPC retirement must also remove every handler that serves it: the server's, the gateway's, and any upstream RPC the gateway forwards it through (each removed handler then answers UNIMPLEMENTED). Enforced by the `*_NO_DELETE` rules in `proto/buf.yaml`. A deletion that reaches dev is reverted; a deliberate removal needs a new owner ruling and the scoped `ignore_only` procedure in `proto/buf.yaml`.
 - **Plugin ABI stability** — Guard `plugin.h` struct layouts and `YUZU_PLUGIN_ABI_VERSION`. Any ABI change requires version increment with migration plan.
 - **Dependency direction** — Enforce that dependencies flow downward: server → proto, agent → proto, agent → sdk. No circular dependencies. No upward references.
 - **Meson dependency graph** — Approve changes to `meson.build` that add new library dependencies or change the build graph.
@@ -59,7 +59,7 @@ You perform a targeted review when a change:
 
 When reviewing another agent's Change Summary:
 - [ ] Does the change respect module boundaries?
-- [ ] Are proto changes backward-compatible (no field removals, no type changes)?
+- [ ] Are proto changes backward-compatible (nothing deleted from any `.proto`, even with `reserved`; no type changes)?
 - [ ] Is the ABI version unchanged, or properly incremented?
 - [ ] Does the dependency graph remain acyclic?
 - [ ] Is new code in the right namespace and directory?

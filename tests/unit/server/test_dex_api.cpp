@@ -27,6 +27,7 @@
 #include "runtime_config_store.hpp"    // the real policy store behind the production reader
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
@@ -41,6 +42,7 @@
 #include <string>
 #include <vector>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 using yuzu::server::build_dex_device_score_model;
@@ -49,6 +51,7 @@ using yuzu::server::GuaranteedStateEventRow;
 using yuzu::server::GuaranteedStateStore;
 using yuzu::server::make_local_dex_api;
 using yuzu::server::pg::PgPool;
+using Catch::Approx;
 
 namespace {
 
@@ -132,6 +135,31 @@ TEST_CASE("DexApi: null store is the honest degrade, never a throw", "[pg][dex_a
     CHECK(api->device_score("a1", "7d").score == -1);
     CHECK(api->apps("7d").apps.empty());
     CHECK(api->apps("7d").degraded); // a null store is a degrade, never an empty healthy list
+}
+
+// An unknown platform scope is refused before any store, policy or fleet work, so no
+// Postgres is needed. The refusal warning is constant text (no token echo) and throttled:
+// the immediate repeat is demoted (RefusalLogThrottle's interval is 60 s).
+TEST_CASE("DexApi: apps with an unknown platform scope degrades invalid_scope and warns once",
+          "[dex][dex_api]") {
+    auto api = make_local_dex_api(/*store=*/nullptr, /*fleet_fn=*/{});
+    std::string log;
+    {
+        yuzu::test::LogCapture cap;
+        for (int i = 0; i < 2; ++i) {
+            const auto m = api->apps("7d", "darwin");
+            CHECK(m.degraded);
+            CHECK(m.degraded_reason == "invalid_scope");
+        }
+        cap.stop();
+        log = cap.text();
+    }
+    const std::string line = "DexApi::apps: platform scope refused (invalid_scope)";
+    std::size_t n = 0;
+    for (auto p = log.find(line); p != std::string::npos; p = log.find(line, p + 1))
+        ++n;
+    CHECK(n == 1);
+    CHECK(log.find("darwin") == std::string::npos);
 }
 
 // An unavailable policy answers before the fleet snapshot is taken (no wasted work). No
@@ -365,6 +393,18 @@ yuzu::server::DexFleet fleet20() {
     for (int i = 0; i < 15; ++i)
         f.connected_agents.emplace_back("idle-" + std::to_string(i), "windows");
     f.total_online = 20;
+    return f;
+}
+
+// fleet20's Windows devices plus two Linux (l1, l2) and one macOS (m1) device.
+yuzu::server::DexFleet fleet23() {
+    auto f = fleet20();
+    f.connected_agents.emplace_back("l1", "linux");
+    f.connected_agents.emplace_back("l2", "linux");
+    f.connected_agents.emplace_back("m1", "macos");
+    f.linux_online = 2;
+    f.macos_online = 1;
+    f.total_online = 23;
     return f;
 }
 
@@ -726,6 +766,142 @@ TEST_CASE("DexApi: apps counts Windows rows only", "[pg][dex][apps_model]") {
     CHECK(m.apps[0].version_count == 2);
 }
 
+// A platform scope answers over that scope's online devices only; the population
+// and every figure move together.
+TEST_CASE("DexApi: apps platform scope", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    for (int i = 1; i <= 3; ++i)
+        seed_obs_v(store, "lxo" + std::to_string(i), "l1", "linux-only.bin", "process.crashed", "1.0",
+                   kTs, "linux");
+    for (int i = 1; i <= 2; ++i)
+        seed_obs_v(store, "mco" + std::to_string(i), "m1", "macos-only.app", "process.crashed", "1.0",
+                   kTs, "macos");
+    auto api = make_local_dex_api(&store, fleet23);
+
+    const auto win = api->apps("7d");
+    REQUIRE_FALSE(win.degraded);
+    CHECK(win.population == 20);
+    REQUIRE(win.apps.size() == 2);
+    CHECK(win.apps[0].subject == "app.exe");
+    CHECK(win.apps[1].subject == "aardvark.exe");
+
+    const auto all = api->apps("7d", "all");
+    REQUIRE_FALSE(all.degraded);
+    CHECK(all.population == 23);
+    CHECK(all.apps_total == 4);
+    REQUIRE(all.apps.size() == 4);
+    for (const auto& a : all.apps)
+        if (a.subject == "linux-only.bin") {
+            REQUIRE(a.figures.share_affected);
+            CHECK(a.figures.share_affected->estimate == yuzu::server::dex_proportion(1, 23)->estimate);
+        }
+
+    const auto lin = api->apps("7d", "linux");
+    REQUIRE_FALSE(lin.degraded);
+    CHECK(lin.population == 2);
+    REQUIRE(lin.apps.size() == 1);
+    CHECK(lin.apps[0].subject == "linux-only.bin");
+
+    const auto mac = api->apps("7d", "macos");
+    REQUIRE_FALSE(mac.degraded);
+    CHECK(mac.population == 1);
+    REQUIRE(mac.apps.size() == 1);
+    CHECK(mac.apps[0].subject == "macos-only.app");
+}
+
+TEST_CASE("DexApi: apps windows scope is byte-identical to the one-argument read",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    seed_obs_v(store, "lxo1", "l1", "linux-only.bin", "process.crashed", "1.0", kTs, "linux");
+    auto api = make_local_dex_api(&store, fleet23);
+    const auto implicit = api->apps("7d");
+    const auto windows = api->apps("7d", "windows");
+    REQUIRE_FALSE(windows.degraded);
+    CHECK(yuzu::server::dex_apps_json(implicit) == yuzu::server::dex_apps_json(windows));
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(windows))["population_basis"] ==
+          "windows_online");
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(api->apps("7d", "all")))["population_basis"] ==
+          "all_online");
+    // The additive key: the windows read (both spellings) carries one key, all carries three.
+    const auto wj = nlohmann::json::parse(yuzu::server::dex_apps_json(windows));
+    CHECK(wj["crash_source_coverage"] == nlohmann::json{{"windows", "complete"}});
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(implicit))["crash_source_coverage"] ==
+          wj["crash_source_coverage"]);
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(api->apps("7d", "all")))["crash_source_coverage"] ==
+          nlohmann::json{{"windows", "complete"}, {"linux", "partial"}, {"macos", "partial"}});
+}
+
+// A Linux or macOS scope with signals but no connected device in it: the subject is
+// listed, nothing is shared or scored against a zero population.
+TEST_CASE("DexApi: apps on an empty Linux fleet and an empty macOS fleet", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    seed_obs_v(store, "lxe1", "l9", "linux-only.bin", "process.crashed", "1.0", kTs, "linux");
+    seed_obs_v(store, "mce1", "m9", "macos-only.app", "process.crashed", "1.0", kTs, "macos");
+    auto api = make_local_dex_api(&store, fleet20); // Windows devices only
+    for (const auto& [scope, subject] :
+         {std::pair<const char*, const char*>{"linux", "linux-only.bin"}, {"macos", "macos-only.app"}}) {
+        const auto m = api->apps("7d", scope);
+        REQUIRE_FALSE(m.degraded);
+        CHECK(m.population == 0);
+        REQUIRE(m.apps.size() == 1);
+        CHECK(m.apps[0].subject == subject);
+        CHECK(m.apps[0].figures.distinct_devices_online == 0);
+        CHECK_FALSE(m.apps[0].figures.share_affected);
+        CHECK_FALSE(m.apps[0].figures.rate_per_1000);
+        CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+    }
+    CHECK(api->apps("7d", "windows").population == 20);
+}
+
+TEST_CASE("DexApi: apps with an invalid scope is degraded before policy or fleet",
+          "[dex][dex_api]") {
+    int fleet_calls = 0;
+    int policy_calls = 0;
+    auto api = make_local_dex_api(
+        /*store=*/nullptr,
+        [&fleet_calls] {
+            ++fleet_calls;
+            return yuzu::server::DexFleet{};
+        },
+        [&policy_calls]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+            ++policy_calls;
+            return yuzu::server::DexPolicyInForce{};
+        });
+    for (const char* bad : {"", "darwin", "Windows"}) {
+        const auto m = api->apps("7d", bad);
+        CHECK(m.degraded);
+        CHECK(m.degraded_reason == "invalid_scope");
+    }
+    CHECK(fleet_calls == 0);
+    CHECK(policy_calls == 0);
+}
+
+TEST_CASE("DexApi: apps all scope without a FleetFn has an unknown population",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    const auto m = make_local_dex_api(&store, {})->apps("7d", "all");
+    REQUIRE_FALSE(m.degraded);
+    CHECK_FALSE(m.population);
+    REQUIRE_FALSE(m.apps.empty());
+    CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+}
+
 // 102 subjects: the top 100 by devices affected then activity are kept, ties fall
 // to subject order, and the cut is made on that rank, not on name.
 TEST_CASE("DexApi: apps keeps the top 100 applications by activity", "[pg][dex][apps_model]") {
@@ -798,7 +974,7 @@ TEST_CASE("DexApi: apps top-N membership is devices affected, not raw events",
     }
     CHECK(totals == 2);
     CHECK(widespread);
-    const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20,
+    const auto m = yuzu::server::dex_apps_model_from_rows("7d", yuzu::server::kDexAppsScopeWindows, *rows, 20,
                                                           yuzu::server::DexPolicyInForce{});
     CHECK(m.apps_total == 4);
     CHECK(m.apps_truncated);
@@ -917,7 +1093,7 @@ TEST_CASE("DexApi: apps store cuts rank by devices, then events, then byte-order
         for (int limit : {3, 2}) {
             const auto rows = store.dex_app_stability_checked(since, "windows", limit, 20, 5, {});
             REQUIRE(rows);
-            const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20, policy);
+            const auto m = yuzu::server::dex_apps_model_from_rows("7d", yuzu::server::kDexAppsScopeWindows, *rows, 20, policy);
             CHECK(m.apps_total == 3);
             CHECK(m.apps_truncated == (limit == 2));
         }
@@ -1038,4 +1214,164 @@ TEST_CASE("DexApi: apps read over its concurrency budget is refused as a degrade
     store.set_apps_read_budget_for_test(1);
     CHECK_FALSE(api->apps("7d").degraded);
     CHECK_FALSE(api->apps("7d").degraded);
+}
+
+// -- AP-2.17 model parameters --------------------------------------------------
+
+// The per-device event cap reaches the store per application: capme.exe has 7 crashes on
+// a1 and 1 on a2 (both in fleet20's online set, so the affected devices are all online and
+// the score is published). The crashes deduction is 20 * capped / (20 * cap) and the hangs
+// deduction 8 * capped / (20 * cap). Hangs above the cap and a second version of capme.exe
+// (and of the unaffected app.exe) cover the per-version caps and the once-per-application
+// cap: capped events are summed per device and version for a version row, and per device
+// across versions for the application row.
+TEST_CASE("DexApi: a per-application event cap override reaches the store", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    int n = 0;
+    auto id = [&] { return "cap" + std::to_string(++n); };
+    for (int i = 0; i < 7; ++i)
+        seed_obs_v(store, id(), "a1", "capme.exe", "process.crashed", "1.0", kTs);
+    seed_obs_v(store, id(), "a2", "capme.exe", "process.crashed", "1.0", kTs);
+    // The store keeps a subject's bytes, so this is its own row; the policy still folds
+    // its name to capme.exe.
+    for (int i = 0; i < 3; ++i)
+        seed_obs_v(store, id(), "a3", "CapMe.EXE", "process.crashed", "1.0", kTs);
+    // Hangs, and a second version. Per (version, device) crash/hang counts for capme.exe:
+    //   1.0: a1 7/6, a2 1/1, a4 3/3        2.0: a1 4/4, a4 3/3
+    // a4 stays under cap 5 in each version but sums to 6 across them; CapMe.EXE: a3 3/4.
+    const auto seed_n = [&](const char* agent, const char* app, const char* type, const char* ver,
+                            int count) {
+        for (int i = 0; i < count; ++i)
+            seed_obs_v(store, id(), agent, app, type, ver, kTs);
+    };
+    seed_n("a1", "capme.exe", "process.hung", "1.0", 6);
+    seed_n("a2", "capme.exe", "process.hung", "1.0", 1);
+    seed_n("a4", "capme.exe", "process.crashed", "1.0", 3);
+    seed_n("a4", "capme.exe", "process.hung", "1.0", 3);
+    seed_n("a1", "capme.exe", "process.crashed", "2.0", 4);
+    seed_n("a1", "capme.exe", "process.hung", "2.0", 4);
+    seed_n("a4", "capme.exe", "process.crashed", "2.0", 3);
+    seed_n("a4", "capme.exe", "process.hung", "2.0", 3);
+    seed_n("a3", "CapMe.EXE", "process.hung", "1.0", 4);
+    // A subject that differs from the override key "capmi.exe" only by a non-ASCII byte pair
+    // (U+0130): a locale-aware lower() can fold it to ASCII "i", the ASCII-only fold must not.
+    seed_n("a3", "CAPM\xC4\xB0.EXE", "process.crashed", "1.0", 4);
+    // The unaffected control: a2 hangs 3 on each of app.exe's two versions (6 across them).
+    seed_n("a2", "app.exe", "process.hung", "1.0.0.0", 3);
+    seed_n("a2", "app.exe", "process.hung", "2.0.0.0", 3);
+    using yuzu::server::DexAppsModel;
+    using yuzu::server::DexPolicyInForce;
+    using yuzu::server::DexPolicyProfile;
+
+    const auto apps_under = [&](const std::string& doc) {
+        auto fn = [doc]() -> std::expected<DexPolicyInForce, std::string> {
+            return yuzu::server::dex_policy_in_force_from_stored(doc);
+        };
+        return make_local_dex_api(&store, fleet20, fn)->apps("7d");
+    };
+    const auto row = [](const DexAppsModel& m, const std::string& subject) -> decltype(m.apps.front()) {
+        const auto it = std::find_if(m.apps.begin(), m.apps.end(),
+                                     [&](const auto& a) { return a.subject == subject; });
+        REQUIRE(it != m.apps.end());
+        return *it;
+    };
+    const auto crashes_points = [](const auto& a) {
+        REQUIRE(a.figures.score.score.has_value());
+        return a.figures.score.deductions[1].points;
+    };
+    const auto hangs_points = [](const auto& a) {
+        REQUIRE(a.figures.score.score.has_value());
+        return a.figures.score.deductions[2].points;
+    };
+    const auto version_of = [](const auto& a, const std::string& v) -> const auto& {
+        const auto it = std::find_if(a.versions.begin(), a.versions.end(),
+                                     [&](const auto& x) { return x.version == v; });
+        REQUIRE(it != a.versions.end());
+        return *it;
+    };
+
+    // Default policy (cap 5). capme.exe application row: a1 5, a2 1, a4 min(6, 5) = 5 capped
+    // crashes (11) and, the same, 11 capped hangs; 1.0 row 5+1+3 = 9, 2.0 row 4+3 = 7 (both
+    // kinds). The unfolded subject: 3 crashes, 4 hangs.
+    const auto base = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE_FALSE(base.degraded);
+    CHECK(crashes_points(row(base, "capme.exe")) == Approx(20.0 * 11 / (20 * 5)));
+    CHECK(hangs_points(row(base, "capme.exe")) == Approx(8.0 * 11 / (20 * 5)));
+    CHECK(crashes_points(version_of(row(base, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 9 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 9 / (20 * 5)));
+    CHECK(crashes_points(version_of(row(base, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 7 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 7 / (20 * 5)));
+    CHECK(crashes_points(row(base, "CapMe.EXE")) == Approx(20.0 * 3 / (20 * 5)));
+    CHECK(hangs_points(row(base, "CapMe.EXE")) == Approx(8.0 * 4 / (20 * 5)));
+    // app.exe hangs: 1.0.0.0 a1 1 + a2 3 = 4, 2.0.0.0 a2 3, application a1 1 + a2 min(6, 5) = 6.
+    CHECK(hangs_points(row(base, "app.exe")) == Approx(8.0 * 6 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "app.exe"), "1.0.0.0")) == Approx(8.0 * 4 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "app.exe"), "2.0.0.0")) == Approx(8.0 * 3 / (20 * 5)));
+    CHECK(row(base, "capme.exe").profile == DexPolicyProfile::Default);
+    const double app_exe_base = crashes_points(row(base, "app.exe"));
+
+    // An override for capme.exe (cap 2): the application row a1 2, a2 1, a4 2 = 5 (a4's two
+    // versions are capped once, not 2 + 2); 1.0 row 2+1+2 = 5, 2.0 row 2+2 = 4, for both kinds.
+    const auto over = apps_under(
+        R"({"version":2,"overrides":[{"image":"capme.exe","model":{"per_device_event_cap":2}}]})");
+    REQUIRE_FALSE(over.degraded);
+    CHECK(over.policy.fault.empty());
+    CHECK(crashes_points(row(over, "capme.exe")) == Approx(20.0 * 5 / (20 * 2)));
+    CHECK(hangs_points(row(over, "capme.exe")) == Approx(8.0 * 5 / (20 * 2)));
+    CHECK(crashes_points(version_of(row(over, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 5 / (20 * 2)));
+    CHECK(hangs_points(version_of(row(over, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 5 / (20 * 2)));
+    CHECK(crashes_points(version_of(row(over, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 4 / (20 * 2)));
+    CHECK(hangs_points(version_of(row(over, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 4 / (20 * 2)));
+    CHECK(row(over, "capme.exe").profile == DexPolicyProfile::Override);
+    // The ASCII fold in SQL and in the resolver agree: the unfolded subject gets the override too.
+    CHECK(crashes_points(row(over, "CapMe.EXE")) == Approx(20.0 * 2 / (20 * 2)));
+    CHECK(hangs_points(row(over, "CapMe.EXE")) == Approx(8.0 * 2 / (20 * 2)));
+    CHECK(row(over, "CapMe.EXE").profile == DexPolicyProfile::Override);
+    // Sibling of the ASCII fold: a non-ASCII-different subject neither matches nor gets the
+    // override (a lower()-based join would give it cap 2).
+    const auto ovi = apps_under(
+        R"({"version":2,"overrides":[{"image":"capmi.exe","model":{"per_device_event_cap":2}}]})");
+    REQUIRE_FALSE(ovi.degraded);
+    CHECK(row(ovi, "CAPM\xC4\xB0.EXE").profile == DexPolicyProfile::Default);
+    CHECK(crashes_points(row(ovi, "CAPM\xC4\xB0.EXE")) == Approx(20.0 * 4 / (20 * 5)));
+    // Other applications keep the global cap.
+    CHECK(crashes_points(row(over, "app.exe")) == Approx(app_exe_base));
+    CHECK(hangs_points(row(over, "app.exe")) == Approx(8.0 * 6 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(over, "app.exe"), "1.0.0.0")) == Approx(8.0 * 4 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(over, "app.exe"), "2.0.0.0")) == Approx(8.0 * 3 / (20 * 5)));
+    CHECK(row(over, "app.exe").profile == DexPolicyProfile::Default);
+
+    // A global cap of 1 with no override: application row 1+1+1 = 3, 1.0 row 3, 2.0 row 2.
+    const auto glob = apps_under(R"({"version":2,"model":{"per_device_event_cap":1}})");
+    REQUIRE_FALSE(glob.degraded);
+    CHECK(crashes_points(row(glob, "capme.exe")) == Approx(20.0 * 3 / (20 * 1)));
+    CHECK(hangs_points(row(glob, "capme.exe")) == Approx(8.0 * 3 / (20 * 1)));
+    CHECK(crashes_points(version_of(row(glob, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 3 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 3 / (20 * 1)));
+    CHECK(crashes_points(version_of(row(glob, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 2 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 2 / (20 * 1)));
+    CHECK(row(glob, "capme.exe").profile == DexPolicyProfile::Default);
+    // app.exe hangs at cap 1: 1.0.0.0 a1 1 + a2 1 = 2, 2.0.0.0 a2 1, application a1 1 + a2 1 = 2.
+    CHECK(hangs_points(row(glob, "app.exe")) == Approx(8.0 * 2 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "app.exe"), "1.0.0.0")) == Approx(8.0 * 2 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "app.exe"), "2.0.0.0")) == Approx(8.0 * 1 / (20 * 1)));
+
+    // A global cap of 1 with an override of 3: capme.exe takes the override (application row
+    // 3+1+3 = 7, 1.0 row 7, 2.0 row 3+3 = 6, both kinds), app.exe keeps the global 1.
+    const auto mixed = apps_under(
+        R"({"version":2,"model":{"per_device_event_cap":1},)"
+        R"("overrides":[{"image":"capme.exe","model":{"per_device_event_cap":3}}]})");
+    REQUIRE_FALSE(mixed.degraded);
+    CHECK(crashes_points(row(mixed, "capme.exe")) == Approx(20.0 * 7 / (20 * 3)));
+    CHECK(hangs_points(row(mixed, "capme.exe")) == Approx(8.0 * 7 / (20 * 3)));
+    CHECK(crashes_points(version_of(row(mixed, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 7 / (20 * 3)));
+    CHECK(hangs_points(version_of(row(mixed, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 7 / (20 * 3)));
+    CHECK(crashes_points(version_of(row(mixed, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 6 / (20 * 3)));
+    CHECK(hangs_points(version_of(row(mixed, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 6 / (20 * 3)));
+    CHECK(hangs_points(row(mixed, "CapMe.EXE")) == Approx(8.0 * 3 / (20 * 3)));
+    CHECK(hangs_points(row(mixed, "app.exe")) == Approx(8.0 * 2 / (20 * 1)));
 }

@@ -3,9 +3,8 @@
 %%%
 %%% These tests verify end-to-end behaviour of the gateway modules
 %%% (registry, upstream, router) with a mocked gRPC layer.  The
-%%% upstream C++ server is replaced by meck stubs on grpcbox_channel
-%%% and grpcbox_client that return canned responses, so no external
-%%% process is needed.
+%%% upstream C++ server is replaced by a meck stub on yuzu_grpc_client that returns canned
+%%% responses, so no external process is needed.
 %%%
 %%% Configuration:
 %%%   YUZU_FULLSTACK_AGENTS — concurrent agent count (default 20)
@@ -38,7 +37,6 @@ suite() ->
 init_per_suite(Config) ->
     %% Start dependencies.
     ok = ensure_started(ctx),
-    ok = ensure_started(gproc),
 
     %% Mock the gRPC transport layer so we never hit a real server.
     ok = setup_upstream_mocks(),
@@ -88,8 +86,7 @@ end_per_suite(_Config) ->
     catch _:_ -> ok
     end,
     %% Unload mocks.
-    catch meck:unload(grpcbox_channel),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     ok.
 
 init_per_testcase(_TC, Config) ->
@@ -346,7 +343,7 @@ ensure_started(App) ->
         {error, Reason}    -> {error, Reason}
     end.
 
-%% @doc Mock grpcbox_channel and grpcbox_client so that
+%% @doc Mock yuzu_grpc_client so that
 %% yuzu_gw_upstream's do_rpc/3 gets canned responses without
 %% needing a real gRPC server.
 %%
@@ -356,14 +353,10 @@ ensure_started(App) ->
 %%   "/yuzu.gateway.v1.GatewayUpstream/ProxyInventory"
 %%   "/yuzu.gateway.v1.GatewayUpstream/NotifyStreamStatus"
 setup_upstream_mocks() ->
-    %% grpcbox_channel:pick/2 is called internally by grpcbox_client.
-    meck:new(grpcbox_channel, [non_strict, no_link]),
-    meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
-
-    %% grpcbox_client:unary/5 is the actual RPC call site.
+    %% yuzu_grpc_client:unary/5 is the actual RPC call site.
     SessionCounter = atomics:new(1, []),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_Ctx, Path, Req, _Def, _Opts) ->
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_Meta, Path, Req, _Def, _Opts) ->
         mock_upstream_rpc(Path, Req, SessionCounter)
     end),
     ok.

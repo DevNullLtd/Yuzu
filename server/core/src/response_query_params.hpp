@@ -143,7 +143,7 @@ inline constexpr int kQueryRowLimitCap = 1000;
 /// `GET /api/v1/executions/{id}/responses`: each at most 1000 rows, no byte bound) and the
 /// dashboard `/fragments/results` FILTERED branch (it reads by response id); none of those goes
 /// through `query_bounded`. The execution visualization route, the `/fragments/results`
-/// unfiltered read and the TAR scan-page read DO (#4644, row 6a), each reporting a cut
+/// unfiltered read and the Echo scan-page read DO (#4644, row 6a), each reporting a cut
 /// explicitly. Other internal reads are likewise unbounded by
 /// bytes and take their limit from something other than a request parameter; for example
 /// (not an exhaustive list) server.cpp's fleet visualization snapshot collect poll
@@ -161,6 +161,18 @@ inline constexpr std::size_t kExportBodyByteCap = 50u * 1024u * 1024u;
 /// object across every TU that includes this header).
 inline std::atomic<std::size_t>& export_body_byte_cap() {
     static std::atomic<std::size_t> cap{kExportBodyByteCap};
+    return cap;
+}
+
+/// Row bound for the `/fragments/results` read, filtered (the facet-id lookup) and unfiltered
+/// alike. The filtered read asks for one row more than this so a cut is detectable; production
+/// reads the default and a unit test lowers it so truncation is reachable without storing
+/// 10,000 responses.
+inline constexpr int kResultsRowCap = 10000;
+
+/// Test seam over `kResultsRowCap`, same shape as `export_body_byte_cap()`.
+inline std::atomic<int>& results_row_cap() {
+    static std::atomic<int> cap{kResultsRowCap};
     return cap;
 }
 

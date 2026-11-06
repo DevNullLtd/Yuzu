@@ -2,7 +2,7 @@
  * test_web_utils.cpp — Unit tests for server web utility functions
  *
  * Covers: base64_decode, html_escape, url_decode, extract_form_value,
- *         form_value_supplied, extract_plugin
+ *         form_value_supplied
  */
 
 #include "mcp_jsonrpc.hpp"
@@ -678,36 +678,6 @@ TEST_CASE("form_value_supplied: the real key after a decoy suffix key IS a match
     CHECK(form_value_supplied("myscope=x&scope=", "scope"));
 }
 
-// ── extract_plugin ──────────────────────────────────────────────────────────
-
-TEST_CASE("extract_plugin: standard command_id with timestamp", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("chargen-12345") == "chargen");
-    REQUIRE(extract_plugin("netstat-98765") == "netstat");
-    REQUIRE(extract_plugin("hardware-1234567890") == "hardware");
-}
-
-TEST_CASE("extract_plugin: no dash returns whole string", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("chargen") == "chargen");
-    REQUIRE(extract_plugin("netstat") == "netstat");
-}
-
-TEST_CASE("extract_plugin: empty string", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("") == "");
-}
-
-TEST_CASE("extract_plugin: multiple dashes uses first", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("my-plugin-12345") == "my");
-}
-
-TEST_CASE("extract_plugin: dash at start", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("-12345") == "");
-}
-
-TEST_CASE("extract_plugin: underscore plugin name", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("vuln_scan-12345") == "vuln_scan");
-    REQUIRE(extract_plugin("script_exec-12345") == "script_exec");
-}
-
 // ── Time formatters ─────────────────────────────────────────────────────────
 //
 // format_iso_utc and format_relative_time anchor the executions surface; the
@@ -953,6 +923,21 @@ TEST_CASE("audit_token: neutralises k=v structural delimiters + control bytes",
     CHECK(audit_token(std::string("a\r\nb")) == "a__b");
     CHECK(audit_token(std::string("a\x7F" "b")) == "a_b");
     CHECK(audit_token(std::string("a\tb")) == "a_b");
+}
+
+TEST_CASE("flatten_audit_text: one line, trailing whitespace dropped, nothing else changed",
+          "[web_utils][audit]") {
+    CHECK(flatten_audit_text("") == "");
+    CHECK(flatten_audit_text("plain text") == "plain text");
+    // A libpq message: trailing newline, often a second CONTEXT line.
+    CHECK(flatten_audit_text("revoke did not persist: ERROR: boom\n") ==
+          "revoke did not persist: ERROR: boom");
+    CHECK(flatten_audit_text("ERROR: boom\nCONTEXT: PL/pgSQL function f()\n") ==
+          "ERROR: boom CONTEXT: PL/pgSQL function f()");
+    CHECK(flatten_audit_text("a\r\nb\r\n") == "a  b");
+    CHECK(flatten_audit_text("trailing \t \n") == "trailing");
+    // Delimiters are left alone: this is not the caller-value neutraliser.
+    CHECK(flatten_audit_text("k=v, x") == "k=v, x");
 }
 
 // ── mcp_body_exceeds_cap (#2437) ────────────────────────────────────────────
@@ -1262,17 +1247,17 @@ TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
           "[web_utils][agent-error]") {
     // Sol adversarial review. Agent replies are newline-separated records, so a
     // byte-count truncation of the raw output is wrong in both directions.
-    // `tar status`'s offline reply is `error|<long line>` followed by
+    // `echo status`'s offline reply is `error|<long line>` followed by
     // `storage_state|offline`, and the 300-byte window that replaced a 200-byte
     // one ran PAST the newline and rendered a trailing `storage_stat` as debris.
     const std::string offline =
-        "error|TAR storage is offline on this endpoint; the database was closed after a "
+        "error|Echo storage is offline on this endpoint; the database was closed after a "
         "transaction could not be rolled back. Collection and retention are both stopped. The "
-        "read-only query connection is unavailable too, so `tar sql` cannot read the historical "
+        "read-only query connection is unavailable too, so `echo sql` cannot read the historical "
         "data either. Restart the agent to recover.\nstorage_state|offline";
 
     const auto shown = yuzu::server::agent_error_display(offline);
-    CHECK(shown.starts_with("TAR storage is offline")); // prefix stripped
+    CHECK(shown.starts_with("Echo storage is offline")); // prefix stripped
     CHECK(shown.ends_with("Restart the agent to recover."));
     // The whole point: no debris from the NEXT record, at any length.
     CHECK(shown.find("storage_state") == std::string::npos);

@@ -185,10 +185,11 @@ Each column object:
 |---|---|---|---|---|
 | `name` | string | Yes | -- | Column identifier. |
 | `type` | string | Yes | -- | Column type. Values: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`. See [Section 11](#11-result-column-type-system). |
-| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`; the extra keys pass through the embedded `result_schema` untouched. |
+| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`, and the result-set matcher (`result_set_matcher.cpp`) additionally reads `discriminator`; the other extra keys pass through the embedded `result_schema` untouched. |
 | `values` | list of string | No | -- | Documentation only: the closed vocabulary the column may carry (e.g. `[ok, warning, failing, unknown, unsupported]`). Meaningful only on a `string` column. Not enforced at runtime; `tools/plugin-doc-gen` validates the shape of these four keys (a list where a list is meant, `platforms` drawn from the vocabulary below) and fails its `--check` otherwise. |
 | `example` | string | No | -- | Documentation only: one representative value. |
 | `platforms` | list of string | No | -- | Documentation only: the platforms on which the column carries a real value, from `windows`, `linux`, `darwin`. Omitted means every platform the definition lists. |
+| `discriminator` | boolean | No | `false` | Behavioural, first column only (a `string` column; plugin-doc-gen enforces the position and type, the server reads only a boolean on the first column): this column is the wire row's leading discriminator, and the declared columns are the wire fields in order. A result-set column matcher on the instruction then splits each row on every unescaped pipe and binds positionally, taking only a row of exactly the declared width. Without it a key/value plugin's rows are key + remainder and never match a wider declaration, which is also what a stored definition that predates the key keeps doing. Not rendered into the plugin docs; `tools/plugin-doc-gen` validates it. |
 
 #### `spec.result.aggregation`
 
@@ -221,7 +222,7 @@ Each column object:
 server-side representation: `executeRoles`' labels (`endpoint-admin`,
 `security-admin`, ...) are a content-authoring convention that matches no
 seeded RBAC role (`Administrator`/`PlatformEngineer`/`Operator`/
-`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`), and `embed_content.py`
+`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`/`ForensicsAnalyst`), and `embed_content.py`
 drops the entire `permissions` block at build time -- it never reaches the
 running server. Actual execute-time enforcement is `spec.approval.mode` (see
 above); actual author-time enforcement is the `InstructionDefinition:Write`
@@ -779,7 +780,7 @@ Note: For advanced targeting, use the Scope DSL expression language (Section 9) 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `mode` | string | No | `dynamic` | Assignment mode. `dynamic` -- devices matching the scope are continuously included. `static` -- devices are assigned at deployment time and do not change. |
-| `managementGroups` | list of string | No | `[]` | Management group names to which this policy is assigned. |
+| `managementGroups` | list of string | No | `[]` | Management group **ids** (the server-assigned 12-character id, not the display name) to which this policy is assigned. A non-empty list replaces `scope` for targeting. An entry outside letters, digits and `_ . : * -` is refused (#2123). |
 
 #### `spec.fragment`
 
@@ -871,7 +872,8 @@ spec:
   assignment:
     mode: dynamic
     managementGroups:
-      - workstations
+      # the workstations group's id (ids, not names)
+      - 8d41e0c7a2b9
   fragment:
     ref: fragment.service.must_be_running
     with:
@@ -1306,7 +1308,8 @@ from_result_set:rs_01HXYZ AND ostype == "windows"
 ```yaml
 spec:
   scope:
-    fromResultSet: "windows-chrome-suspects"   # id or per-operator alias
+    # fromResultSet: a canonical rs_ id or a per-operator alias
+    fromResultSet: "windows-chrome-suspects"
     selector:                                    # optional refinement (AND-ed)
       platform: windows
       tags:
@@ -1324,6 +1327,7 @@ This lowers to the scope-engine string `from_result_set:windows-chrome-suspects 
 3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned — including a set deleted in the window between the pre-dispatch owner-check gate and the registry's own membership read, closed as a TOCTOU by #4981 PR-1) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and — as of governance M1, 2026-07-29 — **aborts the entire dispatch**: zero devices are targeted, including devices matched by other scope atoms (a paired `scope.evaluation_aborted` row records `reason=owner_check_failed`, or one of `db_degraded`/`principal_unresolved`/`presence_degraded`/`unresolvable` for the other abort classes — see `docs/user-manual/rest-api.md`'s audit-event table for the full vocabulary). The previous behavior (proceed with only that reference zeroed) inverted to a fleet-wide match under a `NOT` combinator and is gone.
 4. `fromResultSet` (id or alias), `selector.platform`, and each `selector.tags` entry must contain only letters, digits, and `_ . : * -` (the scope-ident charset). A space, quote, or operator character is rejected at load — these values are lowered into a scope-engine token, so anything else would produce an unparseable or ambiguous expression. **Choose result-set aliases (`name`) from this charset**; an alias with a space cannot be referenced from a scope.
 5. The `scope:` block must use **block form** (`scope:` on its own line, children indented beneath). Inline flow-mapping (`scope: {fromResultSet: x}`) is rejected — the runtime YAML scanner reads only the block form.
+6. **Lines and lists (#2123).** LF, CRLF and a lone CR are all line breaks; blank and `#` comment lines may appear anywhere and never end a block. A comment may not follow a scalar value on the same line (`fromResultSet: x   # note` keeps the comment in the value, which then fails rule 4); put it on its own line. An inline `[ ]` list (`tags: [a, b]`) must close on its own line, and a block list's `- item` lines must share one indent with no item continued on a following line. Within the `selector:` block, a list line the scanner cannot place — a `- item` off the list's column, a line missing its `- `, a `key:` line deeper than `tags:`, a continued item, an unclosed inline list, an empty-string item, a single value where a list is expected (`tags: prod`), or list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`) — is rejected at load (its raw text fails rule 4), never lowered with that entry missing, since a dropped tag would widen the scope. A `- item` inside `scope:` but outside `selector:` (for example indented to `selector:`'s own column) is rejected with its own error. `tags: null` (or `~`) on its own means no tags. **Not yet refused (tracked for the fail-closed follow-up on #2123):** a list line indented at or shallower than `scope:` itself, a `- item` written after another key (such as `platform:` under `selector:`, or any key after `managementGroups:`), tab characters in indentation, and a `scope:` or `managementGroups:` line inside a multi-line block scalar (`description: |`), which can be read as the real key. Each of these can still drop or replace an entry without an error, widening the policy: keep a list's `- item` lines together, directly under their key, indent with spaces only, and keep those key names out of multi-line values.
 
 > Tag presence (`EXISTS tag:<name>`) requires the tag to have a **non-empty value**; a device carrying a tag with an empty value is treated as not having it.
 
@@ -1766,6 +1770,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.enumerate_values` | `registry` | Y | - | - | Verified |
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
 | `registry.list_profiles` | `registry` | Y | - | - | Verified |
+| `registry.set_user_value` | `registry` | Y | - | - | Verified |
+| `registry.delete_user_value` | `registry` | Y | - | - | Verified |
+| `registry.apply` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
 | `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |
@@ -1830,28 +1837,28 @@ This section enumerates the stable builtin primitives that content authors targe
 | `discovery.ping_sweep` | `discovery` | Y | Y | Y | Verified |
 | `discovery.port_scan` | `discovery` | Y | Y | Y | Verified |
 
-### 14.15 Timeline Activity Record (TAR)
+### 14.15 Echo
 
 | Primitive | Backing Plugin | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
-| `tar.status` | `tar` | Y | Y | Y | Verified |
-| `tar.query` | `tar` | Y | Y | Y | Verified |
-| `tar.snapshot` | `tar` | Y | Y | Y | Verified |
-| `tar.export` | `tar` | Y | Y | Y | Verified |
-| `tar.configure` | `tar` | Y | Y | Y | Verified |
-| `tar.collect_fast` | `tar` | Y | Y | Y | Verified |
-| `tar.collect_slow` | `tar` | Y | Y | Y | Verified |
-| `tar.collect_perf` | `tar` | Y | Y | - | Verified |
-| `tar.sql` | `tar` | Y | Y | Y | Verified |
-| `tar.rollup` | `tar` | Y | Y | Y | Verified |
-| `tar.compatibility` | `tar` | Y | Y | Y | Verified |
-| `tar.fleet_snapshot` | `tar` | Y | Y | Y | Active |
+| `echo.status` | `echo` | Y | Y | Y | Verified |
+| `echo.query` | `echo` | Y | Y | Y | Verified |
+| `echo.snapshot` | `echo` | Y | Y | Y | Verified |
+| `echo.export` | `echo` | Y | Y | Y | Verified |
+| `echo.configure` | `echo` | Y | Y | Y | Verified |
+| `echo.collect_fast` | `echo` | Y | Y | Y | Verified |
+| `echo.collect_slow` | `echo` | Y | Y | Y | Verified |
+| `echo.collect_perf` | `echo` | Y | Y | - | Verified |
+| `echo.sql` | `echo` | Y | Y | Y | Verified |
+| `echo.rollup` | `echo` | Y | Y | Y | Verified |
+| `echo.compatibility` | `echo` | Y | Y | Y | Verified |
+| `echo.fleet_snapshot` | `echo` | Y | Y | Y | Active |
 
-**`tar.compatibility`** -- Emit the live OS compatibility matrix for every registered capture source (process, tcp, service, user, perf, procperf, netqual, module, software, arp, dns, netconn, mapdrive, power, removable, usage). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`; the mechanism actually in force is reported as `network_capture_method_effective` by the `status` action (always `polling` today).
+**`echo.compatibility`** -- Emit the live OS compatibility matrix for every registered capture source (process, tcp, service, user, perf, procperf, netqual, module, software, arp, dns, netconn, mapdrive, power, removable, usage). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`; the mechanism actually in force is reported as `network_capture_method_effective` by the `status` action (always `polling` today).
 
-**`tar.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (on by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `tar|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: a tick whose core counter read fails (e.g. a hardened container masking `/proc/stat` on Linux, or an NT-counter read failure on Windows) reports `counters_unavailable` on any OS the registry lists as supported for `perf`/`procperf`, and `unsupported_platform` only where no perf collector exists (macOS today) — so a supported platform whose reads are failing is distinguishable from an unsupported one. The per-source streak is in `tar.status` (`perf_last_status` / `perf_consecutive_failures`, and identically `procperf_last_status` / `procperf_consecutive_failures`). The first sample after agent start is a baseline (records no row). See [the TAR user manual](user-manual/tar.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
+**`echo.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (on by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `echo|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: a tick whose core counter read fails (e.g. a hardened container masking `/proc/stat` on Linux, or an NT-counter read failure on Windows) reports `counters_unavailable` on any OS the registry lists as supported for `perf`/`procperf`, and `unsupported_platform` only where no perf collector exists (macOS today) — so a supported platform whose reads are failing is distinguishable from an unsupported one. The per-source streak is in `echo.status` (`perf_last_status` / `perf_consecutive_failures`, and identically `procperf_last_status` / `procperf_consecutive_failures`). The first sample after agent start is a baseline (records no row). See [the Echo user manual](user-manual/echo.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
 
-**`tar.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
+**`echo.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
 
 ### 14.16 Test and Debug
 

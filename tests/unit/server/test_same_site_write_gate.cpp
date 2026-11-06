@@ -16,7 +16,7 @@
  * Every refusal case asserts: status 403, the A4 envelope (code, message, remediation, no
  * permission field, correlation id), exactly one audit row whose detail carries the closed-set
  * reason token, exactly one counter increment on the right series, and that neither the route
- * handler nor the pre-request stage ran. On Windows a lost early-4xx response (#2757, see
+ * handler nor the after-routing witness hook ran. On Windows a lost early-4xx response (#2757, see
  * test_loopback_http.hpp) skips the response-level assertions but never the row, counter and
  * handler deltas.
  *
@@ -259,8 +259,10 @@ struct Pipeline {
             return httplib::Server::HandlerResponse::Unhandled;
         });
 
-        // Runs only after a route matched (httplib dispatch), so it is the witness that a
-        // refusal precedes everything past routing.
+        // A witness counter only: it runs after a route matched (httplib dispatch), so it shows
+        // that a refusal precedes everything past routing. The production post-read stage is NOT
+        // modelled here; it is installed through PostReadStageRegistry and HttplibRouteSink (see
+        // post_read_stage_test_support.hpp).
         svr.set_pre_request_handler([this](const httplib::Request&, httplib::Response&)
                                         -> httplib::Server::HandlerResponse {
             pre_request_hits.fetch_add(1);
@@ -434,7 +436,7 @@ std::optional<httplib::Response> expect_refused(Pipeline& f, const std::string& 
         CHECK(r.detail == refusal_detail(reason));
     }
     CHECK(f.handler_hits.load() == before.hits);    // no route handler ran
-    CHECK(f.pre_request_hits.load() == before.pre); // no pre-request stage ran
+    CHECK(f.pre_request_hits.load() == before.pre); // no after-routing hook ran
     CHECK(f.gate_rejections.load() == before.gate + 1);
     CHECK(f.total() == before.total + 1);
     CHECK(f.series(cls, reason) == before.series + 1);
@@ -785,7 +787,7 @@ TEST_CASE("same-site pipeline: each refusal is counted exactly once on its own s
     CHECK(f.row_count() == 4);
 }
 
-TEST_CASE("same-site pipeline: a refusal precedes the pre-request stage and the route handler",
+TEST_CASE("same-site pipeline: a refusal precedes the after-routing hook and the route handler",
           "[csrf][same_site][pipeline]") {
     Pipeline f;
     const int witness0 = f.gate_rejections.load();
@@ -992,9 +994,10 @@ TEST_CASE("same-site pipeline: oversized and control-byte headers are refused wi
     expect_admitted(f, "POST", kCanary, {{"Cookie", kCookieOk}, {"Origin", f.origin()}});
 }
 
-#endif // YUZU_TSAN_BUILD
-
 // -- Guarded reads -----------------------------------------------------------------------------
+// Inside the TSan guard like everything above: these cases build the same `Pipeline` fixture, so
+// they cannot sit after the guard's `#endif` (#6419). tests/test_tsan_whole_file_guard.py fails
+// the docs-suite gate if code is ever added after that `#endif`.
 
 TEST_CASE("same-site pipeline: a guarded read with cross-site fetch metadata is refused",
           "[csrf][same_site][pipeline]") {
@@ -1166,3 +1169,5 @@ TEST_CASE("same-site pipeline: near-miss spellings of a table path never reach t
     }
 }
 #endif
+
+#endif // YUZU_TSAN_BUILD

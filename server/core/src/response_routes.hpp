@@ -63,6 +63,7 @@
 ///                                      MUST register LAST
 
 #include "authz_gates.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 
 #include <yuzu/server/auth.hpp>
 
@@ -101,6 +102,12 @@ struct Deps {
     /// `ServerImpl::response_store_`. Null or `!is_open()` -> every route
     /// answers 503 without touching it.
     ResponseStore* store{nullptr};
+    /// #4990: `ServerImpl::forensics_plugin_set_` (null = unwired: the routes then refuse every
+    /// row, see `tier_filter_for`). Feeds the `ResponseTierFilter` every store read takes.
+    const ForensicsPluginSet* forensics_plugins{nullptr};
+    /// #4990: who may read Forensics-plugin rows (see `forensics_visibility.hpp`). Unwired (empty)
+    /// resolves to present-empty at the use site.
+    ForensicsVisibilityFn forensics_visibility_fn;
     /// `ServerImpl::metrics_`. Null is allowed (tests): the #4644/#4703 counters are skipped.
     yuzu::MetricsRegistry* metrics{nullptr};
 };

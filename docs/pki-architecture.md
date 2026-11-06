@@ -35,16 +35,27 @@ peer can use to tell the **server** from a **gateway**, whose CA-signed leaf sha
 other SAN with it. Nothing an agent or gateway can send can obtain it: `sign_agent_csr`
 ignores the CSR's subject, SAN and EKU and only ever emits `yuzu://<ca-fingerprint>/agent/<id>`
 with clientAuth only, and `--cert-san` accepts DNS/IP values only. Operator-supplied
-certificates, `--no-default-certs`, and the `--mgmt-tls-server-*` override never carry it.
-This release only mints it; the gateway management plane does not check it yet and
-still admits the server by SPKI pin. A later release will check the URI (#6016).
+certificates, `--no-default-certs`, and a server given its own `--cert`/`--key` never carry it.
+The gateway management plane admits the server by it (ADR-2004, #6016): see the
+`server → gateway mgmt` row of the transport table below and "Authorizing the server by
+its identity" in `docs/user-manual/gateway.md`. From release N+1 the
+shipped reference gateway configs set `{mgmt_peer_auth_mode, identity}` with no pin; an unset
+mode is still `pin`, so an installation with its own config stays on its SPKI pins until the
+operator sets the key (the boot logs a WARN that it was defaulted). Bring-your-own certificates,
+`--no-default-certs` and a server given its own `--cert`/`--key` carry no identity and must set
+`pin` before they take a shipped config. The identity is only as strong as the issuing CA's refusal to mint it for anyone
+else: it trusts the issuing CA's issuance policy, so it must not be enabled behind a CA that lets a
+requester choose a URI SAN, and an identity over a `cacertfile` that is not demonstrably exactly
+one readable certificate (a bundle, or an empty, unreadable or half-written file) needs mode
+`identity` with a pin.
 
 An install whose set predates the URI is upgraded **in place on the first boot of a build
 that mints it**: only `default-server.pem` is re-issued, under the **same root and the same
 key** (so every existing `mgmt_peer_pins` entry stays valid), signed with the on-disk CA
 key; the superseded certificate's `ca_store` row is revoked (`superseded`), not purged,
-and `default-marker.json` is untouched, so rolling back is safe (an older build ignores
-the extra URI). "Superseded" is bookkeeping, not a compromise signal: the new certificate
+and `default-marker.json` is untouched, so rolling back the **server** is safe (an older build ignores
+the extra URI; rolling back the **gateway** is not the same, because a pre-#6016 gateway ignores
+`mgmt_peer_denied` and the mode, see "Rolling back" in `docs/user-manual/gateway.md`). "Superseded" is bookkeeping, not a compromise signal: the new certificate
 certifies the same key, so the revocation does not (and must not) be read as the key being
 withdrawn. To keep that true, the CA store records an operator-typed revocation reason that
 collides with a system marker (`superseded`, `unpublished`; compared trimmed and case-insensitively)
@@ -80,7 +91,7 @@ valid for a deployment name a client actually dials — e.g. `--cert-san dns:gat
 an agent reaching the gateway by that service name passes SNI hostname verification.
 Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
 the prior certs). For new SANs to take effect, rename `default-marker.json` in the cert dir aside
-(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Re-minting issues every default leaf with a **new key, the gateway's `default-gateway` leaf included**: the restarted server auto-pins the new gateway key (`docs/user-manual/server-admin.md`, "Gateway upstream peer authorization"), and a gateway that dialled before the restart keeps presenting its old certificate until it redials, so it is refused (`not_pinned`) until then. The server restart drops the connection and forces that redial, so first check whether the gateway already presents the new certificate (cause class B in that runbook; the circuit state does not decide it), and restart that gateway node, one node at a time, only if denials continue and its agents can take the disconnect, because unless the agents run a build with the #5183 fix (in no release yet) released agents stay wedged afterwards. Never clear
+(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Re-minting issues every default leaf with a **new key, the gateway's `default-gateway` leaf included**: the restarted server auto-pins the new gateway key (`docs/user-manual/server-admin.md`, "Gateway upstream peer authorization"), and a gateway that dialled before the restart keeps presenting its old certificate until it redials, so it is refused (`not_pinned`) until then. The server restart drops the connection and forces that redial, so first check whether the gateway already presents the new certificate (cause class B in that runbook; the circuit state does not decide it), and restart that gateway node, one node at a time, only if denials continue and its agents can take the disconnect, because unless the agents run a build with the #5183 fix (shipped in 0.15.0) released agents stay wedged afterwards. Never clear
 the whole cert dir: it also holds the CA key and the secrets KEK (`secrets-kek-*.key`, #5370).
 (Implementation: `parse_extra_sans` validates the flag/`YUZU_CERT_SAN` values,
 `merge_sans` injects them into every default leaf, `pki::is_valid_ip_literal` does the
@@ -407,30 +418,57 @@ the issuance response and re-sign before it lapses.
 ## Gateway TLS (PR5)
 
 The Erlang gateway (`gateway/`) is an optional scale-out fan-out plane that sits
-between agents and the server. Its TLS posture is shaped by a hard property of
-the underlying transport library, **grpcbox v0.17.1**, verified against its
-source:
+between agents and the server. It has two TLS roles, handled by two different
+pieces of code:
 
-- A grpcbox listener does TLS **only** when its `transport_opts` map carries
-  `ssl => true` **and** `keyfile`/`certfile`/`cacertfile` (all four). Omit
-  `ssl => true` and it silently runs plaintext (`grpcbox_pool.erl:18`). When TLS
-  is on, grpcbox **hardcodes** `fail_if_no_peer_cert=true` + `verify=verify_peer`
-  + TLS 1.2 + ALPN `h2` — i.e. every TLS listener is **mutual** TLS; there is no
-  request-but-don't-require mode.
-- A grpcbox client channel does TLS via `{https, Host, Port, SslOpts}`; grpcbox
-  prepends ALPN `h2` and passes `SslOpts` to `ssl:connect`, so the channel
-  honours `cacertfile`/`certfile`/`keyfile`/`verify`. **`{verify, verify_peer}`
-  is mandatory** — an ssl client does not verify the server otherwise — and OTP
-  enforces SNI hostname matching, so the server cert SAN must cover the dialled
-  host.
+- **Its two listeners** (agent `:50051`, management `:50063`) are served by the
+  gateway's own gRPC layer over Cowboy/Ranch (`yuzu_grpc_listener`; ADR-0066
+  amendment). TLS is the `tls` map of a `{yuzu_gw, grpc_listeners}` entry. A
+  `tls` map requires `certfile`, `keyfile` **and** `cacertfile` (an incomplete
+  map refuses to start; omit the map for plaintext). Without further keys the
+  listener is **mutual** TLS (`verify => verify_peer`,
+  `fail_if_no_peer_cert => true`); `verify => verify_none` gives one-way
+  (server-authenticated) TLS, and `verify => verify_peer,
+  fail_if_no_peer_cert => false` is the request-but-don't-require mode. TLS 1.2
+  only, ALPN `h2`. The cipher suites follow the certificate's key type unless `ciphers`
+  is set: ECDHE-ECDSA AEAD suites for an EC key (the generated certificates), ECDHE-RSA
+  AES-GCM suites for an RSA key. FIPS mode is not claimed.
+- **Its upstream channel** to the C++ server is a channel of the gateway's own
+  gRPC client (`yuzu_grpc_client` over gun, `{yuzu_gw, [{upstream_client, ...}]}`;
+  until 2026-10-11 a grpcbox client channel under `{grpcbox, [{client, ...}]}`),
+  which does TLS via `{https, Host, Port, SslOpts}`: gun advertises ALPN `h2`,
+  sets the SNI to the dialled host and installs a hostname check, and
+  hands `SslOpts` to the `ssl` application unchanged, so the channel honours
+  `cacertfile`/`certfile`/`keyfile`/`verify`.
+  **`{verify, verify_peer}` plus a `cacertfile` / `cacerts` of the endpoint's own
+  are mandatory** — an ssl client does not verify the server otherwise, and gun
+  injects the operating system's CA store when no CA is given, so `verify_peer`
+  alone would trust any publicly trusted certificate for the name. The gateway
+  refuses to boot if ANY `https` endpoint lacks either (unless
+  `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1`), and if one channel lists both `http`
+  and `https` endpoints (`mixed_upstream_endpoints`; calls are spread over every
+  live connection of a channel). The server cert SAN must cover the dialled host.
+  The boot log says `mutual-TLS` only when every endpoint also carries
+  `certfile` + `keyfile`; otherwise `server-authenticated TLS (no client
+  certificate)`. The gateway does not require the client certificate: the server
+  does, with the SPKI pin.
+
+A leftover `{grpcbox, [{servers, ...}]}` or `{grpcbox, [{client, ...}]}` block refuses boot
+(`yuzu_gw_app:check_legacy_grpcbox_servers/0`, `check_legacy_grpcbox_client/0`; the gateway
+contains no grpcbox, so nothing would read either, and a `client` block left under that name
+would be invisible to the VM), and a listener entry may carry only the
+keys the layer reads: a legacy key such as `transport_opts` or `ssl`, or a misspelled one,
+refuses boot by name, so a half-converted entry cannot leave certificates configured while
+the listener runs plaintext. A listener without a `tls` map is plaintext by choice. Both
+checks run before anything is bound, so a refused config opens no listener.
 
 ### M1 posture — upstream mutual TLS
 
 | Hop | M1 TLS | Why |
 |---|---|---|
 | gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS + SPKI peer pin on the server** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. The server authorizes the caller as a gateway before any request is processed: the leaf's public key (SPKI SHA-256) must be in the pin set and the leaf must carry `serverAuth` (a bring-your-own gateway leaf needs both `serverAuth` and `clientAuth`), and must be inside its validity window at the time of the call. Pins are fixed at server boot and withdrawn by removing the pin and restarting; there is no reload and no CRL or CA-store revocation read on this path. The pin is derived automatically only when the gRPC listener runs on the server's generated default certificates (it pins `default-gateway.pem`); with operator-supplied certificates the server refuses to start until a pin (`--gateway-peer-pin`, `--gateway-peer-pin-file`) is given. A plaintext (`--no-tls`) deployment can start only with the explicit `--insecure-gateway-peer` acknowledgement, which disables the check on every port the service is reachable on. See `docs/user-manual/server-admin.md`. |
-| agent → gateway (:50051) | **one-way TLS (PR5c; live in the reference gateway compose, #1314)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod` and shipped live in `docker-compose.reference-gateway.yml`: the gateway mounts the grpcbox TLS `sys.config` + the shared CA volume, and the agent auto-discovers the install CA at `/etc/yuzu/certs/default-ca.pem` (#1314). **Caveat (#1291):** the transport is driven by the mounted grpcbox `sys.config`, NOT the `YUZU_GW_TLS_*` env vars, which are still inert — an operator who only sets those env vars has NOT enabled gateway TLS. Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. Agent `Heartbeat` admission is bound to the HTTP/2 connection that opened the session's `Subscribe` stream (connection key = the connection process, not a certificate); the listener still does not authenticate agents. |
-| server → gateway mgmt (:50063) | **strict mutual TLS + SPKI peer pin (#1314, #1422)** | The privileged command-fan-out plane. Strict mTLS (the patched grpcbox's `verify_peer`+`fail_if_no_peer_cert` defaults) admits only CA-issued client certs; the C++ server's command-forwarding client presents its server leaf and verifies the gateway against the install CA (`build_gateway_command_credentials`, fail-closed if the certs are missing). On top of that, the mgmt listener's grpcbox `auth_fun` (`yuzu_gw_authz:check_mgmt_peer/1`) **pins the peer to the server's KEY** — SPKI SHA-256 against `{yuzu_gw, mgmt_peer_pins}` — and requires the `serverAuth` EKU (agent leaves are `clientAuth`-only by construction, so no agent leaf can ever qualify). This closes the #1314 M-1 residual: a stolen per-agent leaf, an enrollment-minted CN-collision leaf (`--agent-id` is endpoint-chosen and lands in the CN verbatim), and the group-readable `default-gateway` leaf all get `UNAUTHENTICATED` — pre-handler, so the RPC never executes. Pins: `{cert_file, Path}` (default `default-server.pem` in the shared cert volume; mtime+size-cached re-read, so server leaf rotation self-heals; a same-second, same-size rewrite is the one undetected shape — fail-closed (stale pin rejects, never admits wrongly), a gateway restart recovers — the pin is the **first** certificate in the PEM, so REPLACE the file on rotation, never append the new leaf below the old) or `{spki_sha256, "hex"}` for bring-your-own-cert installs (`openssl x509 -in cert.pem -pubkey -noout \| openssl pkey -pubin -outform DER \| openssl dgst -sha256`); list two pins to overlap a rotation; empty/unresolvable pins fail **closed**. A `yuzu_gw_app` boot guard refuses a network-reachable mgmt listener lacking this posture (loopback exempt; `{allow_insecure_mgmt, true}` is the lab-rig acknowledgement, seeded in the UAT/demo configs whose composes keep :50063 unpublished). **Residual (#1422):** no CRL/OCSP on this path — a revoked-but-stolen *server* leaf passes until rotation. A plaintext stack (`--no-tls`) keeps the plane insecure and must stay on a trusted network. |
+| agent → gateway (:50051) | **one-way TLS (PR5c; live in the reference gateway compose, #1314)** | The agent listener's `tls` map sets `verify => verify_none` (and `fail_if_no_peer_cert => false`): **server-authenticated** TLS — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod` and shipped live in `docker-compose.reference-gateway.yml`: the gateway mounts the TLS `sys.config` (its `grpc_listeners` block) + the shared CA volume, and the agent auto-discovers the install CA at `/etc/yuzu/certs/default-ca.pem` (#1314). **Caveat (#1291):** the transport is driven by the mounted `sys.config`'s `grpc_listeners` entries, NOT the `YUZU_GW_TLS_*` env vars, which are still inert — an operator who only sets those env vars has NOT enabled gateway TLS. Agent identity stays app-layer, not transport. The agent's address reaches the server as `RegisterRequest.gateway_observed_peer`, which the gateway sets itself from the transport peer (or the address a trusted proxy vouched for, `origin` option; empty, recorded by the server as `origin_observed=false`, when a configured proxy gave no usable address) and overwrites whatever the agent sent (#1064; see `docs/user-manual/gateway.md`, "Client addresses behind a proxy"). A move to client certificates on this edge is staged: see "Moving the agent edge to mutual TLS" in the same manual (stage 2 is configuration only and enforces nothing; enforcement needs a separate design). Agent `Heartbeat` admission is bound to the HTTP/2 connection that opened the session's `Subscribe` stream (connection key = the connection process, not a certificate); the listener still does not authenticate agents. |
+| server → gateway mgmt (:50063) | **strict mutual TLS + server identity and/or SPKI peer pin (#1314, #1422, #6016)** | The privileged command-fan-out plane. Strict mTLS (a `tls` map that omits `verify`/`fail_if_no_peer_cert` gets `verify_peer` + `fail_if_no_peer_cert => true`) admits only CA-issued client certs; the C++ server's command-forwarding client presents its server leaf and verifies the gateway against the install CA (`build_gateway_command_credentials`, fail-closed if the certs are missing). On top of that, the mgmt listener's `auth_fun` (`yuzu_gw_authz:check_mgmt_peer/1`, run by `yuzu_grpc_stream_h` before a handler exists) **admits only the server**, by the mode in `{yuzu_gw, mgmt_peer_auth_mode}` (below): the server's KEY (SPKI SHA-256 against `{yuzu_gw, mgmt_peer_pins}`), the server's IDENTITY (the URI SAN `yuzu://<install>/server` that only the `default-server` leaf carries), or either — and requires the `serverAuth` EKU (agent leaves are `clientAuth`-only by construction, so no agent leaf can ever qualify). This closes the #1314 M-1 residual: a stolen per-agent leaf, an enrollment-minted CN-collision leaf (`--agent-id` is endpoint-chosen and lands in the CN verbatim), and the group-readable `default-gateway` leaf all get `UNAUTHENTICATED` — pre-handler, so the RPC never executes. Pins: `{cert_file, Path}` (in `pin` mode the default is `default-server.pem` in the shared cert volume; the shipped reference configs from release N+1 set `identity` and list no pin; watched OFF the stream path by the `yuzu_gw_mgmt_pins` process, #5696, which re-reads the file every `mgmt_pin_refresh_ms` (default 5 s) with raw file operations, parses it again only when the SHA-256 of its contents changed (not its mtime or size: a same-type key rotation gives a PEM of the same size, and `cp -p` / `rsync -a` keep the mtime), and publishes the pinned key to `persistent_term`; the per-stream `auth_fun` reads that and does no file I/O, so a stalled cert volume stalls only the watcher. Server leaf rotation self-heals within one interval; until then the new leaf is refused (fail closed), and the server does not retry: each command forwarded in that window fails terminally as `gateway_unauthenticated` and must be submitted again (#5988 tracks a server-side retry). The pins are resolved once before the listeners start. The pin is the **first** certificate in the PEM, so REPLACE the file on rotation, never append the new leaf below the old) or `{spki_sha256, "hex"}` for bring-your-own-cert installs (`openssl x509 -in cert.pem -pubkey -noout \| openssl pkey -pubin -outform DER \| openssl dgst -sha256`); list two pins to overlap a rotation; empty/unresolvable pins fail **closed**. **Last known good:** a `{cert_file, Path}` pin that has resolved keeps its key when the file later becomes unreadable, blank or garbled (no time limit; `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` = 0 and `YuzuGatewayMgmtPinUnresolved` report it), so **deleting, blanking or corrupting the pin file does NOT revoke the pinned key**. To revoke it, replace the file with the new certificate (picked up within one interval), or remove the entry and restart the gateway, only if its agents can take the disconnect (agents without the #5183 fix stay wedged after a gateway restart). Last known good never admits a key that was not pinned, and a pin file never readable since the gateway started pins nothing, so with no pin resolved every peer is refused (`no_pins_resolved`): that is what "unresolvable" means here. **Identity (#6016, ADR-2004).** `mgmt_peer_auth_mode` is `pin` (SPKI pins only: the behaviour before #6016, the default whenever the key is unset, and required for certificates that carry no identity), `identity_or_pin` (the identity or a pin; the explicit transition mode, never implied by a missing key) or `identity` (the identity, and a configured pin must also match; what the shipped reference configs set, with no pin; it is never implied by a missing key, so an unset mode with no pins still refuses to boot on an exposed listener). An unset mode logs a boot WARN that it was defaulted to `pin`; a later release may make the identity the default for an unset key. An own-certificate install that takes a shipped config is refused `no_uri_san` until it sets `pin`. If `mgmt_peer_identity` is set while the mode is `pin` it is ignored and the boot logs a warning. The identity is compared byte for byte against any URI SAN of the peer's leaf (no case folding, normalisation or prefix match) and is resolved once at boot: `mgmt_peer_identity` if set, else derived from the management listener's `cacertfile` only when that file holds exactly one certificate (upper-case hex SHA-256 of its DER, the value the server mints); a bundle or an empty, unreadable or half-written file leaves it unresolved, which refuses the peers that need it (`identity_unresolved`) and an exposed listener refuses to boot when nothing can admit the server (no pin in `pin`, no resolved identity in `identity`, neither in `identity_or_pin`). An identity over a `cacertfile` that is not demonstrably exactly one readable certificate (more than one, or empty, unreadable or half-written at boot, because the listener reads the file again when it starts) refuses to boot (`identity_over_ca_bundle`) unless the mode is `identity` and a pin is configured (the pin must also match). An explicit identity that differs from the one derived from the `cacertfile` boots with a warning (a typo, or a lower-case copy: the install id is upper-case hex). A server key renewal that keeps the identity needs no change on the gateway when no pin is configured (a pin kept in `identity` mode must follow the renewal; in `identity_or_pin` the identity admits the renewed key whatever the pin says). New closed reasons: `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked` and, with a CRL source, `revocation_unknown`, `revocation_stale`, `crl_revoked` (in `identity_or_pin` with pins configured, a peer that fails both paths because it has no identity is reported with the pin's reason, so `no_uri_san` and `identity_mismatch` appear only when no pin is configured; `identity_unresolved` and `revoked` are always reported as themselves, and a pin that never resolved is reported even while the identity admits the traffic); `yuzu_gw_mgmt_auth_admitted_total{method}` shows which path admitted. **Withdrawal:** `{mgmt_peer_denied, [{serial, "0A1B2C"}]}` (inside the `{yuzu_gw, [...]}` list of `sys.config`; the full hex serial, not the truncated dashboard text) refuses a certificate serial in every mode (`revoked`); it is keyed on the serial, never the key, because the server re-issues its leaf over the same key; it is read at boot, so a change takes effect when the gateway next restarts (which disconnects the node's agents); a gateway that sets `mgmt_crl_source` is also withdrawn by the CA's CRL, without a restart (below). **Trust:** a pin required the server's private key, the identity requires a certificate the install CA signed with that URI, so a CA-key holder no longer needs the server key, and the identity trusts the issuing CA's issuance policy (a corporate CA that lets a requester choose a URI SAN, or any CA in a bundle, could mint it); see `docs/security-reviews/gateway-mgmt-identity-2026-10-18.md`. Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key` carry no identity and stay on `pin`. A `yuzu_gw_app` boot guard refuses a network-reachable mgmt listener lacking this posture (loopback exempt; `{allow_insecure_mgmt, true}` is the lab-rig acknowledgement, seeded in the UAT/demo configs whose composes keep :50063 unpublished). **Residual (#1422, #6016):** no OCSP on this path, and the CRL only where a gateway sets `mgmt_crl_source` — without it a revoked-but-stolen *server* leaf passes in `pin` mode until rotation, and in the identity modes until its serial is in `mgmt_peer_denied` and the gateway has restarted. A plaintext stack (`--no-tls`) keeps the plane insecure and must stay on a trusted network. **CRL (#6016 PR 4b):** with `{yuzu_gw, mgmt_crl_source}` set the gateway reads the CA's public CRL (`GET /api/v1/ca/crl`), trusts it by signature only, and refuses a listed serial (`crl_revoked`) and every stream when it holds no usable CRL (`revocation_unknown`) or one past `nextUpdate` plus the grace (`revocation_stale`); fail-closed, in every mode, on every management stream it admits (a stream already running is not cut, and a gateway that starts afresh has forgotten the held CRL: see `docs/user-manual/gateway.md`, "Withdrawing a server certificate", Limits). |
 
 > **⚠ SECURITY — do not expose the plaintext gateway agent edge to an untrusted
 > network.** The gateway is the command fan-out plane: it pushes
@@ -445,12 +483,12 @@ source:
 > (PR2/PR3) over any network — the gap is specific to the gateway edge.**
 >
 > **One-way TLS now closes this (PR5c), and the reference composes ship it live
-> (#1314).** The vendored+patched grpcbox (`_checkouts/grpcbox`) makes
-> `fail_if_no_peer_cert`/`verify` configurable, so the agent listener runs
+> (#1314).** The listener's `tls` map makes `fail_if_no_peer_cert`/`verify`
+> configurable, so the agent listener runs
 > server-authenticated TLS (`verify_none` + `fail_if_no_peer_cert=false`):
 > encrypted + gateway-authenticated, no client cert required (bootstrap-safe). It
 > is enabled in `sys.config.prod` and wired live in
-> `docker-compose.reference-gateway.yml` (mounted grpcbox `sys.config` + shared CA
+> `docker-compose.reference-gateway.yml` (mounted `sys.config` + shared CA
 > volume + agent CA auto-discovery). **But a deployment that still runs plaintext —
 > the UAT/demo/sanitizer rigs (which pass `--no-tls` deliberately), a hand-rolled
 > compose, or one that relied on the still-inert `YUZU_GW_TLS_*` env vars (#1291)
@@ -458,42 +496,49 @@ source:
 > gateway exposed to an untrusted network, MUST still do one of: (a) front the
 > gateway at L4 or with TLS passthrough only (one TCP connection per agent end to
 > end, with the gateway's own agent-listener TLS enabled; an HTTP/2-terminating
-> reverse proxy, including a service-mesh sidecar that terminates HTTP/2, is not
-> supported for heartbeat admission, see
-> [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)); or (b) keep
+> reverse proxy is supported for heartbeat admission only when it is configured for
+> connection affinity, one backend connection per client connection, and a proxy
+> or service-mesh sidecar that pools backend connections is not, see
+> [Heartbeat admission](user-manual/gateway.md#heartbeat-admission) and
+> [Keeping each agent on one backend connection](user-manual/gateway.md#keeping-each-agent-on-one-backend-connection)); or (b) keep
 > the agent port on a trusted network (VPN / private subnet / a mesh policy that does not
 > terminate HTTP/2; see [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)).
-> Observed in a test with two agents: behind an HTTP/2-terminating proxy (nginx
-> `grpc_pass`) every heartbeat was rejected as a connection mismatch (counted, never
+> Observed in a test with two agents: behind an HTTP/2-terminating proxy that was not
+> pinning backend connections (nginx `grpc_pass`) every heartbeat was rejected as a connection mismatch (counted, never
 > forwarded) while the agents still enrolled and received commands; behind an L4 TCP
 > forwarder (nginx `stream`) there were no rejections. The agent sees the same
 > `unknown session` for every rejection reason, so diagnose from the gateway
-> counters and summary log. The native fix is a vendored grpcbox accessor that exposes the transport peer to the gateway's handlers (#1172); gRPC is the permanent transport (ADR-0066).
+> counters and summary log. The gateway's own layer now exposes the transport peer to its handlers (`yuzu_grpc:peer/1`, `origin/1`; #1172); gRPC is the permanent transport (ADR-0066).
 
 The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
 (upstream `{https,...}` mutual TLS + **one-way TLS on the agent listener** (PR5c) +
-a documented optional strict-mTLS block for the privileged mgmt listener). It is
+the strict-mTLS mgmt listener with its `auth_fun`). It is
 unit-tested in `gateway/apps/yuzu_gw/test/yuzu_gw_mtls_tests.erl` — real EC
 handshakes (P-384 CA / P-256 leaf) prove both the mutual-TLS option shape (certless
-client rejected) **and** the one-way shape (certless client accepted, bootstrap-safe). `yuzu_gw_app:log_tls_state/0` reports the *actual* grpcbox posture at
-startup (the older `tls_enabled`/`tls` env is advisory only — grpcbox reads its
-own config at boot).
+client rejected) **and** the one-way shape (certless client accepted, bootstrap-safe). `yuzu_gw_app:log_tls_state/0` reports the *actual* listener posture at
+startup (the older `tls_enabled`/`tls` env is advisory only — the listeners read
+their `grpc_listeners` entries, not that env).
 
 **Operational notes:**
-- **Fail-closed on misconfig** — the gateway refuses to boot if the upstream channel
-  is `https` *without* `{verify, verify_peer}` (encrypted but MITM-able);
+- **Fail-closed on misconfig** — the gateway refuses to boot if ANY `https` upstream
+  endpoint is TLS-but-unverified: no `{verify, verify_peer}`, or no `cacertfile` /
+  `cacerts` of its own (encrypted but MITM-able, or trusting the OS CA store);
   `evaluate_upstream_posture/2`, override `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` for
-  dev/CI. Plaintext upstream is still permitted (the UAT/dev posture).
+  dev/CI. It also refuses a channel mixing `http` and `https` endpoints
+  (`check_upstream_channel_mix/0`, no override). Plaintext upstream is still permitted
+  (the UAT/dev posture). Production is `https`, `verify_peer`, a CA-pinned
+  `cacertfile`, plus a client certificate and key (mutual TLS).
 - **Cert SAN ↔ dial-name (checklist)** — OTP enforces SNI hostname verification under
   `verify_peer`, so the server cert SAN must include the name the gateway dials. The
   default certs carry `localhost` + `IP:127.0.0.1` + `IP:::1` + `gethostname()`; for
   cross-container/host dialing, either dial the server's hostname and set that service's
   `hostname:` so its SAN matches, or add the dialled name with `--cert-san dns:<name>`
   (shipped — extends every default leaf's SAN).
-- **Leaf rotation.** From reading the grpcbox code (not tested), grpcbox reads the cert/key/CA files at channel *connect* time (lazy), so replacing `default-gateway.{pem,key}` on disk is picked up on the next upstream reconnect; an *established* channel keeps the old cert until it drops. A redial can still present the previous certificate for up to about 2 minutes after the files change, because the Erlang ssl PEM cache cleans every 120 s (measured on OTP 28.4.2 with a stub by a reviewer, not on a Yuzu gateway); a node restart clears the cache. A `systemctl restart yuzu-gateway` therefore forces a rotation deterministically, but restart a gateway only if denials continue after the redial window and its agents can take the disconnect: unless the agents run a build with the #5183 fix (in no release yet), released agents stay wedged afterwards (see the gateway peer-authorization runbook in `docs/user-manual/server-admin.md`).
-- **Observability** — an upstream TLS-handshake failure currently surfaces only as the
-  generic circuit-breaker open state; a dedicated handshake-failure metric is a tracked
-  follow-up. A server-side pin refusal is not a handshake failure: the TLS session
+- **Leaf rotation.** The gateway's upstream client hands the cert/key/CA file paths to Erlang's `ssl`, which reads the files when a connection's handshake runs, so replacing `default-gateway.{pem,key}` on disk is picked up on the next upstream reconnect; an *established* connection keeps the old cert until it drops (measured on 2026-10-11 with the gun-based channel against a local TLS listener that requires a client certificate on OTP 28; before that date the claim was read from the grpcbox code and not tested). A redial can still present the previous certificate for up to about 2 minutes after the files change, because the Erlang ssl PEM cache cleans every 120 s (measured on OTP 28.4.2 with a stub by a reviewer, not on a Yuzu gateway); a node restart clears the cache. A `systemctl restart yuzu-gateway` therefore forces a rotation deterministically, but restart a gateway only if denials continue after the redial window and its agents can take the disconnect: unless the agents run a build with the #5183 fix (shipped in 0.15.0), released agents stay wedged afterwards (see the gateway peer-authorization runbook in `docs/user-manual/server-admin.md`).
+- **Observability** — an upstream TLS-handshake failure surfaces as
+  `yuzu_gw_upstream_tls_handshake_failures_total` (while the breaker is open it moves
+  only at the breaker's probes), the channel's `connection <n> down (<alert>)` log line, and
+  the circuit-breaker open state. A server-side pin refusal is not a handshake failure: the TLS session
   completes and the server answers with gRPC `UNAUTHENTICATED`, which the gateway counts
   as an `rpc_error` rather than a transport failure (server-side signal:
   `yuzu_server_gateway_peer_denied_total`). See the consolidated residual-risk register
@@ -535,7 +580,7 @@ non-verifying listener for now — issuing it completes per-agent-mTLS day-one
 (records the cert for inventory/revocation, future-proofs gateway mTLS), but
 *cryptographic* through-gateway identity binding remains a follow-up (the gRPC
 gateway-hop identity design, #5578, ADR-0066)
-(agent identity across the gateway is still the app-layer `gateway_observed_peer`).
+(across the gateway the agent's address is attributed by the app-layer `gateway_observed_peer`, which is attribution, not authentication).
 
 ### Distribution flip — shipped as #1314
 
@@ -694,7 +739,7 @@ compose also mounts it a third time, read-only, into a one-shot `ca-export`
 service); the agent container mounts the `ca-public` volume, into which that
 service copies `default-ca.pem`. The server creates the cert
 dir `0700` and each leaf key `0600` owned by itself, so a different-uid sibling can
-neither traverse the dir nor read its key (the gateway's grpcbox crashes `eacces`). The
+neither traverse the dir nor read its key (the gateway fails to read its key, `eacces`). The
 **`--cert-group <name|gid>`** flag (`YUZU_CERT_GROUP`) fixes this at cert-gen
 time: it chgrp's the cert dir (`0750`) and **only** `default-gateway.key`
 (`0640`) to a shared group — the FIXED gid 2000 `yuzu-pki` group baked into all
@@ -707,9 +752,10 @@ are public `0644`. Empty (the default, single-host) keeps the tight 0700/0600
 posture. POSIX-only (Windows uses ACLs). This is `apply_cert_group_share()` in
 `default_certs.cpp`, applied on both the generate and idempotent-restart paths.
 
-**Gateway TLS config** still comes from the grpcbox block (`{grpcbox,
-client|servers}`), which grpcbox reads itself — the `YUZU_GW_*` env vars do NOT
-drive it (#1291). The secure reference mounts a TLS `sys.config`
+**Gateway TLS config** comes from the `{yuzu_gw, grpc_listeners}` entries
+(listeners) and the `{yuzu_gw, upstream_client}` entry (upstream channel) — the
+`YUZU_GW_TLS_*` env vars do NOT drive either (#1291); `YUZU_GW_AGENT_PORT` /
+`YUZU_GW_MGMT_PORT` only change the matching listener's port. The secure reference mounts a TLS `sys.config`
 (`reference-gateway-sys.config`: upstream mutual TLS to the `server` service,
 one-way TLS agent listener). `--cert-san dns:gateway dns:server` puts the service
 names on the default leaves so SNI verification succeeds across the hops.
@@ -763,16 +809,29 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   "Gateway-proxied agents: revocation scope").
 - **CRL distribution:** point external consumers at `GET /api/v1/ca/crl`. The
   server keeps the CRL fresh on its own — a background freshness check
-  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`, so a
-  fleet with no revocations never serves an expired CRL and a failed startup
-  pre-publish self-heals on the next **successful leader** tick. That freshness
+  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`. A CRL
+  is valid for 48 hours from the moment it is built (`kCrlValidity`, #6016), so a
+  fleet with no revocations gets a new CRL about once a day and a healthy leader
+  keeps it from expiring. Headroom is exported on every replica's `/metrics` as
+  `yuzu_server_ca_crl_next_update_timestamp_seconds` (the CRL's `nextUpdate`; remaining
+  time is that value minus `time()`) with `YuzuCaCrlNearExpiry` (under 12 hours) and
+  `YuzuCaCrlExpired` (past `nextUpdate`), so a stalled republish is visible from any
+  scrape (#6527). That detects a stalled republish only: it does not detect a server that
+  is down (use `up`), a publisher clock that is wrong, or a consumer that fails to fetch,
+  and an installation with its own certificates has no internal CA and so no series. See
+  "CRL near expiry or expired" below. The same check lets a failed startup pre-publish self-heal
+  on the next **successful leader** tick. That freshness
   re-publish is `FencedLeaderOnly` (WS-3, ADR-2002) — under a leadership pause (a
   lost coordination connection; look for `[HA] … FencedLeaderOnly background loops
   are PAUSED`) it does NOT run, so `/api/v1/ca/crl` can stay 503 (or serve a CRL
   past `nextUpdate`) until leadership is re-acquired. On a single-replica deployment
   a *transient* coordination loss is momentary, but a *persistent* one keeps it
   paused until leadership returns — investigate the coordination connection, don't
-  wait it out. The *operator revoke* publish path is unfenced and republishes
+  wait it out: with no leader publishing, the served CRL passes its `nextUpdate`
+  24 to 48 hours after leadership is lost (each CRL is valid for 48 hours from its
+  own build, and a healthy leader rebuilds it at the 24-hour mark), and a consumer
+  that refuses an expired CRL then fails closed. Restarting any server replica republishes the CRL at startup,
+  independent of leadership. The *operator revoke* publish path is unfenced and republishes
   immediately. If that republish fails, it increments
   `yuzu_server_ca_crl_publish_failures_total` and audits `ca.crl.published`
   `result=failure` — alert on it: the public CRL is stale while server-side
@@ -809,15 +868,24 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   (its `depends_on`). `restart` also restarts the one-shot container but without that ordering, so
   the agent can keep the OLD CA in `ca-public` (inferred from the compose file, not tested). The
   new gateway leaf also has a new key, which the restarted server auto-pins; a gateway presents
-  its new certificate only after it redials (inferred from reading the grpcbox code, not tested),
+  its new certificate only after it redials (measured with the gateway's gun-based upstream client, see the leaf-rotation note above),
   so check first whether it has already redialled (a server restart forces one), and restart that
   gateway node, one at a time, only if denials continue and its agents can take the disconnect
-  (unless the agents run a build with the #5183 fix, in no release yet, released agents stay wedged
+  (unless the agents run a build with the #5183 fix, shipped in 0.15.0, agents older than 0.15.0 stay wedged
   afterwards), as cause class B of the gateway peer-authorization runbook describes. Prefer `POST /ca/import-chain`
   (Subordinate-CA, PR6) when the
   goal is re-keying under a new authority without an enrollment outage. **Not** when the goal is
   to stop trusting a leaf whose revocation was lost: import-chain keeps the issuing key, so that
-  leaf still chains — only this clean re-root removes it.
+  leaf still chains — only this clean re-root removes it. **Gateway server identity (#6016):** a
+  clean re-root changes the install id inside `yuzu://<install>/server`. A gateway whose management
+  `cacertfile` holds only the new root derives the new identity at its next restart; an explicit
+  `mgmt_peer_identity` from before the re-root is stale (the boot warns that it differs from the
+  derived one) and must be updated. If you keep the old and the new root together in that file for the
+  transition, it is a bundle: a derived identity is unresolved and `identity_over_ca_bundle` refuses an
+  explicit one unless the mode is `identity` and a pin is configured, so a gateway restart in that
+  window with mode `identity` and no explicit identity plus pin refuses to boot. Stay in (or return
+  to) `pin` for the duration, or set the explicit identity of the NEW root with mode `identity` and a
+  pin (`docs/user-manual/gateway.md`, "During a CA re-root").
 - **A bootstrap that seems permanently stuck** (multi-replica default-cert self-heal, ADR-0053
   C5-1/Gate 8 — an unsupported topology, `docs/user-manual/upgrading.md`'s HA note): check
   `pg_locks` for a lingering `yuzu:default_certs_bootstrap` session advisory lock —
@@ -829,6 +897,21 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   replica's retry loop (`kBootstrapLockAcquireTimeout`/`kBootstrapLockRetryInterval`,
   `default_certs.cpp`) picks the now-free lock up on its own next attempt — no restart required.
 
+### CRL near expiry or expired
+
+`YuzuCaCrlNearExpiry` (under 12 hours of `nextUpdate` left) or `YuzuCaCrlExpired` (past it) means the
+leader's freshness pass has stopped republishing; the server's own revocation check (`is_revoked`)
+reads the database and is unaffected, but anything that reads `GET /api/v1/ca/crl` (a reverse proxy's
+`ssl_crl`, a monitoring check) will start refusing this CA's certificates at `nextUpdate`.
+
+1. **Confirm** what is served: `curl -s --cacert <install CA> https://<server>/api/v1/ca/crl | openssl crl -inform DER -noout -lastupdate -nextupdate`. A 503 means no CRL is published at all.
+2. **Is there a leader?** `yuzu_server_leader_is_leader` and `YuzuLeaderNoLeader` (the zombie-lock steps are in `docs/user-manual/server-admin.md`, "Leader election: metrics and alerts"). A leader that reads `1` but is wedged is caught only by this alert.
+3. **Is publishing failing?** `yuzu_server_ca_crl_publish_failure_reason_total{reason}` and `YuzuCaCrlPublishFailing` name the cause (key load, lock timeout, no connection).
+4. **Is the leader's clock right?** The freshness pass compares `nextUpdate` with the leader's own clock, so a clock far from real time hides the problem from the leader while Prometheus still sees it.
+5. **Restart only the single wedged or leaderless replica**, one at a time. Do not restart every replica (that is the re-root procedure above, not this), and do not restart while Postgres is unreachable: the server fails closed at boot without it, so a restart turns a degraded state into an outage. A booting server publishes a CRL (the boot pre-publish is not leader-gated); success is the gauge moving to about 48 hours of headroom and no `PKI: initial CRL publish failed` warning in its log.
+
+What these alerts do **not** cover: a server process that is down or an unreachable `/metrics` (both silence the series; keep your own `up == 0` alert), a publisher clock stepped forward (a CRL dated in the future shows more than 48 hours of headroom and raises nothing), and consumers failing to fetch the CRL. Rolling back to a build without the gauges silences both alerts.
+
 ## Roadmap
 
 | PR | Scope | Status |
@@ -839,7 +922,7 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR4 | CA REST surface + this doc | shipped |
 | PR4b | Dashboard CA panel (inventory, revoke, root/CRL download, rotation CTA) | shipped |
 | PR5 | Gateway TLS: upstream mutual TLS **reference config** (`sys.config.prod`) + `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent mTLS enrollment forwards through the gateway + fail-closed-on-unverified startup guard + TLS-posture logging. (Shipped images/composes are now TLS by default — #1314.) | shipped |
-| PR5c | One-way (server-authenticated) TLS on the agent listener — vendored+patched grpcbox (`_checkouts/grpcbox`) makes `verify`/`fail_if_no_peer_cert` configurable; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test shipped in #1314 (wired live in `docker-compose.reference-gateway.yml`). | shipped |
+| PR5c | One-way (server-authenticated) TLS on the agent listener — shipped with a vendored+patched grpcbox (`_checkouts/grpcbox`, since deleted) making `verify`/`fail_if_no_peer_cert` configurable, then replaced by the gateway's own listener layer whose `tls` map has the same options; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test shipped in #1314 (wired live in `docker-compose.reference-gateway.yml`). | shipped |
 | PR5b → #1314 | Distribution flip — drop `--no-tls`/`--no-https` from the image CMDs + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (HTTPS healthcheck, volume timing, `--cert-san`). The original PR5b branch (#1271) was **closed**; the deliverable **shipped as #1314** (secure-by-default images + agent CA auto-discovery; `docker-compose.reference-gateway.yml` is the worked example). Residuals tracked as #1291 (inert `YUZU_GW_TLS_*` env — use a mounted `sys.config`), #1313 (compose wizard), #660 (agent plaintext default). | shipped (#1314) |
 | PR6 (M2) | Subordinate-CA — export the CA CSR (`GET /ca/root-csr`) + import an enterprise-signed intermediate (`POST /ca/import-chain`, validates carries-our-key + is-CA + chains-to-parent) → `CaMode::Subordinate`; issued leaves chain to the corporate root, issuing key unchanged. Engine `cert_matches_key`/`cert_is_ca`/`verify_chain_to_bundle`; `ca_root.chain_pem` (migration v4); dashboard import panel. See "Subordinate-CA" above. | in review |
 | — (gap-matrix #10) | Code-signing certificate issuance — `POST /api/v1/ca/issue-code-signing` + MCP twin `issue_code_signing_cert`, CSR-custody, usage hard-pinned to `codeSigning`. See "Code-signing certificate issuance" above. CRL-distribution-to-agent-verifier enforcement and an optional operator CSR-mode `--out` CLI convenience remain tracked follow-ups. | shipped |
@@ -885,7 +968,7 @@ heartbeat hot-path in-memory revoked-set memoization (pairs with the open-stream
 sweep); a distinct gateway **upstream TLS-handshake-failure metric**
 (`yuzu_gw_upstream_tls_handshake_failures_total`, R-3) so cert-expiry / CA-rotation
 / wrong-SAN failures don't collapse into a generic circuit-open; an env-substituted
-`sys.config.src` so `YUZU_GW_TLS_*` actually drive the grpcbox cert paths (today
+`sys.config.src` so `YUZU_GW_TLS_*` actually drive the listener and upstream cert paths (today
 they set an advisory `yuzu_gw` env that nothing consumes, R-2);
 `enrollment_request_id`→enrollment-decision correlation; `crlNumber` in the
 `ca.crl.published` audit detail; a `yuzu_server_ca_cert_revoked_total` counter +
@@ -899,7 +982,7 @@ on revocation (the periodic sweep, PR3 H-1); periodic CRL re-publish before
 `nextUpdate` + startup-503 self-heal (the freshness check); the revoked-identity
 re-provision guard (PR3 H-2); `idx_ca_issued_issued_at` for the inventory sort.
 **Addressed by the #1243/#1244 round:** the agent↔gateway edge encryption
-(one-way TLS capability, PR5c — vendored+patched grpcbox, agent listener enabled
+(one-way TLS capability, PR5c — originally a vendored+patched grpcbox, now the gateway's own listener layer; agent listener enabled
 in `sys.config.prod`) with live wiring + CA-to-agent distribution shipped in #1314;
 `--cert-san` for cross-host default leaves; the PR5 over-claim corrected (gateway
 CSR survives transit but is not signed until PR5d). (The plaintext-`:50051`

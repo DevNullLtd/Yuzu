@@ -37,6 +37,7 @@ This wizard walks you through a step-by-step configuration and generates a produ
 | Server healthcheck used `curl` (#1487) | The server image ships no curl. Replaced with a bash `/dev/tcp` TCP-connect probe on the real serving port (8443/8080), matching `docker-compose.uat.yml` |
 | Admin `admin:admin` hash didn't validate (#1488) | The admin credential row is now derived in-browser via SubtleCrypto **PBKDF2-HMAC-SHA256, 100k iters** for the password you enter — matching the server KDF, so login actually works (the old row put the password in the role field and shipped a stale hash) |
 | Named-volumes off + Prometheus/Grafana/ClickHouse on (#1485 review M1) | Those services use anonymous volumes when named volumes are disabled, so `docker compose config` no longer fails on an undefined volume |
+| Grafana `admin`/`admin` by default (#4817) | The Grafana password has no default; empty, `admin`, and anything but printable ASCII without spaces, `$` or quotes (Compose changes those in `.env`) are refused. It is written only to `.env` (`YUZU_GRAFANA_ADMIN_PASSWORD`) and the compose requires it, so the stack will not start without it. Grafana applies it only when it first creates its database: regenerating `.env` for an existing install gives it a new value Grafana ignores, so edit rather than regenerate, and on an install generated before this fix change the old password with `docker compose exec grafana grafana cli admin reset-admin-password '<new>'` |
 
 ## Usage
 

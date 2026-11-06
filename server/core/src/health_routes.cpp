@@ -27,6 +27,8 @@
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "leader_elector.hpp" // HA WS-11: LeaderElector::Stats (stats() only)
+#include "leader_metrics.hpp" // HA WS-11
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
@@ -51,6 +53,7 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_store.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 #include "upload_grant_store.hpp"
@@ -105,7 +108,10 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // (see this file's header comment). The `ServerImpl` member declaration
     // is deleted by this extraction.
     auto scrape_mu = std::make_shared<std::mutex>();
-    sink.Get("/metrics", [deps, scrape_mu](const httplib::Request&, httplib::Response& res) {
+    // HA WS-11: serializes the leader counter delta-sync across concurrent scrapes.
+    auto leader_publisher = std::make_shared<yuzu::server::LeaderMetricsPublisher>();
+    sink.Get("/metrics", [deps, scrape_mu, leader_publisher](const httplib::Request&,
+                                                             httplib::Response& res) {
         // WS-3 3.3 (sre-F2/WS-11): refresh the command-outbox delivery-backlog
         // gauge on scrape (regardless of leadership — a stuck loop that never
         // acquires leadership shows flat event counters, so this gauge is the
@@ -130,6 +136,43 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             if (snap.last_success_ns != yuzu::server::pg_reachability::kNever)
                 deps.metrics->gauge("yuzu_server_pg_reachability_last_success_age_seconds")
                     .set(static_cast<double>(now - snap.last_success_ns) / 1e9);
+        }
+        // HA WS-11 (#4014): leader-election observability. A lock-free Stats copy
+        // (never an elector reference), so a scrape cannot stall behind the
+        // election loop's blocking libpq calls; counters/age are computed here so
+        // they keep moving if that loop wedges.
+        if (deps.leader_elector) {
+            leader_publisher->publish(
+                *deps.metrics, deps.leader_elector->stats(),
+                deps.leader_loop_errors ? deps.leader_loop_errors->load(std::memory_order_relaxed)
+                                        : 0,
+                yuzu::server::LeaderMetricsPublisher::steady_now_ns());
+        }
+        // #6527: CRL freshness. Absolute timestamps, not "seconds remaining", so a scrape whose
+        // read fails or is skipped leaves the last value in place and Prometheus's `- time()`
+        // keeps counting down from it: for ONE replica that value stays true (only a publish moves
+        // nextUpdate). With several replicas a replica whose reads keep failing holds an OLDER
+        // nextUpdate than the shared row, which is why the alerts aggregate `max by (job)`: the
+        // freshest replica wins and a stale one cannot page. Nothing is published while no CRL
+        // exists, and a successful read that finds no row also leaves the last value (the re-root
+        // runbook restarts every instance, docs/pki-architecture.md). Every replica reads the shared
+        // row, so a wedged or absent leader is visible from any scrape. The read omits the DER; the
+        // pool lease wait is bounded by the store's read timeout (the query itself by the pool's
+        // statement timeout). It is skipped while the reachability probe (no I/O) says Postgres is
+        // down, so this series adds no stall to a scrape during that outage; a null probe means
+        // "unknown", so the read proceeds.
+        const bool pg_known_down =
+            deps.pg_reachability_probe &&
+            yuzu::server::pg_reachability::classify(deps.pg_reachability_probe->snapshot(),
+                                                    yuzu::server::PgReachabilityProbe::now_ns()) !=
+                yuzu::server::pg_reachability::Verdict::Ready;
+        if (!pg_known_down && deps.ca_store && deps.ca_store->is_open()) {
+            if (auto fresh = deps.ca_store->latest_crl_freshness(); fresh.has_value() && *fresh) {
+                deps.metrics->gauge("yuzu_server_ca_crl_next_update_timestamp_seconds")
+                    .set(static_cast<double>((*fresh)->next_update));
+                deps.metrics->gauge("yuzu_server_ca_crl_published_timestamp_seconds")
+                    .set(static_cast<double>((*fresh)->published_at));
+            }
         }
         // Refresh management group gauges before serializing
         if (deps.mgmt_group_store && deps.mgmt_group_store->is_open()) {
@@ -584,6 +627,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         //
         // LEADERSHIP IS NOT READINESS (#4014 decision): a follower serves every
         // operator-synchronous path, so the LeaderElector is deliberately absent.
+        // That includes "the elector is not open": a replica that cannot lead is a
+        // ready follower (it still serves every operator-synchronous path), and
+        // gating it out would evict a working replica from the LB -- on a single
+        // replica, take the whole API down over an HA-substrate fault. The pause
+        // of the FencedLeaderOnly loops is surfaced by the yuzu_server_leader_*
+        // series and the YuzuLeaderNoLeader alert instead. The elector is read on
+        // /metrics only, through the lock-free stats() snapshot.
         struct StoreCheck {
             const char* name;
             bool ok;
@@ -744,6 +794,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // with no ingest and the Forensics REST/MCP reads degrade to
             // 503/kInternalError — surface that boot state (latched, #3061).
             {"app_usage_store", deps.app_usage_store && deps.app_usage_store->is_open()},
+            // Slice-2 PR 2a-2a born-on-Pg store (ADR-0070 D12 "Lifecycle"). Same rationale as
+            // app_usage_store above: fail-closed at boot; a store that failed to open would make
+            // ReportInventory/ProxyInventory acknowledge the certificate_inventory blob with no
+            // rows (and, from 2a-2b, every certificate read answer 503) — surface that boot
+            // state (latched, #3061).
+            {"certificate_inventory_store",
+             deps.certificate_inventory_store && deps.certificate_inventory_store->is_open()},
             {"product_registry_store",
              deps.product_registry_store && deps.product_registry_store->is_open()},
             // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing

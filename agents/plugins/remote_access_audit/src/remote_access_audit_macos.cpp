@@ -2,7 +2,7 @@
  * remote_access_audit_macos.cpp -- macOS leg: the path binding, the mount-table read and the
  * `launchctl print-disabled system` runner (rung 2; works unprivileged). Every decision is
  * `list_posix`. The mount table is getmntinfo_r_np(MNT_NOWAIT), the kernel's cache, which
- * never calls into a wedged server.
+ * never calls into a wedged server (agents/shared/macos_network_mounts.hpp, shared with runtimes).
  */
 #include "remote_access_audit_legs.hpp"
 
@@ -10,30 +10,9 @@
 
 #include "remote_access_audit_posix_fs.hpp"
 
-#include <cstdlib>
-#include <memory>
-#include <sys/mount.h>
-#include <sys/param.h>
+#include <macos_network_mounts.hpp> // yuzu::shared::read_macos_network_mounts (agents/shared)
 
 namespace yuzu::remote_access_audit {
-
-namespace {
-
-std::optional<std::vector<std::string>> macos_network_prefixes() {
-    struct statfs* raw = nullptr;
-    const int n = ::getmntinfo_r_np(&raw, MNT_NOWAIT);
-    const std::unique_ptr<struct statfs, decltype(&::free)> mnt{raw, &::free};
-    if (n <= 0 || raw == nullptr)
-        return std::nullopt;
-    std::vector<std::string> out;
-    for (int i = 0; i < n; ++i) {
-        if (yuzu::shared::is_network_mount_fstype(mnt.get()[i].f_fstypename))
-            out.emplace_back(mnt.get()[i].f_mntonname);
-    }
-    return out;
-}
-
-} // namespace
 
 int run_macos(yuzu::CommandContext& ctx) {
     Paths p;
@@ -44,7 +23,7 @@ int run_macos(yuzu::CommandContext& ctx) {
     // canonical spelling: /var is a link to private/var and a home opens hop by hop with no link followed
     p.single_homes = {"/private/var/root"};
     p.min_uid = 500; // an account home, not Shared or a stray entry (autoruns_macos.cpp's rule)
-    p.mounts = &macos_network_prefixes;
+    p.mounts = &yuzu::shared::read_macos_network_mounts;
     p.run = [](const std::vector<std::string>& args, const yuzu::agent::SubprocessOptions& opts) {
         std::vector<std::string> argv{"/bin/launchctl"};
         argv.insert(argv.end(), args.begin(), args.end());

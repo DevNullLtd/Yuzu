@@ -62,12 +62,14 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// four classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// five classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
 /// costs a conforming client nothing), `upload_session`, `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
-/// callers) and `dex_score_policy` (one JSON document, capped by its handler). Every other
+/// callers), `dex_score_policy` (one JSON document, capped by its handler) and `commands`
+/// (`POST /api/v1/commands`, a new route whose MCP twin `execute_instruction` already requires a
+/// measurable body, so a REST caller is held to the same contract). Every other
 /// class below — public REST (bundles), SCIM, certificate import (REST + dashboard), the
 /// plugin trust bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
@@ -85,16 +87,19 @@
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
 ///
-/// That gap is narrower than it once was: `server.cpp`'s `set_pre_request_
-/// handler` (body-cap-post-read-stage) is a SECOND chokepoint, driven by the
+/// That gap is narrower than it once was: the post-read stage (body-cap-post-read-stage,
+/// `step_up_wiring.hpp`'s `run_post_read_stage`) is a SECOND chokepoint, driven by the
 /// SAME `resolve_body_cap` table, that runs after httplib has read the body
 /// into `req.body` but before the route handler runs — so a chunked body
 /// that turns out to be over this table's cap is still refused, just after
 /// being buffered rather than before. It closes "reaches a handler
-/// uncapped", not "gets buffered uncapped" — see that handler's own doc
-/// comment for what it does and does not cover (notably: it cannot see a
+/// uncapped", not "gets buffered uncapped" — see the comment at its install
+/// in `server.cpp` for what it does and does not cover (notably: it cannot see a
 /// multipart request's body at all, since httplib never copies multipart
-/// content into `req.body`).
+/// content into `req.body`). It is installed through `PostReadStageRegistry`
+/// (`post_read_stage.hpp`) and run by `HttplibRouteSink`'s handler wrapper, NOT as
+/// `httplib::Server::set_pre_request_handler`: from cpp-httplib v0.47.0 that handler
+/// runs BEFORE the body is read, so a body-size check hung there would always see 0 bytes.
 ///
 ///
 /// ROUTED-CONCERN ROW: `.claude/routed-concerns-access-control.md`, which
@@ -117,13 +122,13 @@
 /// but "grounded" is not "measured byte-for-byte": two different kinds of
 /// reasoning appear beside the exact matches, and BOTH are reasoned rather
 /// than measured. (1) MEASURED-PLUS-MARGIN (`ca_import_chain_dashboard`,
-/// `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`,
+/// `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`,
 /// `instruction_yaml`): a real handler-level check exists and is cited, but
 /// the pre-routing gate checks the RAW body while the handler checks a
 /// DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-
 /// extracted), so the cap adds an explicit margin over the handler's own
 /// number instead of mirroring it — getting this wrong rejects legitimate
-/// traffic, which is exactly what happened to the two TAR entries before
+/// traffic, which is exactly what happened to the two Echo entries before
 /// this fix (see their comments). (2) JUDGMENT CALL, NO CONTRACT
 /// (`guardian_rule_authoring`, `workflow_yaml`, `product_pack_yaml`,
 /// `instruction_import`, `nvd_match`): no aggregate size contract is defined
@@ -200,7 +205,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // (session open POST, chunk PUT, status GET, commit POST, cancel DELETE).
     // ANY method: only the chunk PUT carries a large body, but scoping to PUT
     // would silently drop every sibling verb on this prefix to the catch-all
-    // (rule 4 in the routed-concern row — prefer any-method rows). Cap = the
+    // (rule 4 in the routed-concern row: a mutating route needs its own entry or a
+    // reviewed catch-all decision). Any-method rows are preferred. Cap = the
     // protocol's own per-chunk maximum, `upload_grant::kDefaultChunkMaxBytes`
     // (upload_grant_parsers.hpp; bound by a static_assert in
     // file_retrieval_routes.cpp so the two cannot drift). requires_measurable
@@ -360,7 +366,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"POST", "/api/v1/definitions/", 64u * 1024, false, "response_templates"},
     {"PUT", "/api/v1/definitions/", 64u * 1024, false, "response_templates"},
 
-    // POST /api/dashboard/tar-execute — TAR warehouse SQL query, HTMX form
+    // POST /api/dashboard/echo-execute — Echo warehouse SQL query, HTMX form
     // fields `sql` + `scope` (dashboard_routes.cpp:866 `sql.size() > 4096`
     // check on the FORM-DECODED value). The #2407-as-shipped 4096-byte cap
     // capped the RAW body at the SAME number the handler checks against the
@@ -379,11 +385,11 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // "group:<name>", short, but nothing bounds it today) = 12288 + 4096 =
     // 16384 bytes exactly. Reasoned margin, not a byte-for-byte measurement
     // — same category as the CA/plugin-trust dashboard classes below.
-    {"POST", "/api/dashboard/tar-execute", 16u * 1024, false, "tar_dashboard_sql"},
+    {"POST", "/api/dashboard/echo-execute", 16u * 1024, false, "echo_dashboard_sql"},
 
-    // POST /api/v1/result-sets/from-tar-query — TAR result-set SQL, JSON
+    // POST /api/v1/result-sets/from-echo-query — Echo result-set SQL, JSON
     // body (rest_api_v1.cpp:6802, `sql.size() > 100000` check on the JSON-
-    // PARSED `sql` field). Same unit mismatch as tar_dashboard_sql above,
+    // PARSED `sql` field). Same unit mismatch as echo_dashboard_sql above,
     // with almost no headroom to hide it: the old 102400-byte cap left only
     // 2400 bytes over the handler's 100000-character check to absorb JSON
     // string-escaping (quotes, backslashes, and control characters expand
@@ -403,8 +409,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // decoded `sql` value is still <=100000 characters passes here and is
     // then decided by the handler's own check, as intended; a raw body over
     // 204800 bytes never reaches the handler at all.
-    {"POST", "/api/v1/result-sets/from-tar-query", 200u * 1024, false,
-     "tar_result_set_sql"},
+    {"POST", "/api/v1/result-sets/from-echo-query", 200u * 1024, false,
+     "echo_result_set_sql"},
 
     // POST /api/v1/guaranteed-state/rules — Guardian rule authoring
     // (rest_api_v1.cpp:7759 handler start; :7842 the legacy path that
@@ -467,7 +473,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // `validate_yaml_source` -> `instruction_yaml::validate_definition_yaml`, which hard-rejects
     // `yaml_source.size() > 1048576` at instruction_yaml.cpp:165 (the exact
     // 1 MiB decoded-value contract create/update also enforce). This is the
-    // SAME raw-vs-decoded shape as tar_dashboard_sql (C1) — the pre-routing
+    // SAME raw-vs-decoded shape as echo_dashboard_sql (C1) — the pre-routing
     // gate sees the percent-encoded RAW body, the handler checks the
     // DECODED `yaml_source` value — so the cap must NOT mirror 1048576
     // directly (the #2407-as-shipped defect this table already paid for
@@ -544,7 +550,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // while keeping an unauthenticated flood against this subtree (whose
     // gates all run in the handler, after httplib buffers the body) 256x
     // under the 4 MiB catch-all it previously fell to. ANY method: the
-    // bodyless siblings share the prefix (rule 4 in the routed-concern row).
+    // bodyless siblings share the prefix.
     // requires_measurable stays OFF per the file-header default.
     {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
 
@@ -562,16 +568,40 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
     // even fully escaped. Mirrors the handler's own kLayoutBodyMaxBytes (16 KiB) exactly - the
     // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
-    // shares the prefix (rule 4 in the routed-concern row).
+    // shares the prefix.
     {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
 
     // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
     // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
     // tag key, an OIDC client secret or a short JSON array of routed observation types), well
     // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
-    // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
-    // row).
+    // ANY method: the sibling GET is bodyless and shares the prefix.
     {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
+
+    // /api/v1/inventory/software/normalization/ — the software-title curation REST v1 routes
+    // (software_curation_routes.cpp). The body-bearing routes are POST .../aliases (one JSON
+    // object of at most eight strings, each capped at 256 bytes by the handler) and POST
+    // .../queue/{key}/reject (bodyless); the GETs (status, queue) are bodyless. 64 KiB is
+    // generous headroom over that shape while holding an unauthenticated flood 64x under the
+    // 4 MiB catch-all (the admission gate runs in the handler, after httplib buffers the body).
+    // ANY method: the GET siblings share the prefix (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/", 64u * 1024, false,
+     "software_curation"},
+    // POST /api/v1/inventory/software/normalization/pack — the alias-pack CSV upload. The raw
+    // body IS the CSV, which parse_normalization_pack refuses over kMaxPackBytes (1 MiB,
+    // software_normalization_pack.hpp), so the cap mirrors that bound exactly (the ca_revoke
+    // two-authority precedent). Longer literal prefix than the row above, so it wins there.
+    // ANY method; no sibling verb carries a body on this path.
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/pack", 1u * 1024 * 1024,
+     false, "software_alias_pack"},
+    // /api/v1/commands -- POST: the REST v1 twin of MCP execute_instruction (command_v1_routes.cpp).
+    // The same 4 MiB as the `/mcp/` row because the same worst case rides it: a maximal request
+    // (10000 agent ids, 32 parameters of 64 KiB, an 8 KiB scope) is `kExecInstrWorstCaseBody`,
+    // about 3.3 MiB, which test_command_v1_routes.cpp pins against THIS entry. `requires_measurable`
+    // is true like the MCP row: an unmeasurable (chunked) body would otherwise bypass the pre-routing
+    // cap on this route while the twin refuses it. ANY method: the segment-boundary match keeps a
+    // future sibling under this prefix capped too (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/commands", 4u * 1024 * 1024, true, "commands"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
