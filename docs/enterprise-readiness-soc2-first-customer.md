@@ -972,9 +972,10 @@ the current limits of the two controls listed above, each with a tracking issue:
 rule on `main` and `dev` can be bypassed (inferred from the review state of merged PRs — the
 bypass-actor list is visible only to administrators; current figures in that document's §1) and
 there is no written emergency-change policy (#6431); one role authors and merges every change to
-`main`, by bypass where no review was given, with no compensating control yet (#6431); the release preflight's
-reconciliation check cannot pass under the PR-only rulesets and has been red at every 0.14.x
-release, so the operator's judgement is recorded in the promotion PR instead (#6427); and the
+`main`, by bypass where no review was given, with no compensating control yet (#6431); no PR
+step can make the release preflight's reconciliation check pass — it was red at every 0.14.x
+release, and `v0.15.0` passed it only after a direct bypass push to `dev` — so the operator's
+judgement is recorded in the promotion PR instead (#6427); and the
 governance review's only evidence is a committed `governance.d/` fragment that CI does not check
 for (#6430). Until those close, answer "branch protection and mandatory code review" as *process
 documented and substantially followed; enforcement partial; gaps disclosed and tracked* — not as

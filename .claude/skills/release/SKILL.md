@@ -31,7 +31,7 @@ Before invoking the skill, the operator should already have:
 - All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` shows nothing you meant to ship; preflight check #9 reports divergence in either direction and, under the PR-only rulesets, will report at least the promotion merge commit — see Phase 0.5 for what it can and cannot resolve).
 - CHANGELOG promoted: `python3 scripts/assemble-changelog.py promote X.Y.Z` run and committed — it assembles all `changelog.d/` fragments (plus any legacy `[Unreleased]` content) into `## [X.Y.Z] - YYYY-MM-DD` and deletes the fragment files. Never hand-move `[Unreleased]` content. Preflight check 4b fails while unpromoted fragments remain. **Later RCs and the final release:** the version was promoted at its first RC, so hotfix fragments added since then are folded in with `python3 scripts/assemble-changelog.py promote X.Y.Z --append` before each later RC tag, and with `--append --date <final-date>` before the final tag; run that even if no fragment landed since the last RC: with no fragments it only re-dates the header (#5221). Convention: `changelog.d/README.md`.
 - `meson.build` `version: 'X.Y.Z'` updated.
-- `README.md`'s Docker quickstart updated to the new release (the `/vX.Y.Z/` URL and `YUZU_VERSION=X.Y.Z`); `python3 -I tests/test_readme_quickstart.py` passes. It runs only locally — nothing in CI catches a quickstart that installs N-1 (#5540 is the precedent).
+- `README.md`'s Docker quickstart updated to the new release (the `/vX.Y.Z/` URL and `YUZU_VERSION=X.Y.Z`); `python3 -I tests/test_readme_quickstart.py` passes. CI runs it too (the `docs` suite of the required *Linux gcc-15 debug* check), but not on a docs-only change (PR or push), which gets that check's stub — run it locally before the release commit's PR rather than finding out from CI (#5540 is the precedent for the bump).
 - The six required checks green on the commit being tagged (`main`'s tip). **Skipped counts as passing; absent, failed or cancelled do not.** A docs/changelog-only push to `main` (the final `promote --append --date` commit is one only when it touches `CHANGELOG.md` alone; folding fragments also deletes `changelog.d/*.md`, which are nested markdown and so build) skips the build legs via preflight's `code_changed=false` (#5320): `Proto backward-compat` shows `skipped`, and the `Linux gcc-15 debug` / `Windows MSVC debug` / `macOS debug` names come from the `docs-required-checks` stub as `success`. That skip only happens when the previous commit's push run succeeded, so a green docs-only commit never hides a red or unbuilt code commit. `success` on those three names for a docs-only commit means *inherited from the predecessor's build*, not *built*; the run's summary says so. A context that is missing entirely is a stop: wait for the run, or find out why it did not start. Check it with:
 
   ```bash
@@ -66,9 +66,13 @@ bash scripts/release-preflight.sh vX.Y.Z          # CRLF, version, CHANGELOG, co
 bash scripts/check-compose-versions.sh X.Y.Z      # explicit compose check (preflight wraps this too)
 ```
 
-The command blocks in this skill are written to run as scripts, one block at a time; each STOP
-ends the block (`return 1 2>/dev/null || exit 1` works both when sourced and when executed, and
-does not close an interactive shell when sourced). If anything prints `STOP`, do not run any
+The command blocks in this skill are written to run as scripts, one block at a time — save the
+block and run it with `bash`, or feed it whole to `bash <<'EOF' … EOF`. Each STOP then ends the
+block (`return 1 2>/dev/null || exit 1` also ends a `source`d file without closing the shell).
+**Never paste a block line by line into an interactive shell:** there a STOP's `return` ends
+only its own line, the lines after it still run, and in Phase 1 those include `git tag` and
+`git push`. A step you do by hand (an edit, a commit) always sits between two blocks, never
+inside one. If anything prints `STOP`, do not run any
 later step; report to the operator. (`--ff-only`
 refuses when local `main` has a commit `origin/main` lacks — that is a STOP too. **Never
 `git reset --hard` local `main`**: the stray commit is usually an un-pushed promote or version
@@ -89,8 +93,8 @@ Preflight checks (numbered as `scripts/release-preflight.sh` numbers them):
 8. `docker-compose.full-uat.yml` includes `--data-dir`
 9. `origin/dev` and `origin/main` have IDENTICAL tips (both `rev-list --count`s zero) — hard
    FAIL otherwise, except that it PASSes as "skipping" when either branch is missing on
-   `origin`. **Under the PR-only rulesets this check cannot be made to pass** — read Phase 0.5
-   before acting on it
+   `origin`. **No PR-based step can make this check pass** — read Phase 0.5 before acting on
+   it
 10. (`--full` only) local C++ + Erlang compile (~2 min)
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
@@ -104,8 +108,10 @@ The preflight's check #9 surfaces this as a hard FAIL with the exact ahead/behin
 **Check #9 cannot be made to PASS by any PR-based step, so do not loop on it.** It demands
 identical tips. A PR merge — merge commit, squash or rebase — always creates a commit on the
 target branch only, so after the promotion PR `main` is ahead by that commit and after the
-back-merge PR `dev` is. The tips have only ever coincided after a direct fast-forward push, which
-the rulesets allow for bypass actors alone. Every 0.14.x tag points at a PR merge commit on
+back-merge PR `dev` is. The tips coincide only after a direct fast-forward push, which the
+rulesets allow for bypass actors alone — that is how `v0.15.0` passed it (a direct push moved
+`dev` onto the promotion merge before the tag; `docs/branch-strategy.md` §3.3). Do not rely on
+that route: it needs a bypass actor and leaves no review trail. Every 0.14.x tag points at a PR merge commit on
 `main`; at `v0.14.0` and `v0.14.1` the check would have read `main` a handful of commits ahead
 and `dev` several hundred to a thousand ahead (`docs/branch-strategy.md` §6 has the measured
 pairs) — the releases were cut with #9 red and the operator reading the counts rather than
@@ -114,7 +120,7 @@ waiting for zero. Do the same: after the two PRs below, re-run preflight, confir
 back-merge will carry, and proceed. Making the check merge-aware is a tooling change tracked
 separately (see `docs/branch-strategy.md` §3.3).
 
-**Both directions go through a pull request.** The *Protect Main* and *Protect Dev* rulesets accept changes only by PR and require one approving review, so for an ordinary contributor a direct `git push` to either branch — including a fast-forward — is refused. (Which accounts may bypass is visible only to repository administrators; the history shows at least one can, since five `main` PRs and the #6271 back-merge merged without an approving review. Use the PR path regardless — it is what leaves the review trail.) Reconciliation flow:
+**Both directions go through a pull request.** The *Protect Main* and *Protect Dev* rulesets accept changes only by PR and require one approving review, so for an ordinary contributor a direct `git push` to either branch — including a fast-forward — is refused. (Which accounts may bypass is visible only to repository administrators; the history shows at least one can, since five `main` PRs and the #6271 back-merge merged without an approving review, and on 2026-10-30 `dev` was moved by a direct push. Use the PR path regardless — it is what leaves the review trail.) Reconciliation flow:
 
 ```bash
 git fetch origin                             # every command below reads origin/*; a stale
@@ -130,7 +136,10 @@ else
   echo "step 1: $(git rev-list --count origin/dev..origin/main) commit(s) on main to carry back"
   # A merge is usually right (it keeps the hotfix history); cherry-pick only when main
   # holds nothing but a CHANGELOG/version commit that would conflict anyway.
-  git switch -c chore/back-merge-vX.Y.Z origin/dev   # version-suffixed: a stale same-named branch in this clone would make `switch -c` refuse
+  # Distinct from Phase 6's chore/post-release-back-merge-vX.Y.Z: a merged PR deletes only the
+  # REMOTE branch, so a shared name would make the later `switch -c` refuse.
+  git switch -c chore/pre-release-back-merge-vX.Y.Z origin/dev \
+    || { echo "STOP: could not create chore/pre-release-back-merge-vX.Y.Z (a same-named local branch exists?) - do not merge or push"; return 1 2>/dev/null || exit 1; }
   git merge --no-edit origin/main \
     || { echo "STOP: merge conflict - report the conflicting paths (git diff --name-only --diff-filter=U) to the operator"; return 1 2>/dev/null || exit 1; }
                                    # Never `git merge --abort` silently and never resolve with
@@ -141,7 +150,8 @@ else
                                    # would be released twice.
   ! git grep -nE '^(<<<<<<< |>>>>>>> )' -- . \
     || { echo "STOP: conflict markers committed - fix the merge before pushing"; return 1 2>/dev/null || exit 1; }
-  git push -u origin chore/back-merge-vX.Y.Z
+  git push -u origin chore/pre-release-back-merge-vX.Y.Z \
+    || { echo "STOP: push of chore/pre-release-back-merge-vX.Y.Z failed - do not open the PR"; return 1 2>/dev/null || exit 1; }
   gh pr create --base dev \
     --title "chore: back-merge main into dev after the <release> promotion" \
     --body "Carries the <release> promotion, folds and hotfixes back to dev. Merge as a MERGE COMMIT (not squash/rebase) so origin/main becomes an ancestor of origin/dev. Closes nothing."
@@ -159,80 +169,272 @@ a merge commit, not squashed, or the ancestor test above never fires again. Poll
 BM_PR=<n>
 [ -z "$BM_PR" ] || gh pr view "$BM_PR" --json state,baseRefName -q '[.state,.baseRefName]|join(" ")' | grep -qx "MERGED dev" \
   || { echo "STOP: back-merge PR $BM_PR is not MERGED into dev - do not start step 2"; return 1 2>/dev/null || exit 1; }
-# Step 2 — the release-prep PR into main. TWO variants; pick by what you are releasing.
+# Step 2 — the PR into main that carries the release commit. THREE variants; pick by what you
+# are releasing. Every variant's main-bound PR body carries the record below, and every
+# variant passes the nightly-broken gate before that PR is merged.
 #
-# (a) PROMOTION (a new minor, or its first candidate): a release/vX.Y.Z-prep branch cut from the
+# (a) PROMOTION via a prep branch (#5113): a release/vX.Y.Z-prep branch cut from the
 #     RECONCILED dev (after step 1), carrying the release commit (CHANGELOG promotion,
-#     meson.build bump, compose defaults — pre-conditions above). `--head dev` is the exception,
-#     not the rule: a branch ref keeps moving while the PR is open, so anything merged to dev in
-#     the meantime rides into the release without release review (#6264 used it for a
-#     no-release-commit sync; #5113 used a prep branch).
+#     meson.build bump, compose defaults — pre-conditions above), PR'd straight into main.
 # (b) PATCH (vX.Y.(Z+1) carrying hotfixes already on main): cut the prep branch from
 #     ORIGIN/MAIN and SKIP step 1 — a patch must not pick up unreleased dev work. #5540
 #     (release/v0.14.1-prep) is the precedent. If the patch also needs a fix that exists only
 #     on dev, cherry-pick it onto a hotfix branch off main FIRST (docs/branch-strategy.md §4);
 #     never merge dev into a patch prep branch.
+# (c) PROMOTION via dev (the 0.15.0 route: #6725 prep → dev, then #6773 dev → main): the same
+#     prep branch as (a), PR'd into DEV with NO record in its body; once it is merged, a PINNED
+#     candidate goes to main and THAT PR carries the record — see the variant (c) blocks below.
+#     Never a bare `--head dev`: a branch ref keeps moving while the PR is open, so anything
+#     merged to dev in the meantime rides into the release without release review.
 #
 # Set BASE once; the single `switch` below reads it. Never write two switch lines.
-BASE=origin/dev        # (a) promotion
+BASE=origin/dev        # (a) and (c) promotion
 # BASE=origin/main     # (b) patch — uncomment this line and comment out the origin/dev line above
-git fetch origin
+git fetch origin \
+  || { echo "STOP: git fetch failed - $BASE may be stale; do not cut the prep branch"; return 1 2>/dev/null || exit 1; }
 git switch -c release/vX.Y.Z-prep "$BASE" \
   || { echo "STOP: could not create release/vX.Y.Z-prep from $BASE"; return 1 2>/dev/null || exit 1; }
-python3 scripts/assemble-changelog.py promote X.Y.Z   # plain for a new version. A LATER RC of an already-promoted version is neither (a) nor (b):
-                                                      # its `--append` fold goes in a chore/release-* branch cut from main (docs/branch-strategy.md §3.4)
-# edit meson.build version and the compose ${YUZU_VERSION:-X.Y.Z} defaults; commit
-git push -u origin release/vX.Y.Z-prep
-gh pr create --base main --head release/vX.Y.Z-prep \
+git config branch.release/vX.Y.Z-prep.yuzuReleaseBase "$BASE"   # the next block reads BASE from here
+python3 scripts/assemble-changelog.py promote X.Y.Z \
+  || { echo "STOP: promote failed - do not edit or commit"; return 1 2>/dev/null || exit 1; }
+# plain promote for a new version. A LATER RC of an already-promoted version is none of (a)-(c):
+# see "Later release candidates" below. The block ends here, on purpose.
+```
+
+**Now, by hand, on `release/vX.Y.Z-prep`:** set `version: 'X.Y.Z'` in `meson.build`, the
+`${YUZU_VERSION:-X.Y.Z}` default in every compose file `scripts/check-compose-versions.sh` lists,
+and the README quickstart (pre-conditions above); run `bash scripts/check-compose-versions.sh X.Y.Z`
+and `python3 -I tests/test_readme_quickstart.py`; then `git add` those files and the promote's
+`CHANGELOG.md`/`changelog.d/` changes and commit. A manual step never sits inside a block, because
+a block runs whole. The next block refuses to push a branch with no commit of its own or a dirty
+tree.
+
+```bash
+PR_BASE=main           # (a)/(b). (c): PR_BASE=dev, and a body that says the promotion PR follows - no record
+BASE=$(git config --get branch.release/vX.Y.Z-prep.yuzuReleaseBase) \
+  || { echo "STOP: no recorded base for release/vX.Y.Z-prep - run the block above first"; return 1 2>/dev/null || exit 1; }
+test "$(git rev-parse --abbrev-ref HEAD)" = release/vX.Y.Z-prep \
+  || { echo "STOP: not on release/vX.Y.Z-prep"; return 1 2>/dev/null || exit 1; }
+[ -n "$(git rev-list "$BASE..HEAD")" ] \
+  || { echo "STOP: release/vX.Y.Z-prep has no commit beyond $BASE - make the release commit first"; return 1 2>/dev/null || exit 1; }
+[ -z "$(git status --porcelain --untracked-files=no)" ] \
+  || { echo "STOP: uncommitted changes - commit or discard them before pushing"; return 1 2>/dev/null || exit 1; }
+git push -u origin release/vX.Y.Z-prep \
+  || { echo "STOP: push of release/vX.Y.Z-prep failed - do not open the PR"; return 1 2>/dev/null || exit 1; }
+gh pr create --base "$PR_BASE" --head release/vX.Y.Z-prep \
   --title "release: vX.Y.Z — promote changelog, bump version" \
   --body "<promotion from dev | patch on main> for vX.Y.Z. Tag follows once merged. Preflight #9 record below.
 
+Release: <tag: vX.Y.Z, or vX.Y.Z-rcN for a candidate>
 Preflight #9: main ahead <n> (no-merges <k>) / dev ahead <m>
 Expected + (named): <sha> <subject> [release-prep | hotfix #NNNN]; ...
 git cherry -v output (verbatim): NOT YET RUN
-Unexplained +: NOT YET RUN          Judged by: NOT YET RUN"
-# The three NOT YET RUN values are filled in step 3; Phase 1 refuses to tag while any remains.
-# Get it approved and merged (a merge commit; the ruleset forbids a force or direct push).
-
-# Step 3 — on the MERGED tip (re-sync local main as in Phase 0), re-run preflight. Expect check
-# #9 to report main ahead by the step-2 merge commit (and dev ahead by anything merged since).
-# ACCEPTANCE TEST for the red #9 (docs/branch-strategy.md §3.3; tooling fix tracked in #6427).
-# Write the expected `+` list into the PR body BEFORE running git cherry (pre-commitment):
-git log --no-merges --oneline origin/dev..origin/main   # must be ONLY release prep + hotfixes you can name
-git cherry -v origin/dev origin/main                     # every `+` must be in the expected list; an unexpected `+` STOPS the release
-git log --merges -p --cc origin/dev..origin/main         # cherry and --no-merges both skip merges; a non-empty --cc diff = a hand-resolved merge, READ it
-git diff --stat origin/main^1 origin/main                # the promotion merge vs its first parent = what the release added; must be the intended delta
-# Replace the three NOT YET RUN values in the promotion PR's body (`gh pr edit <n> --body-file`;
-# a merged PR's body stays editable), then proceed to Phase 1 - which greps for them.
-bash scripts/release-preflight.sh vX.Y.Z
+Unexplained +: NOT YET RUN          Judged by: NOT YET RUN
+Validated SHA: NOT YET RUN"
+# `Release:` is the exact tag Phase 1 will push. The NOT YET RUN values are filled in step 3;
+# Phase 1 refuses to tag while any remains. Get it approved; merge it only after the gate below
+# (a merge commit; the ruleset forbids a force or direct push).
 ```
+
+**Before merging ANY PR into `main`** — the step-2 PR, the variant (c) promotion PR, a later
+candidate's `chore/release-*` fold, a hotfix — run this gate. There is no merge to `main` while a
+`nightly-broken` issue is open (CLAUDE.md, CI architecture; `docs/ci-architecture.md`). The list
+is read with your authenticated `gh`; an API error is a STOP, never an empty list, and so is a
+missing label (a renamed label would otherwise list nothing and pass).
+
+```bash
+gh label list --repo DevNullLtd/Yuzu --search nightly-broken --json name -q '.[].name' | grep -qx nightly-broken \
+  || { echo "STOP: cannot confirm the nightly-broken label exists - do not merge to main"; return 1 2>/dev/null || exit 1; }
+NB=$(gh issue list --repo DevNullLtd/Yuzu --label nightly-broken --state open --json number -q 'map(.number)|join(" ")') \
+  || { echo "STOP: cannot list nightly-broken issues - do not merge to main"; return 1 2>/dev/null || exit 1; }
+[ -z "$NB" ] \
+  || { echo "STOP: nightly-broken issue(s) open: $NB - no merge to main"; return 1 2>/dev/null || exit 1; }
+```
+
+**Variant (c) only — the pinned dev → `main` promotion.** Run after the prep PR is merged into
+`dev`. The candidate is the `dev` commit you review; the PR's head is a branch created at it,
+and the candidate is written into the PR body so every later check reads it from there rather
+than from a fresh `origin/dev`. The block refuses a candidate that does not contain the merged
+prep PR, and lists every `dev` merge that landed after it: those ride into the release, so the
+promotion PR's reviewer must see them.
+
+```bash
+PREP_PR=<n>    # the variant (c) prep PR, merged into dev; a literal <n> fails closed
+git fetch origin \
+  || { echo "STOP: git fetch failed - origin/dev may be stale; do not pin a candidate"; return 1 2>/dev/null || exit 1; }
+PREP_MERGE=$(gh pr view "$PREP_PR" --json state,baseRefName,mergeCommit -q 'select(.state=="MERGED" and .baseRefName=="dev") | .mergeCommit.oid') \
+  && [ -n "$PREP_MERGE" ] \
+  || { echo "STOP: prep PR $PREP_PR is not MERGED into dev - do not pin a candidate"; return 1 2>/dev/null || exit 1; }
+CANDIDATE=$(git rev-parse origin/dev)
+git merge-base --is-ancestor "$PREP_MERGE" "$CANDIDATE" \
+  || { echo "STOP: candidate $CANDIDATE does not contain the prep merge $PREP_MERGE"; return 1 2>/dev/null || exit 1; }
+RIDERS=$(git log --first-parent --oneline "$PREP_MERGE..$CANDIDATE")
+echo "Merged to dev after the prep PR (they ride into the release): ${RIDERS:-none}"
+PROMOTE_BRANCH=release/vX.Y.Z-promote   # a re-pin uses a fresh name: release/vX.Y.Z-promote-2, ...
+# The branch must not exist yet: pushing onto an existing one would silently fast-forward it.
+# (`${CANDIDATE}` is braced: in zsh, "$CANDIDATE:r…" is a modifier and eats the colon.)
+git ls-remote --exit-code origin "refs/heads/${PROMOTE_BRANCH}" >/dev/null; LS_RC=$?
+[ "$LS_RC" = 2 ] \
+  || { echo "STOP: ${PROMOTE_BRANCH} already exists (or origin is unreadable, rc $LS_RC) - pin on a fresh name"; return 1 2>/dev/null || exit 1; }
+git push origin "${CANDIDATE}:refs/heads/${PROMOTE_BRANCH}" \
+  || { echo "STOP: could not create ${PROMOTE_BRANCH} at the candidate"; return 1 2>/dev/null || exit 1; }
+gh pr create --base main --head "${PROMOTE_BRANCH}" \
+  --title "release: dev → main promote for vX.Y.Z" \
+  --body "Promotes candidate $CANDIDATE (dev, carrying the vX.Y.Z prep #$PREP_PR) to main. Tag follows once merged.
+
+Merged to dev after the prep PR (riding into the release):
+${RIDERS:-none}
+
+Candidate: $CANDIDATE
+<then the step-2 record lines, Release: through Validated SHA: NOT YET RUN>"
+```
+
+Merge it only this way, after the nightly-broken gate. `PROMO_PR` is this promotion PR, and
+Phase 1 uses the same number. `--match-head-commit` makes GitHub refuse the merge if the head
+has moved since it was pinned — nothing protects `release/*` branches, so this, not the branch
+name, is the guard.
+
+```bash
+PROMO_PR=<n>
+# The whole nightly-broken gate again, in the same block as the merge it guards.
+gh label list --repo DevNullLtd/Yuzu --search nightly-broken --json name -q '.[].name' | grep -qx nightly-broken \
+  || { echo "STOP: cannot confirm the nightly-broken label exists - do not merge to main"; return 1 2>/dev/null || exit 1; }
+NB=$(gh issue list --repo DevNullLtd/Yuzu --label nightly-broken --state open --json number -q 'map(.number)|join(" ")') \
+  && [ -z "$NB" ] \
+  || { echo "STOP: nightly-broken open (${NB:-gh error}) - no merge to main"; return 1 2>/dev/null || exit 1; }
+CANDIDATE=$(gh pr view "$PROMO_PR" --json body -q .body | tr -d '\r' | sed -n 's/^Candidate: \([0-9a-f]\{40\}\)[[:space:]]*$/\1/p')
+[ -n "$CANDIDATE" ] && [ "$(printf '%s\n' "$CANDIDATE" | wc -l | tr -d ' ')" = 1 ] \
+  || { echo "STOP: PR $PROMO_PR needs exactly one 'Candidate: <40-hex>' line"; return 1 2>/dev/null || exit 1; }
+gh pr merge "$PROMO_PR" --merge --match-head-commit "$CANDIDATE" \
+  || { echo "STOP: merge refused - if the head moved off $CANDIDATE, close the PR, pin a new candidate on a fresh branch and re-review"; return 1 2>/dev/null || exit 1; }
+```
+
+For every other PR into `main` there is no scripted merge: run the gate block above immediately
+before you press merge, not when the PR is opened.
+
+The head moves if anyone pushes to the branch, or if "Update branch" is used — both rulesets
+require branches to be up to date, so a hotfix landing on `main` while the PR is open forces
+one. In either case re-pin: close the PR; if `main` gained a commit `dev` lacks, carry it back
+first (step 1's back-merge, merged), or every new candidate is refused the same way; then pin
+the reviewed new candidate as `release/vX.Y.Z-promote-2` and re-review.
+
+Phase 1 also checks that the tagged merge's second parent is the recorded candidate — when the
+record is on this promotion PR. If a hotfix lands after it and the record moves to the hotfix
+PR, that body has no `Candidate:` line and the check does not apply; the promotion merge was
+already bound to the candidate by `--match-head-commit`.
+
+```bash
+# Step 3 — on the MERGED tip, re-run preflight and record what it validated. Expect check #9
+# to report main ahead by the step-2 merge commit (and dev ahead by anything merged since).
+# ACCEPTANCE TEST for the red #9 (docs/branch-strategy.md §3.3; tooling fix tracked in #6427).
+# Write the expected `+` list into the PR body BEFORE running git cherry (pre-commitment).
+git fetch origin \
+  || { echo "STOP: git fetch failed - do not validate a stale origin/main"; return 1 2>/dev/null || exit 1; }
+git switch main && git merge --ff-only origin/main \
+  || { echo "STOP: cannot fast-forward local main to origin/main"; return 1 2>/dev/null || exit 1; }
+VALIDATED=$(git rev-parse HEAD)
+[ "$VALIDATED" = "$(git rev-parse origin/main)" ] \
+  || { echo "STOP: local main != origin/main"; return 1 2>/dev/null || exit 1; }
+bash scripts/release-preflight.sh vX.Y.Z; PF_RC=$?   # READ IT: every check except #9 must PASS (below)
+[ "$PF_RC" -eq 0 ] || echo "
+!!! PREFLIGHT EXITED $PF_RC. Read every FAIL line above. If any is not check #9
+!!! (origin/dev and origin/main diverged), STOP: there is no SHA to record.
+"
+# The evidence reads $VALIDATED, not origin/main: preflight re-fetches, and origin/main may have moved.
+git log --no-merges --oneline "origin/dev..$VALIDATED"   # must be ONLY release prep + hotfixes you can name
+git cherry -v origin/dev "$VALIDATED"                     # every `+` must be in the expected list; an unexpected `+` STOPS the release
+git log --merges -p --cc "origin/dev..$VALIDATED"         # cherry and --no-merges both skip merges; a non-empty --cc diff = a hand-resolved merge, READ it
+git diff --stat "$VALIDATED^1" "$VALIDATED"               # the promotion merge vs its first parent = what the release added; must be the intended delta
+echo "Validated SHA: $VALIDATED"
+```
+
+**Read the preflight output before recording anything.** If any check other than #9 reports
+FAIL, STOP: fix it and re-run this step; there is no SHA to record. The skill does not parse
+the script's output — a scripted "only #9 failed" check belongs in `release-preflight.sh`
+(#6427), where it can be tested against the script's own wording.
+
+Then fill the record (`gh pr edit <n> --body-file`; a merged PR's body stays editable) on the PR
+whose merge commit is the `Validated SHA` printed above — normally the promotion PR; if a hotfix
+merged after the promotion and before this step, the hotfix PR, with its `Expected +` line
+written before you re-run `git cherry`. Phase 1 tags exactly that SHA and nothing else.
+
+- `Preflight #9:` — the two counts preflight printed, and the `--no-merges` count.
+- `git cherry -v output (verbatim):` — the first `+`/`-` line on the same line after the colon,
+  the remaining lines below it, unedited. If it printed nothing, write `(empty)`.
+- `Unexplained +:` — `none`. Anything else means the release stops here; Phase 1 tags only on
+  `none`. `Judged by:` — your GitHub handle.
+- `Validated SHA:` — the line printed above.
+
+Phase 1 checks only what binds the tag to this record: exactly one well-formed `Validated SHA:`
+line, no `NOT YET RUN` left, `Release:` exactly the tag, `Unexplained +: none`, the PR merged
+into `main` at that SHA with local and remote `main` still there, and (variant (c)) that the
+merge's second parent is the recorded `Candidate:`. The other fields are for the reviewer;
+nothing parses them.
 
 `origin/main^1` is the promotion merge's first parent only while that merge is still `main`'s
 tip; if a hotfix landed after it, diff the merge commit itself: `git diff --stat <merge>^1 <merge>`.
 
-`gh pr create` needs `--body` (or `--fill`) when run non-interactively — with `--title` alone it
-exits with "must provide --title and --body". Recent instances of the two PRs: #6271
-(back-merge, 2026-10-21) and #6264 (promotion with `--head dev`, 2026-10-21); #5113 and #5540
-were promotions from `release/*` branches carrying the release commit.
+**If anything lands on `main` after step 3**, the record no longer describes the tip and Phase 1
+STOPs. Re-run step 3 on the new tip and write the record on the PR whose merge produced that tip
+(for a hotfix, the hotfix PR — its body stays editable after the merge), writing its
+`Expected +` line there before re-running `git cherry`.
 
-The operator then tags `main`'s tip (Phase 1). The back-merge of the step-2 merge commit itself
-happens after the release (Phase 6 step 1).
+**Later release candidates.** A later `-rcN` of an already-promoted version is folded by
+`promote X.Y.Z --append` on a `chore/release-*` branch cut from `origin/main`
+(`docs/branch-strategy.md` §3.4). That fold PR is the next tag's record PR: open it with the same
+record lines (`Release: vX.Y.Z-rcN`), pass the nightly-broken gate, merge it, and run step 3 on
+its merged tip.
+
+`gh pr create` needs `--body` (or `--fill`) when run non-interactively — with `--title` alone it
+exits with "must provide --title and --body". Recent instances:
+
+- #6271 — back-merge, 2026-10-21.
+- #6264 — a `--head dev` sync to `main` with no release commit, 2026-10-21.
+- #5113 and #5540 — variants (a) and (b): promotions from `release/*` branches carrying the
+  release commit.
+- #6725 → #6773 — variant (c), v0.15.0, 2026-10-30. #6773 used `--head dev`; this skill replaces
+  that with a pinned branch.
+
+The operator then tags the validated SHA (Phase 1). The back-merge of the step-2 merge commit
+itself happens after the release (Phase 6 step 1).
 
 ## Phase 1 — Tag and push (~5 sec)
 
 ```bash
-git fetch origin && git switch main && git merge --ff-only origin/main
-test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" \
-  || { echo "STOP: local main != origin/main - do not tag; report to the operator"; return 1 2>/dev/null || exit 1; }
-# The promotion PR's Preflight #9 record must be complete (Phase 0.5 step 3). PROMO_PR = its number.
-# Fail CLOSED: an unreadable body (wrong number, gh error, literal <n>) is a STOP, not a pass.
+# PROMO_PR = the PR whose merge commit is main's tip and whose body carries the Preflight #9
+# record (Phase 0.5 step 3): the step-2 PR, the variant (c) promotion PR, a later candidate's
+# chore/release-* fold PR, or a hotfix PR that landed after the promotion. TAG = the exact tag,
+# -rcN included. Fail CLOSED: an unreadable PR (wrong number, gh error, literal <n>) is a STOP.
 PROMO_PR=<n>
-BODY=$(gh pr view "$PROMO_PR" --json body -q .body) && test -n "$BODY" \
-  || { echo "STOP: cannot read promotion PR $PROMO_PR body - do not tag"; return 1 2>/dev/null || exit 1; }
-printf '%s' "$BODY" | grep -qE 'NOT YET RUN|<paste|<name>|<sha>|ahead <n>|<k>|<m>' \
-  && { echo "STOP: promotion PR $PROMO_PR still carries an unfilled Preflight #9 record"; return 1 2>/dev/null || exit 1; }
-git tag -a vX.Y.Z -m "Release vX.Y.Z"
-git push origin vX.Y.Z
+TAG=vX.Y.Z
+git fetch origin \
+  || { echo "STOP: git fetch failed - origin/main may be stale; do not tag"; return 1 2>/dev/null || exit 1; }
+git switch main && git merge --ff-only origin/main \
+  || { echo "STOP: cannot fast-forward local main to origin/main - do not tag"; return 1 2>/dev/null || exit 1; }
+META=$(gh pr view "$PROMO_PR" --json state,baseRefName,mergeCommit -q '[.state, .baseRefName, (.mergeCommit.oid // "none")] | join(" ")') \
+  && BODY=$(gh pr view "$PROMO_PR" --json body -q .body | tr -d '\r' | sed 's/[[:space:]]*$//') && test -n "$BODY" \
+  || { echo "STOP: cannot read promotion PR $PROMO_PR - do not tag"; return 1 2>/dev/null || exit 1; }
+# The verbatim git cherry lines (`+ `/`- `) and riders are free text, so they are not scanned.
+printf '%s\n' "$BODY" | grep -vE '^(git cherry -v output \(verbatim\): )?[+-] ' | grep -qF 'NOT YET RUN' \
+  && { echo "STOP: PR $PROMO_PR still carries an unfilled Preflight #9 record"; return 1 2>/dev/null || exit 1; }
+[ "$(printf '%s\n' "$BODY" | grep -cE '^Validated SHA: [0-9a-f]{40}$')" = 1 ] \
+  || { echo "STOP: PR $PROMO_PR needs exactly one 'Validated SHA: <40-hex>' line"; return 1 2>/dev/null || exit 1; }
+VALIDATED_SHA=$(printf '%s\n' "$BODY" | sed -n 's/^Validated SHA: \([0-9a-f]\{40\}\)$/\1/p')
+[ "$META" = "MERGED main $VALIDATED_SHA" ] \
+  || { echo "STOP: PR $PROMO_PR is '$META', not MERGED into main at the validated SHA $VALIDATED_SHA - the record belongs on the PR whose merge commit that SHA is"; return 1 2>/dev/null || exit 1; }
+[ "$(git rev-parse HEAD)" = "$VALIDATED_SHA" ] && [ "$(git rev-parse origin/main)" = "$VALIDATED_SHA" ] \
+  || { echo "STOP: main is no longer the validated SHA $VALIDATED_SHA - re-run Phase 0.5 step 3 on the new tip and record it on the PR whose merge produced that tip"; return 1 2>/dev/null || exit 1; }
+[ "$(printf '%s\n' "$BODY" | grep -c '^Release:')" = 1 ] && printf '%s\n' "$BODY" | grep -qxF "Release: $TAG" \
+  && [ "$(printf '%s\n' "$BODY" | grep -c '^Unexplained +:')" = 1 ] \
+  && printf '%s\n' "$BODY" | grep -qE '^Unexplained \+: none([[:space:]]+Judged by:.*)?$' \
+  || { echo "STOP: PR $PROMO_PR needs exactly one 'Release: $TAG' line and exactly one 'Unexplained +: none' line"; return 1 2>/dev/null || exit 1; }
+# Variant (c): the promotion merge must have merged the recorded candidate.
+CANDIDATE=$(printf '%s\n' "$BODY" | sed -n 's/^Candidate: //p')
+[ -z "$CANDIDATE" ] || [ "$(git rev-parse -q --verify "$VALIDATED_SHA^2")" = "$CANDIDATE" ] \
+  || { echo "STOP: $VALIDATED_SHA did not merge the recorded candidate $CANDIDATE"; return 1 2>/dev/null || exit 1; }
+git tag -a "$TAG" "$VALIDATED_SHA" -m "Release $TAG" \
+  || { echo "STOP: git tag failed"; return 1 2>/dev/null || exit 1; }
+git push origin "$TAG"
 ```
 
 If that prints `STOP`, nothing has been tagged; do not run any later step.
@@ -483,27 +685,47 @@ After all verification passes:
 
 1. **Carry `main` back to `dev`, and bump `dev`'s version in the same PR.** The promotion
    merge commit, every hotfix and every `promote --append` fold exist only on `main` until this
-   happens. Open the back-merge PR described in Phase 0.5 step 1 (skip only if
-   `git merge-base --is-ancestor origin/main origin/dev` already holds), and before pushing it
-   add one more commit on the same branch (name it with the version — `chore/back-merge-vX.Y.Z` —
-   so it cannot collide with a Phase 0.5 branch left in the same clone):
+   happens. The flow is Phase 0.5 step 1's on its own branch name: Phase 0.5 used
+   `chore/pre-release-back-merge-vX.Y.Z`, and a merged PR deletes only the remote branch, so
+   reusing that name would make `switch -c` refuse. When
+   `git merge-base --is-ancestor origin/main origin/dev` already holds the merge below is a
+   no-op, and the PR carries only the version bump.
    ```bash
-   # on chore/back-merge-vX.Y.Z, after `git merge origin/main` has been committed:
-   # Update meson.build version to X.Y.(Z+1) or (X+1).Y.0 (operator's call).
-   # PLAIN version only — never a -dev/-rcN suffix. The suffix convention was
-   # tried at 0.13.1-dev and rejected (operator ruling 2026-07-13): it
-   # generated `int kVersionPatch = 1-dev;` via version.hpp.in and red-lined
-   # the entire C++ matrix on dev + every open PR (fixed in fca69e34).
-   # (No CHANGELOG step: the promote already left the ## [Unreleased] header +
-   # do-not-edit note in place; new entries arrive as changelog.d/ fragments.)
+   git fetch origin \
+     || { echo "STOP: git fetch failed - origin/* may be stale"; return 1 2>/dev/null || exit 1; }
+   git switch -c chore/post-release-back-merge-vX.Y.Z origin/dev \
+     || { echo "STOP: could not create chore/post-release-back-merge-vX.Y.Z (a same-named local branch exists?) - do not merge or push"; return 1 2>/dev/null || exit 1; }
+   git merge --no-edit origin/main \
+     || { echo "STOP: merge conflict - report the conflicting paths (git diff --name-only --diff-filter=U) to the operator"; return 1 2>/dev/null || exit 1; }
+                                   # Same rules as Phase 0.5 step 1: never abort or -X ours/theirs
+                                   # silently; delete a cherry-picked fix's dev-side fragment (#6428).
+   ! git grep -nE '^(<<<<<<< |>>>>>>> )' -- . \
+     || { echo "STOP: conflict markers committed - fix the merge before pushing"; return 1 2>/dev/null || exit 1; }
+   ```
+   **Now, by hand:** set `meson.build`'s `version:` to X.Y.(Z+1) or (X+1).Y.0 (the operator's
+   call). PLAIN version only — never a `-dev`/`-rcN` suffix: that convention was tried at
+   0.13.1-dev and rejected (operator ruling 2026-07-13), because it generated
+   `int kVersionPatch = 1-dev;` via `version.hpp.in` and red-lined the entire C++ matrix on `dev`
+   and every open PR (fixed in fca69e34). There is no CHANGELOG step: the promote already left the
+   `## [Unreleased]` header and its do-not-edit note in place. Then run:
+   ```bash
+   test "$(git rev-parse --abbrev-ref HEAD)" = chore/post-release-back-merge-vX.Y.Z \
+     || { echo "STOP: not on chore/post-release-back-merge-vX.Y.Z"; return 1 2>/dev/null || exit 1; }
    git add meson.build            # never `commit -a`: a stray tracked change would ride along
-   git commit -m "chore(post-release): bump dev to X.Y.Z+1"
+   git commit -m "chore(post-release): bump dev to X.Y.Z+1" \
+     || { echo "STOP: nothing committed - was meson.build's version edited?"; return 1 2>/dev/null || exit 1; }
+   git push -u origin chore/post-release-back-merge-vX.Y.Z \
+     || { echo "STOP: push of chore/post-release-back-merge-vX.Y.Z failed - do not open the PR"; return 1 2>/dev/null || exit 1; }
+   gh pr create --base dev \
+     --title "chore: back-merge main into dev after vX.Y.Z; bump dev to X.Y.Z+1" \
+     --body "Carries the vX.Y.Z release commits back to dev and sets dev's next version. Merge as a MERGE COMMIT (not squash/rebase) so origin/main becomes an ancestor of origin/dev."
    ```
    One PR, not two: a separate bump branch cut from `origin/dev` before the back-merge has
    merged lacks `main`'s commits and conflicts with the promotion's version stamp. #6271 is the
    2026-10-21 back-merge; observed practice has lagged the bump half — after v0.14.1
-   (2026-10-07) `dev` still read `0.14.1` on 2026-10-24, and the bump happened at the next
-   promotion instead (`docs/branch-strategy.md` §3.5).
+   (2026-10-07) `dev` still read `0.14.1` on 2026-10-24, and after v0.15.0 (2026-10-30) the
+   bump came three days later in a PR of its own (#6855, `chore/post-release-bump-0.16.0`)
+   (`docs/branch-strategy.md` §3.5).
 2. **Close any release-blocker issues** in the milestone.
 3. **Update the rollout doc** if relevant (`docs/dependency-rollout-*.md`, `docs/roadmap.md`).
 4. **Announce.** Yuzu doesn't (currently) have an automated announcement channel. If applicable, post the release URL.
