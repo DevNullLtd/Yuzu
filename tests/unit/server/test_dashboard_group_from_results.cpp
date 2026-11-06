@@ -267,6 +267,13 @@ struct GroupFromResultsHarness {
     std::string fleet_read_securable;
     std::string fleet_read_operation;
 
+    /// The flat ManagementGroup:Write admission (`perm_fn`). Admits by default; read live per
+    /// call so a case can revoke it while the attempted row is written (#3619 review).
+    /// `perm_asked` records each call as "<securable>:<operation>".
+    bool perm_allow{true};
+    int perm_calls{0};
+    std::vector<std::string> perm_asked;
+
     /// @param degrade_response_store true → wire a ResponseStore pointed at
     ///        an unreachable pool (never open), so the 503-before-scope-logic
     ///        path is reachable. `mg` (the confinement substrate the group
@@ -330,8 +337,18 @@ struct GroupFromResultsHarness {
             }
             return s;
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+        // Read live per call, so a case can revoke ManagementGroup:Write mid-request (#3619).
+        // A denial answers 403 itself, as the production gate does.
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                              const std::string& type, const std::string& op) -> bool {
+            ++perm_calls;
+            perm_asked.push_back(type + ":" + op);
+            if (perm_allow)
+                return true;
+            res.status = 403;
+            res.set_content(R"({"error":"permission denied"})", "application/json");
+            return false;
+        };
         // ONE recording sink behind both callbacks, as production wires ONE `audit_log` behind
         // both (server.cpp): the persist-reporting `set_persist_audit_fn` sink the `attempted`
         // row goes through, and `audit_fn` for the outcome, refusal and scope-drop rows. Each
@@ -1878,4 +1895,54 @@ TEST_CASE("group-from-results audit (UP-5): a session invalidated while the atte
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
     CHECK(h.audit_detail("group.create_from_results", "failure") == "session_revoked");
+}
+
+TEST_CASE("group-from-results audit (UP-5): ManagementGroup:Write revoked while the attempted row "
+          "is written creates no group and records the outcome",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "group.create_from_results" && r.result == "attempted")
+            h.perm_allow = false; // ManagementGroup:Write revoked mid-write
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("perm-revoked"));
+    CHECK(res->status == 403);
+    CHECK_FALSE(h.mg.find_group_by_name("perm-revoked").has_value());
+    CHECK(h.perm_calls == 2); // admission, then the recheck after the attempted row
+    CHECK(h.perm_asked == std::vector<std::string>{"ManagementGroup:Write", "ManagementGroup:Write"});
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+          "permission_revoked name=perm-revoked");
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
+}
+
+TEST_CASE("group-from-results audit (UP-5, Gate 5 CH-1): a recheck refusal whose failure row is not "
+          "stored still creates no group and flags the response",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    bool attempted_seen = false;
+    h.audit_persists = [&h, &attempted_seen](const AuditRow& r) {
+        if (attempted_seen)
+            return false; // the audit store fails after the attempted row
+        if (r.action == "group.create_from_results" && r.result == "attempted") {
+            attempted_seen = true;
+            h.perm_allow = false; // revoked mid-write
+        }
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("perm-revoked-audit-down"));
+    CHECK(res->status == 403);
+    CHECK_FALSE(h.mg.find_group_by_name("perm-revoked-audit-down").has_value());
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+          "permission_revoked name=perm-revoked-audit-down");
+    CHECK(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }

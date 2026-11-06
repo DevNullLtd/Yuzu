@@ -1951,12 +1951,16 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
     // has failed the rest are SKIPPED: counted as a degrade exactly like a failed write (the
     // command is still dispatched; its responses are labelled unverified), so an outage costs the
     // loop one short wait, not N. A null latch is every other caller: the ordinary budget, no skip.
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (latch && latch->tripped()) {
         latch->note_skipped();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        // #3678: the command is still sent and may consume an agent dedup-ring slot, so the
+        // outbox redelivery horizon must count it even though its record was not written.
+        if (tracker)
+            tracker->note_unrecorded_dispatch();
         return;
     }
-    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     const bool recorded =
         tracker && (latch ? tracker->record_command_dispatch(command_id, plugin, execution_id,
                                                              latch->lease_timeout())
@@ -1965,6 +1969,10 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
         if (latch)
             latch->trip();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        // #3678: see the skipped branch above. A null tracker has no sequence to advance (the
+        // outbox's reader is then unreadable and holds), so there is nothing to count.
+        if (tracker)
+            tracker->note_unrecorded_dispatch();
     }
 }
 

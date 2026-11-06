@@ -830,7 +830,7 @@ command not delivered`:
 
 | Reason code prefix | Meaning | What to check |
 |---|---|---|
-| `gateway_unauthenticated` | The gateway's mgmt-plane peer authorization (the SPKI pin, #1422, and/or the server identity, #6016) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_auth_mode` / `mgmt_peer_pins` configuration agree; the reason is on the gateway's `yuzu_gw_mgmt_auth_rejected_total{reason}` (see [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)) |
+| `gateway_unauthenticated` | The gateway's mgmt-plane peer authorization (the SPKI pin, #1422, the server identity, #6016, or the gateway's CRL check, `mgmt_crl_source`: `crl_revoked`, `revocation_unknown`, `revocation_stale`) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_auth_mode` / `mgmt_peer_pins` / `mgmt_crl_source` configuration agree, and the certificate is not one the CA withdrew (see [Withdrawing a server certificate](gateway.md#withdrawing-a-server-certificate)); the reason is on the gateway's `yuzu_gw_mgmt_auth_rejected_total{reason}` (see [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)) |
 | `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
 | `gateway_unavailable` | The gateway was unreachable after 3 retry attempts | Gateway process health, network path between server and gateway |
 | `gateway_agent_mismatch` | The gateway answered for a different agent than the one this command targeted | Possible cross-cluster response forgery or a stale cluster resolution — treat as a security-relevant signal, not routine noise |
@@ -1194,7 +1194,21 @@ no-backfill, since this store never existed before 3.3).
   actual delivery outcome. **Any SIEM correlation rule or audit-count
   assurance built on "one audit event per scheduled fire" must be updated**
   to expect the pair, or to key off `command.outbox_delivered` for the
-  delivery outcome.
+  delivery outcome. A `failure` row is not always "reached nobody": since
+  #3678 it also records a redelivery dead-letter (detail contains
+  `redelivery_horizon_exceeded` or `redelivery_sequence_regressed`) for an
+  occurrence that may or may not have reached any agent.
+- **A scheduled run's retry is now bounded (#3678).** Previously a run whose
+  delivery kept being retried was re-sent indefinitely under the same command
+  ID. An agent only remembers its most recent 20,000 completed commands, so an
+  old retry could re-execute a command the agent had forgotten. The server now
+  refuses a retry once its dispatch count has advanced by 10,000 since the
+  occurrence's first attempt: the occurrence is marked failed
+  (`redelivery_horizon_exceeded`), audited, and never sent again. An approval
+  ticket it used stays spent. The count is an estimate and can err in both
+  directions; see "Execution semantics" in `docs/user-manual/instructions.md`
+  for the limits and the steps to take after a dead-letter. Alerts:
+  `YuzuOutboxHeld`, `YuzuOutboxStampFailing` and `YuzuOutboxDeadLettered`.
 - **New metrics.** Eight counters and a backlog gauge —
   `yuzu_server_command_outbox_*` — cover enqueue-side degrade and the
   delivery loop's outcomes (delivered / no-agents / denied / retry / errors /
@@ -2915,14 +2929,14 @@ The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` before
 templating; any other character returns `400`.
 
 **Connection window — `fleet_snapshot_window_seconds` (Echo plugin config).**
-`echo.fleet_snapshot` reports not only the connections ESTABLISHED at the
-exact `/proc` sample instant but also connections Echo observed recently
-in its `tcp_live` warehouse, so short-lived flows still reach the viz.
-The look-back window is operator-tunable via the Echo plugin's KV config
-key `fleet_snapshot_window_seconds` (default `3600`). It is an Echo plugin
-config key, not a server CLI flag — set it through the Echo plugin's
-configuration surface. The 60 s sampler still cannot see sub-interval
-connections; that needs kernel eventing (tracked separately).
+The key is still accepted but has no effect since Echo became roll-up-only:
+`echo.fleet_snapshot` reports the connections ESTABLISHED at the exact
+`/proc` sample instant and nothing else. It used to add connections Echo had
+observed recently in its `tcp_live` warehouse, so short-lived flows still
+reached the viz; the roll-up tiers keep hourly counts per remote and process,
+not per socket, so there is nothing to look back through. It is an Echo plugin
+config key, not a server CLI flag. The 60 s sampler still cannot see
+sub-interval connections; that needs kernel eventing (tracked separately).
 
 ### vNEXT — Agent interval triggers now functional
 
@@ -3362,7 +3376,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with a "Test SSO" button (checks the issuer's discovery document and signing keys). Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
-| Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). Gated on `AccessReview:Read` (the write controls appear for a caller who also holds `AccessReview:Attest`), and, like every `/api/v1/access-reviews` route, refused with `403` to an engine principal session whatever role it holds (audited as a denied `access_review.list` or `access_review.get` row with detail `engine_session_denied`). The panel is a view over the same `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. Unlike the **Audit and reviews** page (`/access/audit`), a person's successful view of this panel writes no `access_review.list`, `access_review.get` or `access_review.exported` audit row; the changes made from it are audited by the REST routes it calls. See `docs/auth-architecture.md` "Periodic access reviews". |
+| Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A decision is final, and a reviewer cannot decide their own grant (or an engine principal they own): the panel shows the refusal, and another reviewer must decide it, so a one-Administrator deployment needs a second person holding `Reviewer`. Gated on `AccessReview:Read` (the write controls appear for a caller who also holds `AccessReview:Attest`), and, like every `/api/v1/access-reviews` route, refused with `403` to an engine principal session whatever role it holds (audited as a denied `access_review.list` or `access_review.get` row with detail `engine_session_denied`). The panel is a view over the same `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. Unlike the **Audit and reviews** page (`/access/audit`), a person's successful view of this panel writes no `access_review.list`, `access_review.get` or `access_review.exported` audit row; the changes made from it are audited by the REST routes it calls. See `docs/auth-architecture.md` "Periodic access reviews". |
 
 ### Plugins and updates (System page)
 

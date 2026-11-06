@@ -316,18 +316,18 @@ All three responses use the standard [A4 error envelope](#json-envelope) with a 
 
 ### Post-Read Backstop (#2407)
 
-The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 28 of 32 classes (distinct `path_class` labels, the catch-all `default` included) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 30 of 34 classes (distinct `path_class` labels, the catch-all `default` included) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
 
-A second stage, wired at httplib's `Server::set_pre_request_handler` in `server.cpp`, closes that gap from the other side. It runs inside httplib's `dispatch_request` — **after** `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
+A second stage, installed by `server.cpp` through `PostReadStageRegistry` and run by the route sink (`HttplibRouteSink` wraps every handler it registers on the web server), closes that gap from the other side. It runs **after** httplib's `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. It is deliberately not `Server::set_pre_request_handler`: from cpp-httplib v0.47.0 that handler runs *before* the body is read, where `req.body` is empty and a size check on it can never fire. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
 
-**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 28-of-32-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
+**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 30-of-34-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
 
 **The two stages are mutually exclusive per request, not stacked.** httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so it never calls `dispatch_request` for a request that gate already refused — a **measurable** over-cap body (a declared `Content-Length` above the cap) is still rejected by the pre-routing gate, before anything is buffered, exactly as before this stage existed. Do not describe this as "the cap now runs twice" — in practice `over_cap_post_read` fires almost exclusively for the chunked/unmeasurable case the pre-routing gate deliberately admits.
 
 **Limitations — read before relying on this as complete coverage:**
 
 - **Multipart is not covered.** httplib only appends to `req.body` on the non-multipart branch of `read_content` (`httplib.h:11002` swaps the receiver for the multipart parser once it detects a multipart body) — so `req.body.size()` reads 0 for ANY multipart request, regardless of the real bytes read off the wire. **No multipart class is covered** — stated as a rule rather than a list, because an earlier draft of this text enumerated a single class and was wrong: `/api/settings/updates/upload` (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so the 4 MiB default) are multipart too. Their chunked-body gap is **not** closed by this stage. This is not a regression introduced here — it is exactly as exposed as it was before this stage existed — but do not read the post-read stage as having closed coverage for every class.
-- **The stage only runs when a route matched.** `set_pre_request_handler` is invoked from httplib's `dispatch_request`, which only runs once routing has matched a route — a request to a path that 404s never reaches this handler at all. It is a backstop behind the pre-routing gate for matched routes, not a second universal pre-auth gate.
+- **The stage only runs when a route matched.** It runs inside a registered route's handler, which httplib only calls once routing has matched a route — a request to a path that 404s never reaches it at all. A route registered on the web server other than through the route sink would also not be wrapped; none is. It is a backstop behind the pre-routing gate for matched routes, not a second universal pre-auth gate.
 
 **Why not one global cap?** httplib's own `Server::set_payload_max_length` is a single server-wide knob shared by every route on the same listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload — a single small value would break those outright, and a single large value (httplib's 100 MiB default) leaves every small JSON/form route able to buffer up to 100 MiB from an unauthenticated caller. The table below exists so each route class gets a cap sized to what it actually needs.
 
@@ -373,12 +373,14 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/crypto` | 16 KiB | `crypto` | The `/crypto` REST v1 subtree. The only body-bearing route is `PUT /api/v1/crypto/dashboard/layout` (at most 64 catalogue ids, about 4.4 KiB even fully escaped); 16 KiB mirrors the handler's own `kLayoutBodyMaxBytes` exactly. Any method, because every sibling is a bodyless GET and shares the prefix. |
 | any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a string holding a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
 | any | `/api/v1/commands` | 4 MiB | `commands` | The fifth `requires_measurable=true` class. The REST v1 twin of MCP `execute_instruction` (`POST /api/v1/commands`). The same 4 MiB as the `/mcp/` class, because the same worst case rides it: 10000 agent ids, 32 parameters of 64 KiB and an 8 KiB scope come to about 3.3 MiB. `requires_measurable=true`, like `/mcp/`: a chunked (unmeasurable) body is refused here rather than read unbounded. Any method, so a sibling under the prefix is capped too. |
+| any | `/api/v1/inventory/software/normalization/` | 64 KiB | `software_curation` | The software-title curation subtree. The body-bearing routes are `POST .../aliases` (one JSON object of at most eight strings, each at most 256 bytes) and `POST .../queue/{key}/reject` (bodyless); the status and queue GETs are bodyless siblings sharing the prefix, so any method. |
+| any | `/api/v1/inventory/software/normalization/pack` | 1 MiB | `software_alias_pack` | The alias-pack CSV upload. The raw body is the CSV, which `parse_normalization_pack` refuses over 1 MiB, so the cap mirrors that bound exactly. A longer prefix than the row above, so it wins for this path. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the five 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **36 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config` and `dex_score_policy`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **32 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **38 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config`, `dex_score_policy`, `software_curation` and `software_alias_pack`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **34 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -542,7 +544,7 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 
 **Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter). MCP twin: `list_hardware_ci` (strict argument typing and a lowercase-only `os`/`status`/`sort`/`dir`; see `docs/user-manual/mcp.md`).
 
-**Query parameters:** `q`, `os`, `status`, `sort`, `dir`, `tag`, `offset`, `limit`. An unrecognised `sort`, `os` or `status` token, or an invalid `tag` key, is a `400`; any `dir` other than `desc` sorts ascending.
+**Query parameters:** `q`, `os`, `status`, `sort`, `dir`, `tag`, `offset`, `limit`. `q` is a whitespace-separated list of tokens that must all match (case-insensitive substring) across hostname, id, OS, serial, model, manufacturer, CPU model, OS name, version and build, domain, architecture, agent version, IPs, tag keys and `key=value` pairs, and the chassis asset tag, chassis serial and board serial (at most 8 tokens are used). A blank or `unknown` value never matches, and neither does the agent's `-` "no value" placeholder in the chassis and board fields; only the placeholder VALUE is excluded, so a search term of `-` still matches hyphenated hostnames. An unrecognised `sort`, `os` or `status` token, or an invalid `tag` key, is a `400`; any `dir` other than `desc` sorts ascending.
 
 **Response:** `{ "data": { "devices": [...], "count", "total_matching", "devices_omitted", "ci_degraded", "tags_degraded", "kpis", "query" }, "pagination", "meta" }`.
 
@@ -559,11 +561,15 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 
 #### `GET /api/v1/hardware/{id}`
 
-One device's CI record: identity, device-CI blob, installed software and tags, each read independently so a degraded read is distinguishable from an absent one.
+One device's CI record: identity, device-CI blob, the per-section hardware record, installed software and tags, each read independently so a degraded read is distinguishable from an absent one.
 
 **Permission:** `Inventory:Read`, via `require_fleet_read`. An id outside the caller's fleet-read scope returns the same `404` as a nonexistent id. MCP twin: `get_hardware_ci` (see `docs/user-manual/mcp.md`).
 
 **Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`. `agent_id`, `hostname`, `os` and `last_seen` are `null` (and `online` is `false`) unless `identity_state` is `found`.
+
+`ci` also carries the chassis (`chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`), baseboard (`board_vendor`, `board_product`, `board_serial`, `board_source`) and hashed machine-id (`machine_id_hash`, `machine_id_algorithm`, `machine_id_source`) values, each `null` when the agent did not report it (including a record from an agent that predates the v2 record, and the agent's `-` placeholder), and `sections`: an array, in registry order (`chassis`, `baseboard`, `machine_id`, `cpu`, `dimm`, `disk`, `swap`, `volume`, `partition`, `topology`), of `{ kind, status, reason, source, complete, rows }` for each section the agent reported. `status` is the agent's level and `reason` its token (for example `linux:planned`; `server_cap:<n>` where the server cut a section at its row cap; `server:row_count_mismatch` where the section's stored rows no longer match the row count recorded when it was written, such as after a partial database restore; or `server:content_digest_mismatch` where the row count still matches but the rows hash differently from the digest recorded when it was written, such as rows edited or swapped for another sync's out of band). A section carrying either `server:` token is served `constrained` and incomplete, with the rows that were read; under `server:content_digest_mismatch` those rows are NOT the values the agent reported. Neither token is stored: both are worked out on each read, so reading again does not clear them. Only a full device-record sync repairs either token: `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`, or **Sync now** on the device's Hardware page. The fleet-wide `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed software only and do not repair a section, and there is no MCP tool that does. Otherwise it clears on the device's next hardware change or weekly full report. The digest is an integrity check against accident and non-malicious drift, not tamper resistance: someone who can write the table can rewrite the digest, and it covers the rows only, not `status` or `reason`. A section stored before these checks existed is not verified until the device's next full sync (see [Inventory](inventory.md)). The levels mean: `ok` read in full; `constrained` a partial read (read the reason); `unavailable` could not be read on this host, including a collector not shipped for that OS, which reads `<os>:planned` (today the `chassis`, `baseboard`, `machine_id` and `swap` collectors ship on Windows only, `partition` on Windows only, and `topology` on no OS yet, so those sections read `unavailable` with `linux:planned` or `macos:planned` elsewhere, and `windows:planned` for topology; `volume` has rows on macOS only today and otherwise reads `unavailable` with its own reason); `permission_denied` the agent was refused. Treat any other value as not complete. `complete` is `true` only for `ok`: a `constrained` section is a bounded or partial read and reads as incomplete, never as a device with fewer rows, and it still lists the rows it has. An `unavailable` or `permission_denied` section lists its reason and **no rows**. `source` is the matching `*_source` value for `chassis`, `baseboard` and `machine_id` (whose values are the scalars above, so their `rows` are always empty) and `null` for a list section. `rows` holds objects keyed by the section's column names (the full column list is in the OpenAPI `HardwareCiSection` schema). Cells are strings: parse numerics using the unit in the column name (`size_mb`, `clock_mhz`). An unread value is `null`, never missing: a blank cell and a lone `-` are both mapped to `null`. A section the agent did not report is absent from the array. The record can be large (tens of KB, up to about 150 KB); within `ci` the identity scalars come first and `sections` is last.
+
+`sections_state` (a sibling of `ci_state`) is `found`, `absent` or `degraded`. `absent` with an empty `sections` array means no sections are stored: an older (v1) agent, or a v2 agent that reported no section, or no record yet. It is **not** "this device has no CPUs", and the server is already ahead of such agents, so upgrade the agents to get sections. `degraded` means `ci_state` is `degraded` (the record has no `ci`), so the sections were not read. Only a failed read of the sections themselves, made after the record itself was read successfully, is a `503`, not a `200` (below); a failure at or before the record read (a pool timeout, a failed transaction start or commit, or a failed record query) degrades instead to `ci: null` with `ci_state` and `sections_state` `degraded`, HTTP `200`, and an audited `state=store degraded` row. The record and its sections are read in one consistent snapshot, so the scalars and the sections are always from the same sync. The section rows are values the agent supplied: the agent minimises them at the source, but the server treats them as untrusted data and a client must too. The MCP tool `get_hardware_ci` returns the same body and answers a failed sections read with a retryable error (`retry_after_ms` 5000) instead of this `503`.
 
 | Status | Meaning |
 |---|---|
@@ -571,9 +577,9 @@ One device's CI record: identity, device-CI blob, installed software and tags, e
 | `400` | Device id longer than 256 bytes or containing a byte below `0x20`. Checked after the `Inventory:Read` check and before the scope check. Registration applies the same 256-byte limit and refuses an id with a byte below `0x20` (through its enrollment check), so any id that agent registration accepts passes and a registered device is not affected. |
 | `403` | Caller lacks `Inventory:Read`. |
 | `404` | Not found, or outside the caller's fleet-read scope (indistinguishable by design). |
-| `503` | Route misconfigured, audit row not persisted, the authorization store unavailable (`retry_after_ms` 5000), or the device roster could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags). Never a `404`. |
+| `503` | Route misconfigured, audit row not persisted, the authorization store unavailable (`retry_after_ms` 5000), or the device roster could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags), or the record's hardware sections could not be read after the record itself was read (message `hardware sections unavailable`, `retry_after_ms` 5000; a failure at or before the record read is a `200` with `ci: null` instead). The roster case is never a `404`, and a failed sections read is never a `200` with an empty sections list (an empty list with `sections_state` `absent` is a different answer: nothing is stored). |
 
-**Audit:** `inventory.device.ci`; `result=failure` when the roster read failed (detail `state=roster unreadable` on the `503`, `state=<...> identity=roster unreadable` on a served `200`).
+**Audit:** `inventory.device.ci`; `result=failure` when the roster read or the sections read failed (detail `state=roster unreadable` or `state=sections unreadable` on the `503`, `state=<...> identity=roster unreadable` on a served `200`).
 
 ---
 
@@ -4433,19 +4439,33 @@ flag ≠ revoke.
 
 **Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
 `principal_id`, or `role_name` missing, or `decision` is neither `attested`
-nor `flagged_revoke`. `403` without `AccessReview:Attest` (or an engine-classed
+nor `flagged_revoke`, or an identifier contains a NUL byte or is longer than 512 bytes, or the
+`justification` contains a NUL byte or is longer than 8192 bytes. `403` without `AccessReview:Attest` (or an engine-classed
 caller), or for a browser (session-cookie) request that carries no
 `Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
-callers are exempt). `404` — no campaign with that id, no such frozen grant in it, or
-the campaign is already closed. `415` — `Content-Type` is not
+callers are exempt). Also `403` when the caller is the subject of the grant
+(a `user` grant whose `principal_id` is the caller's own username) or the owner
+of the `engine` principal being reviewed — see "Separation of duties" below.
+`404` — no campaign with that id, no such frozen grant in it, or
+the campaign is already closed. `409` — the grant already has a decision.
+`415` — `Content-Type` is not
 `application/json`. `503` — the access-review store is
 unavailable, or a genuine write failure.
 
-**This route is an UPSERT — a second call for the same `(campaign_id,
-principal_type, principal_id, role_name)` overwrites the prior reviewer's
-decision, reviewer, and justification.** The earlier decision is not
-retained (mirrors `record_attestation`'s MCP `destructiveHint:true`, see
-`docs/mcp-server.md`).
+**A decision is final.** The first `attested` or `flagged_revoke` recorded for a
+`(campaign_id, principal_type, principal_id, role_name)` grant stays: a second
+call, by any reviewer, returns `409` and changes nothing. If a decision was a
+mistake, open a new campaign and review the grant again. (`record_attestation`
+on MCP is `destructiveHint:true` because the write is irreversible, see
+`docs/mcp-server.md`.)
+
+**Separation of duties.** You cannot decide your own access. The route returns
+`403` when the caller is the subject of a `user` grant, or the owner of an
+`engine` principal as recorded when the campaign was opened; another reviewer
+must decide it. The comparison is exact (no case folding), and a call made with
+an API token counts as the token's owner. Group grants have no owner, so they
+are not covered by this check. When one call breaks both rules, the `403` is
+returned.
 
 Audited as `access_review.attested` (decision `attested`) or
 `access_review.flagged` (decision `flagged_revoke`) — the two outcomes are
@@ -4476,7 +4496,7 @@ Audited as `access_review.closed`.
 | `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv\|view> rows=<N> rbac_enforcement=<value>` (`view` is the dashboard's Current grants panel, `GET /fragments/access/reviews/grants`). `result=success`. |
 | `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews` or the dashboard fragment `GET /fragments/access/reviews/campaigns`. `target_type=AccessReview`. `result=success`. |
 | `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
-| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`}. |
+| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>` on `success` and `denied` rows; a `failure` row carries `<campaign_id>` only (empty when the request was a `400` for a NUL-bearing or over-long identifier). `result` ∈ {`success`, `failure`, `denied`}. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}` or the dashboard fragment `GET /fragments/access/reviews/campaign`. `target_id=<campaign_id>`. `result=success`. |
@@ -4490,6 +4510,14 @@ The Settings Access reviews fragments (`GET /fragments/settings/access-reviews` 
 `access_review.campaign_opened` and `access_review.attested` also record
 `result=denied`, `detail=content_type_not_json` (empty `target_id`) when a
 request is refused with `415`.
+`access_review.attested` and `access_review.flagged` (by the decision requested)
+record `result=denied` when the store refuses the decision on purpose:
+`detail=self_attestation_blocked` for the `403` (the caller is the subject or
+owner) and `detail=already_decided` for the `409`. `target_id` is the full
+`<campaign_id>:<principal_type>:<principal_id>:<role_name>`. A denied row means
+nothing was recorded. If a denied row cannot be saved, the `403` or `409` still
+stands and the response carries `Sec-Audit-Failed: true`. The `409` message names the
+decision already recorded.
 
 The three mutating routes (`POST /api/v1/access-reviews`,
 `POST /api/v1/access-reviews/{id}/attestations` and
@@ -5699,13 +5727,13 @@ guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depend
 fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
 where it sits: a record is still in its finer tier until the coarser roll-up closes. It holds while
 the device is within its `db_budget_bytes` (default 250 MiB): a device over its byte budget removes
-raw capture rows older than 24 h that their first summary tier has passed and hourly rows older
-than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is back under;
-`echo.status` reports it as `budget_evicted_raw_rows_total` and `budget_evicted_hourly_rows_total`
-(see the Echo manual, The database byte budget). It is a
-floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
-roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
-that tier, not a deeper tier. The
+hourly rows older than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is
+back under (daily and monthly rows, the `usage` tables and paused sources are never taken);
+`echo.status` reports it as `budget_evicted_hourly_rows_total` (`budget_evicted_raw_rows_total` is
+retired: there is no raw tier) (see the Echo manual, The database byte budget). It is a floor on
+rows that exist, not on coverage: every event folds into every tier as it arrives, so an agent that
+is offline records nothing for that span in any tier, and there is no later aggregation pass or
+catch-up window that could fill it. The
 `usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
 set (20,000 runs) before this limit can apply.
 
@@ -5738,10 +5766,10 @@ server-enforced reading, if one ever ships, lands under a new key, never by rede
     "echo": {
       "tick_seconds": 900,
       "tiers": [
-        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+        { "source": "usage", "tier": "live", "limit_kind": "rows", "limit": 200000,
           "bucket_seconds": 0, "guaranteed_depth_seconds": null },
-        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
-          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 15552000,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 15465600 }
       ]
     }
   },
@@ -8050,6 +8078,50 @@ Installs per version for one title: distinct devices per version, most-installed
 
 `newest` marks the title's fleet-wide newest version; `truncated` is `true` when the limit was reached; `devices_omitted` is `1` when the per-device view named a device outside the caller's scope (the empty list is then "hidden", not "no installs"), else `0`. Every call that serves a page is audited as `inventory.software.versions` (`success`); an out-of-scope per-device read writes a `denied` row only, a `400` writes none, a confined or service-scoped refusal writes `denied`, and the `Inventory:Read` gate's own refusal is audited as `auth.fleet_read_required`. The **unfiltered** read (no `kind`, `ecosystem`, `source` or `agent_id`) serves the precomputed version rollup, so before the first catalogue refresh it is a `503` with `retry_after_ms` and a `failure` audit row rather than an empty list; filtered and per-device reads do not depend on the rollup for their rows and counts (`newest` is `false` until the first refresh). Errors: `400` (missing `name`, repeated parameter, an over-long value, invalid UTF-8 or a NUL byte), `401`, `403`, `503` (`retry_after_ms: 5000` on a degraded or not-yet-built read, never an empty `200`; no hint where the store or gate is absent).
 
+#### Software normalisation curation
+
+The queue of installed-software titles the server could not resolve to a product, and the writes that settle them (see [Software title normalisation](inventory.md#software-title-normalisation-server-job)). REST only: there is no MCP tool or page for these yet (a recorded ADR-1005 exception, roadmap row 4.3-mcp, revisit by 2026-12-31). All five routes need a **global** grant: `Inventory:Read` for the two reads, `Inventory:Write` for the three writes. A management-group-confined caller gets `403` (the queue and the pack are fleet-wide and cannot be scoped), and a service-scoped API token is refused with `403` and no `permission` field. Every error is the standard envelope.
+
+The three writes are audited BEFORE the store is touched, as `inventory.software.curation.alias`, `inventory.software.curation.reject` and `inventory.software.curation.pack` (result `requested`; a request refused for its content writes `denied`, and so does a service-scoped token's `403` on any of the five routes). The `requested` row records the request, not its outcome: the HTTP status is the outcome, and a `404`, `409` or `503` after the row means nothing changed. An audit row that cannot be stored fails the request with `503` and `Sec-Audit-Failed: true`, and nothing is written. An admitted read is not audited; a caller refused by the permission gate is audited by the gate itself. None of the routes dispatches work to a device, and all are exempt from MFA step-up.
+
+#### `GET /api/v1/inventory/software/normalization/status`
+
+The stored pack version, load time and loader, the titles normalized and unnormalized, and the queue's open and rejected counts, read in one snapshot.
+
+```json
+{"data": {"pack_version": "2026.11.1", "loaded_at": 1793000000, "loaded_by": "seed",
+          "titles_normalized": 812, "titles_unnormalized": 41, "queue_open": 38, "queue_rejected": 3},
+ "meta": {"api_version": "v1"}}
+```
+
+`pack_version` is empty when no pack is stored. A degraded read is a `503` with `retry_after_ms`, never zeros.
+
+#### `GET /api/v1/inventory/software/normalization/queue`
+
+The curation queue, most-installed first (`device_count` descending, then `raw_name`, `raw_publisher`, `ecosystem`).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `status` | string | `open` (default), `rejected` or `all` |
+| `limit` | integer | 1-500, default 100 |
+| `cursor` | string | The `next_cursor` of the previous page |
+
+A repeated parameter, an unknown `status`, a `limit` outside 1-500 or a malformed `cursor` is a `400`. Each row carries `key` (the opaque value the reject route takes; `null` for a title whose fields hold the 0x1F control byte, which cannot be rejected through this API), `raw_name`, `raw_publisher`, `ecosystem`, `device_count`, `status`, `first_queued_at` and `last_seen_at`; `next_cursor` is `null` on the last page, and also `null` when more rows follow but the last row on the page has a `null` `key` (its 0x1F byte cannot be encoded into a cursor, so that continuation is lost: narrow the query with `status` or reject entries and list again). A degraded read is a `503` with `retry_after_ms`, never an empty page.
+
+#### `POST /api/v1/inventory/software/normalization/aliases`
+
+Curates a title onto a canonical product. The body is a JSON object of strings, each at most 256 bytes with no NUL: `ecosystem` (one of the published ecosystems: `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python` and `ibm_mq`), `raw_name`, `vendor` and `product` (required), and optional `raw_publisher` (empty binds any publisher), `edition` (an edition token such as `standard`; empty takes the edition found in `raw_name`), `category` (`web_server`, `database`, `message_broker`, `runtime` or `other`; when omitted, an existing product keeps its category and a new product gets `other`) and `cpe_product` (lowercase letters, digits and `_ . - +`; the CPE logical values `-` and `.` are reserved and refused).
+
+The stored alias key carries the edition, so a curated alias binds exactly one edition and there is no edition wildcard. The product and the `curated:<ecosystem>` alias are written in one transaction taken after the normalisation lock, and every title is marked for re-resolution in that same transaction. `201` returns `{product_id, norm_key, alias_source, alias_key, alias_publisher}`. An invalid field, an unknown ecosystem or category, or an edition that is not an edition token or contradicts `raw_name` is a `400`.
+
+#### `POST /api/v1/inventory/software/normalization/queue/{key}/reject`
+
+Marks one open queue entry `rejected` (`200 {"data": {"rejected": true}}`). `key` is the value on a queue row. A rejected entry stays in the queue, is kept by later reconciles and does not trigger re-resolution. A malformed key (including one with a NUL byte or invalid UTF-8) is a `400`; an entry that is absent or already rejected is a `404`.
+
+#### `POST /api/v1/inventory/software/normalization/pack`
+
+Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row (and at least 50-row) and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400` (a NUL byte or invalid UTF-8 included). A body over 1 MiB never reaches the parser: the pre-auth body cap answers `413`. A replace keeps products a curator owns (`origin` curated) at their category, and at their `cpe_product` once it is non-empty. A replace also leaves curated aliases active. An alias curated with the category omitted still marks its product curated, which freezes that product's category against later packs. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
+
 ---
 
 ### Crypto
@@ -9785,7 +9857,7 @@ Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, 
 - `yuzu_viz_pushed_cap_evictions_total` (gauge) — `pushed_` map entries evicted because the map hit the 100 000-agent hard cap. The victim is the least-recently-seen agent by *server* receipt time (not the agent-controlled `ts`); each eviction emits a `topology.push.evicted_for_cap` audit event.
 - `yuzu_viz_pushed_map_size` (gauge) — current `pushed_` map occupancy; the memory-pressure signal to alert on before evictions begin.
 
-**`fleet_snapshot.v1` (agent-emitted payload).** The `fleet_topology.v1` document above is the server-aggregated shape; the per-agent payload the agent pushes (via `HeartbeatRequest.fleet_snapshot_json`) or returns from a dispatched `echo.fleet_snapshot` is `fleet_snapshot.v1`. Its `schema_minor` is at **2** — the `1 → 2` bump added an optional `connections[].last_seen_seconds_ago` field, emitted only when non-zero, alongside the operator-tunable Echo plugin config key `fleet_snapshot_window_seconds` (default `3600`): connections seen within that window are merged into the snapshot even if not ESTABLISHED at the exact `/proc` sample instant. `fleet_snapshot_window_seconds` is an Echo plugin config key set via `echo.configure`, not a server CLI flag.
+**`fleet_snapshot.v1` (agent-emitted payload).** The `fleet_topology.v1` document above is the server-aggregated shape; the per-agent payload the agent pushes (via `HeartbeatRequest.fleet_snapshot_json`) or returns from a dispatched `echo.fleet_snapshot` is `fleet_snapshot.v1`. Its `schema_minor` is at **2** — the `1 → 2` bump added an optional `connections[].last_seen_seconds_ago` field, emitted only when non-zero, alongside the Echo plugin config key `fleet_snapshot_window_seconds` (default `3600`), which no longer has an effect: the snapshot carries only the connections ESTABLISHED at the exact `/proc` sample instant, because Echo keeps no per-connection rows to merge in. `fleet_snapshot_window_seconds` is an Echo plugin config key set via `echo.configure`, not a server CLI flag.
 
 **Example**
 
@@ -10340,8 +10412,8 @@ Update a rule. Version is incremented on every successful update regardless of w
 Delete a rule.
 
 - **Permission:** `GuaranteedState:Delete`
-- **4xx:** `404` if the rule does not exist; `403` if a service-scoped API token calls this route (same reasoning as create/update above).
-- **Audit:** `guaranteed_state.rule.delete`.
+- **4xx:** `404` if the rule does not exist, and also when the store faults on the delete (the audit row tells them apart: `denied` for a missing rule, `failure` for a store fault); `403` if a service-scoped API token calls this route (same reasoning as create/update above).
+- **Audit:** `guaranteed_state.rule.delete`. The delete removes the rule's census rows and retires its pending census events in one transaction, fleet-wide.
 - **MCP twin:** `delete_guardian_rule` (#2146 Batch B1). Does NOT automatically push an unarm to agents already enforcing the rule (tracked in #4304).
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}/status`
@@ -10349,7 +10421,7 @@ Delete a rule.
 Per-guard fleet-wide agent-status drilldown (#4037, api-parity #2146 Batch A) — agent_id/state/updated_at for **every** agent that has reported this ONE rule's state. Machine-readable twin of the dashboard's per-guard fleet compliance census (`/guardian/guard/{id}`).
 
 - **Permission:** `GuaranteedState:Read` via `AuthRoutes::require_list_read`, this route's **sole** authorization gate (ADR-0017 admit-then-filter) — the same chokepoint `GET .../status` uses, not a bare `perm_fn`. A service-scoped API token is refused outright (a rule has no single owning IT service to confine to); a management-group-confined grant's visible-agent set filters the returned rows.
-- **Response:** `data[]` of `{agent_id, state, updated_at}`, `pagination.total`. Raw census — does **not** apply the dashboard fragment's own offline-agent-folds-to-unknown rollup (same posture `GET .../status` already established for the identical class of data).
+- **Response:** `data[]` of `{agent_id, state, updated_at, order_uncertain, projection_pending}`, `pagination.total`. Raw census — does **not** apply the dashboard fragment's own offline-agent-folds-to-unknown rollup (same posture `GET .../status` already established for the identical class of data). `order_uncertain` is sticky: the verdict persisted for the pair cannot be proven to be the latest (a refused older arrival, a key below the high-water mark, two different verdicts with the same key, a pending event that out-ranks, shares, or arrived later with a lower key than the verdict, an unusable or capped agent stamp, or a verdict applied by the stale-mark recovery described in the Guardian guide). `projection_pending` means a retained event for the pair has not reached the row, so `state` may lag it. A `false` in either field does not establish freshness or completeness: an event that never arrived leaves no trace.
 - **4xx:** `404` if `rule_id` names no rule; `403` for a service-scoped token or no `GuaranteedState:Read` grant anywhere.
 - **5xx:** `503` if the store is degraded (A4 envelope, `retry_after_ms: 5000`), the gate is unwired, or the `guaranteed_state.rule.view` audit row cannot persist (fail-closed, `Sec-Audit-Failed: true`, also `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.view` (`success`/`not_found`), `target_type=GuaranteedState`, `target_id=<rule_id>` — the SAME verb the per-guard dashboard drilldown emits (not `guardian.device.view`; a fleet-wide-per-rule read is a different shape from a per-device read). MCP twin: `get_guardian_rule_status` (`audit_persisted:false` posture instead of fail-closed).
@@ -10359,7 +10431,7 @@ Per-guard fleet-wide agent-status drilldown (#4037, api-parity #2146 Batch A) �
 Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's state for ONE device, unscoped to any Baseline. Machine-readable twin of the dashboard's per-device Guardian lens (`/fragments/device/guardian`). Genuinely distinct from `GET .../device-compliance` below, which answers "is this device compliant with this ONE named Baseline" (requires both `agent_id` **and** `baseline`, and returns a baseline-shaped response) — this route has no `baseline` parameter and returns every guard the device has EVER reported, regardless of Baseline membership.
 
 - **Permission:** `GuaranteedState:Read`, per-device scoped (management-group aware) — same `scoped_perm_fn(GuaranteedState, Read, agent_id)` gate `GET .../device-compliance` and the dashboard Guardian device lens both use.
-- **Response:** `data.agent_id`, `data.guards[]` of `{rule_id, name, state, updated_at}`, `data.total_guards`. A device with no reported guards returns an empty `guards[]`, not an error.
+- **Response:** `data.agent_id`, `data.guards[]` of `{rule_id, name, state, updated_at, order_uncertain, projection_pending}`, `data.total_guards`. A device with no reported guards returns an empty `guards[]`, not an error. `order_uncertain` is sticky: the verdict persisted for the pair cannot be proven to be the latest (a refused older arrival, a key below the high-water mark, two different verdicts with the same key, a pending event that out-ranks, shares, or arrived later with a lower key than the verdict, an unusable or capped agent stamp, or a verdict applied by the stale-mark recovery described in the Guardian guide). `projection_pending` means a retained event for the pair has not reached the row, so `state` may lag it. A `false` in either field does not establish freshness or completeness: an event that never arrived leaves no trace. The device-compliance route does not yet report ordering uncertainty.
 - **5xx:** `503` if the scoped-permission gate is unwired, the store is degraded (A4 envelope, `retry_after_ms: 5000`), or the `guardian.device.view` audit row cannot persist (fail-closed).
 - **Audit:** `guardian.device.view`, `target_type=Agent`, `target_id=<agent_id>` — the SAME verb `GET .../status/{agent_id}` and the dashboard Guardian device lens emit. MCP twin: `get_guardian_device_guards` (`audit_persisted:false` posture instead of fail-closed).
 
@@ -10481,7 +10553,7 @@ management-group dimension. **A real grant that resolves to ZERO visible agents
 actually covers the agents it should.
 
 - **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via `AuthRoutes::require_list_read`, ADR-0017)
-- **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
+- **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`), and `uncertain_rules`: live rules with at least one reported pair that is order-uncertain or has a pending event, within the caller's scope. `uncertain_rules: 0` does not prove the census is fresh or complete.
 - **4xx/5xx:** `403` for a service-scoped token, a caller with no `GuaranteedState:Read` grant anywhere, **or an unreachable/corrupt RBAC or management-group store for an ordinary caller** — `authorize_list_read` fails closed to the SAME `403` as a genuine no-grant denial, not a `503`, for every non-engine caller (the two are not currently distinguished in the response code). `503` only for: an unwired list-read gate or a null Guaranteed State store (server misconfiguration, no `retry_after_ms`); a Guaranteed State store query-time degrade (transient, `retry_after_ms: 5000`); or, for an **engine-principal** caller specifically, an unreachable/unopened RBAC store (engine sessions get a distinct `503` here, unlike human/service sessions) — never a silent `0`.
 - **MCP twin:** `get_guardian_status` (#4037) — calls the SAME `guardian_status_rollup` builder and the SAME `require_list_read` gate (via `McpServer::set_list_read_fn`, wired from the identical server.cpp lambda REST uses), so REST and MCP cannot observe a different admit decision or a different rollup for the same caller.
 
@@ -10498,7 +10570,7 @@ audited as `guardian.device.view` — **fail-closed**: `503` + `Sec-Audit-Failed
 if the audit row cannot persist.
 
 - **Permission:** `GuaranteedState:Read`, per-device scoped
-- **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
+- **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`, `uncertain_rules` (this device's rules whose row is order-uncertain or pending; `0` does not prove freshness).
 - **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store (A4 envelope, `retry_after_ms: 5000`) — never a silent `0`.
 - **MCP twin:** `get_guardian_agent_status` (#2146 Batch B1) — calls the SAME `guardian_agent_status_rollup` builder and the SAME `scoped_perm_fn` gate, so REST and MCP cannot observe a different admit decision or a different rollup for the same caller.
 
@@ -10506,6 +10578,7 @@ if the audit row cannot persist.
 
 Name-anchored, device-applicable Guardian compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding a device's compliance against a curated Baseline into an external CMDB / ITSM record. Looks the Baseline up by **name** and returns the Guards **actually applicable to the device**, each with that device's last reported verdict.
 
+- **Ordering uncertainty is NOT reported here.** Counts and states cover represented pairs only: a guard reading `compliant` may still be `order_uncertain` or `projection_pending`. Read `GET /guaranteed-state/agents/{agent_id}/rules` (MCP `get_guardian_device_guards`) for those flags before treating the device as settled. This route does not yet carry them.
 - **Why name, not id.** An integration pins one stable constant (e.g. `ServiceNow Compliance`) once. Baseline names are unique and survive reseeds/rebuilds, where a `baseline_id` churns — so there is no per-environment id to reconfigure.
 - **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
 - **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
@@ -13193,8 +13266,9 @@ Dispatch a single-device `echo.configure` with `<source>_enabled=true`. Per-sour
 - 400 with explanatory body for missing/invalid params.
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 - 503 with `Sec-Audit-Failed: true`, the body `The audit record could not be stored, so nothing was sent. Retry once the audit store recovers.` (`data-reason="audit_unavailable"`) and the same text as an `HX-Trigger` error toast, when the `attempted` audit row cannot be stored (#3619). Nothing is dispatched. Counted as `yuzu_echo_source_reenable_total{result="audit_unavailable"}`.
+- The permission gate's refusal (normally `403`) when `Execution:Execute` was withdrawn while the `attempted` row was being stored (#3619). Nothing is dispatched; audited as `result=failure` with `detail` `permission_revoked device=<id> source=<src>` and counted as `yuzu_echo_source_reenable_total{result="denied"}`.
 
-**Audit:** Emits `echo.source.reenable` with `result=attempted` (same `detail`) after every refusal and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
+**Audit:** Emits `echo.source.reenable` with `result=attempted` (same `detail`) once every check has passed (a request those checks refuse writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
 
 #### `POST /fragments/echo/retention-paused/purge`
 
@@ -13219,8 +13293,11 @@ Dispatch a single-device `echo.purge_source` that **permanently drops every ware
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 - 503 if command dispatch is unavailable.
 - 503 with `Sec-Audit-Failed: true`, the body `The audit record could not be stored, so nothing was sent. Retry once the audit store recovers.` (`data-reason="audit_unavailable"`) and the same text as an `HX-Trigger` error toast, when the `attempted` audit row cannot be stored (#3619). Nothing is purged. Counted as `yuzu_echo_source_purge_total{result="audit_unavailable"}`.
+- The permission gate's refusal (normally `403`) when `Infrastructure:Delete` was withdrawn while the `attempted` row was being stored (#3619). Nothing is purged; audited as `result=failure` with `detail` `permission_revoked device=<id> source=<src>` and counted as `yuzu_echo_source_purge_total{result="denied"}`.
 
-**Audit:** Emits `echo.source.purge` with `result=attempted` (same `detail`) after every refusal and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
+**Audit:** Emits `echo.source.purge` with `result=attempted` (same `detail`) once every check has passed (a request those checks refuse writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row; the audit row records the dispatch, never the agent's outcome.
+
+**What the agent reports (the response record):** one JSON line, `{"source":"<name>","rows_deleted":<n>,"status":"purged","dictionary_pending":<true|false>}`, or an `error|...` line (`source_not_paused`, `config_unreadable`, an unknown source). `status` `purged` means the source's rows are deleted. The interned strings only those rows referenced are swept afterwards under a 60 s deadline: when the sweep ran out of time or failed, `dictionary_pending` is `true` and the record's result status is `CONSTRAINED` (the status alone reaches the server; the completeness and the status detail, `echo:purge_dictionary_pending`, are in the agent's log). **A pending result is not a complete erasure**: the strings stay on the device until the weekly dictionary sweep, or until the purge is run again (a rerun deletes nothing twice and finishes the sweep). An automation that promises erasure must read `dictionary_pending`, not `status` alone. One further limit: a write-ahead-log checkpoint that finds the file busy right after the purge leaves the deleted pages in the log until the next checkpoint, and the reply still says `purged` (the agent logs a warning).
 
 **Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes.
 
@@ -13240,7 +13317,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 | `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Others → 400. |
 
 **Responses:**
-- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled, or `config_unreadable` if the enable flag could not be read) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
+- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` and `dictionary_pending` (and the agent-side `source_not_paused` refusal if the source was re-enabled, or `config_unreadable` if the enable flag could not be read) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `dictionary_pending` `true` (with a `CONSTRAINED` result status on the record) means the rows are gone but the strings they referenced stay until the weekly sweep or a rerun of the purge: not a complete erasure (see the fragment route above). `X-Correlation-Id` header on every response.
 - **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
 - **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
 - **404** — dispatch reached zero agents (device offline).

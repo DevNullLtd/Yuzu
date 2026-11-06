@@ -3,12 +3,17 @@
 /**
  * echo_schema_registry.hpp -- Capture source definitions for the Echo data warehouse
  *
- * Defines every capture source, its supported granularity tiers (Live, Hourly,
- * Daily, Monthly), typed column schemas per tier, and the DDL + rollup SQL
- * needed to create and maintain the warehouse tables.
+ * Defines every capture source, its roll-up tiers (Hourly, Daily, Monthly), typed column
+ * schemas per tier, and the DDL for the tables the roll-up model does not own. The tiers'
+ * columns are derived from fold_sources() (echo_fold_schema.hpp), never typed twice.
  *
- * The $-name convention ($Process_Live, $TCP_Hourly, etc.) maps to snake_case
- * SQLite table names (process_live, tcp_hourly) via a whitelist translation.
+ * ROLL-UP IS THE ONLY STORAGE MODEL: raw capture rows are not kept, and no setting, flag or
+ * environment variable selects between the two. `$Process_Live` and the other 15 retired raw
+ * names still translate, to empty shim views with the legacy columns, so a stored query reads
+ * zero rows instead of failing.
+ *
+ * The $-name convention ($Process_Hourly, $TCP_Daily, etc.) maps to snake_case SQLite
+ * view names (process_hourly, tcp_daily) via a whitelist translation.
  */
 
 #include <yuzu/plugin.h>
@@ -56,7 +61,7 @@ struct ColumnDef {
 enum class RetentionType { kRowCount, kTimeBased };
 
 struct GranularityDef {
-    std::string_view suffix;      // "live", "hourly", "daily", "monthly"
+    std::string_view suffix;      // "hourly", "daily", "monthly"; "boot" (netqual) and "live" (usage) are plain tables
     RetentionType retention_type;
     int64_t retention_default;    // row count or seconds
     std::vector<ColumnDef> columns;
@@ -133,14 +138,6 @@ struct CaptureSourceDef {
     // (Declared before os_support so the designated initialisers in
     // build_sources() stay in member-declaration order.)
     bool default_enabled = true;
-    // Non-empty for a source whose LIVE tier enforces replay idempotence via a
-    // UNIQUE index (echo_cursor.hpp rule 3 — the cursor-model seam). When set,
-    // generate_warehouse_ddl() emits
-    // `CREATE UNIQUE INDEX IF NOT EXISTS <table>_record_key_uq ON <table>(<this column>)`
-    // for the live tier only. Empty ("") for every source that has no such
-    // column (the default — a plain diff-driven source has no idempotence
-    // requirement beyond its own diff logic).
-    std::string_view unique_key_column;
     std::vector<OsSupport> os_support;
     std::vector<GranularityDef> granularities;
 };
@@ -214,20 +211,20 @@ accepted_capture_methods_for_os(std::string_view source_name, std::string_view o
 const std::vector<CaptureSourceDef>& capture_sources();
 
 /**
- * The timestamp column for a granularity suffix: `ts` (live), `hour_ts`,
+ * The timestamp column for a granularity suffix: `ts` (usage_live, netqual_boot), `hour_ts`,
  * `day_ts`, `month_ts`. Unknown suffixes fall back to `ts`.
  *
- * This is the one mapping the warehouse DDL indexes, `retention_sql`'s
- * time-based branch filters on, and the #2361 retention clock guard counts
- * against. Read it from here rather than re-deriving it -- a second copy would
- * diverge silently, and the guard would then count a different column from the
- * one the delete acts on.
+ * This is the one mapping the warehouse DDL indexes, the fold's bucket columns use and the
+ * #2361 retention clock guard counts against. Read it from here rather than re-deriving it --
+ * a second copy would diverge silently, and the guard would then count a different column from
+ * the one the delete acts on.
  */
 [[nodiscard]] std::string_view ts_column_for_suffix(std::string_view suffix);
 
 /**
- * Generate DDL for all typed warehouse tables.
- * Returns a single SQL string containing CREATE TABLE IF NOT EXISTS + indexes.
+ * Generate DDL for the typed warehouse tables the roll-up model does not own (netqual_boot and
+ * the usage tables). Every roll-up tier name is a VIEW (generate_fold_ddl creates it) and is
+ * skipped here. Returns a single SQL string of CREATE TABLE IF NOT EXISTS + indexes.
  */
 std::string generate_warehouse_ddl();
 
@@ -259,24 +256,5 @@ std::vector<std::string> all_dollar_names();
  * Returns empty vector if the table is unknown.
  */
 std::vector<std::string> columns_for_table(const std::string& real_table_name);
-
-/**
- * Generate rollup SQL for a specific source and target granularity.
- * The SQL is an INSERT INTO ... SELECT that aggregates from the source tier.
- * @param source_name  e.g. "process"
- * @param target_suffix e.g. "hourly"
- * @return SQL string, or empty if rollup is not defined for this combination.
- */
-std::string rollup_sql(std::string_view source_name, std::string_view target_suffix);
-
-/**
- * Generate retention SQL for a specific table.
- * Row-count retention: DELETE oldest rows exceeding the limit.
- * Time-based retention: DELETE rows older than the cutoff.
- * @param real_table_name  e.g. "process_live"
- * @param now_epoch        Current epoch seconds (for time-based retention).
- * @return SQL string to execute, or empty if no retention defined.
- */
-std::string retention_sql(const std::string& real_table_name, int64_t now_epoch);
 
 } // namespace yuzu::echo
