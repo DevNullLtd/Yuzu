@@ -268,6 +268,52 @@ TEST_CASE("CommandDedupStore: retention evicts oldest TERMINAL rows",
     CHECK(t.store.claim("cmd-oldest").status == ClaimStatus::Claimed);
 }
 
+// #3678: the boundary the server's redelivery horizon is sized against. The ring keeps the newest
+// `max` TERMINAL rows by rowid and prunes only on every kPruneInterval-th record_terminal. With
+// `max == kPruneInterval` the FIRST prune runs while the table holds EXACTLY `max` terminal rows,
+// so it pins both sides of the boundary at once:
+//   * a command followed by `max - 1` newer terminals is still the oldest of `max` retained rows,
+//     and must survive that prune (a bound of `max - 1`, or an off-by-one in the LIMIT, evicts it
+//     and fails the first assertion);
+//   * after `max` MORE newer terminals the next prune must evict it (a bound that keeps extra rows,
+//     or a prune that no longer fires on cadence, fails the second assertion).
+// An earlier version used a bound of 600 beside the 512 cadence: its only prune ran with fewer
+// than 600 rows, so it passed for ANY bound from 512 to 1500 and proved nothing about the limit.
+// Reduced ring (the idiom above): this proves the SHAPE of the boundary, not the 20000 figure.
+TEST_CASE("CommandDedupStore: a terminal command survives max-1 newer terminals through a prune "
+          "and is evicted by the next prune after max more (#3678)",
+          "[command_dedup][retention][3678]") {
+    static_assert(CommandDedupStore::kMaxDedupRows == ::yuzu::kAgentDedupRingRows,
+                  "the ring bound is single-sourced in command_replay_horizon.hpp");
+    constexpr std::int64_t kRing = static_cast<std::int64_t>(CommandDedupStore::kPruneInterval);
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(kRing);
+
+    REQUIRE(t.store.claim("cmd-x").status == ClaimStatus::Claimed);
+    REQUIRE(t.store.record_terminal("cmd-x", "SUCCESS-X") == RecordOutcome::Recorded);
+
+    // kRing - 1 newer terminals => kRing terminal rows in total; the kRing-th record_terminal
+    // triggers the first prune with exactly kRing rows held. cmd-x must survive it.
+    for (std::int64_t i = 0; i < kRing - 1; ++i) {
+        auto id = "newer-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+    auto inside = t.store.claim("cmd-x");
+    CHECK(inside.status == ClaimStatus::Duplicate);
+    CHECK(inside.state == DedupState::Terminal);
+    CHECK(inside.response == "SUCCESS-X"); // replayed with its ORIGINAL outcome
+
+    // kRing more newer terminals => the next prune (kRing record_terminals later) keeps only the
+    // newest kRing rows, and cmd-x is no longer among them: a redelivery is a fresh claim.
+    for (std::int64_t i = 0; i < kRing; ++i) {
+        auto id = "pushout-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+    CHECK(t.store.claim("cmd-x").status == ClaimStatus::Claimed);
+}
+
 TEST_CASE("CommandDedupStore: a live in-flight row is NEVER evicted by retention (UP-1)",
           "[command_dedup][retention][effectively-once]") {
     auto t = make_store();

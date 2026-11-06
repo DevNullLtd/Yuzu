@@ -494,5 +494,5 @@ driver_inv|tun|-|-|kernel|module|-|-|-|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: `tests/test_hardware_definition.py` · `tests/unit/server/test_hardware_list_model.cpp` · `tests/unit/server/test_hardware_routes.cpp` · `tests/unit/server/test_hardware_sync_routes.cpp` · `tests/unit/server/test_hardware_ui.cpp` · `tests/unit/test_hardware_device_identity_posix_actions.cpp` · `tests/unit/test_hardware_disks_macos.cpp` · `tests/unit/test_hardware_drivers_inventory.cpp` · `tests/unit/test_hardware_estate_parsers.cpp` · `tests/unit/test_hardware_linux_parsers.cpp` · `tests/unit/test_hardware_local_dispatcher.cpp` · `tests/unit/test_hardware_macos_bios.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-11-03-hardware-windows-estate.added.md`
+- Changelog: `changelog.d/2026-11-03-hardware-windows-estate.added.md` · `changelog.d/2026-11-04-hardware-expanded-record.added.md`
 <!-- END GENERATED -->

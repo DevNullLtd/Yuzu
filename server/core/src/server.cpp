@@ -18399,6 +18399,14 @@ private:
                                                                    plugin, action);
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+                // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
+                // measured on. An unwired tracker reads as unreadable, which HOLDS every
+                // occurrence (fail closed) -- never as 0.
+                .dispatch_seq_fn = [this]() -> std::optional<DispatchPosition> {
+                    if (!execution_tracker_)
+                        return std::nullopt;
+                    return execution_tracker_->current_dispatch_position();
+                },
             });
         schedule_tick_thread_ = std::thread([this]() {
             spdlog::info("Schedule runner thread started (schedule eval 30s, outbox delivery 5s)");
@@ -19843,15 +19851,25 @@ private:
         // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
         // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
         // "the CI record" means.
-        auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
+        auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id,
+                                                      bool with_sections) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
-            detail.ci = device_inventory_store_
-                            ? device_inventory_store_->get_device_ci(agent_id)
-                            : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
-                                  std::unexpected(CiReadError::kDegraded));
+            if (!device_inventory_store_) {
+                detail.ci = std::unexpected(CiReadError::kDegraded);
+            } else if (with_sections) {
+                // The v2 per-section statuses and rows (H.7): ONLY the REST record route and the
+                // MCP tool ask for them (the dashboard fragment, its sync-now poll and the actions
+                // lens do not render them). The record and its sections come from ONE
+                // REPEATABLE READ snapshot, so the scalars and the rows are always the same
+                // replace generation; the pure mapping keeps a failed sections read as the error
+                // (the REST route 503s and the MCP tool answers a retryable error on it).
+                apply_ci_with_sections_read(detail, device_inventory_store_->get_device_ci_with_sections(agent_id));
+            } else {
+                detail.ci = device_inventory_store_->get_device_ci(agent_id);
+            }
             if (software_inventory_store_) {
                 auto sw = software_inventory_store_->get_agent_software(agent_id);
                 if (sw) {

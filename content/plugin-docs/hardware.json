@@ -2306,7 +2306,8 @@
       "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
     ],
     "changelog": [
-      "changelog.d/2026-11-03-hardware-windows-estate.added.md"
+      "changelog.d/2026-11-03-hardware-windows-estate.added.md",
+      "changelog.d/2026-11-04-hardware-expanded-record.added.md"
     ],
     "definitions": [
       "content/definitions/hardware.yaml"
