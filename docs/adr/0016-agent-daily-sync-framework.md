@@ -1189,7 +1189,8 @@ collection settings".
 
 - **Document.** `interval_s` 3600 to 604800, an optional window in minutes past local midnight, a zone
   (empty = the machine's own, else an IANA name checked against `pg_timezone_names` in the write
-  transaction), a boolean per collector (`installed_apps`, `middleware`, `msi_packages`,
+  transaction; names under `posix/`, `right/` or `SystemV/` and the placeholder `Factory` are refused,
+  as an agent cannot resolve them), a boolean per collector (`installed_apps`, `middleware`, `msi_packages`,
   `pkg_inventory`, `runtimes`, `windows_optional_features`) and a priority 0 to 1000. A window needs a
   whole-day interval: the agent fires a window once per local day, so a 25 hour interval with a window
   has no meaning. `installed_apps` cannot be turned off by a document. The roadmap's `evidence`

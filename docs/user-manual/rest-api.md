@@ -8133,7 +8133,7 @@ Per-management-group settings for the daily installed-software collection: how o
 |---|---|---|
 | `interval_s` | integer | 3600 to 604800 (1 hour to 7 days) |
 | `window` | object or `null` | `{"start_min": 60, "end_min": 300}`, minutes past local midnight, `0 <= start_min < end_min <= 1440`; allowed only with a whole-day interval (86400, 172800, ...) |
-| `timezone` | string | Empty for the machine's own zone, else an IANA zone name known to the database (`Europe/London`); at most 64 bytes |
+| `timezone` | string | Empty for the machine's own zone, else an IANA zone name known to the database (`Europe/London`); at most 64 bytes. Names under `posix/`, `right/` or `SystemV/` and the placeholder `Factory` are a `400` (an agent cannot resolve them); link names such as `US/Pacific` are accepted |
 | `plugins` | object | Every collector as a boolean: `installed_apps`, `middleware`, `msi_packages`, `pkg_inventory`, `runtimes`, `windows_optional_features`. `installed_apps` cannot be `false`. An unknown or missing key is a `400` |
 | `priority` | integer | 0 to 1000; decides only between branches (below). The root group's document takes no priority. Optional: omitted is 0, except for a group owner, for whom it keeps the stored value |
 | `expected_version` | string | Write only: the `version` last read, or `none` (also the default) to create only |

@@ -143,7 +143,8 @@ inline const CollectionSettings kFleetDefault = [] {
 }
 
 /// Bounds and shape. `is_root` = the document belongs to the root group. The timezone check is
-/// shape only; the store checks existence against the database's zone table.
+/// shape plus the refused names below; the store checks existence against the database's zone
+/// table.
 [[nodiscard]] inline std::expected<void, std::string> validate(const CollectionSettings& s,
                                                                bool is_root) {
     if (s.interval_s < kMinIntervalS || s.interval_s > kMaxIntervalS)
@@ -163,6 +164,13 @@ inline const CollectionSettings kFleetDefault = [] {
         if (!ok)
             return std::unexpected("timezone has an invalid character");
     }
+    // Names a database's zone table can list that an agent cannot resolve: the alternative
+    // trees and the tzdata placeholder. Exact and case-sensitive; link names (US/Pacific, GB,
+    // GMT0) are valid.
+    if (s.timezone.starts_with("posix/") || s.timezone.starts_with("right/") ||
+        s.timezone.starts_with("SystemV/") || s.timezone == "Factory")
+        return std::unexpected(
+            "timezone names a zone an agent cannot resolve (posix/, right/, SystemV/ or Factory)");
     for (const auto& [name, on] : s.plugins) {
         (void)on;
         if (!is_collection_plugin(name))

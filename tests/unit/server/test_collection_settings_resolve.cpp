@@ -115,6 +115,24 @@ TEST_CASE("collection settings validate: timezone shape only", "[collection_sett
     CHECK_FALSE(invalid(s));
 }
 
+TEST_CASE("collection settings validate: zone names an agent cannot resolve are refused",
+          "[collection_settings][resolve]") {
+    auto s = make();
+    // The alternative trees and the tzdata placeholder, which some database builds list.
+    for (const char* name : {"posix/Europe/London", "right/UTC", "SystemV/EST5", "Factory"}) {
+        INFO(name);
+        s.timezone = name;
+        CHECK(invalid(s));
+    }
+    // Exact and case-sensitive: link names and look-alikes stay valid.
+    for (const char* name : {"US/Pacific", "GB", "GMT0", "EST5EDT", "Etc/UTC", "factory",
+                             "Factory/X", "Europe/posix", "Posix/UTC", "rightUTC"}) {
+        INFO(name);
+        s.timezone = name;
+        CHECK_FALSE(invalid(s));
+    }
+}
+
 TEST_CASE("collection settings resolve: no documents gives the fleet default",
           "[collection_settings][resolve]") {
     const auto r = cs::resolve({"aa"}, {node(kRoot, "", 1), node("aa", "", 2)}, {}, kNoKills);
