@@ -2230,9 +2230,10 @@ std::string SettingsRoutes::render_data_retention_fragment() {
 
 namespace {
 
-// Page-local rules for the DEX Alerts form body. The sub-nav's own style block
-// (dex_fragment_style) carries the DEX shell rules; these cover only the three
-// alert panels. Tokens only; one rule per line source, joined to one line.
+// Page-local rules for the DEX settings tabs' form bodies: `.dxa*` for the three alert panels
+// and `.dxs*` for the Scoring tab's form, one style block shared by both tabs. The sub-nav's own
+// style block (dex_fragment_style) carries the DEX shell rules. Tokens only; one rule per line
+// source, joined to one line.
 const char* const kDexAlertsCss = R"CSS(
 .dxa{margin-top:16px}
 .dxa .form{gap:12px}
@@ -2483,6 +2484,12 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
                                       DexScorePolicyWriteRequest::Op op, bool dry_run) {
     const bool put = op == DexScorePolicyWriteRequest::Op::Put;
     const char* leaf = dry_run ? "preview" : (put ? "save" : "reset");
+    // The same read gate as GET /fragments/dex/scoring, first: every answer carries the Apps
+    // model's application names (the datalist, the preview table), and the legacy-role test
+    // below does not imply a GuaranteedState:Read grant once RBAC is enforced. A principal who
+    // cannot load the tab cannot save from it.
+    if (!read_perm(req, res, "GuaranteedState", "Read"))
+        return;
     if (!admin_fn_(req, res))
         return;
     const auto session = auth_fn_(req, res);
@@ -3753,7 +3760,8 @@ void SettingsRoutes::register_routes(
     // BEFORE either the policy or the application names are read, exactly as GET
     // /api/v1/dex/score-policy and /fragments/dex/apps gate. A reader who is not an
     // administrator gets the same page with every control disabled (a quiet role test, no
-    // denied row, as the Alerts tab); the three POSTs keep the loud admin_fn_.
+    // denied row, as the Alerts tab); the three POSTs take the same read gate first, then the
+    // loud admin_fn_.
     sink.Get("/fragments/dex/scoring", [this](const httplib::Request& req,
                                               httplib::Response& res) {
         if (!read_perm(req, res, "GuaranteedState", "Read"))

@@ -86,6 +86,21 @@ TEST_CASE("step-up policy: the table's total and per-class row counts are pinned
           kStepUpPolicyCount);
 }
 
+TEST_CASE("step-up policy: the DEX Scoring tab's three POSTs are exempt operational data",
+          "[stepup][policy]") {
+    // The counts above only move together; this pins the three exact keys and their class, the
+    // same classification as PUT/DELETE /api/v1/dex/score-policy.
+    for (const char* path : {R"(/api/settings/dex-scoring/save)",
+                             R"(/api/settings/dex-scoring/preview)",
+                             R"(/api/settings/dex-scoring/reset)"}) {
+        INFO(path);
+        const auto* e = step_up_policy_for("POST", path);
+        REQUIRE(e != nullptr);
+        CHECK(e->cls == StepUpClass::kExempt);
+        CHECK(e->reason == step_up_detail::kOperationalData);
+    }
+}
+
 TEST_CASE("step-up policy: kOwnGate is the three elevation routes", "[stepup][policy]") {
     const auto* a = step_up_policy_for("POST", R"(/api/v1/users/([^/]+)/elevation-eligibility)");
     const auto* b = step_up_policy_for("POST", R"(/api/v1/users/elevation-eligibility)");

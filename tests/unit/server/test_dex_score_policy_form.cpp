@@ -128,6 +128,60 @@ TEST_CASE("form: a non-default model and an override model field build a version
     CHECK(json::parse(dex_score_policy_canonical(*v))["version"] == 2);
 }
 
+TEST_CASE("form: every field of the document survives the round trip through the form",
+          "[server][dex][score_policy][form]") {
+    // Persistence, not markup: full_policy() sets every global field and every override field
+    // off its default, so a field the form builder dropped (or left at its default) changes the
+    // canonical text and fails the comparison below.
+    const auto p = full_policy();
+    REQUIRE_FALSE(dex_score_policy_fault(p));
+    std::vector<std::string> paths;
+    leaves(dex_score_policy_to_json(p), "", paths);
+    REQUIRE(paths.size() > 20); // not vacuous
+    REQUIRE(dex_score_policy_canonical(p) != dex_score_policy_canonical(dex_default_score_policy()));
+
+    const auto doc = dex_form_to_document(pairs_of(dex_form_values(p)));
+    REQUIRE(doc);
+    CHECK(doc->row_of_override == std::vector<int>{0});
+    const auto parsed = dex_score_policy_validate_text(doc->text);
+    REQUIRE(parsed);
+    CHECK(dex_score_policy_canonical(*parsed) == dex_score_policy_canonical(p));
+}
+
+TEST_CASE("form: an override row with values but no image is refused by name, never dropped",
+          "[server][dex][score_policy][form]") {
+    auto v = dex_form_values(dex_default_score_policy());
+    v["overrides[0].image"] = "a.exe";
+    v["overrides[1].image"] = "  ";
+    v["overrides[1].tiers.edges.excellent"] = "95";
+    v["overrides[1].weights.hangs"] = "";
+    SECTION("typed values without an image") {
+        const auto doc = dex_form_to_document(pairs_of(v));
+        REQUIRE_FALSE(doc);
+        CHECK(doc.error().field == "overrides[1].image");
+        CHECK(doc.error().message == "an override needs an application image");
+        // The renderer marks that exact input, so the operator sees which row to fix.
+        DexScoringView view;
+        view.values = v;
+        view.admin = true;
+        view.error = doc.error();
+        CHECK(has(render_dex_scoring_section(view),
+                  "<span class=\"err\" data-field=\"overrides[1].image\""));
+    }
+    SECTION("a ticked Remove box drops the row, values and all") {
+        v["overrides[1].remove"] = "on";
+        const auto doc = dex_form_to_document(pairs_of(v));
+        REQUIRE(doc);
+        CHECK(doc->row_of_override == std::vector<int>{0});
+    }
+    SECTION("blank and whitespace-only values are the browser's empty row") {
+        v["overrides[1].tiers.edges.excellent"] = " \t";
+        const auto doc = dex_form_to_document(pairs_of(v));
+        REQUIRE(doc);
+        CHECK(doc->row_of_override == std::vector<int>{0});
+    }
+}
+
 TEST_CASE("form: blank and removed rows are dropped, order is kept and unset fields inherit",
           "[server][dex][score_policy][form]") {
     auto v = dex_form_values(dex_default_score_policy());
@@ -260,6 +314,10 @@ TEST_CASE("render: an input named for every field of the typed document",
             continue; // stamped by the builder, not a field
         INFO(path);
         CHECK(has(html, "name=\"" + path + "\""));
+        // ...and it carries the policy's own value, not a default or an empty string.
+        REQUIRE(view.values.contains(path));
+        CHECK(has(html, "name=\"" + path + "\" value=\"" + view.values.at(path) + "\""));
+        CHECK_FALSE(view.values.at(path).empty());
     }
     CHECK(has(html, "<input type=\"hidden\" name=\"if_match\" value=\"0123456789abcdef\""));
     CHECK(has(html, "At most 200 overrides; 1 in use."));

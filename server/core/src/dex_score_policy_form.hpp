@@ -146,6 +146,17 @@ split_override_key(std::string_view name) {
     return "overrides[" + std::to_string(row) + "]." + std::string(rest);
 }
 
+/// True when any field of override `row` other than its image and Remove box holds text. The
+/// map is sorted by path, so the row's fields are one contiguous run.
+[[nodiscard]] inline bool row_has_values(const DexFormValues& v, int row) {
+    const std::string prefix = row_key(row, "");
+    for (auto it = v.lower_bound(prefix); it != v.end() && it->first.starts_with(prefix); ++it)
+        if (it->first != prefix + "image" && it->first != prefix + "remove" &&
+            !trim(it->second).empty())
+            return true;
+    return false;
+}
+
 [[nodiscard]] inline std::string num(double d) { return std::format("{}", d); }
 
 [[nodiscard]] inline const std::string& value_of(const DexFormValues& v, const std::string& name) {
@@ -265,7 +276,8 @@ inline void attach(json& obj, const char* key, json&& child) {
 
 /// Build the version-2 document the writer validates, plus the override row map. Refuses a
 /// form over the pair cap or naming an override row above kDexFormMaxOverrideIndex, before
-/// anything is built. Every range is left to the validator.
+/// anything is built, and an override row that carries values but no image. Every range is
+/// left to the validator.
 [[nodiscard]] inline std::expected<DexFormDocument, DexFormError>
 dex_form_to_document(const DexFormPairs& pairs) {
     using namespace dex_form_detail;
@@ -288,8 +300,16 @@ dex_form_to_document(const DexFormPairs& pairs) {
     json arr = json::array();
     for (const int row : rows) {
         const std::string image = trim(value_of(v, row_key(row, "image")));
-        if (image.empty() || value_of(v, row_key(row, "remove")) == "on")
+        if (value_of(v, row_key(row, "remove")) == "on")
             continue;
+        if (image.empty()) {
+            // A blank row is dropped; a row with typed values and no image is the operator's
+            // input and is refused by name, never silently lost.
+            if (row_has_values(v, row))
+                return std::unexpected(DexFormError{row_key(row, "image"),
+                                                    "an override needs an application image"});
+            continue;
+        }
         const auto at = [&](std::string_view rest) { return row_key(row, rest); };
         json ov{{"image", image}};
         json ot = json::object();
@@ -505,8 +525,10 @@ private:
     [[nodiscard]] std::string edges(const std::string& base, bool inherit) const {
         std::string o = group_open(base + "tiers.edges", "Score edges",
                                    "Lowest displayed score of each tier, 0 to 100 at one "
-                                   "decimal, strictly descending and at least 1.0 apart. Poor is "
-                                   "everything below Fair.") +
+                                   "decimal, strictly descending and at least " +
+                                       num(static_cast<double>(kDexPolicyMinTierGapTenths) /
+                                           kStabilityScoreScale) +
+                                       " apart. Poor is everything below Fair.") +
                         "<div class=\"row2\">";
         o += number(base + "tiers.edges.excellent", "Excellent from", 0.0, 100.0, "0.1", inherit);
         o += number(base + "tiers.edges.good", "Good from", 0.0, 100.0, "0.1", inherit);
@@ -515,8 +537,9 @@ private:
     }
     [[nodiscard]] std::string names(const std::string& base, bool inherit) const {
         std::string o = group_open(base + "tiers.names", "Tier names",
-                                   "1 to 24 printable characters; none of &lt; &gt; &amp; "
-                                   "&quot;.") +
+                                   "1 to " + std::to_string(kDexPolicyMaxNameBytes) +
+                                       " bytes of printable ASCII; none of &lt; &gt; &amp; "
+                                       "&quot;.") +
                         "<div class=\"row2\">";
         o += name_input(base + "tiers.names.excellent", "Excellent", inherit);
         o += name_input(base + "tiers.names.good", "Good", inherit);
@@ -527,19 +550,29 @@ private:
     [[nodiscard]] std::string weights(const std::string& base, bool inherit) const {
         std::string o = group_open(base + "weights", "Weights",
                                    "Points deducted from 100 for each factor at its worst; "
-                                   "the four sum to at most 100.") +
+                                   "the four sum to at most " + num(kDexPolicyWeightSumMax) +
+                                       ".") +
                         "<div class=\"row2\">";
-        o += number(base + "weights.breadth", "Breadth", 0.0, 100.0, "any", inherit);
-        o += number(base + "weights.crashes", "Crashes", 0.0, 100.0, "any", inherit);
-        o += number(base + "weights.hangs", "Hangs", 0.0, 100.0, "any", inherit);
-        o += number(base + "weights.regression", "Regression", 0.0, 100.0, "any", inherit);
+        constexpr double kMax = kDexPolicyWeightSumMax;
+        o += number(base + "weights.breadth", "Breadth", 0.0, kMax, "any", inherit);
+        o += number(base + "weights.crashes", "Crashes", 0.0, kMax, "any", inherit);
+        o += number(base + "weights.hangs", "Hangs", 0.0, kMax, "any", inherit);
+        o += number(base + "weights.regression", "Regression", 0.0, kMax, "any", inherit);
         return o + "</div>" + group_close(base + "weights");
     }
     [[nodiscard]] std::string model(const std::string& base, bool global) const {
         const bool inherit = !global;
         std::string o = group_open(base + "model", "Model",
-                                   "Per-device event cap 1 to 1000; the regression ratios 1 to "
-                                   "1000 with start below full.") +
+                                   "Per-device event cap 1 to " +
+                                       std::to_string(kStabilityMaxPerDeviceEventCap) +
+                                       "; the regression ratios 1 to " +
+                                       num(kStabilityMaxRegressionRatio) +
+                                       " with start below full" +
+                                       (global ? "; interval confidence " +
+                                                     num(kDexStatsConfidenceMin) + " to " +
+                                                     num(kDexStatsConfidenceMax)
+                                               : std::string()) +
+                                       ".") +
                         "<div class=\"row2\">";
         o += input(base + "model.per_device_event_cap", "Per-device event cap", "number",
                    " min=\"1\" max=\"" + std::to_string(kStabilityMaxPerDeviceEventCap) +

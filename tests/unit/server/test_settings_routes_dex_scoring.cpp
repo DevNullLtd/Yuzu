@@ -11,6 +11,7 @@
 #include "dex_score_policy_writer.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "store_errors.hpp"
 
 #include "test_route_sink.hpp"
 
@@ -104,6 +105,7 @@ struct Harness {
     // The fake store.
     std::optional<std::string> stored;
     bool read_fails{false};
+    bool cas_fails{false}; // the commit answers a store error (an ambiguous outcome)
     int cas_calls{0};
     int reads{0};
     std::shared_ptr<DexScorePolicyProvider> provider;
@@ -216,6 +218,8 @@ struct Harness {
                                    const std::string& canonical,
                                    const std::string&) -> std::expected<bool, std::string> {
             ++cas_calls;
+            if (cas_fails)
+                return std::unexpected(std::string(kDbErrorPrefix) + "database write failed");
             if (stored != expected)
                 return false;
             stored = canonical;
@@ -461,6 +465,48 @@ TEST_CASE("scoring save: a missing if_match is a 428 or a refusal token",
     CHECK(h.cas_calls == 0);
 }
 
+TEST_CASE("scoring save: a writer failure keeps the edits, with its token and toast (htmx) or its status (plain)",
+          "[server][routes][dex][score_policy][scoring]") {
+    Harness h;
+    h.stored = doc_with_excellent(95.0);
+    std::string if_match = h.stored_revision();
+    std::string token, toast;
+    int status = 0;
+    SECTION("a malformed revision") {
+        if_match = "zz";
+        token = "if_match_malformed";
+        toast = "Score policy not saved: reload and try again";
+        status = 400;
+    }
+    SECTION("the store cannot be read") {
+        h.read_fails = true;
+        token = "store_unavailable";
+        toast = "Score policy not saved: try again shortly";
+        status = 503;
+    }
+    SECTION("the commit fails with a store error, so the outcome is unknown") {
+        h.cas_fails = true;
+        token = "outcome_unknown";
+        toast = "Score policy not saved: try again shortly";
+        status = 503;
+    }
+    const auto body = form_body(dex_form_values(policy_with_excellent(96.0)), if_match);
+
+    const auto hx = h.post(kSave, body, kHx);
+    CHECK(hx->status == 200);
+    CHECK(has(hx->body, "data-refused=\"" + token + "\""));
+    CHECK(has(hx->get_header_value("HX-Trigger"), toast));
+    CHECK(has(hx->body, "name=\"tiers.edges.excellent\" value=\"96\"")); // the edit stays visible
+
+    const auto plain = h.post(kSave, body);
+    CHECK(plain->status == status);
+    const auto j = json::parse(plain->body);
+    CHECK(j["error"]["message"].is_string());
+    if (status == 503)
+        CHECK(j["error"]["retry_after_ms"].is_number());
+    CHECK(h.stored == doc_with_excellent(95.0)); // nothing was overwritten
+}
+
 TEST_CASE("scoring preview: validates, stores nothing, keeps the edits and the current revision",
           "[server][routes][dex][score_policy][scoring]") {
     Harness h;
@@ -527,6 +573,24 @@ TEST_CASE("scoring POST: every refusal before the writer leaves nothing behind",
             CHECK(h.post(path, body, kHx)->status == 403);
         CHECK(h.rows.empty());
         CHECK(h.cas_calls == 0);
+        CHECK_FALSE(h.stored);
+    }
+    SECTION("a caller without GuaranteedState:Read is refused first, before the role test or any read") {
+        Harness h;
+        h.perm_allow = false;
+        for (const char* path : {kSave, kPreview, kReset}) {
+            const auto res = h.post(path, body, kHx);
+            CHECK(res->status == 403);
+            CHECK_FALSE(has(res->body, "outlook.exe")); // no application name leaves with a refusal
+        }
+        REQUIRE(h.perm_calls.size() == 3);
+        for (const auto& call : h.perm_calls)
+            CHECK(call == std::pair<std::string, std::string>{"GuaranteedState", "Read"});
+        CHECK(h.admin_calls == 0);
+        CHECK(h.reads == 0);
+        CHECK(h.apps_calls == 0);
+        CHECK(h.cas_calls == 0);
+        CHECK(h.rows.empty());
         CHECK_FALSE(h.stored);
     }
     SECTION("a cross-site browser write is refused with a csrf.denied row") {

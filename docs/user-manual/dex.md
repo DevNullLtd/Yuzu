@@ -75,8 +75,9 @@ rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
 
 The **Scoring** tab (`/fragments/dex/scoring`) shows the score policy in force and lets an
 administrator edit every parameter of it in one place. Viewing needs the
-**`GuaranteedState:Read`** permission; editing needs the **Administrator** role. Anyone who can
-view and is not an administrator sees the same page with every control disabled and a role note.
+**`GuaranteedState:Read`** permission; editing needs the **Administrator** role and the same read
+permission, because every answer carries application names. Anyone who can view and is not an
+administrator sees the same page with every control disabled and a role note.
 
 The tab has these sections:
 
@@ -85,7 +86,7 @@ The tab has these sections:
   policy is saved).
 - **Tiers** - the lowest displayed score of the Excellent, Good and Fair tiers (0 to 100 at one
   decimal, strictly descending, at least 1.0 point apart; Poor is everything below Fair) and the
-  four tier names (1 to 24 printable characters, none of `< > & "`).
+  four tier names (1 to 24 bytes of printable ASCII, none of `< > & "`).
 - **Weights** - the four deduction weights (breadth, crashes, hangs, regression), each 0 or more,
   summing to at most 100.
 - **Model** - the per-device event cap (1 to 1000, default 5), the regression start and full ratios
@@ -103,7 +104,8 @@ and writes it through the same function, so the revision check and the audit row
 shown against the field that caused it. Range faults (an edge, a weight, a model value) mark the
 whole group of fields, because the validator reports the group; a value that is not a number marks
 that exact field. A field of an override row is marked on the row you submitted, even after earlier
-rows were removed.
+rows were removed. An override row that has values but no application image is refused on its image
+field rather than dropped; tick *Remove this override* to delete a row.
 
 **Preview tier changes** is a dry run: it validates the form, stores nothing, and lists how many
 of the top applications of the last 7 days (all platforms) would change tier, with the first

@@ -5847,6 +5847,17 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 | `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
 | `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
 
+### DEX Scoring
+
+The score policy is viewed and edited on the **DEX page, Scoring tab**: tier edges and names, the four deduction weights, the scoring-model parameters and the per-application overrides, with the validator's refusals shown against the field, a pre-save tier-change preview, a stale-revision refusal and a reset to the shipped defaults. The tab is a form over the same policy document and the same writer as `GET`/`PUT`/`DELETE /api/v1/dex/score-policy`, so validation, the revision check and the audit rows are identical (`dex.score_policy.update` on save, `dex.score_policy.reset` on reset, `dex.score_policy.validate` on preview, which stores nothing). See the user-manual *DEX -> Scoring* section.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/dex/scoring` | The Scoring tab: DEX sub-nav, the policy in force and the edit form (HTMX). Needs `GuaranteedState:Read`; the form is editable for administrators and every control is disabled for any other reader. |
+| `POST` | `/api/settings/dex-scoring/save` | Save the whole policy. Body: the form (every field plus the hidden `if_match` revision), capped at 320 KiB. Needs `GuaranteedState:Read` and the Administrator role. A refusal (field error, stale revision) re-renders the form with the error against its field. Audit: `dex.score_policy.update`. |
+| `POST` | `/api/settings/dex-scoring/preview` | Validate the form and show how many applications would change tier, without storing anything. Same body, cap and gates as save. Audit: `dex.score_policy.validate`. |
+| `POST` | `/api/settings/dex-scoring/reset` | Reset the policy to the shipped defaults. Same cap and gates as save. Audit: `dex.score_policy.reset`. |
+
 ### Home (sign-in landing page)
 
 `GET /home` is the landing and sign-in page: the first page a visitor sees, with no sidebar and no header bar because there may be no session yet. Top to bottom it shows a slim bar (the Yuzu mark; the server's host name and the running version are added only once signed in, because the page is reachable without a session), and a headline with the sign-in panel beside it. Signed out, that is all the page shows. Once signed in, the fifteen screens of the product appear below as tiles in five families (Operate, Posture, Estate, Access, System), each saying what the area does. The page fetches no data. It is reached from the Yuzu logo on every other page; it has no sidebar entry, and `/` stays the Console.
