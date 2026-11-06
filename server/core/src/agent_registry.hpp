@@ -1471,6 +1471,13 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog();
 // -- AgentHealthStore ---------------------------------------------------------
 // Aggregates per-agent heartbeat status_tags into fleet-wide Prometheus metrics.
 
+/// The ONE staleness window for every read of AgentHealthStore's per-agent heartbeat data: the
+/// 15 s sweep's prune (recompute_metrics), perf_snapshot, net_snapshot and the per-device
+/// guardian_backend accessors. An agent whose last heartbeat is older than this is not counted
+/// anywhere, so a gauge and the device field that mirrors it cannot disagree on who is "live"
+/// (#2240). A literal at each site is the drift this constant removes.
+inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
+
 struct AgentHealthSnapshot {
     std::string agent_id;
     std::unordered_map<std::string, std::string> status_tags;
