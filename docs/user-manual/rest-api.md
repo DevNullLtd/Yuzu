@@ -8135,12 +8135,12 @@ Per-management-group settings for the daily installed-software collection: how o
 | `window` | object or `null` | `{"start_min": 60, "end_min": 300}`, minutes past local midnight, `0 <= start_min < end_min <= 1440`; allowed only with a whole-day interval (86400, 172800, ...) |
 | `timezone` | string | Empty for the machine's own zone, else an IANA zone name known to the database (`Europe/London`); at most 64 bytes |
 | `plugins` | object | Every collector as a boolean: `installed_apps`, `middleware`, `msi_packages`, `pkg_inventory`, `runtimes`, `windows_optional_features`. `installed_apps` cannot be `false`. An unknown or missing key is a `400` |
-| `priority` | integer | 0 to 1000; decides only between unrelated branches (below). The root group's document takes no priority |
+| `priority` | integer | 0 to 1000; decides only between branches (below). The root group's document takes no priority. Optional: omitted is 0, except for a group owner, for whom it keeps the stored value |
 | `expected_version` | string | Write only: the `version` last read, or `none` (also the default) to create only |
 
 Any other top-level key is a `400`. `version` is the SHA-256 of the stored document including its priority, so a concurrent priority-only edit is caught by `expected_version`.
 
-**Authority.** Reads and writes need the global `ManagementGroup:Read` / `ManagementGroup:Write` grant, or an `ITServiceOwner` assignment on the group or any ancestor group (a parent's owner reaches its children, never a sibling branch). The fleet list needs the global read. The root group and any change to `priority` need the global write grant. A service-scoped API token, an MCP-tier token and an engine principal are never admitted through the group assignment. An authority read that cannot be completed (the RBAC store, the group hierarchy or the role assignments) is a `503` with `retry_after_ms`, never a `403` and never an admit.
+**Authority.** Reads and writes need the global `ManagementGroup:Read` / `ManagementGroup:Write` grant, or an `ITServiceOwner` assignment on the group or any ancestor group (a parent's owner reaches its children, never a sibling branch). The fleet list needs the global read. The root group and any change to `priority` need the global write grant. For a caller admitted through the group assignment, an omitted `priority` keeps the stored value (0 when the group has no document), and a `priority` that differs from the stored value is a `403` whose message says to omit it; for a caller with the global grant the document is replaced whole and an omitted `priority` is 0. A service-scoped API token, an MCP-tier token and an engine principal are never admitted through the group assignment. An authority read that cannot be completed (the RBAC store, the group hierarchy or the role assignments) is a `503` with `retry_after_ms`, never a `403` and never an admit.
 
 #### `GET /api/v1/inventory/software/collection-settings`
 

@@ -149,6 +149,7 @@ struct ParsedPut {
     cs::CollectionSettings settings;
     std::optional<std::string> expected_version; // nullopt = create only
     std::string expected_text;                    // "none" or the 64-hex, for the audit row
+    bool priority_given{false};                   // the body carried a `priority` key
 };
 
 std::expected<ParsedPut, std::string> parse_put(const std::string& body) {
@@ -203,6 +204,7 @@ std::expected<ParsedPut, std::string> parse_put(const std::string& body) {
         if (!priority)
             return Bad("priority must be an integer");
         out.settings.priority = *priority;
+        out.priority_given = true;
     }
     out.expected_text = "none";
     if (const auto ev = j.find("expected_version"); ev != j.end()) {
@@ -366,9 +368,15 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                 return;
             }
             const int stored_priority = *stored ? (*stored)->settings.priority : 0;
+            // Priority is outside a group owner's writable surface: an omitted one keeps the
+            // stored value, an explicit different one is refused.
+            if (!parsed.priority_given && authority == Authority::AdmitGroup)
+                parsed.settings.priority = stored_priority;
             if (parsed.settings.priority != stored_priority &&
                 authority != Authority::AdmitGlobal) {
-                refuse(403, "changing the priority needs the global ManagementGroup:Write grant",
+                refuse(403,
+                       "changing the priority needs the global ManagementGroup:Write grant; omit "
+                       "priority to keep the stored value",
                        "priority change needs the global grant");
                 return;
             }

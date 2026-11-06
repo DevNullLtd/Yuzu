@@ -582,6 +582,51 @@ TEST_CASE("collection settings PUT: the real gate admits a group owner on the gr
     CHECK(rig.call("PUT", rig.doc_path(rig.group_p), nobody, put_body(9000))->status == 403);
 }
 
+TEST_CASE("collection settings PUT: an omitted priority keeps the stored one for a group owner",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto owner = rig.group_owner("gadmin", rig.group_p);
+    const auto boss = rig.global_admin();
+    const auto path = rig.doc_path(rig.group_c);
+    const auto no_priority = [](const std::string& expected) {
+        auto b = json::parse(put_body(9000, 0, expected));
+        b.erase("priority");
+        return b.dump();
+    };
+    REQUIRE(rig.call("PUT", path, boss, put_body(7200, 5))->status == 200);
+    auto cv = rig.store->get(rig.group_c)->value().version;
+
+    SECTION("omitted: the owner's write lands with the stored priority") {
+        auto res = rig.call("PUT", path, owner, no_priority(cv));
+        REQUIRE(res->status == 200);
+        CHECK(rig.parse(*res)["data"]["priority"] == 5);
+        const auto stored = rig.store->get(rig.group_c)->value();
+        CHECK(stored.settings.priority == 5);
+        CHECK(stored.settings.interval_s == 9000);
+    }
+    SECTION("the same value echoed back is admitted") {
+        CHECK(rig.call("PUT", path, owner, put_body(9000, 5, cv))->status == 200);
+        CHECK(rig.store->get(rig.group_c)->value().settings.priority == 5);
+    }
+    SECTION("an explicit different value is a 403 that says how to keep it") {
+        auto res = rig.call("PUT", path, owner, put_body(9000, 0, cv));
+        CHECK(res->status == 403);
+        CHECK(res->body.find("omit priority to keep the stored value") != std::string::npos);
+        CHECK(rig.audit.back().result == "denied");
+        CHECK(rig.audit.back().detail == "priority change needs the global grant");
+        CHECK(rig.store->get(rig.group_c)->value().settings.interval_s == 7200);
+    }
+    SECTION("omitted on a group with no document: priority 0") {
+        const auto pv = rig.call("PUT", rig.doc_path(rig.group_p), owner, no_priority("none"));
+        REQUIRE(pv->status == 200);
+        CHECK(rig.store->get(rig.group_p)->value().settings.priority == 0);
+    }
+    SECTION("the global grant replaces the whole document: omitted is 0") {
+        REQUIRE(rig.call("PUT", path, boss, no_priority(cv))->status == 200);
+        CHECK(rig.store->get(rig.group_c)->value().settings.priority == 0);
+    }
+}
+
 TEST_CASE("collection settings PUT: tokens the permission gate refuses never get the group fallback",
           "[pg][routes][collection_settings]") {
     RoutesRig rig;
