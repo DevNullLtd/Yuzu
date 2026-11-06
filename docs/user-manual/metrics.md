@@ -2231,8 +2231,10 @@ unmeasured threshold now - this counter names the fault class only.
 ### Guardian backend fleet gauge (#2240)
 
 `yuzu_fleet_guardian_backend{os,backend}` rolls up the agent's `yuzu.guardian_backend` heartbeat tag
-([Guaranteed State](guaranteed-state.md)): which detection backend each agent's Guardian actually
-enforces with. `backend` is one of `legacy`, `spark`, `spark_failed` or `unwired`, taken from a
+([Guaranteed State](guaranteed-state.md)): which detection backend each agent reports its Guardian
+enforcing with. The value is the agent's own report, not independent verification: `legacy` means the
+flip is off, not that enforcement was checked, and an absent series or a `null` is not evidence of
+health. `backend` is one of `legacy`, `spark`, `spark_failed` or `unwired`, taken from a
 closed server-side table, never from the raw heartbeat bytes. It is a **partition count**: each
 agent with a valid tag is in exactly one `{os,backend}` series per sweep, so the series sum to
 `yuzu_fleet_guardian_backend_reporting`. The family is rebuilt every 15 second sweep and is
@@ -2252,22 +2254,36 @@ Read it with these limits in mind:
   agent whose Guardian heartbeat tag group faulted on that beat, and a stopping agent are all
   in no series. The gauge can therefore drop an agent for a sweep or two on a faulted beat. Compare
   `yuzu_fleet_guardian_backend_reporting` with `yuzu_fleet_agents_by_os` for the coverage gap.
-- **Population:** agents with a heartbeat in the last 90 seconds, per core replica (sum across
-  replicas; a failover can briefly count an agent on two). The OS label is the agent's
-  self-reported `yuzu.os`, allowlisted to `windows`, `linux`, `darwin`, `other` or `unknown`.
-  `sum without (os)` is legitimate because the posture means the same on every OS.
+- **Population:** every agent the health store holds a heartbeat for within the last 90 seconds,
+  per core replica. An agent that has just disconnected stays counted until it ages out (up to
+  about 105 seconds: the 90 second window plus one sweep), and a failover or a restart moves that
+  window to another replica, so scrape each replica directly and sum across them; the sum can
+  briefly exceed the fleet. After a restart every device reads `null` and the family is absent
+  until the agents' next beats and the first sweep. The OS label is the agent's self-reported
+  `yuzu.os`, allowlisted to `windows`, `linux`, `darwin`, `other` or `unknown`; it can differ from
+  the `os` on the device row, which comes from the session.
 - **Per-device twin:** the same classification is served per device as the nullable
   `guardian_backend` field on `GET /api/v1/devices[/{id}]` and the `list_agents` and
-  `get_agent_details` MCP tools (`null` when this gauge would not count the agent). The field is
-  read live, the gauge is republished every sweep, so they can differ by up to one sweep.
+  `get_agent_details` MCP tools. `null` means this gauge does not count the agent, but not the
+  converse: the field covers only connected devices and is read live, while the gauge is
+  republished every sweep and also counts a just-disconnected agent.
 - **No alert ships.** A rule such as `yuzu_fleet_guardian_backend{backend=~"spark_failed|unwired"} > 0`
-  becomes meaningful only after the flip and is left to the Spark alert group (#2084).
+  becomes meaningful only after the flip. No shipped alert rule reads this family, and `unwired` is a
+  state no existing alert covers, so an alert for it is a flip precondition.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_fleet_guardian_backend{os,backend}` | gauge | Agents by Guardian detection backend and OS. One series per `(os, backend)` that has at least one agent; absent otherwise. The 5 OS values times 4 backends bound the family at 20 series. |
 | `yuzu_fleet_guardian_backend_reporting` | gauge | Agents whose latest heartbeat carried a valid `yuzu.guardian_backend` tag - the denominator the series above sum to. **Published every sweep including `0`.** |
 | `yuzu_fleet_guardian_backend_tag_rejected` | gauge | Tags **present and non-empty** this sweep but rejected by the closed-set, case-sensitive parse (anything but exactly the four tokens, or over 12 bytes). An empty value is skipped and not counted. **Published every sweep including `0`.** A rejected value lands in no series and reads `null` on the device field, so this is the only fleet signal for it. `> 0` means a forged or malformed tag, or a newer agent shipping a backend this server does not know yet during a rolling upgrade. |
+
+Scrape behaviour to expect. The family and `yuzu_fleet_guardian_backend_reporting` are written at
+different moments in the sweep, so a scrape between them can see an empty family beside the previous
+`_reporting`: "the series sum to `_reporting`" holds per sweep, not per scrape. Ratio and difference
+expressions then return no data for that scrape, which is correct; do not patch them with
+`or vector(0)`. All three families are absent until the first sweep after boot, and the labelled
+family is absent on an empty fleet. `_tag_rejected` cannot name the agent, because the device field
+reads `null` for both a missing and a rejected tag.
 
 ### Guardian M1 health-stream fleet gauges
 

@@ -515,12 +515,17 @@ server-side table. The key is always present. `null` means the device has not re
 older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a
 forged or unrecognised value, no heartbeat in the last 90 seconds, or no heartbeat yet. `null` is
 never `legacy`, and one device cannot show whether it is a forged value or an old agent;
-`yuzu_fleet_guardian_backend_tag_rejected` is the fleet signal for rejected values. Every device reads
-`legacy` until `prefer_spark` is enabled. The field is read live while the
-`yuzu_fleet_guardian_backend{os,backend}` gauge is republished every 15 seconds, so the two can differ
-by up to one sweep. It is machine metadata in the same class as `os` and `agent_version`, so the
+`yuzu_fleet_guardian_backend_tag_rejected` is the fleet signal for rejected values. Until `prefer_spark` is
+enabled every device that reports reads `legacy`. The value is the device's own report, not independent verification, and `null` on a connected device is routine (for example before its first heartbeat), not evidence that it is unprotected. The set is closed: a new value is a
+documented contract change, so treat the key as optional across replicas during a rolling upgrade
+(an older replica omits it). The field covers only connected devices and is read live, while the
+`yuzu_fleet_guardian_backend{os,backend}` gauge is republished every 15 seconds and also counts an
+agent that disconnected within the last 90 seconds, so after a disconnect the two can differ for up
+to about 105 seconds. It is machine metadata in the same class as `os` and `agent_version`, so the
 unaudited posture above is unchanged. It is served only here and on the MCP twins, never on the
-unauthenticated legacy `GET /api/agents`.
+unauthenticated legacy `GET /api/agents`. A degraded tag store on `GET /api/v1/devices/{id}` returns
+`503` with `retry_after_ms: 5000` and a `remediation` in the error body; no `Retry-After` header is
+set.
 
 `devices_omitted` counts agents dropped by the caller's management-group/service-scope
 confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not

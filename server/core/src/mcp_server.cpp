@@ -711,8 +711,11 @@ static const ToolDef kTools[] = {
      "agent_id feeds the per-agent tools. guardian_backend is the detection backend the device "
      "reports on its latest heartbeat: legacy, spark, spark_failed or unwired, or null when it "
      "has not reported one (an older agent, no Guardian, a faulted heartbeat tag group, a "
-     "forged value, or no heartbeat in the last 90 seconds); null is never legacy, and every "
-     "device reads legacy until prefer_spark is enabled. Confined: when the read is scoped to the devices the "
+     "forged value, or no heartbeat in the last 90 seconds); null is never legacy, and until "
+     "prefer_spark is enabled every device that reports reads legacy. The value is the "
+     "device's own report, not independent verification, and null on a connected device is "
+     "routine (for example before its first heartbeat), not evidence that it is unprotected. "
+     "Confined: when the read is scoped to the devices the "
      "caller may read, the result carries scope_basis authority_scoped, and the text content is "
      "the object {agents, scope_basis} instead of the bare array of an unscoped read. It is a "
      "status, set whether or not anything was hidden; the number of hidden devices is never "
@@ -722,7 +725,7 @@ static const ToolDef kTools[] = {
      "permission denial is terminal; an authorization-store failure is a retryable 503 with "
      "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Reads legacy fleet-wide until prefer_spark is enabled."}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Until prefer_spark is enabled every device that reports reads legacy. The value is the device's own report, not independent verification, and null is routine (for example before the first heartbeat) and is not evidence that the device is unprotected. The set is closed: a new value is a documented contract change, so treat the key as optional across replicas during a rolling upgrade."}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
@@ -785,15 +788,20 @@ static const ToolDef kTools[] = {
      "the detection backend the device reports on its latest heartbeat: legacy, spark, "
      "spark_failed or unwired, or null when it has not reported one (an older agent, no "
      "Guardian, a faulted heartbeat tag group, a forged value, or no heartbeat in the last 90 "
-     "seconds); null is never legacy, and every device reads legacy until prefer_spark is "
-     "enabled. The tags array is always present, empty when the device has none. An \"Agent "
+     "seconds); null is never legacy, and until prefer_spark is enabled every device that "
+     "reports reads legacy. The value is the device's own report, not independent "
+     "verification, and null on a connected device is routine (for example before its first "
+     "heartbeat), not evidence that it is unprotected. The tags array is always present, empty "
+     "when the device has none. An \"Agent "
      "not found\" error means the agent is not connected, does not exist, or exists outside "
      "your management-group scope, deliberately indistinguishable to prevent scope-probing, "
      "so an unreadable id is not proof the device is absent from the fleet. Not found and "
      "permission denial are terminal; a tag-store failure (\"Tag store unavailable\") is "
-     "retryable with retry_after_ms 5000, never a device with empty tags.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Reads legacy fleet-wide until prefer_spark is enabled."},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend","tags"]})j"},
+     "retryable with retry_after_ms 5000, never a device with empty tags; an authorization-store "
+     "failure is also a retryable 503 with retry_after_ms; an unwired server or device registry "
+     "is a non-retryable internal error.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent ID"}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Until prefer_spark is enabled every device that reports reads legacy. The value is the device's own report, not independent verification, and null is routine (for example before the first heartbeat) and is not evidence that the device is unprotected. The set is closed: a new value is a documented contract change, so treat the key as optional across replicas during a rolling upgrade."},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend","tags"]})j"},
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries (newest first, rows with "

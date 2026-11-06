@@ -2,7 +2,7 @@
 
 /// @file guardian_backend_fleet_tags.hpp
 /// Reader side of the agent's `yuzu.guardian_backend` heartbeat tag (#2240): which detection
-/// backend the agent's Guardian actually enforces with (`legacy`, `spark`, `spark_failed`,
+/// backend the agent reports its Guardian enforcing with (`legacy`, `spark`, `spark_failed`,
 /// `unwired`). The writer is agents/core/src/guardian_backend.hpp
 /// (`emit_guardian_backend_heartbeat_tag`, called from agent.cpp's per-beat Guardian tag group).
 /// AgentHealthStore::recompute_metrics consumes this header for the `yuzu_fleet_guardian_backend`
@@ -36,7 +36,10 @@
 /// and kAgentHealthStaleness are the right clock (owner Ruling 26, 2026-11-06: the status-beat
 /// split, H4a / ADR-0073, lands after the Spark flip and this reader stays pre-freeze). When a
 /// status-beat split lands, this family and the device accessors must move to the status-beat
-/// timestamp together, or both flap at the status cadence.
+/// timestamp together, or both flap at the status cadence. AgentHealthStore::upsert also REPLACES
+/// status_tags on every beat, so a beat that omits this tag erases it: that replace-semantics must
+/// change in the same slice, or the field reads null (and the gauge drops the agent) on every
+/// lean beat even with the clock moved.
 ///
 /// POPULATION AND SCOPE: the agents with a heartbeat in the last kAgentHealthStaleness; the
 /// health store is per core replica, so each replica exports only the agents attached to it.
@@ -48,6 +51,7 @@
 ///
 /// HELP text is 7-bit ASCII (scripts/ci/check-metrics-help-ascii.sh, help_tables).
 
+#include <cassert>
 #include <cstddef>
 #include <iterator> // std::size
 #include <optional>
@@ -117,13 +121,14 @@ inline constexpr const char* kGuardianBackendHelp =
     "spark_failed is what an agent with prefer_spark on and a failed SparkEngine boot reports; "
     "it is NOT yuzu_fleet_spark_failed{os}, which counts spark_running=0 without spark_disabled "
     "and can fire before the flip. The os label is the agent's self-reported yuzu.os, "
-    "allowlisted to windows, linux, darwin, other or unknown; sum without (os) is legitimate "
-    "because the posture is the same on every OS. Population: agents with a heartbeat in the "
-    "last 90 seconds, per core replica. "
+    "allowlisted to windows, linux, darwin, other or unknown. Population: agents with a heartbeat "
+    "in the last 90 seconds, per core replica, so an agent that has just disconnected is counted "
+    "until it ages out. "
     "The per-device reading is the guardian_backend field on GET /api/v1/devices and the "
     "list_agents and get_agent_details MCP tools, null when this gauge would not count the "
-    "agent; the field is read live, so it can differ from this gauge by up to one 15 second "
-    "sweep";
+    "agent; the field covers only connected devices and is read live, so it can differ from this "
+    "gauge for up to about 105 seconds after a disconnect (90 second window plus one 15 second "
+    "sweep)";
 
 inline constexpr const char* kGuardianBackendReportingHelp =
     "Agents whose latest heartbeat carried a valid yuzu.guardian_backend tag this sweep - the "
@@ -166,6 +171,7 @@ parse_guardian_backend_token(std::string_view s) noexcept {
 /// (static storage), safe to hold after the health store's mutex is released. `i` must be a
 /// value parse_guardian_backend_token returned.
 [[nodiscard]] inline std::string_view guardian_backend_token_view(std::size_t i) noexcept {
+    assert(i < kNGuardianBackendTokens && "index must come from parse_guardian_backend_token");
     return std::string_view{kGuardianBackendTokens[i]};
 }
 

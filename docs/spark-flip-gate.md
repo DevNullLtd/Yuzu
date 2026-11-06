@@ -2471,11 +2471,12 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   this doc) rests on a code-reading assertion, not an auditor-checkable per-deployment
   signal. The wire-level tag already exists (`kGuardianBackendTag`/`yuzu.guardian_backend`,
   correctly distinguishing legacy vs. spark enforcement per agent) and is ingested
-  server-side into the per-agent `status_tags` map. **Resolved by #2240:** the server now reads
+  server-side into the per-agent `status_tags` map. **Signal now visible (#2240), unattested:** the server now reads
   it (`AgentHealthStore::recompute_metrics` rolls it up as `yuzu_fleet_guardian_backend{os,backend}`)
   and serves it per device as the nullable `guardian_backend` field on `GET /api/v1/devices[/{id}]`,
-  `list_agents` and `get_agent_details`. No alert rule ships; reading `legacy` fleet-wide is the
-  correct reading until `prefer_spark` is enabled. Not specific to #2818 (it was a general
+  `list_agents` and `get_agent_details` (the dashboard intentionally does not show it). The value is the
+  agent's own report, not independent verification. No alert rule ships; every reporting agent reading
+  `legacy` is the correct reading until `prefer_spark` is enabled. Not specific to #2818 (it was a general
   PR-5-readiness gap), so not filed as its own #2818-scoped issue; recorded here since several of
   this PR's own non-blocking dispositions depend on it.
 - **Baseline-persist signal emitted but unread (#4045, F14 precondition).** Same shape as the
@@ -2644,7 +2645,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two remaining pre-PR-5 GATING items
   from the PR-2d follow-ups (the three sre observability gaps; the
-  yuzu.guardian_backend server-side-reader gap, now resolved by #2240), plus two items from #4045 (the fleet-visible
+  yuzu.guardian_backend server-side-reader gap, now visible via #2240), plus two items from #4045 (the fleet-visible
   baseline-persist signal (F14 precondition, section 3a) and the missing
   remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
   recognition (C-1), is resolved by #5667 with residuals (a)-(d) carried in the C-1 bullet
@@ -3252,7 +3253,7 @@ mode; `/etc/yuzu-agent/` has no such collision.
    (`agent.cpp:1254`) records `SparkAvailability::SparkDisabled`, and the `SparkDisabled` case
    of the backend-derivation log switch (`:1269–1272`) reports `detection backend = legacy`
    regardless of `prefer_spark`'s compiled-in value - SparkDisabled always means legacy,
-   unconditionally. Verify via the `yuzu.guardian_backend` heartbeat tag on the next beat (or the device's `guardian_backend` field, or `yuzu_fleet_guardian_backend{backend="legacy"}` after the next sweep).
+   unconditionally. Verify via the `yuzu.guardian_backend` heartbeat tag on the next beat (or the device's `guardian_backend` field, or `yuzu_fleet_guardian_backend{backend="legacy"}` after the next sweep). All three are the agent's own report: they corroborate but do not prove that enforcement resumed, and in a one-agent drill the fleet gauge cannot name the drilled agent, so the device field is the discriminating check.
 4. Confirm no spark state leaks: both sub-checks follow directly from step 2's
    `spark_engine_` staying null - with no `SparkEngine` instance, there is nothing to hold an
    armed subscription and nothing to drain an outbox from, by construction, not by a separate

@@ -1475,8 +1475,9 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog();
 /// The ONE staleness window for every read of AgentHealthStore's per-agent heartbeat data: the
 /// 15 s sweep's prune (recompute_metrics), perf_snapshot, net_snapshot and the per-device
 /// guardian_backend accessors. An agent whose last heartbeat is older than this is not counted
-/// anywhere, so a gauge and the device field that mirrors it cannot disagree on who is "live"
-/// (#2240). A literal at each site is the drift this constant removes.
+/// anywhere, so a gauge and the device field that mirrors it apply the same freshness test
+/// (#2240; the POPULATIONS still differ, see guardian_backend_for). A literal at each site is the
+/// drift this constant removes.
 inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
 
 struct AgentHealthSnapshot {
@@ -1532,9 +1533,13 @@ public:
     /// #2240: the per-device twin of the yuzu_fleet_guardian_backend gauge. Same table, same
     /// strict parse (guardian_backend_fleet_tags.hpp) and same staleness contract as
     /// recompute_metrics, so the gauge and the device field cannot disagree on classification or
-    /// on who is live; pass kAgentHealthStaleness. The one remaining difference is SAMPLING: the
-    /// gauge is republished every 15 s sweep, these read the live store, so they can differ by up
-    /// to one sweep. CLOCK: last_seen (the tag rides every beat today; a status-beat split must
+    /// on the freshness test; pass kAgentHealthStaleness. Two differences remain. POPULATION: the
+    /// gauge counts every health-store snapshot within the window, including an agent that has just
+    /// disconnected (remove() has no production caller, so the sweep prune is the only eviction),
+    /// while the device surfaces list only registry-connected rows. SAMPLING: the gauge is
+    /// republished every 15 s sweep, these read the live store. So after a disconnect the gauge can
+    /// still count the agent for up to about 105 s (window plus one sweep); a null field implies the
+    /// gauge does not count the agent, but not the converse. CLOCK: last_seen (the tag rides every beat today; a status-beat split must
     /// move this and the gauge together - see the header).
     ///
     /// `guardian_backend_for` returns one entry per input id, ALIGNED by index: the token

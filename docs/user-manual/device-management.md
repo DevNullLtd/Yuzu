@@ -238,7 +238,7 @@ Every enrolled agent reports identity attributes during registration and heartbe
 | `agent_version` | Running agent binary version | `0.9.3` |
 | `guardian_backend` | Guardian detection backend from the heartbeat: `legacy`, `spark`, `spark_failed`, `unwired`, or `null` when not reported (never assumed `legacy`). Served on the device REST and MCP surfaces (`GET /api/v1/devices[/{id}]`, `list_agents`, `get_agent_details`), not on the legacy `/api/agents` list | `legacy` |
 
-These fields are used by the [Scope Engine](scope-engine.md) for device targeting and by [Management Groups](management-groups.md) for access scoping.
+These fields, except `guardian_backend`, are used by the [Scope Engine](scope-engine.md) for device targeting and by [Management Groups](management-groups.md) for access scoping; `guardian_backend` is read-only posture and is not usable in a scope expression.
 
 ---
 

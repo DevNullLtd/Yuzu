@@ -13,7 +13,8 @@ namespace yuzu::server {
 /// is an O(1) `get_session` point lookup (#3564 — see device_api.hpp's
 /// banner), never a linear scan.
 ///
-/// HARD RULE (#2240): `guardian_backend` exists ONLY on this seam, behind `require_fleet_read`.
+/// HARD RULE (#2240): `guardian_backend` is EMITTED only by the REST and MCP device serialisers,
+/// which sit behind `require_fleet_read` (the dashboard and crypto callers of this seam discard it).
 /// It must never be added to `AgentRegistry::to_json_obj()`, to `make_device_row`/`devices_fn`
 /// in server.cpp, or to the unauthenticated legacy `GET /api/agents`.
 class LocalDeviceApi final : public DeviceApi {
