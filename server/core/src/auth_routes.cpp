@@ -204,6 +204,20 @@ std::string approval_gated_remediation(std::string_view securable_type, std::str
            "ticket-then-recall flow (POST /mcp/v1/) or the dashboard";
 }
 
+// The ONE place a CredentialReadMode is interpreted: true == read the durable row, false == a
+// cache may answer. There is deliberately NO `default:`, so a new enumerator is a -Wswitch
+// diagnostic here instead of a silent fall-through to the weaker (cached) read. A value outside
+// the enumerators (reachable only through a cast) takes the durable read, the stronger one.
+bool reads_durable_row(auth::CredentialReadMode mode) noexcept {
+    switch (mode) {
+    case auth::CredentialReadMode::kCached:
+        return false;
+    case auth::CredentialReadMode::kAuthoritative:
+        return true;
+    }
+    return true;
+}
+
 } // namespace
 
 namespace detail {
@@ -562,15 +576,23 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token,
     if (!engine_principal_store_) {
         return R::kRevoked;
     }
-    // The ONE cached-lookup site (#2367). This function is only ever reached
-    // from revalidate_stream — the per-tick liveness re-check of an ALREADY
-    // authenticated stream — never from session synthesis or an on-behalf-of
-    // target check, both of which call get_for_auth and read through to
-    // Postgres every time (which is why this method is private).
-    if (mode == auth::CredentialReadMode::kAuthoritative) {
-        // A boundary check (the workflow run's per-step re-check), not a timer tick: ask
-        // Postgres, never the 15 s liveness cache. Same three-way mapping as below; nothing is
-        // reported stale because nothing was cached.
+    // The ONE cached-lookup site (#2367). This function is only ever reached from
+    // revalidate_stream, which two kinds of caller ask: the held-open MCP stream's per-tick
+    // liveness re-check (kCached, below) and the workflow run's per-step boundary check
+    // (kAuthoritative, next). Session synthesis and the on-behalf-of target check never come
+    // here: they call get_for_auth and read through to Postgres every time (which is why this
+    // method is private).
+    if (reads_durable_row(mode)) {
+        // A boundary check, not a timer tick: ask Postgres, never the 15 s liveness cache. Same
+        // three-way mapping as below; nothing is reported stale because nothing was cached.
+        // This also bypasses get_for_auth_revalidate's 5-10 s failure backoff (#2367), so under a
+        // pool brownout every check pays for its own lease attempts. The bound: a check makes at
+        // most three reads (two token candidates and this row), each waiting up to the pool's
+        // 1.5 s read timeout (0.5 s when the pool is already saturated at entry), and the run
+        // asks twice when the first answer is indeterminate, one second apart: about 10 s at the
+        // nominal timeout, plus a connect the pool had already started, which runs to its
+        // connect timeout (10 s by default). It still fails closed (kIndeterminate), and the run
+        // deadline is re-tested only after the retry wait.
         switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
         case EngineLookupStatus::Active:
             return R::kValid;
@@ -657,9 +679,8 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
         if (raw.empty() || raw.size() > auth::kMaxApiTokenLength || !api_token_store_)
             continue;
         const auto checked = api_token_store_->validate_token_checked(
-            raw, mode == auth::CredentialReadMode::kAuthoritative
-                     ? ApiTokenStore::TokenReadMode::kAuthoritative
-                     : ApiTokenStore::TokenReadMode::kCached);
+            raw, reads_durable_row(mode) ? ApiTokenStore::TokenReadMode::kAuthoritative
+                                         : ApiTokenStore::TokenReadMode::kCached);
         switch (checked.status) {
         case ApiTokenStore::TokenCheck::kValid:
             if (checked.token && checked.token->principal_id == expected_principal) {

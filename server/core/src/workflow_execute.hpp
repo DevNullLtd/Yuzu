@@ -123,7 +123,10 @@
 /// before the read is seen at the next step boundary. Cost: one indexed read per check (two for an
 /// engine token), against the server's one read-write Postgres, from the pool with a 1.5 s lease
 /// wait; a run is capped at 2 per principal and 60 s. An unanswerable read is `kIndeterminate`
-/// (one retry, then stop), never `kRevoked` and never `kValid`. What remains: the step already
+/// (one retry, then stop), never `kRevoked` and never `kValid`. Under a pool brownout one
+/// boundary can wait about 10 s (up to three reads per attempt at 1.5 s, two attempts, 1 s
+/// between, and a connect the pool had already started runs to its own 10 s timeout); the
+/// engine liveness cache's failure backoff is not applied on this path. What remains: the step already
 /// sent when the revoke lands is not recalled, a cookie session is adjudicated by the durable
 /// session generation (polled at most once per second per replica, so a sign-out on another
 /// replica is seen within about a second), and the token's expiry is still judged on this

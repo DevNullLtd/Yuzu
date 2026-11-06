@@ -67,7 +67,10 @@ call site would pass every existing test. This gate closes that:
      cache by design). Every seam is OPTIONAL by construction (an empty one is "no check"), and the
      mode is a plain argument, so dropping a seam, or flipping a workflow body back to `kCached`,
      compiles, passes every unit test, and leaves a token revoked on another replica able to finish a
-     workflow run it started; only production wiring can be pinned, here.
+     workflow run it started; only production wiring can be pinned, here. The counts alone cannot see
+     a SWAP, so each mode is also bound to its seam: the `wf_deps.revalidate` body and the
+     `set_workflow_revalidate_fn` lambda body must each be `kAuthoritative`, and the lambda that follows
+     `stream_budget_.get(),` in the `build_handler` call (the stream pump) must be `kCached`, once each.
 
   8. (#2146 sec-3/I1/I6, workflow run cap, shutdown drain and audit) The seams of the workflow-execute
      twins are OPTIONAL by construction (a null `StreamBudget` is "unmetered", an empty `draining`
@@ -140,6 +143,17 @@ _REVAL_HEAD = r"^[ \t]*return auth_routes_->revalidate_stream\(req, principal,\s
 REVALIDATE_BODY_AUTH = _REVAL_HEAD + r"kAuthoritative\);"
 REVALIDATE_BODY_CACHED = _REVAL_HEAD + r"kCached\);"
 REVALIDATE_MCP_SETTER = r"^[ \t]*mcp_server_->set_workflow_revalidate_fn\("
+# The BINDING (g8e-sec-1): which seam asks which question. The counts above cannot see a swap (REST
+# or the MCP workflow seam on kCached, the stream pump on kAuthoritative leaves every count intact),
+# so each mode is also anchored to the head of the seam that owns it. The pump is anchored on the
+# `stream_budget_.get(),` argument that precedes it in the `build_handler` call, so the setter's own
+# lambda (same signature) can never be mistaken for it.
+_REVAL_BODY = r"return auth_routes_->revalidate_stream\(req, principal,\s*yuzu::server::auth::CredentialReadMode::"
+_MCP_LAMBDA = r"\[this\]\(const httplib::Request& req,\s*const std::string& principal\)\s*->\s*mcp::StreamRevalidate\s*\{\s*"
+REVALIDATE_REST_BOUND = r"^[ \t]*wf_deps\.revalidate = \[this\]\([^)]*\)\s*\{\s*" + _REVAL_BODY + r"kAuthoritative\);"
+REVALIDATE_MCP_BOUND = (r"^[ \t]*mcp_server_->set_workflow_revalidate_fn\(\s*" + _MCP_LAMBDA + _REVAL_BODY +
+                        r"kAuthoritative\);")
+REVALIDATE_PUMP_BOUND = r"^[ \t]*stream_budget_\.get\(\),\s*" + _MCP_LAMBDA + _REVAL_BODY + r"kCached\);"
 # Clause 8: multi-line, matched over the whole source with re.M; `^[ \t]*` keeps a `//` copy out.
 _STOP_OR_DRAIN = (r"\{\s*return draining_\.load\(std::memory_order_acquire\) \|\|\s*"
                   r"stop_requested_\.load\(std::memory_order_acquire\);\s*\}")
@@ -234,6 +248,8 @@ def problems(src):
     revalidate_auth = count_rx(REVALIDATE_BODY_AUTH, src)
     revalidate_cached = count_rx(REVALIDATE_BODY_CACHED, src)
     revalidate_setter = count_rx(REVALIDATE_MCP_SETTER, src)
+    revalidate_bound = (count_rx(REVALIDATE_REST_BOUND, src), count_rx(REVALIDATE_MCP_BOUND, src),
+                        count_rx(REVALIDATE_PUMP_BOUND, src))
     wf_counts = {name: count_rx(pat, src) for name, pat in WORKFLOW_PINS}
     out = []
     if designated != 1:
@@ -275,14 +291,18 @@ def problems(src):
         out.append("'rest_api_v1_->set_audit_as_session_fn(' must be called BEFORE 'rest_api_v1_->register_routes(': "
                    "the writer is captured by value at registration, so a later call leaves it empty and POST and "
                    "DELETE /api/v1/quarantine answer 500.")
-    if (revalidate_assign, revalidate_auth, revalidate_cached, revalidate_setter) != (1, 2, 1, 1):
+    if ((revalidate_assign, revalidate_auth, revalidate_cached, revalidate_setter) != (1, 2, 1, 1)
+            or revalidate_bound != (1, 1, 1)):
         out.append("expected 'wf_deps.revalidate = ' assigned exactly once, "
                    "'mcp_server_->set_workflow_revalidate_fn(' called exactly once, "
                    "'return auth_routes_->revalidate_stream(req, principal, ...CredentialReadMode::kAuthoritative);' "
                    "exactly twice (the REST workflow assignment's body and the MCP workflow seam's) and the same "
                    "with ::kCached exactly once (the MCP stream pump's StreamRevalidateFn) as active lines in "
                    f"server.cpp; found assignment={revalidate_assign}, setter={revalidate_setter}, "
-                   f"authoritative={revalidate_auth}, cached={revalidate_cached}. Every seam is optional and an "
+                   f"authoritative={revalidate_auth}, cached={revalidate_cached}; bound to its own seam "
+                   f"(REST workflow kAuthoritative, MCP workflow setter kAuthoritative, stream pump kCached): "
+                   f"{revalidate_bound[0]}/{revalidate_bound[1]}/{revalidate_bound[2]}, each expected 1. "
+                   "Every seam is optional and an "
                    "empty one is 'no check', and the mode is a plain argument, so a dropped seam or a workflow "
                    "body flipped to kCached compiles and passes every unit rig while a token revoked on another "
                    "replica finishes the workflow run it started.")
@@ -307,6 +327,17 @@ REVALIDATE_BODY_LINE = ("            return auth_routes_->revalidate_stream(req,
 # body-only mutations anchor on the one that follows the assignment head.
 REVALIDATE_REST_BLOCK = REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE
 REVALIDATE_MCP_SETTER_LINE = "            mcp_server_->set_workflow_revalidate_fn(\n"
+# The MCP workflow seam's lambda body, and the stream pump's (anchored on the preceding argument),
+# for the swap mutations. Each appears exactly once.
+MCP_SETTER_BODY = ("                    return auth_routes_->revalidate_stream(req, principal,\n"
+                   "                                                           yuzu::server::auth::CredentialReadMode::kAuthoritative);\n"
+                   "                });\n"
+                   "            mcp_server_->set_draining_fn(")
+PUMP_BODY = ("                stream_budget_.get(),\n"
+             "                [this](const httplib::Request& req,\n"
+             "                       const std::string& principal) -> mcp::StreamRevalidate {\n"
+             "                    return auth_routes_->revalidate_stream(req, principal,\n"
+             "                                                           yuzu::server::auth::CredentialReadMode::kCached);\n")
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 STREAM_BUDGET_LINE = "        wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface\n"
 WF_DRAINING_HEAD = "        wf_deps.draining = [this] {\n"
@@ -363,7 +394,7 @@ class TierPolicyWiringLexical(unittest.TestCase):
     def test_mutations_are_caught(self):
         src = self.src
         for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE,
-                  REVALIDATE_ASSIGN_LINE, REVALIDATE_REST_BLOCK, REVALIDATE_MCP_SETTER_LINE, STREAM_BUDGET_LINE, WF_DRAINING_HEAD, MCP_DRAINING_HEAD,
+                  REVALIDATE_ASSIGN_LINE, REVALIDATE_REST_BLOCK, REVALIDATE_MCP_SETTER_LINE, MCP_SETTER_BODY, PUMP_BODY, STREAM_BUDGET_LINE, WF_DRAINING_HEAD, MCP_DRAINING_HEAD,
                   RUN_ADAPTER_TAIL, AUDIT_FN_LINE, PERSIST_AUDIT_FN_LINE, WF_EMIT_LINE, MCP_EMIT_LINE,
                   SHOULD_STOP_HEAD, SHOULD_STOP_STOP,
                   SHOULD_STOP_DRAIN):
@@ -430,6 +461,21 @@ class TierPolicyWiringLexical(unittest.TestCase):
              src.replace(REVALIDATE_REST_BLOCK,
                          REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE.replace("kAuthoritative", "kCached"), 1),
              ["wf_deps.revalidate"]),
+            ("T19e SWAP: the REST workflow body on kCached and the stream pump on kAuthoritative (counts intact)",
+             src.replace(REVALIDATE_REST_BLOCK,
+                         REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE.replace("kAuthoritative", "kCached"), 1)
+                .replace(PUMP_BODY, PUMP_BODY.replace("kCached", "kAuthoritative"), 1),
+             ["bound to its own seam"]),
+            ("T19f SWAP: the MCP workflow seam on kCached and the stream pump on kAuthoritative (counts intact)",
+             src.replace(MCP_SETTER_BODY, MCP_SETTER_BODY.replace("kAuthoritative", "kCached"), 1)
+                .replace(PUMP_BODY, PUMP_BODY.replace("kCached", "kAuthoritative"), 1),
+             ["bound to its own seam"]),
+            ("T19g the MCP workflow seam alone flipped to the cached read",
+             src.replace(MCP_SETTER_BODY, MCP_SETTER_BODY.replace("kAuthoritative", "kCached"), 1),
+             ["bound to its own seam"]),
+            ("T19h the stream pump alone flipped to the authoritative read",
+             src.replace(PUMP_BODY, PUMP_BODY.replace("kCached", "kAuthoritative"), 1),
+             ["bound to its own seam"]),
             ("T19c the MCP workflow revalidate seam dropped (compiles: an unset seam is no check)",
              src.replace(REVALIDATE_MCP_SETTER_LINE, "            mcp_server_->unrelated(\n", 1),
              ["wf_deps.revalidate"]),

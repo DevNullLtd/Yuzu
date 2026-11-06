@@ -340,6 +340,11 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
 
     using R = auth::CredentialCheck;
 
+    // Taken BEFORE the first read, so every entry the outer body warms below expires strictly
+    // after it. A SECTION that freezes the store's clock here sees the entry live however long the
+    // process was stalled since (a loaded or sanitizer box), instead of racing the real ~12 s TTL.
+    const auto before_warm = std::chrono::steady_clock::now();
+
     // First tick: cold cache, so the engine gate reads through to Postgres.
     // An authoritative confirmation is plain kValid — NOT kValidStale. This is
     // what lets a stream pump reset its grace budget.
@@ -370,6 +375,9 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
         // A principal revoked behind the cache (a second replica's write: the cache is not told)
         // is still "valid" to the cached read and revoked to the authoritative one.
         REQUIRE(api_tokens->validate_token(*raw).has_value());
+        // Freeze the liveness clock at the pre-warm instant: the cached read below is then
+        // "inside the TTL" by construction, not by being quick. (By value, restored on exit.)
+        engine_store->set_clock_for_test([before_warm] { return before_warm; });
         {
             auto lease = ep_integ_shared().pool->acquire();
             REQUIRE(lease);
@@ -384,6 +392,7 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
               R::kValidStale);
         CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kAuthoritative) ==
               R::kRevoked);
+        engine_store->set_clock_for_test({});
     }
 
     SECTION("an expired entry reverts to an authoritative kValid") {

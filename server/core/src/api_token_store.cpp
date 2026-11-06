@@ -924,7 +924,18 @@ ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::str
     // "we asked and did not get an answer", and zero rows is the same definitive no.)
     const auto hash = sha256_hex(raw_token);
     const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
-    const bool authoritative = mode == TokenReadMode::kAuthoritative;
+    // The one place the mode is interpreted. No `default:` on purpose: a new enumerator is a
+    // -Wswitch diagnostic here, not a silent fall-through to the cache. A value outside the
+    // enumerators (only reachable through a cast) takes the durable read, the stronger one.
+    const bool authoritative = [mode] {
+        switch (mode) {
+        case TokenReadMode::kCached:
+            return false;
+        case TokenReadMode::kAuthoritative:
+            return true;
+        }
+        return true;
+    }();
 
     if (!authoritative) {
         {
