@@ -10137,8 +10137,9 @@ not the effective state, in the same shape as the `GET` above.
 
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
-may not have been applied: read the switch back with the same `plugin`, `action` and `os`, checking that the `source` it
-reports names the row you wrote, or repeat the `PUT`, which is safe to repeat), `503` (store
+may not have been applied: read the switch back with the same `plugin`, `action` and `os`, and comparing `enabled`, `reason` and `updated_at_ms`
+with what you sent (the `GET` reports the effective state, and `source` names the row that produced the answer,
+which is not yours when another layer disables the switch), or repeat the `PUT`, which is safe to repeat), `503` (store
 unavailable, or the audit row could not be saved).
 
 ---
@@ -10204,7 +10205,7 @@ revocable (already redeemed or already revoked), and `503` if the store is unava
 `attempted` audit row cannot be saved (nothing is revoked, so retry). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
-upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
+upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads) (read its known-defect note first).
 The `content_dist` agent plugin's `upload_file` action is the reference
 client — see its [InstructionDefinition](../../content/definitions/t2_capabilities.yaml)
 for the operator-facing parameters (`path`, `grant_id`, `grant_secret`).
@@ -10224,8 +10225,9 @@ ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the ref
 **Known defect (#5626).** The server's pre-routing session check does not yet exempt these five routes,
 so a request that carries only the grant or session header is answered `401` with the generic
 `{"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}}` body before the handler
-runs. That body has no `reason`, unlike the handler's own `401` values below. Until #5626 is fixed, an
-agent with no operator session cannot open an upload, so the protocol described here cannot start.
+runs. That body has no `reason`, unlike the handler's own `401` values below. Until #5626 is fixed, a
+client that presents only the grant or session header, as the shipped `upload_file` client does, cannot
+open an upload, so the protocol described here cannot start.
 
 **Common to all five routes:**
 
