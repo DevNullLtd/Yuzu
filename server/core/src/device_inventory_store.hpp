@@ -105,10 +105,31 @@ public:
     /// every section is from the same replace generation. An empty vector means nothing is
     /// stored (a v1 agent, or no record) — NOT "the device has none"; a store/pool/query
     /// failure is `std::unexpected(CiReadError::kDegraded)`, never an empty success.
-    /// Personal data (DIMM serials): no route serves this yet — the later REST change must
-    /// put it behind the same fail-closed audit as `inventory.device.ci` (ADR-0016).
+    /// No production caller: any production use MUST sit behind the fail-closed
+    /// `inventory.device.ci` audit and the Inventory:Read scope gate; reads DIMM serials. The
+    /// record routes use `get_device_ci_with_sections` below (one snapshot with the record).
+    /// The levels returned here are RAW: they are neither row-count nor content-digest verified.
+    /// Anything that serves them must pass each section through `verify_section_content`
+    /// (hardware_list_model.hpp; it applies `verify_section_row_count` first) or it re-opens the
+    /// lost-rows and same-count-drift read-as-complete defects.
     [[nodiscard]] std::expected<std::vector<DeviceCiSection>, CiReadError>
     get_device_ci_sections(std::string_view agent_id);
+
+    /// One agent's CI record AND its v2 sections from ONE REPEATABLE READ READ ONLY transaction
+    /// (one lease), so the scalars and the section rows can never come from two different
+    /// replace generations (two separate reads could pair gen N scalars with gen N+1 rows).
+    /// Served by GET /api/v1/hardware/{id} and MCP get_hardware_ci behind the audited
+    /// `inventory.device.ci` read (H.7); it reads DIMM serials, so any new caller needs the same
+    /// fail-closed audit and Inventory:Read scope gate.
+    /// The sections are read only when a record was found and `blob_version >= 2`; they land
+    /// in `record->sections`. Failure semantics:
+    ///   * the record read fails (closed store, pool timeout, query error) ->
+    ///     `std::unexpected(CiReadError::kDegraded)`;
+    ///   * the record read succeeded but a SECTION statement failed -> the record with
+    ///     `sections_failed = true` (never an empty-sections success);
+    ///   * no record -> `record == nullopt`, not an error.
+    [[nodiscard]] std::expected<DeviceCiWithSections, CiReadError>
+    get_device_ci_with_sections(std::string_view agent_id);
 
     /// Drop an agent's CI record (e.g. on agent removal). Returns true iff the
     /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or

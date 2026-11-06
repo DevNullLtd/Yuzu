@@ -24,6 +24,8 @@
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
 
+#include <limits>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -710,4 +712,89 @@ TEST_CASE("guardian ingest: #4666 PR-4 T_server's construction-failure path retu
     auto healthy_logger =
         create_t_server_logger(std::vector<spdlog::sink_ptr>{sink}, spdlog::level::info);
     CHECK(healthy_logger != nullptr);
+}
+
+TEST_CASE("guardian ingest: agent_stamp_ns validates the wire stamp once (#5690 ordering input)",
+          "[guardian][ingest][ordering]") {
+    using yuzu::server::detail::agent_stamp_ns;
+    // A normal stamp is seconds * 1e9 + nanos.
+    CHECK(agent_stamp_ns(true, 1718000000, 5).value() == 1718000000'000'000'005LL);
+    CHECK(agent_stamp_ns(true, 0, 0).value() == 0); // present epoch 0 is a value, not "absent"
+    // An absent stamp is unusable (seconds() reads 0 and must not pass for epoch 0).
+    CHECK_FALSE(agent_stamp_ns(false, 1718000000, 0).has_value());
+    // nanos must be in [0, 1e9).
+    CHECK_FALSE(agent_stamp_ns(true, 1718000000, -1).has_value());
+    CHECK_FALSE(agent_stamp_ns(true, 1718000000, 1'000'000'000).has_value());
+    CHECK(agent_stamp_ns(true, 1718000000, 999'999'999).has_value());
+    // seconds must be in [0, INT64_MAX / 1e9 - 1] = [0, 9'223'372'035].
+    CHECK_FALSE(agent_stamp_ns(true, -1, 0).has_value());
+    CHECK_FALSE(agent_stamp_ns(true, 9'223'372'036LL, 0).has_value());
+    const auto top = agent_stamp_ns(true, 9'223'372'035LL, 999'999'999);
+    REQUIRE(top.has_value());
+    CHECK(*top == 9'223'372'035'999'999'999LL); // still below INT64_MAX
+    CHECK(*top < std::numeric_limits<std::int64_t>::max());
+}
+
+TEST_CASE("guardian ingest: an event with an empty rule_id is refused and not stored (#5690)",
+          "[pg][guardian][ingest][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    ingest_guardian_response(store, "agent-A", make_rule_event("evt-empty-rule", ""), nullptr,
+                             nullptr, &metrics);
+    cap.stop();
+    CHECK(store.event_count() == 0);
+    CHECK(store.events_written_total() == 0);
+    CHECK(cap.text().find("empty rule_id") != std::string::npos);
+    CHECK(metrics
+              .counter(yuzu::server::detail::kGuardianEventsRejectedMetric,
+                       {{"reason", "empty_rule_id"}})
+              .value() == 1);
+
+    // A well-formed rule id still goes in, so the refusal is the empty id, not the path.
+    ingest_guardian_response(store, "agent-A", make_rule_event("evt-ok", "rule-1"), nullptr,
+                             nullptr);
+    CHECK(store.event_count() == 1);
+}
+
+TEST_CASE("guardian ingest: the agent stamp and the receipt reach the stored ordering key (#5690)",
+          "[pg][guardian][ingest][ordering]") {
+    // A dropped assignment of agent_ns/received_ns would leave every production event at key 0 and
+    // flagged fleet-wide while every other test stays green, so the wiring is pinned end to end.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    const auto key_of = [&](const std::string& event_id) {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql =
+            "SELECT proj_key || '|' || proj_key_capped FROM guaranteed_state_store."
+            "guaranteed_state_events WHERE event_id = '" +
+            event_id + "'";
+        pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(r.ok());
+        return PQntuples(r.get()) == 1 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string{};
+    };
+    // A stamp in the past of the server's receipt is the key as sent.
+    ingest_guardian_response(store, "agent-A", make_rule_event("k-past", "rule-1", 1718000000, 5),
+                             nullptr, nullptr);
+    CHECK(key_of("k-past") == "1718000000000000005|false");
+    // No stamp at all is the unusable key 0.
+    ingest_guardian_response(store, "agent-A",
+                             make_rule_event("k-none", "rule-1", 0, 0, /*with_timestamp=*/false),
+                             nullptr, nullptr);
+    CHECK(key_of("k-none") == "0|false");
+    // A stamp far past receipt plus 300 s is capped to it (receipt is the ingest wall clock, so
+    // the capped value is checked by its flag and by being well below the sent stamp).
+    ingest_guardian_response(store, "agent-A",
+                             make_rule_event("k-future", "rule-1", 9'000'000'000LL, 0), nullptr,
+                             nullptr);
+    const std::string future = key_of("k-future");
+    CHECK(future.ends_with("|true"));
+    CHECK(std::stoll(future) < 9'000'000'000LL * 1'000'000'000LL);
 }

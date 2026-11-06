@@ -1111,6 +1111,49 @@ progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then cal
 with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
 both follow a registry link and can delete its target.
 
+**Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
+`YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A
+real-time session outlives its process until something stops it, so a test process that is killed (a meson timeout),
+crashes or is cancelled leaves its session running, and the four runner agents share one OS identity, so the leak is
+shared state. On 2026-11-05 `logman query -ets` on Wee Tam showed one such session for a dead pid while `echo unit
+tests` failed on every Windows run waiting for its own registry event (#7173, #7135); the leg passed in the two runs
+after the session was stopped by hand. Whether the leak is the cause is not established (35 of the 64 system sessions
+were in use, so the limit was not reached, and no mechanism by which a dead session starves a new one is known), so
+the guard is preventive and the root-cause question stays on #7135.
+The Windows job runs `scripts/ci/stop-dead-etw-sessions.ps1` three times, each step capped at 5 minutes: `Self-test
+the ETW leaked-session cleanup` before the suite (canned `logman` output with injected liveness and stop functions,
+plus one arm that runs the host `pwsh` as a short-lived child to prove the call timeout: it starts and stops no ETW
+session and writes plain `selftest note:` lines, never an annotation), `Stop ETW sessions leaked by dead Yuzu test
+processes (pre-test)` before `Test (non-pg suites)`, and a `(post-test)` run under `always()` after the registry
+leftover assertion, so a session leaked by this job's own killed or cancelled test process is stopped and logged
+against this job rather than the next one. Each real run logs the total session count (limit 64, `::warning` from 48)
+and the Yuzu count. It stops a session by exact name only when the name matches `^Yuzu[A-Za-z]*Etw-[0-9]+$`
+(case-sensitive) and its pid is not a running process, so a live job on another runner slot keeps its session and no
+system or Defender session is ever matched; a liveness probe that fails for any reason other than "no such process"
+counts as alive. The pid is checked a second time just before `logman stop`, which only guards against a flip between
+the two checks; the window is not closed, which is safe because a live owner's session always has a live pid. It never
+fails the job: a listing or stop error is a `::warning` and the script exits 0. Every `logman` call runs in a child
+process that is killed after 45 s, inside a 180 s budget for the whole run, so a wedged ETW service costs a step at
+most about three minutes and then warns; the 5-minute step cap is only a backstop. "Never fails" describes the
+script's own logic: the step envelope can still fail the job (`pwsh` missing, or a failed self-test arm, which is
+deliberate: a broken guard should be loud). A listing with fewer than 3 session rows (a healthy box lists its kernel
+loggers) is treated as not understood and stops nothing. A stop that fails is checked against a fresh listing, and a
+session that has gone (a concurrent job stopped it first) is logged as gone. A successful stop is also annotated as a
+`::warning`, deliberately, so a leak shows on the job, and each run appends its counts to the job summary. `logman` is
+run from the Windows system directory only: if it is not there, nothing is stopped. *Acceptance check, one-off:* in
+the first three Windows runs after this change merges, read the `ETW sessions (pre-test):` line (`N total (system
+limit 64), M Yuzu`). A green run whose log instead shows `could not list sessions`, `listing not understood`, `timed
+out` or `could not stop leaked ETW session` means the guard is not working there; those are warnings, not failures,
+and nothing pages anyone, so someone must look. Residuals: a pid reused by an unrelated live process keeps its session
+until that process exits (and a leak whose pid was reused persists until a check happens to find that pid free); a
+process killed after the post-test step leaves its session for the next job's pre-test step; output the parser does
+not understand (a non-English Windows) stops nothing and warns; a session name of about 39 characters or more would be
+undercounted in the total (the Yuzu names are about 30). A name outside `^Yuzu[A-Za-z]*Etw-[0-9]+$`, such as one with
+a digit before `Etw`, is left alone. If the guard is itself broken, recover by hand on the runner host: `logman query
+-ets`, then `logman stop <exact name> -ets` for a `Yuzu*Etw-<pid>` session whose pid is not running, with no job
+running on any of the four slots. `nightly.yml`'s `windows-asan` job runs only the `agent` suite, whose tests do not
+start the echo session, so it needs no such step.
+
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
 ungated, with no multiplier, on the shared 4-runner Wee Tam box. It shares
@@ -1478,8 +1521,27 @@ job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
-`timeout-minutes: 120`. At np=2 the Linux slot-wait case was the one that
-needed attention: the "revisit the 700s per-shard budget or the Linux
+`timeout-minutes: 120`. Since #7135 a hung agent shard C holds the step for up to
+480 s (was 240 s; shards A and B keep 240 s) and a hung echo entry up to 180 s (was
+90 s). Where `flake-retry.py` can start its enumeration re-run of the failed suite,
+an entry that hangs again on the re-run costs its limit twice before the job fails
+(nothing is masked): about 16 minutes for shard C on Linux (480 s twice), and about
+24 on macOS, where the first run uses `--timeout-multiplier 2` (960 s) and the re-run
+does not. On Windows the re-run has not produced a classification in any of the four
+logs read for this: in the one TIMEOUT log (run 41919798385 attempt 4) shard C's
+verdict `not a classifiable Catch2 run` arrived 0.4 s after its TIMEOUT line (echo's
+TIMEOUT line was two minutes earlier, and both verdicts print at the end of the
+run), and three runs with a plain echo exit-42 failure (42040619981, 42049202343,
+42056811785) gave the same verdict. That fits the open #6316 (flake-retry spawns the
+DLL-linked test binary without meson's `extra_paths`), so a hung entry on Windows
+costs its limit once: about 8 minutes for shard C, 3 for echo. It is an inference
+from those logs, not a guarantee; fixing #6316 would make it twice (16 minutes for
+shard C). The sanitizer and coverage legs call
+`meson test --timeout-multiplier 2` directly, with no re-run, so a hung shard C
+there costs 16 minutes. The 95 minutes above leaves 25 minutes inside
+`timeout-minutes: 120` for checkout, build and that step's own run time, so several
+hung entries are bounded by that job timeout, not by this arithmetic.
+At np=2 the Linux slot-wait case was the one that needed attention: the "revisit the 700s per-shard budget or the Linux
 `--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
 above) had a less severe trigger than at 16 shards (the all-at-cap ceiling alone
 fit the job limit, the ceiling plus a full slot wait did not). At np=4 (Push 2c)
@@ -1942,8 +2004,16 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   the `Ok:`, `Fail:` and `Skipped:` lines: Ok 100, Fail 0, Skipped 5 for the first
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
-  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, echo
-  90 s, `gateway eunit` and `gateway ct` 600 s.
+  that matter: agent shard C 480 s (shards A and B 240 s), `blocked log sink
+  SIGTERM harness` 300 s, echo 180 s (`echo unit tests`; `echo fold sizing` and `echo v10 migration` are 300 s), `gateway eunit` and `gateway ct` 600 s. (Shard
+  C was 240 s until #7135, a deliberate, temporary raise: see the sizing comment in
+  `tests/meson.build`, and #7177 for the split that brings C back down. Echo was 90 s
+  and is now 180 s, which keeps its measured passing runs under 50% of the limit.
+  Every "of 240 s" sample below for shard C, every "of 90 s" sample for echo, and the
+  192 s and 72 s 80% thresholds for them in the decision rule are against those old
+  values; the current marks are 384 s for shard C and 144 s for echo, so while the
+  raise stands neither warns as early as it did. Shards A and B are unchanged at
+  240 s and a 192 s mark.)
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
   carry these entries (the junit import runs once at job end and reads the last
@@ -1960,7 +2030,8 @@ applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
-240 s for the harness, 192 s for an agent shard, 72 s for echo); and the entry
+240 s for the harness, 192 s for agent shards A and B, 192 s for shard C before #7135
+and 384 s now, 72 s for echo before #7135 and 144 s now); and the entry
 count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
 guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green
@@ -2944,12 +3015,17 @@ one file is one PG-instance event, not a test bug.
 The agent suite's single `agent unit tests` entry (one serial Catch2 process,
 240 s budget) is three entries over the same `yuzu_agent_tests` binary:
 `agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
-'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
-and conservative headroom rather than a measured need: the only measured
-contention figure is for the server `~[pg]` suite, 289 s with no other test
-phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
-the pre-#3443 combined step, per "Windows test-phase
-concurrency gate"; it has not been re-measured for the agent shards) and
+'agent-shard']`, one positional tag spec, a per-shard `timeout:` (A and B 240 s;
+C 480 s, raised from the old single entry's 240 s by #7135 as a deliberate,
+temporary exception to the 50% budget rule in `docs/testing/unit-test-conventions.md`,
+to come back down with the split tracked as #7177). #7135 measured shard C at
+185 s to 212 s as a pass on Windows MSVC debug (three of the 206 s to 212 s samples
+are from jobs that failed on the echo ETW case, not from green jobs) and at the old
+240 s limit once under load; the sizing comment beside the `timeout:` records the
+runs. The contention figure for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, was measured on
+the pre-#3443 combined step; see "Windows test-phase concurrency gate". The entries
+also take
 `--allow-running-no-tests`. That flag is what stops the zero-match shard C from
 failing when `meson test --suite agent --test-args '[tag]'` appends a second
 positional spec. It does not make that a targeted run: Catch2 binds the extra
@@ -2978,7 +3054,8 @@ fails if a shard spec term does not end with that suffix (the meson
 `agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
 shape flake-retry's isolated retry can strip, or if two shard entry names are
 equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
-notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+notice, and the drift signal is the 80%-of-budget table above (shard C's mark is 384 s while
+the #7135 raise stands, so it is a late warning until #7177 lands). Per-entry history
 in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
 the new names.
 

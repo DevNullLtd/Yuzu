@@ -7,6 +7,8 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
+#include <yuzu/log_token.hpp>
+
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
@@ -19,6 +21,20 @@
 namespace yuzu::server {
 
 namespace {
+
+// Log a failed write with its SQLSTATE and return the fixed text the caller gets: the libpq message
+// can carry schema, constraint and value fragments, so it stays in the server log (bounded and
+// neutralised by log_key_token) and never reaches the REST or MCP client. The campaign id has
+// passed `valid_campaign_id` by the time this runs.
+std::string logged_write_fault(const char* what, const std::string& campaign_id, PGconn* conn,
+                               const PGresult* res) {
+    const char* sqlstate = res ? PQresultErrorField(res, PG_DIAG_SQLSTATE) : nullptr;
+    spdlog::error("AccessReviewStore::{}: failed (campaign={}, sqlstate={}): {}", what,
+                  campaign_id, sqlstate ? sqlstate : "?",
+                  ::yuzu::log_key_token(PQerrorMessage(conn)));
+    return std::string(what) + " failed";
+}
+
 
 constexpr const char* kStoreName = "access_review_store";
 
@@ -470,7 +486,7 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
             "FOR UPDATE OF a FOR SHARE OF c",
             std::vector<std::string>{campaign_id, principal_type, principal_id, role_name});
         if (pre.status() != PGRES_TUPLES_OK) {
-            error_msg = std::string("record_attestation read failed: ") + PQerrorMessage(conn);
+            error_msg = logged_write_fault("record_attestation read", campaign_id, conn, pre.get());
             return false;
         }
         if (PQntuples(pre.get()) == 0 || std::string_view{PQgetvalue(pre.get(), 0, 2)} != "open") {
@@ -497,7 +513,7 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
                                      decision, old_decision, reviewer, justification, decided_at});
         if (hist.status() != PGRES_COMMAND_OK) {
             error_msg =
-                std::string("record_attestation history write failed: ") + PQerrorMessage(conn);
+                logged_write_fault("record_attestation history write", campaign_id, conn, hist.get());
             return false;
         }
 
@@ -521,7 +537,7 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
                                      decision, reviewer, decided_at, justification,
                                      std::to_string(old_seq)});
         if (upd.status() != PGRES_TUPLES_OK) {
-            error_msg = std::string("record_attestation write failed: ") + PQerrorMessage(conn);
+            error_msg = logged_write_fault("record_attestation write", campaign_id, conn, upd.get());
             return false;
         }
         if (PQntuples(upd.get()) == 0) {
@@ -694,8 +710,8 @@ AccessReviewStore::close_campaign(const std::string& campaign_id, const std::str
         "WHERE campaign_id=$1 AND status='open' RETURNING campaign_id",
         std::vector<std::string>{campaign_id, closed_by, std::to_string(now_ms())});
     if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("close_campaign write failed: ") +
-                               PQerrorMessage(lease.get()));
+        return std::unexpected(
+            logged_write_fault("close_campaign write", campaign_id, lease.get(), res.get()));
     if (PQntuples(res.get()) == 0)
         return std::unexpected("not_found: campaign missing or already closed");
     return {};

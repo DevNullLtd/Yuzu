@@ -45,7 +45,7 @@ was corrected).
   `pending` attestation rows in one transaction; `POST
   /api/v1/access-reviews/{id}/attestations` records a reviewer decision
   (`attested`/`flagged_revoke`) against one frozen `(principal, role)` grant
-  — an UPSERT that overwrites a prior decision on a re-call; `POST
+  — recorded once and then final (an UPSERT until #4752, see "Update 2026-11-05" below); `POST
   /api/v1/access-reviews/{id}/close` closes the campaign; `GET
   /api/v1/access-reviews/{id}` returns the full evidentiary state
   (metadata + every attestation row + `pending_count`).
@@ -78,7 +78,7 @@ was corrected).
   (hardening round), `close_access_review` (hardening round) — JSON only;
   the REST `?format=csv` export has no MCP equivalent.
   `record_attestation` carries `destructiveHint:true` (hardening round —
-  it is a decision-overwriting UPSERT); every other twin is
+  it writes a final, irreversible decision; it was a decision-overwriting UPSERT until #4752); every other twin is
   `destructiveHint:false`.
 - **Audit actions:** `access_review.exported`, `.list` (hardening round),
   `.campaign_opened`, `.attested`, `.flagged`, `.closed`, `.get`.

@@ -3851,6 +3851,19 @@ two SSO identities, counts as two reviewers. This is the maintainer-accepted exc
 `docs/enterprise-readiness-soc2-first-customer.md` (the addendum "approver assurance for approve and reject",
 residual risk (e)); it is not a guarantee across identities.
 
+**It needs at least two people able to attest.** A sole Administrator (RBAC off, the default, admits only
+administrators) cannot decide that administrator's own grants. They stay `pending` until someone closes the
+campaign, and `close` has no separation of duties, so the campaign closes with unreviewed rows. Assign
+`Reviewer` to a second person.
+
+**It is not four-eyes.** Nothing stops two colluding reviewers deciding each other's grants. Four-eyes on
+distinct human roots is a separate control (ADR-0033 section 7 reserves human-root resolution for it); this
+rule compares usernames only, the same limit ADR-1005's 2026-10-19 addendum records for approvals. No separate
+acceptance of that limit is recorded for access reviews.
+
+**Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is the subject of a
+grant can still open or close a campaign.
+
 **The decision history.** The current-state row in `access_review_attestation` keeps its four-part key and
 holds the latest decision plus `decision_seq` (0 while pending). The new table
 `access_review_attestation_history` holds one row per recorded decision, keyed by the same four parts and
