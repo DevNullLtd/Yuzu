@@ -4157,6 +4157,17 @@ test('agent command-dedup wiring lexical gate (#3668)',
   timeout: 30,
 )
 
+# Guardian empty-rule_id sender refusal: the helper sits on two private AgentImpl send paths with
+# no gRPC seam (#1492); this pins that both still call it before the Write, return the
+# disposed-by-design outcome, tokenise the logged id and keep T_wire honest. Carries its own
+# in-memory mutation self-test. No build required.
+test('agent guardian sender-refusal wiring lexical gate (#5690)',
+  _python3_test,
+  args: [files('test_agent_guardian_refusal_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # __sync__.now parameter wiring: decide_sync_now is a pure function with its own unit tests; this
 # pins that agent.cpp's Subscribe loop still reads the `source` and `delay_max_s` keys and passes
 # both in (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.

@@ -20,6 +20,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption (boot, upgrade window)
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
+#include <yuzu/log_token.hpp> // log_id_token (CWE-117) for the refusal log line
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/reconnect_backoff.hpp>
 #include <yuzu/agent/server_address_resolver.hpp>
@@ -2323,7 +2324,10 @@ public:
                     // running, exactly like send_guardian_outbox_entry's own capture below.
                     guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
                         const auto outcome = emit_guardian_event(ev);
-                        const bool sent = (outcome == LegacySendOutcome::Sent);
+                        // A refused event is reported Sent (disposed by design, no Write); the
+                        // T_wire line must not claim a local write happened.
+                        const bool sent = (outcome == LegacySendOutcome::Sent) &&
+                                          !guardian_event_refused_by_server(ev);
                         // #4606 criterion-10 T_wire (legacy non-Spark drift-sink path only — the
                         // DEX observer's call to this same method stays uninstrumented, see
                         // emit_guardian_event's own comment).
@@ -4150,7 +4154,8 @@ private:
     // journal (the live entry is still enqueued), so this refusal is what stops it reaching the
     // wire; it is the last line. Logged on the first occurrence and then every 1024th, so a bad
     // producer cannot flood; the counter exists only to set that cadence and is not exported.
-    // The legacy drift-sink lambda still writes a T_wire line with sent=1 for a refused event.
+    // The legacy drift-sink lambda logs sent=0 in its T_wire line for a refused event, so the
+    // line never claims a write that did not happen.
     bool refuse_unsendable_guardian_event(const gpb::GuaranteedStateEvent& ev,
                                           std::string_view path) {
         if (!guardian_event_refused_by_server(ev))
@@ -4160,7 +4165,7 @@ private:
             try {
                 spdlog::warn("Guardian {} path: not sending event {}: its rule_id is empty and the "
                              "server would drop it (refused so far: {})",
-                             path, ev.event_id(), n);
+                             path, ::yuzu::log_id_token(ev.event_id()), n);
             } catch (...) { // best-effort diagnostic; never propagate onto a send worker
             }
         }

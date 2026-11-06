@@ -113,7 +113,8 @@
  *                 A legacy detection made before the sink is wired is dropped with NO line
  *                 at all, so the absence of a legacy T_wire does not prove nothing fired.
  *         sent=1  as above. An event refused locally as unsendable (an empty rule_id; no producer
- *                 reaches this today) is reported Sent without a Write and logs sent=1 too.
+ *                 reaches this today) is never written, so its line says sent=0 even though the
+ *                 executor records the event as disposed, not lost.
  *   - A T_wire line with no T_detect is normal, not an orphan: domain=lifecycle (armed,
  *     disarmed and errored events - a subscription LOSS produces a lifecycle "errored"
  *     entry - and journal replays from this or an earlier process), domain=health raised by
