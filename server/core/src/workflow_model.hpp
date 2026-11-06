@@ -41,23 +41,42 @@ namespace yuzu::server {
 /// grow `workflow_executions` by ~1.3 MB a row. 1000 ids of up to 128 bytes is about 131 KB.
 inline constexpr std::size_t kStoredAgentIdsMax = 1000;
 
+/// The most bytes of JSON text a run row stores in `agent_ids_json`, the marker included: 1000 ids
+/// of the 128 bytes the v1 and MCP routes allow, quoted and comma-separated, is 131,002 bytes. The
+/// legacy execute route checks no id length, so the count alone does not bound the column.
+inline constexpr std::size_t kStoredAgentIdsMaxBytes = 131072;
+
+/// An id longer than this is never stored (it is counted in the marker's total and digest). It is
+/// `auth::kMaxAgentIdLength`, the longest id any agent can have, so no real device is dropped.
+inline constexpr std::size_t kStoredAgentIdMaxBytes = 256;
+
+/// Bytes held back from the budget for the truncation marker (about 125 with a 20 digit total).
+inline constexpr std::size_t kStoredAgentIdsMarkerReserve = 160;
+
 /// The `agent_ids_json` text a run row stores for `agent_ids`.
 ///
-/// Up to `kStoredAgentIdsMax` ids: the JSON array of strings the caller named, unchanged. Above
-/// it, the array holds the first `kStoredAgentIdsMax` ids (those for which `first` answers true
-/// come first, in request order, then the rest, so the caller's own visible devices survive and a
-/// confined caller can still see the run it started) followed by ONE non-string element, the
-/// marker `{"truncated":true,"total":<count named>,"sha256":"<hex of the full list's JSON text>"}`.
-/// The marker is an object so every reader that takes only string elements
-/// (`workflow_execution_visible`, `confined_workflow_agent_ids_json`, the list SQL) skips it with
-/// no change, and the column stays a valid JSON array. `sha256` is null if the digest provider
-/// failed. `max` is a seam for tests.
+/// The ids are first reduced to the DISTINCT ids in first-seen order (duplicates are dropped before
+/// any bound, so padding a list with copies of one id cannot push a real id out). If every distinct
+/// id is at most `kStoredAgentIdMaxBytes` long, there are at most `max` of them and their JSON text
+/// is at most `max_bytes`, the column is that JSON array of strings, and a list with no duplicates
+/// is stored unchanged. Otherwise it holds the ids admitted in this order: those for which `first`
+/// answers true (the caller's own visible devices, so a confined caller can still see the run it
+/// started), then the rest, each group in first-seen order. Admission stops at `max` ids or when
+/// the next id would take the text past `max_bytes` less `kStoredAgentIdsMarkerReserve`; an id over
+/// `kStoredAgentIdMaxBytes` is skipped. The array is then followed by ONE non-string element, the
+/// marker `{"truncated":true,"total":<DISTINCT ids named>,"sha256":"<hex>"}`. `total` counts every
+/// distinct id including the skipped ones; `sha256` is the digest of the JSON text of the distinct
+/// list in first-seen order (the order the dispatcher received it, not the stored order), and is
+/// null if the digest provider failed. The marker is an object so every reader that takes only
+/// string elements (`workflow_execution_visible`, `confined_workflow_agent_ids_json`, the list SQL)
+/// skips it with no change, and the column stays a valid JSON array. `max` and `max_bytes` are
+/// seams for tests. The run is dispatched with the list as the caller sent it, never this one.
 [[nodiscard]] std::string stored_agent_ids_json(
     const std::vector<std::string>& agent_ids,
     const std::function<bool(const std::string&)>& first = {},
-    std::size_t max = kStoredAgentIdsMax);
+    std::size_t max = kStoredAgentIdsMax, std::size_t max_bytes = kStoredAgentIdsMaxBytes);
 
-/// The number of agent ids the run named when `agent_ids_json` holds a truncated copy (the
+/// The number of distinct agent ids the run named when `agent_ids_json` holds a truncated copy (the
 /// `stored_agent_ids_json` marker), or `nullopt` for a complete copy, a malformed column or a
 /// marker without a usable count.
 [[nodiscard]] std::optional<std::int64_t> stored_agent_ids_total(const std::string& agent_ids_json);

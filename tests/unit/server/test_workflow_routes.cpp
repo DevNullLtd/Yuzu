@@ -4908,6 +4908,46 @@ TEST_CASE("POST /api/workflows/:id/execute: a list over the stored-id cap dispat
     CHECK(all["agent_ids_total"] == static_cast<std::int64_t>(count));
 }
 
+TEST_CASE("POST /api/workflows/:id/execute: ids of several KB each dispatch in full and the stored "
+          "column stays under the byte budget (#2146)",
+          "[pg][workflow][executions][execute][stored_ids]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WFKB", "wfkb");
+    auto wf_id = h.make_workflow("wf-kb", "def-WFKB");
+    h.dispatch_cmd_override = "cmd-wfkb";
+    h.dispatch_sent_override = 1;
+
+    nlohmann::json body{{"agent_ids", nlohmann::json::array({"agent-mine"})}};
+    for (std::size_t i = 0; i < 1000; ++i)
+        body["agent_ids"].push_back(std::string(3000, 'w') + std::to_string(i));
+    SECTION("over-long ids") {
+        auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", body.dump());
+        REQUIRE(res);
+        REQUIRE(res->status == 202);
+        CHECK(h.last_dispatch_agent_ids.size() == 1001); // the step reached every id as sent
+    }
+    SECTION("ids at the longest an agent can have") {
+        body["agent_ids"] = nlohmann::json::array({"agent-mine"});
+        for (std::size_t i = 0; i < 1000; ++i)
+            body["agent_ids"].push_back(std::string(250, 'w') + std::to_string(100 + i));
+        auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", body.dump());
+        REQUIRE(res);
+        REQUIRE(res->status == 202);
+        CHECK(h.last_dispatch_agent_ids.size() == 1001);
+    }
+
+    pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult len{PQexec(conn.get(), "SELECT octet_length(agent_ids_json) FROM "
+                                        "workflow_engine.workflow_executions")};
+    REQUIRE(len.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(len.get()) == 1);
+    CHECK(std::strtoll(PQgetvalue(len.get(), 0, 0), nullptr, 10) < 140000);
+}
+
 TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible derivation is unwired",
           "[pg][workflow][executions][execute][scope][security]") {
     // Genuinely UNWIRED CallerFn. ADR-0033 §1: the handler must hand step

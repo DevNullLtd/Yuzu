@@ -3800,6 +3800,95 @@ TEST_CASE("stored_agent_ids_json: complete up to the cap, bounded with a marker 
     }
 }
 
+TEST_CASE("stored_agent_ids_json: distinct ids are bounded by count and by bytes, duplicates and "
+          "over-long ids never crowd a real id out",
+          "[workflow_engine][stored_ids]") {
+    const auto strings_of = [](const std::string& text) {
+        std::vector<std::string> out;
+        for (const auto& e : nlohmann::json::parse(text))
+            if (e.is_string())
+                out.push_back(e.get<std::string>());
+        return out;
+    };
+
+    SECTION("padding with one id cannot push a real id out of the stored copy") {
+        std::vector<std::string> ids(kStoredAgentIdsMax, "agent-X");
+        ids.push_back("agent-Y");
+        const auto text = stored_agent_ids_json(ids);
+        CHECK(strings_of(text) == std::vector<std::string>{"agent-X", "agent-Y"});
+        CHECK_FALSE(stored_agent_ids_total(text).has_value()); // two distinct ids: a whole copy
+        WorkflowExecution we;
+        we.agent_ids_json = text;
+        CHECK(workflow_execution_visible(
+            we, authz::VisibleSet{std::unordered_set<std::string>{"agent-Y"}}));
+    }
+    SECTION("duplicates are dropped in first-seen order") {
+        const auto text = stored_agent_ids_json({"b", "a", "b", "c", "a"});
+        CHECK(text == R"(["b","a","c"])");
+    }
+    SECTION("the count bound is on DISTINCT ids: 1000 whole, 1001 truncated") {
+        auto ids = numbered_agent_ids(kStoredAgentIdsMax);
+        auto doubled = ids;
+        doubled.insert(doubled.end(), ids.begin(), ids.end());
+        const auto whole = stored_agent_ids_json(doubled);
+        CHECK(whole == nlohmann::json(ids).dump());
+        CHECK_FALSE(stored_agent_ids_total(whole).has_value());
+
+        ids.push_back("agent-last");
+        doubled = ids;
+        doubled.insert(doubled.end(), ids.begin(), ids.end());
+        const auto cut = stored_agent_ids_json(doubled);
+        CHECK(stored_agent_ids_total(cut) == static_cast<std::int64_t>(kStoredAgentIdsMax + 1));
+        CHECK(strings_of(cut).size() == kStoredAgentIdsMax);
+    }
+    SECTION("the byte bound: ids of several KB each stay under the budget and the total counts them all") {
+        std::vector<std::string> ids;
+        for (std::size_t i = 0; i < 1000; ++i)
+            ids.push_back(std::string(250, 'k') + std::to_string(1000 + i)); // 254 bytes: allowed
+        const auto text = stored_agent_ids_json(ids);
+        CHECK(text.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(strings_of(text).size() < ids.size());
+        CHECK(strings_of(text).size() > 400); // the budget is used, not wasted
+        CHECK(stored_agent_ids_total(text) == 1000);
+        CHECK(strings_of(text).front() == ids.front()); // admission is a prefix of first-seen order
+    }
+    SECTION("a legacy-route list of several KB per id is bounded and an over-long id is skipped and counted") {
+        std::vector<std::string> ids{"agent-A", std::string(5000, 'o'), "agent-B"};
+        for (std::size_t i = 0; i < 1000; ++i)
+            ids.push_back(std::string(4000, 'm') + std::to_string(i));
+        const auto text = stored_agent_ids_json(ids);
+        CHECK(text.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(strings_of(text) == std::vector<std::string>{"agent-A", "agent-B"});
+        CHECK(stored_agent_ids_total(text) == 1003);
+    }
+    SECTION("the digest covers the distinct list in first-seen order, not the stored order") {
+        const auto ids = std::vector<std::string>{"d", "a", "d", "b", "c"};
+        const auto text = stored_agent_ids_json(
+            ids, [](const std::string& id) { return id == "c"; }, 2);
+        const auto parsed = nlohmann::json::parse(text);
+        REQUIRE(parsed.size() == 3);
+        CHECK(parsed[0] == "c"); // priority first
+        CHECK(parsed[1] == "d");
+        CHECK(parsed[2]["total"] == 4);
+        CHECK(parsed[2]["sha256"].get<std::string>() ==
+              *sha256_hex(nlohmann::json::array({"d", "a", "b", "c"}).dump()));
+    }
+    SECTION("an invalid UTF-8 byte in an id does not throw out of the insert") {
+        std::string bad = "agent-\xff";
+        std::string text;
+        REQUIRE_NOTHROW(text = stored_agent_ids_json({bad, "agent-ok"}));
+        CHECK(nlohmann::json::parse(text, nullptr, false).is_array());
+    }
+    SECTION("the marker fits inside the budget even for a count-truncated 128 byte id list") {
+        std::vector<std::string> ids;
+        for (std::size_t i = 0; i < 1001; ++i)
+            ids.push_back(std::string(124, 'z') + std::to_string(1000 + i)); // 128 bytes
+        const auto text = stored_agent_ids_json(ids);
+        CHECK(text.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(stored_agent_ids_total(text) == 1001);
+    }
+}
+
 TEST_CASE("stored_agent_ids_json: readers skip the marker and show the truncation",
           "[workflow_engine][stored_ids]") {
     WorkflowExecution we;
@@ -3912,6 +4001,36 @@ TEST_CASE("WorkflowEngine: a run over the stored-id cap dispatches to the full l
         CHECK(page2->rows[0].id == id);
         (void)id2;
         (void)d2;
+    }
+    SECTION("padding the list with one id does not hide a real id from a reader scoped to it") {
+        std::vector<std::string> agents(kStoredAgentIdsMax, "agent-X");
+        agents.push_back("agent-Y");
+        const auto [id, dispatched] = run(agents);
+        CHECK(dispatched == kStoredAgentIdsMax + 1); // the dispatch list is not deduped or clipped
+        const auto stored = stored_agent_ids_of(wf_db_fx_.dsn(), id);
+        CHECK(nlohmann::json::parse(stored) == nlohmann::json::array({"agent-X", "agent-Y"}));
+        const auto page = engine.query_executions_page({}, std::vector<std::string>{"agent-Y"});
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].id == id);
+    }
+    SECTION("ids of 250 bytes each: the stored column stays under the byte budget, all are dispatched") {
+        std::vector<std::string> agents;
+        for (std::size_t i = 0; i < 1000; ++i)
+            agents.push_back(std::string(244, 'q') + std::to_string(100000 + i));
+        agents.insert(agents.begin(), "agent-A");
+        const auto [id, dispatched] = run(agents);
+        CHECK(dispatched == agents.size());
+        const auto stored = stored_agent_ids_of(wf_db_fx_.dsn(), id);
+        CHECK(stored.size() < 140000);
+        CHECK(stored.size() <= kStoredAgentIdsMaxBytes);
+        CHECK(stored_agent_ids_total(stored) == static_cast<std::int64_t>(agents.size()));
+        CHECK(count_rows(wf_db_fx_.dsn(),
+                         "SELECT max(octet_length(agent_ids_json)) FROM "
+                         "workflow_engine.workflow_executions") < 140000);
+        const auto page = engine.query_executions_page({}, std::vector<std::string>{"agent-A"});
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 1);
     }
     SECTION("a keyed replay of a capped run is answered and writes nothing") {
         const auto first =

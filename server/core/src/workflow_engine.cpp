@@ -1601,7 +1601,8 @@ namespace {
 // `pg_input_is_valid` is PostgreSQL 16+ (the documented floor).
 //
 // NOT a byte-for-byte image of that C++ oracle: jsonb and nlohmann accept different JSON. Every
-// document the engine writes (`nlohmann::json(vector<string>).dump()`, execute()) agrees on both
+// document the engine writes (`stored_agent_ids_json()`, execute(): a JSON array of strings, with
+// one trailing marker object on a truncated copy that both sides skip) agrees on both
 // sides; the shapes below can only arrive by a write that bypasses the engine, and each is pinned
 // with its direction in the "SQL visibility predicate" tests:
 //   - jsonb refuses a `\u0000` escape or a UTF-8 byte-order mark; nlohmann takes both. The whole
@@ -1615,8 +1616,9 @@ namespace {
 //     levels deep (a document of about 37 KB) hits the stack-depth guard, a hard error
 //     `pg_input_is_valid` does not trap; 18,650 levels is accepted. A stored row that deep fails
 //     the statement, so every confined list answers the typed degrade (503, never rows) until the
-//     row is gone. The engine only ever writes a flat array of strings, so only a bypassing write
-//     can store one.
+//     row is gone. The engine only ever writes a flat array of strings, plus one trailing marker
+//     object on a truncated copy (`stored_agent_ids_json`), so only a bypassing write can store
+//     one.
 constexpr const char* kGuardedAgentIdsJsonb =
     "CASE WHEN pg_input_is_valid(e.agent_ids_json, 'jsonb') "
     "THEN (CASE WHEN jsonb_typeof(e.agent_ids_json::jsonb) = 'array' "

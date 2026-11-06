@@ -3,33 +3,99 @@
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "sha256_hex.hpp"
 
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+
 #include <algorithm>
+#include <string_view>
+#include <unordered_set>
 
 namespace yuzu::server {
 
+namespace {
+
+// The JSON text length of one id as the stored column will hold it. `replace` keeps an id with an
+// invalid UTF-8 byte from throwing out of the run row's insert and keeps the column valid UTF-8.
+std::string id_json_text(std::string_view id) {
+    return nlohmann::json(std::string(id)).dump(-1, ' ', false,
+                                                nlohmann::json::error_handler_t::replace);
+}
+
+} // namespace
+
 std::string stored_agent_ids_json(const std::vector<std::string>& agent_ids,
                                   const std::function<bool(const std::string&)>& first,
-                                  std::size_t max) {
-    if (agent_ids.size() <= max)
-        return nlohmann::json(agent_ids).dump();
-    nlohmann::json kept = nlohmann::json::array();
-    if (first) {
+                                  std::size_t max, std::size_t max_bytes) {
+    static_assert(kStoredAgentIdMaxBytes == auth::kMaxAgentIdLength);
+
+    // Distinct ids in first-seen order. Duplicates are dropped BEFORE any cap, so padding a list
+    // with copies of one id cannot push a real id out of the stored copy.
+    std::vector<const std::string*> distinct;
+    distinct.reserve(agent_ids.size());
+    {
+        std::unordered_set<std::string_view> seen;
+        seen.reserve(agent_ids.size());
         for (const auto& id : agent_ids)
-            if (kept.size() < max && first(id))
-                kept.push_back(id);
+            if (seen.insert(id).second)
+                distinct.push_back(&id);
     }
-    for (const auto& id : agent_ids) {
-        if (kept.size() >= max)
-            break;
-        if (first && first(id))
-            continue; // already kept above
-        kept.push_back(id);
+
+    const auto to_array = [](const std::vector<const std::string*>& ids) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto* id : ids)
+            arr.push_back(*id);
+        return arr;
+    };
+    const auto dump = [](const nlohmann::json& j) {
+        return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    };
+
+    // Whole copy: every distinct id fits the count and byte bounds and none is over-long.
+    {
+        std::size_t bytes = 2; // '[' and ']'
+        bool whole = distinct.size() <= max;
+        for (std::size_t i = 0; whole && i < distinct.size(); ++i) {
+            const auto& id = *distinct[i];
+            bytes += id_json_text(id).size() + (i == 0 ? 0 : 1);
+            whole = id.size() <= kStoredAgentIdMaxBytes && bytes <= max_bytes;
+        }
+        if (whole)
+            return dump(to_array(distinct));
     }
-    const auto digest = sha256_hex(nlohmann::json(agent_ids).dump());
-    kept.push_back(nlohmann::json{{"truncated", true},
-                                  {"total", agent_ids.size()},
-                                  {"sha256", digest ? nlohmann::json(*digest) : nlohmann::json(nullptr)}});
-    return kept.dump();
+
+    // Bounded copy: the ids `first` accepts, then the rest, each group in first-seen order,
+    // admitted while the count, the byte budget (less the marker's reserve) and the per-id length
+    // allow; admission stops at the first id that would not fit. An over-long id is never stored.
+    const std::size_t id_budget =
+        max_bytes > kStoredAgentIdsMarkerReserve ? max_bytes - kStoredAgentIdsMarkerReserve : 0;
+    std::vector<const std::string*> kept;
+    std::size_t bytes = 2;
+    bool open = true;
+    const auto admit = [&](bool want_first) {
+        for (const auto* idp : distinct) {
+            if (!open)
+                return;
+            const auto& id = *idp;
+            if ((first && first(id)) != want_first || id.size() > kStoredAgentIdMaxBytes)
+                continue;
+            const auto add = id_json_text(id).size() + (kept.empty() ? 0 : 1);
+            if (kept.size() >= max || bytes + add > id_budget) {
+                open = false;
+                return;
+            }
+            bytes += add;
+            kept.push_back(idp);
+        }
+    };
+    if (first)
+        admit(true);
+    admit(false);
+
+    nlohmann::json out = to_array(kept);
+    const auto digest = sha256_hex(dump(to_array(distinct)));
+    out.push_back(nlohmann::json{{"truncated", true},
+                                 {"total", distinct.size()},
+                                 {"sha256", digest ? nlohmann::json(*digest) : nlohmann::json(nullptr)}});
+    return dump(out);
 }
 
 std::optional<std::int64_t> stored_agent_ids_total(const std::string& agent_ids_json) {
