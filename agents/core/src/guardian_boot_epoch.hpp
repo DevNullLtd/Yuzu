@@ -103,8 +103,8 @@
 //     directory's ACL, which was not measured. A principal with write access to the data
 //     directory can also replace the file before the agent starts (the agent then reports
 //     failed if it cannot open the replacement), but that principal can already rewrite
-//     kv_store.db. Accepted: the result is the timestamp ordering the agent used before it
-//     stamped the pair.
+//     kv_store.db. Accepted: the result is ordering by the census ordering key alone, as
+//     before the agent stamped the pair.
 //   * the lock guards the epoch claim only, not the rest of the data directory (the identity
 //     and command-dedup stores have never been exclusive).
 //   * there is no in-process recovery: a process that lost the lock stays at epoch 0 until it

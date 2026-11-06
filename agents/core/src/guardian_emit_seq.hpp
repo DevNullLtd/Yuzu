@@ -4,7 +4,7 @@
 //
 // The event timestamp is the agent wall clock, so after a backward clock step an older
 // compliant event can carry a later stamp than a newer errored one; the server's census
-// ordering key then holds or flags the pair but cannot order it. The remedy is an
+// ordering key then may hold or flag the pair, but cannot reliably order it. The remedy is an
 // agent-assigned ordinal drawn where QUEUE ORDER IS DECIDED, carried on the wire as the
 // pair (boot_epoch, emit_seq); a server that compares it orders lexicographically, one
 // that does not ignores it and keeps ordering by the census ordering key.

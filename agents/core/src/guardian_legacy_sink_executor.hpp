@@ -31,8 +31,8 @@
  * remediation.failed, guard.compliant, guard.unhealthy are all distinct census
  * signals - a server that does not compare the (boot_epoch, emit_seq) pair orders
  * events with an identical stamp by ARRIVAL order (and flags the (agent, rule) census row),
- * and the stamp pair itself is drawn in admission order, so reordering is a correctness bug, not just a
- * cardinality change).
+ * and the stamp pair itself is drawn in admission order, so reordering is a correctness bug,
+ * not just a cardinality change).
  * Bounded by BOTH `max_events` and `max_bytes` (Event::ByteSizeLong() plus
  * kEmitPairMaxWireBytes, computed once at offer()).
  *

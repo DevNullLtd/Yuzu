@@ -5174,8 +5174,9 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     //    replayed lifecycle entries keep the original persisted ns):
     //    a backward wall-clock step between an older compliant and a newer errored makes the
     //    errored timestamp earlier, so the server's census ordering key keeps compliant and
-    //    flags the pair `order_uncertain` (after the one-hour stale-mark recovery it follows
-    //    arrival order, still flagged); the hold cannot affect this. UP-14 puts the (boot_epoch,
+    //    flags the pair `order_uncertain` when the errored event arrives second (after the
+    //    one-hour stale-mark recovery it follows arrival order, still flagged); the cross-lane
+    //    hold cannot affect this. UP-14 puts the (boot_epoch,
     //    emit_seq) pair on every live entry; a server that compares the pair orders by it
     //    AHEAD of the census ordering key, one that does not ignores it and keeps ordering by the
     //    census ordering key (the comparator is the server's, not this function's), so this bullet
