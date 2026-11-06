@@ -8144,7 +8144,7 @@ Any other top-level key is a `400`. `version` is the SHA-256 of the stored docum
 
 #### `GET /api/v1/inventory/software/collection-settings`
 
-Every stored document and the built-in fleet default (24 hours, 01:00 to 05:00, machine-local zone, every collector on), each with its `version`. Global `ManagementGroup:Read` only. A document whose group has since been deleted is listed and ignored by the resolver. More than 20,000 documents, or a stored row that fails the read rule, is a `503`, never a truncated list.
+Every stored document and the built-in fleet default (24 hours, 01:00 to 05:00, machine-local zone, every collector on), each with its `version`. Global `ManagementGroup:Read` only. A document whose group has been deleted is neither listed nor used by the resolver; it counts toward the cap below. More than 20,000 documents, or a stored row that fails the read rule, is a `503`, never a truncated list. The read fails closed on purpose: documents are written only through the validating `PUT`, so a row that fails the read rule means the table was damaged out of band, and one such row makes this list and every device's effective-settings read answer `503` until the row is repaired or removed.
 
 #### `GET /api/v1/inventory/software/collection-settings/{group_id}`
 

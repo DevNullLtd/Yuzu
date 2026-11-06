@@ -15,6 +15,7 @@
 #include <expected>
 #include <limits>
 #include <map>
+#include <set>
 #include <string_view>
 #include <vector>
 
@@ -246,7 +247,7 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
     // -- GET list ---------------------------------------------------------------------------
     sink.Get("/api/v1/inventory/software/collection-settings",
              [deps, wired](const httplib::Request& req, httplib::Response& res) {
-                 if (!wired(res, false))
+                 if (!wired(res, true))
                      return;
                  if (!deps.perm_fn(req, res, kGroupTargetType, "Read"))
                      return;
@@ -255,6 +256,16 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                      store_unavailable(res, docs.error());
                      return;
                  }
+                 // A deleted group's document is orphaned (no cross-schema foreign key): listed
+                 // only while its group is in the tree, as the resolver reads it.
+                 const auto groups = deps.mgmt_store->list_groups_checked();
+                 if (!groups) {
+                     unavailable(res, "management group tree read unavailable");
+                     return;
+                 }
+                 std::set<std::string> live;
+                 for (const auto& g : *groups)
+                     live.insert(g.id);
                  const auto def_version = cs::effective_version(cs::kFleetDefault.effective());
                  if (!def_version) {
                      unavailable(res, "digest unavailable");
@@ -264,8 +275,10 @@ void SoftwareCollectionSettingsRoutes::register_routes(HttpRouteSink& sink, Deps
                  fleet["priority"] = 0;
                  fleet["version"] = *def_version;
                  json arr = json::array();
-                 for (const auto& d : *docs)
-                     arr.push_back(document_json(d));
+                 for (const auto& d : *docs) {
+                     if (live.contains(d.group_id))
+                         arr.push_back(document_json(d));
+                 }
                  res.set_content(ok_body({{"fleet_default", std::move(fleet)},
                                           {"documents", std::move(arr)}}),
                                  "application/json");

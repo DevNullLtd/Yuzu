@@ -26,8 +26,8 @@
 /// trimmed inside the write transaction (no wall-clock cutoff; see docs/clock-guarded-retention.md).
 ///
 /// Group ids carry no foreign key (cross-schema foreign keys are banned, ADR-0024 D4): a deleted
-/// group's row is orphaned. The resolver ignores a document whose group is not in the tree; the
-/// list read returns it.
+/// group's row is orphaned. `list_all` returns it and it counts toward `kListRowCap`; the resolver
+/// and the list route ignore a document whose group is not in the tree.
 ///
 /// Read rule (the stored row is configuration, never silently defaulted): a row whose
 /// `plugins_json` does not parse, holds a non-boolean or an UNKNOWN key, or whose scalar fields fail

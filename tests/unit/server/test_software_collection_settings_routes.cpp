@@ -827,3 +827,28 @@ TEST_CASE("collection settings host route: effective settings over the pure reso
         CHECK(rig.call("GET", host1, rig.cookie("nobody"))->status == 403);
     }
 }
+
+TEST_CASE("collection settings routes: a deleted group's document is not listed and not resolved",
+          "[pg][routes][collection_settings]") {
+    RoutesRig rig;
+    const auto boss = rig.global_admin();
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
+    REQUIRE(rig.call("PUT", rig.doc_path(rig.group_s), boss, put_body(10800, 1000))->status == 200);
+    REQUIRE(rig.mgmt.add_member(rig.group_c, "agent-1").has_value());
+    REQUIRE(rig.mgmt.add_member(rig.group_s, "agent-1").has_value());
+    const std::string host = "/api/v1/inventory/software/hosts/agent-1/collection-settings";
+    const std::string list = "/api/v1/inventory/software/collection-settings";
+    // Control: while S exists its priority-1000 document wins and both documents are listed.
+    CHECK(rig.parse(*rig.call("GET", host, boss))["data"]["source_group_id"] == rig.group_s);
+    CHECK(rig.parse(*rig.call("GET", list, boss))["data"]["documents"].size() == 2);
+
+    REQUIRE(rig.mgmt.delete_group(rig.group_s).has_value());
+    // The store keeps the orphan row (no cross-schema foreign key); the routes ignore it.
+    REQUIRE(rig.store->list_all()->size() == 2);
+    const auto listed = rig.parse(*rig.call("GET", list, boss));
+    REQUIRE(listed["data"]["documents"].size() == 1);
+    CHECK(listed["data"]["documents"][0]["group_id"] == rig.group_p);
+    const auto resolved = rig.parse(*rig.call("GET", host, boss));
+    CHECK(resolved["data"]["source_group_id"] == rig.group_p);
+    CHECK(resolved["data"]["effective"]["interval_s"] == 7200);
+}
