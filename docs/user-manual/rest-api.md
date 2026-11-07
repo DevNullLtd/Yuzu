@@ -10127,8 +10127,8 @@ A failed read of the execution store answers `503` with `retry_after_ms: 2000`, 
 
 Server-side per-plugin configuration, sealed plugin secrets, and the plugin/action **kill switch**
 (the `plugin_config_store` Postgres schema; decision record
-[ADR-3005](../adr/3005-plugin-config-store.md)). Every response uses the `{data, meta}` envelope and
-every error the A4 envelope. Plugin and action names must start with a lowercase ASCII letter, followed
+[ADR-3005](../adr/3005-plugin-config-store.md)). Every success response carries `meta`: reads and writes use the `{data, meta}` envelope and both
+`DELETE`s return `{deleted, meta}`. Every error uses the A4 envelope. Plugin and action names must start with a lowercase ASCII letter, followed
 by lowercase letters, digits or `_` (1–64 bytes). A key follows the same rule but may also contain
 internal dots for a nested path such as `smtp.host`, up to 128 bytes. A store that is unavailable
 answers `503` with `retry_after_ms: 2000`.
@@ -10167,10 +10167,10 @@ administrator can read this route but not the panel.
 }
 ```
 
-**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, a
-service-scoped token, or an authorization store that is closed or degraded, which fails closed),
-`503` (the plugin config store is unavailable, or the authorization store is unavailable to an engine
-principal).
+**Errors:** `400` (the `plugin` query parameter is not a valid plugin name), `401` (not signed in),
+`403` (no global `PluginConfig:Read`, a confined grant, a service-scoped token, or an authorization
+store that is closed or degraded, which fails closed), `503` (the plugin config store is
+unavailable, or the authorization store is unavailable to an engine principal).
 
 #### `GET /api/v1/plugin-config/{plugin}/{key}`
 
@@ -10253,7 +10253,8 @@ counts as disabled. This view instead reports the store error. If no row has eve
 reads `enabled: true`. Without `os` the route reports only the all-OS layer and never shows a per-OS
 OFF row. With `os`, `enabled` is the effective state of the two layers combined: the OS layer can
 narrow the all-OS layer but never widen it, and within the OS layer an `action@os` ON row overrides a
-`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row).
+`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row), and
+`reason`, `set_by` and `updated_at_ms` come from that same row.
 
 ```json
 {
@@ -10290,8 +10291,72 @@ rule delivery, disable or remove the rules instead. The response returns the row
 not the effective state, in the same shape as the `GET` above.
 
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
-plugin/action/os/reason, or `?os=` present but empty), `413`, `500`, `503` (store unavailable, or the
-audit row could not be saved).
+plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
+may not have been applied: see "After a `500`" below), `503` (store unavailable, or the audit row could not be saved).
+
+**After a `500`.** The write may or may not have been applied, and the `GET` cannot always tell. Read
+the switch back with a `GET` for the same `plugin`, `action` and `os` (needs `PluginConfig:Read`), then:
+
+- If the `GET` answers `503`, the store is unavailable. Wait until the server is ready and read the switch
+  back again, then follow the rest of this list. If you cannot read it back: for a stop (`enabled` false),
+  repeat the `PUT`; for an enable, ask a holder of `PluginConfig:Read` to read it, and do not repeat it.
+- If the `GET` answers `403`, either you hold `PluginConfig:Write` but not `PluginConfig:Read`, or the
+  authorization store is degraded (it shares the database with the plugin config store, so the fault behind
+  the `500` can cause this too). Wait until the server is ready and read the switch back again. If it
+  still answers `403`, ask a holder of `PluginConfig:Read`, or, for a stop, repeat the `PUT`.
+- If `source` is empty, no row exists for this scope key, yours included: repeat the `PUT`.
+- If `source` names the row you wrote (`plugin`, `plugin.action`, with `@os` appended when `os` was set),
+  `enabled` and `reason` are what you sent and `set_by` is you, the write applied. For a whole-plugin stop
+  (`action` omitted) that covers the plugin row only: an action with its own ON row keeps running, so check
+  any action that matters with `?action=`.
+- If `source` names the plugin row of your own layer where you wrote an action row (`plugin` where you wrote
+  `plugin.action`, `plugin@os` where you wrote `plugin.action@os`), your action row is absent: within a layer
+  the `GET` picks an action row over the plugin row, and the server never deletes a kill-switch row. This is
+  the same state as an empty `source`: repeat the `PUT`.
+- If `source` names your row but `enabled`, `reason` or `set_by` differ, either your write did not apply
+  and the row still holds an earlier value, or someone changed the switch after it; the `GET` cannot tell
+  which. Do the audit check below.
+- If you set `os` and `source` names a row without `@os`, the all-OS layer decided the effective state, and
+  your `@os` row, if it exists, can be masked by a disabling all-OS row, so the `GET` does not show whether
+  your write applied. Do the audit check below for your own scope key, and read the `source` key as well.
+
+**Audit check.** Read the rows with
+`GET /api/v1/audit?action=plugin_config.kill_switch.set&target_type=PluginConfig&target_id=<scope key>&since=<epoch seconds>&limit=1000`
+(needs `AuditLog:Read`, which is admin-only while RBAC is off). The scope key is the `target_id` shown
+above, `<plugin>[.<action>][@<os>]`; use your own. Set `since` at least 10 minutes before your first
+request: the server clock stamps the rows, not yours, and a `since` that is too late hides your own rows
+and other writers' rows, which would read below as if nobody had written. Rows come back newest first;
+each has an `id`, a `principal`, a `detail` (`enabled=true` or `enabled=false`, plus the `reason` when one
+was given) and a `result` of `attempted`, `success` or `failure`. Timestamps are whole seconds, so "after"
+below means a higher `id`, never a later timestamp. Your own `attempted` row must be in the result; if it
+is not, widen `since` or page with `offset` before concluding anything.
+
+Take your own failed requests out first. Every `attempted` or `failure` row with your `principal` and
+exactly your `detail` is yours, from this request or an earlier retry, and a row from your own other
+session with that same `detail` cannot differ from your write, so ignore all of them. Then count the rest,
+from any principal (a row from your own account with a different `detail` counts): a `success` or `failure`
+row with a higher `id` than your first `attempted` row (a `failure` row means the write errored, not that
+it did not apply); and any `attempted` row with no `success` or `failure` row of the same `principal` and
+`detail` after it, whatever its `id`, because that write may land after yours or its outcome row was lost.
+If there is no such row, no other write is recorded: repeat the `PUT`. If there is one, do not repeat the `PUT` until you have agreed the intended
+state with that operator. The exception is a stop (`enabled` false): repeat it and tell them. A repeated
+stop replaces whatever the row holds, including their re-enable, which is the safe direction for an
+emergency but not harmless.
+
+If `source` named another key, read that key's rows the same way to understand the effective state: a
+change at that row decides it, so agree it first, and a repeated enable will not change the effective
+state while that row stands. Only rows on your own scope key decide whether to repeat.
+
+If you do not hold `AuditLog:Read`, or the audit read answers `403` or `503` and keeps doing so after the
+server is ready (the authorization or audit store is degraded, which the fault behind the `500` can cause
+too), you cannot read the audit rows: wait and retry first, then ask a holder of `AuditLog:Read` to check,
+giving them your `principal`, your exact `detail`, your first request time and the scope key, so they ignore
+your own rows by the rule above. If nobody can and your request was a stop, repeat it; if it was an enable,
+do not repeat it.
+
+A repeat is idempotent: it leaves the same `enabled` and `reason` but replaces `set_by` and
+`updated_at_ms`, and writes its own audit rows. The `attempted` row of the failed request stays in the
+trail, with a `failure` row after it when that row could be saved.
 
 ---
 
@@ -10337,6 +10402,11 @@ Mint a one-time upload grant for an agent. Operator-facing.
 SHA-256 digest. The response is sent `Cache-Control: no-store, no-cache, must-revalidate`
 and `Pragma: no-cache`.
 
+**Audit:** `upload_grant.mint` is written after the grant is created, or when the store refuses the mint. It
+is set-and-proceed: a row that cannot be saved sets `Sec-Audit-Failed` and the grant stands (the MCP twin
+`mint_upload_grant` reports `audit_persisted:false` in its result instead). **Known defect (#5626):** the
+shipped agent client cannot yet redeem a grant, see [Uploads](#uploads).
+
 #### `GET /api/v1/upload-grants`
 
 List upload grants. **Permission:** `UploadGrant:Read`, routed through
@@ -10352,10 +10422,15 @@ the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permiss
 
 Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
-revocable (already redeemed or already revoked). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
+revocable (already redeemed or already revoked), and `503` if the store is unavailable or the
+`attempted` audit row cannot be saved. When the audit row could not be saved nothing was revoked, so
+retry. After a store error the revoke may or may not have applied: retry, and a `404` on the retry then
+means the first call applied, the grant was redeemed or revoked by someone else in the meantime, or it never
+existed; read the grant's state with `GET /api/v1/upload-grants` (needs `UploadGrant:Read`). The two `503`
+causes carry different messages. An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
-upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
+upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads) (read its known-defect note first).
 The `content_dist` agent plugin's `upload_file` action is the reference
 client — see its [InstructionDefinition](../../content/definitions/t2_capabilities.yaml)
 for the operator-facing parameters (`path`, `grant_id`, `grant_secret`).
@@ -10372,6 +10447,21 @@ session credential (`X-Yuzu-Upload-Session`). There is no `Permission:` line for
 MCP twin: MCP authenticates as an operator, and this credential belongs to the agent (a permanent
 ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the reference client.
 
+**Known defect (#5626).** The server's session check does not yet exempt these five routes,
+so a request that carries only the grant or session header is answered `401` with the generic
+`{"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}}` body before the handler
+runs. That body has no `reason`, unlike the handler's own `401` values below. Until #5626 is fixed, a
+client that presents only the grant or session header, as the shipped `upload_file` client does, cannot
+open an upload, so the protocol described here cannot start. There is no supported workaround: minting a
+grant succeeds, but the agent cannot redeem it and an unredeemed grant expires. Never put an operator
+credential on the agent to get past the refusal: it would give the endpoint operator authority, and the
+shipped client cannot send one. Server-side the refusal leaves no audit row and no per-route metric (only
+the fleet-wide `yuzu_http_requests_total` 401 count moves). To check for it, look for `upload_grant.mint`
+success rows older than 15 minutes (the longest grant lifetime) with no `upload_grant.session_open` row of any
+result for that grant id, or grants that `GET /api/v1/upload-grants` still lists as minted past their
+`expires_at` (needs `UploadGrant:Read`), while agents report `401` and `yuzu_server_audit_emit_failed_total` is flat (a lost row looks the same).
+Revoke the unused grants or let them expire.
+
 **Common to all five routes:**
 
 - **TLS required.** On a deployment serving plain HTTP, every route returns `400` with `reason: tls_required`.
@@ -10384,16 +10474,19 @@ ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the ref
 - **Credentials.** Both headers are `<id>.<secret>`. An unknown id and a wrong secret get the same
   `401` (`grant_unknown` / `session_unknown`). For the four `{upload_id}` routes, the id in
   `X-Yuzu-Upload-Session` must equal the `{upload_id}` path segment, or the request also gets `401 session_unknown`.
-- **Expiry.** A session expires when its grant expires. The first request after `expires_at` (status,
-  chunk, commit or cancel) discards the partial file and returns `410 expired`.
+- **Expiry.** A session expires when its grant expires. A request after `expires_at` (status, chunk,
+  commit or cancel) on a session that is still open or already expired returns `410 expired`. A
+  session that was committed or cancelled before then keeps answering as terminal (`409 session_terminal`;
+  status answers `200`). The request that wins the expiry transition also tries to discard the partial
+  file; a removal that fails is logged and the file stays.
 - **Body cap.** Every `/api/v1/uploads` route is capped at 8 MiB before authentication and must send a
-  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps).
+  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407).
 - **Store unavailable:** `503`.
 
 #### `POST /api/v1/uploads`
 
 Redeems a grant and opens an upload session. Send header `X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`
-and no body. Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
+and no body (send `Content-Length: 0`; a `POST` without a `Content-Length` is answered `411`). Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
 
 **Response (`201`):**
 
@@ -10416,8 +10509,8 @@ Returns the session's status, for example so an agent can resume. Send `X-Yuzu-U
 `open`, `committed` or `cancelled`; a committed or cancelled session still answers `200` with its
 final state. An expired session never answers `200`: it gets `410 expired`. Neither `upload_id` nor the declared size is returned.
 
-**Errors:** `401 session_unknown`; `410 expired`. When this request is the first one after expiry, it
-also discards the partial file.
+**Errors:** `401 session_unknown`; `410 expired`. When this request wins the expiry transition, it
+also tries to discard the partial file (a removal that fails is logged and the file stays).
 
 #### `PUT /api/v1/uploads/{upload_id}/chunk`
 
@@ -10433,10 +10526,14 @@ from there); `409 session_terminal`; `410 expired`; `413 chunk_too_large`; `413 
 asserted `total` or the running total exceeds the grant's `declared_max_size`); `500` (the file could
 not be opened or written).
 
-**`size_exceeded` ends the session:** the server cancels it and discards the partial file.
+**`size_exceeded` attempts to end the session:** the server tries to cancel it and, when that cancel succeeds, discards the partial file. The request answers `413` either way.
 
 **Audit:** chunks are not audited one by one. Only `upload_grant.chunk` `failure` rows for `expired`
-and `size_exceeded` are written.
+and `size_exceeded` are written. Like the other device-side upload rows, this is set-and-proceed: a row
+that cannot be persisted sets `Sec-Audit-Failed` on the response and the request still completes.
+The header reaches the calling agent; operators see a dropped row through
+`yuzu_server_audit_emit_failed_total` and the `YuzuAuditPersistFailures` alert (an audit hook that throws
+is logged as a WARN line beginning `audit_fn threw` and still sets the header, but is not counted).
 
 #### `POST /api/v1/uploads/{upload_id}/commit`
 
@@ -10454,14 +10551,15 @@ and it must match the grant's `expected_sha256` if one was set. The file must al
 
 **Errors:** `400` (`sha256` missing); `401 session_unknown`; `409 session_terminal` (including when a
 concurrent commit or cancel got there first); `410 expired`; `422 hash_mismatch` (the session is
-cancelled and the partial file discarded); `500` (the stored file could not be read back for
-verification).
+cancelled and the server tries to discard the partial file); `500` (the stored file could not be read back for
+verification; the session stays open, so the commit can be retried); `503` (store unavailable; read the
+session status before retrying).
 
 **Audit:** `upload_grant.commit` (`success` with `size=<n>`, or `failure`).
 
 #### `DELETE /api/v1/uploads/{upload_id}`
 
-Cancels an open session and discards the partial file. Header `X-Yuzu-Upload-Session`; no body.
+Cancels an open session and tries to discard the partial file (a removal that fails is logged and the file stays). Header `X-Yuzu-Upload-Session`; no body.
 
 **Response:** `204`.
 
