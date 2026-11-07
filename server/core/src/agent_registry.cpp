@@ -1139,13 +1139,15 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
          "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
-         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
+         "with apt/snap/flatpak counts; Windows Chocolatey lib presence and winget presence "
+         "from the Appx roster; read-only, no subprocess)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
-         "Linux unsupported by design; installed_apps owns the roster)"},
+         "List macOS Homebrew formulae and casks and Windows Chocolatey packages by name, "
+         "version and kind (Linux unsupported by design; installed_apps owns the roster)"},
         {"pkg_inventory.store_packages",
-         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
-         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux) and "
+         "the Windows Appx/MSIX all-user roster (read-only, no subprocess; macOS unsupported "
+         "by design)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
@@ -1153,10 +1155,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "
-         "install path (Linux only; standard roots only, directory walk, no subprocess)"},
+         "install path (Windows registry, macOS and Linux standard-root directory walks; "
+         "no subprocess)"},
         {"runtimes.jvm",
          "List installed JVMs by image type, version, home and vendor from each home's "
-         "release file (Linux only; standard roots only, no subprocess)"},
+         "release file (Windows registry, macOS JavaVirtualMachines and Linux standard "
+         "roots; no subprocess)"},
         {"runtimes.python",
          "List installed Python interpreters by flavour, version, install path and vendor "
          "(Windows PEP 514 registry keys, macOS python.org framework, Linux python3.<minor> "

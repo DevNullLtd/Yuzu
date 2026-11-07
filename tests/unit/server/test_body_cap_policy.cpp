@@ -18,10 +18,14 @@
  * exists to catch.
  */
 
+#include "body_cap_httplib.hpp"
 #include "body_cap_policy.hpp"
 #include "post_read_stage_test_support.hpp"
+#include "raw_close_probe.hpp"
 #include "test_loopback_http.hpp"
 #include "web_utils.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <httplib.h>
 
@@ -30,15 +34,22 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(__has_feature)
 #  if __has_feature(thread_sanitizer)
@@ -59,11 +70,13 @@
 using yuzu::server::BodyCapDecision;
 using yuzu::server::BodyCapMatch;
 using yuzu::server::body_cap_prefix_matches;
+using yuzu::server::content_encoding_for_body_cap;
 using yuzu::server::content_length_for_body_cap;
 using yuzu::server::evaluate_body_cap;
 using yuzu::server::kBodyCapAnyMethod;
 using yuzu::server::kBodyCapTable;
 using yuzu::server::resolve_body_cap;
+using yuzu::server::transfer_encoding_for_body_cap;
 
 namespace {
 
@@ -474,9 +487,12 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_sess
 // ── 8. On-the-wire coverage for the D1-D4 hardening of the pre-routing
 //       chokepoint (server.cpp `set_pre_routing_handler`) ───────────────────
 //
-// SKIPPED UNDER ThreadSanitizer (#438), same reasoning as
-// test_mcp_body_cap.cpp: this deliberately exercises httplib::Server's
-// middleware wiring, which crashes the TSan build.
+// Compiled out under ThreadSanitizer (#438, the guard below), as in
+// test_mcp_body_cap.cpp. The original reason was a crash of the TSan build in
+// httplib's asynchronous name lookup; CI's TSan jobs now preload a synchronous
+// getaddrinfo shim (scripts/ci/build-gai-sync-shim.sh, used by nightly.yml and
+// sanitizer-tests.yml) that covers loopback servers, so the guard is a leftover
+// until this section is re-enabled and run under TSan.
 //
 // This fixture drives the SAME UNIFIED pre-routing DECISION server.cpp's
 // `enforce_pre_auth_body_cap` lambda makes (D1: one branch for every path,
@@ -584,6 +600,10 @@ struct UnifiedBodyCapTestServer {
         sink.Get("/health", ok_handler);
         sink.Post("/health", ok_handler);
         sink.Post("/mcp/v1/", ok_handler);
+        // Bodyless DELETE (MCP session teardown): a method other than POST/PUT/PATCH, so an
+        // absent Content-Length is not itself "unmeasurable", which isolates the
+        // Transfer-Encoding argument in the empty-first-line wire test below.
+        sink.Delete("/mcp/v1/", ok_handler);
         // A small-cap (256 KiB), requires_measurable=false class — used by
         // the post-read-stage tests below so a genuine chunked over-cap body
         // stays cheap to send in a test.
@@ -606,9 +626,14 @@ struct UnifiedBodyCapTestServer {
             // so a mutation to production's combination (an inverted
             // condition, a swapped 411/413, a dropped branch) had nothing
             // here that could see it. Routing through the one shared
-            // function makes that divergence structurally impossible instead
-            // of something to keep re-verifying by hand. `is_chunked` still
-            // MUST come from httplib's own `is_chunked_transfer_encoding`
+            // function shares the COMBINATION of predicates, so it need not be
+            // re-verified by hand. The Content-Length, Transfer-Encoding and
+            // Content-Encoding ARGUMENTS come from the same accessors
+            // server.cpp uses (`content_length_for_body_cap`,
+            // `transfer_encoding_for_body_cap`); a raw first-line
+            // `get_header_value("Transfer-Encoding")` would miss an empty first
+            // line followed by `chunked`. `is_chunked` still
+            // MUST come from httplib's own chunked decision, `is_chunked_for_body_cap`
             // (unchanged from before this extraction — a prior version of
             // this fixture called `req.get_header_value_u64` directly for
             // Content-Length while production hand-rolled a
@@ -619,10 +644,10 @@ struct UnifiedBodyCapTestServer {
             // that specific gap, `evaluate_body_cap` closes the
             // decision-combination gap this same defect class lives in).
             const auto decision = evaluate_body_cap(
-                req.method, req.path, req.has_header("Content-Length"),
-                content_length_for_body_cap(req), req.get_header_value("Transfer-Encoding"),
-                req.get_header_value("Content-Encoding"),
-                httplib::detail::is_chunked_transfer_encoding(req.headers));
+                req.method, req.path, yuzu::server::has_content_length_for_body_cap(req),
+                content_length_for_body_cap(req), transfer_encoding_for_body_cap(req),
+                content_encoding_for_body_cap(req),
+                yuzu::server::is_chunked_for_body_cap(req));
             if (decision.refuse) {
                 res.status = decision.status;
                 pre_routing_rejections.fetch_add(1);
@@ -862,7 +887,29 @@ TEST_CASE("Pre-routing body cap: a non-chunked Transfer-Encoding does NOT suppre
                                 te + "\r\n\r\n";
         const auto resp = raw_request_status_line(ts.port, req);
         INFO("Transfer-Encoding: " << te);
-        CHECK(resp.starts_with("HTTP/1.1 413"));
+        // httplib >= 0.43 rejects Content-Length > 0 together with ANY Transfer-Encoding with a 400
+        // (RFC 9112 6.3) BEFORE the pre-routing gate runs, so the gate's own 413 is only reachable on
+        // older httplib. Either way the request must be refused and the handler must never run; the
+        // gate's authoritative-length logic is pinned directly by the pure tests above.
+        CHECK((resp.starts_with("HTTP/1.1 413") || resp.starts_with("HTTP/1.1 400")));
+    }
+    CHECK(ts.handler_calls.load() == 0);
+
+    // Content-Length: 0 with a non-chunked Transfer-Encoding: httplib 0.43 let it through to the gate
+    // (the 400 applied to a non-zero length); httplib 0.59.0 answers 400 to ANY Transfer-Encoding
+    // whose final coding is not chunked, whatever the Content-Length. Both are safe. The property
+    // pinned here is that there is nothing to cap, so it is never answered 413, and that the
+    // handler never runs for a request httplib considers mis-framed (asserted below for the 400).
+    for (const auto* te : {"identity", "x"}) {
+        const std::string req0 = std::string("POST /api/v1/ca/import-chain HTTP/1.1\r\n"
+                                             "Host: 127.0.0.1\r\n"
+                                             "Content-Length: 0\r\n"
+                                             "Transfer-Encoding: ") +
+                                 te + "\r\n\r\n";
+        const auto resp0 = raw_request_status_line(ts.port, req0);
+        INFO("Content-Length: 0 + Transfer-Encoding: " << te << " -> " << resp0);
+        CHECK_FALSE(resp0.starts_with("HTTP/1.1 413"));
+        CHECK(resp0.starts_with("HTTP/1.1 400"));
     }
     CHECK(ts.handler_calls.load() == 0);
 
@@ -912,21 +959,16 @@ TEST_CASE("Pre-routing body cap: a non-identity Content-Encoding is refused rega
 
     // A request with NO Content-Encoding header (ordinary traffic) is still
     // admitted (sanity: the check is encoding-VALUE aware, not "any
-    // Content-Encoding header present"). Deliberately NOT tested by sending
-    // an EXPLICIT `Content-Encoding: identity` end-to-end here: doing so
-    // during development surfaced a SEPARATE, PRE-EXISTING httplib quirk,
-    // unrelated to this change — `detail::create_decompressor` (httplib.h:
-    // 6717) recognises only gzip/deflate/br/zstd and returns null for
-    // anything else INCLUDING the literal string "identity", so httplib's
-    // own content-reader 415s an explicit `identity` value for any ordinary
-    // route's body read (`prepare_content_receiver`, httplib.h:6980-6986) —
-    // completely independent of `has_non_identity_content_encoding`, which
-    // correctly does NOT refuse it at THIS (pre-routing) chokepoint. That
-    // downstream quirk is out of scope for #2407 and worth its own follow-up
-    // (an explicit `identity` is a materially different declaration from
-    // omitting the header, and RFC 7231 §3.1.2.1 lists it as valid), but
-    // asserting past it here would make this test depend on unrelated
-    // httplib internals rather than on the D4 decision under test.
+    // Content-Encoding header present"). An EXPLICIT `Content-Encoding: identity`
+    // is asserted end-to-end in its own case further down, because the docs
+    // promise it is admitted. Background: through 0.37.1 `detail::create_decompressor`
+    // recognised only gzip/deflate/br/zstd and returned null for anything else
+    // INCLUDING the literal string "identity", so httplib's own content-reader
+    // 415'd an explicit `identity` value for any ordinary route's body read. From
+    // 0.59.0 `prepare_content_receiver` leaves an unrecognised coding, "identity"
+    // included, alone and passes the payload through (httplib.h v0.59.0:8489-8500).
+    // `has_non_identity_content_encoding` never refused it at THIS (pre-routing)
+    // chokepoint.
     auto r3 = cli.Post("/api/v1/devices", "small body", "application/json");
     REQUIRE(r3);
     CHECK(r3->status == 200);
@@ -972,6 +1014,73 @@ TEST_CASE("Pre-routing body cap: /mcp/ still behaves as before through the unifi
     }
     CHECK(ts.handler_calls.load() == 0);
 }
+
+TEST_CASE("Pre-routing body cap: an empty first Transfer-Encoding line followed by chunked is "
+          "refused 411 on a requires_measurable class",
+          "[body_cap][mcp][bounds][integration]") {
+    // `get_header_value("Transfer-Encoding")` reads the empty FIRST line, which reads as "no
+    // Transfer-Encoding", while httplib reads the last line (chunked). DELETE is used because it
+    // is a method (not POST/PUT/PATCH) whose absent Content-Length is not itself
+    // unmeasurable, so the 411 can only come from the Transfer-Encoding argument
+    // (`transfer_encoding_for_body_cap`) reaching `evaluate_body_cap`. The body is complete so a fixture that wrongly admits the request
+    // answers promptly instead of waiting on the chunk reader.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string req = "DELETE /mcp/v1/ HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Transfer-Encoding:\r\n"
+                            "Transfer-Encoding: chunked\r\n\r\n"
+                            "0\r\n\r\n";
+    const auto resp = raw_request_status_line(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 411"));
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: an empty first Content-Encoding line followed by an encoding is "
+          "refused 415",
+          "[body_cap][bounds][integration]") {
+    // `get_header_value("Content-Encoding")` reads the empty FIRST line, which reads as "no
+    // encoding", while httplib's body reader decodes against the combined value (`br`). The
+    // gate must refuse on the value httplib acts on (`content_encoding_for_body_cap`), so a body
+    // httplib would decode never reaches the reader or a handler.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string body = "garbage";
+    const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Encoding:\r\n"
+                            "Content-Encoding: br\r\n"
+                            "Content-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body;
+    const auto resp = raw_request_status_line(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 415"));
+    // The gate answered (httplib without a brotli build would answer 415 itself).
+    CHECK(ts.pre_routing_rejections.load() == 1);
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: an explicit Content-Encoding: identity is admitted",
+          "[body_cap][bounds][integration]") {
+    // The docs promise an explicit `identity` reaches the handler. It does so only while both
+    // the gate (an exact, case-insensitive `identity`) and httplib's reader (an unrecognised
+    // coding is passed through) agree, so a bump or a gate change that breaks either side fails
+    // here instead of silently changing what clients may send.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string body = "small body";
+    const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Encoding: identity\r\n"
+                            "Content-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body;
+    const auto resp = raw_request_status_line(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 200"));
+    CHECK(ts.pre_routing_rejections.load() == 0);
+    CHECK(ts.handler_calls.load() == 1);
+}
 #endif // !_WIN32
 
 TEST_CASE("Pre-routing body cap: /mcp/ still behaves as before through the unified path "
@@ -997,9 +1106,9 @@ TEST_CASE("Pre-routing body cap: an all-digit Content-Length above 2^64-1 is ref
     // The defect this pins: `std::from_chars` reports
     // `result_out_of_range` for these two values and the pre-#2407-R1 code
     // folded that to `content_length = 0` ("no header present, don't
-    // cap") — while httplib's own `is_numeric()` + `strtoull()` parser
-    // (httplib.h:2769-2789) accepts the same all-digit string and returns
-    // `SIZE_MAX`, which is what it ALSO uses to decide what it buffers.
+    // cap") — while httplib's own accessor returned `SIZE_MAX` for it (0.37.1:
+    // `is_numeric()` + `strtoull()`), which is what it ALSO used to decide what it buffers. 0.59.0
+    // flags the value invalid and answers 400 (`get_header_value_u64`, httplib.h v0.59.0:3480-3506).
     // `content_length_for_body_cap` (web_utils.hpp) now delegates to that
     // same accessor, so both values must resolve to "oversize" (413), on
     // the plain catch-all class, not just /mcp/.
@@ -1015,7 +1124,10 @@ TEST_CASE("Pre-routing body cap: an all-digit Content-Length above 2^64-1 is ref
                                 overflow_value + "\r\n\r\n";
         INFO("Content-Length: " << overflow_value);
         const auto resp = raw_request_status_line(ts.port, req);
-        CHECK(resp.starts_with("HTTP/1.1 413"));
+        // httplib 0.59.0 treats an out-of-range Content-Length as invalid and answers 400 while
+        // parsing the request head, before the pre-routing gate runs; older httplib saturates to
+        // SIZE_MAX and the gate answers 413. Either refuses it before any body is read.
+        CHECK((resp.starts_with("HTTP/1.1 413") || resp.starts_with("HTTP/1.1 400")));
     }
     CHECK(ts.handler_calls.load() == 0);
 }
@@ -1024,14 +1136,14 @@ TEST_CASE("Pre-routing body cap: a malformed (non-numeric) Content-Length is nev
           "silently admitted — refused end-to-end even where this gate alone reads it "
           "as absent (#2407 R2)",
           "[body_cap][bounds][integration]") {
-    // `is_numeric()` (httplib.h:2769-2773) requires EVERY character to be
+    // `is_numeric()` (httplib.h v0.59.0:3476-3478) requires EVERY character to be
     // an ASCII digit, so each of these fails it and
     // `content_length_for_body_cap` reads them as 0 — matching httplib's
     // OWN accessor exactly (that is the point of #2407 R1/R2: one shared
     // function, not two that might disagree). A 0 reading is NOT oversize,
     // so THIS gate alone lets the request past as Unhandled. That is fine,
     // not a re-opened gap: httplib's own body reader
-    // (`detail::read_content`, httplib.h:7057-7063) independently rejects
+    // (`detail::read_content`, httplib.h v0.59.0:8574-8579) independently rejects
     // the SAME malformed header with its own `is_invalid_value` check and
     // answers 400 before any route handler runs — this test asserts THAT
     // end-to-end outcome, proving the request is refused somewhere in the
@@ -1064,23 +1176,18 @@ TEST_CASE("Pre-routing body cap: a malformed (non-numeric) Content-Length is nev
 TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync the "
           "gate's decision from httplib's own body read (#2407 R2)",
           "[body_cap][bounds][integration]") {
-    // httplib's `Headers` is `std::unordered_multimap<..., case_ignore::hash,
-    // case_ignore::equal_to>` (httplib.h:778-780) — an UNORDERED container,
-    // not the ordered `std::multimap` an RFC 7230 "first occurrence" framing
-    // might suggest. WHICH of two duplicate `Content-Length` values
-    // `get_header_value_u64("Content-Length", 0, /*id=*/0)` resolves to is
-    // therefore UNSPECIFIED by the C++ standard (hash-bucket insertion
-    // order, not header-line order). Measured empirically against this
-    // vcpkg baseline while writing this test (a standalone reproduction
-    // against a real httplib::Server): `id=0` resolved to the LAST header
-    // LINE sent, not the first — the opposite of what an ordered container,
-    // or an RFC-literal reading, would give. This test deliberately does
-    // NOT assert on that specific measurement, because it is an
-    // IMPLEMENTATION detail that could shift with a future vcpkg bump, not
-    // a contract. What it asserts instead is the SAFETY property that holds
-    // regardless of which duplicate value httplib's bucket order happens to
-    // prefer: `content_length_for_body_cap` (this gate) and httplib's own
-    // body reader (httplib.h:7057-7061) call the IDENTICAL accessor with
+    // Through 0.37.1 httplib's `Headers` was `std::unordered_multimap<...,
+    // case_ignore::hash, case_ignore::equal_to>`, an UNORDERED container, so
+    // WHICH of two duplicate `Content-Length` values
+    // `get_header_value_u64("Content-Length", 0, /*id=*/0)` resolved to was
+    // UNSPECIFIED by the C++ standard (measured then: the LAST header line
+    // sent). From 0.59.0 `Headers` is an insertion-ordered multimap
+    // (httplib.h v0.59.0:1084-1101, 1360-1362), so `id=0` is the FIRST line
+    // sent. This test deliberately does NOT assert on which one wins, because
+    // that is an implementation detail that could shift with a future vcpkg
+    // bump, not a contract. What it asserts instead is the SAFETY property that
+    // holds regardless of which duplicate value httplib prefers: `content_length_for_body_cap` (this gate) and httplib's own
+    // body reader (httplib.h v0.59.0:8574-8576) call the IDENTICAL accessor with
     // the IDENTICAL id against the SAME already-parsed `Headers` object,
     // for the SAME single request — so whichever value "wins" is the SAME
     // value at BOTH call sites, deterministically, every time. There is no
@@ -1099,7 +1206,7 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
                             "Content-Length: 99999999999999999999999\r\n\r\n" +
                             small_body;
     const auto resp = raw_request_status_line(ts.port, req);
-    // Whichever duplicate value httplib's unordered_multimap resolves as
+    // Whichever duplicate value httplib's reader resolves as
     // id=0: either it is the oversize one — refused here, 413, handler
     // never runs — or it is the small one — admitted, and httplib's ACTUAL
     // body read is then bounded to those `small_body.size()` bytes we
@@ -1108,11 +1215,40 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
     // of these) would mean the gate and the real reader disagreed about
     // which duplicate to trust — the split-brain this test exists to rule
     // out.
-    const bool refused = resp.starts_with("HTTP/1.1 413");
+    // httplib >= 0.43 (RFC 9110 8.6) rejects DIFFERING duplicate Content-Length values with a 400
+    // before the gate runs; older httplib resolves one of them and reaches the gate. Both are safe:
+    // the property is that nothing is buffered past the cap and the handler never sees a body the
+    // gate did not vet.
+    const bool refused = resp.starts_with("HTTP/1.1 413") || resp.starts_with("HTTP/1.1 400");
     const bool admitted = resp.starts_with("HTTP/1.1 200");
     INFO("response: " << resp);
     CHECK((refused || admitted));
     CHECK(ts.handler_calls.load() == (admitted ? 1 : 0));
+
+    // IDENTICAL duplicates are not rejected by httplib, so they still reach the gate and keep
+    // exercising the original same-accessor property: the oversize value must be refused by the
+    // gate (413), the small one admitted. The oversize value is deliberately a parseable u64:
+    // httplib 0.59.0 answers 400 to an out-of-range one before the gate (pinned by the test above).
+    {
+        const std::string big = "POST /api/v1/devices HTTP/1.1\r\n"
+                                "Host: 127.0.0.1\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: 99999999999\r\n"
+                                "Content-Length: 99999999999\r\n\r\n";
+        const auto rbig = raw_request_status_line(ts.port, big);
+        INFO("identical oversize duplicates -> " << rbig);
+        CHECK(rbig.starts_with("HTTP/1.1 413"));
+    }
+    {
+        const std::string ok = "POST /api/v1/devices HTTP/1.1\r\n"
+                               "Host: 127.0.0.1\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Content-Length: 2\r\n"
+                               "Content-Length: 2\r\n\r\nok";
+        const auto rok = raw_request_status_line(ts.port, ok);
+        INFO("identical small duplicates -> " << rok);
+        CHECK(rok.starts_with("HTTP/1.1 200"));
+    }
 }
 #endif // !_WIN32
 
@@ -1125,7 +1261,7 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
 // (`resolve_body_cap` etc.), never httplib's actual middleware wiring for
 // this stage, so a test written only against a fixture like that could not
 // have told a real server.cpp defect from a fixture defect. These cases
-// exercise the real stage wiring (registry plus route-sink wrapper) end-to-end —
+// exercise the real httplib `pre_request_handler_` call site end-to-end —
 // same reasoning as section 8 above for the pre-routing stage.
 #ifndef _WIN32
 TEST_CASE("Post-read body cap: a genuine chunked body over a class's cap is rejected "
@@ -1204,6 +1340,573 @@ TEST_CASE("Post-read body cap: a MEASURABLE over-cap body is still caught by the
     CHECK(ts.post_read_calls.load() == 0);
     CHECK(ts.post_read_rejections.load() == 0);
 }
+
+TEST_CASE("Pre-routing body cap: a pre-routing refusal closes the connection while the declared "
+          "body is still unsent",
+          "[body_cap][pre_routing][bounds][integration]") {
+    // The real gate (`evaluate_body_cap`, through the fixture) refuses a declared 64 MiB body on
+    // a route whose cap is 4 MiB. The probe sends the head and five body bytes and no more, with
+    // no `Expect` header (an `httplib::Client` would send `Expect: 100-continue` for a body this
+    // size and so never send it). A response head can therefore only arrive if the answer comes
+    // before the body is read; the 413 must carry `Connection: close` and the socket must reach
+    // EOF.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Type: application/octet-stream\r\n"
+                            "Content-Length: 67108864\r\n\r\nhello";
+    const auto r = yuzu::test::probe_for_close(ts.port, req);
+    INFO(r.head);
+    CHECK(r.head.starts_with("HTTP/1.1 413"));
+    CHECK(r.head.find("Connection: close") != std::string::npos);
+    CHECK(r.closed);
+    CHECK(ts.pre_routing_rejections.load() == 1);
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+namespace {
+
+/// A server whose ONLY handler is a pre-routing one answering a fixed status, with the SAME
+/// `close_if_unread_framed_body` helper server.cpp's post-routing handler calls on every response
+/// (the wiring is pinned lexically in test_step_up_wiring.cpp; this fixture reproduces no rule of
+/// its own).
+struct PreRoutingAnswerServer {
+    explicit PreRoutingAnswerServer(int status) {
+        // 30 s read timeout, as production: a body that is still being read is then unambiguous
+        // against the probe's wait (5 s by default).
+        svr.set_read_timeout(30, 0);
+        svr.set_pre_routing_handler(
+            [status](const httplib::Request&, httplib::Response& res)
+                -> httplib::Server::HandlerResponse {
+                res.status = status;
+                res.set_content("x", "text/plain");
+                if (status >= 300 && status < 400)
+                    res.set_header("Location", "/home");
+                return httplib::Server::HandlerResponse::Handled;
+            });
+        svr.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+            yuzu::server::close_if_unread_framed_body(req, res);
+        });
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        th = std::thread([this] { svr.listen_after_bind(); });
+        svr.wait_until_ready();
+    }
+    ~PreRoutingAnswerServer() {
+        svr.stop();
+        if (th.joinable())
+            th.join();
+    }
+    PreRoutingAnswerServer(const PreRoutingAnswerServer&) = delete;
+    PreRoutingAnswerServer& operator=(const PreRoutingAnswerServer&) = delete;
+
+    httplib::Server svr;
+    int port = 0;
+    std::thread th;
+};
+
+} // namespace
+
+TEST_CASE("Pre-routing answer: a response to a request with an unread framed body closes the "
+          "connection",
+          "[body_cap][pre_routing][bounds][integration]") {
+    // From httplib 0.59 a response below 400 that leaves a declared request body unread must
+    // carry `Connection: close`. The probe waits for EOF rather than reading the header
+    // alone: the header is what we set, EOF is what the SERVER did with it. The 302 and 200 rows
+    // pin the close rule; the 413 and 400 rows pin that a refusal is answered and closed too
+    // (httplib stamps close itself for a status >= 400). The third framing is an empty
+    // Transfer-Encoding line followed by `chunked`: `get_header_value` sees no Transfer-Encoding,
+    // httplib reads the body as chunked.
+    for (const int status : {302, 200, 413, 400}) {
+        for (const auto& [name, request] :
+             {std::pair<const char*, std::string>{"chunked", yuzu::test::kChunkedPostRequest},
+              std::pair<const char*, std::string>{"content-length 64 MiB declared",
+                                                  yuzu::test::kLengthPostRequest},
+              std::pair<const char*, std::string>{"empty then chunked Transfer-Encoding lines",
+                                                  yuzu::test::kEmptyThenChunkedPostRequest}}) {
+            DYNAMIC_SECTION("status " << status << ", " << name) {
+                PreRoutingAnswerServer ts(status);
+                const auto r = yuzu::test::probe_for_close(ts.port, request);
+                INFO(r.head);
+                CHECK(r.head.find("Connection: close") != std::string::npos);
+                CHECK(r.closed);
+            }
+        }
+    }
+}
+
+TEST_CASE("Pre-routing answer: a bodyless request keeps its keep-alive connection",
+          "[body_cap][pre_routing][integration]") {
+    // The close rule is for a declared, unread body only: an ordinary GET answered from the
+    // pre-routing handler (the sign-in redirect of a bookmarked page) must not lose keep-alive.
+    PreRoutingAnswerServer ts(302);
+    const auto r = yuzu::test::probe_for_close(
+        ts.port, "GET /home HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", std::chrono::seconds(2));
+    INFO(r.head);
+    CHECK(r.head.find("Connection: close") == std::string::npos);
+    CHECK_FALSE(r.closed);
+}
+
 #endif // !_WIN32
 
 #endif // !YUZU_TSAN_BUILD
+
+TEST_CASE("close_if_unread_framed_body: decides on status and declared framing",
+          "[body_cap][pre_routing]") {
+    // Pure logic: no sockets, so it runs on every platform and under TSan.
+    httplib::Request chunked;
+    chunked.headers.emplace("Transfer-Encoding", "chunked");
+    httplib::Request sized;
+    sized.headers.emplace("Content-Length", "10");
+    httplib::Request zero;
+    zero.headers.emplace("Content-Length", "0");
+    httplib::Request bare;
+    httplib::Request overflow;
+    overflow.headers.emplace("Content-Length", "99999999999999999999999");
+    // First line empty, last line chunked: get_header_value reads the empty first line.
+    httplib::Request empty_then_chunked;
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "");
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "chunked");
+
+    const auto closes = [](const httplib::Request& req, int status) {
+        httplib::Response res;
+        res.status = status;
+        yuzu::server::close_if_unread_framed_body(req, res);
+        return res.get_header_value("Connection") == "close";
+    };
+    CHECK(closes(chunked, 302));
+    CHECK(closes(sized, 200));
+    CHECK(closes(overflow, 302)); // out-of-range reads as SIZE_MAX, which is a declared body
+    CHECK(closes(empty_then_chunked, 302));
+    CHECK_FALSE(closes(zero, 302));
+    CHECK_FALSE(closes(bare, 302));
+    // 400 and above: httplib closes itself, the helper adds nothing.
+    CHECK_FALSE(closes(chunked, 413));
+    CHECK_FALSE(closes(sized, 400));
+    // A body a handler already read leaves nothing to drain: keep-alive is untouched.
+    httplib::Request consumed = sized;
+    consumed.body_consumed_ = true;
+    CHECK_FALSE(closes(consumed, 200));
+}
+
+TEST_CASE("content_encoding_for_body_cap: reads the combined value httplib decodes against",
+          "[body_cap]") {
+    httplib::Request none;
+    httplib::Request plain;
+    plain.headers.emplace("Content-Encoding", "br");
+    httplib::Request empty_then_br;
+    empty_then_br.headers.emplace("Content-Encoding", "");
+    empty_then_br.headers.emplace("Content-Encoding", "br");
+    httplib::Request identity_then_br;
+    identity_then_br.headers.emplace("Content-Encoding", "identity");
+    identity_then_br.headers.emplace("Content-Encoding", "br");
+    httplib::Request empty_only;
+    empty_only.headers.emplace("Content-Encoding", "");
+    CHECK(content_encoding_for_body_cap(none).empty());
+    CHECK(content_encoding_for_body_cap(empty_only).empty());
+    CHECK(content_encoding_for_body_cap(plain) == "br");
+    // The raw first-line read this accessor replaces sees nothing here.
+    CHECK(empty_then_br.get_header_value("Content-Encoding").empty());
+    CHECK(content_encoding_for_body_cap(empty_then_br) == "br");
+    CHECK(yuzu::server::has_non_identity_content_encoding(
+        content_encoding_for_body_cap(empty_then_br)));
+    // A list that is not exactly one coding is refused by the gate (httplib does not decode it).
+    CHECK(content_encoding_for_body_cap(identity_then_br) == "identity, br");
+    CHECK(yuzu::server::has_non_identity_content_encoding(
+        content_encoding_for_body_cap(identity_then_br)));
+}
+
+TEST_CASE("transfer_encoding_for_body_cap: an empty first line still reads as present",
+          "[body_cap]") {
+    httplib::Request none;
+    httplib::Request plain;
+    plain.headers.emplace("Transfer-Encoding", "chunked");
+    httplib::Request empty_then_chunked;
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "");
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "chunked");
+    CHECK(yuzu::server::transfer_encoding_for_body_cap(none).empty());
+    CHECK(yuzu::server::transfer_encoding_for_body_cap(plain) == "chunked");
+    // body_unmeasurable refuses any non-empty value, so the marker must not be empty.
+    CHECK_FALSE(yuzu::server::transfer_encoding_for_body_cap(empty_then_chunked).empty());
+    CHECK(yuzu::server::body_unmeasurable(
+        "POST", /*has_content_length=*/true,
+        yuzu::server::transfer_encoding_for_body_cap(empty_then_chunked)));
+}
+
+// ── httplib's pre-request handler runs before the body is read (cpp-httplib >= 0.47) ─────────────
+//
+// The post-read body cap and the step-up check measure `req.body`, so they must run AFTER httplib
+// has read it: they are installed through `PostReadStageRegistry` and the route sink, never as
+// `set_pre_request_handler`. The cases in this section keep that true when the baseline moves or
+// when the route-sink wrapper change is reverted on its own. The scan LOGIC below shares nothing
+// with the wrapper change's own wiring tests, but this file as a whole needs that change
+// (`post_read_stage_test_support.hpp`, `PostReadStageRegistry`), so it is the source scan that
+// carries the pin, not the file's independence.
+
+namespace {
+
+/// `{major, minor}` of the httplib this build links, from `CPPHTTPLIB_VERSION` ("0.59.0").
+/// A malformed string fails the test loudly instead of reading as an old version.
+std::pair<int, int> httplib_major_minor() {
+    const std::string_view v = CPPHTTPLIB_VERSION;
+    const auto dot1 = v.find('.');
+    REQUIRE(dot1 != std::string_view::npos);
+    const auto dot2 = v.find('.', dot1 + 1);
+    REQUIRE(dot2 != std::string_view::npos);
+    int major = -1;
+    int minor = -1;
+    const auto r1 = std::from_chars(v.data(), v.data() + dot1, major);
+    const auto r2 = std::from_chars(v.data() + dot1 + 1, v.data() + dot2, minor);
+    INFO("CPPHTTPLIB_VERSION = " << v);
+    REQUIRE(r1.ec == std::errc{});
+    REQUIRE(r1.ptr == v.data() + dot1);
+    REQUIRE(r2.ec == std::errc{});
+    REQUIRE(r2.ptr == v.data() + dot2);
+    REQUIRE(major >= 0);
+    REQUIRE(minor >= 0);
+    return {major, minor};
+}
+
+bool httplib_reads_body_after_pre_request_handler() {
+    const auto [major, minor] = httplib_major_minor();
+    return major > 0 || minor >= 47;
+}
+
+/// `in` with comments and string, raw-string and character literals blanked, so a mention in a
+/// comment or a string cannot count as code. False in `clean` when a comment or literal is left
+/// open. Minimal on purpose: it is enough for the identifier scan below.
+struct CodeOnly {
+    std::string text;
+    bool clean = true;
+};
+
+CodeOnly code_only(const std::string& in) {
+    CodeOnly r;
+    const auto n = in.size();
+    const auto is_ident = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_';
+    };
+    for (std::size_t i = 0; i < n;) {
+        const char c = in[i];
+        if (c == '/' && i + 1 < n && in[i + 1] == '/') {
+            while (i < n && in[i] != '\n')
+                ++i;
+        } else if (c == '/' && i + 1 < n && in[i + 1] == '*') {
+            const auto end = in.find("*/", i + 2);
+            if (end == std::string::npos) {
+                r.clean = false;
+                break;
+            }
+            r.text += ' ';
+            i = end + 2;
+        } else if (c == '"' || c == '\'') {
+            // A quote right after an identifier character that is not an encoding prefix is a
+            // digit separator (120'000), not a literal.
+            auto b = i;
+            while (b > 0 && is_ident(in[b - 1]))
+                --b;
+            const auto id = in.substr(b, i - b);
+            if (c == '\'' && !id.empty() && id != "L" && id != "u" && id != "U" && id != "u8") {
+                r.text += c;
+                ++i;
+            } else if (c == '"' &&
+                       (id == "R" || id == "u8R" || id == "uR" || id == "UR" || id == "LR")) {
+                const auto open = in.find('(', i + 1);
+                if (open == std::string::npos || open - (i + 1) > 16) {
+                    r.clean = false;
+                    break;
+                }
+                const std::string close = ")" + in.substr(i + 1, open - (i + 1)) + "\"";
+                const auto end = in.find(close, open + 1);
+                if (end == std::string::npos) {
+                    r.clean = false;
+                    break;
+                }
+                r.text += "\"\"";
+                i = end + close.size();
+            } else {
+                ++i;
+                while (i < n && in[i] != c) {
+                    if (in[i] == '\\')
+                        ++i;
+                    ++i;
+                }
+                if (i >= n) {
+                    r.clean = false;
+                    break;
+                }
+                r.text += c;
+                r.text += c;
+                ++i;
+            }
+        } else {
+            r.text += c;
+            ++i;
+        }
+    }
+    return r;
+}
+
+/// Occurrences of `name` as a whole identifier in the code-only text.
+std::size_t count_identifier(const std::string& text, std::string_view name) {
+    const auto is_ident = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_';
+    };
+    std::size_t n = 0;
+    for (auto at = text.find(name); at != std::string::npos; at = text.find(name, at + 1)) {
+        const bool left = at == 0 || !is_ident(text[at - 1]);
+        const auto end = at + name.size();
+        const bool right = end >= text.size() || !is_ident(text[end]);
+        if (left && right)
+            ++n;
+    }
+    return n;
+}
+
+/// How many times the bare token `set_pre_request_handler` appears as code in `text`: any use
+/// (`->`, `.`, `::`, a member pointer, a call through an alias) counts, not only a call.
+std::size_t pre_request_handler_uses(const std::string& text) {
+    return count_identifier(text, "set_pre_request_handler");
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    INFO("reading " << path.string());
+    REQUIRE(in.good());
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+struct SrcFile {
+    std::string name; ///< path relative to the server source directory, '/' separated
+    std::string text; ///< comment- and literal-stripped text
+};
+
+/// Every `.cpp`, `.hpp`, `.h`, `.inc` and `.ipp` file under the server source directory and the
+/// public server header directory (`server/core/include/yuzu/server`, named with an `include/`
+/// prefix), stripped of comments and literals, loaded once. A file whose comments or literals do
+/// not balance fails the test loudly: it would otherwise hide code from every scan below. Test
+/// sources are not under either directory, so the negative-control strings in tests are never
+/// scanned.
+const std::vector<SrcFile>& server_src_corpus() {
+    static const std::vector<SrcFile> corpus = [] {
+        std::vector<SrcFile> out;
+        const std::filesystem::path src_root(YUZU_SERVER_SRC_DIR);
+        const auto include_root = src_root / ".." / "include" / "yuzu" / "server";
+        const std::pair<std::filesystem::path, std::string> roots[] = {{src_root, ""},
+                                                                       {include_root, "include/"}};
+        for (const auto& [root, prefix] : roots) {
+            INFO("scanning " << root.string());
+            REQUIRE(std::filesystem::is_directory(root));
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+                if (!entry.is_regular_file())
+                    continue;
+                const auto ext = entry.path().extension().string();
+                if (ext != ".cpp" && ext != ".hpp" && ext != ".h" && ext != ".inc" &&
+                    ext != ".ipp")
+                    continue;
+                auto stripped = code_only(read_text_file(entry.path()));
+                INFO("stripping " << entry.path().string());
+                REQUIRE(stripped.clean);
+                out.push_back(
+                    {prefix + std::filesystem::relative(entry.path(), root).generic_string(),
+                     std::move(stripped.text)});
+            }
+        }
+        return out;
+    }();
+    return corpus;
+}
+
+const SrcFile& server_src_file(std::string_view name) {
+    for (const auto& f : server_src_corpus())
+        if (f.name == name)
+            return f;
+    FAIL("server source file not found in the corpus: " << name);
+    std::abort();
+}
+
+/// Calls of `name` (an identifier followed by optional whitespace and `(`) in code-only text.
+std::size_t count_calls(const std::string& text, std::string_view name) {
+    std::size_t n = 0;
+    for (auto at = text.find(name); at != std::string::npos; at = text.find(name, at + 1)) {
+        const auto is_ident = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '_';
+        };
+        if (at > 0 && is_ident(text[at - 1]))
+            continue;
+        const auto next = text.find_first_not_of(" \t\r\n", at + name.size());
+        if (next != std::string::npos && text[next] == '(')
+            ++n;
+    }
+    return n;
+}
+
+std::string without_space(std::string s) {
+    std::erase_if(s, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("httplib pre-request handler: it runs before the request body is read from 0.47 on",
+          "[body_cap][httplib_version][integration]") {
+    // A real socket and a POST that carries a body. On 0.47 and later the pre-request handler
+    // sees an empty `req.body` (the body is read after it); on an earlier httplib it sees the
+    // body. The route handler sees the body either way. If this case changes its answer on a
+    // later httplib, the placement of the post-read stage must be re-examined.
+    httplib::Server svr;
+    std::atomic<std::size_t> pre_request_body_size{9999};
+    std::atomic<std::size_t> handler_body_size{9999};
+    svr.set_pre_request_handler(
+        [&](const httplib::Request& req, httplib::Response&) -> httplib::Server::HandlerResponse {
+            pre_request_body_size.store(req.body.size());
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+    svr.Post("/probe", [&](const httplib::Request& req, httplib::Response& res) {
+        handler_body_size.store(req.body.size());
+        res.set_content("ok", "text/plain");
+    });
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&]() { svr.listen_after_bind(); });
+    // Stops and joins on every exit, including a failed REQUIRE below: a joinable std::thread
+    // destroyed during unwinding would terminate the whole test binary. The wait sits inside the
+    // joinable() test because stop() is a no-op until the accept loop is running.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (server_thread.joinable()) {
+            svr.wait_until_ready();
+            svr.stop();
+            server_thread.join();
+        }
+    }};
+    svr.wait_until_ready();
+
+    const std::string body(2048, 'x');
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(10, 0);
+    const auto r = cli.Post("/probe", body, "application/octet-stream");
+
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(handler_body_size.load() == body.size());
+    INFO("httplib " << CPPHTTPLIB_VERSION);
+    if (httplib_reads_body_after_pre_request_handler())
+        CHECK(pre_request_body_size.load() == 0);
+    else
+        CHECK(pre_request_body_size.load() == body.size());
+}
+
+TEST_CASE("no server source file uses httplib's pre-request handler on a baseline that reads "
+          "the body after it",
+          "[body_cap][httplib_version][lexical]") {
+    // A source-text pin, over comment- and literal-stripped text of EVERY file under the server
+    // source and public header directories, that does not depend on the route-sink wrapper
+    // change's own tests: the bare token `set_pre_request_handler` must not appear as code
+    // anywhere, in any form. If that wrapper change were reverted on its own on this baseline,
+    // server.cpp would again install the stage that way, which runs before the body is read,
+    // and the post-read body cap and the step-up check would see an empty body. (There is no
+    // allowlist: the one deliberate use of the handler in this repository is in a test, outside
+    // the scanned directories.)
+    if (!httplib_reads_body_after_pre_request_handler()) {
+        SUCCEED("this httplib reads the body before its pre-request handler");
+        return;
+    }
+    const auto& corpus = server_src_corpus();
+    REQUIRE(corpus.size() > 100);
+    // Both directories are really in the corpus (a path that stopped resolving would shrink it).
+    CHECK(std::any_of(corpus.begin(), corpus.end(),
+                      [](const SrcFile& f) { return f.name.starts_with("include/"); }));
+    std::string offenders;
+    for (const auto& f : corpus)
+        if (pre_request_handler_uses(f.text) != 0)
+            offenders += f.name + " ";
+    INFO("files using set_pre_request_handler: " << offenders);
+    CHECK(offenders.empty());
+    // The stage still goes in through the registry.
+    CHECK(server_src_file("server.cpp").text.find("PostReadStageRegistry::instance().install(") !=
+          std::string::npos);
+}
+
+TEST_CASE("the body-cap decision and the close rule have exactly one production caller each",
+          "[body_cap][lexical]") {
+    // Over the whole server source and public header directories: a second `evaluate_body_cap(`
+    // call site (one that could read the headers raw) or a second `close_if_unread_framed_body(`
+    // call site would be a second copy of a rule that has one home. The defining headers are
+    // excluded by name.
+    std::string eval_sites;
+    std::string close_sites;
+    std::size_t eval_calls = 0;
+    std::size_t close_calls = 0;
+    for (const auto& f : server_src_corpus()) {
+        if (f.name != "body_cap_policy.hpp") {
+            if (const auto n = count_calls(f.text, "evaluate_body_cap")) {
+                eval_calls += n;
+                eval_sites += f.name + " ";
+            }
+        }
+        if (f.name != "body_cap_httplib.hpp") {
+            if (const auto n = count_calls(f.text, "close_if_unread_framed_body")) {
+                close_calls += n;
+                close_sites += f.name + " ";
+            }
+        }
+    }
+    INFO("evaluate_body_cap call sites: " << eval_sites);
+    INFO("close_if_unread_framed_body call sites: " << close_sites);
+    CHECK(eval_calls == 1);
+    CHECK(eval_sites == "server.cpp ");
+    CHECK(close_calls == 1);
+    CHECK(close_sites == "server.cpp ");
+}
+
+TEST_CASE("body_cap_httplib.hpp: the accessors stay thin wrappers over httplib's own rules",
+          "[body_cap][lexical]") {
+    // The accessors exist so the gate and httplib read the same bytes the same way. Pinned
+    // whole, whitespace aside, over the stripped text: a body replaced by another predicate, or by
+    // a constant, fails here.
+    const auto flat = without_space(server_src_file("body_cap_httplib.hpp").text);
+    CHECK(flat.find("inlineboolis_chunked_for_body_cap(consthttplib::Request&req){"
+                    "returnhttplib::detail::is_chunked_transfer_encoding(req.headers);}") !=
+          std::string::npos);
+    CHECK(flat.find("inlineboolhas_content_length_for_body_cap(consthttplib::Request&req){"
+                    "constautocl_range=req.headers.equal_range(\"\");"
+                    "returncl_range.first!=cl_range.second;}") != std::string::npos);
+    CHECK(flat.find("inlinestd::stringcontent_encoding_for_body_cap(consthttplib::Request&req){"
+                    "returnhttplib::detail::get_combined_header_value(req.headers,\"\");}") !=
+          std::string::npos);
+    // Literals are blanked in the stripped text, so the header NAME is pinned on the raw file.
+    const auto raw =
+        read_text_file(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "body_cap_httplib.hpp");
+    std::size_t names = 0;
+    for (auto at = raw.find("req.headers.equal_range(\"Content-Length\")"); at != std::string::npos;
+         at = raw.find("req.headers.equal_range(\"Content-Length\")", at + 1))
+        ++names;
+    CHECK(names == 1);
+    CHECK(raw.find("get_combined_header_value(req.headers, \"Content-Encoding\")") !=
+          std::string::npos);
+}
+
+TEST_CASE("pre-request handler scan: negative controls", "[body_cap][httplib_version][lexical]") {
+    // The scan above must see every form of use, and must not see a mention.
+    const auto uses = [](const std::string& src) {
+        const auto s = code_only(src);
+        REQUIRE(s.clean);
+        return pre_request_handler_uses(s.text);
+    };
+    CHECK(uses("svr->set_pre_request_handler(f);") == 1);
+    CHECK(uses("svr.set_pre_request_handler(f);") == 1);
+    CHECK(uses("httplib::Server::set_pre_request_handler;") == 1);
+    CHECK(uses("auto p = &httplib::Server::set_pre_request_handler;") == 1);
+    CHECK(uses("x\n  ->\n  set_pre_request_handler\n  (f);") == 1);
+    CHECK(uses("// svr->set_pre_request_handler(f);\n") == 0);
+    CHECK(uses("/* set_pre_request_handler */ int a;") == 0);
+    CHECK(uses("const char* s = \"set_pre_request_handler\";") == 0);
+    CHECK(uses("auto s = R\"x(set_pre_request_handler)x\";") == 0);
+    CHECK(uses("my_set_pre_request_handler(f); set_pre_request_handler_2(f);") == 0);
+    CHECK_FALSE(code_only("int a; /* open").clean);
+}

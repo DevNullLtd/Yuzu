@@ -168,6 +168,8 @@ struct DeviceGuardRow {
     std::string name;       ///< the Guard's human name
     std::string state;      ///< "compliant" | "drifted" | "errored"
     std::string updated_at; ///< ISO of the evaluation that set it
+    bool order_uncertain{false};    ///< ordering of the persisted verdict cannot be proven
+    bool projection_pending{false}; ///< a retained event for this guard is not yet reflected
 };
 
 /// PURE: the DEX lens for one device — the per-device score + its signal summary
@@ -179,8 +181,21 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
 
 /// PURE: the Guardian lens for one device — compliance summary + per-guard state.
 /// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
+///
+/// `unrepresented_pending` / `unrepresented_ids` are the device's retained pending events that
+/// have NO census row yet (#7217: the count is exact, the id list is capped by the store and the
+/// ids are agent-reported identifiers). When the count is above zero the lens renders a notice and
+/// NEVER the clean tile state: the tile uses the same warn tone and "ordering uncertain" wording as
+/// an order-uncertain guard, and an empty `guards` list is not rendered as "No guards evaluated"
+/// (the device has evidence the census does not show). Defaults of 0 / empty are not a no-op for the
+/// tile label: a lens with every guard compliant (100%) and either `uncertain>0` (a guard whose
+/// ordering is uncertain or whose retained event is unreflected) or a nonzero `unrepresented_pending`
+/// now labels the tile "Compliant, ordering uncertain" in the warn tone, where it used to read
+/// "Compliant"; every other input renders as before.
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true,
+                                        std::int64_t unrepresented_pending = 0,
+                                        const std::vector<std::string>& unrepresented_ids = {});
 
 /// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
 /// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which

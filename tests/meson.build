@@ -646,9 +646,12 @@ agent_test_exe = executable(
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
     'unit/test_runtimes_win_walk.cpp',           # runtimes python: PythonCore dual-view walk, FakeOps + salted scratch key (Windows-only; no-op TU elsewhere)
+    'unit/test_runtimes_macos_dotnet_jvm.cpp',   # runtimes macOS dotnet/jvm legs: materialized fixture trees (walk bodies POSIX-only)
+    'unit/test_hardware_drivers_inventory.cpp',  # hardware.drivers_inventory: pure builders + dispatcher grammar, every host
     'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
     'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
     'unit/test_pkg_inventory_linux_parsers.cpp',    # pkg_inventory Linux legs: injected-root Linux snap/flatpak/managers walk over a REAL CAPTURE tree manifest (body POSIX-only)
+    'unit/test_pkg_inventory_win_parsers.cpp',      # pkg_inventory Windows legs: nuspec tag scanner, Appx PackageFullName parser, rows and the three legs over a FakeOps seam (REAL CAPTURE names/versions plus labelled synthetic cases; runs on every OS, RealOps cases Windows-only)
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
@@ -1039,7 +1042,9 @@ endif
 # case in no shard, in two shards, or outside the reference set
 # `~[.]~[tsan-heavy]~[flaky-4086]`. It prints per-shard case counts as an
 # informational notice only: count is not time, so there is no ratio gate. The
-# drift signal is flake-retry.py's 80%-of-budget table (#2092/#2093).
+# drift signal is flake-retry.py's 80%-of-budget table (#2092/#2093); while the
+# #7135 stopgap stands, shard C's mark is 384s, not 192s, so it is a late warning
+# until #7177 rebalances C.
 #
 # MEASURED BALANCE (2026-10-01, case-sum predictions from per-case durations
 # joined to tags, not CI measurements): Linux ~[30.6, 29.4, 29.9]s, Windows
@@ -1142,20 +1147,34 @@ agent_shard_specs = {
   'C': _agent_a_excl + _agent_b_excl + agent_shard_suffix,
 }
 agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin]
+# Per-shard meson timeouts. Only shard C is raised (#7135); A and B keep the old single
+# entry's 240s, because only C was measured to need more.
+#
+# SHARD C's 480s IS A DELIBERATE, TEMPORARY EXCEPTION to docs/testing/unit-test-conventions.md
+# ("an entry past 50% of its timeout is ported, split or host-gated, never given more time"),
+# in the same shape as the #3582 shard bump (docs/ci-architecture.md): the split is tracked as
+# #7177 and this value comes back down when it lands. Measured on the Windows MSVC debug leg:
+# shard C ran 184.87s (run 41919798385 attempt 5; its echo entry passed in 51.04s), 211.54s,
+# 210.55s and 206.28s (runs 42040619981, 42049202343, 42056811785: all three are jobs that
+# FAILED, on the echo ETW case, so those are shard C passing inside a failed job), and it hit
+# the 240s limit at 240.09s in the same job where echo hit its 90s limit (run 41919798385
+# attempt 4, job 126911227871); both passed on the rerun with no code change, so the box was
+# loaded, not hung. #7135 records ~222s for C alone on a 16-thread host. The worst case is at
+# least 240s (a timeout is a floor, not a measurement) and the limit is 2x that. Shards A
+# (98-102s) and B (70s) are well under. Do not shorten tests to fit; split the shard instead
+# (#7177). Side effect to know about: flake-retry.py's 80%-of-timeout warning mark for C moves
+# from 192s to 384s, so C can grow ~80% before it warns; #7177 restores an early warning. The
+# one other measured contention figure is for SERVER `~[pg]` (c0 289s -> c4 603s, ~2.1x,
+# across jobs, on the pre-#3443 combined step; docs/ci-architecture.md "Windows test-phase
+# concurrency gate"). A real hang is also bounded by the job-level timeouts.
+agent_shard_timeouts = {'A': 240, 'B': 240, 'C': 480}
 foreach shard, spec : agent_shard_specs
   test(
     'agent unit tests shard ' + shard,
     agent_test_exe,
     args: [spec, '--allow-running-no-tests', '--durations=yes'],
     suite: ['agent', 'agent-shard'],
-    # 240s per shard, unchanged from the old single entry; treat it as conservative
-    # headroom, not a measured need. Uncontended Windows is ~75s (a case-sum
-    # prediction), ~3x under 240s. The only measured contention figure is for SERVER
-    # `~[pg]` (c0 289s -> c4 603s, ~2.1x, across jobs, on the pre-#3443 combined step;
-    # docs/ci-architecture.md "Windows test-phase concurrency gate"); it has NOT been
-    # re-measured for agent shards, so do not size or lower this timeout from it. A
-    # real hang is also bounded by the job-level timeouts.
-    timeout: 240,
+    timeout: agent_shard_timeouts[shard],
     depends: agent_shard_deps,
   )
 endforeach
@@ -1367,6 +1386,7 @@ echo_test_exe = executable(
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
+    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, shim views
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1380,6 +1400,7 @@ echo_test_exe = executable(
     '../agents/plugins/echo/src/echo_schema_registry.cpp',
     '../agents/plugins/echo/src/echo_fold_schema.cpp',
     '../agents/plugins/echo/src/echo_fold.cpp',
+    '../agents/plugins/echo/src/echo_db_v10_migration.cpp',  # schema v10: the one-transaction roll-up flip (test_echo_v10_migration.cpp drives it)
     '../agents/plugins/echo/src/echo_aggregator.cpp',
     '../agents/plugins/echo/src/echo_usage.cpp',
     '../agents/plugins/echo/src/echo_perf.cpp',
@@ -1416,8 +1437,23 @@ echo_test_exe = executable(
 )
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
-test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 90)
+# 180s (#7135; was 90s). Unlike agent shard C above this is not an exception to the budget rule in
+# docs/testing/unit-test-conventions.md: no split is planned, and at 180s the measured passing runs
+# sit under the rule's 50% line. It took 51.04s on a Windows CI runner when
+# it passed (run 41919798385 attempt 5, 28% of 180s) and 82s on a standalone Windows host (#7135
+# comment, 46%), and it timed out at 90.09s on a loaded runner (attempt 4, job 126911227871) in
+# the same job where agent shard C also timed out; both passed on the rerun, so that was load,
+# not a hang. A timeout is a floor, not a measurement: the limit is 2x that floor, and the
+# deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
+# live-registry case adds its own 15s waits on top. Revisit the value once #7173/#7135 settle; there
+# is no commitment to lower it, because the 50% rule is met at 180s.
+# The schema-v10 migration cases ([v10]: a seeded v9 database folded over all 17 sources, chunked
+# folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
+# run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
+# third test() too. Together the three filters cover every case exactly once.
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
+test('echo v10 migration', echo_test_exe, args: ['[v10]~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -1446,6 +1482,7 @@ if build_server
       'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
       'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired as the post-read stage (registry + HttplibRouteSink wrapper), over a real httplib::Server (no PG)
       'unit/server/test_post_read_stage.cpp', # PostReadStageRegistry + HttplibRouteSink handler wrapper: order, short-circuit, install guards, unwrapped servers (no PG)
+      'unit/server/test_model_param_to_params.cpp', # model_detail::to_params: key-sorted copy of httplib params for the pure parsers (no PG)
       'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
       'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
       'unit/server/test_mfa_qr.cpp',
@@ -1575,6 +1612,7 @@ if build_server
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
+      'unit/server/test_command_replay_horizon.cpp', # #3678: outbox redelivery horizon < agent dedup ring (compile-time cross-component pin)
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
@@ -1594,6 +1632,8 @@ if build_server
       'unit/server/test_rbac_admin_hint.cpp', # #6034: rbac_admin_hint == the real POST assign / PUT enforcement answer, per persona
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
+      'unit/server/test_rbac_enforcement_read.cpp', # #6033: GET /api/v1/rbac/enforcement (REST twin of the enforcement fragment)
+      'unit/server/test_rbac_enforcement_read_mcp.cpp', # #6033: MCP get_rbac_enforcement
       'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
       'unit/server/test_revocation_source_surface.cpp', # ADR-0070 R1: /api/v1/crypto/revocation-sources + MCP twins + service validation
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
@@ -1695,6 +1735,7 @@ if build_server
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_census_ordering_store.cpp', # #5690 PR2a-1: census ordering key, durable pending evidence, schema v4
       'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
@@ -1739,6 +1780,7 @@ if build_server
       # (see the include-path constraint below) - the test includes the header by
       # relative path.
       '../agents/plugins/echo/src/echo_schema_registry.cpp',
+      '../agents/plugins/echo/src/echo_fold_schema.cpp', # the registry's roll-up tiers are declared there
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
@@ -3615,6 +3657,18 @@ test('instructions runner hardening',
   timeout: 300,
 )
 
+# scripts/test/ensure-puppeteer.sh and ensure-gcovr.sh, the /test Phase 0b installers, run against
+# stub node/npm/npx/python3 executables in a temp HOME (never the real HOME or repo tree): every
+# ready / NOT READY branch, the hash-verified pip install, the interrupted-install repairs and the
+# refuse-to-delete guards. Bash only; the gcovr cases skip off Linux (the script is Linux-only) and
+# the whole file skips on Windows. Suite docs, which CI runs on the Linux leg and /test runs natively.
+test('ensure install helpers',
+  _python3_test,
+  args: [files('test_ensure_install_helpers.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
@@ -3797,10 +3851,11 @@ test('plugin readme gate',
 #
 # TIMEOUT (#2340 PR-4): the harness now runs TWO full gates per invocation -
 # the shipped RULES/TESTS pair, then the marker-extracted yuzu-guardian-journal
-# group (CH-2 + CH-5-PROM) - each up to 4x120s (check + test + the canary's own
-# test + check) = 480s worst case, plus ~225s for the docker daemon probe and
-# pull ladder under the opt-in (0 under a native promtool). Worst case is
-# 225 + 480x2 = 1185s; 1500 keeps ~300s of margin over that, the same
+# group (CH-2 + CH-5-PROM) - each up to 120 + 240 + 240 + 120 (check + test +
+# the canary's own test + check; the two test calls were 120s until #7191)
+# = 720s worst case, plus ~225s for the docker daemon probe and pull ladder
+# under the opt-in (0 under a native promtool). Worst case is
+# 225 + 720x2 = 1665s; 2000 keeps ~335s of margin over that, the same
 # methodology run_promtool_tests.py's own pull_with_retry() comment uses for
 # its ladder ("must fit inside the timeouts that enclose it") - see that
 # comment for the full arithmetic and how it composes with the CI job's own
@@ -3809,7 +3864,7 @@ test('prometheus alert rules',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py')],
   suite: 'docs',
-  timeout: 1500,
+  timeout: 2000,
 )
 
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv
@@ -3870,7 +3925,8 @@ test('gateway private epmd selftest',
 # Timeout sized to the sweep's own worst-case ceiling, not typical runtime:
 # with both scenarios' alerts shipped (#2854 rung D) all 6 (scenario,
 # interval) measure() calls run for real -- pull ladder ~195s plus 6 x
-# (30s check + 90s test) = ~915s -- so 1200 keeps a real margin over that.
+# (30s check + 90s test) + the ~30s daemon probe = ~945s -- so 1200 keeps a
+# real margin over that.
 # A third sweep scenario adds another ~360s: re-derive, don't inherit.
 test('audit retention alert coverage manifest',
   _python3_test,
@@ -4201,6 +4257,14 @@ test('sso-only runtime wiring lexical gate',
   suite: 'docs',
   timeout: 60,
 )
+# #7175: pins the Windows job's wiring of scripts/ci/stop-dead-etw-sessions.ps1 (step order, the post-test
+# step's always(), pwsh, and that the script can never fail the job); source-text only, so Python.
+test('windows etw cleanup wiring lexical gate',
+  _python3_test,
+  args: [files('test_etw_cleanup_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('same-site gate production wiring lexical selftest',
   _python3_test,
   args: [files('test_same_site_wiring_lexical_selftest.py')],
@@ -4465,6 +4529,15 @@ test('assert-suite-cover selftest',
 test('issue lifecycle docs',
   _python3_test,
   args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# The Windows package-sources upgrade note states the fresh-deployment contract (routed
+# Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
+test('upgrade notes contract',
+  _python3_test,
+  args: [files('test_upgrade_notes_contract.py')],
   suite: 'docs',
   timeout: 10,
 )

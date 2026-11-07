@@ -178,6 +178,42 @@
         %% A LIST, even for one pin: [{cert_file, ...}]; a bare tuple refuses boot.
         {mgmt_peer_pins, []},
 
+        %% Withdrawal by CRL (#6016 PR 4b). The identity admits the server for as long
+        %% as its certificate verifies; the CA's CRL is how a certificate the CA
+        %% withdrew (a re-issue supersedes the old server serial) stops being admitted.
+        %% {mgmt_crl_source, {url, "https://<server>:8443/api/v1/ca/crl"}} fetches the
+        %% CRL from the server's HTTPS port over VERIFIED TLS, trusting the management
+        %% listener's cacertfile; if 8443 presents a certificate NOT issued by that CA
+        %% (a bring-your-own dashboard certificate) name the CA that issued it:
+        %% {url, Url, #{cacertfile => "/path/ca.pem"}}. {file, Path} reads a CRL
+        %% file instead. The CRL must verify against the management listener's CA,
+        %% be no more than 1 h in the future, and replace the held one only with a later thisUpdate or a
+        %% higher number, never with one already past its own nextUpdate plus grace while the held
+        %% one is believed (a gateway that starts afresh holds nothing and takes the first it is given);
+        %% a refused CRL leaves the loaded one in force. Once a source is set EVERY
+        %% admitted peer is checked, in every mode: no usable CRL refuses all streams
+        %% (revocation_unknown), one past nextUpdate plus mgmt_crl_grace_s (default
+        %% 86400, 0..604800) refuses all (revocation_stale), a listed serial is
+        %% refused (crl_revoked). mgmt_crl_refresh_ms (default 5000, 1000..3600000)
+        %% is the fetch interval. Only an https URL is accepted (no http, no
+        %% userinfo, no fragment); any defect refuses boot. Unset, the gateway reads
+        %% no CRL and logs a WARNING at boot (a later release will refuse to boot
+        %% in `identity' or `identity_or_pin' mode without a source). Read at boot: a change applies
+        %% only when the gateway is restarted, which disconnects the node's agents
+        %% (see docs/user-manual/gateway.md "Withdrawing a server certificate").
+        %% mgmt_crl_max_validity_s (unset in code: no bound; 3600..31536000) refuses a validly
+        %% signed CRL whose nextUpdate is more than that many seconds after its thisUpdate
+        %% (`validity_too_long'): without it a CRL with a far-future nextUpdate keeps being
+        %% believed and keeps the staleness alerts quiet. The width is read from the CRL's own two
+        %% dates, never from this host's clock. 691200 (8 days) must stay above 7 days plus 300 s,
+        %% the validity a server that publishes 7-day CRLs backdated 300 s needs, or every CRL
+        %% is refused. The Yuzu server publishes 48 hours.
+        %% The example below is commented out because this file ships no mgmt_crl_source (a key with no
+        %% source is inert); deploy/docker/reference-gateway-sys.config sets both, so a deployment that
+        %% enables the source here should set this key with it.
+        %% Example: {mgmt_crl_source, {url, "https://yuzu-server.example.com:8443/api/v1/ca/crl"}},
+        %% Example: {mgmt_crl_max_validity_s, 691200},
+
         %% HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b),
         %% distinct from `cluster_id` above: this is what to RESOLVE to find
         %% peer addresses, not the logical cluster identifier. Default

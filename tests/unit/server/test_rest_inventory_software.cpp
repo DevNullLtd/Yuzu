@@ -36,6 +36,7 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
+#include "device_ci_kinds.hpp"
 #include "hardware_list_model.hpp"
 #include "openapi_spec_access.hpp"
 #include "management_group_store.hpp"
@@ -63,14 +64,17 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -334,6 +338,13 @@ TEST_CASE("REST inventory/software: the 200 body is typed in the OpenAPI spec an
     CHECK(properties == served);
     CHECK(required == served);
 
+    // The row's ecosystem description points at the generated filter enum rather than carrying a
+    // hand-typed list that drifts behind the vocabulary table (it once named nine of seventeen).
+    const auto eco = schemas["InstalledSoftwareRow"]["properties"]["ecosystem"]["description"]
+                         .get<std::string>();
+    CHECK(eco.find("ecosystem filter enum") != std::string::npos);
+    CHECK(eco.find("macos_pkgutil") == std::string::npos);
+
     // The page envelope's keys are those devices_response_json emits (result_truncated_by_cap is
     // conditional, so it is a property but not required).
     const auto page = software_catalogue::devices_response_json({}, "", 0, true);
@@ -404,6 +415,132 @@ TEST_CASE("REST hardware: the 200/202 bodies are typed in the OpenAPI spec and m
     REQUIRE(schemas.contains("HardwareCiRecord"));
     CHECK(keys_of(schemas["HardwareCiRecord"]["properties"]) == keys_of(rec["ci"]));
     CHECK(required_of(schemas["HardwareCiRecord"]) == keys_of(rec["ci"]));
+
+    // The v2 sections (H.7): the section element's schema keys are exactly the keys a served
+    // section carries, for every registered kind (status-only and list alike) and every level.
+    REQUIRE(schemas.contains("HardwareCiSection"));
+    HardwareCiDetail v2;
+    v2.identity = InventoryDeviceRow{};
+    v2.ci = std::optional<DeviceCiRecord>(DeviceCiRecord{});
+    std::vector<std::string> kinds;
+    for (const auto& def : kDeviceCiSections)
+        kinds.emplace_back(def.section);
+    std::vector<DeviceCiSection> all;
+    for (const auto& k : kinds) {
+        DeviceCiSection sec;
+        sec.kind = k;
+        sec.level = "constrained";
+        sec.reason = "r";
+        all.push_back(sec);
+    }
+    v2.ci_sections = all;
+    const auto v2j = hardware_ci_json(v2, 0);
+    REQUIRE(v2j["ci"]["sections"].size() == kDeviceCiSectionCount);
+    for (const auto& served : v2j["ci"]["sections"]) {
+        INFO(served["kind"].get<std::string>());
+        CHECK(keys_of(schemas["HardwareCiSection"]["properties"]) == keys_of(served));
+        CHECK(required_of(schemas["HardwareCiSection"]) == keys_of(served));
+    }
+    // `kind` is an OPEN string (the registry can grow, and a client must ignore kinds it does not
+    // know), so the schema carries no enum; its description lists every registered kind and says so.
+    const auto& kind_schema = schemas["HardwareCiSection"]["properties"]["kind"];
+    CHECK_FALSE(kind_schema.contains("enum"));
+    const auto kind_desc = kind_schema["description"].get<std::string>();
+    for (const auto& k : kinds) {
+        INFO(k);
+        // whole-word match: `volume` must not pass because `volumes` appears, nor `disk` via `disks`
+        const auto at = kind_desc.find(k);
+        REQUIRE(at != std::string::npos);
+        const auto after = at + k.size();
+        CHECK((after >= kind_desc.size() || !(std::isalnum(static_cast<unsigned char>(kind_desc[after])) ||
+                                              kind_desc[after] == '_')));
+    }
+    CHECK(kind_desc.find("must ignore kinds it does not know") != std::string::npos);
+    // The other direction: every kind the description lists is registered (a kind removed from
+    // the registry, or a typo, cannot linger in the documentation).
+    {
+        const std::string kmark = "Registered kinds today: ";
+        const auto kat = kind_desc.find(kmark);
+        REQUIRE(kat != std::string::npos);
+        std::string list = kind_desc.substr(kat + kmark.size());
+        list.resize(list.find('.')); // the kind list carries no '.', the next sentence starts at one
+        std::set<std::string> listed;
+        std::string_view rest = list;
+        while (!rest.empty()) {
+            const auto comma = rest.find(", ");
+            listed.emplace(rest.substr(0, comma));
+            if (comma == std::string_view::npos)
+                break;
+            rest.remove_prefix(comma + 2);
+        }
+        std::set<std::string> registered(kinds.begin(), kinds.end());
+        CHECK(listed == registered);
+    }
+    // The rows description lists, per list kind, its exact column list in a parseable form -
+    // `Columns: <kind>: <col>, <col>; <kind>: ...` - and the parse equals the registry in BOTH
+    // directions: the same kinds and the same columns in the same order. A column added to,
+    // removed from or renamed in the registry without the schema following fails here, and a
+    // column name that merely appears in another kind's clause cannot satisfy it.
+    const auto rows_desc =
+        schemas["HardwareCiSection"]["properties"]["rows"]["items"]["description"].get<std::string>();
+    const std::string marker = "Columns: ";
+    const auto mk = rows_desc.find(marker);
+    REQUIRE(mk != std::string::npos);
+    std::string clauses = rows_desc.substr(mk + marker.size());
+    if (const auto dot = clauses.find('.'); dot != std::string::npos)
+        clauses.resize(dot); // the columns text carries no '.', the sentence after it starts at one
+    std::map<std::string, std::vector<std::string>> documented;
+    {
+        std::string_view rest = clauses;
+        while (!rest.empty()) {
+            const auto semi = rest.find(';');
+            std::string_view clause = rest.substr(0, semi);
+            const auto colon = clause.find(": ");
+            REQUIRE(colon != std::string_view::npos);
+            const std::string kind{clause.substr(0, colon)};
+            std::vector<std::string> cols;
+            std::string_view list = clause.substr(colon + 2);
+            while (!list.empty()) {
+                const auto comma = list.find(", ");
+                cols.emplace_back(list.substr(0, comma));
+                if (comma == std::string_view::npos)
+                    break;
+                list.remove_prefix(comma + 2);
+            }
+            const bool first_clause_for_kind = documented.emplace(kind, std::move(cols)).second;
+            CHECK(first_clause_for_kind); // each kind once
+            if (semi == std::string_view::npos)
+                break;
+            rest.remove_prefix(semi + 1);
+            while (!rest.empty() && rest.front() == ' ')
+                rest.remove_prefix(1);
+        }
+    }
+    std::map<std::string, std::vector<std::string>> registry;
+    for (const auto& def : kDeviceCiSections) {
+        if (def.table == nullptr)
+            continue;
+        std::vector<std::string> cols;
+        std::string_view list = def.columns;
+        while (!list.empty()) {
+            const auto comma = list.find(',');
+            cols.emplace_back(list.substr(0, comma));
+            if (comma == std::string_view::npos)
+                break;
+            list.remove_prefix(comma + 1);
+        }
+        registry.emplace(def.section, std::move(cols));
+    }
+    REQUIRE_FALSE(registry.empty());
+    CHECK(documented == registry);
+    // sections and its state are the nullable / enumerated members the description promises.
+    CHECK(schemas["HardwareCiRecord"]["properties"]["sections"]["nullable"] == true);
+    CHECK(schemas["HardwareRecord"]["properties"]["sections_state"]["enum"] ==
+          nlohmann::json::array({"found", "absent", "degraded"}));
+
+    // The route documents the sections 503.
+    const auto& r503 = spec["paths"]["/hardware/{id}"]["get"]["responses"]["503"]["description"];
+    CHECK(r503.get<std::string>().find("sections could not be read") != std::string::npos);
 }
 
 // The per-group guides are for people reading /swagger. The default document, and so the MCP resource

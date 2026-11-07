@@ -22,12 +22,16 @@
 ///  - hardware_ci_json: ci_state discrimination (found/absent/degraded) and
 ///    the independent nullopt-vs-present-empty signal for software/tags.
 
+#include "device_ci_kinds.hpp"
+#include "device_ci_section_digest.hpp"
 #include "hardware_list_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -291,6 +295,37 @@ TEST_CASE("hw_row_matches: search finds a row by a key=value tag pair", "[hardwa
     InventoryDeviceRow r = make_row("a1");
     r.tags = {{"team", "platform"}};
     CHECK(hw_row_matches(r, hw_search_tokens("team=platform"), "all", "all", ""));
+}
+
+TEST_CASE("hw_row_matches: search finds a row by asset tag or chassis serial or board serial",
+          "[hardware][model][search]") {
+    InventoryDeviceRow r = make_row("a1");
+    r.ci_chassis_asset_tag = "AT-0042-Z";
+    r.ci_chassis_serial = "CHS9X77";
+    r.ci_board_serial = "BRD-SN-5150";
+    CHECK(hw_row_matches(r, hw_search_tokens("at-0042-z"), "all", "all", "")); // case folded
+    CHECK(hw_row_matches(r, hw_search_tokens("CHS9X77"), "all", "all", ""));
+    CHECK(hw_row_matches(r, hw_search_tokens("brd-sn-5150"), "all", "all", ""));
+    CHECK(hw_row_matches(r, hw_search_tokens("chs9x"), "all", "all", "")); // substring, as the other fields
+    CHECK_FALSE(hw_row_matches(r, hw_search_tokens("no-such-tag"), "all", "all", ""));
+}
+
+// The agent writes `-` for "no value": it must never be a search term, so `q=-` finds nothing on a
+// row whose only hyphens are those placeholders. Kills: dropping the placeholder filter.
+TEST_CASE("hw_row_matches: the - placeholder in a v2 identifier is never searchable",
+          "[hardware][model][search]") {
+    InventoryDeviceRow r = make_row("a1");
+    r.ci_chassis_asset_tag = "-";
+    r.ci_chassis_serial = "-";
+    r.ci_board_serial = "-";
+    CHECK_FALSE(hw_row_matches(r, hw_search_tokens("-"), "all", "all", ""));
+    // the older sentinels stay filtered too
+    r.ci_chassis_asset_tag = "unknown";
+    r.ci_chassis_serial = "";
+    CHECK_FALSE(hw_row_matches(r, hw_search_tokens("unknown"), "all", "all", ""));
+    // and a real value next to a placeholder still matches
+    r.ci_board_serial = "REAL-1";
+    CHECK(hw_row_matches(r, hw_search_tokens("real-1"), "all", "all", ""));
 }
 
 // ── hardware_kpis ────────────────────────────────────────────────────────────
@@ -636,6 +671,204 @@ TEST_CASE("hardware_ci_json: software_last_seen distinguishes nullopt (degraded)
     CHECK(hardware_ci_json(d, 0)["software_last_seen"] == 1234567);
 }
 
+// ── hardware_ci_json: the v2 scalars and sections (H.7) ──────────────────────
+
+namespace {
+
+DeviceCiSection make_section(std::string kind, std::string level, std::string reason = "",
+                             std::vector<std::vector<std::string>> rows = {}) {
+    DeviceCiSection s;
+    s.kind = std::move(kind);
+    s.level = std::move(level);
+    s.reason = std::move(reason);
+    s.rows = std::move(rows);
+    return s;
+}
+
+HardwareCiDetail v2_detail(std::vector<DeviceCiSection> sections) {
+    HardwareCiDetail d;
+    DeviceCiRecord rec;
+    rec.blob_version = 2;
+    rec.chassis_type = "Laptop";
+    rec.chassis_serial = "CHS1";
+    rec.chassis_asset_tag = "AT1";
+    rec.chassis_source = "smbios";
+    rec.board_vendor = "Acme";
+    rec.board_product = "B450";
+    rec.board_serial = "BSN1";
+    rec.board_source = "smbios";
+    rec.machine_id_hash = "abcdef01";
+    rec.machine_id_algorithm = "sha256";
+    rec.machine_id_source = "etc_machine_id";
+    d.ci = std::optional<DeviceCiRecord>(rec);
+    d.ci_sections = std::move(sections);
+    return d;
+}
+
+const nlohmann::json& section_of(const nlohmann::json& j, std::string_view kind) {
+    static const nlohmann::json none;
+    for (const auto& s : j["ci"]["sections"])
+        if (s["kind"] == std::string(kind)) // not string_view: MSVC reads json == string_view as ambiguous (C2666)
+            return s;
+    return none;
+}
+
+} // namespace
+
+TEST_CASE("hardware_ci_json: the v2 identity scalars are served and the - placeholder is null",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(j["ci"]["chassis_type"] == "Laptop");
+    CHECK(j["ci"]["chassis_serial"] == "CHS1");
+    CHECK(j["ci"]["chassis_asset_tag"] == "AT1");
+    CHECK(j["ci"]["chassis_source"] == "smbios");
+    CHECK(j["ci"]["board_vendor"] == "Acme");
+    CHECK(j["ci"]["board_product"] == "B450");
+    CHECK(j["ci"]["board_serial"] == "BSN1");
+    CHECK(j["ci"]["board_source"] == "smbios");
+    CHECK(j["ci"]["machine_id_hash"] == "abcdef01");
+    CHECK(j["ci"]["machine_id_algorithm"] == "sha256");
+    CHECK(j["ci"]["machine_id_source"] == "etc_machine_id");
+
+    // A v1 record (every v2 scalar blank), an agent that sent `-`, and an `unknown` all read null.
+    HardwareCiDetail v1;
+    DeviceCiRecord rec;
+    rec.chassis_asset_tag = "-";
+    rec.chassis_serial = "unknown";
+    rec.machine_id_hash = "-";
+    v1.ci = std::optional<DeviceCiRecord>(rec);
+    const auto vj = hardware_ci_json(v1, 0);
+    for (const char* k : {"chassis_type", "chassis_serial", "chassis_asset_tag", "chassis_source", "board_vendor",
+                          "board_product", "board_serial", "board_source", "machine_id_hash",
+                          "machine_id_algorithm", "machine_id_source"}) {
+        INFO(k);
+        REQUIRE(vj["ci"].contains(k));
+        CHECK(vj["ci"][k].is_null());
+    }
+}
+
+TEST_CASE("hardware_ci_json: a clean ok list section serves its rows keyed by the declared columns",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "ok", "", {{"0", "Xeon", "8", "16", "2400", "CPU0", "-"}}),
+                        make_section("disk", "ok", "", {{"0", "NVMe", "512", "ssd", "nvme"}})});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(j["sections_state"] == "found");
+    const auto& cpu = section_of(j, "cpu");
+    REQUIRE(cpu.is_object());
+    CHECK(cpu["status"] == "ok");
+    CHECK(cpu["complete"] == true);
+    CHECK(cpu["reason"].is_null());
+    CHECK(cpu["source"].is_null());
+    REQUIRE(cpu["rows"].size() == 1);
+    CHECK(cpu["rows"][0]["idx"] == "0");
+    CHECK(cpu["rows"][0]["model"] == "Xeon");
+    CHECK(cpu["rows"][0]["clock_mhz"] == "2400");
+    CHECK(cpu["rows"][0]["socket_designation"] == "CPU0");
+    CHECK(cpu["rows"][0]["stepping"].is_null()); // the `-` placeholder
+    CHECK(cpu["rows"][0].size() == 7);
+    CHECK(section_of(j, "disk")["rows"][0]["interface"] == "nvme");
+}
+
+// Kills: serving a constrained section as complete, or dropping its rows.
+TEST_CASE("hardware_ci_json: a constrained section is incomplete and keeps its rows",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("dimm", "constrained", "agent:partial;server_cap:64",
+                                     {{"A1", "8192", "DDR4", "3200", "Acme", "P1", "S1"}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& dimm = section_of(j, "dimm");
+    CHECK(dimm["status"] == "constrained");
+    CHECK(dimm["complete"] == false);
+    CHECK(dimm["reason"] == "agent:partial;server_cap:64");
+    REQUIRE(dimm["rows"].size() == 1);
+    CHECK(dimm["rows"][0]["slot"] == "A1");
+    CHECK(dimm["rows"][0]["serial"] == "S1");
+}
+
+// Kills: rendering rows for a failed section.
+TEST_CASE("hardware_ci_json: unavailable and permission_denied sections carry the reason and no rows",
+          "[hardware][model][json][sections]") {
+    // Rows are stored here on purpose: the serialiser must withhold them regardless of what the
+    // store holds.
+    auto d = v2_detail({make_section("swap", "unavailable", "linux:planned", {{"/swap", "1024", "file"}}),
+                        make_section("volume", "permission_denied", "agent:denied", {{"C:", "C:\\", "d", "ntfs", "1", ""}}),
+                        make_section("topology", "mystery", "", {{"lvm", "vg0", "u", "m", ""}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& swap = section_of(j, "swap");
+    CHECK(swap["status"] == "unavailable");
+    CHECK(swap["reason"] == "linux:planned");
+    CHECK(swap["complete"] == false);
+    CHECK(swap["rows"].is_array());
+    CHECK(swap["rows"].empty());
+    const auto& vol = section_of(j, "volume");
+    CHECK(vol["status"] == "permission_denied");
+    CHECK(vol["reason"] == "agent:denied");
+    CHECK(vol["complete"] == false);
+    CHECK(vol["rows"].empty());
+    // a level this server does not know is neither complete nor row-bearing
+    const auto& topo = section_of(j, "topology");
+    CHECK(topo["status"] == "mystery");
+    CHECK(topo["complete"] == false);
+    CHECK(topo["rows"].empty());
+}
+
+TEST_CASE("hardware_ci_json: status-only sections carry their source value and never rows",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("chassis", "ok"), make_section("baseboard", "ok", "-"),
+                        make_section("machine_id", "constrained", "server:machine_id_shape")});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(section_of(j, "chassis")["source"] == "smbios");
+    CHECK(section_of(j, "baseboard")["source"] == "smbios");
+    CHECK(section_of(j, "baseboard")["reason"].is_null()); // `-` is "no reason"
+    CHECK(section_of(j, "machine_id")["source"] == "etc_machine_id");
+    CHECK(section_of(j, "machine_id")["complete"] == false);
+    for (const char* k : {"chassis", "baseboard", "machine_id"})
+        CHECK(section_of(j, k)["rows"].empty());
+}
+
+TEST_CASE("hardware_ci_json: sections are served in registry order whatever order they arrive in "
+          "and an unregistered kind is never surfaced",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("topology", "ok"), make_section("bogus", "ok"),
+                        make_section("cpu", "ok"), make_section("machine_id", "ok"),
+                        make_section("disk", "ok")});
+    const auto j = hardware_ci_json(d, 0);
+    std::vector<std::string> kinds;
+    for (const auto& s : j["ci"]["sections"])
+        kinds.push_back(s["kind"].get<std::string>());
+    CHECK(kinds == std::vector<std::string>{"machine_id", "cpu", "disk", "topology"});
+}
+
+// "Not reported" is not "has none": a v1 record reads absent with an empty list, a failed read
+// reads degraded with a null list, and the three states never collapse.
+TEST_CASE("hardware_ci_json: sections_state tells found from absent from degraded",
+          "[hardware][model][json][sections]") {
+    // v1 / nothing stored
+    const auto absent = hardware_ci_json(v2_detail({}), 0);
+    CHECK(absent["sections_state"] == "absent");
+    REQUIRE(absent["ci"]["sections"].is_array());
+    CHECK(absent["ci"]["sections"].empty());
+
+    // the sections read failed
+    auto failed = v2_detail({});
+    failed.ci_sections = std::unexpected(CiReadError::kDegraded);
+    CHECK(hardware_ci_sections_unreadable(failed));
+    const auto fj = hardware_ci_json(failed, 0);
+    CHECK(fj["sections_state"] == "degraded");
+    CHECK(fj["ci"]["sections"].is_null());
+
+    // the struct default (ci degraded, sections never read) reads degraded, not absent, and is not
+    // a sections-read failure (the record route keeps its per-part 200 for a degraded ci)
+    const HardwareCiDetail untouched;
+    CHECK_FALSE(hardware_ci_sections_unreadable(untouched));
+    CHECK(hardware_ci_json(untouched, 0)["sections_state"] == "degraded");
+
+    // ci readable but no record yet: nothing stored
+    HardwareCiDetail none;
+    none.ci = std::optional<DeviceCiRecord>{};
+    CHECK(hardware_ci_json(none, 0)["sections_state"] == "absent");
+}
+
 // ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───
 
 // Kills: apply_roster_read treating a failed read as healthy (returns true / leaves a degraded
@@ -964,5 +1197,664 @@ TEST_CASE("classify_hardware_ci_read: found, not found, roster unreadable", "[ha
         empty.software = std::nullopt;
         empty.tags = std::vector<DeviceTag>(1);
         CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::Found);
+    }
+}
+
+// ── hardware_ci_json: section edge cases (H.7 Gate 3) ────────────────────────────────────────
+
+// A row shorter than the registry's column count reads the missing trailing cells as null; a longer
+// one has its extra cells ignored. Neither throws, and the row keeps exactly the declared keys.
+TEST_CASE("hardware_ci_json: a section row shorter or longer than the declared columns is bounded",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "ok", "",
+                                     {{"0", "Xeon", "8"},
+                                      {"1", "Epyc", "16", "32", "3000", "CPU1", "B2", "EXTRA1", "EXTRA2"}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& rows = section_of(j, "cpu")["rows"];
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].size() == 7);
+    CHECK(rows[0]["idx"] == "0");
+    CHECK(rows[0]["cores"] == "8");
+    CHECK(rows[0]["threads"].is_null());
+    CHECK(rows[0]["stepping"].is_null());
+    CHECK(rows[1].size() == 7); // the two extra cells are ignored
+    CHECK(rows[1]["stepping"] == "B2");
+    CHECK_FALSE(rows[1].contains("EXTRA1"));
+}
+
+// Rows are served only for the recognised `ok` and `constrained` levels, matched exactly: a blank
+// level (rows stored but no status row) and a mixed-case level are neither complete nor row-bearing.
+TEST_CASE("hardware_ci_json: a blank or mixed-case level serves no rows and is not complete",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "", "", {{"0", "Xeon", "8", "16", "2400", "CPU0", "A"}}),
+                        make_section("disk", "OK", "", {{"0", "NVMe", "512", "ssd", "nvme"}}),
+                        make_section("swap", "Constrained", "r", {{"/swap", "1024", "file"}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& cpu = section_of(j, "cpu");
+    REQUIRE(cpu.is_object());
+    CHECK(cpu["status"].is_null());
+    CHECK(cpu["complete"] == false);
+    CHECK(cpu["rows"].empty());
+    const auto& disk = section_of(j, "disk");
+    CHECK(disk["status"] == "OK"); // served as the agent sent it, never normalised into a recognised level
+    CHECK(disk["complete"] == false);
+    CHECK(disk["rows"].empty());
+    CHECK(section_of(j, "swap")["complete"] == false);
+    CHECK(section_of(j, "swap")["rows"].empty());
+}
+
+// The registry order picks the first stored section of a kind: a duplicate kind never doubles up.
+TEST_CASE("hardware_ci_json: a duplicated section kind is served once and the first one wins",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "ok", "", {{"0", "First", "1", "1", "1", "S", "x"}}),
+                        make_section("cpu", "unavailable", "dup", {})});
+    const auto j = hardware_ci_json(d, 0);
+    std::size_t n = 0;
+    for (const auto& s : j["ci"]["sections"])
+        n += s["kind"] == "cpu" ? 1 : 0;
+    CHECK(n == 1);
+    CHECK(section_of(j, "cpu")["status"] == "ok");
+    CHECK(section_of(j, "cpu")["rows"][0]["model"] == "First");
+}
+
+// Every registry kind either has a `*_source` mapping in ci_sections_json (status-only kinds) or
+// serves `source: null` (list kinds). A new status-only kind added to the registry without a
+// mapping serves null here and fails, instead of silently carrying a null source.
+TEST_CASE("hardware_ci_json: every status-only registry kind has a source mapping and list kinds serve null",
+          "[hardware][model][json][sections]") {
+    std::vector<DeviceCiSection> all;
+    for (const auto& def : kDeviceCiSections)
+        all.push_back(make_section(def.section, "ok"));
+    auto d = v2_detail(all); // chassis_source, board_source, machine_id_source are all non-blank
+    const auto j = hardware_ci_json(d, 0);
+    REQUIRE(j["ci"]["sections"].size() == kDeviceCiSectionCount);
+    for (const auto& def : kDeviceCiSections) {
+        INFO(def.section);
+        const auto& sec = section_of(j, def.section);
+        REQUIRE(sec.is_object());
+        if (def.table == nullptr)
+            CHECK(sec["source"].is_string());
+        else
+            CHECK(sec["source"].is_null());
+    }
+}
+
+// ── apply_ci_with_sections_read: the store result -> HardwareCiDetail mapping ────────────────
+
+namespace {
+DeviceCiRecord mapped_record(int blob_version) {
+    DeviceCiRecord r;
+    r.agent_id = "a1";
+    r.blob_version = blob_version;
+    r.chassis_serial = "CHS1";
+    return r;
+}
+} // namespace
+
+// Kills: leaving `ci_sections` at a stale value on a failed record read.
+TEST_CASE("apply_ci_with_sections_read: a failed record read is a degraded ci and no sections",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    d.ci_sections = std::vector<DeviceCiSection>{make_section("cpu", "ok")};
+    apply_ci_with_sections_read(d, std::unexpected(CiReadError::kDegraded));
+    REQUIRE_FALSE(d.ci.has_value());
+    CHECK(d.ci.error() == CiReadError::kDegraded);
+    REQUIRE(d.ci_sections.has_value());
+    CHECK(d.ci_sections->empty());
+    CHECK_FALSE(hardware_ci_sections_unreadable(d)); // ci degraded, not a sections failure
+}
+
+TEST_CASE("apply_ci_with_sections_read: an absent record is an answered nullopt with no sections",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    apply_ci_with_sections_read(d, DeviceCiWithSections{});
+    REQUIRE(d.ci.has_value());
+    CHECK_FALSE(d.ci->has_value());
+    REQUIRE(d.ci_sections.has_value());
+    CHECK(d.ci_sections->empty());
+}
+
+TEST_CASE("apply_ci_with_sections_read: a v2 record moves its sections into ci_sections",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    DeviceCiWithSections read;
+    read.record = mapped_record(2);
+    read.record->sections = {make_section("cpu", "ok", "", {{"0", "Xeon"}}), make_section("swap", "unavailable")};
+    apply_ci_with_sections_read(d, std::move(read));
+    REQUIRE(d.ci.has_value());
+    REQUIRE(d.ci->has_value());
+    CHECK((*d.ci)->chassis_serial == "CHS1");
+    CHECK((*d.ci)->sections.empty()); // one home for the rows
+    REQUIRE(d.ci_sections.has_value());
+    REQUIRE(d.ci_sections->size() == 2);
+    CHECK((*d.ci_sections)[0].kind == "cpu");
+    CHECK((*d.ci_sections)[1].level == "unavailable");
+    CHECK_FALSE(hardware_ci_sections_unreadable(d));
+}
+
+// Kills: dropping the `blob_version >= 2` guard (a v1 record never has sections to serve, whatever
+// a caller left in the struct).
+TEST_CASE("apply_ci_with_sections_read: a v1 record serves no sections even if some are present",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    DeviceCiWithSections read;
+    read.record = mapped_record(1);
+    read.record->sections = {make_section("cpu", "ok")};
+    apply_ci_with_sections_read(d, std::move(read));
+    REQUIRE(d.ci.has_value());
+    REQUIRE(d.ci->has_value());
+    REQUIRE(d.ci_sections.has_value());
+    CHECK(d.ci_sections->empty());
+    CHECK(hardware_ci_json(d, 0)["sections_state"] == "absent");
+}
+
+// Kills: flattening a failed sections read into an empty vector (a 200 that reads "reports none").
+TEST_CASE("apply_ci_with_sections_read: a failed sections read keeps the error and the record",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    DeviceCiWithSections read;
+    read.record = mapped_record(2);
+    read.sections_failed = true;
+    apply_ci_with_sections_read(d, std::move(read));
+    REQUIRE(d.ci.has_value());
+    REQUIRE(d.ci->has_value());
+    CHECK((*d.ci)->chassis_serial == "CHS1");
+    REQUIRE_FALSE(d.ci_sections.has_value());
+    CHECK(d.ci_sections.error() == CiReadError::kDegraded);
+    CHECK(hardware_ci_sections_unreadable(d));
+}
+
+// ── The persisted row-count check (up-2): a section whose child rows were lost out of band ────
+
+namespace {
+
+DeviceCiSection counted_section(std::string kind, std::string level, std::string reason, std::optional<int> count,
+                                std::size_t rows) {
+    std::vector<std::vector<std::string>> r;
+    for (std::size_t i = 0; i < rows; ++i)
+        r.push_back({std::to_string(i), "M", "4", "8", "2800", "S", "1"});
+    auto s = make_section(std::move(kind), std::move(level), std::move(reason), std::move(r));
+    s.row_count = count;
+    return s;
+}
+
+} // namespace
+
+// Kills: verifying a section with no persisted count (the pre-v3 upgrade path must read as before).
+TEST_CASE("verify_section_row_count: a NULL count leaves the section exactly as stored",
+          "[hardware][model][sections][row_count]") {
+    for (const char* level : {"ok", "constrained", "unavailable", "permission_denied", "novel", ""}) {
+        INFO(level);
+        const auto v = verify_section_row_count(counted_section("cpu", level, "r", std::nullopt, 0));
+        CHECK(v.level == level);
+        CHECK(v.reason == "r");
+    }
+}
+
+TEST_CASE("verify_section_row_count: an equal count leaves the section exactly as stored",
+          "[hardware][model][sections][row_count]") {
+    auto v = verify_section_row_count(counted_section("cpu", "ok", "", 3, 3));
+    CHECK(v.level == "ok");
+    CHECK(v.reason.empty());
+    v = verify_section_row_count(counted_section("cpu", "ok", "", 0, 0)); // a verified-empty section
+    CHECK(v.level == "ok");
+    v = verify_section_row_count(counted_section("cpu", "constrained", "server_cap:32", 32, 32));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server_cap:32");
+}
+
+// Kills: serving a section whose rows were deleted as complete (the up-2 defect).
+TEST_CASE("verify_section_row_count: fewer rows than stored downgrades ok to constrained",
+          "[hardware][model][sections][row_count]") {
+    const auto v = verify_section_row_count(counted_section("cpu", "ok", "", 3, 0));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:row_count_mismatch");
+    // An ok section that already carried a reason keeps it, with the token appended.
+    const auto w = verify_section_row_count(counted_section("cpu", "ok", "agent:note", 3, 1));
+    CHECK(w.level == "constrained");
+    CHECK(w.reason == "agent:note;server:row_count_mismatch");
+}
+
+TEST_CASE("verify_section_row_count: more rows than stored is the same downgrade",
+          "[hardware][model][sections][row_count]") {
+    const auto v = verify_section_row_count(counted_section("cpu", "ok", "", 1, 2));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:row_count_mismatch");
+}
+
+TEST_CASE("verify_section_row_count: an already constrained section keeps its reason and gains the token once",
+          "[hardware][model][sections][row_count]") {
+    const auto v = verify_section_row_count(counted_section("cpu", "constrained", "server_cap:32", 32, 10));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server_cap:32;server:row_count_mismatch");
+    // Idempotent: a reason that already names the mismatch is not extended.
+    const auto again = verify_section_row_count(
+        counted_section("cpu", "constrained", "server:row_count_mismatch", 3, 1));
+    CHECK(again.reason == "server:row_count_mismatch");
+    // A constrained section with no reason takes just the token.
+    CHECK(verify_section_row_count(counted_section("cpu", "constrained", "", 3, 1)).reason ==
+          "server:row_count_mismatch");
+}
+
+// Kills: upgrading or reasoning over a level that has no rows by contract.
+TEST_CASE("verify_section_row_count: unavailable and permission_denied and unknown and blank levels are never touched",
+          "[hardware][model][sections][row_count]") {
+    for (const char* level : {"unavailable", "permission_denied", "novel", ""}) {
+        INFO(level);
+        const auto v = verify_section_row_count(counted_section("cpu", level, "why", 5, 0));
+        CHECK(v.level == level);
+        CHECK(v.reason == "why");
+    }
+}
+
+// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows that were read.
+TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and incomplete with its rows",
+          "[hardware][model][json][sections][row_count]") {
+    auto d = v2_detail({counted_section("cpu", "ok", "", 3, 1), counted_section("dimm", "ok", "", 2, 0),
+                        counted_section("disk", "ok", "", std::nullopt, 0)});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& cpu = section_of(j, "cpu");
+    CHECK(cpu["status"] == "constrained");
+    CHECK(cpu["complete"] == false);
+    CHECK(cpu["reason"] == "server:row_count_mismatch");
+    CHECK(cpu["rows"].size() == 1); // the rows that WERE read are still served
+    const auto& dimm = section_of(j, "dimm");
+    CHECK(dimm["status"] == "constrained");
+    CHECK(dimm["complete"] == false);
+    CHECK(dimm["rows"].empty());
+    // No persisted count: exactly as before.
+    const auto& disk = section_of(j, "disk");
+    CHECK(disk["status"] == "ok");
+    CHECK(disk["complete"] == true);
+    CHECK(disk["reason"].is_null());
+}
+
+TEST_CASE("hardware_ci_json: a status-only section never takes the row-count check",
+          "[hardware][model][json][sections][row_count]") {
+    auto d = v2_detail({counted_section("chassis", "ok", "", 4, 0)});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(section_of(j, "chassis")["status"] == "ok");
+    CHECK(section_of(j, "chassis")["complete"] == true);
+}
+
+// ── The section content digest (up2r-up-3): same-count drift the row count cannot see ──────────
+
+namespace {
+
+using Rows = std::vector<std::vector<std::string>>;
+
+const DeviceCiSectionDef& def_of(std::string_view kind) {
+    const auto idx = device_ci_section_index(kind);
+    REQUIRE(idx.has_value());
+    return kDeviceCiSections[*idx];
+}
+
+Rows cpu_rows(std::size_t n) {
+    Rows r;
+    for (std::size_t i = 0; i < n; ++i)
+        r.push_back({std::to_string(i), "M", "4", "8", "2800", "S", "1"});
+    return r;
+}
+
+// A section exactly as the store would hand it back: the count AND the digest of its own rows.
+DeviceCiSection digested_section(std::string kind, std::string level, std::string reason, Rows rows) {
+    const auto& def = def_of(kind);
+    const auto digest = section_content_digest(def, rows);
+    REQUIRE(digest.has_value());
+    const auto n = static_cast<int>(rows.size());
+    auto s = make_section(std::move(kind), std::move(level), std::move(reason), std::move(rows));
+    s.row_count = n;
+    s.content_digest = *digest;
+    return s;
+}
+
+} // namespace
+
+// Kills: a serialization where cell boundaries can shift (the classic ambiguity of a delimiter join).
+TEST_CASE("section_content_digest: moving a byte across a cell boundary changes the digest",
+          "[hardware][model][sections][digest]") {
+    const auto& def = def_of("swap"); // 3 columns
+    const auto a = section_content_digest(def, Rows{{"ab", "c", "d"}});
+    const auto b = section_content_digest(def, Rows{{"a", "bc", "d"}});
+    const auto c = section_content_digest(def, Rows{{"a", "b", "cd"}});
+    REQUIRE(a.has_value());
+    CHECK(a != b);
+    CHECK(b != c);
+    CHECK(a != c);
+    // A delimiter-looking byte inside a cell is just a byte.
+    CHECK(section_content_digest(def, Rows{{"a|b", "", ""}}) != section_content_digest(def, Rows{{"a", "b", ""}}));
+}
+
+// Kills: treating an empty cell and a missing cell, or an empty row and no row, as different - and
+// the reverse: treating two different shapes as the same.
+TEST_CASE("section_content_digest: a short row pads to blanks and an extra cell is ignored",
+          "[hardware][model][sections][digest]") {
+    const auto& def = def_of("swap");
+    // The writer stores a short row padded with blanks and truncates a long one, so the digest of
+    // the wire shape and of the stored shape must agree.
+    CHECK(section_content_digest(def, Rows{{"d", "1"}}) == section_content_digest(def, Rows{{"d", "1", ""}}));
+    CHECK(section_content_digest(def, Rows{{"d", "1", "s", "ignored"}}) ==
+          section_content_digest(def, Rows{{"d", "1", "s"}}));
+    // But a blank row is not the absence of a row.
+    CHECK(section_content_digest(def, Rows{{"", "", ""}}) != section_content_digest(def, Rows{}));
+    CHECK(section_content_digest(def, Rows{{"", "", ""}, {"", "", ""}}) !=
+          section_content_digest(def, Rows{{"", "", ""}}));
+}
+
+// Kills: a digest that ignores row order (a generation swap that permutes rows is still drift).
+TEST_CASE("section_content_digest: row order is part of the content and the kind is part of the preimage",
+          "[hardware][model][sections][digest]") {
+    const Rows fwd{{"d0", "1", "s"}, {"d1", "2", "s"}};
+    const Rows rev{{"d1", "2", "s"}, {"d0", "1", "s"}};
+    const auto& swap = def_of("swap");
+    CHECK(section_content_digest(swap, fwd) != section_content_digest(swap, rev));
+    // Stable: the same rows always give the same v1 digest (prefix plus 64 hex).
+    const auto d = section_content_digest(swap, fwd);
+    REQUIRE(d.has_value());
+    CHECK(d->size() == 3 + 64);
+    CHECK(d == section_content_digest(swap, fwd));
+    // Same bytes under another kind of the same width never collide.
+    const auto& other = def_of("swap");
+    DeviceCiSectionDef renamed = other;
+    renamed.section = "swapx";
+    CHECK(section_content_digest(renamed, fwd) != d);
+}
+
+// Pins the serialization itself: a silent change would make every stored digest read as drift.
+// Two rows, so a position that does not advance (every row at ord 0) is caught.
+TEST_CASE("section_content_preimage layout is pinned", "[hardware][model][sections][digest]") {
+    const std::string pre = section_content_preimage("swap", 3, Rows{{"a", "", "c"}, {"d", "e", "f"}});
+    std::string want = "yuzu.device_ci.section.v1";
+    auto u64 = [&](std::uint64_t v) {
+        for (int sh = 56; sh >= 0; sh -= 8)
+            want.push_back(static_cast<char>((v >> sh) & 0xff));
+    };
+    auto str = [&](std::string_view x) {
+        u64(x.size());
+        want.append(x);
+    };
+    str("swap");
+    u64(3); // ncol
+    u64(2); // nrows
+    u64(0); // ord of the first row
+    str("a");
+    str("");
+    str("c");
+    u64(1); // ord of the second row
+    str("d");
+    str("e");
+    str("f");
+    CHECK(pre == want);
+}
+
+// A hard-coded vector, computed outside the code under test (python hashlib over the layout above):
+// the digest function itself, prefix included, cannot drift without this failing.
+TEST_CASE("section_content_digest: a fixed input has a fixed v1 digest", "[hardware][model][sections][digest]") {
+    const auto d = section_content_digest(def_of("swap"), Rows{{"a", "", "c"}, {"d", "e", "f"}});
+    REQUIRE(d.has_value());
+    CHECK(*d == "v1:3e77875b5c562ab906284410143716a347521d08e6b9a6e3dc44fd5a3c94c2c4");
+}
+
+TEST_CASE("section_content_digest: the stored form is the v1 prefix then 64 lowercase hex",
+          "[hardware][model][sections][digest]") {
+    const auto d = section_content_digest(def_of("cpu"), cpu_rows(2));
+    REQUIRE(d.has_value());
+    CHECK(d->size() == 3 + 64);
+    CHECK(d->substr(0, 3) == "v1:");
+    CHECK(classify_stored_digest(*d) == StoredDigestForm::kCurrent);
+    for (const char c : d->substr(3))
+        CHECK(((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')));
+}
+
+// The CLOSED classification of a stored (non-NULL) digest. Only a well-formed digest of a layout
+// version other than 1 is unverified; everything else that is not the current form is damage.
+TEST_CASE("classify_stored_digest: only a well-formed digest of another layout version is unverified",
+          "[hardware][model][sections][digest]") {
+    using F = StoredDigestForm;
+    const std::string hex(64, 'a');
+    // Current form.
+    CHECK(classify_stored_digest("v1:" + hex) == F::kCurrent);
+    CHECK(classify_stored_digest("v1:") == F::kCurrent); // compared (and mismatches): never unverified
+    CHECK(classify_stored_digest("v1:xyz") == F::kCurrent);
+    // A well-formed digest of another layout version: unverified.
+    for (const char* v : {"v2:abc", "v10:abc", "v9:x", "v123456:z", "v2: leading space is the remainder"})
+        CHECK(classify_stored_digest(v) == F::kOtherLayout);
+    CHECK(classify_stored_digest("v2:" + hex) == F::kOtherLayout);
+    // Everything else is malformed (a mismatch at the verifier).
+    for (const char* v : {"", " ", "  ", "\n", "v", "v:", "v1", "vx:abc", "v0:abc", "v01:abc", "v001:abc",
+                          "v2", "v2:", "v10:", "v1234567:abc", "V1:abc", "V2:abc", "x1:abc", "1:abc",
+                          "sha256:abc", "garbage", "v-1:abc", "v+1:abc", " v2:abc", "v 2:abc", "v2 :abc"})
+        CHECK(classify_stored_digest(v) == F::kMalformed);
+    CHECK(classify_stored_digest(hex) == F::kMalformed);               // bare hex
+    CHECK(classify_stored_digest(" v1:" + hex) == F::kMalformed);       // leading space
+    CHECK(classify_stored_digest("V1:" + hex) == F::kMalformed);
+}
+
+// Kills: a digest over the cell WITH its NULs. pg::to_text_array drops 0x00 on store, so the cell
+// reads back without it and the stored digest must be of that projection.
+TEST_CASE("section_content_digest: a NUL byte in a cell is skipped to match what the store keeps",
+          "[hardware][model][sections][digest]") {
+    const auto& disk = def_of("disk");
+    const std::string nul("m\0x", 3);
+    REQUIRE(nul.size() == 3);
+    CHECK(section_content_digest(disk, Rows{{"0", nul, "1", "ssd", "sata"}}) ==
+          section_content_digest(disk, Rows{{"0", "mx", "1", "ssd", "sata"}}));
+    // A cell of only NULs is the blank cell; a NUL does not hide a following cell boundary.
+    CHECK(section_content_digest(disk, Rows{{"0", std::string(2, '\0'), "1", "ssd", "sata"}}) ==
+          section_content_digest(disk, Rows{{"0", "", "1", "ssd", "sata"}}));
+    CHECK(section_content_digest(disk, Rows{{"0", "m", "x", "ssd", "sata"}}) !=
+          section_content_digest(disk, Rows{{"0", nul, "1", "ssd", "sata"}}));
+    // A section hand-built with a NUL cell verifies, not a permanent mismatch.
+    auto s = digested_section("disk", "ok", "", Rows{{"0", nul, "1", "ssd", "sata"}});
+    CHECK(verify_section_content(s).level == "ok");
+}
+
+TEST_CASE("verify_section_content: an intact section is served exactly as stored",
+          "[hardware][model][sections][digest]") {
+    for (const char* level : {"ok", "constrained"}) {
+        INFO(level);
+        auto v = verify_section_content(digested_section("cpu", level, "r", cpu_rows(3)));
+        CHECK(v.level == level);
+        CHECK(v.reason == "r");
+    }
+    // A verified-empty section too.
+    const auto e = verify_section_content(digested_section("cpu", "ok", "", Rows{}));
+    CHECK(e.level == "ok");
+    CHECK(e.reason.empty());
+}
+
+// Kills (by mutation: the verifier ignores the digest) the up2r-up-3 defect - same-count drift.
+TEST_CASE("verify_section_content: a same-count edit of one cell downgrades ok to constrained",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.rows[1][1] = "Edited"; // count unchanged: the count rule alone sees nothing
+    CHECK(verify_section_row_count(s).level == "ok");
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:content_digest_mismatch");
+    // Also with a reason already present, and idempotently.
+    auto t = digested_section("cpu", "ok", "agent:note", cpu_rows(3));
+    t.rows[0][2] = "9";
+    CHECK(verify_section_content(t).reason == "agent:note;server:content_digest_mismatch");
+    auto u = digested_section("cpu", "constrained", "server:content_digest_mismatch", cpu_rows(3));
+    u.rows[0][2] = "9";
+    CHECK(verify_section_content(u).reason == "server:content_digest_mismatch");
+    // A capped section keeps its token and gains the digest one.
+    auto cap = digested_section("cpu", "constrained", "server_cap:32", cpu_rows(3));
+    cap.rows[2][0] = "x";
+    const auto cv = verify_section_content(cap);
+    CHECK(cv.level == "constrained");
+    CHECK(cv.reason == "server_cap:32;server:content_digest_mismatch");
+}
+
+TEST_CASE("verify_section_content: rows swapped for another generation of the same size are caught",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+    Rows other = cpu_rows(2);
+    other[0][1] = "Other";
+    other[1][1] = "Other";
+    s.rows = other;
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:content_digest_mismatch");
+}
+
+// Composition: a lost row reports the count token alone (the digest necessarily changes too).
+TEST_CASE("verify_section_content: a count mismatch is reported alone and wins over the digest",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.rows.pop_back();
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:row_count_mismatch");
+    // And with the count unverifiable (NULL) the digest still catches the loss.
+    auto n = digested_section("cpu", "ok", "", cpu_rows(3));
+    n.row_count.reset();
+    n.rows.pop_back();
+    CHECK(verify_section_content(n).reason == "server:content_digest_mismatch");
+}
+
+// Kills: verifying (or downgrading) a section that has no stored digest - the pre-feature path.
+TEST_CASE("verify_section_content: a NULL digest leaves the section as the count rule left it",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.content_digest.reset();
+    s.rows[0][1] = "Edited";
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "ok");
+    CHECK(v.reason.empty());
+    // The count rule still applies on its own.
+    s.rows.pop_back();
+    CHECK(verify_section_content(s).reason == "server:row_count_mismatch");
+}
+
+// Kills: a verifier that early-returns on a stored digest of the wrong length, or compares only a
+// prefix of it (fail-open on a corrupt column). A value that carries the v1 prefix is a digest this
+// build can recompute, so any difference from it is a mismatch.
+TEST_CASE("verify_section_content: a wrong or damaged v1 digest is a mismatch",
+          "[hardware][model][sections][digest]") {
+    const auto good = section_content_digest(def_of("cpu"), cpu_rows(2));
+    REQUIRE(good.has_value());
+    const std::string hex = good->substr(3);
+    std::string upper = hex;
+    for (auto& c : upper)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    const std::string bad_values[] = {
+        "v1:deadbeef",                               // garbage, short
+        "v1:",                                       // prefix only
+        "v1:" + hex.substr(0, 8),                    // truncated to 8
+        "v1:" + hex.substr(0, 63),                   // one short
+        "v1:" + hex + "0",                           // one long
+        "v1:" + hex.substr(0, 8) + std::string(56, '0'), // right head, wrong tail
+        "v1:" + upper,                               // case changed
+        "",                                          // empty
+        " ",                                         // whitespace
+        " " + *good,                                 // valid, leading space
+        *good + " ",                                 // valid, trailing space
+        "V1:" + hex,                                 // wrong case of the prefix
+        hex,                                         // bare 64 hex (never shipped)
+        "v1:" + hex + std::string(2, 'a'),           // 66 chars after the prefix
+        "v:",                                        // malformed version forms
+        "vx:abc",
+        "v01:abc",
+        "v0:abc",
+        "v1",
+        "v2:",                                       // another layout with nothing after it
+        "garbage",
+    };
+    for (const auto& bad : bad_values) {
+        INFO(bad);
+        auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+        s.content_digest = bad;
+        const auto v = verify_section_content(s);
+        CHECK(v.level == "constrained");
+        CHECK(v.reason == "server:content_digest_mismatch");
+    }
+}
+
+// Kills: reading a well-formed digest of another layout version as drift (a false alarm on every
+// row after a future layout bump), and the reverse: reading damage as unverified.
+TEST_CASE("verify_section_content: a well-formed digest of another layout version is unverified",
+          "[hardware][model][sections][digest]") {
+    const auto good = section_content_digest(def_of("cpu"), cpu_rows(2));
+    REQUIRE(good.has_value());
+    const std::string hex = good->substr(3);
+    for (const std::string& stored : {"v2:" + hex, std::string("v2:abc"), std::string("v10:abc"),
+                                      std::string("v99:x")}) {
+        INFO(stored);
+        auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+        s.content_digest = stored;
+        s.rows[0][1] = "Edited"; // would be a mismatch if the digest were understood
+        const auto v = verify_section_content(s);
+        CHECK(v.level == "ok");
+        CHECK(v.reason.empty());
+    }
+}
+
+// Kills: skipping the digest when no rows remain. With the count unknown (NULL) a section whose
+// rows have all gone is visible only to the digest.
+TEST_CASE("verify_section_content: a digest-only loss of every row is a mismatch",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+    s.row_count.reset();
+    s.rows.clear();
+    const auto v = verify_section_content(s);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:content_digest_mismatch");
+}
+
+TEST_CASE("verify_section_content: levels with no rows by contract are never touched",
+          "[hardware][model][sections][digest]") {
+    for (const char* level : {"unavailable", "permission_denied", "novel", ""}) {
+        INFO(level);
+        auto s = digested_section("cpu", "ok", "why", cpu_rows(2));
+        s.level = level;
+        s.rows[0][1] = "Edited";
+        const auto v = verify_section_content(s);
+        CHECK(v.level == level);
+        CHECK(v.reason == "why");
+    }
+}
+
+TEST_CASE("verify_section_content: a status-only or unregistered kind never takes the digest check",
+          "[hardware][model][sections][digest]") {
+    auto c = digested_section("cpu", "ok", "", cpu_rows(1));
+    c.kind = "chassis"; // status-only
+    c.rows[0][1] = "Edited";
+    CHECK(verify_section_content(c).level == "ok");
+    auto u = digested_section("cpu", "ok", "", cpu_rows(1));
+    u.kind = "nosuchkind";
+    CHECK(verify_section_content(u).level == "ok");
+}
+
+// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows read.
+TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and incomplete with its rows",
+          "[hardware][model][json][sections][digest]") {
+    auto cpu = digested_section("cpu", "ok", "", cpu_rows(2));
+    cpu.rows[0][1] = "Edited";
+    auto d = v2_detail({std::move(cpu), digested_section("disk", "ok", "", Rows{})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& c = section_of(j, "cpu");
+    CHECK(c["status"] == "constrained");
+    CHECK(c["complete"] == false);
+    CHECK(c["reason"] == "server:content_digest_mismatch");
+    CHECK(c["rows"].size() == 2); // served, but NOT the reported generation: see the verdict doc
+    CHECK(section_of(j, "disk")["complete"] == true);
+}
+
+// The digest binds n_fields; the INSERT and SELECT use the parsed column list. They must agree for
+// every kind (also a build-time static_assert in device_ci_kinds.hpp; this reports which kind).
+TEST_CASE("registry: n_fields equals the column count of every table-backed kind",
+          "[hardware][model][sections][digest]") {
+    for (const auto& d : kDeviceCiSections) {
+        INFO(d.section);
+        const std::string_view cols{d.columns};
+        if (d.table == nullptr) {
+            CHECK(cols.empty());
+            CHECK(d.n_fields == 0);
+            continue;
+        }
+        const auto n = 1 + std::count(cols.begin(), cols.end(), ',');
+        CHECK(n == d.n_fields);
     }
 }

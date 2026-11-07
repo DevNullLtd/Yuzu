@@ -183,6 +183,11 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // views; list_guardian_events is the __observation__/enforcement event feed
 // (confined, not denied — see its kToolSecurityRows comment);
 // get_guardian_device_guards is the per-device all-guards census.
+// #5690: get_guardian_status, get_guardian_agent_status, get_guardian_rule_status and
+// get_guardian_device_guards report order_uncertain / projection_pending per row and
+// uncertain_rules per rollup; a clean value never proves freshness or completeness.
+// #7217: get_guardian_device_compliance carries the per-guard flags and uncertain_guards too, and
+// both per-device reads (it and get_guardian_device_guards) report unrepresented_pending_guards.
 // #2146 Batch B1 extends this family with the rule CRUD/push mutations
 // (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
 // per-agent reads #4037 deliberately deferred (get_guardian_agent_status,
@@ -262,8 +267,10 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // whole catalog + role grid) and from Engine principals' assign/unassign/
 // list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
 // GET /api/v1/me) joins it: the same kind of read, a self-description of the
-// CALLING principal that cannot name another one.
-constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
+// CALLING principal that cannot name another one. get_rbac_enforcement (twin of
+// GET /api/v1/rbac/enforcement, #6033) does too: whether enforcement is on and whether the
+// caller could administer RBAC, again about the caller alone.
+constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me", "get_rbac_enforcement"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring
 // action) and from Engine principals' assign/unassign_engine_role (a
@@ -413,8 +420,9 @@ constexpr std::array<ToolFamily, 43> kFamilies{{
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
-                        "permission, and describe the calling session (identity, role, tier, "
-                        "direct RBAC role names)",
+                        "permission, describe the calling session (identity, role, tier, "
+                        "direct RBAC role names), and read whether RBAC enforcement is on and "
+                        "whether the caller could administer it",
      kRbacCheck},
     {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "
