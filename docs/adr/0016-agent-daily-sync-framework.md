@@ -1190,7 +1190,11 @@ spelling that normalises equal); the rest pair k-th to k-th in tuple order as on
 `upgrade(from, to)` each; leftovers are `remove` and `install`. `from_version` and `to_version`
 hold `[epoch:]version[-release]`, non-empty parts only (the `:` follows a non-empty epoch, the
 `-` joins a release to a non-empty version, so a Flatpak row reads as its commit), in the
-existing text columns. **There are no tombstones on `installed_software`**: a removal is a hard
+existing text columns. A version is compared as written, so a row whose version could not be read
+(an empty version, which a Chocolatey package reads when its directory is a junction) moves to or
+from a real version as an `upgrade` with an empty side. The writer must also keep the spelling of
+`arch` and the install location stable from one release to the next: a re-spelled row is a removal
+and an install, not an update. **There are no tombstones on `installed_software`**: a removal is a hard
 delete plus a `remove` row carrying name, publisher and that version text, so no read needs a
 `removed_at` filter.
 
