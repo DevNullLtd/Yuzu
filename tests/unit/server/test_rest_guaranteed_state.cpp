@@ -4558,7 +4558,8 @@ TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never
     other.instruction_id = "os_info-live";
     other.agent_id = "OTHER";
     other.status = kStatusSuccess;
-    // A marker no hex command id in the 504 body can contain (a "99d" could, by chance).
+    // A marker the 504 body cannot contain: its hex correlation id (req-<hex>-<hex>) could hold
+    // "99d" by chance.
     other.output = "uptime_display|OTHER_AGENT_UPTIME_MARKER";
     h.resp_store->store(other);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
