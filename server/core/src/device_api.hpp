@@ -119,8 +119,9 @@ public:
     ///
     /// COST: each row's `guardian_backend` costs one health-store lookup. They are taken under
     /// that store's mutex (the heartbeat upsert path) in slices of kGuardianBackendSlice ids with
-    /// a short pause between slices, so the list is not one snapshot and an upsert waits for one
-    /// slice, not the whole fleet (agent_registry.hpp has the measurements). Six
+    /// a short pause between slices, so the list is not one snapshot and, for this accessor, an
+    /// upsert waits for one slice rather than the whole fleet (agent_registry.hpp has the
+    /// measurements and the stalls the sweep still causes). Six
     /// production callers use this method and four discard the field (the dashboard device
     /// fragment, the crypto hostname map, and two `.size()`-only counts); they pay the lookup
     /// anyway. That cost was accepted deliberately (#2240) in preference to a second seam method.

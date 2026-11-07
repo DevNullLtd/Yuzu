@@ -322,9 +322,10 @@ TEST_CASE("AgentHealthStore guardian_backend_for: entries no writer touches stay
 
     // The writer touches ONLY even indices (upserts, garbage values, and remove-then-re-add), so
     // every odd index must read back as exactly kGuardianBackendTokens[0] on every round: that
-    // is a content assertion that does not depend on timing, and it fails if a slice shifts the
-    // alignment while the map is mutating. An even index may be nullopt (removed), a rejected
-    // value (nullopt) or any table token.
+    // is a content assertion that does not depend on timing, and it can fail if a slice shifts
+    // the alignment into a mutated neighbour (the deterministic alignment case above is what pins
+    // the boundaries). An even index may be nullopt (removed), a rejected value (nullopt) or any
+    // table token.
     //
     // HONEST LIMIT: in a plain build this cannot show that the lock is doing anything; the data
     // race it exists to expose is visible only to a ThreadSanitizer build.

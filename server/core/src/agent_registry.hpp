@@ -1490,13 +1490,16 @@ inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
 /// Unsliced, one call held mu_ about 150-200 ms and stalled an upsert by about as long. Slices
 /// alone did NOT help (std::mutex is unfair: the releasing thread re-takes it before the woken
 /// writer runs) and neither did yield(). Slices plus a 50 us sleep took the worst upsert stall to
-/// 2-4 ms for about 15-20 ms more per call. A separate model with 16-64 open-loop writers at the
-/// heartbeat rate gave a worst stall of 9-20 ms. The pause is therefore load-bearing: do not
-/// remove it as a dead sleep.
-/// PLATFORM: POSIX sleeps. MSVC rounds sleep_for up to a scheduler tick (1-15.6 ms) and nothing in
-/// the server raises the timer resolution, which would add up to about 1.9 s per call at 500k, so
-/// _WIN32 busy-waits on steady_clock instead (about 6 ms of CPU per 500k call). The _WIN32 path has
-/// NOT been measured: no Windows run of this change exists.
+/// 2-4 ms for about 15-20 ms more per call; that sleep actually lasted about 100 us (Linux timer
+/// slack). A separate model with 16-64 open-loop writers at the heartbeat rate gave a worst stall
+/// of 9-20 ms. The pause is therefore load-bearing: do not remove it as a dead sleep.
+/// PLATFORM: only Linux was measured; other non-Windows builds (macOS) sleep unmeasured. MSVC
+/// rounds sleep_for up to a scheduler tick (1-15.6 ms) and nothing in the server raises the timer
+/// resolution, which would add up to about 1.9 s per call at 500k, so _WIN32 busy-waits on
+/// steady_clock instead (about 6 ms of CPU per 500k call, a true 50 us window). On Linux the same
+/// spin measured somewhat worse than the sleep (worst stall about 9-22 ms at 16-64 writers). That
+/// the spin lets a writer in on Windows (SRWLOCK-backed std::mutex) is reasoned from the Linux
+/// model, NOT measured: no Windows run of this change exists.
 /// Slices are not a point-in-time snapshot, which list_devices never was (the registry lock is
 /// released before the health lock is taken).
 inline constexpr std::size_t kGuardianBackendSlice = 4096;
@@ -1575,10 +1578,11 @@ public:
     /// (a view into the header's constexpr table, static storage, safe after mu_ is released)
     /// or nullopt for an id that is unknown to the store, stale, has no tag or an empty one, or
     /// carries a rejected value. nullopt NEVER means `legacy`. It does one hash lookup per id with
-    /// no string copies, taking mu_ per kGuardianBackendSlice ids with a kGuardianBackendPause
-    /// sleep between slices (list_devices has six callers, four of which discard the field; see
-    /// device_api.hpp). Because mu_ is released between slices an entry can be refreshed or pruned
-    /// mid-call: each id is read consistently, the list is not one snapshot.
+    /// no string copies, taking mu_ per kGuardianBackendSlice ids with a pause between slices
+    /// (kGuardianBackendPause: a sleep or a busy-wait by platform, see the constants).
+    /// list_devices has six callers, four of which discard the field; see device_api.hpp.
+    /// Because mu_ is released between slices an entry can be refreshed or pruned mid-call: each
+    /// id is read consistently, the list is not one snapshot.
     /// `guardian_backend_of` is the O(1) point lookup for lookup_device (#3564: no scan, so a miss
     /// costs the same as a hit). Neither may be called from a hot path; both are for
     /// Infrastructure:Read device reads.
