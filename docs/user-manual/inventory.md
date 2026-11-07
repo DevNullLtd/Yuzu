@@ -17,8 +17,8 @@ cadences.
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products), `runtimes` `python` (installed
-  Python interpreters), and `middleware` `ibm_mq` (IBM MQ
+  (Windows machine-context MSI products), `runtimes` `python`, `dotnet` and `jvm` (installed
+  Python, .NET and Java runtimes), and `middleware` `ibm_mq` (IBM MQ
   installations; Linux). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
@@ -31,7 +31,11 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  carried. A `constrained` `runtimes` `dotnet` or `jvm` answer that still lists at least one install is
+  accepted the same way: the constraint names a home or root that could not be fully read, the installs
+  found keep their rows and any install the read could not see is deleted server-side with no marker;
+  one that lists none skips the device's whole installed-software report for the day (retried daily
+  on backoff) and keeps the last good state. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
   exception: it withholds only that source's rows and the cycle continues, so the
   stored rows of that source are removed until a later read succeeds (see
   Troubleshooting). A skipped cycle
@@ -48,7 +52,7 @@ cadences.
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
   `windows_optional_features.list`, `msi_packages.list_inventory`,
-  `runtimes.python`, `middleware.ibm_mq`); `package_id`
+  `runtimes.python`, `runtimes.dotnet`, `runtimes.jvm`, `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -87,19 +91,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) | `Microsoft` | ✓ (the build's self-reported `IMPLEMENTOR`; empty if absent) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -178,6 +182,37 @@ cadences.
   software rows, so the stored `python` rows are removed until a read succeeds again
   (see Troubleshooting). A missing or unreadable version file never does this, the
   row reports the version it could determine.
+
+  **.NET runtimes** are collected through `runtimes` `dotnet` (all three OSes; `source`
+  `runtimes.dotnet`) as one `app` row per installed runtime, SDK or Framework version, `ecosystem`
+  `dotnet`, `publisher` `Microsoft`, `version` the install's version, and `name` `.NET Runtime`,
+  `.NET SDK` or `.NET Framework` (any other shared framework reads `.NET`). No process is started.
+  Windows reads the .NET installer registry keys in both registry views (the shared frameworks are
+  registered in the 32-bit view) and the .NET Framework release key (no directory is read, so only a registered install is found; a
+  zip or `dotnet-install` copy is not); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
+  under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
+  `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
+  A constrained read keeps the rows it found (see the managers rule above); if it found none, the day's
+  report is skipped and the stored `dotnet` rows stay.
+
+  **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
+  `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
+  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
+  Windows) and `publisher` the file's `IMPLEMENTOR`. The publisher is self-reported by the
+  build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
+  the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
+  JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu registry keys and then each home's `release` file; Linux
+  walks `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`; macOS walks
+  `/Library/Java/JavaVirtualMachines`. Version managers and Homebrew JDKs are not walked. On Windows
+  only a JDK that registered itself under one of those keys is found (a zip or tarball install is not),
+  and a home on a removable, optical, remote or otherwise non-fixed drive keeps its row but its
+  `release` file is not read (`windows:runtimes:jvm:release_unreadable`); `supported` with no rows
+  means none was found at the standard roots, not that none is installed. A
+  constrained read keeps the rows it found (installs it could not read are deleted server-side with no
+  marker); if it found none, the device's whole installed-software report is skipped for the day and
+  the stored `jvm` rows stay. The macOS Java leg is verified against fixture
+  trees built from the documented bundle layout, not a real JDK install.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
   `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
@@ -700,7 +735,7 @@ place, **Hardware** and **Software**, each its own page:
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
   `tag=<key>[=<value>]` directly), and the device-CI columns from before (manufacturer,
   model, serial, CPU model + cores/threads, RAM, OS version). All columns except DEX are
-  sortable; a server-side search box (hostname/serial/model/CPU), OS/status filter
+  sortable; a server-side search box (hostname, device id, serial, model, manufacturer, CPU, OS, chassis asset tag, chassis serial, board serial and similar identity fields), OS/status filter
   chips, a filter breadcrumb, and pagination narrow a large fleet. A new checkbox column
   plus a sticky bulk-tag bar let you apply or remove one tag across every selected
   device in one action — under the hood it loops the existing single-device tag routes,
@@ -1028,6 +1063,20 @@ mount table could not be read), `macos:runtimes:permission_denied`,
 `windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
 daily sync restores the rows.
 
+**A device's whole installed-software report has frozen; its log shows
+`sync: runtimes.dotnet failed: <tokens> — skipping this cycle` (or `runtimes.jvm`).** The
+`dotnet` or `jvm` read was constrained and found no install at all, so the agent skipped the
+device's whole installed-software report rather than send an empty list, and retries daily on
+backoff while the answer stays constrained; the stored rows are kept and nothing is deleted. A
+constrained read that still found an install is not an error: its rows are sent, and the log shows
+`sync: runtimes.jvm constrained (<tokens>) — rows kept`. The tokens name the cause, for example `windows:runtimes:dotnet_reg:access_denied`,
+`windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`, `windows:runtimes:jvm:home_unusable`,
+`linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
+`runtimes` README lists them all. On Linux a Java home with a java binary but no `release` file keeps the source constrained
+for as long as it is installed; on macOS the bundle's `Info.plist` supplies the version; on Windows
+such a home keeps its row with the registry's version key as its version and the source stays
+supported. Fix the named cause; the next daily sync resumes.
+
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
 APIs, which return the system code page (cp1252 on Western installs), so any
@@ -1354,17 +1403,52 @@ sync, defeating the hash-skip protocol.
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
   Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
-  not read; storage topology is planned everywhere), and the stored sections are not yet
-  shown in the Hardware pages or API.
+  not read; storage topology is planned everywhere). The stored sections are served by
+  `GET /api/v1/hardware/{id}` and the MCP `get_hardware_ci` tool (they are not rendered in the
+  dashboard Hardware pages yet).
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
   means the server kept only the first `n` rows; `server:machine_id_shape` on the
-  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  `machine_id` section means the reported machine ID was not a hash and was discarded;
+  `server:row_count_mismatch` means the rows stored for the section no longer match the count
+  recorded when the device last synced in full (rows were lost outside the product, for example
+  a partial database restore), so the section is served `constrained` and incomplete with the
+  rows that remain. `server:content_digest_mismatch` means the number of rows still matches but
+  the rows no longer hash to the digest the server recorded beside the section's status when the
+  device last synced in full (a row was edited, or the rows were swapped for another sync's out
+  of band): the section is served `constrained` and incomplete, with the rows that were read, but
+  those rows are **not** the values the agent reported, so do not rely on them. A lost row
+  reports `server:row_count_mismatch` alone. Neither token is stored: both are worked out each
+  time the record is read, so they never appear in the `device_ci_section` query further down.
+  Reading the record again does not clear either token. **Only a full device-record sync
+  repairs either** (a device whose hardware has not changed sends only a hash on its daily sync,
+  which leaves the rows alone): use **Sync now** on the device's Hardware page, or
+  `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
+  `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed
+  software only and do not repair a section, and there is no MCP tool that does: an agentic
+  client should ask an operator to run Sync now on the device, or call
+  `POST /api/v1/hardware/{id}/sync` if it holds REST access. Otherwise it clears on the device's next hardware
+  change or its weekly full report (at most 7 days). A section stored before these checks existed
+  (before migration 3) has neither a recorded count nor a digest and is not verified until that
+  device's next full sync, so a freshly upgraded server verifies a device only after that sync.
+  The digest is computed by the server from the rows it was about to insert (the same projection
+  that is stored; never taken from the agent) and is an integrity check against accident and
+  non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
+  digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
+  layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
+  version (for example `v2:` followed by a digest) is treated as unverified, because this server
+  cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
+  by a colon and a non-empty remainder). Any other stored value that is not the current form (an
+  empty or damaged value, `V1:`, a bare hex string, a malformed version) is compared as a
+  mismatch and reported as `server:content_digest_mismatch`, so a damaged column cannot let an
+  edited section read as complete. Only an absent value (a section stored before migration 3, or
+  a status-only kind) or a well-formed digest of another layout version is unverified. A section
+  whose row count already disagrees reports the count token alone, and an `unavailable` or
+  `permission_denied` section is never compared.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
-  before the agents. No page or API reads the per-device rows yet: these values are stored
-  now and become visible when the device-CI read surface ships.
+  before the agents.
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:
@@ -1389,7 +1473,7 @@ sync, defeating the hash-skip protocol.
   independently: one section being unavailable never stops the others, or the base device
   fields, from being reported.
 
-On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and are not yet shown on the Hardware pages or returned by the REST or MCP device-record endpoints.
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and returned by `GET /api/v1/hardware/{id}` (the chassis, baseboard and machine-id values in `ci`, and every section's status, reason, source and rows in `ci.sections`; a `constrained` section reads as incomplete, and an `unavailable` or `permission_denied` one shows its reason and no rows). The MCP `get_hardware_ci` tool returns the same body and its output schema declares the new keys. They are not yet shown on the Hardware pages. The Hardware list search (`q`) also matches the chassis asset tag, chassis serial and board serial.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its

@@ -108,10 +108,14 @@ revoke_deprovision_credentials(ApiTokenStore& token_store, auth::AuthManager& au
         }
         auto sessions = auth_mgr.invalidate_user_sessions(principal);
         result.sessions_revoked += sessions.count;
-        // Sessions are in-memory-only (AuthManager::invalidate_user_sessions
-        // ' RevokeResult::db_persisted is always true today — no durable
-        // session surface exists to fail to persist to) — nothing to fold
-        // into api_tokens_persisted here.
+        // Since HA WS-1a, sessions are durable rows in the SessionStore:
+        // `invalidate_user_sessions` wipes this replica's cache regardless, but
+        // reports `db_persisted == false` when the durable DELETE failed. That row
+        // survives and any other replica (or this one after a restart) rehydrates
+        // a valid session from it, so a non-persisted delete is NOT a revoked
+        // session. Fold it exactly as the token leg above does (#4772).
+        if (!sessions.db_persisted)
+            result.sessions_persisted = false;
     }
     return result;
 }

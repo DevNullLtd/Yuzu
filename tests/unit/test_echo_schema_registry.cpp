@@ -11,6 +11,7 @@
 //     `do_configure` is the de-duplicated union of all non-Unsupported
 //     methods, sorted, so error messages are stable.
 
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -235,17 +236,18 @@ TEST_CASE("Echo schema: the registry source row (PR11.8)", "[echo][schema][regis
     REQUIRE(def != nullptr);
     CHECK(def->dollar_name == "Registry");
     CHECK(def->default_enabled);
-    CHECK(def->unique_key_column == "record_key");
     REQUIRE(def->os_support.size() == 3);
     CHECK(os_support_status("registry", "windows") == OsSupportStatus::kSupported);
     CHECK(supported_capture_method("registry", "windows") == "regnotify+etw");
     CHECK(os_support_status("registry", "linux") == OsSupportStatus::kUnsupported);
     CHECK(os_support_status("registry", "macos") == OsSupportStatus::kUnsupported);
-    REQUIRE(def->granularities.size() == 1); // one live tier, no rollups
-    CHECK(def->granularities[0].suffix == "live");
-    CHECK(def->granularities[0].retention_type == RetentionType::kRowCount);
-    CHECK(def->granularities[0].retention_default == 500000);
-    CHECK(is_queryable_table("registry_live"));
+    REQUIRE(def->granularities.size() == 2); // hourly + daily roll-up tiers, no raw table
+    CHECK(def->granularities[0].suffix == "hourly");
+    CHECK(def->granularities[0].retention_type == RetentionType::kTimeBased);
+    CHECK(def->granularities[0].retention_default == 7776000);
+    CHECK(def->granularities[1].suffix == "daily");
+    CHECK(is_queryable_table("registry_hourly"));
+    CHECK(is_queryable_table("registry_live")); // the retired raw name answers with an empty shim view
 }
 
 // ── Per-source default-enabled (review R1) ──────────────────────────────────
@@ -274,13 +276,13 @@ TEST_CASE("Echo schema: software source is registered with three tiers + Windows
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "Software");
 
-    // live + daily + monthly, in that declaration order (so run_aggregation rolls
-    // daily-from-live before monthly-from-daily within one tick).
+    // hourly + daily + monthly, the roll-up tiers the fold writes (there is no raw live table).
     REQUIRE(it->granularities.size() == 3);
-    CHECK(it->granularities[0].suffix == "live");
+    CHECK(it->granularities[0].suffix == "hourly");
     CHECK(it->granularities[1].suffix == "daily");
     CHECK(it->granularities[2].suffix == "monthly");
-    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+    for (const auto& g : it->granularities)
+        CHECK(g.retention_type == RetentionType::kTimeBased);
 
     // Windows is fully supported; Linux/macOS are planned (queryable-empty).
     for (const auto& os : it->os_support) {
@@ -330,9 +332,13 @@ TEST_CASE("Echo schema: $Software dollar-names translate and DDL has the columns
     CHECK(is_queryable_table("software_live"));
     CHECK(is_queryable_table("software_daily"));
 
-    const auto ddl = generate_warehouse_ddl();
-    CHECK(ddl.find("CREATE TABLE IF NOT EXISTS software_live") != std::string::npos);
-    CHECK(ddl.find("prev_version") != std::string::npos);
+    // The warehouse DDL no longer creates software_live: a roll-up tier is created by the fold
+    // DDL (a table behind a view), and the retired raw name is answered by an empty shim view that
+    // keeps its old columns.
+    CHECK(generate_warehouse_ddl().find("software_live") == std::string::npos);
+    CHECK(generate_fold_ddl().find("CREATE TABLE IF NOT EXISTS software_hourly_r") != std::string::npos);
+    CHECK(legacy_live_shim_ddl().find("CREATE VIEW IF NOT EXISTS software_live") != std::string::npos);
+    CHECK(legacy_live_shim_ddl().find("prev_version") != std::string::npos);
 
     // live carries the full event columns (machine scope only — no scope/user);
     // daily/monthly carry the count rollup.
@@ -397,11 +403,12 @@ TEST_CASE("Echo schema: netqual Windows is kSupportedConstrained via estats (ADR
     auto mac_methods = accepted_capture_methods_for_os("netqual", "macos");
     CHECK(std::find(mac_methods.begin(), mac_methods.end(), "nstat") != mac_methods.end());
 
-    // live + the per-boot retrospective baseline tier.
-    REQUIRE(it->granularities.size() == 2);
-    CHECK(it->granularities[0].suffix == "live");
-    CHECK(it->granularities[1].suffix == "boot");
-    CHECK(it->granularities[1].retention_type == RetentionType::kRowCount);
+    // The per-boot retrospective baseline tier (a plain table) plus the hourly and daily roll-ups.
+    REQUIRE(it->granularities.size() == 3);
+    CHECK(it->granularities[0].suffix == "boot");
+    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+    CHECK(it->granularities[1].suffix == "hourly");
+    CHECK(it->granularities[2].suffix == "daily");
 
     CHECK(translate_dollar_name("$NetQual_Boot") == "netqual_boot");
     CHECK(is_queryable_table("netqual_boot"));
@@ -412,7 +419,7 @@ TEST_CASE("Echo schema: netqual Windows is kSupportedConstrained via estats (ADR
     }
 }
 
-TEST_CASE("Echo schema: netconn source is registered live-only with Windows wevtapi support",
+TEST_CASE("Echo schema: netconn source is registered with hourly and daily tiers and Windows wevtapi support",
           "[echo][schema][netconn]") {
     const auto& sources = capture_sources();
     auto it = std::find_if(sources.begin(), sources.end(),
@@ -420,9 +427,11 @@ TEST_CASE("Echo schema: netconn source is registered live-only with Windows wevt
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "NetConn");
 
-    REQUIRE(it->granularities.size() == 1);
-    CHECK(it->granularities[0].suffix == "live");
-    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+    REQUIRE(it->granularities.size() == 2);
+    CHECK(it->granularities[0].suffix == "hourly");
+    CHECK(it->granularities[1].suffix == "daily");
+    for (const auto& g : it->granularities)
+        CHECK(g.retention_type == RetentionType::kTimeBased);
 
     for (const auto& os : it->os_support) {
         INFO("netconn os=" << os.os);

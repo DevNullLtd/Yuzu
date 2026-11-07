@@ -979,6 +979,101 @@ groups:
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # #3678 -- the command outbox's REDELIVERY HORIZON. Three states, deliberately different rules.
+      #
+      # YuzuOutboxHeld: the delivery loop could not read the dispatch counters (or no reader is
+      # wired), so it HOLDS every pending occurrence and ends the tick -- nothing is sent, nothing
+      # fails, no audit row. All scheduled work stalls silently until the read recovers.
+      # `yuzu_server_command_outbox_pending` is the documented stall signal but nothing watched it.
+      # A hold repeats every ~5 s tick for as long as it lasts, so `increase()` stays positive
+      # throughout. The expression then stays true for the hold PLUS the 10m window, so with
+      # `for: 15m` a hold of roughly 7 minutes or more fires it (verified: 6 minutes does not,
+      # 7 does) and it keeps firing for about 10 minutes after recovery. It is a "stalled for
+      # several minutes" rule, not a 15-minute one. `stamp_not_committed` is excluded here (it
+      # also occurs for seconds at every leader handover); a PERSISTENT one is YuzuOutboxStampFailing
+      # below. The series are pre-seeded at 0 in CommandOutboxDelivery's constructor, so the first
+      # hold is a 0->1 step.
+      - alert: YuzuOutboxHeld
+        expr: |
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_hold_cause_total{cause=~"sequence_unwired|sequence_unreadable"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The command outbox is holding all scheduled work on {{ $labels.instance }}"
+          description: >-
+            For several minutes (roughly 7 or more) the command outbox delivery loop on
+            {{ $labels.instance }} has been unable to read the dispatch counts its retry
+            limit needs (cause sequence_unreadable) or has no reader wired (sequence_unwired), so
+            it sends and fails NOTHING: every pending scheduled occurrence is held and no audit row
+            is written. The alert keeps firing for about 10 minutes after the read recovers.
+            FIRST check PostgreSQL reachability and pool health on that instance (the counters
+            live in the execution_tracker schema, the same database as the outbox), then that the
+            execution_tracker.dispatch_seq sequence exists and the server role can read it.
+            Occurrences that were never attempted are sent late once the read recovers. One that
+            was ALREADY being retried keeps counting dispatches during the hold and may be
+            dead-lettered when the read recovers (see YuzuOutboxDeadLettered). See
+            docs/user-manual/instructions.md "Execution semantics" and docs/user-manual/metrics.md
+            (yuzu_server_command_outbox_deliver_hold_cause_total).
+
+      # #3678 -- YuzuOutboxStampFailing: the first-attempt stamp keeps failing to commit
+      # (cause stamp_not_committed) -- a schema missing the outbox's stamp columns, a role without
+      # UPDATE on the outbox, or a store that cannot write. Like a hold it stalls scheduled work
+      # with a throttled log line and no audit row, but it is excluded from YuzuOutboxHeld because
+      # it also occurs for a few seconds at every leader handover. `for: 1h` over a 30m window
+      # fires after a failure of roughly 35 to 45 minutes (31m does not, 45m does) and keeps
+      # firing for up to 30 minutes after recovery: a persistent failure, not a handover.
+      - alert: YuzuOutboxStampFailing
+        expr: |
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_hold_cause_total{cause="stamp_not_committed"}[30m])) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The command outbox cannot record first-attempt stamps on {{ $labels.instance }}"
+          description: >-
+            For roughly 35 to 45 minutes or more the command outbox delivery loop on {{ $labels.instance }} has
+            been unable to commit the stamp it must write before a scheduled occurrence's first
+            attempt, so those occurrences are HELD (not sent, not failed, no audit row). Likely
+            causes: the command_outbox_store schema is missing the dispatch stamp columns (check its
+            schema_meta version), the server role lacks
+            UPDATE on the outbox, or Postgres is rejecting writes. Check the server log line
+            "held: stamp_not_committed" and the outbox's schema_meta version.
+
+      # #3678 -- YuzuOutboxDeadLettered: a scheduled occurrence was refused a retry because the
+      # dispatch count advanced by the redelivery horizon (or went backwards) since its first
+      # attempt, and was marked failed instead of being re-sent. That is the control working AND a
+      # lost scheduled run, so it is worth surfacing, but it is a WARNING, not a page: a single very
+      # large Guardian / asset-tag / sync push legitimately ends every waiting occurrence at once,
+      # and the count is only an estimate (docs/command-dedup.md). No `for:`: each dead-letter is
+      # one terminal row, and a lone one must be visible. The series is pre-seeded at 0, but
+      # `increase()` ignores a series' FIRST sample, so a dead-letter on the first leader tick
+      # after a restart (which can land inside one scrape interval) would create the series
+      # already at N>0 and never fire. The second clause covers that: a series that is non-zero
+      # now and had no sample at all between 7 hours and 1 hour ago (a range lookup, not a point
+      # lookup: a scrape gap of up to 6 hours must not make a long-lived series look newborn).
+      - alert: YuzuOutboxDeadLettered
+        expr: |
+          increase(yuzu_server_command_outbox_deliver_horizon_exceeded_total[1h]) > 0
+            or (yuzu_server_command_outbox_deliver_horizon_exceeded_total > 0
+                unless on (job, instance)
+                  last_over_time(yuzu_server_command_outbox_deliver_horizon_exceeded_total[6h] offset 1h))
+        labels:
+          severity: warning
+        annotations:
+          summary: "A scheduled run was dead-lettered by the redelivery limit on {{ $labels.instance }}"
+          description: >-
+            At least one scheduled occurrence on {{ $labels.instance }} was marked failed in the
+            last hour because retrying it would have re-sent a command the agent may have already
+            forgotten (redelivery_horizon_exceeded), or because the shared dispatch sequence went
+            backwards (redelivery_sequence_regressed). The occurrence MAY OR MAY NOT have reached
+            any agent. Find it in the audit log (action command.outbox_delivered, result failure),
+            check the agents' responses for its command ID, and re-run it by hand if it did not
+            complete; an approval ticket it used is spent. A likely benign cause is a very large
+            fan-out push (Guardian, asset-tag, sync) that counted one dispatch per target; a
+            suspicious one is rows stuck for hours (see yuzu_server_command_outbox_deliver_retry_cause_total).
+            See docs/user-manual/instructions.md "Execution semantics".
+
       # HA WS-5 slice 2 (ADR-2002 §7f) — a presented gateway session_id that
       # matches MORE than one live directory row. No `for:` (same reasoning as
       # YuzuGatewayResponseAgentMismatch below): ambiguity means a duplicate
@@ -3406,6 +3501,64 @@ groups:
             (is_revoked) reads the database, not the CRL, and is unaffected.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-near-expiry-or-expired"
 
+      # A CRL dated in the future (#7097). The `published` gauge is the publishing
+      # replica's clock at build time (published_at), and the CRL's thisUpdate is
+      # 300 s earlier (the publisher backdates it), so a healthy newest CRL has
+      # `published - time()` at or below zero. If that replica's clock was ahead
+      # of real time when it published, the CRL is future-dated: relying parties
+      # refuse it as not yet valid (the gateway tolerates a thisUpdate 3600 s
+      # ahead, yuzu_gw_mgmt_crl:max_future_s/0, which is `published - time()` of
+      # 3900 s; a strict verifier such as OpenSSL refuses any future thisUpdate),
+      # while the two expiry rules above see more than 48 hours of headroom and
+      # stay silent. The timing, stated exactly: `published - time()` falls by one
+      # second per second, and `for: 2m` needs it above 3600 s throughout, so the
+      # rule fires for every CRL published more than 3720 s (62 minutes) ahead,
+      # 2 minutes after the first scrape. A gateway refuses once the gap passes
+      # 3900 s, so every CRL a gateway refuses alerts within about 2 minutes
+      # (3720 s is below 3900 s); a CRL published 3600 to 3720 s ahead is accepted
+      # by gateways and never alerts. `for:` is short on purpose: the input is a
+      # stored row, so there is no transient to filter, and a long `for:` only
+      # delays the real case (docs/observability-conventions.md). A
+      # republish at the correct time supersedes the row, but the freshness pass
+      # does not do that by itself until under 24 hours of the future-dated
+      # nextUpdate remain (see "CRL dated in the future" in
+      # docs/pki-architecture.md for the restart that does). `max by (job)`
+      # follows the newest row, which every replica exports, so a replica holding
+      # an older value cannot hide it and one deployment gives one page. The
+      # reverse holds too, and is the price of `max`: after the fix, a replica whose
+      # reads keep failing keeps the OLD future-dated value, `max` selects it, and
+      # the alert stays firing until that replica's reads recover or it restarts.
+      # Same `up == 0` caveat as the two rules above. Nothing else detects this
+      # today: #6916 (still open) covers only the opposite direction, a clock
+      # stepped back.
+      - alert: YuzuCaCrlFutureDated
+        expr: |
+          (max by (job) (yuzu_server_ca_crl_published_timestamp_seconds) - time()) > 3600
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The newest internal-CA CRL was published more than an hour ahead of now"
+          description: >-
+            yuzu_server_ca_crl_published_timestamp_seconds (the publishing
+            replica's clock when it built the newest CRL; the CRL's thisUpdate
+            is 300 seconds earlier) is more than an hour ahead of the current
+            time. A CRL is dated by the clock of the replica that published it,
+            so that clock was ahead of real time at publish. Relying parties
+            refuse a CRL that is not yet valid (the gateway tolerates a
+            thisUpdate up to one hour ahead and refuses beyond that, so this
+            fires within about two minutes of every CRL a gateway refuses;
+            OpenSSL-style verifiers refuse any future thisUpdate),
+            and YuzuCaCrlNearExpiry and YuzuCaCrlExpired stay silent because
+            nextUpdate is also in the future. Nothing records which replica
+            published, so check the clock (NTP state) of every replica and
+            correct the one that is wrong, then restart one replica with a
+            correct clock (never all of them, and not while Postgres is
+            unreachable) so its boot publish replaces the CRL; see "CRL dated
+            in the future" in docs/pki-architecture.md. This rule needs a successful
+            scrape, so keep your own `up == 0` alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-dated-in-the-future"
+
       - alert: YuzuCaRevocationSweepReadFailing
         expr: |
           increase(yuzu_server_ca_revocation_sweep_read_failures_total[15m]) > 0
@@ -4517,14 +4670,16 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Two sources on the SAME counter, both keyed by reason
+      # Three sources on the SAME counter (guardian_census, #5690, is the census
+      # pending-evidence count read: it serves no empty result, its gauge keeps
+      # its last value), each keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
       # is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-      # agent_rule_statuses*/rule_names*/errored_rule_count) - these fail HARD
+      # agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count) - these fail HARD
       # (a typed error the caller must act on), but a sustained rate here still
       # means the Guardian push/reconcile/status surface is failing, not
       # merely serving stale data. `by (reason, source)` keeps both dimensions
@@ -4547,9 +4702,13 @@ groups:
             - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
+            source="guardian_census" means the census pending-evidence count
+            read (#5690) failed, which only freezes the
+            yuzu_server_guardian_census_pending_events gauge at its last value (or
+            leaves it absent before the first successful read).
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
-            errored_rule_count) is degrading: the read itself returns a typed
+            errored_rule_count/uncertain_rule_count) is degrading: the read itself returns a typed
             error, not a silent empty/stale result — but "returns a typed
             error" does not mean every caller aborts. Most callers DO fail
             closed (abort push/reconcile/status on the typed error), but this
@@ -7280,7 +7439,10 @@ groups:
             yuzu_exec_correlation_write_degrade_total and the server log line "pool
             exhausted for command_id" (at most one per minute per cause). The responses
             already stored unverified are not repaired when the store recovers; re-run the
-            affected commands.
+            affected commands. While this fires the WS-3 command outbox's redelivery
+            horizon (#3678) counts those dispatches only on the instance that failed to
+            write them; treat the protection against re-sending an old scheduled command
+            as weakened until it clears.
 
       # #4990: the READ side of the same record. A response frame whose record lookup
       # fails twice (one retry) is stored `~unverified` with the same consequences. Only

@@ -1153,10 +1153,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "
-         "install path (Linux only; standard roots only, directory walk, no subprocess)"},
+         "install path (Windows registry, macOS and Linux standard-root directory walks; "
+         "no subprocess)"},
         {"runtimes.jvm",
          "List installed JVMs by image type, version, home and vendor from each home's "
-         "release file (Linux only; standard roots only, no subprocess)"},
+         "release file (Windows registry, macOS JavaVirtualMachines and Linux standard "
+         "roots; no subprocess)"},
         {"runtimes.python",
          "List installed Python interpreters by flavour, version, install path and vendor "
          "(Windows PEP 514 registry keys, macOS python.org framework, Linux python3.<minor> "
