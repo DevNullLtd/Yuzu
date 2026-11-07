@@ -6019,9 +6019,11 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
 
 TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
           "[software_inventory][v3][ledger]") {
-    // The row shapes the Windows pkg_inventory legs emit: no publisher, no release, no install
-    // location; an Appx row is named by the part of its PackageFullName before the first '_' and
-    // carries the architecture; a Chocolatey package whose nuspec is unreadable has version ''.
+    // The row shapes the Windows pkg_inventory legs emit: the collector declares no vendor for
+    // them, so the publisher is the origin label `via:<ecosystem>` (which the pairing key reads as
+    // no vendor); no release, no install location; an Appx row is named by the part of its
+    // PackageFullName before the first '_' and carries the architecture; a Chocolatey package
+    // whose nuspec is unreadable has version ''.
     // One call diffs one collector's rows, so a call never mixes the two ecosystems.
     const auto row = [](const std::string& name, const std::string& version,
                         const std::string& ecosystem, const std::string& arch = "") {
@@ -6029,6 +6031,7 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
         e.name = name;
         e.version = version;
         e.ecosystem = ecosystem;
+        e.publisher = "via:" + ecosystem;
         e.arch = arch;
         const bool choco = ecosystem == "chocolatey";
         e.kind = choco ? "pkg" : "app";
