@@ -2586,6 +2586,27 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         {"/uploads/{upload_id}/commit",
          "post",
          {"200", "400", "401", "409", "410", "422", "500", "503"}},
+        // register_routes(): sink.Put("/api/v1/dex/score-policy") through score_policy_write:
+        // 200; 400 (apply_dex_score_policy Invalid, IfMatchMalformed); 401 (authenticate_for_
+        // session_audit); 403 (perm_fn, cross-site cookie write); 409 (Stale); 428
+        // (IfMatchMissing); 503 (WriterBusy, StoreUnavailable, OutcomeUnknown,
+        // AuditUnavailable). 411 and 413 come from the pre-routing cap (kBodyCapTable,
+        // dex_score_policy: 320 KiB, requires_measurable, any method): 411 for a request that
+        // cannot be sized in advance, 413 over the cap.
+        {"/dex/score-policy", "put", {"200", "400", "401", "403", "409", "411", "413", "428", "503"}},
+        // sink.Delete("/api/v1/dex/score-policy"): the same handler and gates; the body is
+        // ignored, but the any-method cap row still applies, so 411 and 413 are reachable.
+        {"/dex/score-policy", "delete", {"200", "400", "401", "403", "409", "411", "413", "428", "503"}},
+        // config_routes.cpp, sink.Get("/api/v1/config"): 200; 401 and 403 (perm_fn, which also
+        // refuses a service-scoped token); 503 (build_config_view ViewFault).
+        {"/config", "get", {"200", "401", "403", "503"}},
+        // config_routes.cpp handle_put(v1): 200; 400 (RouteOwned key, body depth, JSON, missing
+        // or non-scalar value, validate_value, unknown key, a Rejected write); 401 (perm_fn,
+        // auth_fn, step-up challenge); 403 (perm_fn including the service-scoped refusal,
+        // cross-site write, write_refusal Denied, step-up SAML or engine); 413 (kBodyCapTable
+        // "config", 16 KiB; requires_measurable is off, so there is no 411); 503 (store not
+        // ready, StoreFault, attempted audit row, step-up store).
+        {"/config/{key}", "put", {"200", "400", "401", "403", "413", "503"}},
     };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -2614,6 +2635,52 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
                 declared.insert(code);
             CHECK(declared == row.statuses);
         }
+    }
+}
+
+TEST_CASE("openapi documents: the /config and /dex/score-policy error responses are typed and the "
+          "audit header is declared where the handler sets it",
+          "[openapi][structure][responses]") {
+    const std::string kEnvelope = "#/components/schemas/A4ErrorEnvelope";
+    struct Op {
+        const char* path;
+        const char* method;
+    };
+    const std::vector<Op> ops = {{"/config", "get"},
+                                 {"/config/{key}", "put"},
+                                 {"/dex/score-policy", "get"},
+                                 {"/dex/score-policy", "put"},
+                                 {"/dex/score-policy", "delete"}};
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& o : ops) {
+            INFO(o.method << " " << o.path);
+            const json* responses = find_at(spec, {"paths", o.path, o.method, "responses"});
+            REQUIRE(responses != nullptr);
+            for (const auto& [code, response] : responses->items()) {
+                INFO("status " << code);
+                if (code[0] != '4' && code[0] != '5')
+                    continue;
+                const json* ref = find_at(response, {"content", "application/json", "schema", "$ref"});
+                REQUIRE(ref != nullptr);
+                CHECK(*ref == kEnvelope);
+            }
+        }
+        // config_routes.cpp handle_put: emit_behavioral_audit sets Sec-Audit-Failed on the
+        // attempted row (the 503) and on the outcome row (the 200, with audit_persisted false).
+        for (const char* code : {"200", "503"}) {
+            INFO("PUT /config/{key} " << code);
+            const json* header = find_at(spec, {"paths", "/config/{key}", "put", "responses", code,
+                                                "headers", "Sec-Audit-Failed", "schema", "enum"});
+            REQUIRE(header != nullptr);
+            CHECK(*header == json::array({"true"}));
+        }
+        // handle_put refuses a service-scoped token on every key: the description says so, not
+        // only under the administrator-only keys.
+        const json* desc = find_at(spec, {"paths", "/config/{key}", "put", "description"});
+        REQUIRE(desc != nullptr);
+        CHECK(desc->get<std::string>().find("refused with a 403 on every key") != std::string::npos);
     }
 }
 
