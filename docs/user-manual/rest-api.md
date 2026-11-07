@@ -10235,7 +10235,7 @@ answers `503` with `retry_after_ms: 2000`.
 `success` or `failure` row once the store answers. If the `attempted` row cannot be saved, the route
 answers `503` and makes no change. Audit actions: `plugin_config.set`, `plugin_config.delete`,
 `plugin_secret.set`, `plugin_secret.delete`, `plugin_config.kill_switch.set` (see
-[Audit Log](audit-log.md)). Request bodies over 192 KiB are refused with `413`.
+[Audit Log](audit-log.md)). Request bodies over 256 KiB are refused with `413`.
 
 **Secrets are write-only.** You can set or delete a secret, but no REST route or MCP tool ever returns
 its value. Secret responses carry metadata only.
