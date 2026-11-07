@@ -385,5 +385,47 @@ class SettingsErrorMessage(unittest.TestCase):
                                                 .replace("e.message", "x")))
 
 
+UPGRADING_MD = SRC_DIR.parent.parent.parent / "docs" / "user-manual" / "upgrading.md"
+BOOT_REFUSAL = "[PG] Refusing to start: access-review store migration/open failed"
+MIGRATION_REFUSAL = "decision row(s) were recorded by the subject of the grant under an earlier build"
+
+
+def boot_refusal_problems(server_src, store_src, doc):
+    """The operator's way to find the schema v3 refusal is the log text the upgrade note quotes."""
+    out = []
+    # server.cpp splits the literal over two lines; compare the first fragment and the flag.
+    at = server_src.find("Refusing to start: access-review store migration/open failed")
+    if at < 0 or "[PG] " not in server_src[max(0, at - 12):at + 1]:
+        out.append("server.cpp no longer logs the access-review store boot refusal text")
+    elif "startup_failed_ = true" not in server_src[at:at + 900]:
+        out.append("the access-review store boot refusal no longer sets startup_failed_")
+    if MIGRATION_REFUSAL not in store_src:
+        out.append("access_review_store.cpp no longer carries the schema v3 migration refusal text")
+    if BOOT_REFUSAL not in doc or MIGRATION_REFUSAL not in doc:
+        out.append("docs/user-manual/upgrading.md no longer quotes the access-review boot and migration refusal text")
+    if "**Fresh database only.**" not in doc:
+        out.append("docs/user-manual/upgrading.md lost the 'Fresh database only' paragraph of the #4752 section")
+    return out
+
+
+class BootRefusalDocs(unittest.TestCase):
+    def sources(self):
+        return (SERVER_CPP.read_text(encoding="utf-8"), STORE_CPP.read_text(encoding="utf-8"),
+                UPGRADING_MD.read_text(encoding="utf-8"))
+
+    def test_refusal_text_and_doc_agree(self):
+        p = boot_refusal_problems(*self.sources())
+        for m in p:
+            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_pattern_is_live(self):
+        server, store, doc = self.sources()
+        self.assertTrue(boot_refusal_problems(server.replace("Refusing to start: access-review store", "Refusing: access-review store"), store, doc))
+        self.assertTrue(boot_refusal_problems(server, store.replace(MIGRATION_REFUSAL, "x"), doc))
+        self.assertTrue(boot_refusal_problems(server, store, doc.replace("**Fresh database only.**", "**Fresh.**")))
+        self.assertTrue(boot_refusal_problems(server, store, doc.replace(BOOT_REFUSAL, "x")))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)
