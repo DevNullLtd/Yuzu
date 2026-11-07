@@ -317,15 +317,10 @@ class VocabularyConsistency(unittest.TestCase):
     def test_manual_table_rows_are_aligned(self):
         # A merge that adds a column to some rows only must not pass: every row of the field
         # table has the header's cell count.
-        lines = read(MANUAL).splitlines()
-        at = next(i for i, l in enumerate(lines) if re.match(r"\s*\| `kind` \|", l))
-        top, end = at, at
-        while top > 0 and lines[top - 1].lstrip().startswith("|"):
-            top -= 1
-        while end + 1 < len(lines) and lines[end + 1].lstrip().startswith("|"):
-            end += 1
-        counts = [len(l.strip()[1:-1].split("|")) for l in lines[top : end + 1]]
-        self.assertEqual(len(set(counts)), 1, f"field table rows have uneven cell counts: {counts}")
+        block = next(b for b in re.findall(r"(?m)(?:^[ \t]*\|.*\n?)+", read(MANUAL))
+                     if "| `kind` |" in b)
+        counts = {len(l.strip()[1:-1].split("|")) for l in block.splitlines()}
+        self.assertEqual(len(counts), 1, f"field table rows have uneven cell counts: {counts}")
 
     def test_emitted_equals_published(self):
         self.assertEqual(self.emitted_kinds, EXPECTED_KINDS)
