@@ -124,9 +124,12 @@
 /// (Bearer and X-Yuzu-Token: up to two) plus one principal row read for an engine token, against the server's one read-write Postgres, from the pool with a 1.5 s lease
 /// wait; a run is capped at 2 per principal and 60 s. An unanswerable read is `kIndeterminate`
 /// (one retry, then stop), never `kRevoked` and never `kValid`. Under a pool brownout one
-/// boundary can wait about 10 s (up to three reads per attempt at 1.5 s, two attempts, 1 s
-/// between), plus up to 10 s more for a connect the pool had already started; the engine
-/// liveness cache's failure backoff is not applied on this path. What remains: the step already
+/// boundary waits about 4 s when the pool is exhausted (0.5 s per read) and about 21 s when no
+/// connection is idle and the database does not answer (two 10 s connect timeouts and the 1 s
+/// retry wait); a read on an already-leased connection to a database that stopped answering
+/// did not return in 150 s in a test, so the 60 s deadline (tested between attempts) does not
+/// bound it (ADR-1005 residual 15); the engine liveness cache's failure backoff is not applied
+/// on this path. What remains: the step already
 /// sent when the revoke lands is not recalled, a cookie session is adjudicated by the durable
 /// session generation (polled at most once per second per replica while the session store
 /// answers, so a sign-out on another replica is seen within about a second; a replica whose

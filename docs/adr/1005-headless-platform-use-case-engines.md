@@ -1382,24 +1382,35 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            `stored_agent_ids_json` holds a set of the distinct ids while it works. The
            legacy `POST /api/workflows/{id}/execute` checks no id count, so a request
            near its 16 MiB body cap (the reachable ceiling is about 2.5 million distinct
-           ids of at most 4 bytes) costs roughly 150 MiB of transient memory in that set
+           ids of at most 4 bytes) costs about 154 MiB of transient memory in that set
            and the distinct list (the set is freed before the digest is built, the list
-           when the helper returns; a standalone probe of the same containers measured
-           about 140 MiB at 2.3 million ids, and the review derived 150 to 160 MiB from
-           node sizes). The digest's JSON copy of the list, which already existed,
-           coexists with the list, so the helper's peak is about 200 MiB (derived by
-           reading, not measured). The v1 route and MCP are capped at 10,000 ids and
+           when the helper returns). The digest's JSON copy of the list, which already
+           existed, coexists with the list, so the helper's peak is about 250 MiB
+           (measured on a release build with glibc: 247 MiB above the input list at
+           2,510,443 distinct ids of 1 to 4 bytes; a list of duplicates peaks at 33 MiB
+           or less). The handler's own parse of the body peaks higher before the helper
+           runs (about 290 MiB for that list and about 450 MiB for 4.19 million one-byte
+           duplicates, measured on a copy of the parse lines). The v1 route and MCP are capped at 10,000 ids and
            are not affected. The body cap bounds it; an id-count cap on the legacy route
            would remove it.
        15. *Pool brownout wait at a step boundary (revisit by 2026-12-15).* The credential
            check reads the token and engine rows from the primary, and (unlike the
            held-open stream's cached read) is not covered by the engine liveness cache's
-           failure backoff. When the connection pool is exhausted or the database is slow,
-           one boundary can wait about 10 s (up to three reads per attempt at the 1.5 s
-           lease wait, two attempts with 1 s between), plus up to 10 s more for a connect
-           the pool had already started. The run still fails closed
-           (`credential_indeterminate`), is capped at 2 per principal and 60 s, and tests
-           its deadline again only after the retry wait.
+           failure backoff. The wait depends on how the database fails (measured, a test
+           harness calling the production store functions). When every pooled connection
+           is in use, a read waits at most 0.5 s (the pool's saturated fast-fail), so one
+           boundary is about 4 s (up to three reads per attempt, two attempts, 1 s
+           between). When the database accepts connections but never answers and no
+           connection is idle, the first read of each attempt waits the 10 s connect
+           timeout and the rest of that attempt fails fast, so one boundary is about 21 s.
+           A read on a connection already leased to a database that stopped answering
+           while its host still acknowledges packets (a paused or frozen server) did not
+           return within 150 s in the test: no pool timeout bounds it, and the 60 s run
+           deadline is tested only between attempts, so such a run is not stopped at
+           60 s. The run still fails closed whenever a read returns
+           (`credential_indeterminate`), and is capped at 2 per principal. A packet-drop
+           failure (no acknowledgement) was not measured; the 10 s TCP user timeout
+           should end it (inferred).
 
 ## Interim rules (until the named follow-ups ship)
 

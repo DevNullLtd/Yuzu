@@ -586,13 +586,15 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token,
         // A boundary check, not a timer tick: ask Postgres, never the 15 s liveness cache. Same
         // three-way mapping as below; nothing is reported stale because nothing was cached.
         // This also bypasses get_for_auth_revalidate's 5-10 s failure backoff (#2367), so under a
-        // pool brownout every check pays for its own lease attempts. The bound: a check makes at
-        // most three reads (two token candidates and this row), each waiting up to the pool's
-        // 1.5 s read timeout (0.5 s when the pool is already saturated at entry), and the run
-        // asks twice when the first answer is indeterminate, one second apart: about 10 s at the
-        // nominal timeout, plus a connect the pool had already started, which runs to its
-        // connect timeout (10 s by default). It still fails closed (kIndeterminate), and the run
-        // deadline is re-tested only after the retry wait.
+        // pool brownout every check pays for its own lease attempts. The bound (measured): a check makes at
+        // most three reads (two token candidates and this row). A saturated pool makes each
+        // wait at most 0.5 s, so about 4 s per boundary (the run asks twice when the first
+        // answer is indeterminate, one second apart). A database that accepts connections but
+        // does not answer costs the 10 s connect timeout on the first read of each attempt, about
+        // 21 s per boundary. A read on a connection already leased to a database that stopped
+        // answering did not return in 150 s in a test: no pool timeout bounds it and the run
+        // deadline is re-tested only after the retry wait. It fails closed (kIndeterminate)
+        // whenever a read returns.
         switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
         case EngineLookupStatus::Active:
             return R::kValid;

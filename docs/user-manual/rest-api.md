@@ -6871,9 +6871,11 @@ of a `foreach` step (so a `foreach` over N items makes N checks), and a check wh
 given is asked once more. A run is capped at 2 per principal and 60 seconds. If the database does
 not answer within the 1.5 second lease wait or the query fails, the answer is "cannot be given", not
 "revoked" and not "valid": it is asked once more and a second non-answer stops the run. Under a
-connection-pool brownout one boundary can wait about 10 seconds (up to three reads per attempt, two
-attempts, one second between), plus up to 10 more for a connection attempt the pool had already
-started; the run still fails closed. What is not covered: a step already sent when the revoke lands
+connection-pool brownout one boundary can wait about 4 seconds when every pooled connection is in
+use, or about 21 seconds when the database accepts connections but does not answer. A database that
+stops answering on a connection a read is already using can hold that read for longer than the 60
+second run cap (a test saw no return in 150 seconds), because the cap is checked between attempts;
+the run still fails closed whenever a read returns. What is not covered: a step already sent when the revoke lands
 is not recalled, a token's expiry time is still judged against the clock of the replica running the
 call, and a cookie session is decided by the durable session store's generation, which each replica
 polls at most once per second, so while the session store answers a sign-out on another replica is
