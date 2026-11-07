@@ -342,6 +342,50 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
                       "disabled");
         return;
     }
+    // Post-migration projection check (postgres-store-playbook "Runner guards"; the same shape as
+    // ApiTokenStore and SoftwareInventoryStore). The runner skips any version at or below the
+    // stored high-water mark, so a database that ran an earlier revision of v2 or v3 (or one
+    // stamped by a different binary) can lack a table or column this binary reads while run()
+    // still reports success - and every sections read then fails with 42P01/42703 on the first
+    // request. One LIMIT 0 SELECT per table, over every column the runtime uses, touches no rows
+    // and refuses here instead. The child tables are driven by the registry, so a registry kind
+    // with no table fails at boot. Column PRESENCE only (an extra column is tolerated, #3894's
+    // ahead-database stance): types, defaults and keys are invisible to a projection, and the
+    // schema test in test_device_inventory_store.cpp pins them for the shipped literals.
+    {
+        struct Probe {
+            std::string table;
+            std::string columns;
+        };
+        std::vector<Probe> probes;
+        probes.push_back({"device_ci", kSelectCols});
+        probes.push_back({"device_ci_section", "agent_id, kind, level, reason, row_count, content_digest"});
+        for (const auto& d : kDeviceCiSections) {
+            if (d.table == nullptr)
+                continue;
+            probes.push_back({d.table, std::string("agent_id, ord, ") + d.columns});
+        }
+        for (const auto& p : probes) {
+            const std::string sql = "SELECT " + p.columns +
+                                    " FROM device_inventory_store." + p.table + " LIMIT 0";
+            pg::PgResult probe =
+                pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+            if (probe.status() != PGRES_TUPLES_OK) {
+                spdlog::error(
+                    "DeviceInventoryStore: post-migration schema projection check failed on {} - "
+                    "an expected table or column is missing (hypothesis: this database ran an "
+                    "earlier revision of migration v2/v3, or a skipped or partial migration; could "
+                    "also be a dropped connection). Device-CI persistence disabled. A development "
+                    "or UAT database that ran an earlier unreleased v2: DROP SCHEMA "
+                    "device_inventory_store CASCADE and DELETE its public.schema_meta row, then "
+                    "restart. One that ran only the earlier row_count-only v3: UPDATE "
+                    "public.schema_meta SET version = 2 WHERE store = 'device_inventory_store', "
+                    "then restart: {}",
+                    p.table, PQresultErrorMessage(probe.get()));
+                return;
+            }
+        }
+    }
     open_ = true;
 }
 
