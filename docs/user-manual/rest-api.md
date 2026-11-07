@@ -10144,40 +10144,63 @@ may not have been applied: see "After a `500`" below), `503` (store unavailable,
 the switch back with a `GET` for the same `plugin`, `action` and `os` (needs `PluginConfig:Read`), then:
 
 - If the `GET` answers `503`, the store is unavailable. Wait until the server is ready and read the switch
-  back again, then follow the rest of this list. If you cannot read it back and your request was a stop
-  (`enabled` false), repeat the `PUT`.
+  back again, then follow the rest of this list. If you cannot read it back: for a stop (`enabled` false),
+  repeat the `PUT`; for an enable, ask a holder of `PluginConfig:Read` to read it, and do not repeat it.
 - If the `GET` answers `403`, either you hold `PluginConfig:Write` but not `PluginConfig:Read`, or the
   authorization store is degraded (it shares the database with the plugin config store, so the fault behind
   the `500` can cause this too). Wait until the server is ready and read the switch back again. If it
   still answers `403`, ask a holder of `PluginConfig:Read`, or, for a stop, repeat the `PUT`.
-- If `source` is empty, no row applies to this scope, so your write did not apply: repeat the `PUT`.
+- If `source` is empty, no row exists for this scope key, yours included: repeat the `PUT`.
 - If `source` names the row you wrote (`plugin`, `plugin.action`, with `@os` appended when `os` was set),
   `enabled` and `reason` are what you sent and `set_by` is you, the write applied. For a whole-plugin stop
   (`action` omitted) that covers the plugin row only: an action with its own ON row keeps running, so check
   any action that matters with `?action=`.
+- If `source` names the plugin row of your own layer where you wrote an action row (`plugin` where you wrote
+  `plugin.action`, `plugin@os` where you wrote `plugin.action@os`), your action row is absent: within a layer
+  the `GET` picks an action row over the plugin row, and the server never deletes a kill-switch row. This is
+  the same state as an empty `source`: repeat the `PUT`.
 - If `source` names your row but `enabled`, `reason` or `set_by` differ, either your write did not apply
   and the row still holds an earlier value, or someone changed the switch after it; the `GET` cannot tell
   which. Do the audit check below.
-- If `source` names a different row, another layer (or the plugin row standing in for your action row)
-  decides the effective state, and the `GET` does not show whether your write applied. Do the audit check
-  below, for your own scope key and for the `source` key.
+- If you set `os` and `source` names a row without `@os`, the all-OS layer decided the effective state, and
+  your `@os` row, if it exists, can be masked by a disabling all-OS row, so the `GET` does not show whether
+  your write applied. Do the audit check below for your own scope key, and read the `source` key as well.
 
 **Audit check.** Read the rows with
-`GET /api/v1/audit?action=plugin_config.kill_switch.set&target_type=PluginConfig&target_id=<scope key>&since=<epoch seconds just before your first request>`
-(needs `AuditLog:Read`, which is admin-only while RBAC is off). Count a row from any principal, including
-your own other sessions and a second writer on your own account, dated after your first `attempted` row for
-this change, when it is a `success` row, or an `attempted` row with no `success` or `failure` row after it
-(a write in flight, or one whose outcome row was lost). Ignore an `attempted` row followed by a `failure`
-row. If there is no such row, your write did not apply: repeat the `PUT`. If there is one, do not repeat the
-`PUT` until you have agreed the intended state with that operator, because it would overwrite their change.
-The exception is a stop (`enabled` false): repeat it and tell them. A repeated stop replaces whatever the row
-holds, including their re-enable, which is the safe direction for an emergency but not harmless. If you do
-not hold `AuditLog:Read`, ask a holder to check. If nobody can and your request was a stop, repeat it; if it
-was an enable, do not repeat it.
+`GET /api/v1/audit?action=plugin_config.kill_switch.set&target_type=PluginConfig&target_id=<scope key>&since=<epoch seconds>&limit=1000`
+(needs `AuditLog:Read`, which is admin-only while RBAC is off). The scope key is the `target_id` shown
+above, `<plugin>[.<action>][@<os>]`; use your own. Set `since` at least 10 minutes before your first
+request: the server clock stamps the rows, not yours, and a `since` that is too late hides your own rows
+and other writers' rows, which would read below as if nobody had written. Rows come back newest first;
+each has an `id`, a `principal`, a `detail` (`enabled=true` or `enabled=false`, plus the `reason` when one
+was given) and a `result` of `attempted`, `success` or `failure`. Timestamps are whole seconds, so "after"
+below means a higher `id`, never a later timestamp. Your own `attempted` row must be in the result; if it
+is not, widen `since` before concluding anything.
 
-A repeat leaves the same `enabled` and `reason` but replaces `set_by` and `updated_at_ms`, and writes its
-own audit rows. The `attempted` row of the failed request stays in the trail, with a `failure` row after
-it when that row could be saved.
+Ignore only the `attempted` and `failure` pair of your own failed request (your `principal`, your `detail`,
+nearest the time of your request). Then count every row with a higher `id` than that `attempted` row, from
+any principal, your own other sessions and a second writer on your own account included: a `success` row; a
+`failure` row (the write errored, but may still have been applied); or an `attempted` row with no `success`
+or `failure` row of the same `principal` and `detail` after it (a write in flight, or one whose outcome row
+was lost). Another principal's `attempted` row counts even when a `failure` row follows it; pair an outcome
+row to an `attempted` row only by `principal` and `detail`. If there is no such row, no other write is
+recorded: repeat the `PUT`. If there is one, do not repeat the `PUT` until you have agreed the intended
+state with that operator. The exception is a stop (`enabled` false): repeat it and tell them. A repeated
+stop replaces whatever the row holds, including their re-enable, which is the safe direction for an
+emergency but not harmless.
+
+If `source` named another key, read that key's rows the same way to understand the effective state: a
+change at that row decides it, so agree it first, and a repeated enable will not change the effective
+state while that row stands. Only rows on your own scope key decide whether to repeat.
+
+If you do not hold `AuditLog:Read`, or the audit read answers `403` or `503` and keeps doing so after the
+server is ready (the authorization or audit store is degraded, which the fault behind the `500` can cause
+too), you cannot read the audit rows: wait and retry first, then ask a holder of `AuditLog:Read` to check.
+If nobody can and your request was a stop, repeat it; if it was an enable, do not repeat it.
+
+A repeat is idempotent: it leaves the same `enabled` and `reason` but replaces `set_by` and
+`updated_at_ms`, and writes its own audit rows. The `attempted` row of the failed request stays in the
+trail, with a `failure` row after it when that row could be saved.
 
 ---
 
