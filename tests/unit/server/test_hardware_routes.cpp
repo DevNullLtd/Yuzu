@@ -76,6 +76,7 @@ struct HwHarness {
     bool roster_degraded = false; // #5531: the durable roster read failed
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
+    std::vector<bool> ci_with_sections; // the `with_sections` argument of every ci_detail_fn call, in order
 
     int dex_calls = 0;
     std::vector<std::string> dex_calls_for; // agent_ids scored, in call order
@@ -179,7 +180,10 @@ struct HwHarness {
             out.roster_degraded = roster_degraded;
             return out;
         };
-        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&) { return ci_detail; };
+        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&, bool with_sections) {
+            ci_with_sections.push_back(with_sections);
+            return ci_detail;
+        };
         HardwareRoutes::ScopedProbeFn probe = [this](const httplib::Request&, const std::string& type,
                                                      const std::string& op, const std::string&) {
             probes.push_back(type + ":" + op);
@@ -1770,6 +1774,170 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readabl
         REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|success");
     }
+}
+
+// ───────────────────────── GET /api/v1/hardware/{id} — the v2 sections (H.7) ─────────────
+
+namespace {
+HardwareCiDetail v2_record_detail() {
+    HardwareCiDetail d;
+    d.identity = make_row("agent-x", "HOST-X", "linux", true);
+    DeviceCiRecord rec;
+    rec.blob_version = 2;
+    rec.chassis_serial = "CHS1";
+    rec.chassis_source = "smbios";
+    rec.machine_id_hash = "abcdef01";
+    d.ci = std::optional<DeviceCiRecord>(rec);
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "constrained";
+    cpu.reason = "agent:partial";
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    DeviceCiSection chassis;
+    chassis.kind = "chassis";
+    chassis.level = "ok";
+    d.ci_sections = std::vector<DeviceCiSection>{chassis, cpu};
+    d.software = std::vector<SoftwareEntry>{};
+    d.tags = std::vector<DeviceTag>{};
+    return d;
+}
+} // namespace
+
+TEST_CASE("route: GET /api/v1/hardware/{id} — serves the v2 scalars and sections and audits a success",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    const auto& data = body["data"];
+    CHECK(data["sections_state"] == "found");
+    CHECK(data["ci"]["chassis_serial"] == "CHS1");
+    CHECK(data["ci"]["machine_id_hash"] == "abcdef01");
+    CHECK(data["ci"]["board_serial"].is_null());
+    REQUIRE(data["ci"]["sections"].size() == 2);
+    CHECK(data["ci"]["sections"][0]["kind"] == "chassis");
+    CHECK(data["ci"]["sections"][0]["source"] == "smbios");
+    CHECK(data["ci"]["sections"][1]["kind"] == "cpu");
+    CHECK(data["ci"]["sections"][1]["complete"] == false); // constrained = incomplete
+    CHECK(data["ci"]["sections"][1]["rows"][0]["model"] == "Xeon");
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|success");
+}
+
+// Kills: flattening a failed sections read to an empty list (a 200 that reads "reports none").
+TEST_CASE("route: GET /api/v1/hardware/{id} — a failed sections read is 503 with a retry hint and never "
+          "an empty 200",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    h.ci_detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["retry_after_ms"].get<int>() == 5000);
+    CHECK(body["error"]["message"].get<std::string>() == "hardware sections unavailable");
+    CHECK_FALSE(body.contains("data")); // nothing of the record leaks beside the 503
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|failure");
+    CHECK(contains(h.audit_details.back(), "state=sections unreadable"));
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed")); // control: the failure row persisted
+}
+
+// The new 503 composes with, and does not replace, the per-part degrade the schema documents: a
+// degraded ci (sections never read) and a v1 record (none stored) both stay a 200.
+TEST_CASE("route: GET /api/v1/hardware/{id} — a degraded ci or a v1 record with no sections stays a 200",
+          "[hardware][route][rest][sections]") {
+    {
+        HwHarness h;
+        h.ci_detail = v2_record_detail();
+        h.ci_detail.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+            std::unexpected(CiReadError::kDegraded));
+        h.ci_detail.ci_sections = std::vector<DeviceCiSection>{};
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["ci_state"] == "degraded");
+        CHECK(body["data"]["sections_state"] == "degraded");
+    }
+    {
+        HwHarness h;
+        h.ci_detail = v2_record_detail();
+        h.ci_detail.ci_sections = std::vector<DeviceCiSection>{};
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["sections_state"] == "absent");
+        REQUIRE(body["data"]["ci"]["sections"].is_array());
+        CHECK(body["data"]["ci"]["sections"].empty());
+    }
+}
+
+// The existence-oracle closure is unchanged: an out-of-scope id never reaches the sections arm.
+TEST_CASE("route: GET /api/v1/hardware/{id} — scope 404 precedes the sections 503",
+          "[hardware][route][rest][sections][security]") {
+    HwHarness h;
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    h.ci_detail = v2_record_detail();
+    h.ci_detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+    auto res = h.sink.Get("/api/v1/hardware/agent-out");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.audits.empty());
+}
+
+// Only the REST record route asks for the sections: the dashboard fragment, its sync-now poll and
+// the actions lens never render them and must not pay for the extra read. A counting fake records
+// the `with_sections` argument of every call. Kills: passing true from a dashboard call site, or
+// false from the REST route.
+TEST_CASE("route: only the REST record asks for sections - the dashboard and actions lens do not",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    h.actions_plugins = {{.name = "firewall", .version = "1", .actions = {"rules"}}};
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview"));
+    REQUIRE(h.ci_with_sections.size() == 1);
+    CHECK(h.ci_with_sections.back() == false);
+
+    // the 1-2 s sync-now poll is the same fragment route
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview&lens_only=1&await_since=1000"));
+    REQUIRE(h.ci_with_sections.size() == 2);
+    CHECK(h.ci_with_sections.back() == false);
+
+    auto actions = h.sink.Get("/fragments/hardware/ci/actions?id=agent-x");
+    REQUIRE(actions);
+    REQUIRE(h.ci_with_sections.size() == 3);
+    CHECK(h.ci_with_sections.back() == false);
+
+    auto rest = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(rest);
+    REQUIRE(h.ci_with_sections.size() == 4);
+    CHECK(h.ci_with_sections.back() == true);
+}
+
+// Section rows are agent-supplied bytes. A byte that is not valid UTF-8 must not throw out of the
+// serialiser after the access audit row persisted: the body is served with the byte replaced.
+// Kills: dump() without the replace error handler.
+TEST_CASE("route: GET /api/v1/hardware/{id} - an invalid UTF-8 byte in a section row is replaced and still served",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    (*h.ci_detail.ci_sections)[1].rows[0][1] = std::string("Xe\xffon");
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["data"]["ci"]["sections"][1]["rows"][0]["model"].get<std::string>().starts_with("Xe"));
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|success");
 }
 
 // ───────────────────────── Containment UI hidden (kContainmentUi == false) ───────────
