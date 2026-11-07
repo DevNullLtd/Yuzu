@@ -1,7 +1,8 @@
 ## Package Inventory Definitions
 ## Reports which package managers are present on an endpoint, the Homebrew
-## formulae and casks installed on macOS, and the snaps and flatpaks installed
-## on Linux. Read-only, zero subprocess.
+## formulae and casks installed on macOS, the snaps and flatpaks installed on
+## Linux, and the Chocolatey packages and Appx (Store and inbox) packages
+## installed on Windows. Read-only, zero subprocess.
 ## Plugin: pkg_inventory | Actions: managers, packages, store_packages
 ##
 ## Sources by platform:
@@ -22,9 +23,13 @@
 ##            directory names under BOTH /opt/homebrew (Apple silicon) and
 ##            /usr/local (Intel). store_packages -- UNSUPPORTED by design:
 ##            installed_apps owns the macOS application list.
-##   Windows: PLANNED (not implemented in this release) -- every action reports
-##            `status|<action>|unsupported|windows:planned`. The Chocolatey,
-##            winget and Appx store legs follow as their own PRs.
+##   Windows: managers -- Chocolatey (C:\ProgramData\chocolatey\lib listable,
+##            directory count as a fact) and winget (the App Installer package
+##            in the HKLM Appx roster; version from its key name).
+##            packages -- Chocolatey lib\<id>\<id>.nuspec, one bounded read per
+##            package. store_packages -- the HKLM Appx AppxAllUserStore
+##            {Applications, InboxApplications, Deprovisioned} subkey names.
+##            Registry and directory reads only; no choco or winget process.
 ##
 ## SCOPE: Machine scope only: per-user package stores are out of scope, deferred to the user-session helper (ADR-3003).
 ## No overlap claim with installed_apps on macOS: Homebrew casks install .app
@@ -47,8 +52,9 @@ metadata:
     /opt/homebrew and /usr/local with tap, formula and cask counts. Linux
     reports which of dpkg, apt, rpm, dnf, pacman, apk, snap and flatpak are
     present (never a package roster) with apt, snap and flatpak counts as
-    facts. Windows is not implemented in this release and reports
-    `status|managers|unsupported|windows:planned`. Machine scope only:
+    facts. Windows reports Chocolatey (its lib directory is listable, with the
+    directory count as a fact) and winget (the App Installer package in the
+    Appx roster, with its version). Machine scope only:
     per-user package stores are out of scope, deferred to the user-session
     helper (ADR-3003). A status row always comes first; a genuinely absent manager
     produces no manager row, while an unreadable location makes the status
@@ -82,18 +88,18 @@ spec:
         platforms: [windows, linux, darwin]
       - name: name
         type: string
-        description: 'Manager rows: the package manager. Values: dpkg, apt, rpm, dnf, pacman, apk, homebrew, snap, flatpak. Linux emits one row per tool found; macOS emits homebrew. Status rows: the action name, always managers.'
+        description: 'Manager rows: the package manager. Values: dpkg, apt, rpm, dnf, pacman, apk, homebrew, snap, flatpak, chocolatey, winget. Linux emits one row per tool found; macOS emits homebrew; Windows emits chocolatey and winget when present. Status rows: the action name, always managers.'
         example: homebrew
         platforms: [windows, linux, darwin]
       - name: state
         type: string
-        description: 'Manager rows: present means at least one Homebrew marker directory (Library/Taps, Cellar, Caskroom) under the prefix was readable; unavailable means a marker exists but none could be read (see reason); a prefix root that cannot be opened counts as Homebrew only for /opt/homebrew, since /usr/local exists on every Mac and there the status tokens appear with no manager row. Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (the planned Windows leg).'
+        description: 'Manager rows: present means at least one Homebrew marker directory (Library/Taps, Cellar, Caskroom) under the prefix was readable; unavailable means a marker exists but none could be read (see reason); a prefix root that cannot be opened counts as Homebrew only for /opt/homebrew, since /usr/local exists on every Mac and there the status tokens appear with no manager row. Status rows: the completeness level. Values: supported, constrained (at least one read failed).'
         values: [present, unavailable, supported, constrained, unsupported]
         example: present
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied, macos:homebrew_taps:walk_budget, macos:managers:busy, linux:apt_sources_d:permission_denied, linux:tool_dir:permission_denied or linux:managers:busy), windows:planned or pkg_inventory:exception (a leg threw).'
+        description: 'Manager rows: the manager version, or "-" (read only for winget, from the App Installer package key name; all other managers are "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied, macos:homebrew_taps:walk_budget, macos:managers:busy, linux:apt_sources_d:permission_denied, linux:tool_dir:permission_denied or linux:managers:busy), windows:pkg_inventory:<source>:<cause> or pkg_inventory:exception (a leg threw).'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: root_path
@@ -152,8 +158,8 @@ metadata:
     prefixes yields one row per prefix. Linux is UNSUPPORTED by design:
     installed_apps owns the Linux package roster, so this action reports
     `status|packages|unsupported|linux:owned_by_installed_apps` and no
-    package row. Windows is not implemented in this release and reports
-    `status|packages|unsupported|windows:planned`. Machine scope only:
+    package row. Windows reports the Chocolatey packages that have a loose
+    nuspec (lib\<id>\<id>.nuspec), with the nuspec version. Machine scope only:
     per-user package stores are out of scope, deferred to the user-session
     helper (ADR-3003). Homebrew casks install .app bundles that installed_apps' macOS
     `list` also reports via system_profiler, and installed_apps'
@@ -177,7 +183,7 @@ spec:
 
   result:
     # status|packages|<supported|constrained|unsupported>|<failure tokens or ->
-    # package|homebrew|<id>|<version>|<formula|cask>
+    # package|<homebrew|chocolatey>|<id>|<version>|<formula|cask|pkg>
     # Two row shapes on one stream, discriminated by field 0; a status row
     # populates only row_kind..version and leaves the kind column unset.
     columns:
@@ -189,17 +195,17 @@ spec:
         platforms: [windows, linux, darwin]
       - name: manager
         type: string
-        description: 'Package rows: the owning package manager, always homebrew in this release. Status rows: the action name, always packages.'
+        description: 'Package rows: the owning package manager, homebrew on macOS, chocolatey on Windows. Status rows: the action name, always packages.'
         example: homebrew
         platforms: [windows, linux, darwin]
       - name: id
         type: string
-        description: 'Package rows: the formula or cask directory name (e.g. openssl@3). Status rows: the completeness level. Values: supported, constrained (at least one read failed or the row cap or walk budget was hit), unsupported (Linux by design, Windows planned).'
+        description: 'Package rows: the formula or cask directory name (e.g. openssl@3). Status rows: the completeness level. Values: supported, constrained (at least one read failed or the row cap or walk budget was hit), unsupported (Linux by design).'
         example: openssl@3
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap, macos:homebrew_cellar:byte_cap, macos:homebrew_caskroom:walk_budget or macos:packages:busy), linux:owned_by_installed_apps, windows:planned or pkg_inventory:exception (a leg threw).'
+        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap, macos:homebrew_cellar:byte_cap, macos:homebrew_caskroom:walk_budget or macos:packages:busy), linux:owned_by_installed_apps, windows:pkg_inventory:<source>:<cause> or pkg_inventory:exception (a leg threw).'
         example: "3.4.1"
         platforms: [windows, linux, darwin]
       - name: kind
@@ -256,8 +262,9 @@ metadata:
     dispatch). macOS is UNSUPPORTED by design (installed_apps owns the
     application list) and reports
     `status|store_packages|unsupported|macos:owned_by_installed_apps`. Windows
-    is not implemented in this release and reports
-    `status|store_packages|unsupported|windows:planned`. Machine scope only.
+    reports the Appx (Store and inbox) packages registered for all users, one
+    row per HKLM AppxAllUserStore package full name, with its version,
+    architecture and state; the WindowsApps folder is not listed. Machine scope only.
   tags: [software, package-managers, inventory]
 
 spec:
@@ -275,7 +282,7 @@ spec:
 
   result:
     # status|store_packages|<supported|constrained|unsupported>|<failure tokens or ->
-    # package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+    # package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
     # Two row shapes on one stream, discriminated by field 0; a status row
     # populates the first four columns (manager = the action name, id = the
     # level, version = the tokens) and leaves every other column "-".
@@ -288,26 +295,26 @@ spec:
         platforms: [windows, linux, darwin]
       - name: manager
         type: string
-        description: 'Package rows: the store, snap or flatpak. Status rows: the action name, always store_packages.'
-        values: [snap, flatpak, store_packages]
+        description: 'Package rows: the store, snap, flatpak or appx. Status rows: the action name, always store_packages.'
+        values: [snap, flatpak, appx, store_packages]
         example: snap
         platforms: [windows, linux, darwin]
       - name: id
         type: string
-        description: 'Package rows: the snap name (the /snap mount directory name, including a parallel-instance key) or the flatpak ref id (e.g. org.gnome.Platform). Status rows: the completeness level. Values: supported, constrained (the list may be incomplete), unsupported (macOS by design, Windows planned).'
+        description: 'Package rows: the snap name (the /snap mount directory name, including a parallel-instance key) or the flatpak ref id (e.g. org.gnome.Platform). Status rows: the completeness level. Values: supported, constrained (the list may be incomplete), unsupported (macOS by design).'
         example: btop
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: 'Snap rows: the snap.yaml `version`, or "-" when the revision is not mounted or readable or the value is not a plain one-line scalar that passes snapd''s version grammar. Flatpak rows: always "-" (the appdata version is not read; the branch is a ref, not a version). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail>: linux:snapd_snaps:*, linux:flatpak_app:* and linux:flatpak_runtime:* (an unlistable directory, entry_cap or walk_budget), linux:store_packages:row_cap, linux:store_packages:byte_cap, linux:store_packages:busy, macos:owned_by_installed_apps, windows:planned or pkg_inventory:exception (a leg threw).'
+        description: 'Snap rows: the snap.yaml `version`, or "-" when the revision is not mounted or readable or the value is not a plain one-line scalar that passes snapd''s version grammar. Flatpak rows: always "-" (the appdata version is not read; the branch is a ref, not a version). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail>: linux:snapd_snaps:*, linux:flatpak_app:* and linux:flatpak_runtime:* (an unlistable directory, entry_cap or walk_budget), linux:store_packages:row_cap, linux:store_packages:byte_cap, linux:store_packages:busy, macos:owned_by_installed_apps, windows:pkg_inventory:<source>:<cause> or pkg_inventory:exception (a leg threw).'
         example: 1.4.7
         platforms: [windows, linux, darwin]
       - name: kind
         type: string
-        description: 'Package rows only. Snap: the snap.yaml `type` (app is the default when absent; application reads as app), or unknown when snap.yaml could not be read, or other for an unrecognised type. Flatpak: app or runtime. Status rows: "-".'
+        description: 'Package rows only. Snap: the snap.yaml `type` (app is the default when absent; application reads as app), or unknown when snap.yaml could not be read, or other for an unrecognised type. Flatpak: app or runtime. Appx: app. Status rows: "-".'
         values: [app, gadget, kernel, base, snapd, os, other, unknown, runtime]
         example: app
-        platforms: [linux]
+        platforms: [windows, linux]
       - name: revision
         type: string
         description: 'Package rows only: the snap revision, or the flatpak commit (64 hex digits); "-" when a flatpak branch has no readable `active` link.'
@@ -315,9 +322,9 @@ spec:
         platforms: [linux]
       - name: arch
         type: string
-        description: 'Package rows only: the flatpak architecture (e.g. x86_64); "-" for snaps.'
+        description: 'Package rows only: the flatpak or Appx architecture (e.g. x86_64); "-" for snaps or when the Appx name carries none.'
         example: x86_64
-        platforms: [linux]
+        platforms: [windows, linux]
       - name: branch
         type: string
         description: 'Package rows only: the flatpak ref branch (e.g. stable, 51, 26.08-extra); "-" for snaps. A branch is a ref, not a version.'
@@ -325,10 +332,10 @@ spec:
         platforms: [linux]
       - name: state
         type: string
-        description: 'Package rows only: active (the snap `current` link or the flatpak `active` link points at this revision), inactive (present but not current), unknown (the link could not be read). Status rows: "-".'
-        values: [active, inactive, unknown]
+        description: 'Package rows only: active (the snap `current` link or the flatpak `active` link points at this revision), inactive (present but not current), unknown (the link could not be read). Appx: active, or deprovisioned for a package under the Deprovisioned key. Status rows: "-".'
+        values: [active, inactive, unknown, deprovisioned]
         example: active
-        platforms: [linux]
+        platforms: [windows, linux]
     aggregation:
       groupBy:
       # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus manager/package named after the action.

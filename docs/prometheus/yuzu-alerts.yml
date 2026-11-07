@@ -3519,6 +3519,64 @@ groups:
             (is_revoked) reads the database, not the CRL, and is unaffected.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-near-expiry-or-expired"
 
+      # A CRL dated in the future (#7097). The `published` gauge is the publishing
+      # replica's clock at build time (published_at), and the CRL's thisUpdate is
+      # 300 s earlier (the publisher backdates it), so a healthy newest CRL has
+      # `published - time()` at or below zero. If that replica's clock was ahead
+      # of real time when it published, the CRL is future-dated: relying parties
+      # refuse it as not yet valid (the gateway tolerates a thisUpdate 3600 s
+      # ahead, yuzu_gw_mgmt_crl:max_future_s/0, which is `published - time()` of
+      # 3900 s; a strict verifier such as OpenSSL refuses any future thisUpdate),
+      # while the two expiry rules above see more than 48 hours of headroom and
+      # stay silent. The timing, stated exactly: `published - time()` falls by one
+      # second per second, and `for: 2m` needs it above 3600 s throughout, so the
+      # rule fires for every CRL published more than 3720 s (62 minutes) ahead,
+      # 2 minutes after the first scrape. A gateway refuses once the gap passes
+      # 3900 s, so every CRL a gateway refuses alerts within about 2 minutes
+      # (3720 s is below 3900 s); a CRL published 3600 to 3720 s ahead is accepted
+      # by gateways and never alerts. `for:` is short on purpose: the input is a
+      # stored row, so there is no transient to filter, and a long `for:` only
+      # delays the real case (docs/observability-conventions.md). A
+      # republish at the correct time supersedes the row, but the freshness pass
+      # does not do that by itself until under 24 hours of the future-dated
+      # nextUpdate remain (see "CRL dated in the future" in
+      # docs/pki-architecture.md for the restart that does). `max by (job)`
+      # follows the newest row, which every replica exports, so a replica holding
+      # an older value cannot hide it and one deployment gives one page. The
+      # reverse holds too, and is the price of `max`: after the fix, a replica whose
+      # reads keep failing keeps the OLD future-dated value, `max` selects it, and
+      # the alert stays firing until that replica's reads recover or it restarts.
+      # Same `up == 0` caveat as the two rules above. Nothing else detects this
+      # today: #6916 (still open) covers only the opposite direction, a clock
+      # stepped back.
+      - alert: YuzuCaCrlFutureDated
+        expr: |
+          (max by (job) (yuzu_server_ca_crl_published_timestamp_seconds) - time()) > 3600
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The newest internal-CA CRL was published more than an hour ahead of now"
+          description: >-
+            yuzu_server_ca_crl_published_timestamp_seconds (the publishing
+            replica's clock when it built the newest CRL; the CRL's thisUpdate
+            is 300 seconds earlier) is more than an hour ahead of the current
+            time. A CRL is dated by the clock of the replica that published it,
+            so that clock was ahead of real time at publish. Relying parties
+            refuse a CRL that is not yet valid (the gateway tolerates a
+            thisUpdate up to one hour ahead and refuses beyond that, so this
+            fires within about two minutes of every CRL a gateway refuses;
+            OpenSSL-style verifiers refuse any future thisUpdate),
+            and YuzuCaCrlNearExpiry and YuzuCaCrlExpired stay silent because
+            nextUpdate is also in the future. Nothing records which replica
+            published, so check the clock (NTP state) of every replica and
+            correct the one that is wrong, then restart one replica with a
+            correct clock (never all of them, and not while Postgres is
+            unreachable) so its boot publish replaces the CRL; see "CRL dated
+            in the future" in docs/pki-architecture.md. This rule needs a successful
+            scrape, so keep your own `up == 0` alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-dated-in-the-future"
+
       - alert: YuzuCaRevocationSweepReadFailing
         expr: |
           increase(yuzu_server_ca_revocation_sweep_read_failures_total[15m]) > 0
