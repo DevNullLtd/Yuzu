@@ -10138,13 +10138,21 @@ not the effective state, in the same shape as the `GET` above.
 
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
-may not have been applied: read the switch back with the same `plugin`, `action` and `os`. The write is
-confirmed when `source` names the row you wrote (`plugin`, `plugin.action`, with `@os` appended when `os`
-was set), `enabled` and `reason` match what you sent, and `updated_at_ms` is not earlier than your request.
-A different or empty `source` does not show whether the write applied, because the `GET` reports the
-effective state and takes `reason` and `updated_at_ms` from the row that decided it. In that case, or when
-in doubt, repeat the `PUT`, which is safe to repeat), `503` (store
-unavailable, or the audit row could not be saved).
+may not have been applied: read the switch back with a `GET` for the same `plugin`, `action` and `os`,
+which needs `PluginConfig:Read`. If that `GET` also answers `503` the store is down: wait until the
+server is ready, then repeat the `PUT`, whose `200` is the confirmation. Otherwise the switch is in the
+state you asked for when `source` names the row you wrote (`plugin`, `plugin.action`, with `@os` appended
+when `os` was set), `enabled` and `reason` are what you sent and `set_by` is you. `updated_at_ms` is a
+database-clock value, so compare it only with another `updated_at_ms`, never with your own clock. If
+`source` names your row but `enabled`, `reason` or `set_by` differ, another operator changed the switch
+after your request: do not repeat the `PUT`, because it would overwrite their change, and review the
+`plugin_config.kill_switch.set` audit rows for that `target_id` instead. A different or empty `source`
+does not show whether the write applied, because the `GET` reports the effective state and takes
+`reason`, `set_by` and `updated_at_ms` from the row that decided it, which belongs to another layer when
+that layer disables the switch; repeat the `PUT` in that case, after a look at the audit rows if another
+operator may be writing the same switch. A repeat leaves the same `enabled` and `reason` but replaces
+`set_by` and `updated_at_ms` and writes its own audit rows; the earlier `failure` row stays in the
+trail), `503` (store unavailable, or the audit row could not be saved).
 
 ---
 
@@ -10206,7 +10214,9 @@ the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permiss
 Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
 revocable (already redeemed or already revoked), and `503` if the store is unavailable or the
-`attempted` audit row cannot be saved (nothing is revoked, so retry). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
+`attempted` audit row cannot be saved. When the audit row could not be saved nothing was revoked, so
+retry. After a store error the revoke may or may not have applied: retry, and a `404` on the retry then
+means the first call may have applied, so check the grant's state with `GET /api/v1/upload-grants`. An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
 upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads) (read its known-defect note first).
@@ -10231,7 +10241,11 @@ so a request that carries only the grant or session header is answered `401` wit
 `{"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}}` body before the handler
 runs. That body has no `reason`, unlike the handler's own `401` values below. Until #5626 is fixed, a
 client that presents only the grant or session header, as the shipped `upload_file` client does, cannot
-open an upload, so the protocol described here cannot start.
+open an upload, so the protocol described here cannot start. There is no operator-side workaround:
+minting a grant succeeds, but the agent cannot redeem it and an unredeemed grant expires. Do not work
+around it by giving the agent an operator credential. Server-side the refusal leaves no audit row and no
+per-route metric; the symptom is `upload_grant.mint` success rows with no `upload_grant.session_open`
+row of any result while agents report `401`. Revoke the unused grants or let them expire.
 
 **Common to all five routes:**
 
@@ -10303,7 +10317,8 @@ not be opened or written).
 and `size_exceeded` are written. Like the other device-side upload rows, this is set-and-proceed: a row
 that cannot be persisted sets `Sec-Audit-Failed` on the response and the request still completes.
 The header reaches the calling agent; operators see a dropped row through
-`yuzu_server_audit_emit_failed_total` and the `YuzuAuditPersistFailures` alert.
+`yuzu_server_audit_emit_failed_total` and the `YuzuAuditPersistFailures` alert (an audit hook that throws
+is logged and still sets the header, but is not counted).
 
 #### `POST /api/v1/uploads/{upload_id}/commit`
 
