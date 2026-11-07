@@ -242,7 +242,7 @@ TEST_CASE("SoftwareCollectionSettingsStore: history keeps one row per save, boun
     const std::string kGroupB = "bbbb11112222";
     auto other = store.put(kGroupB, make(7200), std::nullopt, "bob");
     REQUIRE(other.has_value());
-    auto put = store.put(kGroupA, make(3600), std::nullopt, "alice");
+    const auto put = store.put(kGroupA, make(3600), std::nullopt, "alice");
     REQUIRE(put.has_value());
     {
         const auto h = store.list_history(kGroupA, 10);
@@ -253,9 +253,13 @@ TEST_CASE("SoftwareCollectionSettingsStore: history keeps one row per save, boun
         CHECK((*h)[0].at > 1'700'000'000);
     }
     // 204 more saves: 205 in all. Each interval is distinct so every save is a real change.
+    // Carry only the version string forward: reassigning the whole expected<PutResult, Error> does
+    // not compile on MSVC (the result holds a std::map).
+    auto version = put->stored.version;
     for (int i = 1; i <= 204; ++i) {
-        put = store.put(kGroupA, make(3600 + i), put->stored.version, "alice");
-        REQUIRE(put.has_value());
+        const auto next = store.put(kGroupA, make(3600 + i), version, "alice");
+        REQUIRE(next.has_value());
+        version = next->stored.version;
     }
     REQUIRE(store.put(kGroupB, make(10800), other->stored.version, "bob").has_value());
     CHECK(scalar(settings_db_fx_.dsn(), "SELECT count(*) FROM "
@@ -466,8 +470,9 @@ TEST_CASE("SoftwareCollectionSettingsStore: concurrent writers from the same sta
                               SoftwareCollectionSettingsStore::Error>;
     const auto race = [&](const std::optional<std::string>& expected) {
         std::optional<Put> a, b;
-        std::thread ta([&] { a = store.put(kGroupA, make(7200), expected, "alice"); });
-        std::thread tb([&] { b = store.put(kGroupA, make(10800), expected, "bob"); });
+        // emplace, not assignment: expected<PutResult, Error> is not assignable on MSVC.
+        std::thread ta([&] { a.emplace(store.put(kGroupA, make(7200), expected, "alice")); });
+        std::thread tb([&] { b.emplace(store.put(kGroupA, make(10800), expected, "bob")); });
         ta.join();
         tb.join();
         REQUIRE((a->has_value() != b->has_value())); // exactly one write lands
