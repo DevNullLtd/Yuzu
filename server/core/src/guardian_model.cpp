@@ -7,6 +7,23 @@
 
 namespace yuzu::server {
 
+namespace {
+
+void set_fault(GuardianReadFault* fault, GuardianReadFault value) noexcept {
+    if (fault)
+        *fault = value;
+}
+
+// Only the unrepresented-pending read can report a statement timeout; every other store
+// degrade is transient.
+GuardianReadFault fault_of(const UnrepresentedPendingError& e) noexcept {
+    return e.kind == UnrepresentedPendingFault::kStatementTimeout
+               ? GuardianReadFault::kStatementTimeout
+               : GuardianReadFault::kTransient;
+}
+
+} // namespace
+
 std::optional<GuardianStatusRollup>
 guardian_status_rollup(GuaranteedStateStore& store,
                        const std::optional<std::vector<std::string>>& agent_scope) {
@@ -76,20 +93,36 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
     return out;
 }
 
-std::optional<std::vector<GuardianDeviceGuardRow>>
-guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id) {
-    auto statuses = store.agent_rule_statuses_for_agent(agent_id);
-    if (!statuses)
+std::optional<GuardianDeviceGuardsReport>
+guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id,
+                           GuardianReadFault* fault) {
+    set_fault(fault, GuardianReadFault::kNone);
+    // #7217: retained events with no census row are invisible to the census read below. Same
+    // ADR-0038 posture: a degrade must never render as "nothing pending". Issued BEFORE the
+    // census read, so that a pair repaired between the two reads then appears in BOTH
+    // categories (a harmless over-report) instead of in neither. The reads are not one atomic
+    // snapshot; the counts are exact per read, not a joint snapshot.
+    auto unrepresented = store.unrepresented_pending_for_agent(agent_id, std::nullopt);
+    if (!unrepresented) {
+        set_fault(fault, fault_of(unrepresented.error()));
         return std::nullopt;
+    }
+    auto statuses = store.agent_rule_statuses_for_agent(agent_id);
+    if (!statuses) {
+        set_fault(fault, GuardianReadFault::kTransient);
+        return std::nullopt;
+    }
     std::vector<std::string> rule_ids;
     rule_ids.reserve(statuses->size());
     for (const auto& s : *statuses)
         rule_ids.push_back(s.rule_id);
     auto names = store.rule_names_for(rule_ids);
-    if (!names)
+    if (!names) {
+        set_fault(fault, GuardianReadFault::kTransient);
         return std::nullopt;
-    std::vector<GuardianDeviceGuardRow> out;
-    out.reserve(statuses->size());
+    }
+    GuardianDeviceGuardsReport out;
+    out.guards.reserve(statuses->size());
     for (const auto& s : *statuses) {
         GuardianDeviceGuardRow row;
         row.rule_id = s.rule_id;
@@ -99,17 +132,21 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
         row.updated_at = s.updated_at;
         row.order_uncertain = s.order_uncertain;
         row.projection_pending = s.projection_pending;
-        out.push_back(std::move(row));
+        out.guards.push_back(std::move(row));
     }
+    out.unrepresented_pending_guards = unrepresented->count;
+    out.unrepresented_pending_rule_ids = std::move(unrepresented->rule_ids);
     return out;
 }
 
 std::optional<GuardianDeviceComplianceRollup>
 guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
                                   const std::string& baseline_name, const std::string& agent_id,
-                                  bool* store_degraded, bool* pii_access_began) {
+                                  bool* store_degraded, bool* pii_access_began,
+                                  GuardianReadFault* fault) {
     *store_degraded = false;
     *pii_access_began = false;
+    set_fault(fault, GuardianReadFault::kNone);
     bool baseline_store_ok = true;
     const auto baseline = baseline_store.get_baseline_by_name(baseline_name, &baseline_store_ok);
     if (!baseline_store_ok) {
@@ -117,6 +154,7 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
         // "no PII was looked up yet" posture this route has always had -
         // pii_access_began stays false, caller owes no audit row.
         *store_degraded = true;
+        set_fault(fault, GuardianReadFault::kTransient);
         return std::nullopt;
     }
     if (!baseline)
@@ -131,9 +169,25 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
     auto guard_ids_result = baseline_store.deployed_member_rule_ids(baseline->baseline_id);
     if (!guard_ids_result) {
         *store_degraded = true;
+        set_fault(fault, GuardianReadFault::kTransient);
         return std::nullopt;
     }
     const auto& guard_ids = *guard_ids_result;
+
+    // #7217: pending events for snapshot members with no census row are invisible to
+    // agent_rule_statuses_for_agent. Same ADR-0038 posture and same audit obligation as the reads
+    // below (pii_access_began is already true): a degrade must never render as "nothing
+    // pending". An empty guard_ids is an engaged-empty filter, which the store answers without a
+    // query. Issued BEFORE the census read, so that a pair repaired between the two reads
+    // then appears in BOTH categories (a harmless over-report) instead of in neither. The reads
+    // are not one atomic snapshot; the counts are exact per read, not a joint snapshot.
+    auto unrepresented = store.unrepresented_pending_for_agent(
+        agent_id, std::optional<std::vector<std::string>>(guard_ids));
+    if (!unrepresented) {
+        *store_degraded = true;
+        set_fault(fault, fault_of(unrepresented.error()));
+        return std::nullopt;
+    }
 
     // ADR-0038 catastrophic-read set: this route's compliance counts are an
     // enforce-gate/census consumer - a degrade must never render as a silent
@@ -146,6 +200,7 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
     auto statuses_result = store.agent_rule_statuses_for_agent(agent_id);
     if (!rule_names_result || !statuses_result) {
         *store_degraded = true;
+        set_fault(fault, GuardianReadFault::kTransient);
         return std::nullopt;
     }
     const auto& rule_names = *rule_names_result;
@@ -183,8 +238,14 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
         row.name = (nit != rule_names.end() && !nit->second.empty()) ? nit->second : rid;
         row.status = status;
         row.updated_at = updated_at;
+        row.order_uncertain = it->second.order_uncertain;
+        row.projection_pending = it->second.projection_pending;
+        if (row.order_uncertain || row.projection_pending)
+            ++out.uncertain_guards;
         out.guards.push_back(std::move(row));
     }
+    out.unrepresented_pending_guards = unrepresented->count;
+    out.unrepresented_pending_rule_ids = std::move(unrepresented->rule_ids);
     out.pending = out.total_guards - (out.compliant + out.drifted + out.errored);
     return out;
 }

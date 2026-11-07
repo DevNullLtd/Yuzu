@@ -83,7 +83,7 @@ inline bool is_os_native(const SoftwareEntry& e) {
     return kind == "app" || kind == "feat" || eco == "windows" || eco == "macos" ||
            eco == "macos_pkgutil" || eco == "brew" || eco == "optional_feature" ||
            eco == "snap" || eco == "flatpak" || eco == "msi" || eco == "python" || eco == "ibm_mq" ||
-           eco == "dotnet" || eco == "jvm";
+           eco == "dotnet" || eco == "jvm" || eco == "chocolatey" || eco == "winget" || eco == "appx";
 }
 
 // ---------------------------------------------------------------------------

@@ -1225,10 +1225,17 @@ savepoint a writer locks every pending event of the pair in `ingest_seq` order i
 row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
 event-row waits of single-event ingest, repair and `delete_rule` are acyclic; the batch path (no production
 caller) carries no such guarantee. Every census read that returns per-pair state, or a rollup of it, discloses
-`order_uncertain` and `projection_pending` (or `uncertain_rules`), with one named exception: the device-compliance
-read covers represented pairs only and does not yet report them. A pending event whose pair has no census row is
-visible only on `yuzu_server_guardian_census_pending_events`. See the user manual's Compliance overview for the
-operator-facing contract.
+`order_uncertain` and `projection_pending` (or `uncertain_rules`); the device-compliance read, which was the one
+named exception, now reports the two flags per guard and an `uncertain_guards` rollup (#7217). A pending event
+whose pair has no census row has no row to carry the flags: both per-device reads (device-compliance and the
+all-guards read) report such pairs as `unrepresented_pending_guards` and a bounded `unrepresented_pending_rule_ids`
+list (first 50 in ascending byte order of the rule id; the ids are agent-reported identifiers), and they are also
+counted on `yuzu_server_guardian_census_pending_events`. The count is read before the census rows and the two are
+non-atomic observations: a pair repaired between them can appear in both the guards list and the unrepresented list
+for one request, never in neither. The count read runs under a 5 s statement timeout; its expiry (most likely a large
+retained pending backlog; a lock wait, a loaded database or an administrator cancel is reported the same way) is a non-transient failure, reported separately from an ordinary store degrade and counted on the
+`guardian_census_device` source of `yuzu_server_guardian_read_degrade_total`. See the user manual's Compliance
+overview for the operator-facing contract.
 
 ### 9.2 REST API endpoints
 
