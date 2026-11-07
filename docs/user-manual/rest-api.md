@@ -10326,16 +10326,16 @@ and other writers' rows, which would read below as if nobody had written. Rows c
 each has an `id`, a `principal`, a `detail` (`enabled=true` or `enabled=false`, plus the `reason` when one
 was given) and a `result` of `attempted`, `success` or `failure`. Timestamps are whole seconds, so "after"
 below means a higher `id`, never a later timestamp. Your own `attempted` row must be in the result; if it
-is not, widen `since` before concluding anything.
+is not, widen `since` or page with `offset` before concluding anything.
 
-Ignore only the `attempted` and `failure` pair of your own failed request (your `principal`, your `detail`,
-nearest the time of your request). Then count every row with a higher `id` than that `attempted` row, from
-any principal, your own other sessions and a second writer on your own account included: a `success` row; a
-`failure` row (the write errored, but may still have been applied); or an `attempted` row with no `success`
-or `failure` row of the same `principal` and `detail` after it (a write in flight, or one whose outcome row
-was lost). Another principal's `attempted` row counts even when a `failure` row follows it; pair an outcome
-row to an `attempted` row only by `principal` and `detail`. If there is no such row, no other write is
-recorded: repeat the `PUT`. If there is one, do not repeat the `PUT` until you have agreed the intended
+Take your own failed requests out first. Every `attempted` or `failure` row with your `principal` and
+exactly your `detail` is yours, from this request or an earlier retry, and a row from your own other
+session with that same `detail` cannot differ from your write, so ignore all of them. Then count the rest,
+from any principal (a row from your own account with a different `detail` counts): a `success` or `failure`
+row with a higher `id` than your first `attempted` row (a `failure` row means the write errored, not that
+it did not apply); and any `attempted` row with no `success` or `failure` row of the same `principal` and
+`detail` after it, whatever its `id`, because that write may land after yours or its outcome row was lost.
+If there is no such row, no other write is recorded: repeat the `PUT`. If there is one, do not repeat the `PUT` until you have agreed the intended
 state with that operator. The exception is a stop (`enabled` false): repeat it and tell them. A repeated
 stop replaces whatever the row holds, including their re-enable, which is the safe direction for an
 emergency but not harmless.
@@ -10346,8 +10346,10 @@ state while that row stands. Only rows on your own scope key decide whether to r
 
 If you do not hold `AuditLog:Read`, or the audit read answers `403` or `503` and keeps doing so after the
 server is ready (the authorization or audit store is degraded, which the fault behind the `500` can cause
-too), you cannot read the audit rows: wait and retry first, then ask a holder of `AuditLog:Read` to check.
-If nobody can and your request was a stop, repeat it; if it was an enable, do not repeat it.
+too), you cannot read the audit rows: wait and retry first, then ask a holder of `AuditLog:Read` to check,
+giving them your `principal`, your exact `detail`, your first request time and the scope key, so they ignore
+your own rows by the rule above. If nobody can and your request was a stop, repeat it; if it was an enable,
+do not repeat it.
 
 A repeat is idempotent: it leaves the same `enabled` and `reason` but replaces `set_by` and
 `updated_at_ms`, and writes its own audit rows. The `attempted` row of the failed request stays in the
