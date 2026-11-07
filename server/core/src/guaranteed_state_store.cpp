@@ -3622,7 +3622,7 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
     const auto degrade = [this](const char* reason, const char* what, const std::string& detail) {
         if (const auto d = note_read_degrade(metrics_, reason, kDegradeSourceCensusDevice, sampler);
             d.should_log)
-            spdlog::warn("GuaranteedStateStore::unrepresented_pending_for_agent: {}: {}", what,
+            spdlog::warn("GuaranteedStateStore: unrepresented pending read: {}: {}", what,
                          ::yuzu::log_key_token(detail));
     };
     const auto unavailable = [](std::string message) {
