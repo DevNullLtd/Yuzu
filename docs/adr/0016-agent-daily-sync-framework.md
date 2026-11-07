@@ -1169,7 +1169,8 @@ non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex,
 `v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
 same-count edit read as complete. A later layout change or a registry column change (see the warning in
 `device_ci_kinds.hpp`) can therefore be rolled out under a new prefix without raising a false integrity
-alarm on every stored row. One pure function
+alarm on every stored row. (A column change also needs its own ALTER migration; the registry is not the schema, see
+`docs/postgres-store-playbook.md` "Registry-backed tables".) One pure function
 (`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
 read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
 row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
