@@ -643,7 +643,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 : std::nullopt;
         std::vector<DeviceRow> all;
         if (api_) {
-            for (const auto& r : api_->list_devices()) {
+            // The basic list: this fragment never renders the per-device backend, so it must
+            // not pay the health-store read for it (and cannot carry it by construction).
+            for (const auto& r : api_->list_devices_basic()) {
                 if (!authz::in_scope(scope, r.agent_id)) continue;
                 all.push_back(to_device_row(r));
             }

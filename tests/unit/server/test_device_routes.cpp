@@ -50,7 +50,22 @@ public:
     std::vector<std::string> degraded_ids;
     const std::string* device_os_ptr = nullptr;
 
-    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
+    // Call counters: which list method a route used is the property under test for the
+    // "callers that discard the per-device backend must not pay for it" pin below.
+    mutable int full_list_calls = 0;
+    mutable int basic_list_calls = 0;
+
+    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override {
+        ++full_list_calls;
+        return rows;
+    }
+    [[nodiscard]] std::vector<DeviceListRow> list_devices_basic() const override {
+        ++basic_list_calls;
+        auto out = rows;
+        for (auto& r : out)
+            r.guardian_backend.reset();
+        return out;
+    }
 
     [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
     lookup_device(const std::string& id) const override {
@@ -844,6 +859,16 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         CHECK(r->status == 200);
         CHECK(r->body.find("mine-host") != std::string::npos);
         CHECK(r->body.find("other-team") == std::string::npos);
+    }
+    SECTION("the list fragment reads the basic list and never the full one") {
+        // The dashboard row never renders the per-device backend, so it must not pay the
+        // health-store read that list_devices() costs (#2240); a return to the full list
+        // would leave every row-content assertion green.
+        auto r = sink.Get("/fragments/devices/list");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(api->basic_list_calls >= 1);
+        CHECK(api->full_list_calls == 0);
     }
     SECTION("out-of-scope device page is 403, not opened") {
         auto r = sink.Get("/fragments/device/page?id=other-team");

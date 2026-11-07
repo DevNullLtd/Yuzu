@@ -1580,7 +1580,8 @@ public:
     /// carries a rejected value. nullopt NEVER means `legacy`. It does one hash lookup per id with
     /// no string copies, taking mu_ per kGuardianBackendSlice ids with a pause between slices
     /// (kGuardianBackendPause: a sleep or a busy-wait by platform, see the constants).
-    /// list_devices has six callers, four of which discard the field; see device_api.hpp.
+    /// Only DeviceApi::list_devices() calls it (REST /api/v1/devices and MCP list_agents); the
+    /// callers that discard the field use list_devices_basic() or connected_count().
     /// Because mu_ is released between slices an entry can be refreshed or pruned mid-call: each
     /// id is read consistently, the list is not one snapshot.
     /// `guardian_backend_of` is the O(1) point lookup for lookup_device (#3564: no scan, so a miss

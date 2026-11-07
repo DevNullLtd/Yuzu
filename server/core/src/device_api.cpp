@@ -27,33 +27,17 @@ public:
     LocalDeviceApi& operator=(const LocalDeviceApi&) = delete;
 
     [[nodiscard]] std::vector<DeviceListRow> list_devices() const override {
-        // Lock order: the registry's lock is taken and released inside to_json_obj(), THEN the
-        // health store's mutex is taken per slice of ids (see kGuardianBackendSlice). Sequential
-        // acquisitions, never nested, so there is no ordering relation with heartbeat ingest
-        // (which also touches the two stores separately).
-        const auto arr = registry_.to_json_obj();
-        std::vector<std::string> ids;
-        ids.reserve(arr.size());
-        for (const auto& a : arr)
-            ids.push_back(a.value("agent_id", ""));
-        const auto backends = health_.guardian_backend_for(ids, detail::kAgentHealthStaleness);
+        return build_rows(/*with_backend=*/true);
+    }
 
-        std::vector<DeviceListRow> out;
-        out.reserve(arr.size());
-        std::size_t i = 0;
-        for (const auto& a : arr) {
-            DeviceListRow row;
-            row.agent_id = std::move(ids[i]);
-            row.hostname = a.value("hostname", "");
-            row.os = a.value("os", "");
-            row.arch = a.value("arch", "");
-            row.agent_version = a.value("agent_version", "");
-            if (backends[i])
-                row.guardian_backend = std::string{*backends[i]};
-            out.push_back(std::move(row));
-            ++i;
-        }
-        return out;
+    [[nodiscard]] std::vector<DeviceListRow> list_devices_basic() const override {
+        return build_rows(/*with_backend=*/false);
+    }
+
+    [[nodiscard]] std::size_t connected_count() const override {
+        // O(1) under the registry lock: the same population list_devices() builds rows from
+        // (agents_), without the per-agent JSON and strings.
+        return registry_.agent_count();
     }
 
     [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
@@ -90,6 +74,40 @@ public:
     }
 
 private:
+    /// The one row builder behind list_devices() and list_devices_basic(). `with_backend` is the
+    /// only difference: the basic path never touches the health store.
+    [[nodiscard]] std::vector<DeviceListRow> build_rows(bool with_backend) const {
+        // Lock order: the registry's lock is taken and released inside to_json_obj(), THEN (only
+        // with_backend) the health store's mutex is taken per slice of ids (see
+        // kGuardianBackendSlice). Sequential acquisitions, never nested, so there is no ordering
+        // relation with heartbeat ingest (which also touches the two stores separately).
+        const auto arr = registry_.to_json_obj();
+        std::vector<std::string> ids;
+        ids.reserve(arr.size());
+        for (const auto& a : arr)
+            ids.push_back(a.value("agent_id", ""));
+        std::vector<std::optional<std::string_view>> backends;
+        if (with_backend)
+            backends = health_.guardian_backend_for(ids, detail::kAgentHealthStaleness);
+
+        std::vector<DeviceListRow> out;
+        out.reserve(arr.size());
+        std::size_t i = 0;
+        for (const auto& a : arr) {
+            DeviceListRow row;
+            row.agent_id = std::move(ids[i]);
+            row.hostname = a.value("hostname", "");
+            row.os = a.value("os", "");
+            row.arch = a.value("arch", "");
+            row.agent_version = a.value("agent_version", "");
+            if (with_backend && backends[i])
+                row.guardian_backend = std::string{*backends[i]};
+            out.push_back(std::move(row));
+            ++i;
+        }
+        return out;
+    }
+
     detail::AgentRegistry& registry_;
     TagStore* tags_; ///< nullable — degrades `tags` to empty, never an error
     const detail::AgentHealthStore& health_; ///< borrowed; see device_api_local.hpp LIFETIME

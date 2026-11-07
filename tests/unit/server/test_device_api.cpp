@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -265,6 +266,77 @@ TEST_CASE("DeviceApi guardian_backend: the registry is the population, the healt
     REQUIRE_FALSE(snapshot.empty());
     for (const auto& entry : snapshot)
         CHECK_FALSE(entry.contains("guardian_backend"));
+}
+
+TEST_CASE("DeviceApi basic list and connected count: same population, no backend, no health read",
+          "[device_api][guardian_backend]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    AgentHealthStore health;
+    auto api = make_local_device_api(registry, nullptr, health);
+
+    // Empty fleet: both views agree, nothing to build.
+    CHECK(api->list_devices_basic().empty());
+    CHECK(api->connected_count() == 0);
+
+    REQUIRE(registry.register_agent(make_info("bc-spark", "linux")).has_value());
+    REQUIRE(registry.register_agent(make_info("bc-none", "windows")).has_value());
+    REQUIRE(registry.register_agent(make_info("bc-ghost-free", "linux")).has_value());
+    beat(health, "bc-spark", "spark");
+    beat(health, "bc-orphan", "legacy"); // in the health store only: never listed or counted
+
+    const auto full = api->list_devices();
+    const auto basic = api->list_devices_basic();
+    REQUIRE(full.size() == 3);
+    REQUIRE(basic.size() == full.size());
+    CHECK(api->connected_count() == full.size());
+    for (std::size_t i = 0; i < full.size(); ++i) {
+        INFO("index " << i);
+        // Same rows in the same order; only the backend differs.
+        CHECK(basic[i].agent_id == full[i].agent_id);
+        CHECK(basic[i].hostname == full[i].hostname);
+        CHECK(basic[i].os == full[i].os);
+        CHECK(basic[i].arch == full[i].arch);
+        CHECK(basic[i].agent_version == full[i].agent_version);
+        CHECK_FALSE(basic[i].guardian_backend.has_value());
+    }
+    // The full list does carry the one reported token, so the basic list's null is not vacuous.
+    const auto* spark = row_for(full, "bc-spark");
+    REQUIRE(spark != nullptr);
+    REQUIRE(spark->guardian_backend.has_value());
+    CHECK(*spark->guardian_backend == "spark");
+}
+
+namespace {
+// A seam implementation that only overrides list_devices(), like every route-test double.
+class ListOnlyDeviceApi final : public yuzu::server::DeviceApi {
+public:
+    [[nodiscard]] std::vector<yuzu::server::DeviceListRow> list_devices() const override {
+        yuzu::server::DeviceListRow a;
+        a.agent_id = "d1";
+        a.guardian_backend = "spark";
+        yuzu::server::DeviceListRow b;
+        b.agent_id = "d2";
+        return {a, b};
+    }
+    [[nodiscard]] std::expected<std::optional<yuzu::server::DeviceDetail>,
+                                yuzu::server::DeviceReadError>
+    lookup_device(const std::string&) const override {
+        return std::optional<yuzu::server::DeviceDetail>{std::nullopt};
+    }
+};
+} // namespace
+
+TEST_CASE("DeviceApi defaults: a list-only double gets a basic list and a count for free",
+          "[device_api][guardian_backend]") {
+    ListOnlyDeviceApi api;
+    const auto basic = api.list_devices_basic();
+    REQUIRE(basic.size() == 2);
+    CHECK(basic[0].agent_id == "d1");
+    CHECK_FALSE(basic[0].guardian_backend.has_value()); // cleared by the default
+    CHECK(api.connected_count() == 2);
+    REQUIRE(api.list_devices()[0].guardian_backend.has_value()); // the full list still has it
 }
 
 TEST_CASE("AgentHealthStore guardian_backend_for: results stay aligned across lock slices",

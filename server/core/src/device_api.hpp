@@ -121,11 +121,28 @@ public:
     /// that store's mutex (the heartbeat upsert path) in slices of kGuardianBackendSlice ids with
     /// a short pause between slices, so the list is not one snapshot and, for this accessor, an
     /// upsert waits for one slice rather than the whole fleet (agent_registry.hpp has the
-    /// measurements and the stalls the sweep still causes). Six
-    /// production callers use this method and four discard the field (the dashboard device
-    /// fragment, the crypto hostname map, and two `.size()`-only counts); they pay the lookup
-    /// anyway. That cost was accepted deliberately (#2240) in preference to a second seam method.
+    /// measurements and the stalls the sweep still causes). Only a caller that SERIALISES the
+    /// field should pay that: today GET /api/v1/devices and MCP list_agents. Every other caller
+    /// uses `list_devices_basic()` (rows, no lookup) or `connected_count()` (a number).
     [[nodiscard]] virtual std::vector<DeviceListRow> list_devices() const = 0;
+
+    /// The same rows and order as `list_devices()` with `guardian_backend` always nullopt and NO
+    /// health-store read. For callers that discard the field: the dashboard device fragment
+    /// (which must never carry it) and the crypto hostname map. Non-pure so a test double that
+    /// only overrides `list_devices()` keeps compiling; the default clears the field from it.
+    [[nodiscard]] virtual std::vector<DeviceListRow> list_devices_basic() const {
+        auto rows = list_devices();
+        for (auto& row : rows)
+            row.guardian_backend.reset();
+        return rows;
+    }
+
+    /// How many devices `list_devices()` would return right now, without building the rows. For
+    /// the two page-render connected counts. Non-pure for the same reason; the default counts
+    /// `list_devices_basic()`.
+    [[nodiscard]] virtual std::size_t connected_count() const {
+        return list_devices_basic().size();
+    }
 
     /// Single-device lookup by id — the shape `GET /api/v1/devices/{id}`
     /// serves. `nullopt` (inside the engaged `expected`) on a genuine miss —
