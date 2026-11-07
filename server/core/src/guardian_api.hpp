@@ -166,10 +166,16 @@ public:
     /// `get_guardian_device_guards` — every guard's state for ONE device,
     /// unscoped to any Baseline (genuinely distinct from `device_compliance`
     /// below, which is scoped to one named Baseline). A device with no
-    /// reported guards returns an empty, non-nullopt vector — not an error.
-    /// Returns `nullopt` on a degraded read.
-    [[nodiscard]] virtual std::optional<std::vector<GuardianDeviceGuardRow>>
-    device_guards(const std::string& agent_id) const = 0;
+    /// reported guards returns a report with empty `guards` (and a zero
+    /// unrepresented-pending summary) — not an error. The report also carries
+    /// the count and capped id list of retained pending events with no census
+    /// row (#7217). Returns `nullopt` on a degraded read, including a failed
+    /// unrepresented-pending read. `fault` (may be null) is set to `kNone` on entry and, on a
+    /// `nullopt` return, to why: `kStatementTimeout` when the unrepresented-pending read ran past
+    /// its time budget (a retained-backlog cause a retry does not fix), `kTransient` otherwise
+    /// (see `GuardianReadFault` in `guardian_types.hpp`).
+    [[nodiscard]] virtual std::optional<GuardianDeviceGuardsReport>
+    device_guards(const std::string& agent_id, GuardianReadFault* fault) const = 0;
 
     /// The name-anchored, device-applicable Baseline compliance rollup
     /// behind `GET /api/v1/guaranteed-state/device-compliance` / MCP
@@ -185,7 +191,8 @@ public:
     /// the full audit-obligation table this method preserves verbatim.
     [[nodiscard]] virtual std::optional<GuardianDeviceComplianceRollup>
     device_compliance(const std::string& baseline_name, const std::string& agent_id,
-                       bool* store_degraded, bool* pii_access_began) const = 0;
+                       bool* store_degraded, bool* pii_access_began,
+                       GuardianReadFault* fault) const = 0;
 
     /// The event query behind `GET /api/v1/guaranteed-state/events` / MCP
     /// `list_guardian_events`. UNLIKE every other method on this interface,

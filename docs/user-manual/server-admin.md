@@ -4073,6 +4073,11 @@ a misbehaving automation script.
 > session rows in PostgreSQL (`SessionStore`) survive. A server restart,
 > or a cache miss on another replica, will resurrect those sessions.
 > Retry the revoke once the database is healthy again.
+>
+> A SCIM or dashboard deprovision whose session delete does not persist is
+> different: it answers `500` and leaves the account active (audit `partial`,
+> `sessions_db_error=true`). See the runbook "SCIM / dashboard deprovision
+> returns 500" in `docs/ops-runbooks/auth-db-recovery.md`.
 
 ### Self-service "Sign out everywhere"
 
