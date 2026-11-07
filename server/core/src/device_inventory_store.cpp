@@ -107,17 +107,6 @@ std::string bigint_param(const std::string& s) {
     return std::to_string(v);
 }
 
-// The 11 scalars appended to device_ci at wire positions 22-32 (device_ci_kinds.hpp).
-constexpr const char* kV2ScalarCols[] = {
-    "chassis_type",   "chassis_serial", "chassis_asset_tag", "chassis_source",
-    "board_vendor",   "board_product",  "board_serial",      "board_source",
-    "machine_id_hash", "machine_id_algorithm", "machine_id_source",
-};
-// Ties the migration DDL to the wire: positions 0-21 are the frozen v1 fields, the rest are
-// the appended scalars named here.
-static_assert(std::size(kV2ScalarCols) == kDeviceCiScalarFields - 22,
-              "kV2ScalarCols must name every appended scalar position (22..kDeviceCiScalarFields-1)");
-
 // Split a kDeviceCiSections column list ("a,b,c") into names.
 std::vector<std::string> split_columns(std::string_view columns) {
     std::vector<std::string> out;
@@ -127,34 +116,71 @@ std::vector<std::string> split_columns(std::string_view columns) {
 }
 
 // Migration v2 (additive, online-safe: constant defaults make the ALTER metadata-only,
-// ADR-0008): the v2 blob's identity scalars on device_ci, a per-section status table, and
-// one child table per list kind (typed TEXT columns, driven by kDeviceCiSections so a kind
-// costs one registry entry). Children cascade from device_ci so delete_agent stays one
-// statement. Unqualified DDL — the runner sets search_path to the store schema.
-std::string migration_v2_sql() {
-    std::string sql =
-        "ALTER TABLE device_ci ADD COLUMN blob_version SMALLINT NOT NULL DEFAULT 1";
-    for (const char* c : kV2ScalarCols)
-        sql += std::string(", ADD COLUMN ") + c + " TEXT NOT NULL DEFAULT ''";
-    sql += ";";
-    sql += "CREATE TABLE device_ci_section ("
-           "  agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
-           "  kind     TEXT NOT NULL,"
-           "  level    TEXT NOT NULL DEFAULT '',"
-           "  reason   TEXT NOT NULL DEFAULT '',"
-           "  PRIMARY KEY (agent_id, kind));";
-    for (const auto& d : kDeviceCiSections) {
-        if (d.table == nullptr)
-            continue;
-        sql += std::string("CREATE TABLE ") + d.table +
-               " (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
-               " ord INTEGER NOT NULL";
-        for (const auto& col : split_columns(d.columns))
-            sql += ", " + col + " TEXT NOT NULL DEFAULT ''";
-        sql += ", PRIMARY KEY (agent_id, ord));";
-    }
-    return sql;
-}
+// ADR-0008): the v2 blob's identity scalars on device_ci (wire positions 22-32 of
+// device_ci_kinds.hpp), a per-section status table, and one child table per list kind
+// (typed TEXT columns). Children cascade from device_ci so delete_agent stays one statement.
+// Unqualified DDL - the runner sets search_path to the store schema.
+//
+// FROZEN (#7164): this is a checked-in literal, NOT generated from kDeviceCiSections. The
+// runner skips a migration whose version is already recorded, so a generated v2 changes what a
+// FRESH database gets and nothing about a deployed one. Never edit it: a new table-backed kind,
+// or a changed column list, ships its own migration (v4 or later) - see "Registry-backed tables"
+// in docs/postgres-store-playbook.md. What ties the registry to the schema is now (a) the
+// projection check in the constructor (a registry table or column the database lacks refuses
+// at boot) and (b) the schema test in test_device_inventory_store.cpp. The compile-time tie
+// between kDeviceCiScalarFields and the scalar DDL that the old generator carried is replaced
+// by those two. It is byte-identical to what the generator emitted when it was frozen, so a
+// database that already ran v2 on today's registry needs nothing (recorded in the commit message).
+constexpr const char* kMigrationV2Sql =
+    "ALTER TABLE device_ci ADD COLUMN blob_version SMALLINT NOT NULL DEFAULT 1,"
+    " ADD COLUMN chassis_type TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_serial TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_asset_tag TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_source TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_vendor TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_product TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_serial TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_source TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_hash TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_algorithm TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_source TEXT NOT NULL DEFAULT '';"
+    "CREATE TABLE device_ci_section (  agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    "  kind     TEXT NOT NULL,  level    TEXT NOT NULL DEFAULT '',"
+    "  reason   TEXT NOT NULL DEFAULT '',  PRIMARY KEY (agent_id, kind));"
+    "CREATE TABLE device_ci_cpu (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, idx TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',"
+    " cores TEXT NOT NULL DEFAULT '', threads TEXT NOT NULL DEFAULT '',"
+    " clock_mhz TEXT NOT NULL DEFAULT '', socket_designation TEXT NOT NULL DEFAULT '',"
+    " stepping TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_dimm (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, slot TEXT NOT NULL DEFAULT '',"
+    " size_mb TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT '',"
+    " speed_mhz TEXT NOT NULL DEFAULT '', manufacturer TEXT NOT NULL DEFAULT '',"
+    " part_number TEXT NOT NULL DEFAULT '', serial TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_disk (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, idx TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',"
+    " size_gb TEXT NOT NULL DEFAULT '', media_type TEXT NOT NULL DEFAULT '',"
+    " interface TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_swap (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '',"
+    " total_mb TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_volume (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, volume TEXT NOT NULL DEFAULT '',"
+    " mount_points TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '',"
+    " fstype TEXT NOT NULL DEFAULT '', total_bytes TEXT NOT NULL DEFAULT '',"
+    " detail TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_partition (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, disk TEXT NOT NULL DEFAULT '',"
+    " partition TEXT NOT NULL DEFAULT '', size_bytes TEXT NOT NULL DEFAULT '',"
+    " type TEXT NOT NULL DEFAULT '', mount_points TEXT NOT NULL DEFAULT '',"
+    " detail TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_topology (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, topo_kind TEXT NOT NULL DEFAULT '',"
+    " name TEXT NOT NULL DEFAULT '', uuid TEXT NOT NULL DEFAULT '',"
+    " members TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));";
 
 // Migration v3 (additive, online-safe, ADR-0008): the number of child rows stored for the
 // section (`row_count`) and the SHA-256 of their canonical serialization (`content_digest`),
@@ -213,7 +239,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "  last_seen     BIGINT NOT NULL);"
          // Roster reads order by hostname; the index keeps the LIMIT scan ordered.
          "CREATE INDEX device_ci_hostname_idx ON device_ci (hostname);"},
-        {2, migration_v2_sql()},
+        {2, kMigrationV2Sql},
         {3, kMigrationV3Sql},
     };
     return kMigrations;
