@@ -25,7 +25,9 @@
 /// `list_devices()` inherits correct, if slower, defaults. A remote client MUST NOT add a route
 /// for them (a new public resource needs REST and MCP twins, ADR-1005); it inherits the defaults
 /// or uses a query option on `GET /api/v1/devices`. Note a remote count would then be filtered to
-/// the caller's scope, unlike the local fleet-wide one.
+/// the caller's scope, unlike the local fleet-wide one (on REST, `count + devices_omitted` recovers
+/// the fleet figure; a query option is itself a change to the public resource and needs REST and
+/// MCP parity and an OpenAPI entry).
 ///
 /// The store-backed factory (`make_local_device_api`) lives in the core-only
 /// `device_api_local.hpp` — this header names no store type at all, not even
@@ -117,11 +119,11 @@ struct DeviceDetail {
 /// `compliance_types.hpp`'s `PolicyReadError` shape.
 enum class DeviceReadError { kDegraded };
 
-/// The in-process public device API. Method set == the public REST/MCP
-/// resources listed in the file banner above, so presentation/MCP consume
-/// only what the public, versioned core API serves (ADR-0031 B3, INV-31-4) —
-/// a local in-process client today, a core HTTP client after the WS-B2
-/// cutover.
+/// The in-process public device API. Its public methods (`list_devices`, `lookup_device`) are
+/// the REST/MCP resources listed in the file banner above, so presentation/MCP consume only what
+/// the public, versioned core API serves (ADR-0031 B3, INV-31-4) -- a local in-process client
+/// today, a core HTTP client after the WS-B2 cutover. `list_devices_basic` and `connected_count`
+/// are in-process projections of `list_devices` with no twin (see "IN-PROCESS READ SHAPES").
 class DeviceApi {
 public:
     virtual ~DeviceApi() = default;

@@ -35,8 +35,8 @@ using namespace yuzu::server;
 namespace {
 
 // Minimal test double for the DeviceApi seam (ADR-0031 WS-A4 wave 2). `rows`
-// backs list_devices() (UNSCOPED — DeviceRoutes applies its own visible_set_fn
-// filter, matching the real seam's contract); `details` backs lookup_device()
+// backs list_devices() and list_devices_basic() (UNSCOPED -- DeviceRoutes applies its own
+// visible_set_fn filter, matching the real seam's contract); `details` backs lookup_device()
 // by agent_id (explicit per-id entries take precedence). `device_os_ptr`, when
 // wired and non-empty, makes lookup_device(ANY id without an explicit `details`
 // entry) resolve to a bare identity row carrying that OS — the K-4 live-result
@@ -825,7 +825,8 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         if (agent_id == "other-team") { res.status = 403; return false; }
         return true;
     };
-    // The API's list_devices() is UNSCOPED (both "mine" and "other-team" resolve);
+    // The API's list_devices()/list_devices_basic() are UNSCOPED (both "mine" and "other-team"
+    // resolve);
     // visible_set_fn_ below is this test's OWN confinement filter, matching a flat
     // get_visible_agents JOIN with no ancestor walk — "ancestor-child" is absent
     // from it even though scoped_perm authorizes it (an ancestor-group role).

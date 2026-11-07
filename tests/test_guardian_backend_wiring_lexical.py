@@ -22,8 +22,8 @@ calls what, or of declaration order, not of behaviour:
 
   4. CHEAP READS. The callers that discard the per-device backend (the dashboard device fragment,
      the crypto hostname map, the two page-render connected counts) must call
-     `list_devices_basic()` / `connected_count()` and never the full `list_devices()`, which pays the
-     health-store lookup and the registry JSON walk. Every behavioural test passes with either call,
+     `list_devices_basic()` / `connected_count()` and never the full `list_devices()`, which pays
+     the health-store lookup and the registry JSON walk. Every behavioural test passes with either call,
      so only this gate (and the dashboard call-count pin in test_device_routes.cpp) sees a revert.
 
 `//` and block comments are stripped before matching, so prose cannot satisfy a check. The
@@ -34,7 +34,8 @@ later that is not in HOLDERS; a new call of the accessors in another file; a der
 as `kAgentHealthStaleness / 2` (it checks the constant's NAME appears in the argument); the
 constant's own value (agent_registry.hpp is not scanned); a leak through a helper called from
 to_json_obj, or under a constant spelling; character-literal edge cases (a quote inside '...') in the comment
-stripper; raw strings are handled. Runtime teardown order still needs a sanitizer run of start/stop.
+stripper; a new caller of the full `list_devices()` in a file other than the four CHEAP_READS
+files (only REST /api/v1/devices and MCP list_agents may call it); raw strings are handled. Runtime teardown order still needs a sanitizer run of start/stop.
 
 Usage: python3 tests/test_guardian_backend_wiring_lexical.py
 """
@@ -64,14 +65,16 @@ STALENESS_CALLS = (
 )
 LITERAL_90 = re.compile(r"seconds\s*[{(]\s*90\s*[})]")
 # Callers of the DeviceApi seam that discard the per-device backend must use a cheap read, so they
-# do not pay the health-store lookup (and the registry JSON walk, for the counts): (file, token that
-# MUST appear in code, token that must NOT). Only REST /api/v1/devices and MCP list_agents may call
-# the full list_devices().
+# do not pay the health-store lookup (and the registry JSON walk, for the counts). Each row: (file,
+# marker that starts the scanned region or None for the whole file, regex that MUST match in code,
+# regex that must NOT). The gate scans only these four files, so it does NOT enforce that only REST
+# /api/v1/devices and MCP list_agents call the full list_devices() elsewhere.
+_FULL_LIST = r"\blist_devices\s*\(\s*\)|&\s*\w*(?:::)?list_devices\b"
 CHEAP_READS = (
-    ("device_routes.cpp", "list_devices_basic()", "list_devices()"),
-    ("crypto_api.cpp", "list_devices_basic()", "list_devices()"),
-    ("server.cpp", "connected_count()", "list_devices()"),
-    ("software_catalogue_model.cpp", "connected_count()", "list_devices()"),
+    ("device_routes.cpp", '"/fragments/devices/list"', r"\blist_devices_basic\s*\(\s*\)", _FULL_LIST),
+    ("crypto_api.cpp", None, r"\blist_devices_basic\s*\(\s*\)", _FULL_LIST),
+    ("server.cpp", None, r"\bconnected_count\s*\(\s*\)", _FULL_LIST),
+    ("software_catalogue_model.cpp", None, r"\bconnected_count\s*\(\s*\)", _FULL_LIST),
 )
 # Opener of a C++ raw string, from the quote: "delim( with a delimiter of at most 16 characters.
 _RAW_OPEN = re.compile(r'"([^ ()\\\t\v\f\n"]{0,16})\(')
@@ -216,19 +219,31 @@ def member_declarations(text: str) -> dict:
 
 def cheap_read_problems(files: dict) -> list:
     """The discarding callers must read through list_devices_basic()/connected_count() and must not
-    call the full list_devices() (comments are stripped first, so prose cannot satisfy this)."""
+    call the full list_devices() in any spelling (spaces, `&DeviceApi::list_devices`). Comments are
+    stripped first, so prose cannot satisfy this. For device_routes.cpp the MUST match is scoped to
+    the dashboard list handler, so a second cheap call elsewhere in the file cannot stand in for it;
+    the MUST NOT applies to the whole file."""
     out = []
-    for name, must, must_not in CHEAP_READS:
+    for name, marker, must, must_not in CHEAP_READS:
         code = strip_comments(files[name])
-        if must not in code:
-            out.append(f"{name}: expected a call to {must} (the caller discards the per-device backend)")
-        if must_not in code:
-            out.append(f"{name}: calls the full {must_not}, which pays the health-store lookup")
+        region = code
+        if marker is not None:
+            start = code.find(marker)
+            if start < 0:
+                out.append(f"{name}: handler marker {marker} not found")
+                continue
+            nxt = code.find("sink.Get(", start + len(marker))
+            region = code[start: nxt if nxt >= 0 else len(code)]
+        if not re.search(must, region):
+            out.append(f"{name}: expected a call matching {must} (the caller discards the "
+                       "per-device backend)")
+        if re.search(must_not, code):
+            out.append(f"{name}: calls the full list_devices(), which pays the health-store lookup")
     return out
 
 
 def load_cheap() -> dict:
-    return {name: (SRC / name).read_text(encoding="utf-8") for name, _, _ in CHEAP_READS}
+    return {name: (SRC / name).read_text(encoding="utf-8") for name, _, _, _ in CHEAP_READS}
 
 
 def load() -> dict:
@@ -301,17 +316,36 @@ class GuardianBackendWiring(unittest.TestCase):
 
     def test_cheap_read_mutations_are_reported(self):
         base = load_cheap()
-        for name, must, must_not in CHEAP_READS:
+        for name, marker, must, must_not in CHEAP_READS:
+            code = base[name]
+            self.assertTrue(re.search(must, strip_comments(code)), f"anchor missing in {name}")
+            # 1. point the caller back at the full list (every occurrence of the cheap name, so a
+            #    comment that happens to come first cannot absorb the mutation)
+            token = re.search(must, strip_comments(code)).group(0)
             files = dict(base)
-            self.assertIn(must, strip_comments(files[name]), f"anchor missing in {name}")
-            # point the caller back at the full list
-            # (every occurrence, so a comment that happens to come first cannot absorb the mutation)
-            files[name] = files[name].replace(must, must_not)
+            files[name] = code.replace(token, "list_devices()")
             self.assertTrue(cheap_read_problems(files), f"reverting {name} not reported")
-            # a comment mentioning the cheap call must not satisfy the check
+            # 2. KEEP the cheap call and ADD a full-list call in each spelling: the MUST-NOT half
+            #    must fire on its own
+            for call in ("api->list_devices();", "api->list_devices ();", "api->list_devices( );",
+                         "auto f = &DeviceApi::list_devices;"):
+                files = dict(base)
+                files[name] = code + f"\nstatic void probe() {{ {call} }}\n"
+                self.assertTrue(cheap_read_problems(files), f"extra full call {call!r} not reported in {name}")
+            # 3. a comment mentioning the cheap call must not satisfy the check
             files = dict(base)
-            files[name] = files[name].replace(must, "list_devices_other()") + f"\n// {must}\n"
+            files[name] = re.sub(must, "list_devices_other()", code) + f"\n// {token}\n"
             self.assertTrue(cheap_read_problems(files), f"comment satisfied the check in {name}")
+        # 4. device_routes.cpp: a cheap call outside the dashboard list handler is not enough
+        files = dict(base)
+        dr = base["device_routes.cpp"]
+        start = dr.find('"/fragments/devices/list"')
+        nxt = dr.find("sink.Get(", start + 5)
+        handler = dr[start:nxt]
+        files["device_routes.cpp"] = (dr[:start]
+            + re.sub(r"\blist_devices_basic\s*\(\s*\)", "list_devices_x()", handler)
+            + dr[nxt:] + "\nstatic void other() { api_->list_devices_basic(); }\n")
+        self.assertTrue(cheap_read_problems(files), "a cheap call outside the handler satisfied the check")
 
     def test_comment_stripper_understands_raw_strings(self):
         leak = 'auto leak = "guardian_backend";'
