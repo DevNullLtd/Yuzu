@@ -172,6 +172,15 @@ inline std::string lower(std::string_view s) {
     return out;
 }
 
+inline bool contains_ci(std::string_view hay, std::string_view needle) {
+    return lower(hay).find(needle) != std::string::npos; // needles are lowercase
+}
+
+inline std::string rtrim(std::string s) {
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+    return s;
+}
+
 struct SigRow {
     std::string_view sig; // exactly 12 bytes
     std::string_view vendor;
@@ -238,12 +247,12 @@ inline std::optional<std::string_view> vm_vendor_from_smbios(std::string_view ma
     // "Amazon EC2"); no VM product name does. Nutanix NX appliances are excluded by their row
     // requiring the AHV product. Heuristic: it applies to every vendor, so a VM product name
     // containing ".metal" would read as hardware (none is known).
-    if (yuzu::util::icontains(product, ".metal"))
+    if (detail::contains_ci(product, ".metal"))
         return std::nullopt;
     for (const auto& r : detail::kSmbios) {
-        if (!r.manufacturer.empty() && !yuzu::util::icontains(manufacturer, r.manufacturer))
+        if (!r.manufacturer.empty() && !detail::contains_ci(manufacturer, r.manufacturer))
             continue;
-        if (!r.product.empty() && !yuzu::util::icontains(product, r.product))
+        if (!r.product.empty() && !detail::contains_ci(product, r.product))
             continue;
         return r.vendor;
     }
@@ -525,7 +534,7 @@ inline ContainerVerdict classify_container(const Facts& f) {
     // (systemd classes WSL2 as a container type, but a WSL2 agent is a Hyper-V guest and falls
     // through to the cgroup scan); empty falls through too. The content is never emitted.
     if (in.systemd_container) {
-        const std::string type = yuzu::shared::smbios::rtrim(*in.systemd_container);
+        const std::string type = detail::rtrim(*in.systemd_container);
         if (!type.empty() && type != "wsl") {
             v.value = Tri::yes;
             v.evidence = "/run/systemd/container";
@@ -649,8 +658,8 @@ inline void push_unique(std::vector<std::string>& v, std::string s) {
 /// newline.
 inline SmbiosFacts combine_dmi(const FieldRead& vendor, const FieldRead& product) {
     SmbiosFacts s;
-    s.manufacturer = yuzu::shared::smbios::rtrim(vendor.value);
-    s.product = yuzu::shared::smbios::rtrim(product.value);
+    s.manufacturer = detail::rtrim(vendor.value);
+    s.product = detail::rtrim(product.value);
     std::vector<std::string> reasons;
     for (const FieldRead* r : {&vendor, &product})
         if (r->state == ReadState::unreadable)
@@ -703,7 +712,7 @@ inline SmbiosFacts smbios_facts_from_table(const yuzu::shared::smbios::SmbiosTab
 /// empty or missing file is "no signal", not "not virtual".
 inline OsHint linux_os_hint(std::string_view sys_hypervisor_type) {
     OsHint h;
-    const std::string t = yuzu::shared::smbios::rtrim(detail::lower(sys_hypervisor_type));
+    const std::string t = detail::rtrim(detail::lower(sys_hypervisor_type));
     if (!t.empty()) {
         h.os_says_virtual = true;
         h.source = "sys_hypervisor";
