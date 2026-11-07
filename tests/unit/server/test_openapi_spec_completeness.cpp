@@ -1844,7 +1844,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"08d4ef61169a6cd8\"";
+    static const std::string kOperationIdChecksum = "\"453257712a519510\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
