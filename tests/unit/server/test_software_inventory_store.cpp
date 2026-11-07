@@ -6101,7 +6101,7 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
         CHECK(bumped[0].from_version == "2.45");
         CHECK(bumped[0].to_version == "2.46");
         const auto ch = SoftwareInventoryStore::diff_changes({with("via:chocolatey")},
-                                                             {with("Chocolatey Software")});
+                                                             {with("Acme Tools")});
         REQUIRE(ch.size() == 2);
         for (const auto& c : ch) {
             if (c.kind == Kind::kRemove) {
@@ -6109,7 +6109,7 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
                 CHECK(c.from_version == "2.45");
             } else {
                 CHECK(c.kind == Kind::kInstall);
-                CHECK(c.publisher == "Chocolatey Software");
+                CHECK(c.publisher == "Acme Tools");
                 CHECK(c.to_version == "2.45");
             }
         }
