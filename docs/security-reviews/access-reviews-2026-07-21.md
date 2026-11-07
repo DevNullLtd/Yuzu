@@ -14,9 +14,20 @@ was written, renumbered on 2026-07-25 when a duplicate `10` in that section
 was corrected).
 
 > **Addendum (2026-11-03, #4752, amended 2026-11-04).** The statements below that `record_attestation` is an UPSERT
-> that overwrites a prior decision (under "What shipped", and the `destructiveHint` rationale) are
-> superseded: every decision is now kept and the reviewer must differ from the subject of the
-> grant. See "Addendum (2026-11-03, #4752, amended 2026-11-04)" at the end of this document.
+> that overwrites a prior decision (under "What shipped", and the `destructiveHint` rationale), that
+> a decision is "recorded once and then final" or "final, irreversible", and that the store has
+> "two tables" are superseded: every decision is now kept in the grant's history (schema v3, three
+> tables), a later decision replaces the current one, the grant cannot go back to `pending`, and the
+> reviewer must differ from the subject of the grant. See "Addendum (2026-11-03, #4752, amended
+> 2026-11-04)" at the end of this document.
+>
+> **Amended 2026-11-07 (CC8.1 traceability).** Statements in this document were rewritten in place, not
+> only superseded below, by the #4752 review rounds: (a) the "recorded once and then final", "final,
+> irreversible" and "two tables" statements were replaced by the append-only history (schema v3, three
+> tables); (b) the CC6.2 assurance of "auditable proof that a human reviewer looked" was narrowed to a
+> reviewer ACCOUNT; (c) the residual lock-wait statement (the pool's 10 s `lock_timeout`) was replaced by the
+> store's own 3 s `SET LOCAL lock_timeout` per lock wait; (d) the audit-row attribution wording was
+> corrected. The reasons are in "Amended 2026-11-07" at the end of this document.
 
 ## What shipped
 
@@ -45,13 +56,14 @@ was corrected).
   `pending` attestation rows in one transaction; `POST
   /api/v1/access-reviews/{id}/attestations` records a reviewer decision
   (`attested`/`flagged_revoke`) against one frozen `(principal, role)` grant
-  — recorded once and then final (an UPSERT until #4752, see "Update 2026-11-05" below); `POST
+  — every decision is kept in the grant's history, the latest is the current decision and the grant cannot return to `pending` (an UPSERT until #4752, see the addendum at the end of this document); `POST
   /api/v1/access-reviews/{id}/close` closes the campaign; `GET
   /api/v1/access-reviews/{id}` returns the full evidentiary state
   (metadata + every attestation row + `pending_count`).
 - **Store:** `AccessReviewStore` (`server/core/src/access_review_store.{hpp,cpp}`,
-  schema `access_review_store`) — born-on-Postgres (ADR-0006), two tables
-  (`access_review_campaign`, `access_review_attestation`), authoritative/
+  schema `access_review_store`) — born-on-Postgres (ADR-0006), three tables
+  (`access_review_campaign`, `access_review_attestation`,
+  `access_review_attestation_history`, the last from schema v3), authoritative/
   fail-hard posture (ADR-0012 §1).
 > **Addendum (2026-08-05, #2376) — read the "granted only to" claims below as
 > RBAC-ON-scoped until #2376.** This document describes the `AccessReview`
@@ -78,8 +90,9 @@ was corrected).
   (hardening round), `close_access_review` (hardening round) — JSON only;
   the REST `?format=csv` export has no MCP equivalent.
   `record_attestation` carries `destructiveHint:true` (hardening round —
-  it writes a final, irreversible decision; it was a decision-overwriting UPSERT until #4752); every other twin is
-  `destructiveHint:false`.
+  it replaces the current decision and the grant cannot return to `pending`, although the earlier decision stays in
+  the history; it was a decision-overwriting UPSERT until #4752); every other twin is
+  `destructiveHint:false` except `close_access_review`, which is also `destructiveHint:true`.
 - **Audit actions:** `access_review.exported`, `.list` (hardening round),
   `.campaign_opened`, `.attested`, `.flagged`, `.closed`, `.get`.
 - **Metrics (hardening round):** `yuzu_access_review_export_total{format}`,
@@ -99,8 +112,16 @@ was corrected).
   opening one) carries no side effect beyond its own audit row.
 - **The attestation campaign** (`open_campaign` → `record_attestation` →
   `close_campaign`) is the **"manager/security sign-off"** half — the
-  auditable proof that a *human* reviewer looked at each grant and made an
-  explicit decision, not just that a list was generated. `pending_count` on
+  auditable record that a reviewer account looked at each grant and made an
+  explicit decision, not just that a list was generated. "Reviewer" is an
+  account, not proof of a person at a keyboard: engine principal sessions,
+  service-scoped tokens (403) and the MCP read-only and operator tiers are
+  refused; an API-token caller (acting as its owning user) and a
+  supervised-tier MCP token can still attest. The three write routes are exempt
+  from MFA step-up (`kEvidenceCapture`), which covers the REST and dashboard
+  path only (MCP is not step-up gated and token principals do not take the MFA
+  path), so no fresh MFA proof is required. The history row stores only
+  `reviewer`; `principal_class` is a persisted column stamped only by how the credential was presented (an `Authorization` or `X-Yuzu-Token` header gives `agent`, a `yuzu_session` cookie gives `human`), so an API-token caller and an MCP-token caller cannot be told apart on the `access_review.attested` row, and there is no auth-source field. `AuditEvent::mcp_tool` is never persisted: on MCP the tool name is on the separate companion row `mcp.record_attestation` (`target_type=mcp_tool`). The domain row is set-and-proceed, so it can be absent (`Sec-Audit-Failed` on REST, `audit_persisted:false` on MCP). Audit rows are kept 365 days by default. `pending_count` on
   a closed campaign is the "how complete was this review" number an
   auditor needs without re-deriving it from the attestation rows.
 - Read together, the two pieces answer CC6.2's actual question: not just
@@ -591,8 +612,16 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    grant reaches its limit of 100 decisions, after which the request is refused. A
    superseded entry is returned truncated (and an earlier history entry shows at most its first 64
    characters), so match an earlier entry on those.
-6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
-   answer `503`; retry it.
+6. Under a continuous stream of attestations a `close` can wait up to 3 seconds for the campaign row
+   (a `SET LOCAL lock_timeout` set inside the close transaction, independent of the DSN, and replacing
+   a stricter DSN value) and answer `503`; nothing was committed on that path, so retry it. The 3-second
+   bound applies to each lock wait: an attestation waits on its grant row and then, behind a queued
+   close, on the campaign row, so its lock waits can total about 6 seconds on the leased connection (the
+   4-second acquire wait comes before the lease). Only an attest returns the fixed store-failure message;
+   a close fault returns the store string (`close_campaign lock_timeout failed`,
+   `close_campaign write failed` or `database unavailable — try again`). A close whose COMMIT
+   acknowledgement is lost may leave the campaign closed while the caller sees the `503`; a retry then
+   answers `404`, so read the campaign first.
 7. **Recorded residual and options under consideration (memory use of the history read).** The project owner
    ruled on 2026-11-04 to cut the preview of a superseded entry to 64 characters as the immediate response to the
    measured memory use of the history read (about 2.4 GB for the worst measured case with the former 512-character
@@ -609,3 +638,28 @@ server refuse to start (the schema v3 migration fails and the store does not ope
 until the database is replaced. Only that case is detected: decisions on engine or group grants
 made by earlier builds are not checked and read as "previous: not recorded". This is the hard-cutover posture in `docs/user-manual/upgrading.md`
 ("Deployment contract (hard cutover)"): fresh database only.
+
+### Amended 2026-11-07 (CC8.1 traceability): statements rewritten in place
+
+The 2026-11-03 addendum above lists statements it supersedes, but several were rewritten in place in this
+document rather than left standing. This entry records each change and why, so a reader comparing an earlier
+copy of the file can account for the difference.
+
+- **Immutability and table count.** The "recorded once and then final", "final, irreversible" and "two
+  tables" statements were replaced by the append-only history (schema v3, three tables). Reason: the
+  upsert-then-final design was replaced by #4752, so the old text no longer described the code.
+- **Reviewer assurance (CC6.2).** The assurance of "auditable proof that a human reviewer looked" was
+  narrowed to a reviewer ACCOUNT. Reason: an API-token caller (acting as its owning user) and a
+  supervised-tier MCP token can attest, and the write routes need no fresh MFA proof (the step-up exemption
+  covers the REST and dashboard path only; MCP is not step-up gated). Engine sessions, service-scoped tokens
+  and the MCP read-only and operator tiers are refused.
+- **Residual 6, lock wait.** The statement that a starved close waits for the pool's 10 s `lock_timeout` was
+  replaced by the store's own `SET LOCAL lock_timeout = '3s'`, which applies to each lock wait and replaces
+  the DSN value; an attest can wait on two rows in turn (about 6 s of lock waits). Reason: the earlier
+  figure did not describe the code.
+- **Audit-row attribution.** "The actor class (and, on MCP, the tool name) is on the audit row" was
+  corrected: `principal_class` is stamped only by how the credential was presented, so API-token and
+  MCP-token callers are indistinguishable on the `access_review.attested` row; `AuditEvent::mcp_tool` is not
+  persisted (the MCP tool name is on the companion `mcp.record_attestation` row); there is no auth-source
+  field; and the domain row is set-and-proceed, so it can be absent. Reason: the earlier wording overstated
+  what the audit trail attributes.

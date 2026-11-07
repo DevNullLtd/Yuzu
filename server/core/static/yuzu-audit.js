@@ -152,7 +152,14 @@
       decision: btn.dataset.decision, justification: justification
     }).then(function (r) {
       if (!r.ok) return failure(r);
+      // The success body is the A4 envelope {data: {recorded, decision_seq, previous_decision}}.
+      // A grant another reviewer already decided is replaced, not refused: say so.
+      var d2 = r.data && r.data.data;
+      var prev = d2 && typeof d2.previous_decision === 'string' ? d2.previous_decision : '';
       written(r);
+      if (prev && prev !== 'pending' && !r.auditFailed)
+        banner('That grant already held a "' + prev + '" decision. Yours is now the current ' +
+               'one; the earlier decision stays in the history.');
       loadCampaign(id);
       return null;
     });

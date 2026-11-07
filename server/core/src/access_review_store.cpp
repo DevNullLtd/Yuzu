@@ -45,6 +45,17 @@ constexpr const char* kStoreName = "access_review_store";
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
 
+// Row-lock wait bound for the two write transactions that queue on a campaign or grant row
+// (record_attestation, close_campaign). Set per transaction with SET LOCAL so the bound does not
+// depend on the DSN: PgPool injects its own lock_timeout only when neither `options=` nor
+// PGOPTIONS is set, and a waiter holds a pooled lease for the whole wait. A waiter that hits it
+// fails with SQLSTATE 55P03 and takes the same retryable path as any other write fault. The bound
+// applies to EACH row-lock wait: an attest can wait on its grant row and then on the campaign row,
+// so up to about 6 s of lock waits on the leased connection (a close has one wait, 3 s). The
+// kWriteTimeout acquire wait happens before the lease and is not part of that hold. The setting
+// REPLACES a DSN lock_timeout for these two transactions, so a stricter DSN value is loosened.
+constexpr const char* kWriteLockTimeoutSql = "SET LOCAL lock_timeout = '3s'";
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
     // the migration txn. Runtime statements below schema-qualify explicitly.
@@ -473,6 +484,12 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
     std::string error_msg;
     bool not_found = false;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult lt{PQexec(conn, kWriteLockTimeoutSql)};
+        if (lt.status() != PGRES_COMMAND_OK) {
+            error_msg =
+                logged_write_fault("record_attestation lock_timeout", campaign_id, conn, lt.get());
+            return false;
+        }
         // Lock order: the attestation row, then the campaign row (close_campaign takes only
         // the campaign row, so there is no cycle). FOR SHARE on the campaign makes a close wait
         // for this decision to commit; an attest after a close sees 'closed' and is refused.
@@ -699,21 +716,41 @@ AccessReviewStore::close_campaign(const std::string& campaign_id, const std::str
     if (closed_by.find('\0') != std::string::npos)
         return std::unexpected("bad_request: closed_by contains a NUL byte");
 
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected("database unavailable — try again");
-
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE access_review_store.access_review_campaign "
-        "SET status='closed', closed_by=$2, closed_at_ms=$3::bigint "
-        "WHERE campaign_id=$1 AND status='open' RETURNING campaign_id",
-        std::vector<std::string>{campaign_id, closed_by, std::to_string(now_ms())});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(
-            logged_write_fault("close_campaign write", campaign_id, lease.get(), res.get()));
-    if (PQntuples(res.get()) == 0)
+    // A transaction (not an autocommit statement) so SET LOCAL lock_timeout applies: the UPDATE
+    // waits behind every in-flight attest on this campaign (they hold FOR SHARE), and the wait
+    // must be bounded independently of the DSN (see kWriteLockTimeoutSql).
+    std::string error_msg;
+    bool not_found = false;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult lt{PQexec(conn, kWriteLockTimeoutSql)};
+        if (lt.status() != PGRES_COMMAND_OK) {
+            error_msg =
+                logged_write_fault("close_campaign lock_timeout", campaign_id, conn, lt.get());
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "UPDATE access_review_store.access_review_campaign "
+            "SET status='closed', closed_by=$2, closed_at_ms=$3::bigint "
+            "WHERE campaign_id=$1 AND status='open' RETURNING campaign_id",
+            std::vector<std::string>{campaign_id, closed_by, std::to_string(now_ms())});
+        if (res.status() != PGRES_TUPLES_OK) {
+            error_msg = logged_write_fault("close_campaign write", campaign_id, conn, res.get());
+            return false;
+        }
+        if (PQntuples(res.get()) == 0) {
+            not_found = true;
+            return false;
+        }
+        return true;
+    });
+    if (not_found)
         return std::unexpected("not_found: campaign missing or already closed");
+    if (!ok) {
+        // An empty error_msg means no lease within the budget, or BEGIN/COMMIT failed.
+        return std::unexpected(error_msg.empty() ? std::string{"database unavailable — try again"}
+                                                 : error_msg);
+    }
     return {};
 }
 

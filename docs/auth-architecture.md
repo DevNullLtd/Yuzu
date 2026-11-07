@@ -3898,7 +3898,13 @@ another store, or re-entering the pool, while it holds a lease, so the attest tr
 engine or RBAC store. ADR-0012 s2(c) itself sends cross-store work to s3, a dedicated query owner that takes one
 lease and issues schema-qualified SQL across the schemas; the project chose the pre-read with a documented window
 instead of building one. The window runs from that read to the commit: a pool acquire of up to the store's 4 s
-write budget, a row-lock wait of up to the pool's 10 s `lock_timeout`, and the statements themselves.
+write budget (spent before any lease exists), then, on the leased connection, row-lock waits and the
+statements themselves. The store sets `SET LOCAL lock_timeout = '3s'` as the first statement of the attest
+transaction, so the bound does not depend on the DSN (it replaces a stricter DSN value). It applies to each
+lock wait separately: the pre-read is one statement (`FOR UPDATE OF a FOR SHARE OF c`) that can wait up to
+3 s on the grant row and then up to 3 s on the campaign row (the second wait only behind a queued close), so
+lock waits can total about 6 s plus statement time while holding the connection, and the worst-case caller
+latency is about 4 s + 6 s.
 It is normally milliseconds but is not a bound the code promises. An ownership transfer or a membership change
 that lands inside it is not seen, and there is no re-read after the commit. The user rule has no such window.
 Revisit under the four-eyes primitive work (epic #6060).
@@ -3939,6 +3945,21 @@ acceptance of that limit is recorded for access reviews.
 
 **Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is the subject of a
 grant can still open or close a campaign.
+
+**"Reviewer" is an account, not proof of a person.** Engine principal sessions are refused (REST and MCP), as
+are service-scoped tokens (403) and the MCP read-only and operator tiers. An API-token caller acts as its owning
+user, so an API-token caller and a supervised-tier MCP token can still record a decision. The three write routes
+(open, attest, close) are step-up exempt (`kEvidenceCapture` in `step_up_policy.hpp`), so no fresh MFA proof is
+required; that exemption covers the REST and dashboard path only, because MCP is not step-up gated at all and
+token principals do not take the MFA path. The history row stores only `reviewer`. On the audit side, `principal_class` is a persisted column stamped only by how the credential was presented (an `Authorization` or `X-Yuzu-Token` header gives `agent`, a `yuzu_session` cookie gives `human`), so an API-token caller and an MCP-token caller cannot be told apart on the `access_review.attested` row, and there is no auth-source field. `AuditEvent::mcp_tool` is never persisted: on MCP the tool name is on the separate companion row `mcp.record_attestation` (`target_type=mcp_tool`). The domain row is set-and-proceed, so it can be absent (`Sec-Audit-Failed` on REST, `audit_persisted:false` on MCP). Audit rows are kept for the audit retention period (365 days by default). Do not describe a decision
+as signed by a human.
+
+**Revocation and timing limits.** A reviewer whose authority is revoked while their attest is in flight can
+still commit it (the same window as the engine and group reads above, and the documented revocation latency).
+`decided_at_ms` and `closed_at_ms` are the wall clock of the replica that recorded them, not a database
+clock, so across replicas only `decision_seq` order is reliable. On an RBAC-off install a sole Administrator
+cannot decide their own user grant or a group they belong to, so the campaign can only close with those
+grants `pending`.
 
 **The decision history.** The current-state row in `access_review_attestation` keeps its four-part key and
 holds the latest decision plus `decision_seq` (0 while pending). The new table
@@ -4158,10 +4179,20 @@ whether a decision landed, read the campaign, compare `decision_seq` with the va
 entry on reviewer, justification (an earlier entry shows at most its first 64 characters) and `decided_at_ms`. A
 store failure that is not the caller's is answered with that fixed message and `retry_after_ms` 5000 (`503` on REST,
 an internal error on MCP), never database text, which goes to the server log. There is no idempotency key yet.
+A close has the same ambiguity: if its COMMIT acknowledgement is lost the campaign may already be closed while the
+caller sees the 503, and a retry then answers 404 `not_found`, so read the campaign before retrying the close.
 
 **Close starvation.** A queued `close_campaign` does not block a new attestation's lock on the campaign row, so
-under a continuous stream of attestations a close can wait up to the pool's 10 s `lock_timeout` and answer 503.
-Retry the close.
+under a continuous stream of attestations a close can wait up to 3 s (`SET LOCAL lock_timeout = '3s'`, set
+inside the close transaction so the bound does not depend on the DSN; a close has one lock wait) and answer
+503 (an internal error with `retry_after_ms` 5000 on MCP). The fixed store-failure message belongs to attest
+only: a close fault returns the store string unchanged (`close_campaign lock_timeout failed`,
+`close_campaign write failed`, or `database unavailable — try again`), and its server log has only the
+`AccessReviewStore::close_campaign: failed (campaign=..., sqlstate=...)` line (SQLSTATE 55P03 for the lock
+wait). Nothing was committed on that path, so retry the close. An attestation queuing on its grant row is
+bounded by the same 3 s per wait (it can wait on the grant row and then on the campaign row). A close whose
+COMMIT acknowledgement is lost may leave the campaign closed while the caller sees the 503; a retry then
+answers 404 `not_found` (campaign missing or already closed), so read the campaign before retrying.
 
 **Hard cutover.** A database that holds a `user` grant decided by the account it names (an earlier build
 allowed it) makes the schema v3 migration fail, the store stay closed at version 2, and the server refuse to

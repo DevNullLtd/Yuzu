@@ -90,8 +90,9 @@
 ///
 /// Close starvation: a queued `close_campaign` does not block a NEW
 /// attestation's `FOR SHARE` on the campaign row, so under a continuous
-/// stream of attestations a close can wait for the pool's 10 s
-/// `lock_timeout` and answer a write failure (503). Retry it.
+/// stream of attestations a close can wait up to 3 s (the `SET LOCAL
+/// lock_timeout` of the write transactions) and answer a write failure (503).
+/// Nothing was committed on that path. Retry it.
 ///
 /// Schema v3 REFUSES a database that holds a decision recorded by the
 /// subject of the grant (an earlier build allowed it): the store is

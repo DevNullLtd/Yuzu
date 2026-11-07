@@ -3658,9 +3658,10 @@ static const ToolDef kTools[] = {
      "(enabled|disabled|degraded) stamps whether RBAC actually governs this grant population "
      "right now — degraded means the read could not confirm state, so gates deny "
      "defensively, NOT that an admin turned RBAC off. Self-audited as "
-     "access_review.exported. Requires AccessReview:Read.",
+     "access_review.exported; if that audit write fails the export still stands and the "
+     "result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]}},"required":["count","rows","rbac_enforcement"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","rows","rbac_enforcement"]})j"},
 
     {"open_access_review",
      "Open a review campaign — freeze the CURRENT cross-principal grant population "
@@ -3757,9 +3758,10 @@ static const ToolDef kTools[] = {
      "needs to prove reviews ran on cadence. Each campaign's rbac_enforcement "
      "(enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN (empty string for "
      "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
-     "Self-audited as access_review.list. Requires AccessReview:Read.",
+     "Self-audited as access_review.list; if that audit write fails the list still stands and "
+     "the result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
@@ -29571,7 +29573,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         access_review_sod::sod_refusal_detail(verdict, refusal, {}));
                     res.set_content(
                         a4_error(refusal.jsonrpc_code, refusal.message, refusal.remediation,
-                                 refusal.retry_after_ms.value_or(-1), {},
+                                 static_cast<long>(refusal.retry_after_ms.value_or(-1)), {},
                                  domain_ok && wrapper_ok),
                         "application/json");
                 };

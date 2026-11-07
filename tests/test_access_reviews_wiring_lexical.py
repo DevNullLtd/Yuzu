@@ -27,8 +27,9 @@ It also pins two properties of the attestation write path that no route test can
      MCP classifiers must both delegate to the one shared `classify_store_error` (a local copy is
      how they drift apart).
 
-Same method as test_access_audit_wiring_lexical.py (comments stripped, whitespace collapsed,
-in-memory mutations prove each pattern is live). Lexical only.
+Same method as test_access_audit_wiring_lexical.py (line comments stripped, whitespace
+collapsed, in-memory mutations prove each pattern is live; the attest-gate check also strips
+block comments). Lexical only.
 
 Usage: python3 tests/test_access_reviews_wiring_lexical.py
 """
@@ -92,9 +93,48 @@ HANDLER_START = re.compile(r"sink\.(?:Get|Post|Put|Delete)\(|if \(tool_name == "
 CALL = re.compile(r"(?:->|\.)\s*record_attestation\s*\(")
 
 
+def strip_block_comments(src):
+    """A gate named only inside a /* */ comment must not satisfy the check. Local to the gate
+    check: the shared `normalise` keeps block comments because other pins match text such as
+    `/*include_history=*/true`. A small lexer, not a regex: `/*` appears inside string literals
+    and `//` comments in the big route files (a path such as "/api/v1/dex/*"), and a regex would
+    swallow hundreds of KB from there to the next `*/`. Dead code (an `if (false)` branch) stays
+    out of a lexical gate's reach, so the behavioural SoD tests are the real evidence."""
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        two = src[i:i + 2]
+        if two == "//":  # line comment: kept verbatim, `normalise` strips it
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            out.append(src[i:j])
+            i = j
+        elif two == "/*":
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        elif c == "R" and src[i + 1:i + 2] == '"' and re.match(r'R"([^()\\ \t\n]{0,16})\(', src[i:i + 24]):
+            delim = re.match(r'R"([^()\\ \t\n]{0,16})\(', src[i:i + 24]).group(1)
+            end = src.find(")" + delim + '"', i)
+            j = n if end < 0 else end + len(delim) + 2
+            out.append(src[i:j])
+            i = j
+        elif c in "\"'":
+            j = i + 1
+            while j < n and src[j] != c:
+                j += 2 if src[j] == "\\" else 1
+            out.append(src[i:j + 1])
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def gate_problems(name, src):
     """Every record_attestation( call in `src` has evaluate_attestation_sod( earlier in its handler."""
-    t = normalise(src)
+    t = normalise(strip_block_comments(src))
     out = []
     for call in CALL.finditer(t):
         starts = [m.start() for m in HANDLER_START.finditer(t, 0, call.start())]
@@ -169,6 +209,12 @@ class ReviewsWiring(unittest.TestCase):
 
 GATED = 'sink.Post(R"(/x)", [](auto&) { auto v = access_review_sod::evaluate_attestation_sod(a); s->record_attestation(b); });'
 UNGATED = 'sink.Post(R"(/x)", [](auto&) { s->record_attestation(b); });'
+BLOCK_COMMENT_GATE = ('sink.Post(R"(/x)", [](auto&) { /* evaluate_attestation_sod(a); */'
+                      ' s->record_attestation(b); });')
+LINE_COMMENT_GATE = ('sink.Post(R"(/x)", [](auto&) {\n // evaluate_attestation_sod(a);\n'
+                     ' s->record_attestation(b); });')
+STRING_WITH_COMMENT_OPENER = ('sink.Get(R"(/api/v1/dex/*)", [](auto&) { return 1; });'
+                              ' sink.Post(R"(/x)", [](auto&) { s->record_attestation(b); }); /* x */')
 STALE_GATE = ('sink.Post(R"(/a)", [](auto&) { evaluate_attestation_sod(a); });'
               ' sink.Post(R"(/b)", [](auto&) { s->record_attestation(b); });')
 
@@ -178,7 +224,7 @@ class AttestGate(unittest.TestCase):
         callers = 0
         for path in attesting_sources():
             text = path.read_text(encoding="utf-8")
-            callers += len(CALL.findall(normalise(text)))
+            callers += len(CALL.findall(normalise(strip_block_comments(text))))
             p = gate_problems(path.name, text)
             for m in p:
                 print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
@@ -192,6 +238,41 @@ class AttestGate(unittest.TestCase):
         # A gate in another handler earlier in the file does not cover a later ungated one.
         self.assertEqual(len(gate_problems("f", STALE_GATE)), 1)
         self.assertEqual(len(gate_problems("f", GATED + " " + UNGATED)), 1)
+
+    def test_a_gate_named_only_in_a_comment_does_not_count(self):
+        # Block and line comments are stripped before the check, so neither satisfies it.
+        self.assertEqual(len(gate_problems("f", BLOCK_COMMENT_GATE)), 1)
+        self.assertEqual(len(gate_problems("f", LINE_COMMENT_GATE)), 1)
+
+    def test_a_comment_opener_inside_a_string_does_not_hide_a_later_call(self):
+        # A regex stripper would swallow from the "/*" in the path string to the final "*/" and
+        # miss the ungated call; the lexer must keep it.
+        self.assertEqual(len(gate_problems("f", STRING_WITH_COMMENT_OPENER)), 1)
+
+
+class DashboardDecisionFeedback(unittest.TestCase):
+    """Both dashboard surfaces must say when a decision replaced another one, and the Settings
+    buttons must stay disabled while a request is in flight (each extra click appends a decision)."""
+
+    def test_settings_script_guards_and_reports(self):
+        t = normalise((SRC_DIR / "settings_routes.cpp").read_text(encoding="utf-8"))
+        at = t.find("function arAttest(")
+        self.assertGreaterEqual(at, 0, "arAttest no longer defined")
+        body = t[at:at + 2600]
+        self.assertIn("arSetBusy(true)", body, "Settings Attest/Flag buttons are not disabled in flight")
+        self.assertIn("arSetBusy(false)", body, "Settings buttons are never re-enabled after a failure")
+        self.assertIn("previous_decision", body, "Settings does not report a replaced decision")
+
+    def test_access_page_script_reports_a_replaced_decision(self):
+        raw = (SRC_DIR.parent / "static" / "yuzu-audit.js").read_text(encoding="utf-8")
+        # Comments are not code: a comment naming previous_decision must not satisfy the pin.
+        js = re.sub(r"/\*.*?\*/", " ", re.sub(r"(?m)^\s*//.*$", "", raw), flags=re.S)
+        at = js.find("function decide(")
+        self.assertGreaterEqual(at, 0, "decide() no longer defined")
+        body = js[at:at + 1800]
+        self.assertIn("previous_decision", body, "Access page ignores previous_decision")
+        self.assertRegex(body, r"prev\s*!==\s*'pending'[^;]*\n?[^;]*banner\(",
+                         "Access page does not show a notice for a replaced decision")
 
 
 CLASSIFIERS = (

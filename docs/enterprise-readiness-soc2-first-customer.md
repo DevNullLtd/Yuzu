@@ -110,7 +110,8 @@ decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
 
 **Addendum — the Settings Access reviews panel did not refuse engine sessions until #6744
 (CC6.1/CC6.2).** Every `/api/v1/access-reviews` route and MCP twin refused an engine principal's
-session ("only a human can sign this evidence"), but the two Settings fragments
+session (the intent being that engine credentials do not produce this evidence; the refusal covers engine
+sessions only, see the #4752 addendum below for who else can still attest; the wording "only a human can sign this evidence" is withdrawn and narrowed to a reviewer account, see the amendment note at the end of that addendum), but the two Settings fragments
 (`GET /fragments/settings/access-reviews` and its `/campaign` view) did not, so an engine
 principal holding `AccessReview:Read` through a custom role could read the grant population and
 the campaign attestation rows through them; #6744 closes it, and a refused engine session now
@@ -142,7 +143,7 @@ inherits this same degrade-vs-outage ambiguity"; field reference:
 `docs/user-manual/rest-api.md` → `GET /api/v1/access-reviews/export`.
 
 **Addendum: access-review attestations now require the reviewer to differ from the subject of
-the grant, and every decision is kept (CC6.2, #4752, 2026-11-03, amended 2026-11-04).** Before this change a
+the grant, and every decision is kept (CC6.2, #4752, 2026-11-03, amended 2026-11-04 and 2026-11-07).** Before this change a
 reviewer holding `AccessReview:Attest` could record a decision on a grant that named them, and a
 later decision on a grant replaced the earlier one, so the campaign record could not show who
 decided what, in what order. Now: (1) the reviewer must differ from the subject of the grant, on
@@ -205,8 +206,27 @@ the primary record. A deployment that carries forward a database holding a `user
 the account it names is refused at start (a hard cutover; fresh database only, see
 `docs/user-manual/upgrading.md`); decisions on engine or group grants made by earlier builds are not
 checked and read as "previous: not recorded", and a database carried forward is unsupported either
-way. Revisit under the four-eyes primitive work (epic #6060). See
+way. **More limits an assessor should know.** A "reviewer" is an account, not proof of a person: engine
+principal sessions, service-scoped tokens (403) and the MCP read-only and operator tiers are refused, but an
+API-token caller (acting as its owning user) and a supervised-tier MCP token can still attest; the three
+write routes are step-up exempt (`kEvidenceCapture`), so no fresh MFA proof is required (the exemption
+covers the REST and dashboard path only: MCP is not step-up gated and token principals do not take the MFA
+path); the history row stores only `reviewer`, and on the audit side `principal_class` is a persisted column stamped only by how the credential was presented (an `Authorization` or `X-Yuzu-Token` header gives `agent`, a `yuzu_session` cookie gives `human`), so an API-token caller and an MCP-token caller cannot be told apart on the `access_review.attested` row, and there is no auth-source field. `AuditEvent::mcp_tool` is never persisted: on MCP the tool name is on the separate companion row `mcp.record_attestation` (`target_type=mcp_tool`). The domain row is set-and-proceed, so it can be absent (`Sec-Audit-Failed` on REST, `audit_persisted:false` on MCP). Audit rows are kept for the audit retention period
+(365 days by default). Open and close have no separation of duties. Two colluding reviewers can decide each
+other's grants, so this is not four-eyes beyond the two-identity case above. A reviewer whose authority is
+revoked while their attest is in flight can still commit it (the documented window). `decided_at_ms` and
+`closed_at_ms` are the wall clock of the replica that recorded them; across replicas only `decision_seq`
+order is reliable. A sole Administrator on an RBAC-off install cannot decide their own grants, so the
+campaign can only close with those grants `pending`. Revisit under the four-eyes primitive work (epic #6060). See
 `docs/auth-architecture.md` "Periodic access reviews".
+
+**Amendment 2026-11-07 (CC8.1 traceability).** The wording "only a human can sign this evidence", and any
+statement that an attestation is proof that a person reviewed a grant, is withdrawn and narrowed: a decision
+is evidence that a reviewer ACCOUNT recorded it. Reason: an API-token caller and a supervised-tier MCP token
+can attest as the owning user with no fresh MFA proof, and the audit row cannot tell those callers apart
+(`principal_class` reflects only how the credential was presented; the MCP tool name is on the companion
+`mcp.record_attestation` row, not on the domain row). The detail is in `docs/security-reviews/access-reviews-2026-07-21.md`,
+"Amended 2026-11-07".
 
 **Addendum — service-scoped token fleet-wide confinement, durably closed
 (CC6.1/CC6.3, guardian-confinement-2298 PR 3 — "the flip", 2026-08-18).**

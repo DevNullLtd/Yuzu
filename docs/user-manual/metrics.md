@@ -1472,6 +1472,29 @@ yuzu_access_review_attestations_total{decision="attested"} 0
 yuzu_access_review_attestations_total{decision="flagged_revoke"} 0
 ```
 
+- **`yuzu_access_review_export_total{format}`** — counter, `format` ∈
+  {`json`, `csv`}, pre-seeded to `0` at startup. Increments once per
+  successful `GET /api/v1/access-reviews/export` call, split by which
+  format was requested — a sustained shift toward `csv` typically means an
+  auditor/spreadsheet workflow is in play.
+- **`yuzu_access_review_export_duration_seconds`** — histogram (default
+  bucket ladder, see "Histogram buckets" below), the wall-clock time of the
+  cross-principal grant-population read (`build_access_review`) behind the
+  export, timed regardless of success/failure outcome — a slow/failing read
+  is exactly what an operator debugging a `503` needs latency evidence for.
+- **`yuzu_access_review_campaigns_opened_total`** — counter, no labels.
+  Increments once per successful `POST /api/v1/access-reviews` — the rate
+  this fires at is the empirical "how often does the org actually run a
+  review" cadence signal (compare against the org's stated review policy).
+- **`yuzu_access_review_attestations_total{decision}`** — counter,
+  `decision` ∈ {`attested`, `flagged_revoke`}, pre-seeded to `0` at startup.
+  Increments once per successful `POST
+  /api/v1/access-reviews/{id}/attestations` call, split by the reviewer's
+  decision. `flagged_revoke` counts recorded evidence only — it never
+  itself revokes anything (flag ≠ revoke, see `docs/auth-architecture.md`);
+  a rising `flagged_revoke` count is a worklist size for whoever acts on
+  the flags, not an automatic remediation trigger.
+
 ```
 # HELP yuzu_access_review_attestation_refused_total Access review attestations refused because the reviewer is the subject of the grant, by surface (rest|mcp) and reason (self_subject|engine_owner|group_member|check_unavailable)
 # TYPE yuzu_access_review_attestation_refused_total counter
@@ -1501,29 +1524,6 @@ whether or not the refusal's audit row could be saved. It is operational, not
 `event="security"`, and has no alert rule; the refusal's own audit row
 (`access_review.attested` / `access_review.flagged` with `result=denied`, or
 `result=failure` for `check_unavailable`) is the evidence.
-
-- **`yuzu_access_review_export_total{format}`** — counter, `format` ∈
-  {`json`, `csv`}, pre-seeded to `0` at startup. Increments once per
-  successful `GET /api/v1/access-reviews/export` call, split by which
-  format was requested — a sustained shift toward `csv` typically means an
-  auditor/spreadsheet workflow is in play.
-- **`yuzu_access_review_export_duration_seconds`** — histogram (default
-  bucket ladder, see "Histogram buckets" below), the wall-clock time of the
-  cross-principal grant-population read (`build_access_review`) behind the
-  export, timed regardless of success/failure outcome — a slow/failing read
-  is exactly what an operator debugging a `503` needs latency evidence for.
-- **`yuzu_access_review_campaigns_opened_total`** — counter, no labels.
-  Increments once per successful `POST /api/v1/access-reviews` — the rate
-  this fires at is the empirical "how often does the org actually run a
-  review" cadence signal (compare against the org's stated review policy).
-- **`yuzu_access_review_attestations_total{decision}`** — counter,
-  `decision` ∈ {`attested`, `flagged_revoke`}, pre-seeded to `0` at startup.
-  Increments once per successful `POST
-  /api/v1/access-reviews/{id}/attestations` call, split by the reviewer's
-  decision. `flagged_revoke` counts recorded evidence only — it never
-  itself revokes anything (flag ≠ revoke, see `docs/auth-architecture.md`);
-  a rising `flagged_revoke` count is a worklist size for whoever acts on
-  the flags, not an automatic remediation trigger.
 
 None of the four carries `event="security"` — a review export or an
 attestation decision is expected, privileged, self-audited operator

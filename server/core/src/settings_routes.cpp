@@ -1287,7 +1287,7 @@ function arFeedback(msg, isError) {
   fb.textContent = msg;
   fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
-function arPost(url, body, onSuccess) {
+function arPost(url, body, onSuccess, onFailure) {
   fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -1304,6 +1304,7 @@ function arPost(url, body, onSuccess) {
         var msg = (e && (typeof e === 'string' ? e : e.message)) || (data && data.message) ||
                   ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
+        if (onFailure) onFailure();
         return;
       }
       arFeedback('Done.', false);
@@ -1311,6 +1312,7 @@ function arPost(url, body, onSuccess) {
     });
   }).catch(function () {
     arFeedback('Network error — the action may not have applied', true);
+    if (onFailure) onFailure();
   });
 }
 function arLoadCampaign(id) {
@@ -1336,13 +1338,27 @@ function arAttest(btn) {
   }
   var row = btn.closest('tr');
   var justEl = row ? row.querySelector('[data-ar-justification]') : null;
+  // Every extra click would be a valid request that appends another decision, so every
+  // decision button in the campaign stays disabled until the answer arrives (re-enabled only on
+  // failure; on success the campaign is re-drawn).
+  var btns = document.querySelectorAll('#ar-campaign button');
+  function arSetBusy(busy) { for (var i = 0; i < btns.length; i++) btns[i].disabled = busy; }
+  arSetBusy(true);
   arPost('/api/v1/access-reviews/' + encodeURIComponent(d.campaignId) + '/attestations', {
     principal_type: d.principalType,
     principal_id: d.principalId,
     role_name: d.roleName,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
-  }, function () { arLoadCampaign(d.campaignId); });
+  }, function (data) {
+    // The success body is the A4 envelope {data: {recorded, decision_seq, previous_decision}}.
+    // Another reviewer may have decided this grant since the page was drawn: say so.
+    var r = data && data.data;
+    if (r && typeof r.previous_decision === 'string' && r.previous_decision !== 'pending')
+      arFeedback('Done. This replaced an earlier "' + r.previous_decision + '" decision; the ' +
+                 'earlier decision stays in the history.', false);
+    arLoadCampaign(d.campaignId);
+  }, function () { arSetBusy(false); });
 }
 function arCloseCampaign(btn) {
   var id = btn.dataset.campaignId;
@@ -1515,7 +1531,8 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
             html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
             return html;
         }
-        spdlog::warn("settings access-review campaign: read failed: {}", view_res.error());
+        spdlog::warn("settings access-review campaign: read failed: {}",
+                     ::yuzu::log_key_token(view_res.error()));
         html += "<div class=\"feedback-error\">Access review campaign could not be read. "
                 "Please retry.</div></div>";
         return html;
@@ -1525,6 +1542,14 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     httplib::Response probe;
     bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
     bool is_open_campaign = view.campaign.status == "open";
+    // The signed-in reviewer: the server refuses a reviewer who is the subject of a user grant,
+    // so that row shows no Attest or Flag (a courtesy, not the control), like the Access page.
+    std::string viewer;
+    if (can_attest && auth_fn_) {
+        httplib::Response who_probe;
+        if (auto who = auth_fn_(req, who_probe))
+            viewer = who->username;
+    }
 
     html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
             " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
@@ -1557,6 +1582,9 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     } else {
         for (const auto& a : view.attestations) {
             bool pending = a.decision == "pending";
+            const bool own =
+                !viewer.empty() && a.principal_type == "user" && a.principal_id == viewer;
+            const bool editable = pending && is_open_campaign && !own;
             std::string decision_cls = pending                         ? "role-user"
                                        : a.decision == "flagged_revoke" ? "role-warn"
                                                                         : "role-ok";
@@ -1576,14 +1604,16 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                     ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
             if (can_attest) {
                 html += "<td>";
-                if (pending && is_open_campaign) {
+                if (editable) {
                     html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
                             "style=\"width:140px\">";
                 } else {
                     html += a.justification.empty() ? "—" : html_escape(a.justification);
                 }
                 html += "</td><td>";
-                if (pending && is_open_campaign) {
+                if (pending && is_open_campaign && own) {
+                    html += "<span class=\"hint\">Another reviewer must decide</span>";
+                } else if (editable) {
                     html += "<button class=\"btn btn-primary\" "
                             "data-campaign-id=\"" +
                             html_escape(campaign_id) + "\" data-principal-type=\"" +

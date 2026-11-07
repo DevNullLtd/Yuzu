@@ -4702,8 +4702,10 @@ is the subject of the grant (see the next paragraph). `404` — no campaign with
 that id, no such frozen grant in it, or the campaign is already closed (a
 reviewer who is the subject of the grant, of any of the three types, gets the
 `403` instead, even for a closed campaign). `415` — `Content-Type` is not `application/json`. `503` — the
-access-review store is unavailable, a genuine write failure, or the check that
-the reviewer differs from the subject could not be answered (see below).
+access-review store is unavailable, a genuine write failure (including a row-lock
+wait that expired after 3 seconds, SQLSTATE `55P03`, in which nothing was
+committed), or the check that the reviewer differs from the subject could not be
+answered (see below).
 
 **The reviewer must differ from the subject of the grant.** The reviewer is the
 session's principal. The route refuses the decision when the reviewer is the
@@ -4761,7 +4763,8 @@ attempt writes a `failure` audit row, so an auditor sees a failure row next to a
 committed decision. There is no idempotency key.
 
 **Store failure answer.** A store failure that is not the caller's (a lease timeout,
-a query error, a lost commit acknowledgement) is answered `503` with the fixed
+a query error, a row-lock wait that expired after 3 seconds (SQLSTATE `55P03`, nothing
+committed), a lost commit acknowledgement) is answered `503` with the fixed
 message `the decision store is unavailable or the decision may not have been
 committed; read the campaign and compare decision_seq before retrying`,
 `retry_after_ms: 5000` and that remediation. It never carries database text, which
@@ -4854,7 +4857,10 @@ gate, so a caller without the permission still gets the `403`.
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `404` — no campaign with that id, or already
 closed. `503` — the access-review store is unavailable, or a genuine write
-failure. The route reads no body, so it has no `Content-Type` requirement.
+failure, including a row-lock wait that expired after 3 seconds (SQLSTATE `55P03`,
+nothing committed; retry). A close whose answer was lost may already have closed
+the campaign, and the retry then gives `404`: read the campaign first. The route
+reads no body, so it has no `Content-Type` requirement.
 
 Audited as `access_review.closed`.
 

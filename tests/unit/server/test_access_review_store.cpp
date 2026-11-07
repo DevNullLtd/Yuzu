@@ -997,6 +997,28 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
     REQUIRE_FALSE(ok_len.has_value());
     CHECK(ok_len.error().starts_with("not_found:"));
 
+    // The cap counts BYTES, not characters: 512 two-byte characters are exactly 1024 bytes and
+    // pass the bound; 513 are 1026 bytes and are refused (a character-counting cap would admit
+    // both). Same for principal_id and role_name.
+    std::string wide_at_cap;
+    for (int i = 0; i < 512; ++i)
+        wide_at_cap += "\xC3\xA9";
+    const std::string wide_over = wide_at_cap + "\xC3\xA9";
+    REQUIRE(wide_at_cap.size() == 1024);
+    REQUIRE(wide_over.size() == 1026);
+    auto w1 = store.record_attestation(cid, "user", wide_at_cap, "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(w1.has_value());
+    CHECK(w1.error().starts_with("not_found:"));
+    auto w2 = store.record_attestation(cid, "user", wide_over, "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(w2.has_value());
+    CHECK(w2.error() == text);
+    auto w3 = store.record_attestation(cid, "user", "alice", wide_at_cap, "attested", "carol", "");
+    REQUIRE_FALSE(w3.has_value());
+    CHECK(w3.error().starts_with("not_found:"));
+    auto w4 = store.record_attestation(cid, "user", "alice", wide_over, "attested", "carol", "");
+    REQUIRE_FALSE(w4.has_value());
+    CHECK(w4.error() == text);
+
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
     CHECK(view->pending_count == 3);
@@ -1004,6 +1026,57 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
         CHECK(a.decision == "pending");
         CHECK(a.history.empty());
     }
+}
+
+// A genuine store fault is a fixed string (never libpq text), carries no refusal prefix, and the
+// connection that saw the ERROR is recycled so a second call on a tiny pool fails the same honest
+// way instead of hanging. (Replaces the pre-append-only fixed-string and pool-of-one cases.)
+TEST_CASE("record_attestation and close_campaign: a store fault returns a fixed string and the "
+          "pool recovers",
+          "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Fault", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    const auto not_a_refusal = [](const std::string& e) {
+        return !e.starts_with("not_found:") && !e.starts_with("bad_request:") &&
+               !e.starts_with("forbidden:") && e.find("relation") == std::string::npos &&
+               e.find("does not exist") == std::string::npos;
+    };
+    {
+        // Break the history INSERT (the attest's first write) and the campaign UPDATE.
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{
+            PQexec(conn.get(), "DROP TABLE access_review_store.access_review_attestation_history")};
+        REQUIRE(d.ok());
+    }
+    auto rec = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(rec.has_value());
+    CHECK(rec.error() == "record_attestation history write failed");
+    CHECK(not_a_refusal(rec.error()));
+    auto again = store.record_attestation(cid, "user", "alice", "Admin", "attested", "dave", "");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == "record_attestation history write failed");
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{
+            PQexec(conn.get(), "DROP TABLE access_review_store.access_review_campaign CASCADE")};
+        REQUIRE(d.ok());
+    }
+    auto closed = store.close_campaign(cid, "admin");
+    REQUIRE_FALSE(closed.has_value());
+    CHECK(closed.error() == "close_campaign write failed");
+    CHECK(not_a_refusal(closed.error()));
+    auto closed_again = store.close_campaign(cid, "admin");
+    REQUIRE_FALSE(closed_again.has_value());
+    CHECK(closed_again.error() == "close_campaign write failed");
 }
 
 TEST_CASE("record_attestation: a frozen grant with the longest ids the identity stores produce "
@@ -1795,6 +1868,66 @@ TEST_CASE("an attest issued while a close is in flight waits, then is not_found 
     CHECK(view->pending_count == 3);
     for (const auto& a : view->attestations)
         CHECK(a.history.empty());
+}
+
+// The row-lock wait of the two write transactions is bounded by the store itself (SET LOCAL
+// lock_timeout = '3s'), not by the pool's or the DSN's setting: a DSN that sets its own
+// lock_timeout (PgPool then injects none) must not let an attest or a close pin a leased
+// connection for as long as that DSN says. Here the pool allows 60 s; the waiters must give up in
+// about 3 s with the fixed retryable failure, and a lock holder's connection is not involved.
+TEST_CASE("record_attestation and close_campaign: the row-lock wait is bounded at about 3 s even "
+          "when the pool's own lock_timeout is far longer",
+          "[access_review][store][pg][concurrency][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6, .lock_timeout_ms = 60000}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Bounded", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    std::expected<yuzu::server::AttestationOutcome, std::string> attested;
+    std::expected<void, std::string> closed;
+    std::chrono::milliseconds attest_ms{0};
+    std::chrono::milliseconds close_ms{0};
+    yuzu::test::HeldLocks held(pool);
+    held.run(
+        grant_lock_sql(cid)); // an attest in flight: the grant row and FOR SHARE on the campaign
+    yuzu::test::Workers workers([&] { held.rollback(); });
+    workers.add([&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        attested = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+        attest_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+    });
+    workers.add([&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        closed = store.close_campaign(cid, "admin");
+        close_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+    });
+    workers.join_all(); // the holder never releases: both waiters time out on their own
+    held.rollback();
+
+    REQUIRE_FALSE(attested.has_value());
+    CHECK(attested.error().starts_with("record_attestation read failed"));
+    REQUIRE_FALSE(closed.has_value());
+    CHECK(closed.error().starts_with("close_campaign write failed"));
+    // About 3 s each: waited for the bound (not an instant refusal) and far below the 60 s the
+    // pool allowed. Each waiter blocks on ONE lock (the holder owns both), so one 3 s wait; 8 s
+    // leaves headroom for a loaded runner yet fails a bound of 10 s or more.
+    CHECK(attest_ms >= std::chrono::milliseconds(2500));
+    CHECK(attest_ms < std::chrono::milliseconds(8000));
+    CHECK(close_ms >= std::chrono::milliseconds(2500));
+    CHECK(close_ms < std::chrono::milliseconds(8000));
+
+    // The failures left nothing behind: the campaign is open and the grant is still pending.
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "open");
+    const auto* row = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(row != nullptr);
+    CHECK(row->decision == "pending");
 }
 
 // A queued close does NOT stop a NEW attest from taking its FOR SHARE on the campaign row, so
