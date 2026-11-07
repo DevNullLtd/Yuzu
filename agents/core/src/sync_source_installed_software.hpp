@@ -49,7 +49,7 @@ struct SwEntry {
                            // (vendor_or_origin)
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq|dotnet|jvm
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq|dotnet|jvm|chocolatey|winget|appx
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -124,16 +124,20 @@ YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& 
 ///
 /// Adapt `pkg_inventory` `managers` output (`status|managers|<level>|...` plus
 /// `manager|<name>|<present|unavailable>|<version or ->|...` rows). HOMEBREW
-/// ONLY today: one presence row {name=homebrew, kind=app, ecosystem=brew} per
-/// `present` homebrew row (the collector's dedup collapses a dual-prefix Mac to
-/// one); any other manager name is dropped. The Linux/Windows managers legs must
-/// add their own mapping deliberately (manager facts belong to facet rows).
+/// plus Windows chocolatey and winget: one presence row {name=homebrew, kind=app,
+/// ecosystem=brew} per `present` homebrew row (the collector's dedup collapses a
+/// dual-prefix Mac to one), and likewise {name=chocolatey|winget, kind=app,
+/// ecosystem=chocolatey|winget}; any other manager name is dropped. The Linux
+/// managers leg must add its own mapping deliberately (manager facts belong to
+/// facet rows).
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_managers_output(const std::string& out,
                                                             ConstrainedPolicy policy);
 
 /// Adapt `pkg_inventory` `packages` output (`status|packages|<level>|...` plus
 /// `package|homebrew|<id>|<version>|<formula|cask>`): formula -> kind `pkg`,
-/// cask -> kind `app`, ecosystem `brew`.
+/// cask -> kind `app`, ecosystem `brew`. Windows Chocolatey rows
+/// (`package|chocolatey|<id>|<version or ->|pkg`) -> kind `pkg`, ecosystem
+/// `chocolatey`, version empty when `-`.
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& out,
                                                             ConstrainedPolicy policy);
 
@@ -142,7 +146,10 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 /// ->|<arch or ->|<branch or ->|<state>`). ACTIVE rows only. snap -> ecosystem
 /// `snap`, version from snap.yaml, release = revision; flatpak -> ecosystem
 /// `flatpak`, version EMPTY (the branch is a ref, not a version), release =
-/// commit, arch. kind `app` iff the row's kind is `app`, else `pkg`.
+/// commit, arch. kind `app` iff the row's kind is `app`, else `pkg`. Windows
+/// `appx` -> ecosystem `appx`, kind `app`, name = the package name (the part of
+/// the PackageFullName before the first `_`), version and arch from the row,
+/// release empty; `deprovisioned` rows are seen but not mapped.
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
                                                                   ConstrainedPolicy policy);
 

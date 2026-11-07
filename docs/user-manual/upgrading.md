@@ -121,6 +121,14 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **Title dimension:** the software title dimension and curation queue are keyed on the raw (name, publisher, ecosystem) triple, so a title with no declared vendor is recorded under its `via:` label, not under an empty publisher.
 - **Scripts that read `publisher`:** it is never empty; test for the `via:` prefix to find rows with no declared vendor.
 
+## Behaviour change: Windows software counts include Store apps, Chocolatey packages and winget presence
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a fleet forward.
+
+- **What changed:** the Windows agent now reports the `pkg_inventory` Windows legs in its daily installed-software sync. Each Windows endpoint adds `appx` rows (every Store and inbox app registered for all users, roughly 100-300 rows per host, inbox apps included), `chocolatey` rows (one per Chocolatey package, plus a presence row) and a `winget` presence row.
+- **Affected:** per-device software counts and the `/software` catalogue for Windows devices rise, and a saved filter on `ecosystem` or "Found by" now also matches the new rows. A client that validates `ecosystem` against a fixed list (the MCP `get_crypto_libraries` tool refuses an unknown value) must add `chocolatey`, `winget` and `appx`.
+- **Not affected:** per-user Store packages and anything winget itself installed are not collected. Servers need no setting; the server learns the three ecosystems from its own build, so bring up every server replica before the agents of the same build enroll.
+
 ## Behaviour change: installed-software schema v10 (the server accepts the sectioned report)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.

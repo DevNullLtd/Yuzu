@@ -236,7 +236,9 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
 // data. `package_action` names the ONE action whose package rows this manager's token maps in
 // (so a snap row inside `packages`, or a homebrew row inside `store_packages`, stays unmapped);
 // `presence_row` is whether a present `managers` row for it becomes an installed_software
-// entry. A manager absent from this table maps to nothing. The ecosystem values are written as
+// entry, and `presence_publisher` the constant vendor of that presence row (empty: the row has no
+// vendor field, so the core labels it `via:<ecosystem>`). A manager absent from this table maps
+// to nothing. The ecosystem values are written as
 // `.ecosystem = "..."` so tests/test_software_vocabulary_consistency.py still reads every
 // ecosystem this file emits.
 //
@@ -255,15 +257,25 @@ struct ManagerEcosystem {
     std::string_view ecosystem;
     std::string_view package_action;
     bool presence_row{false};
+    std::string_view presence_publisher{};
 };
 
 constexpr ManagerEcosystem kManagerEcosystems[] = {
     {.manager = "homebrew",
      .ecosystem = "brew",
      .package_action = kActionPackages,
-     .presence_row = true},
+     .presence_row = true,
+     .presence_publisher = "Homebrew"},
     {.manager = "snap", .ecosystem = "snap", .package_action = kActionStorePackages},
     {.manager = "flatpak", .ecosystem = "flatpak", .package_action = kActionStorePackages},
+    // Windows: Chocolatey packages (`pkg` rows) and its presence row; winget has presence only
+    // (its packages are per-user and out of scope); the Appx roster rides store_packages.
+    {.manager = "chocolatey",
+     .ecosystem = "chocolatey",
+     .package_action = kActionPackages,
+     .presence_row = true},
+    {.manager = "winget", .ecosystem = "winget", .package_action = "", .presence_row = true},
+    {.manager = "appx", .ecosystem = "appx", .package_action = kActionStorePackages},
 };
 
 constexpr const ManagerEcosystem* find_manager(std::string_view manager) {
@@ -409,6 +421,9 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 
 AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, ConstrainedPolicy policy) {
     // package|homebrew|<id>|<version>|<formula|cask>
+    // package|chocolatey|<id>|<version or ->|pkg
+    // A row whose id carries an escaped `\|` splits wider than five tokens, fails the width
+    // check below and is dropped (a gap, never a shifted row); this adapter does not unescape.
     return adapt_pkg_inventory(out, kActionPackages,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
@@ -425,9 +440,13 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, Constrai
             e.kind = "pkg";
         else if (tok[4] == "cask")
             e.kind = "app";
+        else if (tok[4] == "pkg")
+            e.kind = "pkg"; // Chocolatey
         else
             return true;
-        e.version = clamp_field(tok[3], kMaxFieldLen);
+        // `-` is the row grammar's empty-version sentinel (format_package_row), written for a
+        // Chocolatey package whose nuspec was unreadable.
+        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));
         return true;
@@ -436,7 +455,14 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, Constrai
 
 AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
                                                       ConstrainedPolicy policy) {
-    // package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+    // package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+    // Appx: <id> is the PackageFullName (Name_Version_Arch_ResourceId_PublisherId); the entry's
+    // name is the Name part, its version and arch come from tok[3] / tok[6] (`-` = unknown),
+    // there is no release, and a `deprovisioned` row is seen but not mapped. A degraded appx
+    // row whose registry key carries a '|' (an escaped `\|` on the wire; a parseable
+    // PackageFullName never does) splits to ten tokens, fails the `!= 9` check below and is
+    // dropped: a gap, never a shifted row. The split is not escape-aware because this adapter
+    // is shared with snap/flatpak and never unescapes (it would store `Weird\|Key` as a name).
     // ACTIVE rows only: an inactive or unknown revision is on disk but is not
     // installed software. A degraded active row (version `-`, kind `unknown`) is
     // still collected (honest-empty version), never a reason to skip the cycle.
@@ -457,6 +483,16 @@ AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
             return true;
         e.kind = tok[4] == "app" ? "app" : "pkg";
         e.ecosystem = std::string(m->ecosystem);
+        if (m->manager == "appx") {
+            // Name_Version_...: the entry is the package name, never the 5-part identity string.
+            e.name = clamp_field(tok[2].substr(0, tok[2].find('_')), kMaxFieldLen);
+            if (e.name.empty())
+                return true;
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+            e.arch = tok[6] == "-" ? std::string{} : clamp_field(tok[6], kMaxFieldLen);
+            entries.push_back(std::move(e));
+            return true;
+        }
         if (m->manager == "snap")
             e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
         else
@@ -491,7 +527,7 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, Constrai
         SwEntry e;
         e.name = std::string(m->manager);
         e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
-        e.publisher = "Homebrew"; // constant vendor of the presence row (middleware precedent)
+        e.publisher = std::string(m->presence_publisher); // middleware precedent; empty -> via:
         e.kind = "app";
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));

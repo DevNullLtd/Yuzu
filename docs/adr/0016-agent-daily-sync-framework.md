@@ -463,6 +463,23 @@ else the `PACKAGER` tag.
 > is a permission fact, where skipping the cycle would freeze every other source
 > for ever.
 
+> **Update (2026-11-04):** the `pkg_inventory` Windows legs are collected as three
+> ecosystems, all machine scope: `appx` (kind `app`; the packages registered for
+> all users in the `AppxAllUserStore` `Applications` and `InboxApplications`
+> registry keys; name is the package name, version and arch come from the package
+> full name, release empty; a package in the `Deprovisioned` key is read but never
+> collected), `chocolatey` (kind `pkg`; one row per `lib\<id>` directory holding a
+> loose nuspec, version from its `<version>`, empty if unreadable) and `winget`
+> (kind `app`; a presence row from the `managers` action, present when the App
+> Installer package is registered, version from that package). Chocolatey's own
+> presence row has an empty version. No process is spawned and nothing is hashed;
+> the `ConstrainedPolicy` of the three actions is unchanged, so a constrained
+> `packages` or `store_packages` answer still skips the cycle, which is why a
+> per-item shortfall (an unreadable nuspec, an unparsable package name) degrades its
+> own row to an empty version instead of constraining the action. The three values
+> are appended at the tail of the published ecosystem enumeration. The tail
+> `install_location` slot stays reserved and empty.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
@@ -1208,8 +1225,9 @@ the fallback.
 | same, Windows | the Uninstall key's `Publisher` | `via:windows` |
 | same, macOS apps | the signing certificate's leaf common name | `via:macos` |
 | same, macOS installer receipts | none: a reverse-domain id is an identifier, not a vendor, and no heuristic turns one into the other | `via:macos_pkgutil` |
-| `pkg_inventory.packages` (Homebrew), `pkg_inventory.store_packages` (snap, flatpak) | none: `pkg_inventory` starts no process by design | `via:brew`, `via:snap`, `via:flatpak` |
+| `pkg_inventory.packages` (Homebrew, Chocolatey), `pkg_inventory.store_packages` (snap, flatpak, Appx) | none: `pkg_inventory` starts no process by design | `via:brew`, `via:chocolatey`, `via:snap`, `via:flatpak`, `via:appx` |
 | `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
+| `pkg_inventory.managers` (Chocolatey and winget presence rows) | none: the row has no vendor field | `via:chocolatey`, `via:winget` |
 | `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
 | `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
 | `runtimes.python`, Windows | the row's vendor column (the `PythonCore` registry tag), unescaped | `via:python` when the column is `-` |
