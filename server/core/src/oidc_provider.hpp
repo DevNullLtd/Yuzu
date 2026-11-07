@@ -454,7 +454,9 @@ public:
     /// fixed `kEgressRefused` text and names no address. Plain http (an `http://` URL) to a PUBLIC
     /// address is refused outright, with the distinct fixed `kEgressCleartextPublicRefused` text,
     /// whatever `allow_private_networks` says; plain http to a loopback/private address still
-    /// needs that flag. Name resolution is inside the total bound. Up to four permitted addresses
+    /// needs that flag. Name resolution is inside the total bound except on a glibc build, where
+    /// a lookup against an unresponsive resolver can run to about 30 s (httplib waits for the
+    /// resolver after it cancels the lookup). Up to four permitted addresses
     /// are tried in order while the connect fails (any other outcome is final).
     ///
     /// NAT64. An IPv6 address the policy would otherwise permit is also decoded under

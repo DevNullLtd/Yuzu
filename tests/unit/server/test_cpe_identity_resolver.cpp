@@ -91,9 +91,13 @@ TEST_CASE("os-native lanes are not-assessed with no identity work", "[cpe]") {
     // An installed Python interpreter (runtimes.python): the plugin emits kind `app`, which is
     // os-native on its own, so kind `pkg` isolates the ecosystem edit.
     SoftwareEntry python = pkg("Python", "3.13.1", "python", "", "pkg");
+    // Windows package-manager ecosystems (kind pkg isolates the ecosystem rule).
+    SoftwareEntry choco = pkg("jq", "1.8.2", "chocolatey", "", "pkg");
+    SoftwareEntry winget = pkg("Git.Git", "2.50.0", "winget", "", "pkg");
+    SoftwareEntry appx = pkg("Microsoft.WindowsCalculator", "11.0", "appx", "", "pkg");
 
     for (const SoftwareEntry* e : {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm, &snap,
-                                   &flatpak_runtime, &msi, &python}) {
+                                   &flatpak_runtime, &msi, &python, &choco, &winget, &appx}) {
         auto id = r.resolve(*e);
         REQUIRE(id.outcome == IdentityOutcome::NotAssessed);
         REQUIRE(id.not_assessed_reason == std::string(kReasonOsNative));

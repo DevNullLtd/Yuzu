@@ -14,11 +14,12 @@ cadences.
   sync calls seven inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
-  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
-  `store_packages` (Linux snaps and flatpaks), and
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
+  Chocolatey and winget on Windows) and `store_packages` (Linux snaps and
+  flatpaks; the Windows Appx roster), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products), `runtimes` `python` (installed
-  Python interpreters), and `middleware` `ibm_mq` (IBM MQ
+  (Windows machine-context MSI products), `runtimes` `python`, `dotnet` and `jvm` (installed
+  Python, .NET and Java runtimes), and `middleware` `ibm_mq` (IBM MQ
   installations; Linux). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
@@ -31,7 +32,11 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  carried. A `constrained` `runtimes` `dotnet` or `jvm` answer that still lists at least one install is
+  accepted the same way: the constraint names a home or root that could not be fully read, the installs
+  found keep their rows and any install the read could not see is deleted server-side with no marker;
+  one that lists none skips the device's whole installed-software report for the day (retried daily
+  on backoff) and keeps the last good state. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
   exception: it withholds only that source's rows and the cycle continues, so the
   stored rows of that source are removed until a later read succeeds (see
   Troubleshooting). A skipped cycle
@@ -48,7 +53,7 @@ cadences.
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
   `windows_optional_features.list`, `msi_packages.list_inventory`,
-  `runtimes.python`, `middleware.ibm_mq`); `package_id`
+  `runtimes.python`, `runtimes.dotnet`, `runtimes.jvm`, `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -87,19 +92,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java | Chocolatey | winget | Appx package |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` | `pkg` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` | `chocolatey` | `winget` | `appx` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) | ✓ (package id) | ✓ (`winget`) | ✓ (package name) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) | ✓ (nuspec `<version>`; empty if unreadable) | ✓ (App Installer package version) | ✓ (from the package full name) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) | `Microsoft` | ✓ (the build's self-reported `IMPLEMENTOR`; empty if absent) | — | — | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -111,9 +116,10 @@ cadences.
   one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
   that records Homebrew itself is present — one row however many prefixes
   exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
-  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
-  mapped from `managers` today: the Linux manager rows (dpkg, apt, rpm, dnf,
-  pacman, apk, snap, flatpak) are read but not collected as software, and a
+  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
+  Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
+  apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
+  software, and a
   constrained `managers` answer keeps the sync cycle as long as it names at
   least one present manager.
 
@@ -129,6 +135,37 @@ cadences.
   version. An inactive revision is not installed software and is not
   collected, and an incomplete listing (for example an unreadable flatpak
   directory) skips the cycle rather than publishing a partial roster.
+
+  **Windows package managers and Store apps** are collected through
+  `pkg_inventory` (`source` `pkg_inventory.packages`, `pkg_inventory.managers`
+  and `pkg_inventory.store_packages`). Chocolatey packages are `ecosystem`
+  `chocolatey`, `kind` `pkg`, one per `C:\ProgramData\chocolatey\lib\<id>`
+  directory that holds a loose `<id>.nuspec`, with `version` from the nuspec
+  (empty if it cannot be read); the `chocolatey` bootstrap package has no loose
+  nuspec and is not listed as a package. Presence of Chocolatey and of winget is
+  one `kind` `app` row each (named `chocolatey` / `winget`, `source`
+  `pkg_inventory.managers`); winget is present when the App Installer package is
+  registered, and its `version` is that package's version, while Chocolatey's own
+  version is not read (empty). Store and system apps are `ecosystem` `appx`,
+  `kind` `app`, one row per package registered for all users (the `Applications`
+  and `InboxApplications` roster keys), with `name` the package name, `version`
+  and `arch` taken from the package full name (`neutral` for an
+  architecture-neutral package); a package in the `Deprovisioned` list and a
+  package installed for one user only are not collected. A host where Chocolatey
+  is absent has no Chocolatey rows, which means none was found at the standard
+  location, not that none exists elsewhere. Only winget's presence is collected,
+  not what winget installed; Scoop, portable apps and the contents of the
+  `WindowsApps` folder are not covered. These reads were measured as a non-admin
+  virtual service account (the same account class as `NT SERVICE\YuzuAgent`);
+  `NT SERVICE\YuzuAgent` itself was not used, so a hardened ACL on the roster keys
+  or the Chocolatey `lib` directory on a given host is not excluded. If
+  `C:\ProgramData\chocolatey` or its `lib` folder is a junction or symlink, every
+  Chocolatey package is listed with an empty version and the status stays supported. A roster key or `lib`
+  directory that is denied (`constrained`, reason
+  `windows:pkg_inventory:<source>:access_denied`), over the row or byte cap or
+  cannot be listed makes that daily cycle skip for every source: the previously
+  stored roster is kept and the agent logs a warning (this policy is shared with
+  snaps and flatpaks and is tracked in #6093).
 
   **Windows optional features** are collected with `ecosystem`
   `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
@@ -178,6 +215,37 @@ cadences.
   software rows, so the stored `python` rows are removed until a read succeeds again
   (see Troubleshooting). A missing or unreadable version file never does this, the
   row reports the version it could determine.
+
+  **.NET runtimes** are collected through `runtimes` `dotnet` (all three OSes; `source`
+  `runtimes.dotnet`) as one `app` row per installed runtime, SDK or Framework version, `ecosystem`
+  `dotnet`, `publisher` `Microsoft`, `version` the install's version, and `name` `.NET Runtime`,
+  `.NET SDK` or `.NET Framework` (any other shared framework reads `.NET`). No process is started.
+  Windows reads the .NET installer registry keys in both registry views (the shared frameworks are
+  registered in the 32-bit view) and the .NET Framework release key (no directory is read, so only a registered install is found; a
+  zip or `dotnet-install` copy is not); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
+  under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
+  `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
+  A constrained read keeps the rows it found (see the managers rule above); if it found none, the day's
+  report is skipped and the stored `dotnet` rows stay.
+
+  **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
+  `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
+  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
+  Windows) and `publisher` the file's `IMPLEMENTOR`. The publisher is self-reported by the
+  build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
+  the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
+  JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu registry keys and then each home's `release` file; Linux
+  walks `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`; macOS walks
+  `/Library/Java/JavaVirtualMachines`. Version managers and Homebrew JDKs are not walked. On Windows
+  only a JDK that registered itself under one of those keys is found (a zip or tarball install is not),
+  and a home on a removable, optical, remote or otherwise non-fixed drive keeps its row but its
+  `release` file is not read (`windows:runtimes:jvm:release_unreadable`); `supported` with no rows
+  means none was found at the standard roots, not that none is installed. A
+  constrained read keeps the rows it found (installs it could not read are deleted server-side with no
+  marker); if it found none, the device's whole installed-software report is skipped for the day and
+  the stored `jvm` rows stay. The macOS Java leg is verified against fixture
+  trees built from the documented bundle layout, not a real JDK install.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
   `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
@@ -1001,6 +1069,20 @@ mount table could not be read), `macos:runtimes:permission_denied`,
 `windows:runtimes:python_reg:access_denied` and any `<os>:runtimes:row_cap` or
 `windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
 daily sync restores the rows.
+
+**A device's whole installed-software report has frozen; its log shows
+`sync: runtimes.dotnet failed: <tokens> — skipping this cycle` (or `runtimes.jvm`).** The
+`dotnet` or `jvm` read was constrained and found no install at all, so the agent skipped the
+device's whole installed-software report rather than send an empty list, and retries daily on
+backoff while the answer stays constrained; the stored rows are kept and nothing is deleted. A
+constrained read that still found an install is not an error: its rows are sent, and the log shows
+`sync: runtimes.jvm constrained (<tokens>) — rows kept`. The tokens name the cause, for example `windows:runtimes:dotnet_reg:access_denied`,
+`windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`, `windows:runtimes:jvm:home_unusable`,
+`linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
+`runtimes` README lists them all. On Linux a Java home with a java binary but no `release` file keeps the source constrained
+for as long as it is installed; on macOS the bundle's `Info.plist` supplies the version; on Windows
+such a home keeps its row with the registry's version key as its version and the source stays
+supported. Fix the named cause; the next daily sync resumes.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`

@@ -338,6 +338,13 @@ TEST_CASE("REST inventory/software: the 200 body is typed in the OpenAPI spec an
     CHECK(properties == served);
     CHECK(required == served);
 
+    // The row's ecosystem description points at the generated filter enum rather than carrying a
+    // hand-typed list that drifts behind the vocabulary table (it once named nine of seventeen).
+    const auto eco = schemas["InstalledSoftwareRow"]["properties"]["ecosystem"]["description"]
+                         .get<std::string>();
+    CHECK(eco.find("ecosystem filter enum") != std::string::npos);
+    CHECK(eco.find("macos_pkgutil") == std::string::npos);
+
     // The page envelope's keys are those devices_response_json emits (result_truncated_by_cap is
     // conditional, so it is a property but not required).
     const auto page = software_catalogue::devices_response_json({}, "", 0, true);

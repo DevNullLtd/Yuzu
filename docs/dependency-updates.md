@@ -125,7 +125,7 @@ product artifact):
 | Directory | What it is | Exercised by |
 |---|---|---|
 | `site/` | Astro docs site (GitHub Pages) | `docs-site.yml` build job on every PR touching it |
-| `tests/puppeteer/` | Puppeteer UAT harness | manual / UAT runs only — **no CI coverage** |
+| `tests/puppeteer/` | Puppeteer UAT harness | manual / UAT runs and the local `/test` pre-push gate (Phases 0b and 5) — **no CI coverage** |
 | `deploy/docker/cedar-vale/app/` | Cedar & Vale demo deck server (Express + pg; built only by the viz-UAT rig) | local `docker-compose.viz-uat.yml` builds |
 
 Each directory commits a `package-lock.json` and is listed in the
@@ -201,6 +201,62 @@ workflow or Dockerfile), **add it to the `files` array in
 `.github/workflows/vcpkg-baseline-update.yml`**. Do not add immutable
 `docs/reviews/` evidence. The post-sed verifier checks listed files, while the
 toolchain-contract inventory test finds an unlisted active reference.
+
+### Baseline bump 2026.10.16
+
+`builtin-baseline` moved from `4b77da7fed37` to `9eec002df1cd` (short SHAs; the full
+new value is in `vcpkg.json`, the old one in git history; committed 2026-10-17 UTC, tagged
+`2026.10.16` upstream). Versions and licenses are read from
+`ports/<port>/vcpkg.json` at each commit; `pv` is `port-version`.
+
+| Direct dependency | Old | New | `license` field |
+|---|---|---|---|
+| grpc | 1.76.0 pv1 | 1.81.1 | no change (Apache-2.0) |
+| protobuf | 6.33.4 pv1 | 6.33.4 pv2 | no change (BSD-3-Clause) |
+| abseil | 20260107.1 | 20260107.1 pv3 | no change (Apache-2.0) |
+| spdlog | 1.17.0 | 1.17.0 pv1 | no change (MIT) |
+| cli11 | 2.6.2 | 2.7.2 | no change (BSD-3-Clause) |
+| cpp-httplib | 0.37.1 | 0.59.0 | no change (MIT) |
+| sqlite3 | 3.52.0 | 3.53.4 pv2 | no change (blessing) |
+| libpq | 16.9 pv3 | 18.4 pv1 | no change (PostgreSQL) |
+| openssl | 3.6.1 pv2 | 3.6.5 pv2 | no change (Apache-2.0) |
+| catch2 | 3.13.0 pv1 | 3.16.0 | no change (BSL-1.0) |
+| libxml2 | 2.15.2 | 2.15.4 | no change (MIT) |
+| xmlsec | 1.3.9 pv1 | 1.3.12 pv1 | no change (X11 AND MPL-1.1) |
+| zlib | 1.3.1 | 1.3.2 pv2 | no change (Zlib) |
+| drogon | 1.9.12 | 1.9.13 pv2 | **changed**: `MIT` to `MIT AND BSD-3-Clause` |
+
+`nlohmann-json` (3.12.0 pv2) is unchanged. The license comparison covered the
+direct dependencies in `vcpkg.json` only; transitive dependencies were not
+checked.
+
+The drogon change is a permissive one (MIT to MIT AND BSD-3-Clause), compatible with
+AGPL-3.0-or-later. The `yuzu_drogon_canary` executable is not installed
+(`server/core/meson.build`, `install: false`), but `.github/workflows/release.yml` copies every
+`*.dll` from `vcpkg_installed/x64-windows/bin` into the Windows archive, so the drogon and
+trantor libraries may be staged there. BSD-3-Clause requires its notice in binary
+redistribution, so `NOTICE` now lists drogon and trantor with their copyright holders (taken
+from the vcpkg port's `copyright` files). No release path ships `NOTICE` or the vcpkg `copyright` files (checked: `release.yml`, the Inno
+Setup files, the rpm and debian packaging, and the `deploy/docker` Dockerfiles, whose shipped
+images copy only the binaries, plugins and gateway release); staging them in the release
+archives and images is a separate follow-up. Drogon's other bundled libraries were not checked.
+
+A future cpp-httplib bump should follow the BUMP CHECKLIST comment in
+`server/core/src/body_cap_httplib.hpp`.
+
+**Resolver fix in the glibc branch of cpp-httplib 0.59.0.** The 0.59.0
+header carries the fix for upstream issue 2431 (a use-after-free around
+`getaddrinfo_a` cancellation); the 0.43.2 header already carries the same fix.
+No CVE id is cited: none appears in the vcpkg tree.
+
+**New behaviour.** On glibc builds a lookup against an unresponsive resolver now waits for the
+resolver itself (about 30 seconds with default resolver settings; cpp-httplib's header says the
+system resolver timeout, about 30 s by default, past the caller's timeout; read as
+about 30 s from the start of the lookup, not measured) before the request fails; see `docs/user-manual/upgrading.md`.
+
+**SBOMs.** Unchanged mechanism: `.github/workflows/release.yml` generates them
+with Syft (`anchore/sbom-action`), scanning the build workspace and the pushed
+release images by digest.
 
 ## Rebar3 deps review checklist
 

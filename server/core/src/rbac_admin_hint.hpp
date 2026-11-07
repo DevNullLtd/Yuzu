@@ -7,8 +7,11 @@
 /// (`access_routes.*`, `access_render.*`) can name the three outcomes without including
 /// `rbac_admin_predicate.hpp` and, through it, `auth_db.hpp`. Only the predicate header and the
 /// auth database header are kept out of them: `access_routes.hpp` and `access_render.hpp`
-/// already include `rbac_store.hpp` for the grant and role types they render. The one call site
-/// of the function is the wiring lambda in `server.cpp`.
+/// already include `rbac_store.hpp` for the grant and role types they render. The function has
+/// TWO production callers: the `rbac_admin_hint_fn` wiring lambda in `server.cpp`, and
+/// `read_rbac_enforcement` in `rbac_enforcement_read.hpp` (the builder behind the machine twins
+/// `GET /api/v1/rbac/enforcement` and `get_rbac_enforcement`, #6033). The second consumes the
+/// answer and changes no admission input of either function.
 namespace yuzu::server {
 
 /// What the Users and roles page may draw for the RBAC administration controls (Assign role, the
