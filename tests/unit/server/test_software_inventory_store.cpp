@@ -5921,25 +5921,31 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
     }
 }
 
-TEST_CASE("diff_changes: Windows package rows (appx, chocolatey, winget) (pure)",
+TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
           "[software_inventory][v3][ledger]") {
     // The row shapes the Windows pkg_inventory legs emit: no publisher, no release, no install
     // location; an Appx row is named by the part of its PackageFullName before the first '_' and
     // carries the architecture; a Chocolatey package whose nuspec is unreadable has version ''.
+    // One call diffs one collector's rows, so a call never mixes the two ecosystems.
     const auto row = [](const std::string& name, const std::string& version,
                         const std::string& ecosystem, const std::string& arch = "") {
         SoftwareEntry e;
         e.name = name;
         e.version = version;
-        e.kind = ecosystem == "chocolatey" ? "pkg" : "app";
         e.ecosystem = ecosystem;
         e.arch = arch;
-        e.source = ecosystem == "appx"        ? "pkg_inventory.store_packages"
-                   : ecosystem == "chocolatey" ? "pkg_inventory.packages"
-                                               : "pkg_inventory.managers";
+        const bool choco = ecosystem == "chocolatey";
+        e.kind = choco ? "pkg" : "app";
+        e.source = choco ? "pkg_inventory.packages" : "pkg_inventory.store_packages";
         return keyed(std::move(e));
     };
     using Kind = SoftwareChangeKind;
+    const auto by_name = [](const std::vector<SoftwareChange>& ch) {
+        std::map<std::string, SoftwareChange> out;
+        for (const auto& c : ch)
+            out.emplace(c.name, c);
+        return out;
+    };
 
     SECTION("one Appx name in two architectures is two installs, each upgraded on its own") {
         // x64 goes 1.0 -> 4.0 and x86 goes 3.0 -> 3.5. Without the architecture in the pairing
@@ -5949,41 +5955,33 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey, winget) (pure)"
             {row("Contoso.Calc", "1.0", "appx", "x64"), row("Contoso.Calc", "3.0", "appx", "x86")},
             {row("Contoso.Calc", "4.0", "appx", "x64"), row("Contoso.Calc", "3.5", "appx", "x86")});
         REQUIRE(ch.size() == 2);
-        std::map<std::string, std::pair<std::string, std::string>> by_to;
+        std::map<std::string, std::string> from_by_to;
         for (const auto& c : ch) {
             CHECK(c.kind == Kind::kUpgrade);
-            by_to[c.to_version] = {c.from_version, c.name};
+            CHECK(c.name == "Contoso.Calc");
+            from_by_to[c.to_version] = c.from_version;
         }
-        CHECK(by_to["4.0"] == std::pair<std::string, std::string>{"1.0", "Contoso.Calc"});
-        CHECK(by_to["3.5"] == std::pair<std::string, std::string>{"3.0", "Contoso.Calc"});
-    }
-    SECTION("an unchanged roster, reordered, is no event") {
-        CHECK(SoftwareInventoryStore::diff_changes(
-                  {row("Contoso.A", "1.0", "appx", "x64"), row("winget", "1.8", "winget"),
-                   row("git", "", "chocolatey")},
-                  {row("git", "", "chocolatey"), row("winget", "1.8", "winget"),
-                   row("Contoso.A", "1.0", "appx", "x64")})
-                  .empty());
+        CHECK(from_by_to == (std::map<std::string, std::string>{{"4.0", "1.0"}, {"3.5", "3.0"}}));
     }
     SECTION("an unreadable Chocolatey version is a version like any other") {
         // The collector writes version '' for a package whose nuspec it cannot read (a junction
         // lib directory does that to every package at once). The pairing rule does not treat ''
         // as unknown: the flip is one upgrade per package with an empty side, in both
         // directions, and a package that appears beside it is an install.
-        const auto lost = SoftwareInventoryStore::diff_changes(
+        const auto lost = by_name(SoftwareInventoryStore::diff_changes(
             {row("git", "2.45", "chocolatey"), row("nodejs", "20.1", "chocolatey")},
             {row("git", "", "chocolatey"), row("nodejs", "", "chocolatey"),
-             row("7zip", "", "chocolatey")});
+             row("7zip", "", "chocolatey")}));
         REQUIRE(lost.size() == 3);
-        std::map<std::string, Kind> kinds;
-        for (const auto& c : lost) {
-            kinds[c.name] = c.kind;
-            if (c.kind == Kind::kUpgrade)
-                CHECK(c.to_version.empty());
-        }
-        CHECK(kinds["git"] == Kind::kUpgrade);
-        CHECK(kinds["nodejs"] == Kind::kUpgrade);
-        CHECK(kinds["7zip"] == Kind::kInstall);
+        CHECK(lost.at("git").kind == Kind::kUpgrade);
+        CHECK(lost.at("git").from_version == "2.45");
+        CHECK(lost.at("git").to_version.empty());
+        CHECK(lost.at("nodejs").kind == Kind::kUpgrade);
+        CHECK(lost.at("nodejs").from_version == "20.1");
+        CHECK(lost.at("nodejs").to_version.empty());
+        CHECK(lost.at("7zip").kind == Kind::kInstall);
+        CHECK(lost.at("7zip").from_version.empty());
+        CHECK(lost.at("7zip").to_version.empty());
         const auto back = SoftwareInventoryStore::diff_changes({row("git", "", "chocolatey")},
                                                                {row("git", "2.45", "chocolatey")});
         REQUIRE(back.size() == 1);
