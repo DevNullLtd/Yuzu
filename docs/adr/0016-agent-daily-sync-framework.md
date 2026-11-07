@@ -461,6 +461,23 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > is a permission fact, where skipping the cycle would freeze every other source
 > for ever.
 
+> **Update (2026-11-04):** the `pkg_inventory` Windows legs are collected as three
+> ecosystems, all machine scope: `appx` (kind `app`; the packages registered for
+> all users in the `AppxAllUserStore` `Applications` and `InboxApplications`
+> registry keys; name is the package name, version and arch come from the package
+> full name, release empty; a package in the `Deprovisioned` key is read but never
+> collected), `chocolatey` (kind `pkg`; one row per `lib\<id>` directory holding a
+> loose nuspec, version from its `<version>`, empty if unreadable) and `winget`
+> (kind `app`; a presence row from the `managers` action, present when the App
+> Installer package is registered, version from that package). Chocolatey's own
+> presence row has an empty version. No process is spawned and nothing is hashed;
+> the `ConstrainedPolicy` of the three actions is unchanged, so a constrained
+> `packages` or `store_packages` answer still skips the cycle, which is why a
+> per-item shortfall (an unreadable nuspec, an unparsable package name) degrades its
+> own row to an empty version instead of constraining the action. The three values
+> are appended at the tail of the published ecosystem enumeration. The tail
+> `install_location` slot stays reserved and empty.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
@@ -1152,7 +1169,8 @@ non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex,
 `v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
 same-count edit read as complete. A later layout change or a registry column change (see the warning in
 `device_ci_kinds.hpp`) can therefore be rolled out under a new prefix without raising a false integrity
-alarm on every stored row. One pure function
+alarm on every stored row. (A column change also needs its own ALTER migration; the registry is not the schema, see
+`docs/postgres-store-playbook.md` "Registry-backed tables".) One pure function
 (`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
 read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
 row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`

@@ -1008,10 +1008,68 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
     return h;
 }
 
+namespace {
+
+// The Guardian lens lists at most this many unrepresented ids, each cut to kLensIdBytes (the ids
+// are agent-reported identifiers: they may match no rule and have no length bound), so one hostile
+// device cannot make the fragment arbitrarily large.
+constexpr std::size_t kLensIdsShown = 10;
+constexpr std::size_t kLensIdBytes = 64;
+
+// Cut at a UTF-8 boundary (never mid-sequence) and mark the cut. Escaping is the caller's job.
+std::string lens_id_text(const std::string& id) {
+    if (id.size() <= kLensIdBytes)
+        return id;
+    std::size_t cut = kLensIdBytes;
+    while (cut > 0 && (static_cast<unsigned char>(id[cut]) & 0xC0) == 0x80)
+        --cut;
+    return id.substr(0, cut) + "...";
+}
+
+// The notice for events the census does not reflect. Empty when there are none.
+std::string unrepresented_notice(std::int64_t count, const std::vector<std::string>& ids) {
+    if (count <= 0)
+        return {};
+    std::string h = "<div class=\"gp-banner\"><b>" + std::to_string(count) +
+                    (count == 1 ? " guard has" : " guards have") +
+                    " recorded events not yet reflected in the compliance census.</b> The "
+                    "compliance figures on this page do not include " +
+                    (count == 1 ? "it" : "them") +
+                    ", so this device is not shown as clean (all compliant). " +
+                    std::string(kUncertainRunbookPointer);
+    if (!ids.empty()) {
+        const std::size_t shown = std::min(ids.size(), kLensIdsShown);
+        h += "<div class=\"gp-mute\">Identifiers as reported by the device (they may match no "
+             "rule in the catalogue): ";
+        for (std::size_t i = 0; i < shown; ++i) {
+            if (i > 0)
+                h += ", ";
+            h += "<code>" + esc(lens_id_text(ids[i])) + "</code>";
+        }
+        if (static_cast<std::int64_t>(shown) < count)
+            h += " and " + std::to_string(count - static_cast<std::int64_t>(shown)) + " more";
+        h += "</div>";
+    }
+    h += "</div>";
+    return h;
+}
+
+} // namespace
+
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards, bool tabs) {
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs,
+                                        std::int64_t unrepresented_pending,
+                                        const std::vector<std::string>& unrepresented_ids) {
     std::string h = tabs ? device_lens_tabs("guardian", agent_id) : std::string();
+    const std::string notice = unrepresented_notice(unrepresented_pending, unrepresented_ids);
     if (guards.empty()) {
+        if (!notice.empty()) {
+            // Evidence exists that the census does not show: never "No guards evaluated".
+            h += notice;
+            h += "<div class=\"gp-placeholder\"><b>No guards in the compliance census</b>This "
+                 "device has no compliance census rows yet.</div>";
+            return h;
+        }
         h += "<div class=\"gp-placeholder\"><b>No guards evaluated</b>No Guardian guards have been "
              "evaluated on this device yet.</div>";
         return h;
@@ -1025,15 +1083,24 @@ std::string render_device_guardian_lens(const std::string& agent_id,
     }
     const int pct = static_cast<int>(100.0 * compliant / static_cast<double>(guards.size()) + 0.5);
     // A clean tone is never shown over a guard whose ordering is uncertain or whose retained
-    // event is not yet reflected (#5690).
+    // event is not yet reflected (#5690), nor over a pair whose retained events have no census row
+    // at all (#7217): the all-compliant state needs both to be absent. The wording is the overview
+    // badge's ("Compliant, ordering uncertain").
+    const bool unsettled = uncertain > 0 || unrepresented_pending > 0;
     h += "<div class=\"gp-tiles\"><div class=\"gp-tile\"><div class=\"n " +
-         std::string(pct >= 100 && uncertain == 0 ? "good" : "warn") + "\">" + std::to_string(pct) +
-         "%</div><div class=\"l\">Compliant</div><div class=\"sx\">" + std::to_string(compliant) +
-         " of " + std::to_string(guards.size()) + " guards" +
+         std::string(pct >= 100 && !unsettled ? "good" : "warn") + "\">" + std::to_string(pct) +
+         "%</div><div class=\"l\">" +
+         std::string(pct >= 100 && unsettled ? "Compliant, ordering uncertain" : "Compliant") +
+         "</div><div class=\"sx\">" + std::to_string(compliant) + " of " +
+         std::to_string(guards.size()) + " guards" +
          (uncertain > 0 ? ", " + std::to_string(uncertain) +
                               " with uncertain ordering or an unreflected verdict"
                         : std::string()) +
+         (unrepresented_pending > 0 ? ", " + std::to_string(unrepresented_pending) +
+                                          " more with events not yet in the census"
+                                    : std::string()) +
          "</div></div></div>";
+    h += notice;
     h += "<div class=\"gp-sech\">Guards on this device</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Guard</th><th>State</th><th>Last evaluated</th>"
          "</tr></thead><tbody>";
