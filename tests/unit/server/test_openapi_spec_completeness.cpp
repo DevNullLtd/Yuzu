@@ -44,6 +44,7 @@
 #include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
 #include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
+#include "guaranteed_state_store.hpp" // kUnrepresentedPendingIdCap: the cap the maxItems literals mirror
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -2142,7 +2143,8 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
         {"/guaranteed-state/agents/{agent_id}/rules",
          kOne,
          false,
-         {"agent_id", "guards", "total_guards"},
+         {"agent_id", "guards", "total_guards", "unrepresented_pending_guards",
+          "unrepresented_pending_rule_ids"},
          true,
          "guards",
          {"rule_id", "name", "state", "updated_at", "order_uncertain", "projection_pending"}},
@@ -2166,10 +2168,12 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
          kOne,
          false,
          {"baseline", "deployed", "assessable", "agent_id", "total_guards", "snapshot_total",
-          "compliant", "drifted", "errored", "pending", "last_updated", "guards"},
+          "compliant", "drifted", "errored", "pending", "uncertain_guards",
+          "unrepresented_pending_guards", "unrepresented_pending_rule_ids", "last_updated",
+          "guards"},
          true,
          "guards",
-         {"rule_id", "name", "status", "updated_at"}},
+         {"rule_id", "name", "status", "updated_at", "order_uncertain", "projection_pending"}},
     };
 
     // The properties a response can carry: writeOnly ones are input-only and never in a response.
@@ -2230,6 +2234,103 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
                 REQUIRE(nested.contains("items"));
                 CHECK(readable(resolve_ref(spec, nested["items"])) == pin.nested_keys);
             }
+        }
+    }
+}
+
+// #7217: the per-device reads declare the unrepresented-pending summary with its bounds and the two
+// per-guard flags. Neither schema declares a `required` list for its data object (the pin above
+// checks the key sets), so what is pinned here is each new property's type and bounds.
+TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are typed and bounded",
+          "[openapi][guardian][ordering]") {
+    for (const bool with_guides : {false, true}) {
+        const json spec = json::parse(document_text(with_guides));
+        INFO("form: " << form_name(with_guides));
+
+        const auto check_summary = [&](const json& data) {
+            REQUIRE(data.contains("properties"));
+            const json& props = data["properties"];
+            REQUIRE(props.contains("unrepresented_pending_guards"));
+            CHECK(props["unrepresented_pending_guards"].value("type", "") == "integer");
+            CHECK(props["unrepresented_pending_guards"].value("minimum", -1) == 0);
+            REQUIRE(props.contains("unrepresented_pending_rule_ids"));
+            const json& ids = props["unrepresented_pending_rule_ids"];
+            CHECK(ids.value("type", "") == "array");
+            // The served literal is bound to the store's cap: a change to one without the other fails here.
+            CHECK(ids.value("maxItems", std::size_t{0}) == yuzu::server::kUnrepresentedPendingIdCap);
+            CHECK(ids.value("uniqueItems", false));
+            REQUIRE(ids.contains("items"));
+            CHECK(ids["items"].value("type", "") == "string");
+        };
+        const auto check_flags = [&](const json& guard_items) {
+            REQUIRE(guard_items.contains("properties"));
+            for (const char* k : {"order_uncertain", "projection_pending"}) {
+                INFO("guard flag: " << k);
+                REQUIRE(guard_items["properties"].contains(k));
+                CHECK(guard_items["properties"][k].value("type", "") == "boolean");
+            }
+        };
+
+        // device-compliance: the shared component.
+        const json& cget = spec["paths"].at("/guaranteed-state/device-compliance").at("get");
+        const json cdata = resolve_ref(spec, cget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        check_summary(cdata);
+        REQUIRE(cdata["properties"].contains("uncertain_guards"));
+        CHECK(cdata["properties"]["uncertain_guards"].value("type", "") == "integer");
+        CHECK(cdata["properties"]["uncertain_guards"].value("minimum", -1) == 0);
+        check_flags(cdata["properties"].at("guards").at("items"));
+        // The old caveat that disclaimed these fields is gone from the route text.
+        const std::string cdesc = cget.value("description", "");
+        CHECK(cdesc.find("do not report ordering uncertainty") == std::string::npos);
+        CHECK(cdesc.find("unrepresented_pending_guards") != std::string::npos);
+        // A5 machine metadata (#7217 gate 8, CA-7): the consumer rule lives on the `assessable`
+        // property, and the per-agent status route points at the per-device reads.
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "Never render a clean state") != std::string::npos);
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "unrepresented_pending_guards") != std::string::npos);
+        const std::string sdesc =
+            spec["paths"].at("/guaranteed-state/status/{agent_id}").at("get").value("description", "");
+        CHECK(sdesc.find("reads all-zero here") != std::string::npos);
+        CHECK(sdesc.find("unrepresented_pending_guards") != std::string::npos);
+        const std::string fdesc =
+            spec["paths"].at("/guaranteed-state/status").at("get").value("description", "");
+        CHECK(fdesc.find("counts only pairs that have a census row") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/agents/{agent_id}/rules") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/device-compliance") != std::string::npos);
+
+        // all-guards: the inline schema.
+        const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
+        const json gdata = resolve_ref(spec, gget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        check_summary(gdata);
+        check_flags(gdata["properties"].at("guards").at("items"));
+        CHECK(gget.value("description", "").find("unrepresented_pending_guards") !=
+              std::string::npos);
+        // The 200 description names the new keys, not only the old three.
+        const std::string g200 = gget.at("responses").at("200").value("description", "");
+        CHECK(g200.find("unrepresented_pending_guards") != std::string::npos);
+        CHECK(g200.find("unrepresented_pending_rule_ids") != std::string::npos);
+        // The pending-evidence statement timeout is documented as NOT retryable on both routes, with
+        // the metric that counts it; the ordinary degrade keeps its retryable text.
+        for (const json* route : {&cget, &gget}) {
+            const std::string r503 = route->at("responses").at("503").value("description", "");
+            INFO(r503);
+            CHECK(r503.find("NOT") != std::string::npos);
+            CHECK(r503.find("retry_after_ms is null") != std::string::npos);
+            CHECK(r503.find("guardian_census_device") != std::string::npos);
+            CHECK(r503.find("statement_timeout") != std::string::npos);
+            CHECK(route->value("description", "").find("ascending byte order") !=
+                  std::string::npos);
         }
     }
 }
