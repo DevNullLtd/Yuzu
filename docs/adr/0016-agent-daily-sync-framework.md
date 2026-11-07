@@ -1227,6 +1227,8 @@ deletes the rows. A repeated `(kind, path)` inside one section is a producer def
 That includes two components of one kind with an empty path, and it holds for a `full` section
 too: the resend repeats the pair, so the facet is answered `mismatch` on every cycle and none of
 it is stored until the writer sends each path once. It does not repair itself.
+The component writer is held to the same precondition as slot 13: `path` and `anchor_app` are
+stored as sent, the server does not enforce it, so the writer must not send per-user paths.
 The facet now carries a real section hash and enters the report hash. A row a delta removes is
 hard-deleted with no history row: component change history is out of scope. Components are
 current-state, bounded to the per-call cap per device by the post-apply check above, and die with
