@@ -355,11 +355,12 @@ TEST_CASE("post-read stage: an exempt server with no stage installed serves its 
 TEST_CASE("post-read stage: the two process-global registries are safe under concurrent "
           "install, record, lookup and forget on distinct servers",
           "[postread][registry][concurrency]") {
-    // Socket-free: the registry and the inventory are process-wide, and a production boot touches
-    // them from one thread (the main listener) while the plaintext redirect listener and tests
-    // touch them from others. Each worker owns its own never-listening server. A start gate makes
-    // the workers overlap, so a plain (non-TSan) build also has a chance to see a lost update;
-    // TSan is the detector that proves the mutexes do their job.
+    // Socket-free: the registry and the inventory are process-wide. A production boot registers
+    // the main listener and the plaintext redirect listener (two server keys) from one thread,
+    // and tests or a later listener may touch them from others. Each worker owns its own
+    // never-listening server. A start gate makes the workers overlap, so a plain (non-TSan)
+    // build also has a chance to see a lost update; TSan is the detector that proves the
+    // mutexes do their job.
     constexpr int kThreads = 8;
     constexpr int kRounds = 100;
     std::atomic<bool> go{false};
