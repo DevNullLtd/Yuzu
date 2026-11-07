@@ -8,10 +8,12 @@
 /// in the .cpp, whose columns are plugin, action, adapter, `accept_partial` and
 /// the `constrained` policy; a new inventory action adds one row + one pure adapter):
 ///   installed_apps.list_inventory           blob contract v2 rows
-///   pkg_inventory.packages                  Homebrew formulae/casks (ecosystem `brew`)
+///   pkg_inventory.packages                  Homebrew formulae/casks and Chocolatey packages
+///                                           (ecosystems `brew`, `chocolatey`)
 ///   pkg_inventory.managers                  presence rows: `homebrew` (publisher `Homebrew`),
 ///                                           `chocolatey` and `winget` (labelled `via:`)
-///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
+///   pkg_inventory.store_packages            active snaps/flatpaks and Appx packages
+///                                           (ecosystems `snap`, `flatpak`, `appx`)
 ///   windows_optional_features.list          every DISM feature, state in `version`
 ///                                           (publisher `Microsoft`)
 ///   msi_packages.list_inventory             machine-context MSI products (ecosystem `msi`)

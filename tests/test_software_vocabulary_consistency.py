@@ -324,7 +324,7 @@ class VocabularyConsistency(unittest.TestCase):
             top -= 1
         while end + 1 < len(lines) and lines[end + 1].lstrip().startswith("|"):
             end += 1
-        counts = [len(l.strip().strip("|").split("|")) for l in lines[top : end + 1]]
+        counts = [len(l.strip()[1:-1].split("|")) for l in lines[top : end + 1]]
         self.assertEqual(len(set(counts)), 1, f"field table rows have uneven cell counts: {counts}")
 
     def test_emitted_equals_published(self):
