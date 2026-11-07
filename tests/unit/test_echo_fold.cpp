@@ -538,7 +538,13 @@ TEST_CASE("generate_fold_ddl: every view keeps the registry's columns first, in 
             ++checked;
         }
     }
-    CHECK(checked == 18); // every tier the registry declares
+    // Every tier the roll-up declarations carry is a tier of the registry, and the other way round.
+    std::size_t declared = 0;
+    for (const auto& d : fold_sources())
+        if (!d.own_tables)
+            declared += d.tiers.size();
+    CHECK(checked == static_cast<int>(declared));
+    CHECK(checked == 34);
 }
 
 TEST_CASE("is_fold_view, is_fold_internal_table and legacy_live_shim_names", "[echo][fold][schema]") {
@@ -766,20 +772,22 @@ TEST_CASE("service_delta: the real tokens from compute_service_events", "[echo][
 
 TEST_CASE("user, software, arp and dns deltas", "[echo][fold][delta]") {
     {
-        UserEvent li, lo;
-        li.ts = lo.ts = kT0;
+        UserEvent li, lo, dc;
+        li.ts = lo.ts = dc.ts = kT0;
         li.action = "login";
         lo.action = "logout";
-        li.user = lo.user = "alice";
-        li.domain = lo.domain = "D";
-        li.logon_type = lo.logon_type = "interactive";
+        dc.action = "disconnect";
+        li.user = lo.user = dc.user = "alice";
+        li.domain = lo.domain = dc.domain = "D";
+        li.logon_type = lo.logon_type = dc.logon_type = "interactive";
         auto acc = make_acc("user");
-        user_delta({li, li, lo}, acc);
+        user_delta({li, li, lo, dc}, acc);
         const auto r = row_for(acc, "daily", {{"user", "alice"}});
         CHECK(mi(acc, r, "login_count") == 2);
         CHECK(mi(acc, r, "logout_count") == 1);
+        CHECK(mi(acc, r, "disconnect_count") == 1);
         CHECK(ks(acc, r, "logon_type") == "interactive");
-        check_zero(acc, r, {"disconnect_count", "session_s_sum"});
+        check_zero(acc, r, {"session_s_sum"});
     }
     {
         SoftwareEvent e;
@@ -984,6 +992,7 @@ TEST_CASE("cursor deltas: power, removable and registry clipping and digests", "
     rm.device_key = "usb1";
     rm.vendor = "V";
     rm.size_bytes = 4096;
+    rm.partition_count = 2;
     rm.record_key = "rk1";
     auto racc = make_acc("removable");
     for (const auto& c : removable_delta({rm}))
@@ -991,7 +1000,8 @@ TEST_CASE("cursor deltas: power, removable and registry clipping and digests", "
     const auto rr = racc.rows("daily")[0];
     CHECK(mi(racc, rr, "size_bytes") == 4096);
     CHECK(mi(racc, rr, "first_ts") == kT0);
-    check_zero(racc, rr, {"disk_id", "partition_count"});
+    CHECK(mi(racc, rr, "partition_count") == 2);
+    check_zero(racc, rr, {"disk_id"});
 
     RegistryEvent rg;
     rg.ts = kT0;
@@ -1142,7 +1152,15 @@ TEST_CASE("identity_digest: deterministic, and covers exactly the fields the raw
 
 TEST_CASE("install_fold_schema: replaces a legacy tier table with its view, idempotently",
           "[echo][fold][writer]") {
+    // open() has installed the schema already; put a legacy tier TABLE back where the view is, as a
+    // file written before roll-up looked, and re-install.
+    const auto legacy_in_place = [](FoldDb& d) {
+        REQUIRE(d.db.execute_sql("DROP VIEW process_hourly"));
+        REQUIRE(d.db.execute_sql("CREATE TABLE process_hourly (id INTEGER PRIMARY KEY, hour_ts INTEGER, "
+                                 "name TEXT, user TEXT)"));
+    };
     auto f = make_fold_db(/*install=*/false);
+    legacy_in_place(*f);
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_hourly'") == 1);
     REQUIRE(f->fold.install_fold_schema(f->db).has_value());
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_hourly'") == 0);
@@ -1150,14 +1168,17 @@ TEST_CASE("install_fold_schema: replaces a legacy tier table with its view, idem
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='netqual_hourly'") == 1);
     REQUIRE(f->fold.install_fold_schema(f->db).has_value());
 
-    // A legacy table that holds rows refuses the install and keeps them.
+    // A legacy table that holds rows refuses the install and keeps them; the refusal rolls the
+    // whole install back, so a view the install would have recreated stays absent.
     auto g = make_fold_db(/*install=*/false);
+    legacy_in_place(*g);
+    REQUIRE(g->db.execute_sql("DROP VIEW tcp_hourly"));
     REQUIRE(g->db.execute_sql("INSERT INTO process_hourly(hour_ts, name, user) VALUES (1, 'a', 'u')"));
     const auto refused = g->fold.install_fold_schema(g->db);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("process_hourly holds 1 rows; move them aside") != std::string::npos);
     CHECK(g->n("SELECT COUNT(*) FROM process_hourly") == 1);
-    CHECK(g->n("SELECT COUNT(*) FROM sqlite_master WHERE name = 'echo_dict'") == 0);
+    CHECK(g->n("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='tcp_hourly'") == 0);
 }
 
 TEST_CASE("fold_rows: counts, text round-trip, and refusals", "[echo][fold][writer]") {
@@ -2348,4 +2369,24 @@ TEST_CASE("synthetic three-day run: every source, every tier equals the independ
     CHECK(f->n("SELECT hour_ts FROM process_hourly WHERE name='late.exe'") == ref_bucket(late, "hourly"));
     CHECK(integrity_violations(*f) == 0);
     CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::nullopt);
+}
+
+TEST_CASE("referenced_legacy_live_shims names the retired tables a translated query mentions",
+          "[echo][fold][schema][shim]") {
+    using V = std::vector<std::string>;
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live WHERE ts > 1") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("select count(*) from tcp_live t join process_live p on 1") ==
+          V{"process_live", "tcp_live"}); // shim order, each once
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_hourly").empty());
+    CHECK(referenced_legacy_live_shims("SELECT * FROM my_process_live").empty());   // not a whole identifier
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live_r").empty());    // nor this
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_livex").empty());     // nor this
+    // every spelling SQLite accepts for the same identifier reaches the shim view
+    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_LIVE") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM \"Process_Live\"") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM [process_live]") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM `Tcp_Live`") == V{"tcp_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_HOURLY").empty());   // an hourly query, any case
+    CHECK(referenced_legacy_live_shims("SELECT * FROM usage_live").empty());        // usage keeps its table
+    CHECK(referenced_legacy_live_shims("").empty());
 }

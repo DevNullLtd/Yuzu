@@ -13,6 +13,7 @@
 #include "echo_fold_schema.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <format>
 #include <sstream>
 #include <unordered_set>
@@ -311,6 +312,213 @@ std::vector<std::string> legacy_live_shim_names() {
         if (!def.own_tables)
             out.push_back(std::format("{}_live", def.name));
     return out;
+}
+
+bool is_legacy_live_shim(std::string_view name) {
+    static const std::unordered_set<std::string> names = [] {
+        const auto v = legacy_live_shim_names();
+        return std::unordered_set<std::string>(v.begin(), v.end());
+    }();
+    return names.contains(std::string(name));
+}
+
+std::vector<std::string> referenced_legacy_live_shims(std::string_view sql) {
+    const auto ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    };
+    // SQLite matches an identifier ASCII case-insensitively, so `PROCESS_LIVE`, `"Process_Live"`
+    // and `[process_live]` all reach the shim view and must all be found: the scan runs over an
+    // ASCII-lowered copy (the names are ASCII; a quote or bracket is not an identifier byte, so
+    // the whole-identifier test already admits the quoted forms).
+    std::string lower(sql);
+    for (auto& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const std::string_view text = lower;
+    std::vector<std::string> out;
+    for (const auto& name : legacy_live_shim_names()) {
+        for (auto pos = text.find(name); pos != std::string_view::npos; pos = text.find(name, pos + 1)) {
+            const bool starts = pos == 0 || !ident(text[pos - 1]);
+            const bool ends = pos + name.size() == text.size() || !ident(text[pos + name.size()]);
+            if (starts && ends) {
+                out.push_back(name);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+// ── The retired raw tables' columns ─────────────────────────────────────────
+
+namespace {
+
+constexpr std::string_view kI = "INTEGER";
+constexpr std::string_view kR = "REAL";
+constexpr std::string_view kT = "TEXT";
+
+// The raw store's column declarations, moved here verbatim from the registry's `live`
+// granularities (name, type, in declaration order; `id` is implicit and leads every table).
+// A raw-row decoder reads them positionally, so a column is never reordered or renamed.
+const std::vector<std::pair<std::string_view, std::vector<LegacyColumn>>>& legacy_tables() {
+    static const std::vector<std::pair<std::string_view, std::vector<LegacyColumn>>> t = {
+        {"process", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"pid", kI}, {"ppid", kI},
+                     {"name", kT}, {"cmdline", kT}, {"user", kT}}},
+        {"tcp", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"proto", kT}, {"local_addr", kT},
+                 {"local_port", kI}, {"remote_addr", kT}, {"remote_host", kT},
+                 {"remote_port", kI}, {"state", kT}, {"pid", kI}, {"process_name", kT}}},
+        {"service", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"name", kT},
+                     {"display_name", kT}, {"status", kT}, {"prev_status", kT},
+                     {"startup_type", kT}, {"prev_startup_type", kT}}},
+        {"user", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"user", kT}, {"domain", kT},
+                  {"logon_type", kT}, {"session_id", kT}}},
+        {"perf", {{"ts", kI}, {"snapshot_id", kI}, {"cpu_pct", kR}, {"mem_used_pct", kR},
+                  {"commit_pct", kR}, {"disk_read_bps", kI}, {"disk_write_bps", kI},
+                  {"disk_read_lat_us", kI}, {"disk_write_lat_us", kI}, {"net_rx_bps", kI},
+                  {"net_tx_bps", kI}}},
+        {"procperf", {{"ts", kI}, {"snapshot_id", kI}, {"name", kT}, {"version", kT},
+                      {"instances", kI}, {"cpu_pct", kR}, {"ws_bytes", kI}, {"is_kthread", kI}}},
+        {"netqual", {{"ts", kI}, {"snapshot_id", kI}, {"proto", kT}, {"remote_bucket", kT},
+                     {"process_name", kT}, {"rtt_us", kI}, {"rtt_var_us", kI}, {"lost", kI},
+                     {"retrans", kI}, {"segs_out", kI}, {"ca_state", kI}}},
+        {"module", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"pid", kI},
+                    {"process_name", kT}, {"module_name", kT}, {"module_dir", kT},
+                    {"signed_state", kT}, {"signer", kT}, {"is_kernel", kI}}},
+        {"software", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"name", kT},
+                      {"version", kT}, {"prev_version", kT}, {"publisher", kT},
+                      {"install_date", kT}}},
+        {"arp", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"interface", kT},
+                 {"ip_address", kT}, {"mac_address", kT}, {"entry_type", kT}}},
+        {"dns", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"name", kT},
+                 {"record_type", kT}, {"data", kT}, {"ttl_remaining_s", kI}, {"source", kT}}},
+        {"netconn", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"channel", kT},
+                     {"category", kT}, {"capability", kT}, {"iface_kind", kT},
+                     {"reason_code", kI}}},
+        {"mapdrive", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"direction", kT},
+                      {"local_mount", kT}, {"remote_path", kT}, {"remote_host", kT},
+                      {"username", kT}, {"provider", kT}, {"origin", kT}}},
+        {"power", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"detail", kT},
+                   {"record_key", kT}}},
+        {"removable", {{"ts", kI}, {"snapshot_id", kI}, {"action", kT}, {"device_key", kT},
+                       {"vendor", kT}, {"product", kT}, {"serial", kT}, {"bus", kT},
+                       {"volume", kT}, {"size_bytes", kI}, {"image_path", kT}, {"pid", kI},
+                       {"evidence", kT}, {"record_key", kT}}},
+        {"registry", {{"ts", kI}, {"snapshot_id", kI}, {"hive", kT}, {"key_path", kT},
+                      {"value_name", kT}, {"action", kT}, {"data_type", kT}, {"data", kT},
+                      {"data_size", kI}, {"data_truncated", kI}, {"prev_data_type", kT},
+                      {"prev_data", kT}, {"prev_data_size", kI}, {"prev_data_truncated", kI},
+                      {"actor_pid", kI}, {"actor_image", kT}, {"source", kT},
+                      {"observed_at", kI}, {"detail", kT}, {"record_key", kT}}},
+    };
+    return t;
+}
+
+} // namespace
+
+std::vector<LegacyColumn> legacy_live_columns(std::string_view source) {
+    for (const auto& [name, cols] : legacy_tables())
+        if (name == source)
+            return cols;
+    return {};
+}
+
+std::string legacy_live_shim_ddl() {
+    std::string ddl;
+    for (const auto& [name, cols] : legacy_tables()) {
+        ddl += std::format("CREATE VIEW IF NOT EXISTS {}_live AS SELECT CAST(NULL AS INTEGER) AS id", name);
+        for (const auto& c : cols)
+            ddl += std::format(", CAST(NULL AS {}) AS {}", c.sql_type, c.name);
+        ddl += " WHERE 0;\n";
+    }
+    return ddl;
+}
+
+// ── The shared merge clause, the tier-to-tier roll-up, the average conversion ──
+
+std::string fold_upsert_assignments(const FoldSourceDef& def) {
+    std::string out;
+    const auto add = [&](std::string s) {
+        out += out.empty() ? "" : ",";
+        out += s;
+    };
+    for (const auto& c : def.columns) {
+        if (c.role != ColumnRole::kMeasure)
+            continue;
+        const std::string name = physical_column_name(c);
+        switch (c.merge) {
+        case MergeOp::kSum:
+            add(std::format("{0}={0}+excluded.{0}", name));
+            break;
+        case MergeOp::kMax:
+            add(std::format("{0}=MAX({0},excluded.{0})", name));
+            break;
+        case MergeOp::kMin:
+            add(std::format("{0}=MIN({0},excluded.{0})", name));
+            break;
+        case MergeOp::kLast:
+            add(std::format("{0}=CASE WHEN excluded.{1}>={1} THEN excluded.{0} ELSE {0} END", name,
+                            c.guard));
+            break;
+        case MergeOp::kNone:
+            break;
+        }
+    }
+    return out;
+}
+
+std::string_view avg_sum_column(const ColumnDef& generated) {
+    // The expression is `CASE WHEN samples>0 THEN <sum>*1.0/samples ELSE 0 END` (REAL) or
+    // `... THEN <sum>/samples ELSE 0 END` (INTEGER): the identifier right after THEN.
+    if (generated.role != ColumnRole::kGenerated)
+        return {};
+    constexpr std::string_view kThen = "THEN ";
+    const auto pos = generated.generated_expr.find(kThen);
+    if (pos == std::string_view::npos)
+        return {};
+    auto rest = generated.generated_expr.substr(pos + kThen.size());
+    std::size_t n = 0;
+    while (n < rest.size() && (std::isalnum(static_cast<unsigned char>(rest[n])) || rest[n] == '_'))
+        ++n;
+    return rest.substr(0, n);
+}
+
+std::string fold_tier_from_tier_sql(std::string_view source, std::string_view from,
+                                    std::string_view to) {
+    const FoldSourceDef* def = fold_source(source);
+    if (!def || def->own_tables)
+        return {};
+    const auto has = [&](std::string_view t) {
+        return std::find(def->tiers.begin(), def->tiers.end(), t) != def->tiers.end();
+    };
+    if (!has(from) || !has(to))
+        return {};
+    const std::string from_bucket{ts_column_for_suffix(from)};
+    const std::string to_bucket{ts_column_for_suffix(to)};
+    // Floor to the coarser bucket in SQL (SQLite's % truncates toward zero, hence the double mod).
+    std::string bucket_expr;
+    if (from == "hourly" && to == "daily")
+        bucket_expr = std::format("({0} - (({0} % 86400) + 86400) % 86400)", from_bucket);
+    else if (from == "daily" && to == "monthly")
+        bucket_expr = std::format(
+            "CAST(strftime('%s', date({}, 'unixepoch', 'start of month')) AS INTEGER)", from_bucket);
+    else
+        return {};
+
+    std::string cols = to_bucket, vals = bucket_expr, conflict = to_bucket;
+    for (const auto& c : def->columns) {
+        if (c.role == ColumnRole::kGenerated)
+            continue;
+        const std::string name = physical_column_name(c);
+        cols += "," + name;
+        vals += ",r." + name;
+        if (c.role == ColumnRole::kKey)
+            conflict += "," + name;
+    }
+    // WHERE is required: without it SQLite reads `ON CONFLICT` after a bare SELECT as a join clause.
+    return std::format("INSERT INTO {0}({1}) SELECT {2} FROM {3} r WHERE r.{4} >= ?1 "
+                       "ORDER BY r.{4}, r.id ON CONFLICT({5}) DO UPDATE SET {6}",
+                       physical_table_name(source, to), cols, vals,
+                       physical_table_name(source, from), from_bucket, conflict,
+                       fold_upsert_assignments(*def));
 }
 
 } // namespace yuzu::echo

@@ -502,6 +502,117 @@ apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 
 metadata:
+  id: device.hardware.drivers_inventory
+  displayName: Driver Inventory (Signed State)
+  version: 1.0.0
+  description: >
+    Lists installed drivers in a stable order (sorted by name, INF, hardware id,
+    version; exact duplicates removed) with version, date, provider, device
+    class, signer, signed state, INF name and hardware id. Always leads with one
+    status row: supported when the read was complete, constrained with reason
+    tokens when it was cut short (a row cap of 4096, a refused or failed read),
+    unsupported on macOS. A value that could not be read is "-", never a guess.
+    Windows reads Win32_PnPSignedDriver (bounded WMI, 4096 rows); a device with
+    no driver bound shows only its hardware id. Linux reads /proc/modules plus
+    /sys/module/<module>/version and taint with bounded no-follow reads: the
+    signed state is "unsigned" only when the module's taint flags contain E, and
+    "-" otherwise (no flag proves a module signed); signer, INF, hardware id and
+    date have no Linux source. Not supported on macOS (no public kext/dext
+    enumeration API). The existing "drivers" instruction is unchanged. This is
+    an on-demand question; it is not part of the daily sync.
+  tags: [hardware, inventory, drivers]
+
+spec:
+  type: question
+  platforms: [windows, linux]
+
+  execution:
+    plugin: hardware
+    action: drivers_inventory
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|drivers_inventory|<supported|constrained|unsupported>|<tokens or ->   (always first)
+    # driver_inv|<name>|<version>|<date>|<provider>|<class>|<signer>|<signed>|<inf>|<hwid>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), driver_inv (one per driver).'
+        values: [status, driver_inv]
+        example: driver_inv
+        platforms: [windows, linux]
+      - name: name
+        type: string
+        description: 'Driver or module name: the Windows DeviceName, or the Linux kernel module name. Status rows: the action name.'
+        example: "AMD Audio CoProcessor"
+        platforms: [windows, linux]
+      - name: version
+        type: string
+        description: 'Driver version (Windows DriverVersion; Linux /sys/module/<m>/version), or "-" when the host reports none. Status rows: the level (supported, constrained or unsupported).'
+        example: "6.0.0.109"
+        platforms: [windows, linux]
+      - name: date
+        type: string
+        description: 'Driver date as YYYY-MM-DD (Windows only), or "-" when empty or in a form that cannot be read unambiguously. Status rows: the reason tokens, comma-separated, or "-" when there are none.'
+        example: "2025-03-26"
+        platforms: [windows]
+      - name: provider
+        type: string
+        description: 'Driver publisher (Windows DriverProviderName; the fixed literal "kernel" on Linux), or "-" when empty.'
+        example: "AMD"
+        platforms: [windows, linux]
+      - name: device_class
+        type: string
+        description: 'Windows DeviceClass (e.g. SYSTEM, NET, MEDIA); the fixed literal "module" on Linux; "-" when empty.'
+        example: "SYSTEM"
+        platforms: [windows, linux]
+      - name: signer
+        type: string
+        description: 'Windows signer of the driver package (Signer), or "-" when empty. No Linux source.'
+        example: "Microsoft Windows Hardware Compatibility Publisher"
+        platforms: [windows]
+      - name: signed
+        type: string
+        description: 'Signature state. Windows: IsSigned True/False. Linux: "unsigned" only when the module taint flags contain E; "-" otherwise, since no flag proves a module signed. Values: signed, unsigned, or "-" when unknown.'
+        values: [signed, unsigned, '-']
+        example: "signed"
+        platforms: [windows, linux]
+      - name: inf
+        type: string
+        description: 'Windows INF name (InfName, e.g. oem18.inf), or "-" when empty. No Linux source.'
+        example: "oem18.inf"
+        platforms: [windows]
+      - name: hwid
+        type: string
+        description: 'Windows hardware id (HardWareID); a backslash is written as "/" by the row escaper. "-" when empty. No Linux source.'
+        example: "PCI/VEN_1022&DEV_15E2&SUBSYS_15E21022&REV_63"
+        platforms: [windows]
+
+  readablePayload: "List installed drivers with signer and signed state"
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+
+metadata:
   id: device.hardware.system
   displayName: System Identity (Serial + UUID)
   version: 1.0.0

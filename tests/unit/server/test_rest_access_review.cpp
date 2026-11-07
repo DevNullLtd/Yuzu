@@ -1328,6 +1328,8 @@ TEST_CASE("access-reviews: a NUL-carrying or oversize identifier is a 400 / inva
 
     // The campaign_id leg: it comes straight from the URL path (REST) or the tool argument (MCP)
     // and used to be echoed raw into the failure row's target even when the store had refused it.
+    // Sink only: a path this long never reaches a regex route on httplib 0.59 (256-byte limit),
+    // so the REST 400 below is not production behaviour; the MCP leg is.
     const std::string huge_cid(600, 'c');
     auto rest_cid = h.sink.Post("/api/v1/access-reviews/" + huge_cid + "/attestations",
                                 sod_body("nina", "NulRole", "attested").dump());

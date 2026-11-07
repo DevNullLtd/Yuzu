@@ -168,6 +168,8 @@ struct DeviceGuardRow {
     std::string name;       ///< the Guard's human name
     std::string state;      ///< "compliant" | "drifted" | "errored"
     std::string updated_at; ///< ISO of the evaluation that set it
+    bool order_uncertain{false};    ///< ordering of the persisted verdict cannot be proven
+    bool projection_pending{false}; ///< a retained event for this guard is not yet reflected
 };
 
 /// PURE: the DEX lens for one device — the per-device score + its signal summary
