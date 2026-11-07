@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -103,21 +104,73 @@ struct DeprovisionRevokeResult {
     /// persist). The caller MUST NOT report a clean deprovision success when
     /// this is false — SCIM 500s so the IdP retries (ADR-2001 §3); the
     /// dashboard delete reports the same failure without proceeding to
-    /// `remove_user`.
+    /// `remove_user`. Read it through `all_persisted()` / `failed_legs_phrase()`,
+    /// never on its own.
     bool api_tokens_persisted{true};
-    /// Sum of in-memory session counts erased (`AuthManager::RevokeResult::
-    /// count`) across every principal.
+    /// Sum of `AuthManager::RevokeResult::count` across every principal. For a
+    /// principal whose durable delete did not persist this is only the count
+    /// erased from THIS replica's cache, not the fleet-wide total.
     std::size_t sessions_revoked{0};
+    /// False iff `AuthManager::invalidate_user_sessions` reported
+    /// `db_persisted == false` for AT LEAST ONE principal in the set (the
+    /// durable `SessionStore` DELETE failed; the local cache was still wiped).
+    /// The durable row survives and another replica, or this one after a
+    /// restart, rehydrates a valid session from it. The caller MUST NOT report
+    /// a clean deprovision success when this is false — same contract as
+    /// `api_tokens_persisted` (#4772): SCIM 500s so the IdP retries, the
+    /// dashboard delete reports the failure without proceeding to
+    /// `remove_user`. The one deliberate exception is SCIM create-inactive,
+    /// where the account removal that follows runs its own session wipe (see
+    /// `SessionLegGate` in scim_routes.cpp).
+    bool sessions_persisted{true};
+
+    /// True iff EVERY credential leg persisted. A caller that decides
+    /// fail-open-vs-closed on the overall outcome uses this rather than
+    /// hand-writing `!a || !b`, which is how the session leg was dropped in
+    /// the first place. EVERY new credential leg added to this struct MUST be
+    /// folded in here and into `failed_legs_phrase()`.
+    [[nodiscard]] constexpr bool all_persisted() const noexcept {
+        return api_tokens_persisted && sessions_persisted;
+    }
 };
+// A new field changes the arity and fails this assert, forcing its author to read the note on
+// `all_persisted()` and fold the new leg into it and into `failed_legs_phrase()`.
+static_assert(
+    [] {
+        auto [revoked, tokens_ok, sessions_revoked, sessions_ok] = DeprovisionRevokeResult{};
+        (void)revoked;
+        (void)tokens_ok;
+        (void)sessions_revoked;
+        (void)sessions_ok;
+        return true;
+    }(),
+    "DeprovisionRevokeResult changed shape: fold the new credential leg into all_persisted() "
+    "and failed_legs_phrase()");
+
+/// Names the credential leg(s) that did not persist, for the operator-facing
+/// failure text: "API tokens", "sessions", or "API tokens and sessions".
+/// Returns an empty view when everything persisted. One copy, shared by the
+/// SCIM seam and the dashboard delete, so their wording cannot diverge.
+[[nodiscard]] constexpr std::string_view
+failed_legs_phrase(const DeprovisionRevokeResult& r) noexcept {
+    if (!r.api_tokens_persisted && !r.sessions_persisted)
+        return "API tokens and sessions";
+    if (!r.api_tokens_persisted)
+        return "API tokens";
+    if (!r.sessions_persisted)
+        return "sessions";
+    return {};
+}
 
 /// ADR-2001 §3 — the credentials-FIRST orchestrator. For EACH principal in
 /// `principals` (in order): revoke its API tokens, then its sessions — never
 /// the reverse, and never two stores' leases held simultaneously (see the
 /// lock/pool discipline note above). Continues through every principal even
-/// after a non-persisted token revoke — best-effort, maximises what actually
-/// gets revoked — but records the failure in the returned result so the
-/// caller fails closed on the OVERALL outcome rather than reporting a clean
-/// success.
+/// after a non-persisted token revoke or session delete — best-effort,
+/// maximises what actually gets revoked — but records each failure
+/// (`api_tokens_persisted`, `sessions_persisted`) in the returned result so
+/// the caller fails closed on the OVERALL outcome rather than reporting a
+/// clean success.
 DeprovisionRevokeResult
 revoke_deprovision_credentials(ApiTokenStore& token_store, auth::AuthManager& auth_mgr,
                                const std::vector<std::string>& principals);
