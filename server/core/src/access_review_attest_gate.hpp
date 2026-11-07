@@ -13,22 +13,28 @@
 ///                also refuses this inside the write (a `forbidden:` result), so the rule holds
 ///                even for a caller that skips this gate; `sod_from_store_error` maps that result
 ///                onto the same refusal.
-///   * `engine` : the reviewer OWNS the engine principal (`EnginePrincipalRow::owner_username`),
-///                revoked engines included. An engine id with no row is an orphan grant and is
-///                admitted (there is no owner to compare against).
+///   * `engine` : the reviewer OWNS the engine principal NOW (`EnginePrincipalRow::owner_username`,
+///                read here), revoked engines included, OR OWNED it when the campaign opened (the
+///                owner frozen into the grant's snapshot; `AccessReviewStore` refuses that inside
+///                the write as `kStoreForbiddenEngineOwner`, which `sod_from_store_error` maps to
+///                the engine-owner outcome). So a former owner stays refused after a transfer. An
+///                engine id with no row and no frozen owner is an orphan grant and is admitted
+///                (there is no owner to compare against).
 ///   * `group`  : the reviewer is a MEMBER of the group (`group_members`, which IdP login
 ///                reconciliation also writes). A group with no row, or one the reviewer is not in,
 ///                is admitted.
 ///
-/// THE WINDOW (stated honestly). The engine-owner and group-member rules are decided by a READ
-/// here, before the store's write transaction. ADR-0012 s2(c) forbids a store method from calling
-/// another store while it holds a lease, so the owning stores cannot be consulted inside the attest
-/// transaction. The window therefore runs from this read to the attest COMMIT: a pool acquire of up
-/// to the store's write budget plus a row-lock wait, normally milliseconds but not a bound this
-/// file can promise. An ownership transfer or membership change that lands inside it is not seen,
-/// and there is no re-read after the commit. Membership can be changed by the reviewer's own SSO
-/// login. The user rule has no such window (it is decided in C++ from the arguments, before any
-/// lease; the UPDATE predicate and the history CHECK are backstops). Revisit under #6060.
+/// THE WINDOW (stated honestly). The LIVE engine-owner rule and the group-member rule are decided
+/// by a READ here, before the store's write transaction. ADR-0012 s2(c) forbids a store method from
+/// calling another store while it holds a lease, so the owning stores cannot be consulted inside
+/// the attest transaction. The window therefore runs from this read to the attest COMMIT: a pool
+/// acquire of up to the store's write budget plus a row-lock wait, normally milliseconds but not a
+/// bound this file can promise. A membership change, or an ownership ACQUIRED by the reviewer after
+/// the campaign opened, that lands inside it is not seen, and there is no re-read after the commit.
+/// Membership can be changed by the reviewer's own SSO login. The user rule and the FROZEN engine
+/// owner have no such window (the first is decided in C++ from the arguments, before any lease;
+/// the second inside the write transaction from the grant's own immutable snapshot; the UPDATE
+/// predicate and the history CHECK are backstops for the first). Revisit under #6060.
 ///
 /// Both lookups FAIL CLOSED: a failed or unavailable read is `kUnavailable` (503 / retryable),
 /// never "not a member" and never "not the owner". `get_group_members` is deliberately not used: it
@@ -56,6 +62,7 @@
 /// `AccessReview:Attest`, so naming it would claim a self-remediation grant that cannot help
 /// (the service-scope row's clause 5).
 
+#include "access_review_model.hpp" // kStoreForbiddenEngineOwner
 #include "engine_principal_store.hpp"
 #include "mcp_jsonrpc.hpp" // kPermissionDenied / kInternalError
 #include "mcp_retry.hpp"   // kMcpStoreFaultRetryMs
@@ -216,12 +223,16 @@ struct SodRefusal {
             "denied", "sod_self_subject",     "self_subject"};
 }
 
-/// The store's in-write refusal (`forbidden:`) is the user rule, caught after the gate: map it onto
-/// the same outcome so the wire answer is byte-identical. `nullopt` for any other store error.
+/// The store's in-write refusal (`forbidden:`) is caught after the gate: the user rule (the
+/// reviewer is the subject) or the frozen-owner backstop for an engine grant. Map each onto its
+/// outcome so the wire answer is byte-identical to the gate's own refusal and the audit reason is
+/// the right one. `nullopt` for any other store error.
 [[nodiscard]] inline std::optional<SodOutcome> sod_from_store_error(std::string_view err) {
-    if (classify_store_error(err) == StoreErrorClass::kForbidden)
-        return SodOutcome::kSelfSubject;
-    return std::nullopt;
+    if (classify_store_error(err) != StoreErrorClass::kForbidden)
+        return std::nullopt;
+    if (err == ::yuzu::server::kStoreForbiddenEngineOwner)
+        return SodOutcome::kEngineOwner;
+    return SodOutcome::kSelfSubject;
 }
 
 /// Decide whether `reviewer` may record a decision on this grant. The user rule needs no store;

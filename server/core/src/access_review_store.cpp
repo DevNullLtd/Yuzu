@@ -12,6 +12,8 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +57,13 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 // kWriteTimeout acquire wait happens before the lease and is not part of that hold. The setting
 // REPLACES a DSN lock_timeout for these two transactions, so a stricter DSN value is loosened.
 constexpr const char* kWriteLockTimeoutSql = "SET LOCAL lock_timeout = '3s'";
+
+// Every authored time column is the DATABASE clock, not the replica's system_clock: with several
+// server replicas on one database a replica-authored stamp can order a later write before an
+// earlier one. now() is the transaction start time, so the history INSERT and the state UPDATE of
+// one attest, which the consistency trigger compares byte for byte, receive the identical value.
+// Same expression as session_store.cpp (#3715). Never clock_timestamp(): it differs per statement.
+constexpr const char* kDbNowMsSql = "(extract(epoch from now())*1000)::bigint";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -238,12 +247,6 @@ CREATE CONSTRAINT TRIGGER access_review_history_consistent AFTER INSERT
     return kMigrations;
 }
 
-std::int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
 std::int64_t to_i64(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0;
@@ -376,7 +379,6 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
         return std::unexpected("rbac_enforcement must be 'enabled', 'disabled', or 'degraded'");
 
     const std::string campaign_id = generate_campaign_id();
-    const std::int64_t created_at = now_ms();
 
     // Parallel arrays for the frozen-population batch insert (unnest), same
     // idiom as PreflightRunStore::create_run — one round-trip regardless of
@@ -395,13 +397,14 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
 
     std::string error_msg;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        const std::string insert_campaign =
+            std::string("INSERT INTO access_review_store.access_review_campaign "
+                        "(campaign_id, title, status, created_by, created_at_ms, rbac_enforcement) "
+                        "VALUES ($1,$2,'open',$3,") +
+            kDbNowMsSql + ",$4) RETURNING campaign_id";
         pg::PgResult r1 = pg::exec_params(
-            conn,
-            "INSERT INTO access_review_store.access_review_campaign "
-            "(campaign_id, title, status, created_by, created_at_ms, rbac_enforcement) "
-            "VALUES ($1,$2,'open',$3,$4::bigint,$5) RETURNING campaign_id",
-            std::vector<std::string>{campaign_id, title, created_by,
-                                     std::to_string(created_at), rbac_enforcement});
+            conn, insert_campaign.c_str(),
+            std::vector<std::string>{campaign_id, title, created_by, rbac_enforcement});
         if (r1.status() != PGRES_TUPLES_OK || PQntuples(r1.get()) == 0) {
             error_msg = std::string("campaign insert failed: ") + PQerrorMessage(conn);
             return false;
@@ -476,10 +479,6 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
     if (principal_type == "user" && principal_id == reviewer)
         return std::unexpected("forbidden: reviewer is the subject of this grant");
 
-    // One timestamp bound into both statements: the state guard compares it byte-exact against
-    // the history row.
-    const std::string decided_at = std::to_string(now_ms());
-
     AttestationOutcome outcome;
     std::string error_msg;
     bool not_found = false;
@@ -495,7 +494,7 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
         // for this decision to commit; an attest after a close sees 'closed' and is refused.
         pg::PgResult pre = pg::exec_params(
             conn,
-            "SELECT a.decision, a.decision_seq, c.status "
+            "SELECT a.decision, a.decision_seq, c.status, a.grant_snapshot "
             "FROM access_review_store.access_review_attestation a "
             "JOIN access_review_store.access_review_campaign c ON c.campaign_id = a.campaign_id "
             "WHERE a.campaign_id=$1 AND a.principal_type=$2 AND a.principal_id=$3 "
@@ -512,22 +511,51 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
         }
         const std::string old_decision = PQgetvalue(pre.get(), 0, 0);
         const std::int32_t old_seq = static_cast<std::int32_t>(to_i64(PQgetvalue(pre.get(), 0, 1)));
+        // Engine grants: the owner frozen into the grant at campaign open is compared here, under
+        // the row lock and on the same row, as the backstop for an ownership transfer since the
+        // route layer read the live owner (so a former owner stays refused: "owner at open OR
+        // owner now"). No other store is read, so ADR-0012 s2(c) is not engaged. An unparsable or
+        // empty snapshot, or an orphan engine id (owner ""), has nothing to compare against.
+        if (principal_type == "engine" && !reviewer.empty()) {
+            const auto snap = nlohmann::json::parse(PQgetvalue(pre.get(), 0, 3), nullptr,
+                                                    /*allow_exceptions=*/false);
+            if (snap.is_object()) {
+                const auto owner = snap.find(kSnapshotOwnerKey);
+                if (owner != snap.end() && owner->is_string() &&
+                    owner->get_ref<const std::string&>() == reviewer) {
+                    error_msg = std::string(kStoreForbiddenEngineOwner);
+                    return false;
+                }
+            }
+            if (!snap.is_object() || !snap.contains(kSnapshotOwnerKey) ||
+                !snap[kSnapshotOwnerKey].is_string()) {
+                // Server-built snapshots always carry a string owner; reaching here means a row
+                // this build did not write. The backstop has nothing to compare, so say so.
+                spdlog::warn("AccessReviewStore::record_attestation: engine grant snapshot has no "
+                             "usable owner; the frozen-owner check was skipped (campaign={})",
+                             campaign_id);
+            }
+        }
         // Per-grant cap, decided under the row lock so two racing attests cannot both pass it.
-        // Returning false rolls the transaction back: no history row, state unchanged.
+        // Returning false rolls the transaction back: no history row, state unchanged. Checked
+        // AFTER the frozen-owner refusal above, so a former owner on a capped grant still gets the
+        // 403 (and the engine-owner audit reason), not the cap text.
         if (old_seq >= kMaxDecisionsPerGrant) {
             error_msg = "bad_request: " + std::string(kDecisionCapMessage);
             return false;
         }
         const std::string new_seq = std::to_string(old_seq + 1);
 
+        const std::string insert_history =
+            std::string("INSERT INTO access_review_store.access_review_attestation_history "
+                        "(campaign_id, principal_type, principal_id, role_name, seq, decision, "
+                        " previous_decision, reviewer, justification, decided_at_ms) "
+                        "VALUES ($1,$2,$3,$4,$5::integer,$6,$7,$8,$9,") +
+            kDbNowMsSql + ")";
         pg::PgResult hist = pg::exec_params(
-            conn,
-            "INSERT INTO access_review_store.access_review_attestation_history "
-            "(campaign_id, principal_type, principal_id, role_name, seq, decision, "
-            " previous_decision, reviewer, justification, decided_at_ms) "
-            "VALUES ($1,$2,$3,$4,$5::integer,$6,$7,$8,$9,$10::bigint)",
+            conn, insert_history.c_str(),
             std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, new_seq,
-                                     decision, old_decision, reviewer, justification, decided_at});
+                                     decision, old_decision, reviewer, justification});
         if (hist.status() != PGRES_COMMAND_OK) {
             error_msg =
                 logged_write_fault("record_attestation history write", campaign_id, conn, hist.get());
@@ -539,20 +567,21 @@ std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attesta
         // inserted (PgPool::with_txn_for rolls back only on `false`) and the next attest would
         // collide with it on the primary key. The deferred consistency trigger is the database
         // backstop for the same case.
-        pg::PgResult upd = pg::exec_params(
-            conn,
-            "UPDATE access_review_store.access_review_attestation "
-            "SET decision=$6, reviewer=$7, decided_at_ms=$8::bigint, justification=$9, "
-            "    decision_seq=$5::integer "
+        const std::string update_state =
+            std::string("UPDATE access_review_store.access_review_attestation "
+                        "SET decision=$6, reviewer=$7, decided_at_ms=") +
+            kDbNowMsSql +
+            ", justification=$8, decision_seq=$5::integer "
             "WHERE campaign_id=$1 AND principal_type=$2 AND principal_id=$3 AND role_name=$4 "
-            "  AND decision_seq=$10::integer "
+            "  AND decision_seq=$9::integer "
             "  AND NOT (principal_type='user' AND principal_id=$7) "
             "  AND EXISTS (SELECT 1 FROM access_review_store.access_review_campaign c "
             "              WHERE c.campaign_id=$1 AND c.status='open') "
-            "RETURNING decision_seq",
+            "RETURNING decision_seq";
+        pg::PgResult upd = pg::exec_params(
+            conn, update_state.c_str(),
             std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, new_seq,
-                                     decision, reviewer, decided_at, justification,
-                                     std::to_string(old_seq)});
+                                     decision, reviewer, justification, std::to_string(old_seq)});
         if (upd.status() != PGRES_TUPLES_OK) {
             error_msg = logged_write_fault("record_attestation write", campaign_id, conn, upd.get());
             return false;
@@ -728,12 +757,12 @@ AccessReviewStore::close_campaign(const std::string& campaign_id, const std::str
                 logged_write_fault("close_campaign lock_timeout", campaign_id, conn, lt.get());
             return false;
         }
-        pg::PgResult res = pg::exec_params(
-            conn,
-            "UPDATE access_review_store.access_review_campaign "
-            "SET status='closed', closed_by=$2, closed_at_ms=$3::bigint "
-            "WHERE campaign_id=$1 AND status='open' RETURNING campaign_id",
-            std::vector<std::string>{campaign_id, closed_by, std::to_string(now_ms())});
+        const std::string close_sql =
+            std::string("UPDATE access_review_store.access_review_campaign "
+                        "SET status='closed', closed_by=$2, closed_at_ms=") +
+            kDbNowMsSql + " WHERE campaign_id=$1 AND status='open' RETURNING campaign_id";
+        pg::PgResult res = pg::exec_params(conn, close_sql.c_str(),
+                                           std::vector<std::string>{campaign_id, closed_by});
         if (res.status() != PGRES_TUPLES_OK) {
             error_msg = logged_write_fault("close_campaign write", campaign_id, conn, res.get());
             return false;

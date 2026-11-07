@@ -132,8 +132,11 @@ struct GrantRef {
     std::string role_name;
     /// Caller-serialized snapshot of the grant as observed at freeze time
     /// (e.g. principal display_name/source/classification/lifecycle_state at
-    /// that instant) — opaque to this store, stored and returned verbatim.
-    /// Free-form (typically JSON), never parsed here.
+    /// that instant), stored and returned verbatim and immutable once written.
+    /// Free-form (typically JSON) EXCEPT for one key: for an ENGINE grant,
+    /// `record_attestation` parses the snapshot and reads `kSnapshotOwnerKey`
+    /// (the owner frozen at open) for its frozen-owner refusal. Both open-campaign
+    /// builders (REST, MCP) must keep writing it under that name.
     std::string grant_snapshot;
 };
 
@@ -171,7 +174,7 @@ struct AttestationHistoryRow {
     std::string justification;
     /// True only for a superseded entry whose stored text was longer than the preview.
     bool justification_truncated{false};
-    std::int64_t decided_at_ms{0}; ///< the recording replica's wall clock
+    std::int64_t decided_at_ms{0}; ///< the DATABASE clock at the write transaction's start
 };
 
 /// What `record_attestation` appended: the decision it superseded and the new `seq`.
@@ -249,9 +252,9 @@ public:
     /// decision it superseded), never an overwrite; an identical repeat appends
     /// too. `decision` must be `"attested"` or `"flagged_revoke"`, NEVER
     /// `"pending"` (that is the frozen-at-open default only; there is no route
-    /// back to pending once a reviewer has spoken). Stamps `decided_at_ms = now`
-    /// (caller-independent, this store reads the wall clock, matching
-    /// `EnginePrincipalStore`'s `now_epoch` idiom) and the given
+    /// back to pending once a reviewer has spoken). Stamps `decided_at_ms` with the
+    /// DATABASE clock (the write transaction's `now()`, never a replica's system clock: the
+    /// campaign `created_at_ms` and `closed_at_ms` are authored the same way) and the given
     /// `reviewer`/`justification`. Returns the superseded decision and the new
     /// `seq`. The history row and the state change commit together or not at all.
     /// Errors carry a machine-checkable prefix so a REST caller can map them
@@ -271,12 +274,17 @@ public:
     /// not in the frozen population, OR the campaign is not open (the
     /// application refuses further decisions on a closed campaign, see
     /// `close_campaign`; the campaign row itself has no database guard);
+    /// `unexpected(kStoreForbiddenEngineOwner)` (403) when `principal_type ==
+    /// "engine"` and the owner frozen into the grant's snapshot at campaign open
+    /// is the reviewer, decided inside the transaction under the row lock, after
+    /// `not_found` and BEFORE the cap (nothing is written); a snapshot with no
+    /// usable owner has nothing to compare and is admitted;
     /// `unexpected("bad_request: " + kDecisionCapMessage)` (400) when the grant
     /// already holds `kMaxDecisionsPerGrant` decisions, decided inside the
     /// transaction under the row lock (nothing is written). Any other
-    /// `unexpected(msg)` is a genuine write failure (503/retry). The engine-owner
-    /// and group-member rules are NOT enforced here (they need other stores); the
-    /// route layer's gate owns them.
+    /// `unexpected(msg)` is a genuine write failure (503/retry). The LIVE
+    /// engine-owner and the group-member rules are NOT enforced here (they need
+    /// other stores, ADR-0012 s2(c)); the route layer's gate owns them.
     [[nodiscard]] std::expected<AttestationOutcome, std::string>
     record_attestation(const std::string& campaign_id, const std::string& principal_type,
                        const std::string& principal_id, const std::string& role_name,
@@ -320,9 +328,9 @@ public:
     close_campaign(const std::string& campaign_id, const std::string& closed_by);
 
     /// Every campaign's metadata row (NOT its attestations — call
-    /// `get_campaign` for those), newest-first by `created_at_ms`. This is
-    /// the surface an auditor needs to prove reviews ran on cadence — "list
-    /// every campaign that ever ran" — so unlike the operational `/auto`
+    /// `get_campaign` for those), newest-first by `created_at_ms`. Campaign
+    /// metadata only, with no decided or pending counts (read a campaign for
+    /// those); unlike the operational `/auto`
     /// pre-flight/deployment run stores, nothing here is pruned. Bounded to
     /// the most recent 500 campaigns (a monthly-cadence program takes ~40
     /// years to reach that; a higher-frequency one is exactly the case an

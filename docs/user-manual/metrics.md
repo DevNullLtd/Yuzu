@@ -1513,7 +1513,8 @@ refused by the rule that the reviewer must differ from the subject of the grant.
 Unlike the four series above it is counted for both the REST route and the MCP
 `record_attestation` tool (`surface` is `rest` or `mcp`). `reason` is
 `self_subject` (a `user` grant naming the reviewer), `engine_owner` (an engine
-principal the reviewer owns), `group_member` (a group the reviewer belongs to) or
+principal the reviewer owns now or owned when the campaign opened; the series counts both the
+live-owner refusal and the frozen-owner refusal and cannot tell them apart), `group_member` (a group the reviewer belongs to) or
 `check_unavailable` (the engine or group lookup behind the check could not be
 answered, so nothing was recorded; this one is a degraded store, not a reviewer
 doing something wrong, and no dedicated alert ships for it: the group path also

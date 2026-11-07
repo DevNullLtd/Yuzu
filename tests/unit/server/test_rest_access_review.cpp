@@ -2150,6 +2150,11 @@ TEST_CASE("attestation SoD gate: pure decisions with no store, and the store-err
     // The store's in-write refusal maps onto the same outcome; nothing else does.
     CHECK(sod::sod_from_store_error("forbidden: reviewer is the subject").value() ==
           SodOutcome::kSelfSubject);
+    // The frozen-owner backstop for an engine grant is the engine-owner outcome (same 403 body,
+    // the right audit reason), not the user rule.
+    CHECK(
+        sod::sod_from_store_error(std::string(yuzu::server::kStoreForbiddenEngineOwner)).value() ==
+        SodOutcome::kEngineOwner);
     CHECK_FALSE(sod::sod_from_store_error("not_found: no such campaign").has_value());
     CHECK_FALSE(sod::sod_from_store_error("bad_request: campaign_id invalid").has_value());
     CHECK_FALSE(sod::sod_from_store_error("pool acquire timeout").has_value());
@@ -2614,6 +2619,61 @@ TEST_CASE("attestation SoD: the owner of an engine principal is refused, revoked
             h.mcp_call_tool("record_attestation", sod_args(cid, "engine", "engine:svc", "Writer"));
         REQUIRE(ok);
         CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    }
+}
+
+TEST_CASE("attestation SoD: a FORMER engine owner (transferred since the campaign opened) is "
+          "refused by the store backstop with the same 403, audit reason and metric",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    seed_engine_grant(h, "engine:svc", "bob");
+    const auto cid = h.open_campaign_rest("sod former owner"); // freezes bob as the owner
+    // The snapshot the REST open handler wrote carries the owner under the shared key: the
+    // backstop reads it, so a rename in the builder must fail here, not silently admit everyone.
+    CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer")
+              .grant_snapshot.find(std::string("\"") + yuzu::server::kSnapshotOwnerKey +
+                                   "\":\"bob\"") != std::string::npos);
+    REQUIRE(h.eps->transfer_owner("engine:svc", "carol").has_value());
+    h.audit_log.clear();
+    const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer";
+
+    SECTION("REST: bob (owner at open, not now) is refused after the live read passes") {
+        h.session_user = "bob";
+        check_rest_sod_refusal(
+            h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer")));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "denied");
+        CHECK(rows[0].detail == "sod_engine_owner" + tuple);
+        CHECK(refused_count(h, "rest", "engine_owner") == 1.0);
+        const auto row = grant_row(h, cid, "engine", "engine:svc", "Writer");
+        CHECK(row.decision == "pending");
+        CHECK(row.decision_seq == 0);
+        CHECK(row.history.empty());
+    }
+
+    SECTION("MCP: the same refusal") {
+        h.session_user = "bob";
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "engine", "engine:svc", "Writer")));
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["message"] == std::string(sod::kSodMessage));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "sod_engine_owner" + tuple);
+        CHECK(refused_count(h, "mcp", "engine_owner") == 1.0);
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+    }
+
+    SECTION("the current owner is refused by the live read; a third reviewer is admitted") {
+        h.session_user = "carol";
+        check_rest_sod_refusal(
+            h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer")));
+        h.session_user = "dave";
+        auto ok = h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer"));
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").decision_seq == 1);
     }
 }
 
@@ -3210,6 +3270,8 @@ TEST_CASE("access review store errors: every string the store returns maps to on
     using yuzu::server::mcp::kInternalError;
     using yuzu::server::mcp::kInvalidParams;
     using yuzu::server::mcp::kPermissionDenied;
+    // A named string: the table holds const char*, so a temporary's c_str() would dangle.
+    const std::string kFrozenOwnerErr{yuzu::server::kStoreForbiddenEngineOwner};
     const Row rows[] = {
         {"not_found: no frozen grant matches (campaign_id, principal_type, principal_id, "
          "role_name) in an open campaign",
@@ -3228,6 +3290,7 @@ TEST_CASE("access review store errors: every string the store returns maps to on
         {"bad_request: justification exceeds 4096 bytes", 400, kInvalidParams},
         {"bad_request: closed_by contains a NUL byte", 400, kInvalidParams},
         {"forbidden: reviewer is the subject of this grant", 403, kPermissionDenied},
+        {kFrozenOwnerErr.c_str(), 403, kPermissionDenied},
         {"database not open", 503, kInternalError},
         {"database unavailable \xe2\x80\x94 try again", 503, kInternalError},
         {"open_campaign failed", 503, kInternalError},

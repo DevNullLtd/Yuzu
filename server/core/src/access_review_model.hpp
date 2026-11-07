@@ -243,10 +243,25 @@ inline constexpr std::int32_t kMaxDecisionsPerGrant = 100;
 /// for this one refusal) cannot drift. It spells out 100, pinned below.
 inline constexpr std::string_view kDecisionCapMessage =
     "this grant already has the maximum number of recorded decisions (100) in this campaign; no "
-    "further decision can be recorded on it. Close the campaign and open a new one to review it "
-    "again. If an earlier attempt may have been recorded, read the campaign first";
+    "further decision can be recorded on it. To review it again, open a new campaign (closing "
+    "this one is a separate choice: it leaves every undecided grant pending). If an earlier "
+    "attempt may have been recorded, read the campaign first";
 static_assert(kMaxDecisionsPerGrant == 100,
               "kDecisionCapMessage spells out 100: update the text with the constant");
+
+/// The store's in-transaction refusal when the reviewer owns the engine principal named by the
+/// grant's FROZEN snapshot (`owner_or_email`, written at campaign open). The route layer reads the
+/// owner live before the write; this is the backstop for an ownership transfer since the campaign
+/// opened, so a former owner stays refused. Carries the `forbidden: ` class prefix; the gate maps
+/// it to the engine-owner outcome (same 403 body).
+inline constexpr std::string_view kStoreForbiddenEngineOwner =
+    "forbidden: reviewer owned the engine principal named by this grant when the campaign opened";
+
+/// The key under which a frozen grant snapshot carries the engine principal's owner
+/// (`owner_username` for an engine row). The two open-campaign builders (REST, MCP) WRITE it and
+/// the store's frozen-owner backstop READS it: one name, so a rename cannot silently disable the
+/// backstop.
+inline constexpr const char* kSnapshotOwnerKey = "owner_or_email";
 
 /// The `bad_request: ` prefix the store puts on a refusal it classifies as the caller's.
 inline constexpr std::string_view kBadRequestPrefix = "bad_request: ";

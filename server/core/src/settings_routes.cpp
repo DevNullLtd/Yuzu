@@ -1488,7 +1488,7 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
                 "<div class=\"mini-field\" style=\"flex:1\">"
                 "<label>Campaign title</label>"
                 "<input type=\"text\" name=\"title\" placeholder=\"e.g. Q3 2026 access review\" "
-                "required>"
+                "maxlength=\"256\" required>"
                 "</div>"
                 "<button class=\"btn btn-primary\" type=\"submit\">Open review campaign</button>"
                 "</form>";

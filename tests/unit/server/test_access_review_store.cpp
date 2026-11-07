@@ -1028,6 +1028,118 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
     }
 }
 
+// Engine grants carry the owner frozen at campaign open (`owner_or_email` in the snapshot). The
+// route layer reads the live owner before the write; the store refuses the FROZEN owner under the
+// row lock, so a former owner stays refused after a transfer ("owner at open OR owner now").
+TEST_CASE("record_attestation: an engine grant refuses the owner frozen at campaign open, admits "
+          "everyone else, and an ownerless or unparsable snapshot has nothing to compare",
+          "[access_review][store][pg][sod][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<GrantRef> grants = {
+        GrantRef{"engine", "engine:own", "Writer",
+                 R"({"display_name":"x","owner_or_email":"owen"})"},
+        GrantRef{"engine", "engine:orphan", "Writer",
+                 R"({"display_name":"y","owner_or_email":""})"},
+        GrantRef{"engine", "engine:junk", "Writer", "not json"},
+        GrantRef{"engine", "engine:typed", "Writer", R"({"owner_or_email":42})"},
+        GrantRef{"user", "owen", "Reader", R"({"owner_or_email":"owen"})"},
+    };
+    auto open_res = store.open_campaign("Frozen owner", "admin", grants, "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto refused =
+        store.record_attestation(cid, "engine", "engine:own", "Writer", "attested", "owen", "");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == std::string(yuzu::server::kStoreForbiddenEngineOwner));
+    CHECK(refused.error().starts_with("forbidden:"));
+    // Refused before the history INSERT: nothing recorded, the grant is still pending.
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* own = find_row(*view, "engine", "engine:own", "Writer");
+    REQUIRE(own != nullptr);
+    CHECK(own->decision == "pending");
+    CHECK(own->decision_seq == 0);
+    CHECK(own->history.empty());
+
+    // Another reviewer is admitted; the owner is refused again afterwards (the rule is per
+    // reviewer, not per grant state).
+    auto other =
+        store.record_attestation(cid, "engine", "engine:own", "Writer", "attested", "carol", "");
+    REQUIRE(other.has_value());
+    auto again =
+        store.record_attestation(cid, "engine", "engine:own", "Writer", "attested", "owen", "");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == std::string(yuzu::server::kStoreForbiddenEngineOwner));
+
+    // Nothing to compare against: an empty owner, a non-JSON snapshot, a non-string owner.
+    for (const char* id : {"engine:orphan", "engine:junk", "engine:typed"}) {
+        INFO(id);
+        auto ok = store.record_attestation(cid, "engine", id, "Writer", "attested", "owen", "");
+        CHECK(ok.has_value());
+    }
+    // The frozen owner only matters for ENGINE grants: a USER (or group) grant whose snapshot
+    // happens to carry an owner key is decided by its own rule, so the "owner" attesting it is
+    // admitted (a check that ran for every type would refuse here).
+    std::vector<GrantRef> others = {
+        GrantRef{"user", "dave", "Reader", R"({"owner_or_email":"owen"})"},
+        GrantRef{"group", "eng", "Reader", R"({"owner_or_email":"owen"})"},
+    };
+    auto other_campaign =
+        store.open_campaign("Frozen owner, other types", "admin", others, "enabled");
+    REQUIRE(other_campaign.has_value());
+    CHECK(
+        store.record_attestation(*other_campaign, "user", "dave", "Reader", "attested", "owen", "")
+            .has_value());
+    CHECK(
+        store.record_attestation(*other_campaign, "group", "eng", "Reader", "attested", "owen", "")
+            .has_value());
+}
+
+// Every authored time column is the DATABASE clock in epoch MILLISECONDS (a seconds-for-ms slip
+// would pass a "> 0" check, so compare with the system clock, which equals the container's host).
+TEST_CASE(
+    "access review times are database-clock epoch milliseconds, ordered open <= decide <= close",
+    "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    const auto sys_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    };
+    const auto before = sys_ms();
+    auto open_res = store.open_campaign("Times", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    auto rec = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok");
+    REQUIRE(rec.has_value());
+    REQUIRE(store.close_campaign(cid, "admin").has_value());
+    const auto after = sys_ms();
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(row != nullptr);
+    constexpr std::int64_t kSlack = 120000; // DB and test share a host in CI; generous for skew
+    for (const std::int64_t t :
+         {view->campaign.created_at_ms, row->decided_at_ms, view->campaign.closed_at_ms}) {
+        CHECK(t > before - kSlack);
+        CHECK(t < after + kSlack);
+    }
+    CHECK(view->campaign.created_at_ms <= row->decided_at_ms);
+    CHECK(row->decided_at_ms <= view->campaign.closed_at_ms);
+    // The state row and its latest history entry carry the identical stamp (the consistency
+    // trigger compares them byte for byte).
+    REQUIRE(row->history.size() == 1);
+    CHECK(row->history[0].decided_at_ms == row->decided_at_ms);
+}
+
 // A genuine store fault is a fixed string (never libpq text), carries no refusal prefix, and the
 // connection that saw the ERROR is recycled so a second call on a tiny pool fails the same honest
 // way instead of hanging. (Replaces the pre-append-only fixed-string and pool-of-one cases.)

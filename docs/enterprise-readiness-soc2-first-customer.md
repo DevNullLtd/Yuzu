@@ -149,7 +149,7 @@ later decision on a grant replaced the earlier one, so the campaign record could
 decided what, in what order. Now: (1) the reviewer must differ from the subject of the grant, on
 REST (`POST /api/v1/access-reviews/{id}/attestations`) and on MCP (`record_attestation`), through
 one shared rule: a `user` grant whose `principal_id` is the reviewer's account name (byte-exact),
-an engine principal the reviewer owns, or a group the reviewer is a member of (as Yuzu's stored
+an engine principal the reviewer owns now or owned when the campaign opened (the store compares the owner frozen into the grant inside the transaction, so a former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner), or a group the reviewer is a member of (as Yuzu's stored
 membership records it; see the limit below for identity-provider-assigned memberships) is refused
 with `403` and nothing is recorded; the rule applies
 to an administrator with RBAC off as well; (2) every decision is appended to
@@ -157,18 +157,30 @@ to an administrator with RBAC off as well; (2) every decision is appended to
 grant row keeps only the latest; (3) a refusal writes an `access_review.attested` or
 `access_review.flagged` row with `result=denied` and a fixed token, and moves
 `yuzu_access_review_attestation_refused_total{surface,reason}`; a check that cannot be answered
-fails closed with `503`. Limits an assessor should know, stated as limits: **the engine and group
-rules are decided by a read before the write transaction** (the Postgres store contract forbids one
-store consulting another while it holds a lease), so an ownership transfer or a membership change
-inside that window is not seen, and there is no re-read after the commit; the user rule has no such
-window. **Group membership is as fresh as the member's last sign-in:** engine ownership is a live
-read, but group membership is read from Yuzu's stored membership, which an identity provider updates
+fails closed with `503`. Limits an assessor should know, stated as limits: **the group rule, and an engine
+ownership acquired after the campaign opened, are decided by a read before the write transaction** (the
+Postgres store contract forbids one store consulting another while it holds a lease), so a membership change
+or an ownership the reviewer acquires inside that window is not seen, and there is no re-read after the
+commit; the user rule and the frozen engine owner have no such window. **Group membership is as fresh as the
+member's last sign-in:** the current engine owner is read live, but group membership is read from Yuzu's stored membership, which an identity provider updates
 only when that member signs in, so a change at the identity provider is not seen by the group rule
 until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token skips the membership
 refresh (for example an Entra groups-overage token) does not refresh it. For identity-provider-
 governed groups the rule is not a current-membership check, and a review of those groups at the
-identity provider at campaign close is the compensating step. An owner who transferred an engine, or
-a member who left a group, before attesting is admitted. **Independence evidence for engine and
+identity provider at campaign close is the compensating step. A member who left a group before attesting
+is admitted; an owner who transferred an engine away is still refused by the frozen owner comparison (the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner).
+**Recorded owner acceptance (2026-11-07).** Accepted by Dave Rae (project owner), questions-window ruling 2026-11-07, for the
+release carrying #4752. (1) The group-member check, and an engine ownership acquired after the campaign
+opened, are decided from a read made before the attest transaction; a membership or ownership change
+committed between that read and the attest COMMIT is not seen. Normally milliseconds; worst case about 4 s
+acquire plus up to 6 s of lock waits plus statement time; no bound is promised. (2) "Member" means a row in
+`rbac_store.group_members`. For identity-provider groups (entra, saml) that row is written only when the
+member signs in interactively; token sessions and groups-overage tokens do not refresh it. Precision notes (drafted by the session, from the code): membership
+held only at the provider or in the SCIM store is not consulted and bears no Yuzu role grant. This is not a
+current-membership check. Not covered by this acceptance: the user rule and the frozen engine owner (no
+window), in-flight reviewer revocation, anything after COMMIT. Compensating control: review of
+provider-governed groups at the provider at campaign close, procedural, not enforced by Yuzu. Precision notes (drafted by the session, from the code): the evidence of
+independence is the set-and-proceed `sod=pass` audit row only. **Independence evidence for engine and
 group grants:** the history row does not record the ownership or membership basis; the `sod=pass`
 audit row (set-and-proceed, kept for the audit retention period) is the evidence, so export audit
 rows to the evidence store within that period; if that row was not persisted (`audit_persisted:false`
@@ -176,7 +188,7 @@ on MCP, `Sec-Audit-Failed` on REST), an assessor should treat that grant's indep
 unevidenced; recording the basis in the history row is tracked under #6060. **Per-grant limit:** a
 grant keeps at most 100 decisions; the 100th is final and no further decision is accepted on that
 grant in that campaign. The history and the audit rows identify who wrote the entries, and the
-remedy is to close the campaign and open a new one, which freezes a fresh population. A blind retry
+remedy is to open a new campaign, which re-freezes the whole population as pending (closing the old one is a separate choice that leaves every undecided grant pending). A blind retry
 of an unacknowledged attempt appends an identical decision until that limit, after which the request
 is refused. **Superseded justifications are shown truncated:** a history read returns, for every entry
 except a grant's latest, at most the first 64 characters of its justification, flagged by
@@ -212,11 +224,9 @@ API-token caller (acting as its owning user) and a supervised-tier MCP token can
 write routes are step-up exempt (`kEvidenceCapture`), so no fresh MFA proof is required (the exemption
 covers the REST and dashboard path only: MCP is not step-up gated and token principals do not take the MFA
 path); the history row stores only `reviewer`, and on the audit side `principal_class` is a persisted column stamped only by how the credential was presented (an `Authorization` or `X-Yuzu-Token` header gives `agent`, a `yuzu_session` cookie gives `human`), so an API-token caller and an MCP-token caller cannot be told apart on the `access_review.attested` row, and there is no auth-source field. `AuditEvent::mcp_tool` is never persisted: on MCP the tool name is on the separate companion row `mcp.record_attestation` (`target_type=mcp_tool`). The domain row is set-and-proceed, so it can be absent (`Sec-Audit-Failed` on REST, `audit_persisted:false` on MCP). Audit rows are kept for the audit retention period
-(365 days by default). Open and close have no separation of duties. Two colluding reviewers can decide each
+(365 days by default). Open and close have no separation of duties. **Audit limit:** `sod_engine_owner` (audit detail) and `engine_owner` (metric reason) cover BOTH the live-owner refusal and the frozen-owner refusal and cannot tell them apart. **Completeness test for an assessor:** A campaign is complete only when it is closed AND `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`) shows `pending_count` 0; a campaign closed with `pending_count` above 0 is recorded as incomplete evidence, and the campaign list (metadata only) cannot show which of the two a campaign is. Two colluding reviewers can decide each
 other's grants, so this is not four-eyes beyond the two-identity case above. A reviewer whose authority is
-revoked while their attest is in flight can still commit it (the documented window). `decided_at_ms` and
-`closed_at_ms` are the wall clock of the replica that recorded them; across replicas only `decision_seq`
-order is reliable. A sole Administrator on an RBAC-off install cannot decide their own grants, so the
+revoked while their attest is in flight can still commit it (the documented window). `created_at_ms`, `decided_at_ms` and `closed_at_ms` are authored by the database clock (the write transaction's `now()`, in epoch milliseconds), not by each replica's system clock. A decision's stamp is the transaction START time, so it can precede the COMMIT by the lock wait, and the history entry and the state row carry the identical value. `decision_seq` is the ordering authority for the decisions on one grant: a decision queued behind a lock can carry an earlier stamp than the one it follows. A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host. A sole Administrator on an RBAC-off install cannot decide their own grants, so the
 campaign can only close with those grants `pending`. Revisit under the four-eyes primitive work (epic #6060). See
 `docs/auth-architecture.md` "Periodic access reviews".
 
@@ -225,7 +235,11 @@ statement that an attestation is proof that a person reviewed a grant, is withdr
 is evidence that a reviewer ACCOUNT recorded it. Reason: an API-token caller and a supervised-tier MCP token
 can attest as the owning user with no fresh MFA proof, and the audit row cannot tell those callers apart
 (`principal_class` reflects only how the credential was presented; the MCP tool name is on the companion
-`mcp.record_attestation` row, not on the domain row). The detail is in `docs/security-reviews/access-reviews-2026-07-21.md`,
+`mcp.record_attestation` row, not on the domain row). The same amendment also records: the cap-refusal remedy is now "open a new campaign" (closing the old one is
+a separate choice that leaves every undecided grant pending); the campaign list is metadata only and is not by
+itself proof that a review was completed (read a campaign for `pending_count` and the attestation rows); the
+timestamps come from the database clock; and the engine-owner rule now also compares the owner frozen at
+campaign open inside the write transaction. The detail is in `docs/security-reviews/access-reviews-2026-07-21.md`,
 "Amended 2026-11-07".
 
 **Addendum — service-scoped token fleet-wide confinement, durably closed

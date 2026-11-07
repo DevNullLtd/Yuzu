@@ -4472,8 +4472,10 @@ exists to surface.
 
 List every review campaign's metadata (**not** its attestations — use
 `GET /api/v1/access-reviews/{id}` for those), newest-first, capped at the
-most recent 500. The surface an auditor needs to prove reviews ran on
-cadence without already knowing a `campaign_id` out-of-band.
+most recent 500, so a `campaign_id` need not be known out-of-band. The list
+carries no decided or pending counts and is not by itself proof that a review
+was completed: read a campaign with `GET /api/v1/access-reviews/{id}` to see
+`pending_count` and the attestation rows.
 
 **Permission:** `AccessReview:Read`.
 
@@ -4578,8 +4580,10 @@ while the grant is pending. Each entry has `seq` (1 for the first decision on th
 `seq`, never by time), `decision`, `previous_decision` (the decision it replaced:
 `pending` for the first one; an empty string means *not recorded*, for a decision
 that predates the history table, and never means pending), `reviewer`,
-`justification`, `justification_truncated` and `decided_at_ms` (the wall clock of
-the server replica that recorded it). The grant's own `decision`, `reviewer`,
+`justification`, `justification_truncated` and `decided_at_ms` (authored by the
+database clock, the write transaction's `now()` in epoch milliseconds; it is the transaction START time, so it can precede the
+commit by the lock wait, and a decision queued behind a lock can carry an earlier stamp than the one it follows, so order one
+grant's decisions by `seq`). `created_at_ms` and `closed_at_ms` are authored the same way. A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host. The grant's own `decision`, `reviewer`,
 `justification` and `decided_at_ms` are the latest entry. Only the latest entry
 carries its whole `justification`. Every earlier entry carries at most the first
 64 characters of the text it was recorded with (counted in characters, so on a
@@ -4690,7 +4694,7 @@ decision. `400`, one cause each:
 - `justification` is longer than 4096 bytes or contains a NUL byte. The store checks this after the
   separation-of-duties gate and writes a `failure` audit row.
 - The grant already holds the maximum of 100 recorded decisions. The message is
-  `this grant already has the maximum number of recorded decisions (100) in this campaign; no further decision can be recorded on it. Close the campaign and open a new one to review it again. If an earlier attempt may have been recorded, read the campaign first`,
+  `this grant already has the maximum number of recorded decisions (100) in this campaign; no further decision can be recorded on it. To review it again, open a new campaign (closing this one is a separate choice: it leaves every undecided grant pending). If an earlier attempt may have been recorded, read the campaign first`,
   with no `bad_request:` prefix. It is decided in the store, leaves the state unchanged and writes a
   `failure` audit row.
 
@@ -4711,18 +4715,22 @@ answered (see below).
 session's principal. The route refuses the decision when the reviewer is the
 subject of the grant, by `principal_type`: a `user` grant whose `principal_id` is
 the reviewer (an exact, case-sensitive comparison of the account name); an
-`engine` grant for an engine principal the reviewer owns (revoked ones included);
+`engine` grant for an engine principal the reviewer owns now or owned when the campaign opened (revoked ones included; the owner is frozen into the grant at open, so a former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner);
 a `group` grant for a group the reviewer is a member of (memberships an identity
 provider assigns count). An engine id or group with no record is admitted. The
 same rule holds for both decisions, so a subject cannot flag or un-flag a grant
-that names them. The check on an engine or group grant is read just before the
-write, not inside it, so a change to the owner or the membership that lands in
-between is not seen; the user rule has no such gap. The two identities of one
+that names them. The group check, and the check of who owns the engine principal now,
+are read just before the write, not inside it, so a membership change, or an ownership the
+reviewer acquires, that lands in between is not seen; the user rule and the comparison with
+the owner frozen at campaign open (made inside the write transaction, answered with the same
+`403` body and the audit reason `sod_engine_owner`) have no such gap. The two identities of one
 person (a local account and an SSO identity) count as two reviewers.
 
-**How fresh the engine and group checks are.** Both are read at the moment of the
-attest, so an owner who transferred an engine, or a member who left a group, before
-attesting is admitted. Engine ownership is a live read. Group membership is read
+**How fresh the engine and group checks are.** Both pre-reads see the state at the
+moment of the attest, so a member who left a group before attesting is admitted, and a
+reviewer who owns the engine principal now is refused even if they did not own it at open.
+An owner who transferred the engine away is still refused by the frozen owner comparison. The way out is to ask another reviewer to record the decision, or to open a new campaign, which freezes the current owner as the grant's owner.
+Current engine ownership is a live read. Group membership is read
 from Yuzu's stored membership, which an identity provider updates only when that
 member signs in: a change at the identity provider is not seen by the group rule
 until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token
@@ -4744,7 +4752,7 @@ entry. `decision_seq` in the `GET /api/v1/access-reviews/{id}` response shows ho
 many decisions the grant has. A grant keeps at most 100: the 100th decision is
 final, and no further decision is accepted on that grant in that campaign. The
 history and the audit rows identify who wrote the entries. To review the grant
-again, close the campaign and open a new one, which freezes a fresh population. `record_attestation`'s MCP `destructiveHint` stays
+again, open a new campaign, which re-freezes the whole population as pending (closing this one is a separate choice that leaves every undecided grant pending). `record_attestation`'s MCP `destructiveHint` stays
 `true` because the current decision is replaced with no route back to pending; the
 earlier one is kept in the history (a read returns the latest 100 entries per grant,
 an earlier justification cut to its first 64 characters).
@@ -4801,7 +4809,7 @@ so an archive holds both:
 |---|---|---|
 | Recorded | `success` | `decision=<d> previous=<pending\|attested\|flagged_revoke\|-> seq=<n> sod=pass` (`-` for a previous decision that was not recorded) |
 | Reviewer is the user subject | `denied` | `sod_self_subject` |
-| Reviewer owns the engine | `denied` | `sod_engine_owner` |
+| Reviewer owns the engine now, or owned it when the campaign opened | `denied` | `sod_engine_owner` (covers the live-owner and the frozen-owner refusal; the two cannot be told apart in the audit row) |
 | Reviewer is a group member | `denied` | `sod_group_member` |
 | Engine or group lookup unavailable | `failure` | `sod_check_unavailable store=engine` or `store=rbac` |
 | Store fault that is not the caller's (lease timeout, query error, lost commit) | `failure` | the fixed store-failure message above, never the database text |

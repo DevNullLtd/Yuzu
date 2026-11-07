@@ -3698,14 +3698,15 @@ static const ToolDef kTools[] = {
      "grant's history (get_access_review returns the latest 100 entries per grant, with an "
      "earlier justification cut to its first 64 characters, and a decision_seq). The "
      "reviewer must differ from the subject of the grant: a user grant naming the caller, an "
-     "engine principal the caller owns, or a group the caller belongs to is refused with a "
+     "engine principal the caller owns now or owned when the campaign opened, or a group the caller "
+     "belongs to is refused with a "
      "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
      "another reviewer to record this decision', and records nothing. principal_id and "
      "role_name are at most 1024 bytes each and justification at most 4096 bytes (a "
      "justification that is present and not a string is refused with invalid params). Each grant "
      "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
-     "invalid params and records nothing, and the way to review that grant again is to close "
-     "the campaign and open a new one. A successful call returns decision_seq (this "
+     "invalid params and records nothing, and the way to review that grant again is to open a "
+     "new campaign. A successful call returns decision_seq (this "
      "decision's position in the grant's history, 1 for the first) and previous_decision "
      "(the decision it superseded, 'pending' for the first), so you can see when you replaced "
      "another reviewer's decision. "
@@ -3750,18 +3751,19 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
-     "for those), newest-first, capped at the most recent 500. The surface an auditor "
-     "needs to prove reviews ran on cadence. Each campaign's rbac_enforcement "
+     "for those), newest-first, capped at the most recent 500. Metadata only, with no "
+     "decided or pending counts: use get_access_review (pending_count and the attestation rows) "
+     "to see how complete a campaign is. Each campaign's rbac_enforcement "
      "(enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN (empty string for "
      "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
      "Self-audited as access_review.list; if that audit write fails the list still stands and "
      "the result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
@@ -29442,7 +29444,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::string snapshot =
                         JObj()
                             .add("display_name", r.display_name)
-                            .add("owner_or_email", r.owner_or_email)
+                            .add(kSnapshotOwnerKey, r.owner_or_email)
                             .add("effective_permission_count", r.effective_permission_count)
                             .add("last_activity_ms", r.last_activity_ms)
                             .add("last_activity_kind", r.last_activity_kind)

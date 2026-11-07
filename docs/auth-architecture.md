@@ -3868,14 +3868,21 @@ permission, session, engine-session and (REST) browser-write checks, on both sur
   any lease is taken: in the gate, and again in the store (a `forbidden:` result), so it holds even for a caller
   that skips the gate, and it is answered before `not_found`. The UPDATE predicate and the history `CHECK` are
   backstops. A self-subject attempt against a closed campaign is therefore refused with 403, not 404.
-- `engine`: refused when the reviewer owns the engine principal (`owner_username`), revoked engines included.
-  An engine id with no row (an orphan grant) is admitted, because there is no owner to compare against.
+- `engine`: refused when the reviewer owns the engine principal now, or owned it when the campaign opened (`owner_username`), revoked engines included.
+  The rule has two parts. The route layer reads the LIVE owner before the write (the window below applies to
+  it). The store then also refuses, inside the locked attest transaction, a reviewer who equals the owner frozen
+  into the grant at campaign open (`grant_snapshot` `owner_or_email`; `kStoreForbiddenEngineOwner`), answered
+  with the same 403 body, the audit reason `sod_engine_owner` and the metric reason `engine_owner` (these cover both the live-owner and the frozen-owner refusal and cannot tell them apart). So a FORMER
+  owner stays refused after an ownership transfer (refused when the reviewer was the owner at open OR is the
+  owner now). The way out is to ask another reviewer to record the decision, or to open a new campaign, which freezes the current owner as the grant's owner. An engine id with no row (an orphan grant), or a snapshot that is empty or cannot be parsed, has
+  no owner to compare against and is admitted.
 - `group`: refused when the reviewer is a member of the group. A group with no row, or one the reviewer is not
   in, is admitted. Membership is read with `RbacStore::user_rbac_group_names_checked` from Yuzu's stored
   membership, which also holds memberships reconciled from an identity provider at login
   (`reconcile_idp_memberships`); see "How fresh the engine and group reads are" below.
 
-The engine and group rules are a pre-read through the owning stores. A lookup that cannot be answered fails
+The group rule and the live-owner part of the engine rule are a pre-read through the owning stores (the frozen
+owner comparison is inside the store transaction and reads no other store). A lookup that cannot be answered fails
 CLOSED: REST answers 503 with `retry_after_ms`, MCP answers `kInternalError` with
 `mcp::kMcpStoreFaultRetryMs`, the audit row is `failure`, and nothing is written. It is never read as "not the
 owner" or "not a member". `get_group_members` is deliberately not used for this: it collapses a read failure
@@ -3892,8 +3899,8 @@ Under RBAC off only administrators do, and the rule still applies: an administra
 `Administrator` grant is refused. Service-scoped tokens are refused earlier (the empty `kServiceScopeGlobalSafe`
 allow-list) and the MCP tier check precedes the gate. Engine principal sessions are refused before the gate.
 
-**The window (stated as a limit, not a guarantee).** The engine-owner and group-member rules are decided by a
-read BEFORE the store's write transaction, not inside it. ADR-0012 s2(c) forbids a store method from calling
+**The window (stated as a limit, not a guarantee).** The group-member rule, and an engine ownership acquired
+after the campaign opened, are decided by a read BEFORE the store's write transaction, not inside it. ADR-0012 s2(c) forbids a store method from calling
 another store, or re-entering the pool, while it holds a lease, so the attest transaction does not consult the
 engine or RBAC store. ADR-0012 s2(c) itself sends cross-store work to s3, a dedicated query owner that takes one
 lease and issues schema-qualified SQL across the schemas; the project chose the pre-read with a documented window
@@ -3905,20 +3912,34 @@ lock wait separately: the pre-read is one statement (`FOR UPDATE OF a FOR SHARE 
 3 s on the grant row and then up to 3 s on the campaign row (the second wait only behind a queued close), so
 lock waits can total about 6 s plus statement time while holding the connection, and the worst-case caller
 latency is about 4 s + 6 s.
-It is normally milliseconds but is not a bound the code promises. An ownership transfer or a membership change
-that lands inside it is not seen, and there is no re-read after the commit. The user rule has no such window.
-Revisit under the four-eyes primitive work (epic #6060).
+It is normally milliseconds but is not a bound the code promises. A membership change, or an engine ownership
+the reviewer acquired, that lands inside it is not seen, and there is no re-read after the commit. The frozen engine
+owner (checked inside the transaction) has no window; only an ownership the reviewer acquired after the campaign
+opened AND after the route layer's read is not seen, until the next read. The user rule also has no window. Revisit under the four-eyes primitive work (epic #6060).
 
-**How fresh the engine and group reads are.** This is separate from the window above. Both reads see the state
-at the moment of the attest, not at the moment the campaign opened: an owner who transferred an engine, or a
-member who left a group, before attesting is admitted. Engine ownership is a live read
-(`EnginePrincipalStore::get` selects the current row). Group membership is read from Yuzu's stored membership
+**How fresh the engine and group reads are.** This is separate from the window above. Both pre-reads see the
+state at the moment of the attest, not at the moment the campaign opened: a member who left a group before
+attesting is admitted, and a reviewer who owns the engine principal now is refused even if they did not own it
+at open. An owner who transferred the engine away is still refused, by the frozen owner comparison in the
+store. The way out is to ask another reviewer to record the decision, or to open a new campaign, which freezes the current owner as the grant's owner. The current owner is a live read (`EnginePrincipalStore::get` selects the current row). Group membership is read from Yuzu's stored membership
 (`rbac_store.group_members`), which an identity provider updates only when that member signs in (the Entra and
 SAML login paths call `reconcile_idp_memberships`). A change at the identity provider is not seen by the group
 rule until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token skips the
 membership refresh (for example an Entra groups-overage token) does not refresh it. For identity-provider-
 governed groups the rule is therefore not a current-membership check. The compensating step is a review of
 those groups at the identity provider at campaign close.
+
+**Recorded acceptance (owner, 2026-11-07).** Accepted by Dave Rae (project owner), questions-window ruling 2026-11-07, for the release
+carrying #4752. (1) The group-member check, and an engine ownership acquired after the campaign opened, are
+decided from a read made before the attest transaction; a membership or ownership change committed between that
+read and the attest COMMIT is not seen. Normally milliseconds; worst case about 4 s acquire plus up to 6 s of
+lock waits plus statement time; no bound is promised. (2) "Member" means a row in `rbac_store.group_members`.
+For identity-provider groups (entra, saml) that row is written only when the member signs in interactively;
+token sessions and groups-overage tokens do not refresh it. Precision notes (drafted by the session, from the code): membership held only at the provider or in the
+SCIM store is not consulted and bears no Yuzu role grant. This is not a current-membership check. Not covered by
+this acceptance: the user rule and the frozen engine owner (no window), in-flight reviewer revocation, anything
+after COMMIT. Compensating control: review of provider-governed groups at the provider at campaign close,
+procedural, not enforced by Yuzu. Precision notes (drafted by the session, from the code): the evidence of independence is the set-and-proceed `sod=pass` audit row only.
 
 **Evidence of independence for engine and group grants.** For these two types the history row does not record
 the ownership or membership basis. Independence is evidenced by the `sod=pass` audit row, which is written
@@ -3946,6 +3967,8 @@ acceptance of that limit is recorded for access reviews.
 **Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is the subject of a
 grant can still open or close a campaign.
 
+**The completeness test an auditor should use.** A campaign is complete only when it is closed AND `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`) shows `pending_count` 0; a campaign closed with `pending_count` above 0 is recorded as incomplete evidence, and the campaign list (metadata only) cannot show which of the two a campaign is.
+
 **"Reviewer" is an account, not proof of a person.** Engine principal sessions are refused (REST and MCP), as
 are service-scoped tokens (403) and the MCP read-only and operator tiers. An API-token caller acts as its owning
 user, so an API-token caller and a supervised-tier MCP token can still record a decision. The three write routes
@@ -3956,8 +3979,7 @@ as signed by a human.
 
 **Revocation and timing limits.** A reviewer whose authority is revoked while their attest is in flight can
 still commit it (the same window as the engine and group reads above, and the documented revocation latency).
-`decided_at_ms` and `closed_at_ms` are the wall clock of the replica that recorded them, not a database
-clock, so across replicas only `decision_seq` order is reliable. On an RBAC-off install a sole Administrator
+`created_at_ms`, `decided_at_ms` and `closed_at_ms` are authored by the database clock (the write transaction's `now()`, in epoch milliseconds), not by each replica's system clock. A decision's stamp is the transaction START time, so it can precede the COMMIT by the lock wait, and the history entry and the state row carry the identical value. `decision_seq` is the ordering authority for the decisions on one grant: a decision queued behind a lock can carry an earlier stamp than the one it follows. A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host. On an RBAC-off install a sole Administrator
 cannot decide their own user grant or a group they belong to, so the campaign can only close with those
 grants `pending`.
 
@@ -4064,12 +4086,12 @@ without NUL`, no audit row, and the same for all three grant types because it is
 and the store checks it again as a backstop; the schema `maxLength` values are discovery metadata only. A grant
 keeps at most 100 decisions: the 101st is refused inside the transaction with `400` / invalid-params and the
 message `this grant already has the maximum number of recorded decisions (100) in this campaign; no further
-decision can be recorded on it. Close the campaign and open a new one to review it again. If an earlier attempt
+decision can be recorded on it. To review it again, open a new campaign (closing this one is a separate choice: it leaves every undecided grant pending). If an earlier attempt
 may have been recorded, read the campaign first` (the store returns it with a `bad_request: ` classification
 prefix that the handlers strip, so it is not on the wire), nothing is written, and a `failure` audit row is
 written. The 100th decision is final: the grant takes no further decision in that campaign, the history and
-the audit rows identify who wrote the entries, and the remedy is to close the campaign and open a new one (a
-new campaign freezes a fresh population). A history read returns at most the latest
+the audit rows identify who wrote the entries, and the remedy is to open a new campaign, which re-freezes the whole population as pending (closing the old one is a
+separate choice that leaves every undecided grant pending). A history read returns at most the latest
 100 entries of a grant; `decision_seq` stays the total, so `decision_seq` greater than the number of entries
 means earlier ones are not shown. That bound holds for rows written through the application path; rows added by
 other means (owner-level SQL with the guard triggers disabled, for example a forged pending state row with more than

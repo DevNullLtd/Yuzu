@@ -250,6 +250,31 @@ class AttestGate(unittest.TestCase):
         self.assertEqual(len(gate_problems("f", STRING_WITH_COMMENT_OPENER)), 1)
 
 
+class StoreAuthorship(unittest.TestCase):
+    """The store authors every time column from the database clock and reads the frozen owner under
+    the shared snapshot key: pin both so a revert or a rename cannot pass silently."""
+
+    def setUp(self):
+        self.store = normalise((SRC_DIR / "access_review_store.cpp").read_text(encoding="utf-8"))
+
+    def test_no_replica_clock_in_the_store(self):
+        self.assertNotIn("system_clock", self.store)
+        self.assertNotIn("now_ms(", self.store)
+
+    def test_each_time_statement_uses_the_database_clock(self):
+        # definition + open (created_at_ms) + attest history and state (decided_at_ms) + close
+        self.assertGreaterEqual(self.store.count("kDbNowMsSql"), 5)
+        for col in ("created_at_ms", "decided_at_ms", "closed_at_ms"):
+            self.assertIn(col, self.store)
+
+    def test_snapshot_owner_key_is_shared(self):
+        self.assertIn("kSnapshotOwnerKey", self.store)
+        for name in ("rest_api_v1.cpp", "mcp_server.cpp"):
+            text = normalise((SRC_DIR / name).read_text(encoding="utf-8"))
+            self.assertIn(".add(kSnapshotOwnerKey, r.owner_or_email)", text,
+                          f"{name}: the open-campaign snapshot no longer uses the shared owner key")
+
+
 class DashboardDecisionFeedback(unittest.TestCase):
     """Both dashboard surfaces must say when a decision replaced another one, and the Settings
     buttons must stay disabled while a request is in flight (each extra click appends a decision)."""

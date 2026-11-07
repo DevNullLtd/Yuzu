@@ -92,7 +92,7 @@
     var created = '';
     YuzuDialog.form({
       title: 'Open review campaign',
-      fields: [{ name: 'title', label: 'Campaign title', required: true, maxlength: 200,
+      fields: [{ name: 'title', label: 'Campaign title', required: true, maxlength: 256,
                  placeholder: 'e.g. Q3 2026 access review' }],
       note: 'Freezes every current grant (one row per principal and role) for attestation. ' +
             'Closed campaigns are kept permanently.',
