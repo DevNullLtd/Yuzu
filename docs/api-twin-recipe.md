@@ -213,10 +213,9 @@ and by the `/swagger` page as well as by people:
   then the path (without the `/api/v1` base) in PascalCase, with each path parameter written as
   `By` plus its name. `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is
   `postHardwareByIdSync`, `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. A
-  new operation follows the same rule. Two tests in `tests/unit/server/test_openapi_spec_completeness.cpp`
-  check uniqueness: `openapi_spec_json(): every operation has a unique and well-formed operationId`
-  (which also checks presence and shape) and `openapi documents: every operation has a unique
-  operationId in both forms`.
+  new operation follows the same rule. One test in `tests/unit/server/test_openapi_spec_completeness.cpp`
+  checks presence, shape and uniqueness, in both forms of the document, and pins the whole set:
+  `openapi documents: every operation has a unique, well-formed and pinned operationId in both forms`.
 - **Group guides.** Prose for a group lives in the guide of the matching top-level `tags` entry
   under `x-yuzu-guide`, not inside an operation. `GET /api/v1/openapi.json` leaves the guides out
   and `?guides=true` includes them; the MCP resource `yuzu://openapi` and the discover tools serve
@@ -228,6 +227,48 @@ and by the `/swagger` page as well as by people:
   `unavailable` field on that row. A route that is registered must not carry it. When a store
   becomes wired in `server.cpp`, remove its markers in the same change:
   `tests/test_unavailable_store_wiring.py` fails if they disagree.
+
+**Checklist for a new operation.** Steps 1 to 5 are checked by the server unit-test binary, so a
+step skipped is found only after a full build, and not all at once: a missing `operationId` stops
+the id test before it reports the checksum, which appears on the next run. Do all six before the
+first build. The document is the template literal, not generated, so nothing below is done for you.
+
+1. **Path item.** Add the entry, and declare its tag in the top-level `tags` list. A registered
+   `/api/v1` route with no `paths` entry fails `RestApiV1::register_routes vs openapi_spec_json():
+   every registered /api/v1 route has a matching OpenAPI paths entry`, and a tag that is not
+   declared fails `openapi documents: every tag an operation uses is declared in the tag list`.
+2. **`operationId`.** Give it one by the rule above. It must match `^[a-z][A-Za-z0-9]*$` and be
+   unique. The id test stops at the first operation that has none, so it does not get as far as
+   the checksum (step 5) until every operation has an id.
+3. **Typed success response.** At least one `2xx` response must carry `content`, and a media type
+   under it must carry a `schema` (a `$ref` counts). The test `openapi documents: all but two
+   operations declare a typed success response` compares the set of operations without one to its
+   `kUntyped` list, which holds the two that answer `204` with no body
+   (`delete /upload-grants/{grant_id}` and `delete /uploads/{upload_id}`). Add a name to that list
+   only for another operation that answers with no body, never to skip the schema. The comparison
+   is for equality, so whoever gives a listed operation a body schema removes its name in the same
+   change. A schema is checked against its handler only for the routes in the `ResponsePin` table
+   in the same file, so write the schema from the handler, and add a row if the shape is easy to
+   get wrong.
+4. **Served text.** Every string in the document, in both forms, is checked by `openapi documents:
+   no text cites an issue, an ADR, a build wave or the review process`. Describe behaviour, not
+   where it came from: no `#1234` or `Issue 12`, ADR or SOC 2 references, `§` section marks,
+   source file names such as `x.cpp`, `Class::member` or `name()` identifiers, `snake_case_fn`
+   helper names, or gate and wave labels. A `summary` is held to a stricter list, which also
+   rejects a bare `Gate` or `ADR`. The regular expressions are in that test case.
+5. **Checksum.** The same id test as step 2 compares a hash of every `operationId method path`
+   to `kOperationIdChecksum`, so adding any operation changes it. Run the test: its failure prints
+   `sorted operationId pairs hash to "<hex>"`. Copy the value, quotes included, into
+   `kOperationIdChecksum`. It is `content_etag` (FNV-1a 64, `content_etag.hpp`) over the lines
+   `<id> <method> <path>`, one per operation with a lower-case method and the path without
+   `/api/v1`, sorted by id, each ending in a newline. A rename must also be stated in the
+   `operationId` note of `docs/user-manual/upgrading.md` and the changelog fragment, because it
+   changes generated clients.
+6. **Literal size.** MSVC rejects one string token over 16,380 bytes, and only the Windows leg
+   compiles it. `tests/test_openapi_literal_segments.py` (meson `docs` suite, no build, run it with
+   `python3 tests/test_openapi_literal_segments.py`) fails any raw-string piece of 15,000 bytes or
+   more. When a piece nears that, split it at the end of a line after a comma or closing brace:
+   close it with `)json"` and open the next piece with `R"json(` on the following line.
 
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
