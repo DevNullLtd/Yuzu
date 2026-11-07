@@ -10143,24 +10143,37 @@ may not have been applied: see "After a `500`" below), `503` (store unavailable,
 **After a `500`.** The write may or may not have been applied, and the `GET` cannot always tell. Read
 the switch back with a `GET` for the same `plugin`, `action` and `os` (needs `PluginConfig:Read`), then:
 
-- If the `GET` answers `503`, the store is down. Wait until the server is ready and read the switch back
-  again, then follow the rest of this list. If you cannot read it back and your request was a stop
-  (`enabled` false), repeat the `PUT`: a stop can only add a stop.
-- If the `GET` answers `403`, you hold `PluginConfig:Write` but not `PluginConfig:Read`. Ask a holder of
-  `PluginConfig:Read` to read the switch, or, for a stop, repeat the `PUT`.
+- If the `GET` answers `503`, the store is unavailable. Wait until the server is ready and read the switch
+  back again, then follow the rest of this list. If you cannot read it back and your request was a stop
+  (`enabled` false), repeat the `PUT`.
+- If the `GET` answers `403`, either you hold `PluginConfig:Write` but not `PluginConfig:Read`, or the
+  authorization store is degraded (it shares the database with the plugin config store, so the fault behind
+  the `500` can cause this too). Wait until the server is ready and read the switch back again. If it
+  still answers `403`, ask a holder of `PluginConfig:Read`, or, for a stop, repeat the `PUT`.
 - If `source` is empty, no row applies to this scope, so your write did not apply: repeat the `PUT`.
 - If `source` names the row you wrote (`plugin`, `plugin.action`, with `@os` appended when `os` was set),
-  `enabled` and `reason` are what you sent and `set_by` is you, the write applied.
+  `enabled` and `reason` are what you sent and `set_by` is you, the write applied. For a whole-plugin stop
+  (`action` omitted) that covers the plugin row only: an action with its own ON row keeps running, so check
+  any action that matters with `?action=`.
 - If `source` names your row but `enabled`, `reason` or `set_by` differ, either your write did not apply
-  and the row still holds an earlier value, or another operator changed the switch after it; the `GET`
-  cannot tell which. Read the `plugin_config.kill_switch.set` audit rows for that `target_id`. If none is
-  from another principal after your own `attempted` row, your write did not apply: repeat the `PUT`. If
-  one is, do not repeat the `PUT` until you have agreed the intended state with that operator, because it
-  would overwrite their change. If you cannot check the audit rows and your request was a stop, repeat it.
-- If `source` names a different row, another layer decides the effective state and the `GET` does not show
-  whether your write applied, because it takes `reason`, `set_by` and `updated_at_ms` from the row that
-  decided. Repeat the `PUT`, after a look at the audit rows if another operator may be writing the same
-  switch.
+  and the row still holds an earlier value, or someone changed the switch after it; the `GET` cannot tell
+  which. Do the audit check below.
+- If `source` names a different row, another layer (or the plugin row standing in for your action row)
+  decides the effective state, and the `GET` does not show whether your write applied. Do the audit check
+  below, for your own scope key and for the `source` key.
+
+**Audit check.** Read the rows with
+`GET /api/v1/audit?action=plugin_config.kill_switch.set&target_type=PluginConfig&target_id=<scope key>&since=<epoch seconds just before your first request>`
+(needs `AuditLog:Read`, which is admin-only while RBAC is off). Count a row from any principal, including
+your own other sessions and a second writer on your own account, dated after your first `attempted` row for
+this change, when it is a `success` row, or an `attempted` row with no `success` or `failure` row after it
+(a write in flight, or one whose outcome row was lost). Ignore an `attempted` row followed by a `failure`
+row. If there is no such row, your write did not apply: repeat the `PUT`. If there is one, do not repeat the
+`PUT` until you have agreed the intended state with that operator, because it would overwrite their change.
+The exception is a stop (`enabled` false): repeat it and tell them. A repeated stop replaces whatever the row
+holds, including their re-enable, which is the safe direction for an emergency but not harmless. If you do
+not hold `AuditLog:Read`, ask a holder to check. If nobody can and your request was a stop, repeat it; if it
+was an enable, do not repeat it.
 
 A repeat leaves the same `enabled` and `reason` but replaces `set_by` and `updated_at_ms`, and writes its
 own audit rows. The `attempted` row of the failed request stays in the trail, with a `failure` row after
@@ -10233,8 +10246,9 @@ Returns `204` on success, `404` if the grant does not exist or is no longer
 revocable (already redeemed or already revoked), and `503` if the store is unavailable or the
 `attempted` audit row cannot be saved. When the audit row could not be saved nothing was revoked, so
 retry. After a store error the revoke may or may not have applied: retry, and a `404` on the retry then
-means the first call applied or the agent redeemed the grant in the meantime; read the grant's state with
-`GET /api/v1/upload-grants` (needs `UploadGrant:Read`). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
+means the first call applied, the grant was redeemed or revoked by someone else in the meantime, or it never
+existed; read the grant's state with `GET /api/v1/upload-grants` (needs `UploadGrant:Read`). The two `503`
+causes carry different messages. An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
 upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads) (read its known-defect note first).
@@ -10264,8 +10278,9 @@ grant succeeds, but the agent cannot redeem it and an unredeemed grant expires. 
 credential on the agent to get past the refusal: it would give the endpoint operator authority, and the
 shipped client cannot send one. Server-side the refusal leaves no audit row and no per-route metric (only
 the fleet-wide `yuzu_http_requests_total` 401 count moves). To check for it, look for `upload_grant.mint`
-success rows past their `expires_at` with no `upload_grant.session_open` row of any result for that grant,
-while agents report `401` and `yuzu_server_audit_emit_failed_total` is flat (a lost row looks the same).
+success rows older than 15 minutes (the longest grant lifetime) with no `upload_grant.session_open` row of any
+result for that grant id, or grants that `GET /api/v1/upload-grants` still lists as minted past their
+`expires_at` (needs `UploadGrant:Read`), while agents report `401` and `yuzu_server_audit_emit_failed_total` is flat (a lost row looks the same).
 Revoke the unused grants or let them expire.
 
 **Common to all five routes:**
