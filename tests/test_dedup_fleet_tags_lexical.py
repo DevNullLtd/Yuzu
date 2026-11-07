@@ -53,9 +53,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 AGENT_CPP = ROOT / "agents" / "core" / "src" / "agent.cpp"
 STORE_HPP = ROOT / "agents" / "core" / "include" / "yuzu" / "agent" / "command_dedup_store.hpp"
+# #3678: the ring size is single-sourced here; the store's kMaxDedupRows is bound to it.
+HORIZON_HPP = ROOT / "common" / "include" / "yuzu" / "command_replay_horizon.hpp"
 TAGS_HPP = ROOT / "server" / "core" / "src" / "dedup_fleet_tags.hpp"
 AGENT_REGISTRY_CPP = ROOT / "server" / "core" / "src" / "agent_registry.cpp"
 SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
+AGENT_SERVICE_CPP = ROOT / "server" / "core" / "src" / "agent_service_impl.cpp"
+OUTBOX_DELIVERY_CPP = ROOT / "server" / "core" / "src" / "command_outbox_delivery.cpp"
 METRICS_MD = ROOT / "docs" / "user-manual" / "metrics.md"
 ALERTS_YML = ROOT / "docs" / "prometheus" / "yuzu-alerts.yml"
 ALERTS_TEST = ROOT / "tests" / "prometheus" / "yuzu-alerts.test.yml"
@@ -120,8 +124,15 @@ def other_gauges() -> list:
 
 
 def kmax_dedup_rows() -> int:
-    m = re.search(r"kMaxDedupRows\s*=\s*(\d+)\s*;", strip_line_comments(read(STORE_HPP)))
+    """The agent's ring bound: kAgentDedupRingRows (command_replay_horizon.hpp), which
+    command_dedup_store.hpp must bind kMaxDedupRows to (checked in problems(), check 5)."""
+    m = re.search(r"kAgentDedupRingRows\s*=\s*(\d+)\s*;", strip_line_comments(read(HORIZON_HPP)))
     return int(m.group(1)) if m else -1
+
+
+def store_binds_to_shared_ring_constant() -> bool:
+    return bool(re.search(r"kMaxDedupRows\s*=\s*(?:::)?(?:yuzu::)?kAgentDedupRingRows\s*;",
+                          strip_line_comments(read(STORE_HPP))))
 
 
 def problems() -> list:
@@ -182,7 +193,10 @@ def problems() -> list:
     # 5. the capacity HELP's ring bound is the agent's constant
     kmax = kmax_dedup_rows()
     if kmax < 0:
-        out.append("could not parse kMaxDedupRows from command_dedup_store.hpp (stale pattern)")
+        out.append("could not parse kAgentDedupRingRows from command_replay_horizon.hpp (stale pattern)")
+    elif not store_binds_to_shared_ring_constant():
+        out.append("command_dedup_store.hpp kMaxDedupRows is not bound to yuzu::kAgentDedupRingRows "
+                   "(#3678): the ring size must be single-sourced in command_replay_horizon.hpp")
     else:
         m = re.search(r'kDedupRowsMaxHelp\s*=(.*?)";', strip_line_comments(read(TAGS_HPP)), re.S)
         help_text = "".join(re.findall(r'"([^"]*)"', m.group(1) + '"')) if m else ""
@@ -238,6 +252,49 @@ def problems() -> list:
         out.append(f"tests/prometheus/yuzu-alerts.test.yml has {cases} 'dedup store degraded' cases, "
                    f"expected at least {MIN_PROMTOOL_CASES}: deleting cases leaves a rule that parses "
                    f"but is no longer behaviour-tested (#2553)")
+
+    # 9. #3678: the outbox redelivery horizon is measured on a sequence the server must WIRE and the
+    # dispatch-record failure sites must COUNT. Both are silent when missing: an unwired reader
+    # fails closed (the whole outbox stalls), and an uncounted failure site freezes the horizon
+    # exactly while record writes fail and the agent's dedup ring fills. A C++ test cannot see
+    # either, because server.cpp and the call sites are not built into the test targets.
+    srv = strip_line_comments(read(SERVER_CPP))
+    at = srv.find("CommandOutboxDelivery::Deps{")
+    window = srv[at:at + 6000] if at >= 0 else ""
+    if at < 0:
+        out.append("server.cpp no longer constructs CommandOutboxDelivery::Deps{...} (stale pattern)")
+    elif not re.search(r"\.dispatch_seq_fn\s*=", window) or "current_dispatch_position()" not in window:
+        out.append("server.cpp's CommandOutboxDelivery::Deps no longer wires .dispatch_seq_fn to "
+                   "ExecutionTracker::current_dispatch_position() (#3678): the outbox would hold every row")
+    svc = strip_line_comments(read(AGENT_SERVICE_CPP))
+    m = re.search(r"void AgentServiceImpl::record_command_dispatch\(.*?\n\}\n", svc, re.S)
+    body = m.group(0) if m else ""
+    if not body:
+        out.append("could not find AgentServiceImpl::record_command_dispatch in agent_service_impl.cpp")
+    else:
+        # Bind each call to ITS branch (comments already stripped, whitespace removed): a bare
+        # count of the token is satisfied by two calls in one branch, or by one after a `return`.
+        flat = re.sub(r"\s+", "", body)
+        degrade = r'metrics_\.counter\("yuzu_exec_correlation_write_degrade_total"\)\.increment\(\);'
+        note = r"if\(tracker\)tracker->note_unrecorded_dispatch\(\);"
+        if not re.search(r"if\(latch&&latch->tripped\(\)\)\{latch->note_skipped\(\);" + degrade + note + r"return;\}", flat):
+            out.append("AgentServiceImpl::record_command_dispatch must call note_unrecorded_dispatch() in "
+                       "its LATCH-SKIP branch, after the degrade count and before the return (#3678): an "
+                       "uncounted skipped dispatch freezes the outbox redelivery horizon while the agent "
+                       "ring fills")
+        if not re.search(r"if\(!recorded\)\{if\(latch\)latch->trip\(\);" + degrade + note + r"\}", flat):
+            out.append("AgentServiceImpl::record_command_dispatch must call note_unrecorded_dispatch() in "
+                       "its FAILED-WRITE branch (#3678): an uncounted failed write freezes the outbox "
+                       "redelivery horizon while the agent ring fills")
+    # 10. #3678: the stamp is cleared ONLY when this call wrote it AND the attempt reached no agent.
+    # A clear on any weaker condition lets a stamp that guards a REAL earlier send be dropped, which
+    # restarts the horizon and is the unsafe direction. The store also guards by epoch, but this is
+    # the condition the caller is responsible for.
+    dlv = strip_line_comments(read(OUTBOX_DELIVERY_CPP))
+    if not re.search(r"clear_first_send_stamp\s*=\s*\*/\s*stamped_now\s*&&\s*outcome\.sent\s*==\s*0", dlv):
+        out.append("command_outbox_delivery.cpp must pass clear_first_send_stamp = stamped_now && "
+                   "outcome.sent == 0 to reschedule (#3678): any weaker condition can drop a stamp "
+                   "that guards a real earlier send")
     return out
 
 
@@ -303,8 +360,48 @@ class DedupFleetTagsLexical(unittest.TestCase):
         self.assertTrue(any("names no issue number" in p for p in found), found)
 
     def test_self_check_detects_a_stale_ring_bound_in_the_help(self):
-        found = self._problems_with(STORE_HPP, lambda s: re.sub(r"(kMaxDedupRows\s*=\s*)20000", r"\g<1>30000", s))
+        found = self._problems_with(HORIZON_HPP, lambda s: re.sub(r"(kAgentDedupRingRows\s*=\s*)20000", r"\g<1>30000", s))
         self.assertTrue(any("kMaxDedupRows" in p for p in found), found)
+
+    def test_self_check_detects_an_unwired_dispatch_seq_reader(self):
+        found = self._problems_with(
+            SERVER_CPP, lambda s: s.replace(".dispatch_seq_fn = [this]", ".dispatch_seq_fx = [this]", 1))
+        self.assertTrue(any("no longer wires .dispatch_seq_fn" in p for p in found), found)
+
+    def test_self_check_detects_an_uncounted_unrecorded_dispatch_site(self):
+        # The skip branch's call (the first occurrence in the file) ...
+        found = self._problems_with(
+            AGENT_SERVICE_CPP, lambda s: s.replace("tracker->note_unrecorded_dispatch();", "", 1))
+        self.assertTrue(any("LATCH-SKIP branch" in p for p in found), found)
+
+        # ... and the failed-write branch's call (the LAST occurrence) are each pinned to THEIR branch.
+        def drop_last(s):
+            i = s.rindex("tracker->note_unrecorded_dispatch();")
+            return s[:i] + s[i + len("tracker->note_unrecorded_dispatch();"):]
+        found = self._problems_with(AGENT_SERVICE_CPP, drop_last)
+        self.assertTrue(any("FAILED-WRITE branch" in p for p in found), found)
+
+    def test_self_check_rejects_two_calls_in_one_branch(self):
+        # A bare token count would accept this: both calls in the failed-write branch, none in the skip.
+        def move_both(s):
+            call = "if (tracker)\n            tracker->note_unrecorded_dispatch();"
+            s = s.replace(call, "", 1)
+            return s.replace("metrics_.counter(\"yuzu_exec_correlation_write_degrade_total\").increment();\n        // #3678: see the skipped branch above.",
+                             "metrics_.counter(\"yuzu_exec_correlation_write_degrade_total\").increment();\n        if (tracker) tracker->note_unrecorded_dispatch();\n        // #3678: see the skipped branch above.", 1)
+        found = self._problems_with(AGENT_SERVICE_CPP, move_both)
+        self.assertTrue(any("LATCH-SKIP branch" in p for p in found), found)
+
+    def test_self_check_detects_a_weakened_stamp_clear_condition(self):
+        found = self._problems_with(
+            OUTBOX_DELIVERY_CPP,
+            lambda s: s.replace("/*clear_first_send_stamp=*/stamped_now && outcome.sent == 0",
+                                "/*clear_first_send_stamp=*/outcome.sent == 0", 1))
+        self.assertTrue(any("clear_first_send_stamp = stamped_now" in p for p in found), found)
+
+    def test_self_check_detects_a_store_ring_bound_that_forks_the_shared_constant(self):
+        found = self._problems_with(
+            STORE_HPP, lambda s: re.sub(r"(kMaxDedupRows\s*=\s*)::yuzu::kAgentDedupRingRows", r"\g<1>20000", s))
+        self.assertTrue(any("not bound to yuzu::kAgentDedupRingRows" in p for p in found), found)
 
 
 if __name__ == "__main__":

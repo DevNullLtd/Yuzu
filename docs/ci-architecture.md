@@ -1521,8 +1521,27 @@ job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
-`timeout-minutes: 120`. At np=2 the Linux slot-wait case was the one that
-needed attention: the "revisit the 700s per-shard budget or the Linux
+`timeout-minutes: 120`. Since #7135 a hung agent shard C holds the step for up to
+480 s (was 240 s; shards A and B keep 240 s) and a hung echo entry up to 180 s (was
+90 s). Where `flake-retry.py` can start its enumeration re-run of the failed suite,
+an entry that hangs again on the re-run costs its limit twice before the job fails
+(nothing is masked): about 16 minutes for shard C on Linux (480 s twice), and about
+24 on macOS, where the first run uses `--timeout-multiplier 2` (960 s) and the re-run
+does not. On Windows the re-run has not produced a classification in any of the four
+logs read for this: in the one TIMEOUT log (run 41919798385 attempt 4) shard C's
+verdict `not a classifiable Catch2 run` arrived 0.4 s after its TIMEOUT line (echo's
+TIMEOUT line was two minutes earlier, and both verdicts print at the end of the
+run), and three runs with a plain echo exit-42 failure (42040619981, 42049202343,
+42056811785) gave the same verdict. That fits the open #6316 (flake-retry spawns the
+DLL-linked test binary without meson's `extra_paths`), so a hung entry on Windows
+costs its limit once: about 8 minutes for shard C, 3 for echo. It is an inference
+from those logs, not a guarantee; fixing #6316 would make it twice (16 minutes for
+shard C). The sanitizer and coverage legs call
+`meson test --timeout-multiplier 2` directly, with no re-run, so a hung shard C
+there costs 16 minutes. The 95 minutes above leaves 25 minutes inside
+`timeout-minutes: 120` for checkout, build and that step's own run time, so several
+hung entries are bounded by that job timeout, not by this arithmetic.
+At np=2 the Linux slot-wait case was the one that needed attention: the "revisit the 700s per-shard budget or the Linux
 `--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
 above) had a less severe trigger than at 16 shards (the all-at-cap ceiling alone
 fit the job limit, the ceiling plus a full slot wait did not). At np=4 (Push 2c)
@@ -1985,8 +2004,16 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   the `Ok:`, `Fail:` and `Skipped:` lines: Ok 100, Fail 0, Skipped 5 for the first
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
-  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, echo
-  90 s, `gateway eunit` and `gateway ct` 600 s.
+  that matter: agent shard C 480 s (shards A and B 240 s), `blocked log sink
+  SIGTERM harness` 300 s, echo 180 s (`echo unit tests`; `echo fold sizing` and `echo v10 migration` are 300 s), `gateway eunit` and `gateway ct` 600 s. (Shard
+  C was 240 s until #7135, a deliberate, temporary raise: see the sizing comment in
+  `tests/meson.build`, and #7177 for the split that brings C back down. Echo was 90 s
+  and is now 180 s, which keeps its measured passing runs under 50% of the limit.
+  Every "of 240 s" sample below for shard C, every "of 90 s" sample for echo, and the
+  192 s and 72 s 80% thresholds for them in the decision rule are against those old
+  values; the current marks are 384 s for shard C and 144 s for echo, so while the
+  raise stands neither warns as early as it did. Shards A and B are unchanged at
+  240 s and a 192 s mark.)
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
   carry these entries (the junit import runs once at job end and reads the last
@@ -2003,7 +2030,8 @@ applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
-240 s for the harness, 192 s for an agent shard, 72 s for echo); and the entry
+240 s for the harness, 192 s for agent shards A and B, 192 s for shard C before #7135
+and 384 s now, 72 s for echo before #7135 and 144 s now); and the entry
 count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
 guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green
@@ -2987,12 +3015,17 @@ one file is one PG-instance event, not a test bug.
 The agent suite's single `agent unit tests` entry (one serial Catch2 process,
 240 s budget) is three entries over the same `yuzu_agent_tests` binary:
 `agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
-'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
-and conservative headroom rather than a measured need: the only measured
-contention figure is for the server `~[pg]` suite, 289 s with no other test
-phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
-the pre-#3443 combined step, per "Windows test-phase
-concurrency gate"; it has not been re-measured for the agent shards) and
+'agent-shard']`, one positional tag spec, a per-shard `timeout:` (A and B 240 s;
+C 480 s, raised from the old single entry's 240 s by #7135 as a deliberate,
+temporary exception to the 50% budget rule in `docs/testing/unit-test-conventions.md`,
+to come back down with the split tracked as #7177). #7135 measured shard C at
+185 s to 212 s as a pass on Windows MSVC debug (three of the 206 s to 212 s samples
+are from jobs that failed on the echo ETW case, not from green jobs) and at the old
+240 s limit once under load; the sizing comment beside the `timeout:` records the
+runs. The contention figure for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, was measured on
+the pre-#3443 combined step; see "Windows test-phase concurrency gate". The entries
+also take
 `--allow-running-no-tests`. That flag is what stops the zero-match shard C from
 failing when `meson test --suite agent --test-args '[tag]'` appends a second
 positional spec. It does not make that a targeted run: Catch2 binds the extra
@@ -3021,7 +3054,8 @@ fails if a shard spec term does not end with that suffix (the meson
 `agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
 shape flake-retry's isolated retry can strip, or if two shard entry names are
 equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
-notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+notice, and the drift signal is the 80%-of-budget table above (shard C's mark is 384 s while
+the #7135 raise stands, so it is a late warning until #7177 lands). Per-entry history
 in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
 the new names.
 

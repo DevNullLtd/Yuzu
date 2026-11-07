@@ -100,17 +100,18 @@ TEST_CASE("EchoDatabase: warehouse tables created on open", "[echo][store][lifec
     ev.pid = 42;
     ev.name = "test.exe";
 
-    CHECK(t.db.insert_process_events({ev}));
+    CHECK(t.db.fold_process_events({ev}));
 }
 
 TEST_CASE("EchoDatabase: purge_source drops ALL tiers for one source, leaves others",
           "[echo][store][purge]") {
     auto t = make_test_db();
 
-    // Seed EVERY process tier (live/hourly/daily/monthly) — not just live — so a
-    // regression that purges only granularities[0] fails, and so the returned
-    // rows_deleted proves the cross-tier sum (governance B2). live via the typed
-    // insert; the rollup tiers via direct INSERT (schema per echo_schema_registry).
+    // Seed EVERY process tier (hourly/daily/monthly) -- not just one -- so a regression that
+    // purges only granularities[0] fails, and so the returned rows_deleted proves the cross-tier
+    // sum (governance B2). One fold writes all three tiers at once: three events in two hours of
+    // one day and month give 3 hourly rows (two in hour 0, one in hour 7200... keyed by name),
+    // 3 daily and 3 monthly.
     ProcessEvent p1;
     p1.ts = 1000;
     p1.snapshot_id = 1;
@@ -120,19 +121,13 @@ TEST_CASE("EchoDatabase: purge_source drops ALL tiers for one source, leaves oth
     ProcessEvent p2 = p1;
     p2.pid = 2;
     p2.name = "b.exe";
-    REQUIRE(t.db.insert_process_events({p1, p2})); // process_live: 2
-    REQUIRE(t.db.execute_sql("INSERT INTO process_hourly "
-                             "(hour_ts,name,user,start_count,stop_count) VALUES "
-                             "(3600,'a.exe','SYSTEM',1,1),(7200,'b.exe','SYSTEM',1,1),"
-                             "(10800,'c.exe','SYSTEM',1,1)")); // process_hourly: 3
-    REQUIRE(t.db.execute_sql("INSERT INTO process_daily "
-                             "(day_ts,name,user,start_count,stop_count) VALUES "
-                             "(86400,'a.exe','SYSTEM',1,1)")); // process_daily: 1
-    REQUIRE(t.db.execute_sql("INSERT INTO process_monthly "
-                             "(month_ts,name,user,start_count,stop_count) VALUES "
-                             "(2592000,'a.exe','SYSTEM',1,1)")); // process_monthly: 1
+    ProcessEvent p3 = p1;
+    p3.ts = 7200;
+    p3.pid = 3;
+    p3.name = "c.exe";
+    REQUIRE(t.db.fold_process_events({p1, p2, p3}));
 
-    // A different source, seeded across TWO tiers, must be entirely untouched.
+    // A different source, folded into its own tiers, must be entirely untouched.
     NetworkEvent n1;
     n1.ts = 1000;
     n1.snapshot_id = 1;
@@ -142,11 +137,7 @@ TEST_CASE("EchoDatabase: purge_source drops ALL tiers for one source, leaves oth
     n1.local_port = 5;
     n1.remote_addr = "1.1.1.1";
     n1.remote_port = 53;
-    REQUIRE(t.db.insert_network_events({n1})); // tcp_live: 1
-    REQUIRE(t.db.execute_sql("INSERT INTO tcp_hourly "
-                             "(hour_ts,remote_addr,remote_port,proto,process_name,"
-                             "connect_count,disconnect_count) VALUES "
-                             "(3600,'1.1.1.1',53,'tcp','sshd',1,1)")); // tcp_hourly: 1
+    REQUIRE(t.db.fold_network_events({n1}));
 
     auto count = [&](const std::string& table) {
         auto r = t.db.execute_query("SELECT COUNT(*) FROM " + table);
@@ -154,22 +145,57 @@ TEST_CASE("EchoDatabase: purge_source drops ALL tiers for one source, leaves oth
         REQUIRE(!r->rows.empty());
         return std::stoi(r->rows[0][0]);
     };
-    REQUIRE(count("process_live") == 2);
     REQUIRE(count("process_hourly") == 3);
-    REQUIRE(count("process_daily") == 1);
-    REQUIRE(count("process_monthly") == 1);
-    REQUIRE(count("tcp_live") == 1);
+    REQUIRE(count("process_daily") == 3);
+    REQUIRE(count("process_monthly") == 3);
     REQUIRE(count("tcp_hourly") == 1);
+    REQUIRE(count("tcp_daily") == 1);
+    REQUIRE(count("tcp_monthly") == 1);
 
     auto res = t.db.purge_source("process");
     REQUIRE(res.has_value());
-    CHECK(*res == 7); // 2 + 3 + 1 + 1 across all four tiers — the cross-tier sum
-    CHECK(count("process_live") == 0);
+    CHECK(res->rows_deleted == 9); // 3 + 3 + 3 across all three tiers -- the cross-tier sum
+    CHECK(!res->dictionary_pending); // the sweep finished inside its deadline
     CHECK(count("process_hourly") == 0);
     CHECK(count("process_daily") == 0);
     CHECK(count("process_monthly") == 0);
-    CHECK(count("tcp_live") == 1);   // a different source is untouched...
-    CHECK(count("tcp_hourly") == 1); // ...across all of its tiers
+    CHECK(count("tcp_hourly") == 1);  // a different source is untouched...
+    CHECK(count("tcp_daily") == 1);   // ...across all of its tiers
+    CHECK(count("tcp_monthly") == 1);
+}
+
+TEST_CASE("EchoDatabase: purge_source also removes the strings only the purged source used",
+          "[echo][store][purge][dictionary]") {
+    // The dictionary interns every text key. A purge that leaves the purged source's strings in
+    // it would keep a user name or a DNS name the operator asked to erase, one SELECT away from
+    // the rows. The sweep removes exactly the strings no remaining row references.
+    auto t = make_test_db();
+    DnsEvent dns;
+    dns.ts = 1000;
+    dns.action = "appeared";
+    dns.name = "secret-host.example";
+    dns.record_type = "A";
+    dns.data = "10.9.8.7";
+    REQUIRE(t.db.fold_dns_events({dns}));
+    ArpEvent arp;
+    arp.ts = 1000;
+    arp.action = "appeared";
+    arp.iface = "en0";
+    arp.ip_address = "10.0.0.1";
+    arp.mac_address = "aa:bb";
+    REQUIRE(t.db.fold_arp_events({arp}));
+    const auto has = [&](const std::string& text) {
+        auto r = t.db.execute_query("SELECT COUNT(*) FROM echo_dict WHERE text = '" + text + "'");
+        REQUIRE(r.has_value());
+        return r->rows[0][0] == "1";
+    };
+    REQUIRE(has("secret-host.example"));
+    REQUIRE(has("10.0.0.1"));
+
+    REQUIRE(t.db.purge_source("dns").has_value());
+    CHECK_FALSE(has("secret-host.example")); // gone with its source
+    CHECK_FALSE(has("10.9.8.7"));
+    CHECK(has("10.0.0.1")); // a string another source still references stays
 }
 
 TEST_CASE("EchoDatabase: purge_source(usage) also erases usage_daily_user",
@@ -200,7 +226,7 @@ TEST_CASE("EchoDatabase: purge_source(usage) also erases usage_daily_user",
 
     auto res = t.db.purge_source("usage");
     REQUIRE(res.has_value());
-    CHECK(*res == 3); // usage_daily + usage_live (registered tiers) + usage_daily_user
+    CHECK(res->rows_deleted == 3); // usage_daily + usage_live (registered tiers) + usage_daily_user
     CHECK(count("usage_daily") == 0);
     CHECK(count("usage_daily_user") == 0); // the regression this test pins
     CHECK(count("usage_live") == 0);
@@ -240,7 +266,8 @@ std::string first_cell(EchoDatabase& db, const std::string& sql) {
 
 } // namespace
 
-TEST_CASE("EchoDatabase: insert_registry_events_and_cursor round-trips every column, replays as a no-op",
+TEST_CASE("EchoDatabase: insert_registry_events_and_cursor rolls the change up and "
+          "replays as a no-op",
           "[echo][store][registry]") {
     auto t = make_test_db();
     auto removed = registry_row("k2", "removed");
@@ -252,31 +279,31 @@ TEST_CASE("EchoDatabase: insert_registry_events_and_cursor round-trips every col
     removed.detail.clear();
     REQUIRE(t.db.insert_registry_events_and_cursor({registry_row("k1"), removed}, R"({"v":1})",
                                                     {{"registry:HKLM\\R", R"({"v":1,"keys":{}})"}}));
-    auto r = t.db.execute_query("SELECT ts, snapshot_id, hive, key_path, value_name, action, data_type, "
-                                "data, data_size, data_truncated, prev_data_type, prev_data, "
-                                "prev_data_size, prev_data_truncated, actor_pid, actor_image, source, "
-                                "observed_at, detail, record_key FROM registry_live ORDER BY id");
+    // A roll-up row per (hive, key, value, action) and hour: what changed and how often, the
+    // last rendered value and type, and who last wrote it. Raw rows are not kept.
+    auto r = t.db.execute_query("SELECT hive, key_path, value_name, action, change_count, last_data, "
+                                "last_data_type, last_actor_image, last_ts FROM registry_hourly "
+                                "ORDER BY action");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 2);
     const auto& row = r->rows[0];
-    CHECK(row[0] == "1761000000");
-    CHECK(row[2] == "HKLM");
-    CHECK(row[3] == "SOFTWARE\\Vendor\\Svc");
-    CHECK(row[5] == "changed");
-    CHECK(row[7] == "2");
-    CHECK(row[11] == "3");
-    CHECK(row[14] == "812");
-    CHECK(row[15] == "actor.exe");
-    CHECK(row[18] == "attr:corr");
-    CHECK(row[19] == "k1");
+    CHECK(row[0] == "HKLM");
+    CHECK(row[1] == "SOFTWARE\\Vendor\\Svc");
+    CHECK(row[2] == "Start");
+    CHECK(row[3] == "changed");
+    CHECK(row[4] == "1");
+    CHECK(row[5] == "2");
+    CHECK(row[6] == "REG_DWORD");
+    CHECK(row[7] == "actor.exe");
+    CHECK(row[8] == "1761000000");
+    CHECK(r->rows[1][3] == "removed");
     CHECK(r->rows[1][6].empty()); // the removed row has no value type: an absent value
-    CHECK(r->rows[1][14] == "0");
-    CHECK(r->rows[1][15].empty());
+    CHECK(r->rows[1][7].empty());
 
-    // A replayed key is a silent no-op and still commits the cursor and baseline.
+    // A replayed key is a silent no-op (the ring knows it) and still commits the cursor and baseline.
     REQUIRE(t.db.insert_registry_events_and_cursor({registry_row("k1")}, R"({"v":1,"n":2})",
                                                     {{"registry:HKLM\\R", R"({"v":1,"keys":{"K":{}}})"}}));
-    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "2");
+    CHECK(first_cell(t.db, "SELECT SUM(change_count) FROM registry_hourly") == "2");
     CHECK(*t.db.get_cursor("registry").value() == R"({"v":1,"n":2})");
     CHECK(*t.db.try_get_state("registry:HKLM\\R").value() == R"({"v":1,"keys":{"K":{}}})");
     // ... even when the replay attributes differently: after a restart the in-memory event
@@ -287,9 +314,9 @@ TEST_CASE("EchoDatabase: insert_registry_events_and_cursor round-trips every col
     reattributed.actor_image.clear();
     reattributed.detail = "attr:degraded";
     CHECK(t.db.insert_registry_events_and_cursor({reattributed}, R"({"v":1})", {}));
-    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "2");
-    CHECK(first_cell(t.db, "SELECT actor_pid || '/' || detail FROM registry_live WHERE record_key = 'k1'") ==
-          "812/attr:corr");
+    CHECK(first_cell(t.db, "SELECT SUM(change_count) FROM registry_hourly") == "2");
+    CHECK(first_cell(t.db, "SELECT last_actor_image FROM registry_hourly WHERE action = 'changed'") ==
+          "actor.exe");
 }
 
 TEST_CASE("EchoDatabase: insert_registry_events_and_cursor refuses collisions and bad keys atomically",
@@ -351,7 +378,9 @@ TEST_CASE("EchoDatabase: purge_source(registry) erases the rows, the cursor (hel
 
     const auto res = t.db.purge_source("registry");
     REQUIRE(res.has_value());
-    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "0");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_hourly") == "0");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_daily") == "0");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'registry'") == "0");
     CHECK_FALSE(t.db.get_cursor("registry").value().has_value());
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_cursor WHERE cursor_json LIKE '%held-%'") == "0");
     CHECK_FALSE(t.db.try_get_state("registry:HKLM\\A").value().has_value());
@@ -378,7 +407,7 @@ TEST_CASE("EchoDatabase: purge_source rejects an unknown source", "[echo][store]
 // Typed inserts and SQL queries
 // =============================================================================
 
-TEST_CASE("EchoDatabase: insert and query process events", "[echo][store][crud]") {
+TEST_CASE("EchoDatabase: fold and query process events", "[echo][store][crud]") {
     auto t = make_test_db();
 
     std::vector<ProcessEvent> events;
@@ -392,21 +421,55 @@ TEST_CASE("EchoDatabase: insert and query process events", "[echo][store][crud]"
         events.push_back(std::move(ev));
     }
 
-    REQUIRE(t.db.insert_process_events(events));
+    REQUIRE(t.db.fold_process_events(events));
 
-    auto results = t.db.execute_query("SELECT ts, action, pid, name FROM process_live ORDER BY ts");
+    // One hourly row per (name, user, parent), counting what happened. The five events fall in
+    // the hour that starts at 0.
+    auto results = t.db.execute_query(
+        "SELECT hour_ts, name, start_count, stop_count FROM process_hourly ORDER BY name");
     REQUIRE(results.has_value());
     REQUIRE(results->rows.size() == 5);
-    CHECK(results->rows[0][0] == "1000");
-    CHECK(results->rows[4][0] == "1004");
-    CHECK(results->rows[0][1] == "started");
+    CHECK(results->rows[0][0] == "0");
+    CHECK(results->rows[0][1] == "proc0");
+    CHECK(results->rows[0][2] == "1"); // proc0 started
+    CHECK(results->rows[0][3] == "0");
+    CHECK(results->rows[1][2] == "0"); // proc1 stopped
+    CHECK(results->rows[1][3] == "1");
+}
+
+TEST_CASE("EchoDatabase: process wrapper writes the view's enrichment columns",
+          "[echo][store][crud][enrichment]") {
+    auto t = make_test_db();
+    ProcessEvent child;
+    child.ts = 5000;
+    child.action = "started";
+    child.pid = 20;
+    child.ppid = 10;
+    child.name = "child.exe";
+    child.user = "jsmith";
+    child.parent_name = "parent.exe";
+    ProcessEvent crash = child;
+    crash.action = "stopped";
+    crash.exit_code = 139;
+    ProcessEvent clean = child;
+    clean.action = "stopped";
+    clean.name = "clean.exe";
+    clean.exit_code = 0;
+    REQUIRE(t.db.fold_process_events({child, crash, clean}));
+
+    // parent_name is a key, abnormal_exit_count counts a stop with a non-zero status. FAILS if
+    // either enrichment is dropped from process_delta or the wrapper.
+    auto r = t.db.execute_query("SELECT name, user, parent_name, start_count, stop_count, "
+                                "abnormal_exit_count FROM process_hourly ORDER BY name");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 2); // start and stop of one process share a key
+    CHECK(r->rows[0] == QueryRow{"child.exe", "jsmith", "parent.exe", "1", "1", "1"}); // exit 139
+    CHECK(r->rows[1] == QueryRow{"clean.exe", "jsmith", "parent.exe", "0", "1", "0"});  // exit 0
 }
 
 TEST_CASE("EchoDatabase: insert and query software events", "[echo][store][crud][software]") {
-    // Direct round-trip through insert_software_events — the only exerciser of the
-    // 8-parameter prepared statement, so a column-binding transposition (e.g.
-    // publisher <-> install_date) is caught here rather than slipping past the
-    // aggregator test (which seeds software_live with raw SQL).
+    // Direct round-trip through fold_software_events -- the only exerciser of the
+    // wrapper's key mapping, so a transposition (e.g. version <-> publisher) is caught here.
     auto t = make_test_db();
 
     std::vector<SoftwareEvent> events;
@@ -431,37 +494,29 @@ TEST_CASE("EchoDatabase: insert and query software events", "[echo][store][crud]
     upg.install_date = "20260102";
     events.push_back(upg);
 
-    REQUIRE(t.db.insert_software_events(events));
+    REQUIRE(t.db.fold_software_events(events));
 
+    // A roll-up row per (name, version, publisher) and hour, counting installs, removals and
+    // upgrades. prev_version and install_date are not kept: they describe one event, not the
+    // application. The two events are distinct keys, so a transposed bind shows here.
     auto r = t.db.execute_query(
-        "SELECT action, name, version, prev_version, publisher, install_date "
-        "FROM software_live ORDER BY ts");
+        "SELECT name, version, publisher, install_count, remove_count, upgrade_count "
+        "FROM software_hourly ORDER BY name");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 2);
-    // Row 0: install — every column in declared order (machine scope only, no
-    // scope/user columns).
-    CHECK(r->rows[0][0] == "installed");
-    CHECK(r->rows[0][1] == "7-Zip");
-    CHECK(r->rows[0][2] == "23.01");
-    CHECK(r->rows[0][3] == ""); // prev_version empty for install
-    CHECK(r->rows[0][4] == "Igor Pavlov");
-    CHECK(r->rows[0][5] == "20260101");
-    // Row 1: upgrade — prev_version + publisher + install_date populated, not transposed.
-    CHECK(r->rows[1][0] == "upgraded");
-    CHECK(r->rows[1][3] == "1.90");
-    CHECK(r->rows[1][4] == "Microsoft");
-    CHECK(r->rows[1][5] == "20260102");
+    CHECK(r->rows[0] == QueryRow{"7-Zip", "23.01", "Igor Pavlov", "1", "0", "0"});
+    CHECK(r->rows[1] == QueryRow{"VSCode", "1.91", "Microsoft", "0", "0", "1"});
 
     // Empty-vector contract matches the sibling inserts (returns true, no-op).
-    CHECK(t.db.insert_software_events({}));
+    CHECK(t.db.fold_software_events({}));
 }
 
-TEST_CASE("execute_user_query: software_live and software_daily are sandbox-readable",
+TEST_CASE("execute_user_query: software_hourly and software_daily are sandbox-readable",
           "[echo][store][sandbox][software][security]") {
-    // The monthly rollup reads FROM software_daily, so both tiers must be
-    // authorizer-allowlisted for an operator echo.sql to aggregate them. No other
-    // test runs an actual statement through the read-only connection on these
-    // tables (the allowlist iteration test only checks is_queryable_table).
+    // The roll-up views read their `_r` tables and the dictionary; the authorizer must let an
+    // operator echo.sql aggregate them THROUGH the view, and only through it. No other test runs
+    // an actual statement through the read-only connection on these tables (the allowlist
+    // iteration test only checks is_queryable_table).
     auto t = make_test_db();
     SoftwareEvent ev;
     ev.ts = 1000;
@@ -469,20 +524,21 @@ TEST_CASE("execute_user_query: software_live and software_daily are sandbox-read
     ev.action = "installed";
     ev.name = "7-Zip";
     ev.version = "23.01";
-    REQUIRE(t.db.insert_software_events({ev}));
-    REQUIRE(t.db.execute_sql(
-        "INSERT INTO software_daily (day_ts, name, install_count, remove_count, "
-        "upgrade_count) VALUES (86400, '7-Zip', 3, 1, 2)"));
+    REQUIRE(t.db.fold_software_events({ev, ev, ev}));
 
-    auto live = t.db.execute_user_query("SELECT action, name FROM software_live");
-    REQUIRE(live.has_value());
-    REQUIRE(live->rows.size() == 1);
-    CHECK(live->rows[0][0] == "installed");
+    auto hourly = t.db.execute_user_query("SELECT name, install_count FROM software_hourly");
+    REQUIRE(hourly.has_value());
+    REQUIRE(hourly->rows.size() == 1);
+    CHECK(hourly->rows[0][0] == "7-Zip");
 
     auto daily = t.db.execute_user_query("SELECT SUM(install_count) FROM software_daily");
     REQUIRE(daily.has_value());
     REQUIRE(daily->rows.size() == 1);
     CHECK(daily->rows[0][0] == "3");
+
+    // The physical table and the dictionary behind the view are NOT readable by name.
+    CHECK_FALSE(t.db.execute_user_query("SELECT * FROM software_daily_r").has_value());
+    CHECK_FALSE(t.db.execute_user_query("SELECT * FROM echo_dict").has_value());
 }
 
 TEST_CASE("execute_user_query: usage tables are denied to generic echo.sql (#4260)",
@@ -503,7 +559,7 @@ TEST_CASE("execute_user_query: usage tables are denied to generic echo.sql (#426
     REQUIRE(t.db.execute_sql(
         "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) VALUES "
         "(1000, 0, 'open', 1, 'a.exe', 'alice', 1000)"));
-    REQUIRE(t.db.insert_process_events({[] {
+    REQUIRE(t.db.fold_process_events({[] {
         ProcessEvent p;
         p.ts = 1000;
         p.snapshot_id = 1;
@@ -524,7 +580,7 @@ TEST_CASE("execute_user_query: usage tables are denied to generic echo.sql (#426
 
     CHECK_FALSE(t.db.execute_user_query("SELECT u.exe_key FROM usage_live u").has_value());
     CHECK_FALSE(t.db
-                    .execute_user_query("SELECT p.name FROM process_live p JOIN usage_daily d "
+                    .execute_user_query("SELECT p.name FROM process_hourly p JOIN usage_daily d "
                                          "ON d.exe_key = p.name")
                     .has_value());
     CHECK_FALSE(
@@ -538,7 +594,7 @@ TEST_CASE("execute_user_query: usage tables are denied to generic echo.sql (#426
     // the $Usage_Daily denial check above; passing the bare $Process_Live
     // string here previously hit SQLite's own "near $Process_Live: syntax
     // error" before the authorizer ever ran.
-    auto ctrl_sql = validate_and_translate_sql("SELECT COUNT(*) FROM $Process_Live");
+    auto ctrl_sql = validate_and_translate_sql("SELECT COUNT(*) FROM $Process_Hourly");
     REQUIRE(ctrl_sql.has_value());
     auto ctrl = t.db.execute_user_query(*ctrl_sql);
     REQUIRE(ctrl.has_value());
@@ -548,12 +604,11 @@ TEST_CASE("execute_user_query: usage tables are denied to generic echo.sql (#426
 
 TEST_CASE("echo.export $Software summary projection references only existing columns",
           "[echo][store][software][export]") {
-    // Regression guard (#1620): do_export's `software` UNION branch builds a summary
-    // expression over software_live. After dropping the per-user `scope`/`user`
-    // columns, that projection must reference only columns that still exist — a stale
-    // column (the removed `scope`) failed at runtime with "no such column: scope".
-    // This mirrors do_export's software projection so a future re-introduction of a
-    // dropped column in that SELECT is caught by the unit suite.
+    // Regression guard (#1620): do_export's `software` UNION branch builds a summary expression
+    // over software_hourly. That projection must reference only columns the view still has -- a
+    // stale column fails at runtime with "no such column". This mirrors do_export's software
+    // projection so a future re-introduction of a dropped column in that SELECT is caught by the
+    // unit suite.
     auto t = make_test_db();
     SoftwareEvent ev;
     ev.ts = 1000;
@@ -561,10 +616,10 @@ TEST_CASE("echo.export $Software summary projection references only existing col
     ev.action = "installed";
     ev.name = "7-Zip";
     ev.version = "23.01";
-    REQUIRE(t.db.insert_software_events({ev}));
+    REQUIRE(t.db.fold_software_events({ev}));
     auto r = t.db.execute_query(
-        "SELECT 'software', ts, snapshot_id, action, "
-        "(name || ' ' || COALESCE(version,'')) AS summary FROM software_live");
+        "SELECT 'software', hour_ts AS ts, 0, 'bucket', (name || ' ' || version) AS summary "
+        "FROM software_hourly");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 1);
     CHECK(r->rows[0][4] == "7-Zip 23.01");
@@ -585,175 +640,65 @@ TEST_CASE("EchoDatabase: insert and query network events", "[echo][store][crud]"
     ev.pid = 100;
     ev.process_name = "curl";
 
-    REQUIRE(t.db.insert_network_events({ev}));
+    REQUIRE(t.db.fold_network_events({ev}));
 
-    auto results = t.db.execute_query("SELECT proto, local_port, remote_addr FROM tcp_live");
+    // The tcp tier keys on the REMOTE end and the owning process; the local address and port are
+    // not kept.
+    auto results = t.db.execute_query(
+        "SELECT proto, remote_port, remote_addr, process_name, connect_count FROM tcp_hourly");
     REQUIRE(results.has_value());
     REQUIRE(results->rows.size() == 1);
-    CHECK(results->rows[0][0] == "tcp");
-    CHECK(results->rows[0][1] == "8080");
-    CHECK(results->rows[0][2] == "10.0.0.1");
+    CHECK(results->rows[0] == QueryRow{"tcp", "443", "10.0.0.1", "curl", "1"});
 }
 
-// ── query_recent_tcp_connections — last-N-seconds window for the viz ─────────
-//
-// Tracer bullet: Echo keeps every observed TCP connection in tcp_live with
-// its observation timestamp. The viz wants to render any connection that
-// existed within the last hour as a tube, not just the currently-ESTABLISHED
-// ones from /proc/net/tcp. So `echo.fleet_snapshot` needs a way to ask the
-// warehouse for the rolling window of connections seen recently.
-//
-// Behaviour: returns one row per unique (proto, local_addr, local_port,
-// remote_addr, remote_port, pid) 5-tuple, with `ts` set to the most recent
-// observation timestamp. Rows older than `since_ts` are dropped. State
-// values other than ESTABLISHED are filtered out (LISTEN, TIME_WAIT, etc.
-// — those aren't "this box talks to that box" edges).
-TEST_CASE("EchoDatabase: query_recent_tcp_connections returns rows newer than the window",
-          "[echo][store][recent-tcp]") {
+// The rolling "recent connections" read (query_recent_tcp_connections) is gone with the raw tcp
+// rows it walked: the roll-up keeps per-remote hourly counts, not per-socket observations. The
+// listening-socket path that test once covered is pinned in test_echo_diff.cpp.
+
+TEST_CASE("EchoDatabase: listening sockets fold as listen_open under the wildcard remote",
+          "[echo][store][listen]") {
     auto t = make_test_db();
-
-    NetworkEvent in_window;
-    in_window.ts = 5000;
-    in_window.action = "connected";
-    in_window.proto = "tcp";
-    in_window.local_addr = "10.0.0.10";
-    in_window.local_port = 50001;
-    in_window.remote_addr = "10.0.0.20";
-    in_window.remote_port = 5432;
-    in_window.state = "ESTABLISHED";
-    in_window.pid = 100;
-    in_window.process_name = "node";
-
-    NetworkEvent out_of_window;
-    out_of_window.ts = 1000; // 4000 seconds before in_window
-    out_of_window.action = "connected";
-    out_of_window.proto = "tcp";
-    out_of_window.local_addr = "10.0.0.10";
-    out_of_window.local_port = 49999;
-    out_of_window.remote_addr = "10.0.0.30";
-    out_of_window.remote_port = 6379;
-    out_of_window.state = "ESTABLISHED";
-    out_of_window.pid = 100;
-    out_of_window.process_name = "node";
-
-    REQUIRE(t.db.insert_network_events({in_window, out_of_window}));
-
-    // Window: [5000 - 3600, 5000] = [1400, 5000]. The t=1000 row is outside.
-    auto recent = t.db.query_recent_tcp_connections(/*since_ts=*/1400);
-    REQUIRE(recent.has_value());
-    REQUIRE(recent->size() == 1);
-    CHECK(recent->at(0).proto == "tcp");
-    CHECK(recent->at(0).local_addr == "10.0.0.10");
-    CHECK(recent->at(0).local_port == 50001);
-    CHECK(recent->at(0).remote_addr == "10.0.0.20");
-    CHECK(recent->at(0).remote_port == 5432);
-    CHECK(recent->at(0).pid == 100u);
-    CHECK(recent->at(0).ts == 5000);
-}
-
-TEST_CASE("EchoDatabase: query_recent_tcp_connections dedups by 5-tuple, keeps latest ts",
-          "[echo][store][recent-tcp]") {
-    auto t = make_test_db();
-
-    // Same 5-tuple+pid observed three times. The result MUST be a single
-    // row with ts set to the most recent observation (3000).
-    NetworkEvent base;
-    base.action = "connected";
-    base.proto = "tcp";
-    base.local_addr = "10.0.0.10";
-    base.local_port = 60001;
-    base.remote_addr = "10.0.0.20";
-    base.remote_port = 5432;
-    base.state = "ESTABLISHED";
-    base.pid = 200;
-    base.process_name = "node";
-
-    base.ts = 1500;
-    NetworkEvent first = base;
-    base.ts = 2500;
-    NetworkEvent middle = base;
-    base.ts = 3000;
-    NetworkEvent latest = base;
-
-    REQUIRE(t.db.insert_network_events({first, middle, latest}));
-
-    auto recent = t.db.query_recent_tcp_connections(/*since_ts=*/1000);
-    REQUIRE(recent.has_value());
-    REQUIRE(recent->size() == 1);
-    CHECK(recent->at(0).ts == 3000);
-    CHECK(recent->at(0).local_port == 60001);
-}
-
-TEST_CASE("EchoDatabase: query_recent_tcp_connections filters out LISTEN and TIME_WAIT",
-          "[echo][store][recent-tcp]") {
-    auto t = make_test_db();
-
-    NetworkEvent established;
-    established.ts = 4000;
-    established.action = "connected";
-    established.proto = "tcp";
-    established.local_addr = "10.0.0.10";
-    established.local_port = 50100;
-    established.remote_addr = "10.0.0.20";
-    established.remote_port = 5432;
-    established.state = "ESTABLISHED";
-    established.pid = 300;
-    established.process_name = "node";
-
-    NetworkEvent listen;
-    listen.ts = 4001;
-    listen.action = "connected";
-    listen.proto = "tcp";
-    listen.local_addr = "0.0.0.0";
-    listen.local_port = 3000;
-    listen.remote_addr = "0.0.0.0";
-    listen.remote_port = 0;
-    listen.state = "LISTEN";
-    listen.pid = 300;
-    listen.process_name = "node";
-
-    NetworkEvent time_wait;
-    time_wait.ts = 4002;
-    time_wait.action = "connected";
-    time_wait.proto = "tcp";
-    time_wait.local_addr = "10.0.0.10";
-    time_wait.local_port = 50101;
-    time_wait.remote_addr = "10.0.0.20";
-    time_wait.remote_port = 5432;
-    time_wait.state = "TIME_WAIT";
-    time_wait.pid = 300;
-    time_wait.process_name = "node";
-
-    REQUIRE(t.db.insert_network_events({established, listen, time_wait}));
-
-    auto recent = t.db.query_recent_tcp_connections(/*since_ts=*/0);
-    REQUIRE(recent.has_value());
-    REQUIRE(recent->size() == 1);
-    CHECK(recent->at(0).state == "ESTABLISHED");
-    CHECK(recent->at(0).local_port == 50100);
+    NetworkEvent open_ev;
+    open_ev.ts = 4001;
+    open_ev.action = "listen_open";
+    open_ev.proto = "tcp";
+    open_ev.local_addr = "0.0.0.0";
+    open_ev.local_port = 3000;
+    open_ev.state = "LISTEN";
+    open_ev.process_name = "node";
+    NetworkEvent close_ev = open_ev;
+    close_ev.action = "listen_close";
+    REQUIRE(t.db.fold_network_events({open_ev, close_ev}));
+    auto r = t.db.execute_query("SELECT remote_addr, remote_port, process_name, listen_open_count, "
+                                "listen_close_count, connect_count FROM tcp_hourly");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0] == QueryRow{"*", "3000", "node", "1", "1", "0"}); // never a connection
 }
 
 TEST_CASE("EchoDatabase: query with time range filter", "[echo][store][query]") {
     auto t = make_test_db();
 
+    // One process start per hour for ten hours: ten hourly buckets.
     std::vector<ProcessEvent> events;
     for (int i = 0; i < 10; ++i) {
         ProcessEvent ev;
-        ev.ts = 1000 + i;
+        ev.ts = 3600 * i + 5;
         ev.snapshot_id = 1;
         ev.action = "started";
         ev.pid = static_cast<uint32_t>(i);
         ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    REQUIRE(t.db.insert_process_events(events));
+    REQUIRE(t.db.fold_process_events(events));
 
     auto results = t.db.execute_query(
-        "SELECT ts FROM process_live WHERE ts >= 1003 AND ts <= 1006 ORDER BY ts");
+        "SELECT hour_ts FROM process_hourly WHERE hour_ts >= 10800 AND hour_ts <= 21600 "
+        "ORDER BY hour_ts");
     REQUIRE(results.has_value());
     REQUIRE(results->rows.size() == 4);
-    CHECK(results->rows[0][0] == "1003");
-    CHECK(results->rows[3][0] == "1006");
+    CHECK(results->rows[0][0] == "10800");
+    CHECK(results->rows[3][0] == "21600");
 }
 
 TEST_CASE("EchoDatabase: query with LIMIT", "[echo][store][query]") {
@@ -762,16 +707,16 @@ TEST_CASE("EchoDatabase: query with LIMIT", "[echo][store][query]") {
     std::vector<ProcessEvent> events;
     for (int i = 0; i < 20; ++i) {
         ProcessEvent ev;
-        ev.ts = 1000 + i;
+        ev.ts = 3600 * i + 5;
         ev.snapshot_id = 1;
         ev.action = "started";
         ev.pid = static_cast<uint32_t>(i);
         ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    REQUIRE(t.db.insert_process_events(events));
+    REQUIRE(t.db.fold_process_events(events));
 
-    auto results = t.db.execute_query("SELECT ts FROM process_live LIMIT 5");
+    auto results = t.db.execute_query("SELECT hour_ts FROM process_hourly LIMIT 5");
     REQUIRE(results.has_value());
     CHECK(results->rows.size() == 5);
 }
@@ -786,22 +731,22 @@ TEST_CASE("EchoDatabase: purge old records via execute_sql_range", "[echo][store
     std::vector<ProcessEvent> events;
     for (int i = 0; i < 10; ++i) {
         ProcessEvent ev;
-        ev.ts = 1000 + i;
+        ev.ts = 3600 * i + 5;
         ev.snapshot_id = 1;
         ev.action = "started";
         ev.pid = static_cast<uint32_t>(i);
         ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    REQUIRE(t.db.insert_process_events(events));
+    REQUIRE(t.db.fold_process_events(events));
 
-    // Delete records with ts < 1005
-    REQUIRE(t.db.execute_sql("DELETE FROM process_live WHERE ts < 1005"));
+    // The rows live in the physical table; the view is read-only.
+    REQUIRE(t.db.execute_sql("DELETE FROM process_hourly_r WHERE hour_ts < 18000"));
 
-    auto remaining = t.db.execute_query("SELECT ts FROM process_live ORDER BY ts");
+    auto remaining = t.db.execute_query("SELECT hour_ts FROM process_hourly ORDER BY hour_ts");
     REQUIRE(remaining.has_value());
     CHECK(remaining->rows.size() == 5);
-    CHECK(remaining->rows[0][0] == "1005");
+    CHECK(remaining->rows[0][0] == "18000");
 }
 
 // =============================================================================
@@ -814,30 +759,33 @@ TEST_CASE("EchoDatabase: stats returns correct values", "[echo][store][stats]") 
     std::vector<ProcessEvent> events;
     for (int i = 0; i < 5; ++i) {
         ProcessEvent ev;
-        ev.ts = 2000 + i;
+        ev.ts = 7200 + i; // all in the hour that starts at 7200
         ev.snapshot_id = 1;
         ev.action = "started";
         ev.pid = static_cast<uint32_t>(i);
         ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    REQUIRE(t.db.insert_process_events(events));
+    REQUIRE(t.db.fold_process_events(events));
 
-    // stats() is data-driven over capture_sources() (review S6), so a row in any
-    // live table — not just the original four — must be counted. Insert one
-    // module_live row (ts within [2000,2004] so oldest/newest are unchanged) and
-    // confirm record_count picks it up. Guards against a future regression that
-    // drops a source from the aggregate.
-    REQUIRE(t.db.execute_sql(
-        "INSERT INTO module_live "
-        "(ts,snapshot_id,action,pid,process_name,module_name,module_dir,"
-        "signed_state,signer,is_kernel) "
-        "VALUES (2002, 1, 'loaded', 100, 'app.exe', 'a.dll', '', 'signed', '', 0)"));
+    // stats() is data-driven over the roll-up declarations (review S6), so a row in ANY source's
+    // finest tier -- not just the original four -- must be counted. Fold one module load an hour
+    // later and confirm record_count picks it up. Guards against a regression that drops a source
+    // from the aggregate. A source counts through its hourly tier: five events of one process in
+    // one hour are ONE row.
+    ModuleRow mod;
+    mod.ts = 10800;
+    mod.snapshot_id = 1;
+    mod.action = "loaded";
+    mod.process_name = "app.exe";
+    mod.module_name = "a.dll";
+    mod.signed_state = "signed";
+    REQUIRE(t.db.fold_module_events({mod}));
 
     auto s = t.db.stats();
-    CHECK(s.record_count == 6); // 5 process_live + 1 module_live
-    CHECK(s.oldest_timestamp == 2000);
-    CHECK(s.newest_timestamp == 2004);
+    CHECK(s.record_count == 2); // 1 process_hourly row + 1 module_hourly row
+    CHECK(s.oldest_timestamp == 7200);  // bucket starts, not event times
+    CHECK(s.newest_timestamp == 10800);
     CHECK(s.db_size_bytes > 0);
     CHECK(s.retention_days == 7); // default
 }
@@ -926,9 +874,9 @@ TEST_CASE("execute_user_query: SELECT on an allowlisted table succeeds",
     ev.action = "started";
     ev.pid = 7;
     ev.name = "p";
-    REQUIRE(t.db.insert_process_events({ev}));
+    REQUIRE(t.db.fold_process_events({ev}));
 
-    auto r = t.db.execute_user_query("SELECT COUNT(*) FROM process_live");
+    auto r = t.db.execute_user_query("SELECT COUNT(*) FROM process_hourly");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 1);
     CHECK(r->rows[0][0] == "1");
@@ -943,17 +891,29 @@ TEST_CASE("execute_user_query: the DEX per-app canned aggregate shape stays auth
     // SUM/MAX/CAST/COUNT/GROUP BY/ORDER BY-alias/LIMIT would otherwise break
     // the panel with no CI signal (governance G3 quality-engineer).
     auto t = make_test_db();
-    // Three rows for Teams.exe: TWO at hour 3600 (a version flip within the hour,
+    // Three view rows for Teams.exe: TWO at hour 3600 (a version flip within the hour,
     // the post-v4 (hour,name,version) granularity) and one at hour 7200. So
     // COUNT(*) == 3 but COUNT(DISTINCT hour_ts) == 2 — they diverge, pinning the
     // happy-path "Hours seen" regression fix (COUNT(*) over-counts across a version
     // change; the correct answer is distinct hourly windows).
-    REQUIRE(t.db.execute_sql(
-        "INSERT INTO procperf_hourly (hour_ts, name, version, samples, instances_max, "
-        "cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes) VALUES "
-        "(3600, 'Teams.exe', '1.0.0.0', 120, 6, 8.4, 41.2, 2040109465, 3328599654), "
-        "(3600, 'Teams.exe', '2.0.0.0', 60,  4, 5.0, 22.0, 1500000000, 2500000000), "
-        "(7200, 'Teams.exe', '2.0.0.0', 120, 5, 4.0, 20.0, 1000000000, 2000000000)"));
+    // Folded as raw samples (the view's generated averages come from the sums): version 1.0.0.0
+    // twice and 2.0.0.0 once in hour 3600, 2.0.0.0 twice in hour 7200.
+    const auto sample = [&](int64_t ts, const char* version, int instances, double cpu, int64_t ws) {
+        ProcPerfRow row;
+        row.ts = ts;
+        row.snapshot_id = 1;
+        row.name = "Teams.exe";
+        row.version = version;
+        row.instances = instances;
+        row.cpu_pct = cpu;
+        row.ws_bytes = ws;
+        return row;
+    };
+    REQUIRE(t.db.fold_proc_perf_samples({sample(3600, "1.0.0.0", 6, 8.0, 2040109465),
+                                         sample(3630, "1.0.0.0", 4, 9.0, 1000000000),
+                                         sample(3660, "2.0.0.0", 4, 5.0, 1500000000),
+                                         sample(7200, "2.0.0.0", 5, 4.0, 1000000000),
+                                         sample(7230, "2.0.0.0", 5, 4.0, 1000000000)}));
     auto r = t.db.execute_user_query(
         "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
         "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
@@ -964,7 +924,7 @@ TEST_CASE("execute_user_query: the DEX per-app canned aggregate shape stays auth
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 1);
     CHECK(r->rows[0][0] == "Teams.exe");
-    CHECK(r->rows[0][1] == "300");  // SUM(samples) across all three rows
+    CHECK(r->rows[0][1] == "5");    // SUM(samples) across all three rows
     CHECK(r->rows[0][7] == "2");    // COUNT(DISTINCT hour_ts) — NOT 3 (COUNT(*) would over-count)
     // Column names ride the schema line the server parser locates fields by.
     REQUIRE(r->columns.size() == 8);
@@ -1090,7 +1050,7 @@ TEST_CASE("execute_user_query: pragma_table_info table-valued function is denied
 // A2: per-app perf rows + the every-open table-ensure regression
 // =============================================================================
 
-TEST_CASE("EchoDatabase: insert_proc_perf_samples batch round-trips", "[echo][store][procperf]") {
+TEST_CASE("EchoDatabase: fold_proc_perf_samples batch round-trips", "[echo][store][procperf]") {
     auto t = make_test_db();
     std::vector<ProcPerfRow> rows;
     for (int i = 0; i < 3; ++i) {
@@ -1105,11 +1065,11 @@ TEST_CASE("EchoDatabase: insert_proc_perf_samples batch round-trips", "[echo][st
         r.is_kthread = (i == 1); // one kernel-thread row among ordinary ones
         rows.push_back(std::move(r));
     }
-    REQUIRE(t.db.insert_proc_perf_samples(rows));
-    REQUIRE(t.db.insert_proc_perf_samples({})); // empty batch is a no-op success
+    REQUIRE(t.db.fold_proc_perf_samples(rows));
+    REQUIRE(t.db.fold_proc_perf_samples({})); // empty batch is a no-op success
 
     auto q = t.db.execute_query(
-        "SELECT name, version, instances, cpu_pct, ws_bytes, is_kthread FROM procperf_live "
+        "SELECT name, version, instances_max, cpu_max, ws_max_bytes, is_kthread FROM procperf_hourly "
         "ORDER BY name");
     REQUIRE(q.has_value());
     REQUIRE(q->rows.size() == 3);
@@ -1121,7 +1081,7 @@ TEST_CASE("EchoDatabase: insert_proc_perf_samples batch round-trips", "[echo][st
     CHECK(q->rows[2][5] == "0");
 }
 
-TEST_CASE("EchoDatabase: insert_netqual_samples batch round-trips", "[echo][store][netqual]") {
+TEST_CASE("EchoDatabase: fold_netqual_samples batch round-trips", "[echo][store][netqual]") {
     auto t = make_test_db();
     std::vector<NetQualRow> rows;
     for (int i = 0; i < 3; ++i) {
@@ -1139,30 +1099,31 @@ TEST_CASE("EchoDatabase: insert_netqual_samples batch round-trips", "[echo][stor
         r.ca_state = (i == 2) ? 4 : 0; // app2 in TCP_CA_Loss
         rows.push_back(std::move(r));
     }
-    REQUIRE(t.db.insert_netqual_samples(rows));
-    REQUIRE(t.db.insert_netqual_samples({})); // empty batch is a no-op success
+    REQUIRE(t.db.fold_netqual_samples(rows));
+    REQUIRE(t.db.fold_netqual_samples({})); // empty batch is a no-op success
 
+    // The tier keeps (proto, destination class, process) per hour: sums, maxima, and the number of
+    // samples that saw current loss. Lifetime counters (retrans, segs_out) and ca_state are not
+    // kept.
     auto q = t.db.execute_query(
-        "SELECT proto, remote_bucket, process_name, rtt_us, lost, segs_out, ca_state "
-        "FROM netqual_live ORDER BY process_name");
+        "SELECT proto, remote_bucket, process_name, rtt_us_sum, lost_sum, lost_max, "
+        "degraded_samples FROM netqual_hourly ORDER BY process_name");
     REQUIRE(q.has_value());
     REQUIRE(q->rows.size() == 3);
     CHECK(q->rows[0][1] == "private");  // app0 destination class
     CHECK(q->rows[0][4] == "0");        // app0 current loss
-    CHECK(q->rows[0][6] == "0");        // app0 ca_state = Open
+    CHECK(q->rows[0][6] == "0");        // app0 not degraded
     CHECK(q->rows[2][1] == "public");   // app2 destination class
     CHECK(q->rows[2][4] == "2");        // app2 current loss
-    CHECK(q->rows[2][6] == "4");        // app2 ca_state = Loss
+    CHECK(q->rows[2][5] == "2");
+    CHECK(q->rows[2][6] == "1");        // app2 degraded
 
-    // The degraded-as-query shape (a later server slice): fraction of a
-    // snapshot's connections with CURRENT loss. Pin it here so the column
-    // semantics stay query-able from the live tier.
-    auto frac = t.db.execute_query(
-        "SELECT SUM(CASE WHEN lost > 0 THEN 1 ELSE 0 END), COUNT(*) "
-        "FROM netqual_live WHERE snapshot_id = 9");
+    // The degraded-as-query shape (a later server slice): fraction of a window's samples with
+    // CURRENT loss. Pin it here so the column semantics stay query-able from the hourly tier.
+    auto frac = t.db.execute_query("SELECT SUM(degraded_samples), SUM(samples) FROM netqual_hourly");
     REQUIRE(frac.has_value());
     REQUIRE(frac->rows.size() == 1);
-    CHECK(frac->rows[0][0] == "2"); // 2 of 3 connections currently losing
+    CHECK(frac->rows[0][0] == "2"); // 2 of 3 samples currently losing
     CHECK(frac->rows[0][1] == "3");
 }
 
@@ -1321,12 +1282,12 @@ TEST_CASE("EchoDatabase: insert_netqual_boot_row returns false (no crash) when t
     REQUIRE(t.db.execute_query("SELECT 1").has_value()); // connection not wedged
 }
 
-TEST_CASE("EchoDatabase: insert_netconn_events round-trips every column + empty no-op",
+TEST_CASE("EchoDatabase: fold_netconn_events round-trips every column + empty no-op",
           "[echo][store][netconn]") {
     // qe-S1: the netconn insert had zero coverage. Exercise every binding and
     // the empty-batch success, cross-platform (the row struct is platform-free).
     auto t = make_test_db();
-    CHECK(t.db.insert_netconn_events({})); // empty batch is a no-op success
+    CHECK(t.db.fold_netconn_events({})); // empty batch is a no-op success
 
     std::vector<NetConnRow> rows;
     NetConnRow a;
@@ -1349,31 +1310,33 @@ TEST_CASE("EchoDatabase: insert_netconn_events round-trips every column + empty 
     b.iface_kind = "";
     b.reason_code = 4;
     rows.push_back(b);
-    REQUIRE(t.db.insert_netconn_events(rows));
+    REQUIRE(t.db.fold_netconn_events(rows));
 
     auto res = t.db.execute_query(
-        "SELECT ts, snapshot_id, action, channel, category, capability, iface_kind, "
-        "reason_code FROM netconn_live ORDER BY ts");
+        "SELECT action, channel, category, capability, iface_kind, reason_code, event_count, last_ts "
+        "FROM netconn_hourly ORDER BY last_ts");
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 2);
-    CHECK(res->rows[0][2] == "wifi_disconnected");
-    CHECK(res->rows[0][3] == "wlan");
-    CHECK(res->rows[0][6] == "wifi");
-    CHECK(res->rows[0][7] == "229377");
-    CHECK(res->rows[1][2] == "capability_changed");
-    CHECK(res->rows[1][5] == "internet");
-    CHECK(res->rows[1][7] == "4");
+    CHECK(res->rows[0][0] == "wifi_disconnected");
+    CHECK(res->rows[0][1] == "wlan");
+    CHECK(res->rows[0][4] == "wifi");
+    CHECK(res->rows[0][5] == "229377");
+    CHECK(res->rows[0][6] == "1");
+    CHECK(res->rows[0][7] == "1710000100");
+    CHECK(res->rows[1][0] == "capability_changed");
+    CHECK(res->rows[1][3] == "internet");
+    CHECK(res->rows[1][5] == "4");
 }
 
-TEST_CASE("EchoDatabase: insert_netconn_events returns false (no crash) when the table is gone",
+TEST_CASE("EchoDatabase: fold_netconn_events returns false (no crash) when the table is gone",
           "[echo][store][netconn]") {
     auto t = make_test_db();
-    REQUIRE(t.db.execute_query("DROP TABLE netconn_live").has_value());
+    REQUIRE(t.db.execute_query("DROP TABLE netconn_hourly_r").has_value());
     NetConnRow r;
     r.ts = 1;
     r.action = "connected";
     r.channel = "networkprofile";
-    CHECK_FALSE(t.db.insert_netconn_events({r}));
+    CHECK_FALSE(t.db.fold_netconn_events({r}));
     REQUIRE(t.db.execute_query("SELECT 1").has_value());
 }
 
@@ -1464,36 +1427,35 @@ TEST_CASE("netqual: nq_win_build_sample scales ms->us, deltas lost, clamps wrap"
     CHECK(nq_win_build_sample(rto, cur, "tcp", "198.51.100.2", "db").ca_state == 4);
 }
 
-TEST_CASE("EchoDatabase: insert_netqual_samples returns false (no crash) when the table is gone",
+TEST_CASE("EchoDatabase: fold_netqual_samples returns false (no crash) when the table is gone",
           "[echo][store][netqual]") {
-    // Mirrors the procperf prepare-fail ROLLBACK path: drop netqual_live out
-    // from under an open EchoDatabase, then insert — prepare fails, the function
-    // must ROLLBACK and return false without wedging the connection.
+    // Mirrors the procperf prepare-fail ROLLBACK path: drop the netqual tier out from under an
+    // open EchoDatabase, then fold — prepare fails, the function must ROLLBACK and return false
+    // without wedging the connection.
     auto t = make_test_db();
-    REQUIRE(t.db.execute_query("DROP TABLE netqual_live").has_value());
+    REQUIRE(t.db.execute_query("DROP TABLE netqual_hourly_r").has_value());
     NetQualRow r;
     r.ts = 1;
     r.snapshot_id = 1;
     r.proto = "tcp";
     r.process_name = "x";
-    CHECK_FALSE(t.db.insert_netqual_samples({r}));
+    CHECK_FALSE(t.db.fold_netqual_samples({r}));
     REQUIRE(t.db.execute_query("SELECT 1").has_value());
 }
 
-TEST_CASE("EchoDatabase: insert_proc_perf_samples returns false (no crash) when the table is gone",
+TEST_CASE("EchoDatabase: fold_proc_perf_samples returns false (no crash) when the table is gone",
           "[echo][store][procperf]") {
-    // The prepare-fail ROLLBACK path (gov QE S1): drop procperf_live out from
-    // under an open EchoDatabase via the trusted exec path, then insert —
-    // sqlite3_prepare_v2 fails, the function must ROLLBACK and return false
-    // without throwing or wedging the connection.
+    // The prepare-fail ROLLBACK path (gov QE S1): drop the procperf tier out from under an open
+    // EchoDatabase via the trusted exec path, then fold -- sqlite3_prepare_v2 fails, the function
+    // must ROLLBACK and return false without throwing or wedging the connection.
     auto t = make_test_db();
-    REQUIRE(t.db.execute_query("DROP TABLE procperf_live").has_value());
+    REQUIRE(t.db.execute_query("DROP TABLE procperf_hourly_r").has_value());
     ProcPerfRow r;
     r.ts = 1;
     r.snapshot_id = 1;
     r.name = "x.exe";
     r.instances = 1;
-    CHECK_FALSE(t.db.insert_proc_perf_samples({r}));
+    CHECK_FALSE(t.db.fold_proc_perf_samples({r}));
     // The connection is still usable afterwards (no wedged transaction).
     REQUIRE(t.db.execute_query("SELECT 1").has_value());
 }
@@ -1501,11 +1463,11 @@ TEST_CASE("EchoDatabase: insert_proc_perf_samples returns false (no crash) when 
 TEST_CASE("EchoDatabase: missing warehouse tables are re-created on reopen (upgrade path)",
           "[echo][store][lifecycle]") {
     // The A1 regression this pins: create_warehouse_tables used to run only at
-    // schema_version<2, so a table added by a NEWER release (perf tier,
-    // procperf tier) never materialised on an upgraded fleet's existing
-    // echo.db — inserts then failed every 30 s. The fix runs the idempotent
-    // IF-NOT-EXISTS DDL on EVERY open. Simulate the upgrade by dropping a
-    // "new" table from a closed v3 DB, then reopening.
+    // schema_version<2, so a table added by a NEWER release never materialised on an upgraded
+    // fleet's existing echo.db -- inserts then failed every 30 s. The fix runs the idempotent
+    // IF-NOT-EXISTS DDL on EVERY open. (After v10 that DDL covers the tables the roll-up does not
+    // own: netqual_boot and the usage tables.) Simulate the upgrade by dropping one from a closed
+    // DB, then reopening.
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_upg_");
     {
         auto db = EchoDatabase::open(tmp);
@@ -1515,7 +1477,7 @@ TEST_CASE("EchoDatabase: missing warehouse tables are re-created on reopen (upgr
     {
         sqlite3* raw = nullptr;
         REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(raw, "DROP TABLE procperf_live", nullptr, nullptr, nullptr) ==
+        REQUIRE(sqlite3_exec(raw, "DROP TABLE netqual_boot", nullptr, nullptr, nullptr) ==
                 SQLITE_OK);
         sqlite3_close(raw);
     }
@@ -1523,12 +1485,10 @@ TEST_CASE("EchoDatabase: missing warehouse tables are re-created on reopen (upgr
     {
         auto db = EchoDatabase::open(tmp); // must re-create the dropped table
         REQUIRE(db.has_value());
-        ProcPerfRow r;
+        NetQualBootRow r;
         r.ts = 1;
-        r.snapshot_id = 1;
-        r.name = "x.exe";
-        r.instances = 1;
-        REQUIRE(db->insert_proc_perf_samples({r}));
+        r.boot_ts = 1;
+        REQUIRE(db->insert_netqual_boot_row(r));
     }
 
     std::error_code ec;
@@ -1562,7 +1522,7 @@ TEST_CASE("EchoDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { EchoDatabase discard = std::move(t.db); }
     auto reopened = EchoDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 9);
+    CHECK(reopened->schema_version() == 10);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1596,7 +1556,7 @@ TEST_CASE("EchoDatabase: a pre-v3 database still has tar_events dropped on open"
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9); // the 2→3→4→5→6→7→8→9 walk ran
+        CHECK(db->schema_version() == 10); // the 2→3→4→5→6→7→8→9→10 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1637,7 +1597,7 @@ TEST_CASE("EchoDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED dat
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1659,9 +1619,9 @@ TEST_CASE("EchoDatabase: create_warehouse_tables joins a transaction the caller 
     // transaction rather than failing or nesting, and must leave the
     // connection's autocommit state undisturbed either way.
     auto t = make_test_db();
-    auto process_live_tables = [&] {
+    auto boot_tables = [&] {
         auto r = t.db.execute_query(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_live'");
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='netqual_boot'");
         REQUIRE(r.has_value());
         return r->rows[0][0];
     };
@@ -1671,29 +1631,28 @@ TEST_CASE("EchoDatabase: create_warehouse_tables joins a transaction the caller 
     // committed a transaction of its own, the re-created table would SURVIVE
     // that rollback; joining the caller's transaction means it must not. This is
     // what makes the test discriminating rather than merely green.
-    REQUIRE(t.db.execute_query("DROP TABLE process_live").has_value());
-    REQUIRE(process_live_tables() == "0");
+    REQUIRE(t.db.execute_query("DROP TABLE netqual_boot").has_value());
+    REQUIRE(boot_tables() == "0");
 
     REQUIRE(t.db.execute_sql("BEGIN IMMEDIATE"));
     CHECK(t.db.create_warehouse_tables());
-    CHECK(process_live_tables() == "1"); // recreated inside the caller's txn
+    CHECK(boot_tables() == "1"); // recreated inside the caller's txn
     REQUIRE(t.db.execute_sql("ROLLBACK"));
-    CHECK(process_live_tables() == "0"); // ...and discarded with it
+    CHECK(boot_tables() == "0"); // ...and discarded with it
 
     // The ordinary un-nested path commits on its own and leaves a usable handle.
     CHECK(t.db.create_warehouse_tables());
-    CHECK(process_live_tables() == "1");
-    auto q = t.db.execute_query("SELECT COUNT(*) FROM process_live");
+    CHECK(boot_tables() == "1");
+    auto q = t.db.execute_query("SELECT COUNT(*) FROM netqual_boot");
     REQUIRE(q.has_value());
 }
 
-TEST_CASE("EchoDatabase: schema v4 ALTERs version onto a pre-existing procperf tier (upgrade path)",
+TEST_CASE("EchoDatabase: a v3 database with pre-version procperf tables upgrades to the roll-up tiers",
           "[echo][store][lifecycle][procperf]") {
-    // The deployment-critical path the fresh-DB tests never exercise: an
-    // UPGRADING agent already has procperf_live/_hourly WITHOUT `version` at
-    // schema_version=3, so create_warehouse_tables' IF-NOT-EXISTS leaves them
-    // alone and the v4 block's ALTER TABLE ADD COLUMN must run. Seed that exact
-    // pre-v4 shape by hand, then open and prove the ALTER fired.
+    // The deployment-critical path the fresh-DB tests never exercise: an UPGRADING agent already
+    // has procperf_live/_hourly WITHOUT `version` at schema_version=3. The ladder's v4 and v7
+    // ALTERs add the columns, then the v10 migration moves the rows (raw and summarised) into the
+    // roll-up tiers. Seed that exact pre-v4 shape by hand with a raw row and a summary row.
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_v4_");
     {
         sqlite3* raw = nullptr;
@@ -1702,11 +1661,19 @@ TEST_CASE("EchoDatabase: schema v4 ALTERs version onto a pre-existing procperf t
             CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
             INSERT INTO echo_config (key, value) VALUES ('schema_version', '3');
             CREATE TABLE procperf_live (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER, snapshot_id INTEGER, name TEXT,
                 instances INTEGER, cpu_pct REAL, ws_bytes INTEGER);
             CREATE TABLE procperf_hourly (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hour_ts INTEGER, name TEXT, samples INTEGER, instances_max INTEGER,
                 cpu_avg REAL, cpu_max REAL, ws_avg_bytes INTEGER, ws_max_bytes INTEGER);
+            INSERT INTO procperf_live (ts, snapshot_id, name, instances, cpu_pct, ws_bytes)
+                VALUES (7300, 1, 'chrome.exe', 2, 5.0, 100);
+            INSERT INTO procperf_hourly (hour_ts, name, samples, instances_max, cpu_avg, cpu_max,
+                                         ws_avg_bytes, ws_max_bytes)
+                VALUES (3600, 'old.exe', 2, 1, 1.5, 2.0, 50, 60);
+            INSERT INTO echo_config (key, value) VALUES ('rollup_procperf_hourly_at', '7200');
         )";
         REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
         sqlite3_close(raw);
@@ -1715,28 +1682,32 @@ TEST_CASE("EchoDatabase: schema v4 ALTERs version onto a pre-existing procperf t
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9); // the v3→v4→v5→v6→v7→v8→v9 walk ran
+        CHECK(db->schema_version() == 10); // the v3→...→v9→v10 walk ran
 
-        // Both tiers now carry `version` (added by the ALTER, not the DDL).
-        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
-            auto info = db->execute_query(std::string{"PRAGMA table_info("} + tbl + ")");
-            REQUIRE(info.has_value());
-            bool has_version = false;
-            for (const auto& row : info->rows)
-                if (row.size() > 1 && row[1] == "version")
-                    has_version = true;
-            CHECK(has_version);
-        }
+        // The summary row survived the move, a retired average back as a sum (1.5 * 2 samples),
+        // and the raw row became an hourly bucket (no version column before v4: empty version).
+        auto old_row = db->execute_query(
+            "SELECT version, samples, instances_max, cpu_avg, ws_avg_bytes FROM procperf_hourly "
+            "WHERE name = 'old.exe'");
+        REQUIRE(old_row.has_value());
+        REQUIRE(old_row->rows.size() == 1);
+        CHECK(old_row->rows[0] == QueryRow{"", "2", "1", "1.5", "50"});
+        auto raw_row = db->execute_query(
+            "SELECT hour_ts, instances_max, ws_max_bytes FROM procperf_hourly WHERE name = 'chrome.exe'");
+        REQUIRE(raw_row.has_value());
+        REQUIRE(raw_row->rows.size() == 1);
+        CHECK(raw_row->rows[0] == QueryRow{"7200", "2", "100"});
 
-        // And a real insert carrying a version round-trips through the migrated table.
+        // And a fold carrying a version round-trips through the migrated tier.
         ProcPerfRow r;
         r.ts = 11;
         r.snapshot_id = 1;
         r.name = "chrome.exe";
         r.version = "124.0.6367.91";
         r.instances = 2;
-        REQUIRE(db->insert_proc_perf_samples({r}));
-        auto q = db->execute_query("SELECT version FROM procperf_live WHERE name = 'chrome.exe'");
+        REQUIRE(db->fold_proc_perf_samples({r}));
+        auto q = db->execute_query(
+            "SELECT version FROM procperf_hourly WHERE name = 'chrome.exe' AND hour_ts = 0");
         REQUIRE(q.has_value());
         REQUIRE(q->rows.size() == 1);
         CHECK(q->rows[0][0] == "124.0.6367.91");
@@ -1749,13 +1720,12 @@ TEST_CASE("EchoDatabase: schema v4 ALTERs version onto a pre-existing procperf t
     fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
-TEST_CASE("EchoDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf tier "
-          "(upgrade path)",
+TEST_CASE("EchoDatabase: a v6 database with is_kthread-less procperf tables upgrades "
+          "(the v7 step)",
           "[echo][store][lifecycle][procperf]") {
-    // Isolates the v7 step specifically: seed the exact POST-v6 shape (both
-    // tiers already carry `version`, from the v4 ALTER; schema_version=6) so
-    // create_warehouse_tables' IF-NOT-EXISTS leaves them alone and only the
-    // v7 block's ALTER TABLE ADD COLUMN is exercised.
+    // Isolates the v7 step specifically: seed the exact POST-v6 shape (both tiers already carry
+    // `version`; schema_version=6) so only the v7 ALTER runs before the v10 migration moves the
+    // rows. A kernel-thread marker written after the upgrade keeps its own row.
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_v7_");
     {
         sqlite3* raw = nullptr;
@@ -1764,12 +1734,16 @@ TEST_CASE("EchoDatabase: schema v7 ALTERs is_kthread onto a pre-existing procper
             CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
             INSERT INTO echo_config (key, value) VALUES ('schema_version', '6');
             CREATE TABLE procperf_live (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER, snapshot_id INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '',
                 instances INTEGER, cpu_pct REAL, ws_bytes INTEGER);
             CREATE TABLE procperf_hourly (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hour_ts INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '', samples INTEGER,
                 instances_max INTEGER, cpu_avg REAL, cpu_max REAL, ws_avg_bytes INTEGER,
                 ws_max_bytes INTEGER);
+            INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes)
+                VALUES (7300, 1, 'app.exe', '2.0', 1, 3.0, 10);
         )";
         REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
         sqlite3_close(raw);
@@ -1778,30 +1752,24 @@ TEST_CASE("EchoDatabase: schema v7 ALTERs is_kthread onto a pre-existing procper
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9); // the v6→v7→v8→v9 walk ran
+        CHECK(db->schema_version() == 10); // the v6→v7→...→v10 walk ran
 
-        // Both tiers now carry `is_kthread` (added by the ALTER, not the DDL).
-        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
-            auto info = db->execute_query(std::string{"PRAGMA table_info("} + tbl + ")");
-            REQUIRE(info.has_value());
-            bool has_is_kthread = false;
-            for (const auto& row : info->rows)
-                if (row.size() > 1 && row[1] == "is_kthread")
-                    has_is_kthread = true;
-            CHECK(has_is_kthread);
-        }
+        // The pre-v7 raw row is migrated as an ordinary (non-kernel-thread) app.
+        auto old_row = db->execute_query(
+            "SELECT version, is_kthread FROM procperf_hourly WHERE name = 'app.exe'");
+        REQUIRE(old_row.has_value());
+        REQUIRE(old_row->rows.size() == 1);
+        CHECK(old_row->rows[0] == QueryRow{"2.0", "0"});
 
-        // A real insert carrying is_kthread=true round-trips through the migrated
-        // table (stored as SQLite's INTEGER 0/1).
+        // A fold carrying is_kthread=true round-trips (stored as SQLite's INTEGER 0/1).
         ProcPerfRow r;
         r.ts = 21;
         r.snapshot_id = 1;
         r.name = "kworker/0:1";
         r.instances = 1;
         r.is_kthread = true;
-        REQUIRE(db->insert_proc_perf_samples({r}));
-        auto q =
-            db->execute_query("SELECT is_kthread FROM procperf_live WHERE name = 'kworker/0:1'");
+        REQUIRE(db->fold_proc_perf_samples({r}));
+        auto q = db->execute_query("SELECT is_kthread FROM procperf_hourly WHERE name = 'kworker/0:1'");
         REQUIRE(q.has_value());
         REQUIRE(q->rows.size() == 1);
         CHECK(q->rows[0][0] == "1");
@@ -1824,17 +1792,18 @@ TEST_CASE("EchoDatabase: insert and query arp events (ADR-0015)", "[echo][store]
     ev.ip_address = "192.168.1.1";
     ev.mac_address = "aa:bb:cc:dd:ee:ff";
     ev.entry_type = "dynamic";
-    REQUIRE(t.db.insert_arp_events({ev}));
-    CHECK(t.db.insert_arp_events({})); // empty input is a no-op success
+    REQUIRE(t.db.fold_arp_events({ev}));
+    CHECK(t.db.fold_arp_events({})); // empty input is a no-op success
 
     auto r = t.db.execute_query(
-        "SELECT interface, ip_address, mac_address, entry_type, action FROM arp_live");
+        "SELECT interface, ip_address, mac_address, appear_count, remove_count FROM arp_hourly");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 1);
     CHECK(r->rows[0][0] == "Ethernet");
     CHECK(r->rows[0][1] == "192.168.1.1");
     CHECK(r->rows[0][2] == "aa:bb:cc:dd:ee:ff");
-    CHECK(r->rows[0][4] == "appeared");
+    CHECK(r->rows[0][3] == "1"); // appeared
+    CHECK(r->rows[0][4] == "0");
 }
 
 TEST_CASE("EchoDatabase: insert and query dns events (ADR-0015)", "[echo][store][crud][dns]") {
@@ -1848,17 +1817,18 @@ TEST_CASE("EchoDatabase: insert and query dns events (ADR-0015)", "[echo][store]
     ev.data = "93.184.216.34";
     ev.ttl_remaining_s = 60;
     ev.source = "cache";
-    REQUIRE(t.db.insert_dns_events({ev}));
-    CHECK(t.db.insert_dns_events({})); // empty input is a no-op success
+    REQUIRE(t.db.fold_dns_events({ev}));
+    CHECK(t.db.fold_dns_events({})); // empty input is a no-op success
 
     auto r = t.db.execute_query(
-        "SELECT name, record_type, data, ttl_remaining_s, source FROM dns_live");
+        "SELECT name, record_type, data, appear_count, remove_count FROM dns_hourly");
     REQUIRE(r.has_value());
     REQUIRE(r->rows.size() == 1);
     CHECK(r->rows[0][0] == "example.com");
+    CHECK(r->rows[0][1] == "A");
     CHECK(r->rows[0][2] == "93.184.216.34");
-    CHECK(r->rows[0][3] == "60");
-    CHECK(r->rows[0][4] == "cache");
+    CHECK(r->rows[0][3] == "1");
+    CHECK(r->rows[0][4] == "0");
 }
 
 // ── #559: corrupt-DB quarantine on open ────────────────────────────────────
@@ -2646,27 +2616,27 @@ TEST_CASE("checked_transaction: happy path commits every statement together",
           "[echo][store][checked_transaction]") {
     auto t = make_test_db();
     auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (2,1,'started',2,0,'b.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (2,1,'started',2,'b.exe','u',2)"))
             return std::unexpected(h.error());
         return {};
     });
     CHECK(result.has_value());
-    CHECK(row_count(t.db, "process_live") == 2);
+    CHECK(row_count(t.db, "usage_live") == 2);
 }
 
 TEST_CASE("checked_transaction: a fault on the FIRST statement commits nothing",
           "[echo][store][checked_transaction]") {
     auto t = make_test_db();
-    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON usage_live "
                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
 
     auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
         // Never reached in a correct implementation -- but written anyway to
         // prove the SECOND statement is not what stops the commit; poisoning
@@ -2675,7 +2645,7 @@ TEST_CASE("checked_transaction: a fault on the FIRST statement commits nothing",
         return {};
     });
     CHECK_FALSE(result.has_value());
-    CHECK(row_count(t.db, "process_live") == 0);
+    CHECK(row_count(t.db, "usage_live") == 0);
     CHECK(t.db.get_config("canary", "") == ""); // the "second statement" never committed either
 }
 
@@ -2687,13 +2657,13 @@ TEST_CASE("checked_transaction: a fault on a MIDDLE statement commits nothing, "
                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
 
     auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
         if (!h.exec("INSERT INTO echo_config (key,value) VALUES ('mid','1')"))
             return std::unexpected(h.error());
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (2,1,'started',2,0,'b.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (2,1,'started',2,'b.exe','u',2)"))
             return std::unexpected(h.error());
         return {};
     });
@@ -2702,7 +2672,7 @@ TEST_CASE("checked_transaction: a fault on a MIDDLE statement commits nothing, "
     // statement here would be durable under that primitive (it precedes the
     // failure and the batch's data segment is tolerant). checked_transaction
     // has no such segment -- the whole thing is one all-or-nothing unit.
-    CHECK(row_count(t.db, "process_live") == 0);
+    CHECK(row_count(t.db, "usage_live") == 0);
 }
 
 TEST_CASE("checked_transaction: a fault on the LAST statement commits nothing",
@@ -2712,59 +2682,59 @@ TEST_CASE("checked_transaction: a fault on the LAST statement commits nothing",
                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
 
     auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
         if (!h.exec("INSERT INTO echo_config (key,value) VALUES ('last','1')"))
             return std::unexpected(h.error());
         return {};
     });
     CHECK_FALSE(result.has_value());
-    CHECK(row_count(t.db, "process_live") == 0);
+    CHECK(row_count(t.db, "usage_live") == 0);
 }
 
 TEST_CASE("checked_transaction: a statement-preserving fault (RAISE ABORT) leaves the "
           "connection usable, and a retry without the fault applies exactly once",
           "[echo][store][checked_transaction]") {
     auto t = make_test_db();
-    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON usage_live "
                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
 
     auto first = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
         return {};
     });
     CHECK_FALSE(first.has_value());
     CHECK(t.db.is_open()); // statement-preserving -- the store is NOT taken offline
-    REQUIRE(row_count(t.db, "process_live") == 0);
+    REQUIRE(row_count(t.db, "usage_live") == 0);
 
     REQUIRE(t.db.execute_sql("DROP TRIGGER block_ins"));
 
     auto retry = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
         return {};
     });
     CHECK(retry.has_value());
-    CHECK(row_count(t.db, "process_live") == 1); // applied exactly once, not twice
+    CHECK(row_count(t.db, "usage_live") == 1); // applied exactly once, not twice
 }
 
 TEST_CASE("checked_transaction: a transaction-aborting fault (RAISE ROLLBACK) stops the "
           "operation from issuing further statements",
           "[echo][store][checked_transaction]") {
     auto t = make_test_db();
-    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON usage_live "
                              "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
 
     int exec_attempts = 0;
     auto result = t.db.checked_transaction(
         [&exec_attempts](TransactionHandle& h) -> std::expected<void, std::string> {
             ++exec_attempts;
-            h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                   "VALUES (1,1,'started',1,0,'a.exe','','u')"); // aborts the transaction
+            h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                   "VALUES (1,1,'started',1,'a.exe','u',1)"); // aborts the transaction
             ++exec_attempts;
             // poisoned() now true -- this exec() must no-op, never touch SQLite,
             // never insert the canary row.
@@ -2778,7 +2748,7 @@ TEST_CASE("checked_transaction: a transaction-aborting fault (RAISE ROLLBACK) st
     CHECK_FALSE(result.has_value());
     CHECK(exec_attempts == 2); // both exec() CALLS were attempted by the callback...
     CHECK(t.db.get_config("canary", "") == ""); // ...but the second never touched the DB
-    CHECK(row_count(t.db, "process_live") == 0);
+    CHECK(row_count(t.db, "usage_live") == 0);
 }
 
 TEST_CASE("checked_transaction: an already-offline store refuses immediately, no crash",
@@ -2807,25 +2777,25 @@ TEST_CASE("checked_transaction: an exception thrown from the operation still rol
           "[echo][store][checked_transaction]") {
     auto t = make_test_db();
     auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
         throw std::runtime_error("simulated fault mid-operation");
     });
     CHECK_FALSE(result.has_value());
     CHECK(result.error().find("simulated fault mid-operation") != std::string::npos);
-    CHECK(row_count(t.db, "process_live") == 0); // the pre-throw INSERT did not survive
+    CHECK(row_count(t.db, "usage_live") == 0); // the pre-throw INSERT did not survive
     CHECK(t.db.is_open()); // an exception is not a wedge -- the connection stays usable
 
     // And the connection genuinely still works afterward.
     auto retry = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
-                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+        if (!h.exec("INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+                    "VALUES (1,1,'started',1,'a.exe','u',1)"))
             return std::unexpected(h.error());
         return {};
     });
     CHECK(retry.has_value());
-    CHECK(row_count(t.db, "process_live") == 1);
+    CHECK(row_count(t.db, "usage_live") == 1);
 }
 
 TEST_CASE("checked_transaction: every statement individually succeeding does not imply "
@@ -2899,15 +2869,15 @@ TEST_CASE("EchoDatabase: process events + baseline are one transaction (#1654)",
     b.name = "b.exe";
 
     install_state_fault(t.db, "process");
-    CHECK_FALSE(t.db.insert_process_events({a, b}, StateWrite{"process", "baseline-2"}));
+    CHECK_FALSE(t.db.fold_process_events({a, b}, StateWrite{"process", "baseline-2"}));
     // Nothing durable: no events, baseline unchanged -> the next tick re-diffs the
     // identical delta instead of double-emitting.
-    CHECK(count_rows(t.db, "process_live") == 0);
+    CHECK(count_rows(t.db, "process_hourly") == 0);
     CHECK(t.db.get_state("process") == "baseline-1");
 
     drop_state_fault(t.db);
-    CHECK(t.db.insert_process_events({a, b}, StateWrite{"process", "baseline-2"}));
-    CHECK(count_rows(t.db, "process_live") == 2);
+    CHECK(t.db.fold_process_events({a, b}, StateWrite{"process", "baseline-2"}));
+    CHECK(count_rows(t.db, "process_hourly") == 2);
     CHECK(t.db.get_state("process") == "baseline-2");
 }
 
@@ -2921,12 +2891,12 @@ TEST_CASE("EchoDatabase: software + network events + baseline are one transactio
     sw.action = "installed";
     sw.name = "app";
     install_state_fault(t.db, "software");
-    CHECK_FALSE(t.db.insert_software_events({sw}, StateWrite{"software", "s2"}));
-    CHECK(count_rows(t.db, "software_live") == 0);
+    CHECK_FALSE(t.db.fold_software_events({sw}, StateWrite{"software", "s2"}));
+    CHECK(count_rows(t.db, "software_hourly") == 0);
     CHECK(t.db.get_state("software").empty());
     drop_state_fault(t.db);
-    CHECK(t.db.insert_software_events({sw}, StateWrite{"software", "s2"}));
-    CHECK(count_rows(t.db, "software_live") == 1);
+    CHECK(t.db.fold_software_events({sw}, StateWrite{"software", "s2"}));
+    CHECK(count_rows(t.db, "software_hourly") == 1);
     CHECK(t.db.get_state("software") == "s2");
 
     NetworkEvent ne;
@@ -2935,12 +2905,12 @@ TEST_CASE("EchoDatabase: software + network events + baseline are one transactio
     ne.action = "connected";
     ne.proto = "tcp";
     install_state_fault(t.db, "network");
-    CHECK_FALSE(t.db.insert_network_events({ne}, StateWrite{"network", "n2"}));
-    CHECK(count_rows(t.db, "tcp_live") == 0);
+    CHECK_FALSE(t.db.fold_network_events({ne}, StateWrite{"network", "n2"}));
+    CHECK(count_rows(t.db, "tcp_hourly") == 0);
     CHECK(t.db.get_state("network").empty());
     drop_state_fault(t.db);
-    CHECK(t.db.insert_network_events({ne}, StateWrite{"network", "n2"}));
-    CHECK(count_rows(t.db, "tcp_live") == 1);
+    CHECK(t.db.fold_network_events({ne}, StateWrite{"network", "n2"}));
+    CHECK(count_rows(t.db, "tcp_hourly") == 1);
     CHECK(t.db.get_state("network") == "n2");
 }
 
@@ -2950,68 +2920,68 @@ TEST_CASE("EchoDatabase: service/user/arp/dns/mapdrive events + baseline are one
 
     ServiceEvent se; se.ts = 1000; se.snapshot_id = 1; se.action = "started"; se.name = "svc";
     install_state_fault(t.db, "service");
-    CHECK_FALSE(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
-    CHECK(count_rows(t.db, "service_live") == 0);
+    CHECK_FALSE(t.db.fold_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_hourly") == 0);
     CHECK(t.db.get_state("service").empty());
     drop_state_fault(t.db);
-    CHECK(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
-    CHECK(count_rows(t.db, "service_live") == 1);
+    CHECK(t.db.fold_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_hourly") == 1);
     CHECK(t.db.get_state("service") == "b2");
 
     UserEvent ue; ue.ts = 1000; ue.snapshot_id = 1; ue.action = "login"; ue.user = "alice";
     install_state_fault(t.db, "user");
-    CHECK_FALSE(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
-    CHECK(count_rows(t.db, "user_live") == 0);
+    CHECK_FALSE(t.db.fold_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_hourly") == 0);
     CHECK(t.db.get_state("user").empty());
     drop_state_fault(t.db);
-    CHECK(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
-    CHECK(count_rows(t.db, "user_live") == 1);
+    CHECK(t.db.fold_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_hourly") == 1);
     CHECK(t.db.get_state("user") == "b2");
 
     ArpEvent ae; ae.ts = 3000; ae.snapshot_id = 1; ae.action = "appeared"; ae.iface = "Ethernet";
     ae.ip_address = "192.168.1.1"; ae.mac_address = "aa:bb:cc:dd:ee:ff"; ae.entry_type = "dynamic";
     install_state_fault(t.db, "arp");
-    CHECK_FALSE(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
-    CHECK(count_rows(t.db, "arp_live") == 0);
+    CHECK_FALSE(t.db.fold_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_hourly") == 0);
     CHECK(t.db.get_state("arp").empty());
     drop_state_fault(t.db);
-    CHECK(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
-    CHECK(count_rows(t.db, "arp_live") == 1);
+    CHECK(t.db.fold_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_hourly") == 1);
     CHECK(t.db.get_state("arp") == "b2");
 
     DnsEvent de; de.ts = 3100; de.snapshot_id = 1; de.action = "appeared"; de.name = "example.com";
     de.record_type = "A"; de.data = "93.184.216.34"; de.ttl_remaining_s = 60; de.source = "cache";
     install_state_fault(t.db, "dns");
-    CHECK_FALSE(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
-    CHECK(count_rows(t.db, "dns_live") == 0);
+    CHECK_FALSE(t.db.fold_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_hourly") == 0);
     CHECK(t.db.get_state("dns").empty());
     drop_state_fault(t.db);
-    CHECK(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
-    CHECK(count_rows(t.db, "dns_live") == 1);
+    CHECK(t.db.fold_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_hourly") == 1);
     CHECK(t.db.get_state("dns") == "b2");
 
     MapDriveEvent me{1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB", "historical"};
     install_state_fault(t.db, "mapdrive");
-    CHECK_FALSE(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
-    CHECK(count_rows(t.db, "mapdrive_live") == 0);
+    CHECK_FALSE(t.db.fold_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_hourly") == 0);
     CHECK(t.db.get_state("mapdrive").empty());
     drop_state_fault(t.db);
-    CHECK(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
-    CHECK(count_rows(t.db, "mapdrive_live") == 1);
+    CHECK(t.db.fold_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_hourly") == 1);
     CHECK(t.db.get_state("mapdrive") == "b2");
 }
 
 TEST_CASE("EchoDatabase: StateWrite with empty events writes only the baseline (#1654)",
           "[echo][store][corruption][atomic]") {
     auto t = make_test_db();
-    CHECK(t.db.insert_process_events({}, StateWrite{"process", "only-state"}));
+    CHECK(t.db.fold_process_events({}, StateWrite{"process", "only-state"}));
     CHECK(t.db.get_state("process") == "only-state");
-    CHECK(count_rows(t.db, "process_live") == 0);
+    CHECK(count_rows(t.db, "process_hourly") == 0);
 
     // nullopt state keeps the historical contract for an open handle byte-for-byte
     // (a closed handle now returns false for the state-carrying overloads).
-    CHECK(t.db.insert_process_events({}));
-    CHECK(t.db.insert_process_events({}, std::nullopt));
+    CHECK(t.db.fold_process_events({}));
+    CHECK(t.db.fold_process_events({}, std::nullopt));
     CHECK(t.db.get_state("process") == "only-state");
 }
 
@@ -3064,9 +3034,9 @@ void remove_db_files(const fs::path& tmp) {
 
 } // namespace
 
-TEST_CASE("EchoDatabase: a fresh open lands at schema_version 9", "[echo][store][migration][v8]") {
+TEST_CASE("EchoDatabase: a fresh open lands at schema_version 10", "[echo][store][migration][v10]") {
     auto t = make_test_db();
-    CHECK(t.db.schema_version() == 9);
+    CHECK(t.db.schema_version() == 10);
 }
 
 TEST_CASE("EchoDatabase v7->v8: stored opt-outs of every formerly-off source flip once",
@@ -3091,7 +3061,7 @@ TEST_CASE("EchoDatabase v7->v8: stored opt-outs of every formerly-off source fli
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
         int64_t expect = 1'700'000'000;
         for (const auto src : kFormerlyOff) {
             INFO("formerly-off source=" << src);
@@ -3119,7 +3089,7 @@ TEST_CASE("EchoDatabase v7->v8: errored / already-on / absent rows are left alon
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
         CHECK(db->get_config("netqual_enabled", "") == "errored");
         // An already-on source's deliberate pause survives.
         CHECK(db->get_config("process_enabled", "") == "false");
@@ -3144,17 +3114,19 @@ TEST_CASE("EchoDatabase v7->v8: an opt-out written after the migration sticks",
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
         CHECK(db->get_config("procperf_enabled", "") == "false");
     }
     remove_db_files(tmp);
 }
 
-TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back and retries",
+TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back and the "
+          "open refuses and the retry completes",
           "[echo][store][migration][v8][atomic]") {
-    // The trigger fails the flip UPDATE after the paused_at upsert already ran
-    // inside the same savepoint: the rollback must undo that, schema stays at 7,
-    // and a reopen with the fault removed completes.
+    // The trigger fails the flip UPDATE after the paused_at upsert already ran inside the same
+    // savepoint: the rollback must undo that, and the roll-up step must NOT run past the failed
+    // one -- it would take the version to 10 and the flip would never be retried. The open refuses
+    // (a retryable error); a reopen with the fault removed completes both steps.
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_v8_");
     seed_v7_config(tmp,
                    {{"procperf_enabled", "false"},
@@ -3166,22 +3138,34 @@ TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back and
                    "BEGIN SELECT RAISE(ABORT, 'injected'); END;");
     {
         auto db = EchoDatabase::open(tmp);
-        REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7);
-        CHECK(db->get_config("procperf_enabled", "") == "false");
-        CHECK(db->get_config("procperf_paused_at", "") == "7");
-        CHECK(db->get_config("netqual_enabled", "") == "false");
+        REQUIRE_FALSE(db.has_value());
+        CHECK(db.error().find("earlier migration step did not finish") != std::string::npos);
     }
     {
+        // Nothing the failed step did survived: read the file the way the next open will.
         yuzu::test::SqliteHandleOwner<sqlite3> owner;
         REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        const auto stored = [&](const char* key) {
+            sqlite3_stmt* st = nullptr;
+            const std::string sql = std::string{"SELECT value FROM echo_config WHERE key = '"} + key + "'";
+            REQUIRE(sqlite3_prepare_v2(owner.db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK);
+            std::string v;
+            if (sqlite3_step(st) == SQLITE_ROW)
+                v = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+            return v;
+        };
+        CHECK(stored("schema_version") == "7");
+        CHECK(stored("procperf_enabled") == "false");
+        CHECK(stored("procperf_paused_at") == "7");
+        CHECK(stored("netqual_enabled") == "false");
         REQUIRE(sqlite3_exec(owner.db, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr,
                              nullptr) == SQLITE_OK);
     }
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
         CHECK(db->get_config("procperf_enabled", "") == "true");
         CHECK(db->get_config("procperf_paused_at", "") == "0");
         CHECK(db->get_config("netqual_enabled", "") == "true");
@@ -3190,37 +3174,73 @@ TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back and
     remove_db_files(tmp);
 }
 
-TEST_CASE("EchoDatabase v7->v8: a disable written while a failed migration is pending is reset by "
-          "the retry",
-          "[echo][store][migration][v8][atomic]") {
-    // Pins the documented limit (upgrading.md, echo.md): the opt-out guarantee holds once the v8
-    // migration has SUCCEEDED. One failed v8 step leaves the agent running at schema 7, and the
-    // retry on the next start reads a "false" an operator wrote in that window as a pre-upgrade
-    // opt-out of one of the eight formerly-off sources.
+TEST_CASE("EchoDatabase v7: a failed v8 step blocks the roll-up step and leaves the raw capture "
+          "rows intact until a reopen succeeds",
+          "[echo][store][migration][v8][v10][atomic]") {
+    // A v7 file that still holds raw capture rows, with a trigger that fails the v8 flip. The
+    // roll-up step must refuse to run past the failed step: it would take the version to 10 and
+    // v8 would never be retried. After the fault is removed one reopen walks v7 to v10.
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_v8_");
-    seed_v7_config(tmp, {{"procperf_enabled", "false"}},
-                   "CREATE TRIGGER yuzu_test_v8_abort BEFORE UPDATE ON echo_config "
-                   "WHEN NEW.key = 'procperf_enabled' "
-                   "BEGIN SELECT RAISE(ABORT, 'injected'); END;");
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        const char* seed = R"(
+            CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+            INSERT INTO echo_config (key, value) VALUES ('schema_version', '7');
+            INSERT INTO echo_config (key, value) VALUES ('netqual_enabled', 'false');
+            CREATE TABLE procperf_live (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER, snapshot_id INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '',
+                instances INTEGER, cpu_pct REAL, ws_bytes INTEGER);
+            CREATE TABLE procperf_hourly (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hour_ts INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '', samples INTEGER,
+                instances_max INTEGER, cpu_avg REAL, cpu_max REAL, ws_avg_bytes INTEGER,
+                ws_max_bytes INTEGER, is_kthread INTEGER NOT NULL DEFAULT 0);
+            ALTER TABLE procperf_live ADD COLUMN is_kthread INTEGER NOT NULL DEFAULT 0;
+            INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes)
+                VALUES (7300, 1, 'app.exe', '2.0', 1, 3.0, 10);
+            CREATE TRIGGER yuzu_test_v8_abort BEFORE UPDATE ON echo_config
+                WHEN NEW.key = 'netqual_enabled'
+                BEGIN SELECT RAISE(ABORT, 'injected'); END;
+        )";
+        REQUIRE(sqlite3_exec(owner.db, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
     {
         auto db = EchoDatabase::open(tmp);
-        REQUIRE(db.has_value());
-        REQUIRE(db->schema_version() == 7); // the v8 step failed; the agent runs on
-        REQUIRE(db->set_config("arp_enabled", "false")); // echo.configure arp enabled=false
-        REQUIRE(db->set_config("arp_paused_at", "1761000000"));
+        REQUIRE_FALSE(db.has_value());
+        CHECK(db.error().find("earlier migration step") != std::string::npos);
     }
     {
         yuzu::test::SqliteHandleOwner<sqlite3> owner;
         REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        const auto scalar = [&](const char* sql) {
+            sqlite3_stmt* st = nullptr;
+            REQUIRE(sqlite3_prepare_v2(owner.db, sql, -1, &st, nullptr) == SQLITE_OK);
+            std::string v;
+            if (sqlite3_step(st) == SQLITE_ROW)
+                v = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+            return v;
+        };
+        CHECK(scalar("SELECT value FROM echo_config WHERE key = 'schema_version'") == "7");
+        CHECK(scalar("SELECT COUNT(*) FROM procperf_live") == "1");
+        CHECK(scalar("SELECT COUNT(*) FROM procperf_hourly") == "0");
+        // No transaction or lock survived the refused open: autocommit, and a writer can begin.
+        CHECK(sqlite3_get_autocommit(owner.db) == 1);
+        CHECK(sqlite3_exec(owner.db, "BEGIN IMMEDIATE; ROLLBACK;", nullptr, nullptr, nullptr) ==
+              SQLITE_OK);
         REQUIRE(sqlite3_exec(owner.db, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr,
                              nullptr) == SQLITE_OK);
     }
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9);
-        CHECK(db->get_config("arp_enabled", "") == "true");
-        CHECK(db->get_config("arp_paused_at", "") == "0");
+        CHECK(db->schema_version() == 10);
+        CHECK(db->get_config("netqual_enabled", "") == "true");
+        auto row = db->execute_query("SELECT version FROM procperf_hourly WHERE name = 'app.exe'");
+        REQUIRE(row.has_value());
+        CHECK(row->rows.size() == 1);
     }
     remove_db_files(tmp);
 }
@@ -3278,7 +3298,7 @@ TEST_CASE("EchoDatabase: one failed schema_version read at open does not replay 
     {
         auto db = EchoDatabase::open(tmp);
         REQUIRE(db.has_value());
-        REQUIRE(db->schema_version() == 9);
+        REQUIRE(db->schema_version() == 10);
         REQUIRE(db->set_config("module_enabled", "false"));
         REQUIRE(db->set_config("module_paused_at", "1761000000"));
     }
@@ -3292,7 +3312,7 @@ TEST_CASE("EchoDatabase: one failed schema_version read at open does not replay 
         g_deny_value_read = -1;
         REQUIRE(db.has_value());
         REQUIRE(g_denied.load()); // the fault reached the schema_version read
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
         CHECK(db->get_config("module_enabled", "") == "false");
         CHECK(db->get_config("module_paused_at", "") == "1761000000");
     }
@@ -3433,7 +3453,7 @@ TEST_CASE("adopt_legacy_echo_db: a crash-shaped tar.db + un-checkpointed WAL ope
         auto db = EchoDatabase::open(echo_db);
         REQUIRE(db.has_value());
         CHECK(db->get_config("wal_marker", "") == "x"); // the WAL-only row survived the move
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
     }
     const auto names = table_names(echo_db);
     CHECK(has_table(names, "echo_state"));
@@ -3617,7 +3637,7 @@ TEST_CASE("EchoDatabase::open refuses to create a fresh echo.db beside an unadop
     REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());
     auto db = EchoDatabase::open(echo_db);
     REQUIRE(db.has_value());
-    CHECK(db->schema_version() == 9);
+    CHECK(db->schema_version() == 10);
 }
 
 TEST_CASE("adopt_legacy_echo_db: a fresh directory is a no-op and opens at schema 9",
@@ -3629,12 +3649,12 @@ TEST_CASE("adopt_legacy_echo_db: a fresh directory is a no-op and opens at schem
     {
         auto db = EchoDatabase::open(echo_db);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 9);
+        CHECK(db->schema_version() == 10);
     }
     CHECK_FALSE(fs::exists(d.path() / "tar.db"));
     auto again = EchoDatabase::open(echo_db);
     REQUIRE(again.has_value());
-    CHECK(again->schema_version() == 9);
+    CHECK(again->schema_version() == 10);
 }
 
 TEST_CASE("EchoDatabase: a v8 file already holding echo_* tables only gets the version marker",
@@ -3653,7 +3673,7 @@ TEST_CASE("EchoDatabase: a v8 file already holding echo_* tables only gets the v
     }
     auto db = EchoDatabase::open(echo_db);
     REQUIRE(db.has_value());
-    CHECK(db->schema_version() == 9);
+    CHECK(db->schema_version() == 10);
     CHECK(db->get_config("kept", "") == "yes");
 }
 
@@ -3727,13 +3747,13 @@ void insert_tcp_rows(EchoDatabase& db, int n, int64_t ts0) {
         ev.local_addr = "10.0.0.1";
         ev.local_port = 1000 + i;
         ev.remote_addr = "10.0.0." + std::to_string(i % 200);
-        ev.remote_port = 443;
+        ev.remote_port = 1000 + i; // the remote port is part of the roll-up key: one row per i
         ev.state = "ESTABLISHED";
         ev.pid = 1;
         ev.process_name = "curl";
         evs.push_back(std::move(ev));
     }
-    REQUIRE(db.insert_network_events(evs));
+    REQUIRE(db.fold_network_events(evs));
 }
 
 int64_t count_table_rows(EchoDatabase& db, const std::string& table) {
@@ -3758,7 +3778,7 @@ TEST_CASE("EchoDatabase: db_size_bytes is used pages plus the WAL, not the file 
     insert_tcp_rows(t.db, 3000, 1000);
     // A contiguous range empties whole pages (every-other-row deletes may free none), and the
     // case is only meaningful with a non-empty freelist: used pages differ from the file then.
-    REQUIRE(t.db.execute_sql("DELETE FROM tcp_live WHERE id <= 2000"));
+    REQUIRE(t.db.execute_sql("DELETE FROM tcp_hourly_r WHERE id <= 2000"));
 
     const int64_t page_count = pragma_int(t.db, "page_count");
     const int64_t freelist = pragma_int(t.db, "freelist_count");
@@ -3823,11 +3843,10 @@ TEST_CASE("EchoDatabase: a failed size measurement is reported as failed, never 
     const auto res = yuzu::echo::run_budget(t.db, 1'700'000'000, /*target_bytes=*/0, [] { return true; });
     CHECK(res.failed);
     CHECK_FALSE(res.exhausted);
-    CHECK(res.evicted_raw == 0);
     CHECK(res.evicted_hourly == 0);
     denier.deny = false;
     CHECK(t.db.storage_bytes().ok);
-    CHECK(count_table_rows(t.db, "tcp_live") == 200);
+    CHECK(count_table_rows(t.db, "tcp_hourly_r") == 200);
 
     // A closed store is the same shape.
     EchoDatabase moved = std::move(t.db);
@@ -3856,7 +3875,7 @@ TEST_CASE("EchoDatabase: set_state with identical JSON is a no-op, a change rewr
     CHECK(t.db.get_state("process") == R"([{"pid":2}])");
 }
 
-TEST_CASE("EchoDatabase: a StateWrite inside insert_network_events skips an identical baseline",
+TEST_CASE("EchoDatabase: a StateWrite inside fold_network_events skips an identical baseline",
           "[echo][store][state][budget]") {
     auto t = make_test_db();
     const auto updated_at = [&] {
@@ -3872,14 +3891,16 @@ TEST_CASE("EchoDatabase: a StateWrite inside insert_network_events skips an iden
     ev.proto = "tcp";
     ev.local_port = 1;
     ev.remote_port = 2;
-    REQUIRE(t.db.insert_network_events({ev}, StateWrite{"network", "[1]"}));
+    REQUIRE(t.db.fold_network_events({ev}, StateWrite{"network", "[1]"}));
     REQUIRE(t.db.execute_sql("UPDATE echo_state SET updated_at = 1 WHERE collector='network'"));
 
     ev.local_port = 3;
-    REQUIRE(t.db.insert_network_events({ev}, StateWrite{"network", "[1]"}));
-    CHECK(updated_at() == 1); // the rows landed, the identical baseline did not rewrite
-    CHECK(count_table_rows(t.db, "tcp_live") == 2);
-    REQUIRE(t.db.insert_network_events({ev}, StateWrite{"network", "[2]"}));
+    REQUIRE(t.db.fold_network_events({ev}, StateWrite{"network", "[1]"}));
+    CHECK(updated_at() == 1); // the counts landed, the identical baseline did not rewrite
+    auto landed = t.db.execute_query("SELECT SUM(connect_count) FROM tcp_hourly", 1);
+    REQUIRE(landed.has_value());
+    CHECK(landed->rows.at(0).at(0) == "2");
+    REQUIRE(t.db.fold_network_events({ev}, StateWrite{"network", "[2]"}));
     CHECK(updated_at() > 1);
 }
 
@@ -3888,12 +3909,12 @@ TEST_CASE("EchoDatabase: delete_counted counts RETURNING rows and bumps the coun
     auto t = make_test_db();
     insert_tcp_rows(t.db, 10, 1000);
     const std::string sql =
-        "DELETE FROM tcp_live WHERE id IN (SELECT id FROM tcp_live ORDER BY id LIMIT 4) RETURNING id";
+        "DELETE FROM tcp_hourly_r WHERE id IN (SELECT id FROM tcp_hourly_r ORDER BY id LIMIT 4) RETURNING id";
 
     auto first = t.db.delete_counted(sql, "budget_test_counter");
     REQUIRE(first.has_value());
     CHECK(*first == 4);
-    CHECK(count_table_rows(t.db, "tcp_live") == 6);
+    CHECK(count_table_rows(t.db, "tcp_hourly_r") == 6);
     CHECK(t.db.get_config("budget_test_counter", "") == "4");
 
     auto second = t.db.delete_counted(sql, "budget_test_counter");
@@ -3901,7 +3922,7 @@ TEST_CASE("EchoDatabase: delete_counted counts RETURNING rows and bumps the coun
     CHECK(*second == 4);
     CHECK(t.db.get_config("budget_test_counter", "") == "8"); // accumulates
 
-    auto none = t.db.delete_counted("DELETE FROM tcp_live WHERE id < 0 RETURNING id",
+    auto none = t.db.delete_counted("DELETE FROM tcp_hourly_r WHERE id < 0 RETURNING id",
                                     "budget_test_counter");
     REQUIRE(none.has_value());
     CHECK(*none == 0);
@@ -3913,17 +3934,17 @@ TEST_CASE("EchoDatabase: a failing delete_counted leaves the rows and the counte
     auto t = make_test_db();
     insert_tcp_rows(t.db, 10, 1000);
     const std::string sql =
-        "DELETE FROM tcp_live WHERE id IN (SELECT id FROM tcp_live ORDER BY id LIMIT 4) RETURNING id";
+        "DELETE FROM tcp_hourly_r WHERE id IN (SELECT id FROM tcp_hourly_r ORDER BY id LIMIT 4) RETURNING id";
 
     SECTION("a statement that fails part-way") {
         // A trigger aborts the whole statement on one of the rows.
         REQUIRE(t.db.execute_sql(
-            "CREATE TRIGGER yuzu_test_block BEFORE DELETE ON tcp_live WHEN OLD.local_port = 1002 "
+            "CREATE TRIGGER yuzu_test_block BEFORE DELETE ON tcp_hourly_r WHEN OLD.remote_port = 1002 "
             "BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
         auto r = t.db.delete_counted(sql, "budget_test_counter");
         REQUIRE_FALSE(r.has_value());
         CHECK_FALSE(r.error().empty());
-        CHECK(count_table_rows(t.db, "tcp_live") == 10);
+        CHECK(count_table_rows(t.db, "tcp_hourly_r") == 10);
         CHECK(t.db.get_config("budget_test_counter", "absent") == "absent");
     }
     SECTION("the counter bump failing rolls the deletes back") {
@@ -3932,7 +3953,7 @@ TEST_CASE("EchoDatabase: a failing delete_counted leaves the rows and the counte
             "WHEN NEW.key = 'budget_test_counter' BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
         auto r = t.db.delete_counted(sql, "budget_test_counter");
         REQUIRE_FALSE(r.has_value());
-        CHECK(count_table_rows(t.db, "tcp_live") == 10); // the deletes did not survive the failed bump
+        CHECK(count_table_rows(t.db, "tcp_hourly_r") == 10); // the deletes did not survive the failed bump
     }
     SECTION("an unknown table") {
         auto r = t.db.delete_counted("DELETE FROM no_such_table RETURNING id", "budget_test_counter");
@@ -3957,10 +3978,48 @@ TEST_CASE("EchoDatabase: rollback_open_transaction clears a transaction an unwin
     ev.snapshot_id = 1;
     ev.action = "connected";
     ev.proto = "tcp";
-    CHECK_FALSE(t.db.insert_network_events({ev})); // cannot BEGIN inside the open transaction
+    CHECK_FALSE(t.db.fold_network_events({ev})); // cannot BEGIN inside the open transaction
     t.db.rollback_open_transaction();
-    CHECK(t.db.insert_network_events({ev}));
-    CHECK(count_table_rows(t.db, "tcp_live") == 2);
+    CHECK(t.db.fold_network_events({ev}));
+    CHECK(count_table_rows(t.db, "tcp_hourly_r") == 2);
+}
+
+namespace {
+
+// Denies the ROLLBACK statement while `deny` is set: a ROLLBACK that fails with the transaction
+// still open, the one state a failed rollback_open_transaction must not leave behind.
+struct RollbackDenier {
+    bool deny{false};
+};
+
+int deny_rollback(void* user, int action, const char* arg1, const char*, const char*, const char*) {
+    if (static_cast<const RollbackDenier*>(user)->deny && action == SQLITE_TRANSACTION &&
+        arg1 != nullptr && std::string_view{arg1} == "ROLLBACK")
+        return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
+} // namespace
+
+TEST_CASE("EchoDatabase: a rollback that fails with the transaction still open closes the store (B3)",
+          "[echo][store][budget][chaos]") {
+    // #6889 review B3: rollback_open_transaction only LOGGED a failed ROLLBACK and left the shared
+    // connection inside the transaction, so every later write was reported durable and lost at
+    // close. It must do what checked_transaction does: ask sqlite3_get_autocommit, and when the
+    // transaction is genuinely still open, close the connection so every method fails closed.
+    RollbackDenier denier; // outlives the database that holds a pointer to it
+    auto t = make_test_db();
+    REQUIRE(t.db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        sqlite3_set_authorizer(h.raw(), deny_rollback, &denier);
+        return {};
+    }));
+    REQUIRE(t.db.execute_sql("BEGIN")); // what an exception between BEGIN and COMMIT leaves behind
+    denier.deny = true;
+    t.db.rollback_open_transaction();
+    CHECK_FALSE(t.db.is_open()); // closed: FAILS WITHOUT the autocommit check + close
+    CHECK_FALSE(t.db.set_config("yuzu_test_key", "v")); // every write now fails closed
+
+    // The healthy path is unchanged (covered by the sibling test): a rollback that works leaves it open.
 }
 
 TEST_CASE("EchoDatabase: set_config and set_state refuse to join a transaction left open",
@@ -4089,4 +4148,34 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
         CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kOk);
         CHECK(db.storage_bytes().wal_bytes == 0); // TRUNCATE reclaimed the WAL file
     }
+}
+
+TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
+          "[echo][store][purge][dictionary]") {
+    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
+    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
+    // "purged". A deadline already past is gc_dictionary's own seam for that path.
+    auto t = make_test_db();
+    ProcessEvent e;
+    e.ts = 1000;
+    e.snapshot_id = 1;
+    e.action = "started";
+    e.pid = 1;
+    e.name = "purged.exe";
+    e.user = "u";
+    REQUIRE(t.db.fold_process_events({e}));
+
+    const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
+    REQUIRE(starved.has_value());
+    CHECK(starved->rows_deleted == 3); // hourly, daily, monthly
+    CHECK(starved->dictionary_pending);
+    CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "1"); // still there
+
+    const auto swept = t.db.purge_source("process");
+    REQUIRE(swept.has_value());
+    CHECK(swept->rows_deleted == 0);
+    CHECK(!swept->dictionary_pending);
+    CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "0");
 }
