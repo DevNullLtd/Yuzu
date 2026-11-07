@@ -6864,7 +6864,8 @@ engine token) the check reads the token's row from the server's Postgres at ever
 for an engine token, the backing engine principal's row too. It does not use the 60 second token
 cache or the 15 second engine-principal cache that the held-open streams use. So a token revoked
 through ANY replica before the read is seen at the next step boundary of a run on any replica: the
-next step is not sent. The cost is one indexed read per check (two for an engine token). A check
+next step is not sent. The cost is one indexed read per presented token header (an `Authorization: Bearer` and an
+`X-Yuzu-Token` header make up to two) plus, for an engine token, one read of the principal row. A check
 runs before every send attempt: each step's first send, each wake from a retry delay, and each item
 of a `foreach` step (so a `foreach` over N items makes N checks), and a check whose answer cannot be
 given is asked once more. A run is capped at 2 per principal and 60 seconds. If the database does
@@ -6877,7 +6878,9 @@ is not recalled, a token's expiry time is still judged against the clock of the 
 call, and a cookie session is decided by the durable session store's generation, which each replica
 polls at most once per second, so while the session store answers a sign-out on another replica is
 seen within about a second rather than at the very next boundary, and while a replica's poll is
-failing it can keep serving the cached session for up to 30 seconds before failing closed. The 60
+failing it can keep serving the cached session for up to 30 seconds before failing closed. A cookie session whose
+store read still fails after that is stopped as `credential_revoked`; only token reads report
+`credential_indeterminate`. The 60
 second deadline, the live RBAC check at each send and the revoke itself apply as before. Other
 callers of the token store, including the held-open MCP streams (see the MCP manual), keep the cached
 read and its lag (#4766).
@@ -7049,10 +7052,10 @@ and a caller with no device scope also gets `agent_ids_total`, the number of dis
 named. Both fields are absent for a run stored whole, and `agent_ids_total` is never sent to a
 confined caller. A confined caller sees a truncated run only if one of the stored ids is in its
 scope, so a confined reader whose devices fall past the stored ids does not see the run, and that
-includes the creator when its `Execution:Execute` scope reaches devices its `Workflow:Read` scope does
-not (a global `Execute` grant with a group-scoped `Read` grant stores the ids in the order named, so
-the creator loses its run when none of its group's devices is among those stored; overlapping scopes
-do not prevent it) (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
+includes the creator unless the run names at least one device inside its `Execution:Execute` scope and
+that scope lies within its `Workflow:Read` scope (overlapping scopes are not enough; a global `Execute`
+grant with a group-scoped `Read` grant stores the ids in the order named, so the creator loses its run
+when none of its group's devices is among those stored) (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
 unconfined readers and the audit log still see it. The same applies to
 `GET /api/workflow-executions/{id}` and MCP `get_workflow_execution`.
 

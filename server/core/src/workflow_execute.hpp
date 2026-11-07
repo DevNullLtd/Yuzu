@@ -120,8 +120,8 @@
 /// API-token caller (human, MCP or engine token) is checked against its `api_tokens` row, never
 /// the 60 s process-local token cache, and an engine token's backing principal against
 /// `engine_principals`, never the 15 s liveness cache. So a revoke committed by ANY replica
-/// before the read is seen at the next step boundary. Cost: one indexed read per check (two for an
-/// engine token), against the server's one read-write Postgres, from the pool with a 1.5 s lease
+/// before the read is seen at the next step boundary. Cost: one indexed read per presented token header
+/// (Bearer and X-Yuzu-Token: up to two) plus one principal row read for an engine token, against the server's one read-write Postgres, from the pool with a 1.5 s lease
 /// wait; a run is capped at 2 per principal and 60 s. An unanswerable read is `kIndeterminate`
 /// (one retry, then stop), never `kRevoked` and never `kValid`. Under a pool brownout one
 /// boundary can wait about 10 s (up to three reads per attempt at 1.5 s, two attempts, 1 s
