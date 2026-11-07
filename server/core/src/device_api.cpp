@@ -28,8 +28,8 @@ public:
 
     [[nodiscard]] std::vector<DeviceListRow> list_devices() const override {
         // Lock order: the registry's lock is taken and released inside to_json_obj(), THEN the
-        // health store's mutex is taken once for the whole join. Two sequential acquisitions,
-        // never nested, so there is no ordering relation with heartbeat ingest (which also
+        // health store's mutex is taken per slice of ids (see kGuardianBackendSlice). Sequential
+        // acquisitions, never nested, so there is no ordering relation with heartbeat ingest (which also
         // touches the two stores separately).
         const auto arr = registry_.to_json_obj();
         std::vector<std::string> ids;

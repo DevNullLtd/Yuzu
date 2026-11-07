@@ -1480,6 +1480,18 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog();
 /// drift this constant removes.
 inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
 
+/// Bulk guardian_backend_for takes mu_ in slices of this many ids and sleeps kGuardianBackendPause
+/// between slices, so heartbeat ingest (upsert) waits for one slice and never the whole list.
+/// MEASURED at 500k ids (real store, -O2): one unsliced call held mu_ about 150-200 ms and
+/// stalled a concurrent upsert by about the same; 4096-id slices alone did NOT help (std::mutex is
+/// unfair, the reader re-takes it before the woken writer runs; yield() did not help either);
+/// 4096 ids plus a 50 us sleep took the worst upsert stall to 2-4 ms for about 10 ms more per
+/// call. The pause is therefore load-bearing: do not remove it as "dead sleep". Slices are not a
+/// point-in-time snapshot, which list_devices never was (the registry lock is released before
+/// the health lock is taken).
+inline constexpr std::size_t kGuardianBackendSlice = 4096;
+inline constexpr std::chrono::microseconds kGuardianBackendPause{50};
+
 struct AgentHealthSnapshot {
     std::string agent_id;
     std::unordered_map<std::string, std::string> status_tags;
@@ -1547,9 +1559,11 @@ public:
     /// `guardian_backend_for` returns one entry per input id, ALIGNED by index: the token
     /// (a view into the header's constexpr table, static storage, safe after mu_ is released)
     /// or nullopt for an id that is unknown to the store, stale, has no tag or an empty one, or
-    /// carries a rejected value. nullopt NEVER means `legacy`. It takes mu_ ONCE and does one hash
-    /// lookup per id with no string copies (list_devices has six callers, four of which discard
-    /// the field; see device_api.hpp). `guardian_backend_of` is the O(1) point lookup for
+    /// carries a rejected value. nullopt NEVER means `legacy`. It does one hash lookup per id with
+    /// no string copies, taking mu_ per kGuardianBackendSlice ids with a kGuardianBackendPause
+    /// sleep between slices (list_devices has six callers, four of which discard the field; see
+    /// device_api.hpp). Because mu_ is released between slices an entry can be refreshed or pruned
+    /// mid-call: each id is read consistently, the list is not one snapshot. `guardian_backend_of` is the O(1) point lookup for
     /// lookup_device (#3564: no scan, so a miss costs the same as a hit). Neither may be called
     /// from a hot path; both are for Infrastructure:Read device reads.
     [[nodiscard]] std::vector<std::optional<std::string_view>>

@@ -41,10 +41,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using yuzu::server::DeviceReadError;
@@ -263,6 +265,86 @@ TEST_CASE("DeviceApi guardian_backend: the registry is the population, the healt
     REQUIRE_FALSE(snapshot.empty());
     for (const auto& entry : snapshot)
         CHECK_FALSE(entry.contains("guardian_backend"));
+}
+
+TEST_CASE("AgentHealthStore guardian_backend_for: results stay aligned across lock slices",
+          "[device_api][guardian_backend]") {
+    using yuzu::server::detail::kGuardianBackendSlice;
+    using yuzu::server::detail::kGuardianBackendTokens;
+    // Two full slices plus a ragged tail, so both slice boundaries are crossed.
+    const std::size_t n = (2 * kGuardianBackendSlice) + 7;
+    AgentHealthStore health;
+    std::vector<std::string> ids;
+    ids.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        ids.push_back("sl-" + std::to_string(i));
+        // i % 5: four valid tokens, and every fifth id is NOT in the store at all.
+        if (i % 5 != 4)
+            beat(health, ids.back(), std::string{kGuardianBackendTokens[i % 5]});
+    }
+    const auto out = health.guardian_backend_for(ids, std::chrono::seconds{300});
+    REQUIRE(out.size() == n);
+    for (std::size_t i = 0; i < n; ++i) {
+        INFO("index " << i);
+        if (i % 5 == 4) {
+            CHECK_FALSE(out[i].has_value());
+        } else {
+            REQUIRE(out[i].has_value());
+            CHECK(*out[i] == kGuardianBackendTokens[i % 5]);
+        }
+    }
+    // The ids on either side of each slice boundary are the ones a slicing bug would shift.
+    for (const std::size_t edge : {kGuardianBackendSlice, 2 * kGuardianBackendSlice})
+        for (const std::size_t i : {edge - 1, edge, edge + 1})
+            CHECK(out[i].has_value() == (i % 5 != 4));
+    // An empty list and a list shorter than one slice behave as before.
+    CHECK(health.guardian_backend_for({}, std::chrono::seconds{300}).empty());
+    const std::vector<std::string> two{ids[0], ids[4]};
+    const auto small = health.guardian_backend_for(two, std::chrono::seconds{300});
+    REQUIRE(small.size() == 2);
+    CHECK(small[0].has_value());
+    CHECK_FALSE(small[1].has_value());
+}
+
+TEST_CASE("AgentHealthStore guardian_backend_for: concurrent upserts never tear a result",
+          "[device_api][guardian_backend]") {
+    using yuzu::server::detail::kGuardianBackendSlice;
+    using yuzu::server::detail::kGuardianBackendTokens;
+    const std::size_t n = (2 * kGuardianBackendSlice) + 100;
+    AgentHealthStore health;
+    std::vector<std::string> ids;
+    ids.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        ids.push_back("cc-" + std::to_string(i));
+        beat(health, ids.back(), std::string{kGuardianBackendTokens[0]});
+    }
+    // The writer flips tokens (and adds garbage) while the reader runs bulk calls whose lock is
+    // released between slices. Every entry must be nullopt or one of the four table tokens, the
+    // list must stay aligned, and a sanitizer build must see no race on the snapshot map.
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        std::size_t k = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            const auto& id = ids[(k * 7919) % n];
+            beat(health, id, (k % 3 == 0) ? std::string{"garbage"}
+                                           : std::string{kGuardianBackendTokens[k % 4]});
+            ++k;
+        }
+    });
+    for (int round = 0; round < 12; ++round) {
+        const auto out = health.guardian_backend_for(ids, std::chrono::seconds{300});
+        REQUIRE(out.size() == n);
+        for (const auto& v : out) {
+            if (!v)
+                continue;
+            const bool known = std::any_of(
+                std::begin(kGuardianBackendTokens), std::end(kGuardianBackendTokens),
+                [&](const char* t) { return *v == std::string_view{t}; });
+            REQUIRE(known);
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    writer.join();
 }
 
 TEST_CASE("AgentHealthStore guardian_backend accessors: staleness uses the sweep's clock and parse",

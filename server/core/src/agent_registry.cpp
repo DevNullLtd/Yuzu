@@ -1,6 +1,7 @@
 #include "agent_registry.hpp"
 
 #include <algorithm>
+#include <thread>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -2436,13 +2437,18 @@ AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
                                        std::chrono::seconds staleness) const {
     std::vector<std::optional<std::string_view>> out;
     out.reserve(agent_ids.size());
-    std::lock_guard lock(mu_);
     const auto now = std::chrono::steady_clock::now();
-    for (const auto& id : agent_ids) {
-        const auto it = snapshots_.find(id);
-        out.push_back(it == snapshots_.end()
-                          ? std::nullopt
-                          : guardian_backend_from_snapshot(it->second, now, staleness));
+    for (std::size_t base = 0; base < agent_ids.size(); base += kGuardianBackendSlice) {
+        if (base != 0)
+            std::this_thread::sleep_for(kGuardianBackendPause); // lock NOT held; see the constant
+        const auto end = std::min(agent_ids.size(), base + kGuardianBackendSlice);
+        std::lock_guard lock(mu_);
+        for (std::size_t i = base; i < end; ++i) {
+            const auto it = snapshots_.find(agent_ids[i]);
+            out.push_back(it == snapshots_.end()
+                              ? std::nullopt
+                              : guardian_backend_from_snapshot(it->second, now, staleness));
+        }
     }
     return out;
 }
