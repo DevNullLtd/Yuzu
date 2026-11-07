@@ -236,9 +236,9 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
 // data. `package_action` names the ONE action whose package rows this manager's token maps in
 // (so a snap row inside `packages`, or a homebrew row inside `store_packages`, stays unmapped);
 // `presence_row` is whether a present `managers` row for it becomes an installed_software
-// entry, and `presence_publisher` the constant vendor of that presence row (empty: the row has no
-// vendor field, so the core labels it `via:<ecosystem>`). A manager absent from this table maps
-// to nothing. The ecosystem values are written as
+// entry, and `presence_publisher` the constant vendor of that presence row (empty: the table
+// declares none, so `vendor_or_origin` labels it `via:<ecosystem>`). A manager absent from this
+// table maps to nothing. The ecosystem values are written as
 // `.ecosystem = "..."` so tests/test_software_vocabulary_consistency.py still reads every
 // ecosystem this file emits.
 //
@@ -506,10 +506,10 @@ AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
 AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, ConstrainedPolicy policy) {
     // manager|<name>|<present|unavailable>|<version or ->|<root>|<facts>|<reason>
     // A PRESENCE row only (the v2 row has no field for the prefix, so two Homebrew
-    // prefixes collapse to one row after dedup). Homebrew-only: a manager whose
-    // kManagerEcosystems row has no `presence_row` (and any name absent from it:
-    // dpkg/apt/rpm/dnf/pacman/apk) is dropped — the Linux/Windows managers
-    // legs must add a deliberate mapping, and manager facts belong to facet rows.
+    // prefixes collapse to one row after dedup). Only a manager whose kManagerEcosystems row
+    // has `presence_row` (homebrew, chocolatey, winget) becomes an entry; any other manager
+    // (and any name absent from the table: dpkg/apt/rpm/dnf/pacman/apk) is dropped, so a
+    // new managers leg needs a deliberate mapping, and manager facts belong to facet rows.
     return adapt_pkg_inventory(out, kActionManagers,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
@@ -527,7 +527,9 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, Constrai
         SwEntry e;
         e.name = std::string(m->manager);
         e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
-        e.publisher = std::string(m->presence_publisher); // middleware precedent; empty -> via:
+        // The vendor the table declares for this presence row (middleware precedent), else
+        // empty, which `vendor_or_origin` labels `via:<ecosystem>`.
+        e.publisher = std::string(m->presence_publisher);
         e.kind = "app";
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));

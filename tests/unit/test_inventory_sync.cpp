@@ -4572,14 +4572,15 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
                                 "C:\\ProgramData\\chocolatey", "lib_dirs=19", ""),
         pkg::format_manager_row(pkg::Manager::winget, pkg::Presence::present, "1.29.379.0",
                                 "C:\\Program Files\\WindowsApps\\DesktopAppInstaller", "", "")});
-    g_fake[1].out["packages"] = nl({supported_status("packages"),
-                                    pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
-                                    "package|chocolatey|7zip|26.5.0|pkg"});
+    g_fake[1].out["packages"] =
+        nl({supported_status("packages"),
+            pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
+            "package|chocolatey|7zip|26.5.0|pkg"});
     g_fake[1].out["store_packages"] =
         nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
             flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit),
             appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
-                     "x64")});
+                     "neutral")});
     g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
     {
         msi::Inventory inv;

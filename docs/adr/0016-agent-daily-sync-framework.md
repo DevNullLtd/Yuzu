@@ -1227,7 +1227,7 @@ the fallback.
 | same, macOS installer receipts | none: a reverse-domain id is an identifier, not a vendor, and no heuristic turns one into the other | `via:macos_pkgutil` |
 | `pkg_inventory.packages` (Homebrew, Chocolatey), `pkg_inventory.store_packages` (snap, flatpak, Appx) | none: `pkg_inventory` starts no process by design | `via:brew`, `via:chocolatey`, `via:snap`, `via:flatpak`, `via:appx` |
 | `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
-| `pkg_inventory.managers` (Chocolatey and winget presence rows) | none: the row has no vendor field | `via:chocolatey`, `via:winget` |
+| `pkg_inventory.managers` (Chocolatey and winget presence rows) | none: no constant vendor is declared for them | `via:chocolatey`, `via:winget` |
 | `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
 | `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
 | `runtimes.python`, Windows | the row's vendor column (the `PythonCore` registry tag), unescaped | `via:python` when the column is `-` |

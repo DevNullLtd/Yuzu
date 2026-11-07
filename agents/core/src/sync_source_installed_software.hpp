@@ -9,7 +9,8 @@
 /// the `constrained` policy; a new inventory action adds one row + one pure adapter):
 ///   installed_apps.list_inventory           blob contract v2 rows
 ///   pkg_inventory.packages                  Homebrew formulae/casks (ecosystem `brew`)
-///   pkg_inventory.managers                  one `homebrew` presence row (publisher `Homebrew`)
+///   pkg_inventory.managers                  presence rows: `homebrew` (publisher `Homebrew`),
+///                                           `chocolatey` and `winget` (labelled `via:`)
 ///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
 ///   windows_optional_features.list          every DISM feature, state in `version`
 ///                                           (publisher `Microsoft`)

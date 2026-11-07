@@ -111,8 +111,10 @@ cadences.
   `via:deb` and so on), which names where the row came from, not who made the software.
   A label is a fixed, lower-case, exact `via:` prefix: Homebrew formulae and casks, Snaps
   and Flatpaks are read without starting a process, so they carry no vendor and always read
-  `via:brew`, `via:snap` and `via:flatpak` (the single Homebrew presence row, `homebrew`,
-  carries the constant publisher `Homebrew`); `pacman` and `apk` have no vendor field in their package
+  `via:brew`, `via:snap` and `via:flatpak`; Chocolatey packages, the Chocolatey and winget
+  presence rows and Appx packages carry none either (`via:chocolatey`, `via:winget`,
+  `via:appx`), and only the Homebrew presence row, `homebrew`, carries a constant publisher,
+  `Homebrew`; `pacman` and `apk` have no vendor field in their package
   list; a macOS installer receipt id is an identifier, not a vendor. A row with no
   ecosystem is labelled `via:unknown`, never the bare `via:`. The catalogue treats a
   label as no vendor: it does not count towards the publisher total, never wins as a
