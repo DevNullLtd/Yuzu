@@ -11,6 +11,8 @@
 
 #include "guaranteed_state.pb.h"
 #include "guardian_arm_ack.hpp" // kWedgeSuppressMaxDecisions (#5459: the held-generation valve test)
+#include "guardian_emit_seq.hpp" // GuardianEmitSeqSource (UP-14: one sequence across both emit paths)
+#include "guardian_legacy_sink_executor.hpp" // LegacySendOutcome (the legacy EventSink's return type)
 #include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
 #include "guardian_baseline_persister.hpp" // GuardianBaselinePersister (#4045)
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
@@ -25,6 +27,7 @@
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
 #include "guardian_outbox_drain_worker.hpp" // GuardianOutboxDrainWorker (started_for_test, #2238)
 #include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::set_detach_fault_for_test (rung 9c PR-2 Unit 6 test (b))
+#include "guardian_spark_send.hpp" // guardian_outbox_entry_to_event (UP-14 parity with the legacy wire event)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3 ("S+") wedge-pattern test
 #include "spark_engine.hpp"
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags (#4685 AC8)
@@ -58,6 +61,9 @@
 #include <thread>
 #include <version> // __cpp_lib_jthread
 #include <vector>
+
+#include <google/protobuf/io/coded_stream.h> // UP-14: raw wire scan of the emit-pair fields
+#include <google/protobuf/wire_format_lite.h>
 
 #include <sqlite3.h> // real KV-write-failure seam (test_kv_store.cpp's own "drop the table
                      // through a second connection" pattern) - no fault-injection stand-in
@@ -604,10 +610,13 @@ struct SparkReconcileFixture {
     /// start_local() (agent.cpp), so spark is Available while the boot re-arm walk runs.
     /// Default false keeps the historical order (start_local() first, so the walk never
     /// reaches spark) that every pre-existing fixture user was written against.
-    explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0,
-                                   std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt,
-                                   SparkType mechanism_type = SparkType::Service,
-                                   bool with_registry_sibling = false, bool wire_first = false) {
+    /// `boot_epoch` (UP-14) is the engine's claimed epoch; 0 (default) is the unordered engine
+    /// every pre-UP-14 caller built.
+    explicit SparkReconcileFixture(
+        std::uint64_t periodic_bound_ms = 0,
+        std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt,
+        SparkType mechanism_type = SparkType::Service, bool with_registry_sibling = false,
+        bool wire_first = false, std::uint64_t boot_epoch = 0) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
@@ -623,7 +632,8 @@ struct SparkReconcileFixture {
         }
         spark_engine.start();
 
-        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true);
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true,
+                                                  boot_epoch);
         // The two timing seams must precede wire_spark_engine() (it constructs the worker and
         // the runtime), and are harmless before start_local(), so one lambda serves both orders.
         const auto configure_and_wire = [&] {
@@ -11092,4 +11102,184 @@ TEST_CASE("#5604 stop(): a second stop() after the store healed currently does N
     CHECK(persister->persist_failures() == failures);
     CHECK(rt->staged_baseline_count_for_test() == 1);
     CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+}
+
+// ---------------------------------------------------------------------------
+// UP-14: ONE (boot_epoch, emit_seq) sequence across the legacy executor and the Spark
+// runtime. wire_spark_engine() hands the runtime the engine's source; a runtime left on its
+// private epoch-0 source would send Spark lifecycle entries 0/0 and restart the ordinal.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::uint64_t kUp14Epoch = 1'790'000'789ULL;
+
+/// Recording legacy EventSink. Captures `this`: declare it BEFORE the fixture it is wired
+/// into and retire the engine's executor workers (retire_up14_workers) before it destructs.
+struct Up14LegacyCapture {
+    std::mutex mu;
+    std::vector<gpb::GuaranteedStateEvent> events;
+    GuardianEngine::EventSink sink() {
+        return [this](const gpb::GuaranteedStateEvent& ev) {
+            std::lock_guard<std::mutex> lk{mu};
+            events.push_back(ev);
+            return yuzu::agent::LegacySendOutcome::Sent;
+        };
+    }
+    std::vector<gpb::GuaranteedStateEvent> snapshot() {
+        std::lock_guard<std::mutex> lk{mu};
+        return events;
+    }
+};
+
+yuzu::agent::GuardDrift up14_drift(const std::string& rule_id) {
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "service";
+    d.rule_id = rule_id;
+    d.rule_name = rule_id;
+    return d;
+}
+
+/// First sent Spark entry for `rule_id` with lifecycle_kind "armed"; waits for the drain
+/// worker to deliver it.
+OutboxEntry wait_for_sent_armed(SparkReconcileFixture& f, const std::string& rule_id) {
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        return std::any_of(f.sent.begin(), f.sent.end(), [&](const OutboxEntry& e) {
+            return e.rule_id == rule_id && e.lifecycle_kind == "armed";
+        });
+    }));
+    std::lock_guard<std::mutex> lk{f.sent_mu};
+    for (const auto& e : f.sent)
+        if (e.rule_id == rule_id && e.lifecycle_kind == "armed")
+            return e;
+    FAIL("armed entry vanished");
+    return {};
+}
+
+/// Every top-level varint field of a serialized event, by FIELD NUMBER, read straight off the
+/// wire - independent of the generated accessor names, so it pins the numbers a server reader
+/// binds to rather than what this build calls them.
+std::map<std::uint32_t, std::uint64_t> wire_varint_fields(const std::string& bytes) {
+    std::map<std::uint32_t, std::uint64_t> out;
+    google::protobuf::io::CodedInputStream in(reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                                              static_cast<int>(bytes.size()));
+    while (true) {
+        const std::uint32_t tag = in.ReadTag();
+        if (tag == 0)
+            break;
+        if (google::protobuf::internal::WireFormatLite::GetTagWireType(tag) ==
+            google::protobuf::internal::WireFormatLite::WIRETYPE_VARINT) {
+            std::uint64_t v = 0;
+            REQUIRE(in.ReadVarint64(&v));
+            out[google::protobuf::internal::WireFormatLite::GetTagFieldNumber(tag)] = v;
+        } else {
+            REQUIRE(google::protobuf::internal::WireFormatLite::SkipField(&in, tag));
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("UP-14: legacy a, then a Spark lifecycle entry b, then legacy c draw ONE strictly "
+          "increasing emit_seq under the engine's epoch",
+          "[spark][guardian][reconcile][emit_seq]") {
+    Up14LegacyCapture legacy; // outlives the fixture: its executor worker may still call it
+    SparkReconcileFixture f{0,     std::nullopt,        SparkType::Service,
+                            false, /*wire_first=*/true, kUp14Epoch};
+    yuzu::test::ScopeExit retire([&] {
+        if (f.engine && !f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{30}))
+            std::abort(); // a worker still holding `legacy` must not outlive it
+    });
+    f.engine->set_event_sink(legacy.sink());
+
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, up14_drift("legacy-rule"));
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    f.apply(make_service_rule("r1"));
+    const OutboxEntry b = wait_for_sent_armed(f, "r1");
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, up14_drift("legacy-rule"));
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+
+    const auto evs = legacy.snapshot();
+    REQUIRE(evs.size() == 2);
+    const auto& a = evs[0];
+    const auto& c = evs[1];
+    CHECK(a.boot_epoch() == kUp14Epoch);
+    CHECK(c.boot_epoch() == kUp14Epoch);
+    CHECK(b.boot_epoch == kUp14Epoch); // the runtime drew from the engine's source, not its own
+    REQUIRE(a.emit_seq() > 0);
+    CHECK(b.seq > a.emit_seq());
+    CHECK(c.emit_seq() > b.seq);
+}
+
+TEST_CASE("UP-14: the legacy executor's wire event and a real drained Spark entry carry the "
+          "same emit-pair field numbers (24/25) with the engine's values",
+          "[spark][guardian][reconcile][emit_seq]") {
+    Up14LegacyCapture legacy;
+    SparkReconcileFixture f{0,     std::nullopt,        SparkType::Service,
+                            false, /*wire_first=*/true, kUp14Epoch};
+    yuzu::test::ScopeExit retire([&] {
+        if (f.engine && !f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{30}))
+            std::abort();
+    });
+    f.engine->set_event_sink(legacy.sink());
+
+    // Legacy: GuardianEngine::emit_guard_event -> executor offer() -> the captured sink.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, up14_drift("legacy-rule"));
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    // Spark: a real runtime entry, drained by the engine's drain worker, mapped by the
+    // production send mapping.
+    f.apply(make_service_rule("r1"));
+    const OutboxEntry entry = wait_for_sent_armed(f, "r1");
+    const auto spark_ev = yuzu::agent::guardian_outbox_entry_to_event(entry, "linux");
+
+    const auto evs = legacy.snapshot();
+    REQUIRE(evs.size() == 1);
+    const auto legacy_fields = wire_varint_fields(evs[0].SerializeAsString());
+    const auto spark_fields = wire_varint_fields(spark_ev.SerializeAsString());
+
+    // Field numbers 24 (boot_epoch) and 25 (emit_seq) on BOTH wire encodings.
+    REQUIRE(legacy_fields.contains(24));
+    REQUIRE(legacy_fields.contains(25));
+    REQUIRE(spark_fields.contains(24));
+    REQUIRE(spark_fields.contains(25));
+    CHECK(legacy_fields.at(24) == kUp14Epoch);
+    CHECK(spark_fields.at(24) == kUp14Epoch);
+    CHECK(legacy_fields.at(25) == evs[0].emit_seq());
+    CHECK(spark_fields.at(25) == entry.seq);
+    CHECK(spark_fields.at(25) > legacy_fields.at(25)); // one sequence: Spark drew second
+}
+
+TEST_CASE("UP-14: the Spark runtime co-owns the engine's emit source and keeps it valid "
+          "after the engine is gone; it is released with the runtime",
+          "[spark][guardian][reconcile][emit_seq]") {
+    std::weak_ptr<yuzu::agent::GuardianEmitSeqSource> weak;
+    {
+        SparkReconcileFixture f{0,     std::nullopt,        SparkType::Service,
+                                false, /*wire_first=*/true, kUp14Epoch};
+        f.apply(make_service_rule("r1")); // runtime present and has drawn at least once
+        std::uint64_t drawn_before = 0;
+        {
+            auto src = f.engine->emit_seq_source_for_test();
+            REQUIRE(src);
+            weak = src;
+            drawn_before = src->last.load();
+            REQUIRE(drawn_before > 0);
+        } // the test keeps no strong reference past here
+
+        // The registered SparkEngine handler owns the runtime (make_handler), so the runtime
+        // outlives the engine - the "detached handler" case the shared_ptr exists for.
+        REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{30}));
+        f.engine.reset();
+        auto still = weak.lock();
+        REQUIRE(still); // alive: only the runtime can be holding it now
+        CHECK(still->boot_epoch == kUp14Epoch);
+        CHECK(still->draw() > drawn_before); // valid memory, still strictly increasing
+        still.reset();
+
+        f.spark_engine.stop(); // drops the registered handler -> the last runtime owner
+        CHECK(weak.expired());
+    }
+    CHECK(weak.expired());
 }

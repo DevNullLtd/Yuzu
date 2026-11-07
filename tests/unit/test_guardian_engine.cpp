@@ -26,6 +26,7 @@
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
+#include "guardian_boot_epoch.hpp"    // claim_guardian_boot_epoch, kGuardianBootEpochKey (UP-14)
 #include "guardian_legacy_sink_executor.hpp" // LegacySendOutcome (EventSink's return type, #4783)
 
 #include "test_helpers.hpp"
@@ -295,6 +296,38 @@ TEST_CASE("full_sync clears the prior rule set but PRESERVES a persisted baselin
     // The rule cache itself IS cleared by full_sync, unaffected by this change —
     // only baseline: keys are exempted from the sweep.
     CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
+}
+
+TEST_CASE("full_sync PRESERVES the persisted boot-epoch claim (meta:boot_epoch)",
+          "[guardian][engine][full_sync][emit_seq]") {
+    // UP-14: the epoch lives in the engine's own namespace beside the rule: keys. full_sync's
+    // sweep is rule-prefix scoped; a sweep that took it would reset every later boot's floor
+    // to the wall-clock term alone, which a backward clock step can then undercut.
+    GuardianFixture f;
+    const auto claim = yuzu::agent::claim_guardian_boot_epoch(f.kv.get(), 1'790'000'000);
+    REQUIRE(claim.boot_epoch != 0);
+    // Same namespace as the rule: keys, which is the premise of this test.
+    REQUIRE(GuardianEngine::kv_namespace() == yuzu::agent::kGuardianBootEpochNamespace);
+    const std::string expected = std::to_string(claim.boot_epoch);
+    const auto epoch_row = [&] {
+        return f.kv->get_entry(yuzu::agent::kGuardianBootEpochNamespace,
+                               yuzu::agent::kGuardianBootEpochKey);
+    };
+    REQUIRE(epoch_row().has_value());
+    REQUIRE(epoch_row()->has_value());
+    REQUIRE(**epoch_row() == expected);
+
+    f.engine->apply_rules(
+        GuardianFixture::make_push({GuardianFixture::make_rule("r1", "r1")}, /*full_sync=*/true));
+    REQUIRE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
+    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_rule("other", "other")},
+                                                     /*full_sync=*/true));
+    // The sweep did run (r1 is gone) ...
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
+    // ... and left the epoch row alone, byte for byte.
+    REQUIRE(epoch_row().has_value());
+    REQUIRE(epoch_row()->has_value());
+    CHECK(**epoch_row() == expected);
 }
 
 TEST_CASE("a full_sync that DOES re-arm the baselined rule seeds it from the persisted "
