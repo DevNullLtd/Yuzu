@@ -1177,7 +1177,8 @@ SoftwareInventoryStore::diff_changes(const std::vector<SoftwareEntry>& old_rows,
         std::sort(g.removed.begin(), g.removed.end(), by_ver);
         std::sort(g.added.begin(), g.added.end(), by_ver);
         // An equal tuple on both sides pairs first: the row churned (install_date, signature,
-        // publisher spelling, location spelling) at the same version, so there is no event.
+        // a publisher or location spelling that normalises equal) at the same version, so there is
+        // no event. A publisher that changes the normalised vendor changes the stem instead.
         std::vector<const SoftwareEntry*> gone;
         std::vector<const SoftwareEntry*> came;
         std::size_t r = 0;

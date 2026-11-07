@@ -6080,6 +6080,26 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
         CHECK(ch[0].from_version == "1.0");
         CHECK(ch[0].instance_key == row("Contoso.Calc", "1.0", "appx", "x86").instance_key);
     }
+    SECTION("an origin label reads as no vendor: label for label is no event, a vendor is new") {
+        // The publisher is hashed verbatim (so the instance key changes with it) but the pairing
+        // stem reads an origin label `via:<ecosystem>` as no vendor. A label for a label pairs at
+        // an equal version and writes nothing; a label becoming a real vendor changes the stem,
+        // so the same version is a removal and an install, not an update.
+        const auto with = [&](const std::string& publisher) {
+            auto e = row("git", "2.45", "chocolatey");
+            e.publisher = publisher;
+            return keyed(std::move(e));
+        };
+        CHECK(SoftwareInventoryStore::diff_changes({with("via:chocolatey")}, {with("via:other")})
+                  .empty());
+        const auto ch = SoftwareInventoryStore::diff_changes({with("via:chocolatey")},
+                                                             {with("Chocolatey Software")});
+        REQUIRE(ch.size() == 2);
+        CHECK(std::set<Kind>{ch[0].kind, ch[1].kind} ==
+              (std::set<Kind>{Kind::kInstall, Kind::kRemove}));
+        for (const auto& c : ch)
+            CHECK((c.from_version == "2.45" || c.to_version == "2.45"));
+    }
     SECTION("an unreadable Chocolatey version is a version like any other") {
         // The collector writes version '' for a package whose nuspec it cannot read (a junction
         // lib directory does that to every package at once). The pairing rule as it stands does
