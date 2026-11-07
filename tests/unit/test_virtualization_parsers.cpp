@@ -8,9 +8,9 @@
  *             `sysctl kern.hv_vmm_present hw.model`.
  *   SYNTHETIC built from the documented layouts (Microsoft TLFS hypervisor-discovery leaves,
  *             DMI strings Linux publishes under Hyper-V, cgroup v1/v2 text). The Windows host
- *             and WSL2 guest specimens are SYNTHETIC until the plugin's own captures from
- *             kingsley land in agents/plugins/virtualization/docs/samples; no real hostname,
- *             serial or account name appears in any fixture.
+ *             and WSL2 guest specimens here stay SYNTHETIC; the plugin's own real captures of
+ *             both are the samples in agents/plugins/virtualization/docs/samples. No real
+ *             hostname, serial or account name appears in any fixture.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -177,8 +177,8 @@ TEST_CASE("virtualization: a real bare-metal Mac reads bare_metal", "[virtualiza
 
 TEST_CASE("virtualization: a Windows host running Hyper-V is host_with_hypervisor not a guest",
           "[virtualization][classify]") {
-    // SYNTHETIC from the TLFS leaves a Windows root partition reports; the kingsley capture
-    // replaces the board strings.
+    // SYNTHETIC from the TLFS leaves a Windows root partition reports; the real capture on a
+    // Hyper-V host is docs/samples/windows.txt.
     Facts f;
     f.os = "windows";
     f.cpuid = cpuid_hv("Microsoft Hv", 0x4000000Cu, "Hv#1", true);
