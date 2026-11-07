@@ -183,7 +183,7 @@
     },
     {
       "grant": "None: both sysctls answer an unprivileged caller",
-      "if_refused": "`CONSTRAINED` / partial with `macos:virtualization:hv_vmm_present:unreadable` or `macos:virtualization:hw_model:unreadable`; the kind is `unknown`",
+      "if_refused": "`CONSTRAINED` / partial with `macos:virtualization:hv_vmm_present:unreadable` or `macos:virtualization:hw_model:unreadable`; the kind is `unknown` unless the other sysctl still identifies a guest",
       "measured": "The sample was captured as an unprivileged user, not under the LaunchDaemon account",
       "os": "macOS",
       "runs_as": "agent daemon (root under the shipped LaunchDaemon today, `docs/agent-privilege-model.md`)"
@@ -232,7 +232,7 @@
       "completeness": "partial",
       "provenance": "`macos:virtualization:hv_vmm_present:unreadable`, `macos:virtualization:hw_model:unreadable`",
       "status": "`CONSTRAINED`",
-      "when": "macOS: a sysctl could not be read; the kind is `unknown`"
+      "when": "macOS: a sysctl could not be read; the kind is `unknown` unless the other sysctl still identifies a guest"
     },
     {
       "completeness": "partial",
