@@ -9,10 +9,23 @@
 /// client without dragging the server's `AgentRegistry`/`TagStore` layer
 /// along.
 ///
-/// The method set == the public REST resources it stands in front of, 1:1
+/// The PUBLIC method set == the public REST resources it stands in front of, 1:1
 /// (INV-31-4 "no private core API"):
 ///   - `list_devices`   <-> `GET /api/v1/devices`      (MCP `list_agents`)
 ///   - `lookup_device`  <-> `GET /api/v1/devices/{id}`  (MCP `get_agent_details`)
+///
+/// -- IN-PROCESS READ SHAPES (#2240): NO REST/MCP TWIN, NOT CONFINED --
+/// `list_devices_basic()` and `connected_count()` are projections of `list_devices()` for
+/// in-process callers that do not serialise the per-device backend field (the dashboard device
+/// fragment, the crypto hostname map, the two page-render connected counts). They are NOT public
+/// resources and add no route or tool. Like `list_devices()` they are UNFILTERED and fleet-wide
+/// (see the next banner): `connected_count()` is the replica-local registry size, the same
+/// population `list_devices()` builds rows from. They are the first defaulted virtuals on a seam
+/// in this tree, by design: a test double or a future remote (WS-B2) client that implements only
+/// `list_devices()` inherits correct, if slower, defaults. A remote client MUST NOT add a route
+/// for them (a new public resource needs REST and MCP twins, ADR-1005); it inherits the defaults
+/// or uses a query option on `GET /api/v1/devices`. Note a remote count would then be filtered to
+/// the caller's scope, unlike the local fleet-wide one.
 ///
 /// The store-backed factory (`make_local_device_api`) lives in the core-only
 /// `device_api_local.hpp` — this header names no store type at all, not even
@@ -20,9 +33,9 @@
 ///
 /// ── UNSCOPED DATA PROVIDER — READ BEFORE ADDING A CONSUMER (mirrors
 /// compliance_api.hpp's identical banner) ──
-/// `list_devices()` returns the registry's UNFILTERED, fleet-wide rows —
-/// every connected agent, regardless of the caller's own management-group
-/// confinement. This is a fan-out read of per-agent data (routed-concerns'
+/// `list_devices()` (and `list_devices_basic()`/`connected_count()`) return the registry's
+/// UNFILTERED, fleet-wide rows or count: every connected agent, regardless of the caller's own
+/// management-group confinement. This is a fan-out read of per-agent data (routed-concerns'
 /// `authorize_list_read`/`require_fleet_read` MUST, ADR-0017 World A) —
 /// EVERY consumer MUST apply the fleet-read/confinement gate appropriate to
 /// its surface before serving this result to a caller (MCP `list_agents` does
@@ -46,6 +59,7 @@
 /// (governance #3564, security-guardian + architect). Reaching `lookup_device`
 /// implies the caller has already cleared its consumer's confinement gate.
 
+#include <cstddef>
 #include <expected>
 #include <optional>
 #include <string>

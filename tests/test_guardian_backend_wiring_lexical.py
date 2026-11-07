@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """#2240 wiring pins for the guardian_backend reader (lexical, no build required).
 
-Three properties the C++ unit tests cannot see, because each is a property of which source line
+Four properties the C++ unit tests cannot see, because each is a property of which source line
 calls what, or of declaration order, not of behaviour:
 
   1. ONE STALENESS CONSTANT. The 15 s sweep, perf_snapshot, net_snapshot and both per-device
@@ -19,6 +19,12 @@ calls what, or of declaration order, not of behaviour:
      `LocalDeviceApi` keeps a `const AgentHealthStore&` and members are destroyed in reverse
      declaration order. Moving it back below a holder is a use-after-free that only a sanitizer
      run during shutdown would find.
+
+  4. CHEAP READS. The callers that discard the per-device backend (the dashboard device fragment,
+     the crypto hostname map, the two page-render connected counts) must call
+     `list_devices_basic()` / `connected_count()` and never the full `list_devices()`, which pays the
+     health-store lookup and the registry JSON walk. Every behavioural test passes with either call,
+     so only this gate (and the dashboard call-count pin in test_device_routes.cpp) sees a revert.
 
 `//` and block comments are stripped before matching, so prose cannot satisfy a check. The
 self-test applies in-memory mutations and requires problems() to report each one.
@@ -57,6 +63,16 @@ STALENESS_CALLS = (
     ("device_api.cpp", "guardian_backend_of("),
 )
 LITERAL_90 = re.compile(r"seconds\s*[{(]\s*90\s*[})]")
+# Callers of the DeviceApi seam that discard the per-device backend must use a cheap read, so they
+# do not pay the health-store lookup (and the registry JSON walk, for the counts): (file, token that
+# MUST appear in code, token that must NOT). Only REST /api/v1/devices and MCP list_agents may call
+# the full list_devices().
+CHEAP_READS = (
+    ("device_routes.cpp", "list_devices_basic()", "list_devices()"),
+    ("crypto_api.cpp", "list_devices_basic()", "list_devices()"),
+    ("server.cpp", "connected_count()", "list_devices()"),
+    ("software_catalogue_model.cpp", "connected_count()", "list_devices()"),
+)
 # Opener of a C++ raw string, from the quote: "delim( with a delimiter of at most 16 characters.
 _RAW_OPEN = re.compile(r'"([^ ()\\\t\v\f\n"]{0,16})\(')
 
@@ -198,6 +214,23 @@ def member_declarations(text: str) -> dict:
     return decl
 
 
+def cheap_read_problems(files: dict) -> list:
+    """The discarding callers must read through list_devices_basic()/connected_count() and must not
+    call the full list_devices() (comments are stripped first, so prose cannot satisfy this)."""
+    out = []
+    for name, must, must_not in CHEAP_READS:
+        code = strip_comments(files[name])
+        if must not in code:
+            out.append(f"{name}: expected a call to {must} (the caller discards the per-device backend)")
+        if must_not in code:
+            out.append(f"{name}: calls the full {must_not}, which pays the health-store lookup")
+    return out
+
+
+def load_cheap() -> dict:
+    return {name: (SRC / name).read_text(encoding="utf-8") for name, _, _ in CHEAP_READS}
+
+
 def load() -> dict:
     names = ("server.cpp", "network_api.cpp", "device_api.cpp", "agent_registry.cpp",
              "dashboard_api_routes.cpp", "device_routes.cpp")
@@ -262,6 +295,23 @@ class GuardianBackendWiring(unittest.TestCase):
             files["server.cpp"] = text
             self.assertTrue(any(f"AFTER {holder}" in p for p in problems(files)),
                             f"reorder below {holder} not reported")
+
+    def test_discarding_callers_use_cheap_reads(self):
+        self.assertEqual(cheap_read_problems(load_cheap()), [])
+
+    def test_cheap_read_mutations_are_reported(self):
+        base = load_cheap()
+        for name, must, must_not in CHEAP_READS:
+            files = dict(base)
+            self.assertIn(must, strip_comments(files[name]), f"anchor missing in {name}")
+            # point the caller back at the full list
+            # (every occurrence, so a comment that happens to come first cannot absorb the mutation)
+            files[name] = files[name].replace(must, must_not)
+            self.assertTrue(cheap_read_problems(files), f"reverting {name} not reported")
+            # a comment mentioning the cheap call must not satisfy the check
+            files = dict(base)
+            files[name] = files[name].replace(must, "list_devices_other()") + f"\n// {must}\n"
+            self.assertTrue(cheap_read_problems(files), f"comment satisfied the check in {name}")
 
     def test_comment_stripper_understands_raw_strings(self):
         leak = 'auto leak = "guardian_backend";'

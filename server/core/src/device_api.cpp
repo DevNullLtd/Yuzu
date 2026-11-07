@@ -8,8 +8,9 @@ namespace yuzu::server {
 /// Store-backed `DeviceApi` implementation (ADR-0031 WS-A4, family=`device`).
 /// `list_devices` walks the SAME source `server.cpp`'s `make_device_row`/
 /// `to_json_obj()`-based providers use (the registry's own JSON snapshot,
-/// which already carries exactly the 5 registry-derived public fields), then joins the
-/// heartbeat-derived `guardian_backend` from the health store; `lookup_device`
+/// which already carries exactly the 5 registry-derived public fields); `list_devices` then
+/// also joins the heartbeat-derived `guardian_backend` from the health store, while
+/// `list_devices_basic` does not touch the health store; `lookup_device`
 /// is an O(1) `get_session` point lookup (#3564 — see device_api.hpp's
 /// banner), never a linear scan.
 ///
@@ -100,7 +101,7 @@ private:
             row.os = a.value("os", "");
             row.arch = a.value("arch", "");
             row.agent_version = a.value("agent_version", "");
-            if (with_backend && backends[i])
+            if (with_backend && i < backends.size() && backends[i]) // i<size: never read past it
                 row.guardian_backend = std::string{*backends[i]};
             out.push_back(std::move(row));
             ++i;

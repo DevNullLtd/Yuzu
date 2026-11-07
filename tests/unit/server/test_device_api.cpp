@@ -268,7 +268,7 @@ TEST_CASE("DeviceApi guardian_backend: the registry is the population, the healt
         CHECK_FALSE(entry.contains("guardian_backend"));
 }
 
-TEST_CASE("DeviceApi basic list and connected count: same population, no backend, no health read",
+TEST_CASE("DeviceApi basic list and connected count: same population, backend always null",
           "[device_api][guardian_backend]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;
@@ -306,6 +306,21 @@ TEST_CASE("DeviceApi basic list and connected count: same population, no backend
     REQUIRE(spark != nullptr);
     REQUIRE(spark->guardian_backend.has_value());
     CHECK(*spark->guardian_backend == "spark");
+
+    // Churn: the count and the list stay the same population when the registry changes. A
+    // re-registration of a known id replaces its session (still one row), and a removal drops
+    // exactly that row. (Whether the basic path skips the health read is not observable here:
+    // the store has no counter and mu_ is private; the dashboard call-count pin in
+    // test_device_routes.cpp covers which method a caller uses.)
+    REQUIRE(registry.register_agent(make_info("bc-spark", "linux")).has_value());
+    CHECK(api->connected_count() == 3);
+    CHECK(api->list_devices_basic().size() == 3);
+    registry.remove_agent("bc-none");
+    CHECK(api->connected_count() == 2);
+    const auto after = api->list_devices_basic();
+    REQUIRE(after.size() == 2);
+    CHECK(row_for(after, "bc-none") == nullptr);
+    CHECK(row_for(after, "bc-spark") != nullptr);
 }
 
 namespace {
@@ -315,9 +330,13 @@ public:
     [[nodiscard]] std::vector<yuzu::server::DeviceListRow> list_devices() const override {
         yuzu::server::DeviceListRow a;
         a.agent_id = "d1";
+        a.hostname = "host-1";
+        a.os = "linux";
         a.guardian_backend = "spark";
         yuzu::server::DeviceListRow b;
         b.agent_id = "d2";
+        b.hostname = "host-2";
+        b.guardian_backend = "legacy";
         return {a, b};
     }
     [[nodiscard]] std::expected<std::optional<yuzu::server::DeviceDetail>,
@@ -333,10 +352,15 @@ TEST_CASE("DeviceApi defaults: a list-only double gets a basic list and a count 
     ListOnlyDeviceApi api;
     const auto basic = api.list_devices_basic();
     REQUIRE(basic.size() == 2);
+    // The default clears ONLY the backend: every other field and the order survive.
     CHECK(basic[0].agent_id == "d1");
-    CHECK_FALSE(basic[0].guardian_backend.has_value()); // cleared by the default
+    CHECK(basic[0].hostname == "host-1");
+    CHECK(basic[0].os == "linux");
+    CHECK(basic[1].agent_id == "d2");
+    CHECK(basic[1].hostname == "host-2");
+    CHECK_FALSE(basic[0].guardian_backend.has_value());
+    CHECK_FALSE(basic[1].guardian_backend.has_value());
     CHECK(api.connected_count() == 2);
-    REQUIRE(api.list_devices()[0].guardian_backend.has_value()); // the full list still has it
 }
 
 TEST_CASE("AgentHealthStore guardian_backend_for: results stay aligned across lock slices",

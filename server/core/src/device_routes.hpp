@@ -321,7 +321,7 @@ public:
     /// `nullopt` = sees the whole fleet (global Infrastructure:Read grant, or
     /// RBAC enforcement is off); a present set = exactly those agent_ids (a
     /// present-EMPTY set on a degraded confinement read, fail-closed —
-    /// ADR-0042). Applied via `authz::in_scope` against `DeviceApi::list_devices()`'s
+    /// ADR-0042). Applied via `authz::in_scope` against `DeviceApi::list_devices_basic()`'s
     /// UNSCOPED rows — ADR-0031 WS-A4 wave 2 replaces the old pre-scoped
     /// `DevicesFn` provider with "unscoped API read + this seam's own filter",
     /// matching the REST/MCP siblings' pattern. An unwired closure is treated
@@ -347,7 +347,7 @@ public:
 
     /// `api` is the store-free `DeviceApi` seam (identity/list data — ADR-0031
     /// WS-A4 wave 2); `visible_set_fn` is this route's OWN confinement filter
-    /// over `api->list_devices()`'s unscoped rows; `dex_score_fn` backs the
+    /// over `api->list_devices_basic()`'s unscoped rows; `dex_score_fn` backs the
     /// per-row/per-page DEX score; `dispatch_fn`/`responses_fn`/`audit_fn` back
     /// the live-info instruction dispatch (all borrowed/may be empty/null →
     /// graceful placeholder).

@@ -125,7 +125,9 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   route was found and is intentionally kept byte-identical rather than fixed in this seam PR (tracked
   #4333, out of scope for a behaviour-preserving refactor).
 - **`device` is the FOURTH family (PR #4484, MERGED to dev)** — the narrowest method set yet
-  (`list_devices`/`lookup_device`, 1:1 with `GET /api/v1/devices[/{id}]`, INV-31-4), unifying the
+  (`list_devices`/`lookup_device`, 1:1 with `GET /api/v1/devices[/{id}]`, INV-31-4; #2240 later added
+  two in-process read shapes with no REST/MCP twin, `list_devices_basic` and `connected_count`, see
+  `device_api.hpp`), unifying the
   THREE live consumers (dashboard `device_routes.cpp`, REST v1, MCP `list_agents`/`get_agent_details`)
   behind one store-free `DeviceApi` (`device_api.hpp` + core-only `device_api_local.hpp`, the same
   two-header template). Authorization is BYTE-IDENTICAL per consumer, not merely "equivalent" —

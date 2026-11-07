@@ -603,7 +603,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- /fragments/devices/list — global Infrastructure:Read + per-operator scope.
     // Exact /api/agents parity: the gate admits Infrastructure:Read operators and
     // the caller's OWN confinement filter (visible_set_fn_, applied via
-    // authz::in_scope over api_->list_devices()'s unscoped rows — ADR-0031 WS-A4
+    // authz::in_scope over api_->list_devices_basic()'s unscoped rows, ADR-0031 WS-A4
     // wave 2) admits only the caller's visible devices, so an operator never
     // enumerates devices outside their scope. --
     sink.Get("/fragments/devices/list", [this, to_device_row](const httplib::Request& req,
@@ -611,7 +611,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         // Fleet-wide identity/inventory disclosure (SEC-2/SEC-3 confinement-gap
-        // class, found during a docs sweep): api_->list_devices() below is
+        // class, found during a docs sweep): api_->list_devices_basic() below is
         // fleet-wide/UNSCOPED (see device_api.hpp's own banner) and does not by
         // itself confine a service-scoped API token whose principal resolves to
         // an unscoped grant — the full device roster (hostname, agent_id, OS,
