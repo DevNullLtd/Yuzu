@@ -1191,10 +1191,11 @@ spelling that normalises equal); the rest pair k-th to k-th in tuple order as on
 hold `[epoch:]version[-release]`, non-empty parts only (the `:` follows a non-empty epoch, the
 `-` joins a release to a non-empty version, so a Flatpak row reads as its commit), in the
 existing text columns. A version is compared as written, so a row whose version could not be read
-(an empty version, which a Chocolatey package reads when its directory is a junction) moves to or
-from a real version as an `upgrade` with an empty side. The writer must also keep the spelling of
-`arch` and the install location stable from one release to the next: a re-spelled row is a removal
-and an install, not an update. **There are no tombstones on `installed_software`**: a removal is a hard
+(an empty version, which a Chocolatey package reads when its nuspec cannot be read, for example
+when the `lib` directory is a junction) moves to or from a real version as an `upgrade` with an
+empty side. The writer must also keep the spelling of `arch` and the install location stable from
+one sync to the next: a row whose `arch`, or whose location beyond case and trailing separators,
+is re-spelled is a removal and an install, not an update. **There are no tombstones on `installed_software`**: a removal is a hard
 delete plus a `remove` row carrying name, publisher and that version text, so no read needs a
 `removed_at` filter.
 
@@ -1231,8 +1232,10 @@ deletes the rows. A repeated `(kind, path)` inside one section is a producer def
 That includes two components of one kind with an empty path, and it holds for a `full` section
 too: the resend repeats the pair, so the facet is answered `mismatch` on every cycle and none of
 it is stored until the writer sends each path once. It does not repair itself.
+
 The component writer is held to the same precondition as slot 13: `path` and `anchor_app` are
 stored as sent, the server does not enforce it, so the writer must not send per-user paths.
+
 The facet now carries a real section hash and enters the report hash. A row a delta removes is
 hard-deleted with no history row: component change history is out of scope. Components are
 current-state, bounded to the per-call cap per device by the post-apply check above, and die with
