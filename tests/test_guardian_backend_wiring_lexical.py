@@ -27,8 +27,8 @@ WHAT THIS DOES NOT PROVE (a lexical gate is not a C++ lexer): it does not see a 
 later that is not in HOLDERS; a new call of the accessors in another file; a derived window such
 as `kAgentHealthStaleness / 2` (it checks the constant's NAME appears in the argument); the
 constant's own value (agent_registry.hpp is not scanned); a leak through a helper called from
-to_json_obj, or under a constant spelling; raw-string and character-literal edge cases in the
-comment stripper. Runtime teardown order still needs a sanitizer run of start/stop.
+to_json_obj, or under a constant spelling; character-literal edge cases (a quote inside '...') in the comment
+stripper; raw strings are handled. Runtime teardown order still needs a sanitizer run of start/stop.
 
 Usage: python3 tests/test_guardian_backend_wiring_lexical.py
 """
@@ -57,15 +57,29 @@ STALENESS_CALLS = (
     ("device_api.cpp", "guardian_backend_of("),
 )
 LITERAL_90 = re.compile(r"seconds\s*[{(]\s*90\s*[})]")
+# Opener of a C++ raw string, from the quote: "delim( with a delimiter of at most 16 characters.
+_RAW_OPEN = re.compile(r'"([^ ()\\\t\v\f\n"]{0,16})\(')
 
 
 @functools.lru_cache(maxsize=32)
 def strip_comments(text: str) -> str:
-    """Remove // and /* */ comments, leaving string literals untouched."""
+    """Remove // and /* */ comments, leaving string literals (ordinary and raw) untouched."""
     out = []
     i, n = 0, len(text)
     while i < n:
         c = text[i]
+        if c == '"' and i > 0 and text[i - 1] == "R":
+            # Raw string R"delim( ... )delim": no escapes, and a `//` or `/*` inside is payload,
+            # not a comment. An unterminated or malformed opener is kept to the end of the text,
+            # so a leak after it is still visible to the scan (fail toward reporting).
+            m = _RAW_OPEN.match(text, i)
+            if m:
+                close = ")" + m.group(1) + '"'
+                k = text.find(close, m.end())
+                end = n if k < 0 else k + len(close)
+                out.append(text[i:end])
+                i = end
+                continue
         if c == '"':
             j = i + 1
             while j < n and text[j] != '"':
@@ -248,6 +262,30 @@ class GuardianBackendWiring(unittest.TestCase):
             files["server.cpp"] = text
             self.assertTrue(any(f"AFTER {holder}" in p for p in problems(files)),
                             f"reorder below {holder} not reported")
+
+    def test_comment_stripper_understands_raw_strings(self):
+        leak = 'auto leak = "guardian_backend";'
+        # A `//` inside a raw string is payload: the leak after it on the same line must survive.
+        same_line = 'auto s = R"({"url":"http://example.test"})"; ' + leak
+        self.assertIn("guardian_backend", strip_comments(same_line))
+        # Custom delimiter, and a `)"` inside the payload that does not close it.
+        custom = 'auto s = R"x(a)" // b)x"; ' + leak
+        self.assertIn("guardian_backend", strip_comments(custom))
+        # Prefixed raw strings.
+        for prefix in ("u8R", "LR", "uR", "UR"):
+            self.assertIn("guardian_backend", strip_comments(f'auto s = {prefix}"(//)"; ' + leak))
+        # A real comment after a raw string is still removed, and so is its content.
+        after = 'auto s = R"(x)"; // guardian_backend in a comment\nint y;'
+        self.assertNotIn("guardian_backend", strip_comments(after))
+        # A comment that merely mentions R"( must not open a raw string.
+        mention = '// see R"( for details\n' + leak
+        self.assertIn("guardian_backend", strip_comments(mention))
+        # An unterminated raw string fails toward reporting: the tail stays visible.
+        self.assertIn("guardian_backend", strip_comments('auto s = R"(unterminated ' + leak))
+        # End to end: the HARD RULE scan reports a leak that sits after a raw-string URL.
+        files = load()
+        files["dashboard_api_routes.cpp"] += '\nauto s = R"({"u":"http://x"})"; ' + leak + "\n"
+        self.assertTrue(any("dashboard_api_routes.cpp" in p for p in problems(files)))
 
 
 if __name__ == "__main__":
