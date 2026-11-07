@@ -4562,12 +4562,14 @@ TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never
     other.instruction_id = "os_info-live";
     other.agent_id = "OTHER";
     other.status = kStatusSuccess;
-    other.output = "uptime_display|99d";
+    // A marker the 504 body cannot contain: its hex correlation id (req-<hex>-<hex>) could hold
+    // "99d" by chance.
+    other.output = "uptime_display|OTHER_AGENT_UPTIME_MARKER";
     h.resp_store->store(other);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 504);
-    CHECK(res->body.find("99d") == std::string::npos); // OTHER's data never leaked
+    CHECK(res->body.find("OTHER_AGENT_UPTIME_MARKER") == std::string::npos); // never leaked
 }
 
 TEST_CASE("REST dex/devices/{id}/live uptime: success terminal, no output → 200 empty",
