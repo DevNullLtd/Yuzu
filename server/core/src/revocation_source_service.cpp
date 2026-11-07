@@ -849,7 +849,7 @@ std::string rfc3339_utc(std::int64_t epoch_seconds) {
 
 namespace {
 // At most this many registrations resolve names at once: DNS runs on the request thread of the
-// shared HTTP pool, and a slow resolver must not starve /livez and /readyz.
+// shared HTTP pool, and DNS on the request thread must not delay /livez and /readyz.
 constexpr int kMaxConcurrentValidations = 4;
 std::atomic<int>& validations_in_flight() {
     static std::atomic<int>& n = *new std::atomic<int>(0);

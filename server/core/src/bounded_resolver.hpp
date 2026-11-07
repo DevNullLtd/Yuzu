@@ -14,10 +14,11 @@
 ///
 /// RESOURCE LEDGER (what this adds): one DETACHED worker thread per outstanding lookup, bounded
 /// by the pool's cap (`kMaxInFlightLookups` for the process pool; a lookup beyond the cap is
-/// refused `kBusy`, never queued). A worker stuck in a resolver that never answers pins one slot
-/// and one thread until process exit; the cap bounds that. Nothing is joined at shutdown: a worker
-/// holds no pointer into any object that is destroyed (the shared state, the host string, the
-/// lookup function and the pool are all owned through the worker's own copies / shared_ptrs).
+/// refused `kBusy`, never queued). A worker whose resolver call has not returned keeps its slot
+/// and its thread until it does (or until process exit); the cap bounds that. Nothing is joined
+/// at shutdown: a worker holds no pointer into any object that is destroyed (the shared state,
+/// the host string, the lookup function and the pool are all owned through the worker's own
+/// copies / shared_ptrs).
 ///
 /// The lookup function is injectable (`LookupFn`) so a test can block it behind a latch and prove
 /// the timeout, the cap and the not-found paths deterministically, with no DNS.
@@ -26,8 +27,8 @@
 /// for any consumer that passes none.
 ///
 /// CONTRACT FOR CONSUMERS:
-///  - POOL OWNERSHIP. Every consumer that passes no pool shares the process pool, so a stuck
-///    resolver starves all of them together. A consumer whose lookups must not be starved by
+///  - POOL OWNERSHIP. Every consumer that passes no pool shares the process pool, so a slow
+///    resolver call affects all of them together. A consumer whose lookups must not be starved by
 ///    another passes its OWN `ResolverPool`, sized for its own concurrency.
 ///  - `kNotFound` IS NOT PROOF OF ABSENCE. It is the resolver's current answer (it may be a
 ///    split-horizon or a poisoned NXDOMAIN, or a transient server failure the OS reported as "no
@@ -132,9 +133,8 @@ inline ResolveResult system_lookup(const std::string& host) {
     if (rc != 0 || list == nullptr) {
         // Only the resolver's definitive "no such name / no such data" is kNotFound (the rule lives
         // in resolver_errors.hpp, shared with every other consumer). EVERY other failure
-        // (EAI_AGAIN, EAI_FAIL, EAI_SYSTEM, EAI_MEMORY, ...) is transient or ours. NOTE: do not
-        // use httplib's getaddrinfo wrappers here: on macOS they report EAI_NODATA for every
-        // CFHost error, which would read as a definitive answer.
+        // (EAI_AGAIN, EAI_FAIL, EAI_SYSTEM, EAI_MEMORY, ...) is transient or ours. NOTE: call
+        // ::getaddrinfo directly here, so the return code is the resolver's own.
         const bool not_found = rc == 0 || resolver_code_is_no_data(rc); // 0: success, empty list
         out.status = not_found ? ResolveStatus::kNotFound : ResolveStatus::kTemporary;
         return out;
@@ -163,7 +163,8 @@ inline ResolveResult system_lookup(const std::string& host) {
 
 } // namespace detail
 
-/// Lookups currently outstanding in the process-wide pool (a stuck resolver pins its slots).
+/// Lookups currently outstanding in the process-wide pool (a call that has not returned holds
+/// its slot).
 [[nodiscard]] inline int process_resolver_in_flight() {
     return detail::process_pool()->in_flight.load();
 }
