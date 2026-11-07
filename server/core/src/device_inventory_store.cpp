@@ -193,8 +193,8 @@ constexpr const char* kMigrationV2Sql =
 // only (no checksum): a database that already recorded the earlier row_count-only v3 will NOT run
 // this again and lacks content_digest. The constructor's projection check then refuses to open the
 // store (and server.cpp refuses to start the server) with a log line naming device_ci_section. The
-// reset for such a dev/UAT database is in docs/user-manual/upgrading.md ("the device inventory
-// store refuses to start on a schema it cannot read"): UPDATE public.schema_meta SET version = 2
+// reset for such a dev/UAT database is in docs/user-manual/upgrading.md ("the server refuses to
+// start on a device inventory schema it cannot read"): UPDATE public.schema_meta SET version = 2
 // WHERE store = 'device_inventory_store', then restart.
 // Unqualified DDL - the runner sets search_path to the store schema.
 constexpr const char* kMigrationV3Sql =
@@ -382,19 +382,22 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
                 const char* state = PQresultErrorField(probe.get(), PG_DIAG_SQLSTATE);
                 const std::string sqlstate = state != nullptr ? state : "";
                 const bool schema_defect = sqlstate == "42P01" || sqlstate == "42703";
+                const bool permission = sqlstate == "42501";
                 spdlog::error(
                     "DeviceInventoryStore: post-migration schema projection check failed on {} "
-                    "(SQLSTATE {}) - {} Device-CI persistence disabled; see docs/user-manual/"
-                    "upgrading.md, \"the device inventory store refuses to start on a schema it "
+                    "(SQLSTATE {}) - {} The server will not start; see docs/user-manual/"
+                    "upgrading.md, \"the server refuses to start on a device inventory schema it "
                     "cannot read\". Database said: {}",
                     p.table, sqlstate.empty() ? "none" : sqlstate,
                     schema_defect
                         ? "the database lacks a table or column this build reads (an earlier "
                           "revision of the unreleased migration v2/v3, a skipped or partial "
                           "migration, or a database from a different build)."
-                        : "this is not a missing-object error (a dropped connection, a timeout "
-                          "or a permission error); restart once before treating the schema as "
-                          "damaged.",
+                        : permission
+                              ? "the server's database role cannot read it (grant SELECT on the "
+                                "store's schema; a restart will not fix a permission error)."
+                              : "this is not a missing-object error (a dropped connection or a "
+                                "timeout); restart once before treating the schema as damaged.",
                     PQresultErrorMessage(probe.get()));
                 return;
             }
