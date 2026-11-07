@@ -4403,12 +4403,14 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
     g_fake[4].out["python"] = nl({supported_status("python"),
                                   "python|cpython|3.14.6|C:/Python314/|PythonCore",
                                   "python|unmodelled|3.11|/usr/bin/python3.11|-"});
-    // runtimes.dotnet: the publisher is the constant Microsoft whatever the vendor column says (`-`
-    // on Linux and the native macOS root). runtimes.jvm: the release file's IMPLEMENTOR, and a home
-    // with none (`-`) is labelled via:jvm.
+    // runtimes.dotnet: the publisher is the constant Microsoft whatever the vendor column says: the
+    // `-` the Linux and native macOS legs emit and a foreign vendor both become Microsoft.
+    // runtimes.jvm: the release file's IMPLEMENTOR, and a home with none (`-`) is labelled via:jvm.
     g_fake[4].out["dotnet"] = nl({supported_status("dotnet"),
                                   "dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft",
-                                  "dotnet|core|8.0.31|/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31|-"});
+                                  "dotnet|sdk|8.0.400|C:/Program Files/dotnet/sdk/8.0.400|Contoso",
+                                  "dotnet|core|8.0.31|/usr/share/dotnet/shared/"
+                                  "Microsoft.NETCore.App/8.0.31|-"});
     g_fake[4].out["jvm"] = nl({supported_status("jvm"),
                                "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
                                "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"});

@@ -1217,7 +1217,7 @@ the fallback.
 | `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
 | `middleware.ibm_mq` | `IBM`, from the product table | n/a |
 | `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
-| `runtimes.jvm` | the row's vendor column, the `release` file's self-reported `IMPLEMENTOR` | `via:jvm` when the column is `-` (no `IMPLEMENTOR`, no `release` file, or a Windows home known only by its registry tag) |
+| `runtimes.jvm` | the row's vendor column: the `release` file's self-reported `IMPLEMENTOR`, or on macOS, for a bundle without a `release` file, its `Info.plist` `JVMVendor` | `via:jvm` when the column is `-` (the home reports no vendor, or it is a Windows home known only by its registry tag) |
 
 The rpm `list_inventory` query format has ten columns, `%{VENDOR}` the last; the pinned argv
 literal in `docs/agent-spawn-sink-manifest.md` carries the same format, and `parse_rpm_inv_line`
