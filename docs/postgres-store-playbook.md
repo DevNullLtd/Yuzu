@@ -402,8 +402,15 @@ from the registry changes what a FRESH database gets and nothing about a deploye
 - **This is not the runner's drift detection** (#7158, a version recorded with different text).
   That is a different question (same version, different SQL) and does not replace the projection
   check: do not consolidate the two. The projection is column PRESENCE only (an extra column is
-  tolerated, in line with the ahead-database stance of #3894); types, defaults and keys are
-  pinned by the schema test for the shipped literals.
+  tolerated, in line with the ahead-database stance of #3894); names, types, nullability, order and
+  the key shape (primary key, cascading foreign key) are pinned for the shipped literals by the
+  schema test, and column defaults are pinned by nothing. A third test pins each registry kind's
+  column list to the stored digest layout, so a column change cannot land without this rule.
+- **The refusal is a boot failure.** The store's `is_open()` is checked in `server.cpp` and a
+  closed store stops the server from starting, so a registry ahead of its database never runs
+  degraded. The log message distinguishes SQLSTATE 42P01/42703 (a schema defect) from any other
+  failure (a restart is the retry) and names no destructive step; the reset recipe for a dev/UAT
+  database lives in `docs/user-manual/upgrading.md`.
 
 ## Anti-patterns reviewers reject
 

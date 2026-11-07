@@ -129,8 +129,9 @@ std::vector<std::string> split_columns(std::string_view columns) {
 // projection check in the constructor (a registry table or column the database lacks refuses
 // at boot) and (b) the schema test in test_device_inventory_store.cpp. The compile-time tie
 // between kDeviceCiScalarFields and the scalar DDL that the old generator carried is replaced
-// by those two. It is byte-identical to what the generator emitted when it was frozen, so a
-// database that already ran v2 on today's registry needs nothing (recorded in the commit message).
+// by those two. It is byte-identical (3311 bytes, sha256
+// 1e6e39f4f195e20b1d0253ab1fc7bc6d48401162e78371df3ebecaaabaf41f6c) to what the generator emitted
+// when it was frozen, so a database that already ran v2 on today's registry needs nothing.
 constexpr const char* kMigrationV2Sql =
     "ALTER TABLE device_ci ADD COLUMN blob_version SMALLINT NOT NULL DEFAULT 1,"
     " ADD COLUMN chassis_type TEXT NOT NULL DEFAULT '',"
@@ -190,11 +191,11 @@ constexpr const char* kMigrationV2Sql =
 // v3 is unreleased, so the digest column is folded into it rather than adding a v4. The ADDs are
 // IF NOT EXISTS so a re-run is harmless, BUT the runner is gated on the recorded version number
 // only (no checksum): a database that already recorded the earlier row_count-only v3 will NOT run
-// this again and lacks content_digest: every full ingest then fails at section_insert, and the
-// sections read fails (the REST record route answers 503, the MCP tool a retryable error). Reset
-// such a dev/UAT database before use, then restart the server:
-//   UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store';
-// or recreate the store schema.
+// this again and lacks content_digest. The constructor's projection check then refuses to open the
+// store (and server.cpp refuses to start the server) with a log line naming device_ci_section. The
+// reset for such a dev/UAT database is in docs/user-manual/upgrading.md ("the device inventory
+// store refuses to start on a schema it cannot read"): UPDATE public.schema_meta SET version = 2
+// WHERE store = 'device_inventory_store', then restart.
 // Unqualified DDL - the runner sets search_path to the store schema.
 constexpr const char* kMigrationV3Sql =
     "ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, "
@@ -348,40 +349,53 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
     // stamped by a different binary) can lack a table or column this binary reads while run()
     // still reports success - and every sections read then fails with 42P01/42703 on the first
     // request. One LIMIT 0 SELECT per table, over every column the runtime uses, touches no rows
-    // and refuses here instead. The child tables are driven by the registry, so a registry kind
-    // with no table fails at boot. Column PRESENCE only (an extra column is tolerated, #3894's
-    // ahead-database stance): types, defaults and keys are invisible to a projection, and the
-    // schema test in test_device_inventory_store.cpp pins them for the shipped literals.
+    // and refuses here instead (server.cpp then refuses to start). The child tables are driven by
+    // the registry, so a registry kind with no table fails at boot. Column PRESENCE only: an extra
+    // column is tolerated (#3894's ahead-database stance); names, types, nullability, order and
+    // the key shape are pinned for the shipped literals by the schema test in
+    // test_device_inventory_store.cpp, column defaults are not pinned by anything.
     {
         struct Probe {
             std::string table;
             std::string columns;
         };
         std::vector<Probe> probes;
-        probes.push_back({"device_ci", kSelectCols});
-        probes.push_back({"device_ci_section", "agent_id, kind, level, reason, row_count, content_digest"});
+        probes.push_back({"device_ci", std::string("content_hash, ") + kSelectCols});
+        probes.push_back(
+            {"device_ci_section", "agent_id, kind, level, reason, row_count, content_digest"});
         for (const auto& d : kDeviceCiSections) {
             if (d.table == nullptr)
                 continue;
             probes.push_back({d.table, std::string("agent_id, ord, ") + d.columns});
         }
         for (const auto& p : probes) {
-            const std::string sql = "SELECT " + p.columns +
-                                    " FROM device_inventory_store." + p.table + " LIMIT 0";
+            const std::string sql =
+                "SELECT " + p.columns + " FROM device_inventory_store." + p.table + " LIMIT 0";
             pg::PgResult probe =
                 pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
             if (probe.status() != PGRES_TUPLES_OK) {
+                // SQLSTATE 42P01 (undefined table) / 42703 (undefined column) is a schema defect;
+                // anything else (a dropped connection, a statement timeout, a permission error)
+                // is not evidence of one, and a restart is the retry. The message names no
+                // destructive step: the supported reset for a development or UAT database is in
+                // the upgrade notes, and it is not advice for any other database.
+                const char* state = PQresultErrorField(probe.get(), PG_DIAG_SQLSTATE);
+                const std::string sqlstate = state != nullptr ? state : "";
+                const bool schema_defect = sqlstate == "42P01" || sqlstate == "42703";
                 spdlog::error(
-                    "DeviceInventoryStore: post-migration schema projection check failed on {} - "
-                    "an expected table or column is missing (hypothesis: this database ran an "
-                    "earlier revision of migration v2/v3, or a skipped or partial migration; could "
-                    "also be a dropped connection). Device-CI persistence disabled. A development "
-                    "or UAT database that ran an earlier unreleased v2: DROP SCHEMA "
-                    "device_inventory_store CASCADE and DELETE its public.schema_meta row, then "
-                    "restart. One that ran only the earlier row_count-only v3: UPDATE "
-                    "public.schema_meta SET version = 2 WHERE store = 'device_inventory_store', "
-                    "then restart: {}",
-                    p.table, PQresultErrorMessage(probe.get()));
+                    "DeviceInventoryStore: post-migration schema projection check failed on {} "
+                    "(SQLSTATE {}) - {} Device-CI persistence disabled; see docs/user-manual/"
+                    "upgrading.md, \"the device inventory store refuses to start on a schema it "
+                    "cannot read\". Database said: {}",
+                    p.table, sqlstate.empty() ? "none" : sqlstate,
+                    schema_defect
+                        ? "the database lacks a table or column this build reads (an earlier "
+                          "revision of the unreleased migration v2/v3, a skipped or partial "
+                          "migration, or a database from a different build)."
+                        : "this is not a missing-object error (a dropped connection, a timeout "
+                          "or a permission error); restart once before treating the schema as "
+                          "damaged.",
+                    PQresultErrorMessage(probe.get()));
                 return;
             }
         }
