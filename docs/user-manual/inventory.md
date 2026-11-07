@@ -14,8 +14,9 @@ cadences.
   sync calls seven inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
-  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
-  `store_packages` (Linux snaps and flatpaks), and
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
+  Chocolatey and winget on Windows) and `store_packages` (Linux snaps and
+  flatpaks; the Windows Appx roster), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
   (Windows machine-context MSI products), `runtimes` `python`, `dotnet` and `jvm` (installed
   Python, .NET and Java runtimes), and `middleware` `ibm_mq` (IBM MQ
@@ -91,19 +92,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) | `Microsoft` | ✓ (the build's self-reported `IMPLEMENTOR`; empty if absent) |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java | Chocolatey | winget | Appx package |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` | `pkg` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` | `chocolatey` | `winget` | `appx` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) | ✓ (package id) | ✓ (`winget`) | ✓ (package name) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) | ✓ (nuspec `<version>`; empty if unreadable) | ✓ (App Installer package version) | ✓ (from the package full name) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) | `Microsoft` | ✓ (the build's self-reported `IMPLEMENTOR`; empty if absent) | — | — | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -115,9 +116,10 @@ cadences.
   one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
   that records Homebrew itself is present — one row however many prefixes
   exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
-  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
-  mapped from `managers` today: the Linux manager rows (dpkg, apt, rpm, dnf,
-  pacman, apk, snap, flatpak) are read but not collected as software, and a
+  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
+  Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
+  apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
+  software, and a
   constrained `managers` answer keeps the sync cycle as long as it names at
   least one present manager.
 
@@ -133,6 +135,37 @@ cadences.
   version. An inactive revision is not installed software and is not
   collected, and an incomplete listing (for example an unreadable flatpak
   directory) skips the cycle rather than publishing a partial roster.
+
+  **Windows package managers and Store apps** are collected through
+  `pkg_inventory` (`source` `pkg_inventory.packages`, `pkg_inventory.managers`
+  and `pkg_inventory.store_packages`). Chocolatey packages are `ecosystem`
+  `chocolatey`, `kind` `pkg`, one per `C:\ProgramData\chocolatey\lib\<id>`
+  directory that holds a loose `<id>.nuspec`, with `version` from the nuspec
+  (empty if it cannot be read); the `chocolatey` bootstrap package has no loose
+  nuspec and is not listed as a package. Presence of Chocolatey and of winget is
+  one `kind` `app` row each (named `chocolatey` / `winget`, `source`
+  `pkg_inventory.managers`); winget is present when the App Installer package is
+  registered, and its `version` is that package's version, while Chocolatey's own
+  version is not read (empty). Store and system apps are `ecosystem` `appx`,
+  `kind` `app`, one row per package registered for all users (the `Applications`
+  and `InboxApplications` roster keys), with `name` the package name, `version`
+  and `arch` taken from the package full name (`neutral` for an
+  architecture-neutral package); a package in the `Deprovisioned` list and a
+  package installed for one user only are not collected. A host where Chocolatey
+  is absent has no Chocolatey rows, which means none was found at the standard
+  location, not that none exists elsewhere. Only winget's presence is collected,
+  not what winget installed; Scoop, portable apps and the contents of the
+  `WindowsApps` folder are not covered. These reads were measured as a non-admin
+  virtual service account (the same account class as `NT SERVICE\YuzuAgent`);
+  `NT SERVICE\YuzuAgent` itself was not used, so a hardened ACL on the roster keys
+  or the Chocolatey `lib` directory on a given host is not excluded. If
+  `C:\ProgramData\chocolatey` or its `lib` folder is a junction or symlink, every
+  Chocolatey package is listed with an empty version and the status stays supported. A roster key or `lib`
+  directory that is denied (`constrained`, reason
+  `windows:pkg_inventory:<source>:access_denied`), over the row or byte cap or
+  cannot be listed makes that daily cycle skip for every source: the previously
+  stored roster is kept and the agent logs a warning (this policy is shared with
+  snaps and flatpaks and is tracked in #6093).
 
   **Windows optional features** are collected with `ecosystem`
   `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
