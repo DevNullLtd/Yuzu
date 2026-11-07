@@ -31,7 +31,7 @@ ok_fetch(Name) ->
 
 state() ->
     #{crl => none, crl_hash => undefined, ca_hash => undefined, etag => undefined,
-      last_reject => undefined}.
+      last_reject => undefined, rejected => none, size_warned_at => undefined}.
 
 %%--------------------------------------------------------------------
 %% Configuration
@@ -284,9 +284,13 @@ load_test_() ->
            Set = yuzu_gw_mgmt_crl_source:reject_reasons(),
            ?assertEqual(length(Set), length(lists:usort(Set))),
            [?assert(lists:member(R, Set))
-            || R <- [malformed, too_large, unverified, issuer_mismatch, future_dated, replay,
+            || R <- [malformed, unsupported, too_large, unverified, issuer_mismatch,
+                     validity_too_long, future_dated, replay,
                      fetch_timeout, fetch_connect, fetch_tls, fetch_status, fetch_error,
-                     file_unreadable]]
+                     file_unreadable]],
+           %% closed: exactly these fourteen, so a new reason is a deliberate change to the set, the
+           %% counter pre-seed, metrics.md and this test together
+           ?assertEqual(14, length(Set))
        end}]}.
 
 %%--------------------------------------------------------------------

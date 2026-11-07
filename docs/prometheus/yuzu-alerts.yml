@@ -482,11 +482,19 @@ groups:
             it did not answer in time; fetch_status means it answered with a
             status other than 200 (503 is "CRL not yet published": the server
             is still starting or its CA is unavailable); malformed or
-            too_large means the bytes are not a usable CRL (malformed also
-            covers a well-formed CRL that is not the issuer's complete base
-            list: a delta, a scoped or indirect one, or one with an
-            extension the gateway cannot process; the Yuzu server publishes
-            none of these, a corporate CA feed can); unverified or
+            too_large means the bytes are not a usable CRL; unsupported means
+            a well-formed CRL the gateway refuses by policy (not the issuer's
+            complete base list: a delta, a scoped or indirect one, or one
+            with an extension the gateway cannot process; the Yuzu server
+            publishes none of these, a corporate CA feed can);
+            validity_too_long means the CRL's nextUpdate is further past its
+            thisUpdate than mgmt_crl_max_validity_s allows (the same refused
+            bytes are counted once in a row and again once an hour, not once
+            per refresh, so read the gateway log and the state gauges, or
+            increase() over a long window, rather than the rate; this applies
+            to malformed, unsupported, unverified, issuer_mismatch and
+            validity_too_long, while future_dated, replay, the fetch reasons
+            and a fetch-reported too_large count every attempt); unverified or
             issuer_mismatch means the CRL was not signed by the CA the
             management listener trusts, or by a CA whose key type the
             gateway cannot bind (RSA, EC and EdDSA are supported); future_dated means the CRL is dated
@@ -512,9 +520,13 @@ groups:
             still admits the server until nextUpdate plus mgmt_crl_grace_s
             (default 24 hours), then refuses every stream as
             revocation_stale. The CRL is not being refreshed: the server
-            stopped publishing, or this gateway cannot fetch it. Check
-            yuzu_gw_mgmt_crl_rejected_total{reason} for the failing class and
-            the server's own CRL publication (the elected server leader
+            stopped publishing, this gateway cannot fetch it, or it fetches
+            a CRL it refuses because of its bytes (malformed, unsupported,
+            unverified, issuer_mismatch or validity_too_long). Check
+            yuzu_gw_mgmt_crl_rejected_total{reason} for the failing class
+            (refused bytes are counted once in a row and again once an hour,
+            so read the value or increase() over a long window, not the rate)
+            and the server's own CRL publication (the elected server leader
             republishes when under 24 hours remain, so a period with no
             leader stops it, and so does a server that cannot reach the CA
             key; restarting a server replica republishes at startup); restore
@@ -545,11 +557,17 @@ groups:
             file_unreadable means a {file, Path}
             source or a cacertfile on a dead mount that has stopped
             answering; malformed and too_large mean the bytes are not a
-            usable CRL (malformed includes a well-formed delta, scoped or
+            usable CRL; unsupported means a well-formed delta, scoped or
             indirect CRL, or one with an unprocessable critical extension,
-            from a feed that is not the Yuzu server's); unverified,
+            from a feed that is not the Yuzu server's; validity_too_long
+            means a CRL wider than mgmt_crl_max_validity_s; unverified,
             issuer_mismatch, replay and future_dated
-            mean the server is serving a CRL this gateway will not take. A
+            mean the server is serving a CRL this gateway will not take. The
+            same refused bytes are counted once in a row and again once an hour,
+            not once per refresh (replay, future_dated, too_large and the
+            fetch reasons count every attempt), so a quiet counter behind
+            this alert is expected for a CRL that is refused for the same
+            reason on every refresh. A
             watcher process that is itself wedged shows no new rejections and
             no new log lines. The rule compares the Prometheus clock with the
             gateway's clock, so keep both on NTP. If you raised
