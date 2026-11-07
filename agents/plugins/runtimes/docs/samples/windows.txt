@@ -1,11 +1,19 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-28 · interactive user (elevated) · leg-hash 10a510136fd8
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive user (elevated) · leg-hash 3cef2d295916
 == action=dotnet
-status|dotnet|unsupported|windows:planned
-[result_status] UNAVAILABLE / PARTIAL / windows:planned
+status|dotnet|supported|-
+dotnet|netfx|4.8.1|C:/Windows/Microsoft.NET/Framework/v4.0.30319/|Microsoft
+dotnet|netfx|4.8.1|C:/Windows/Microsoft.NET/Framework64/v4.0.30319/|Microsoft
+dotnet|runtime|8.0.33|C:/Program Files (x86)/dotnet/|Microsoft
+dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft
+dotnet|runtime|9.0.22|C:/Program Files (x86)/dotnet/|Microsoft
+dotnet|runtime|9.0.22|C:/Program Files/dotnet/|Microsoft
+[result_status] OK / FULL / 
 
 == action=jvm
-status|jvm|unsupported|windows:planned
-[result_status] UNAVAILABLE / PARTIAL / windows:planned
+status|jvm|supported|-
+jvm|jdk|21.0.13|C:/Program Files/Temurin/|Eclipse Adoptium
+jvm|unmodelled|21.0.12.1|C:/Program Files/Microsoft/jdk-21.0.12.101-hotspot/|Microsoft
+[result_status] OK / FULL / 
 
 == action=python
 status|python|supported|-
