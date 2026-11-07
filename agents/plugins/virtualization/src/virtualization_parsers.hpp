@@ -567,7 +567,7 @@ inline ContainerVerdict classify_container(const Facts& f) {
         return v;
     }
     // Residual: a container whose init is not systemd and that sets no marker file (a
-    // Fargate-style or hand-rolled runtime) shows a host-shaped path and reads `no` here.
+    // serverless or hand-rolled runtime) shows a host-shaped path and reads `no` here.
     v.value = Tri::no;
     v.evidence = "linux:no_container_marker";
     return v;

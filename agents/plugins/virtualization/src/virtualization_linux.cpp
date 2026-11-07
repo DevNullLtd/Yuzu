@@ -10,9 +10,10 @@
  * unreadable source (a host-decision one blocks bare_metal, a container one only constrains the
  * status). Leaf::follow is the LEAF POLICY's root-only case: every path read is in a
  * kernel-served or root-owned tree (/sys, /proc, /run/systemd) that no unprivileged user can
- * write, so a leaf link there is not attacker-controlled. The container check reads the AGENT's own /proc/self/cgroup, not PID 1's,
- * which answers a different question when the PID namespace is shared, plus the type systemd
- * records in /run/systemd/container (how a system container is told from a host).
+ * write, so a leaf link there is not attacker-controlled. The container check reads the
+ * AGENT's own /proc/self/cgroup, not PID 1's, which answers a different question when the PID
+ * namespace is shared, plus the type systemd records in /run/systemd/container (how a system
+ * container is told from a host).
  */
 #include "virtualization_legs.hpp"
 
