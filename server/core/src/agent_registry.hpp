@@ -1497,9 +1497,14 @@ inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
 /// rounds sleep_for up to a scheduler tick (1-15.6 ms) and nothing in the server raises the timer
 /// resolution, which would add up to about 1.9 s per call at 500k, so _WIN32 busy-waits on
 /// steady_clock instead (about 6 ms of CPU per 500k call, a true 50 us window). On Linux the same
-/// spin measured somewhat worse than the sleep (worst stall about 9-22 ms at 16-64 writers). That
-/// the spin lets a writer in on Windows (SRWLOCK-backed std::mutex) is reasoned from the Linux
-/// model, NOT measured: no Windows run of this change exists.
+/// spin measured somewhat worse than the sleep (worst stall about 9-22 ms at 16-64 writers).
+/// WINDOWS (MSVC 14.44, Windows 11, 16 hardware threads), measured on a MODEL of the store with
+/// 500k ids, not on the production store: sleep_for(50 us) lasted 15.8 ms, so a sleep-based pause
+/// added about 1.9 s per call; the spin lasted 50 us. With 4 writers at about 38k upserts/s the
+/// spin call took 63 ms (unsliced 55 ms) and the worst upsert stall fell from 55 ms to 1.3 ms;
+/// with 16 writers at about 32k/s, 162 ms and 4.7 ms. One writer in a tight loop, far above the
+/// heartbeat rate (about 17k/s at 500k agents on a 30 s interval), starves the reader (every
+/// slice waits for the lock): 1.5 s per call. The production store's unit tests pass on Windows.
 /// Slices are not a point-in-time snapshot, which list_devices never was (the registry lock is
 /// released before the health lock is taken).
 inline constexpr std::size_t kGuardianBackendSlice = 4096;
