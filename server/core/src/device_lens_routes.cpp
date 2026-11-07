@@ -85,35 +85,64 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
                             "text/html; charset=utf-8");
             return;
         }
-        // Behavioural-PII access audit — set-and-proceed (HTML fragment), parity
-        // with the DEX lens above and the shared #1647 helper.
-        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "success",
-                                            "Agent", id,
+        // device_guards() is a read of the census plus the device's unrepresented pending
+        // events (retained events with no census row, #7217), ADR-0038 catastrophic-read set:
+        // a degraded read (std::nullopt) must render an honest placeholder (distinct from the
+        // unwired `!guardian_api_` "unavailable" one above), never a silent empty/partial guard
+        // list (which would misreport a device as having no guards, or drop live drift verdicts,
+        // for the operator viewing this lens). A failed unrepresented-pending read degrades the
+        // whole read (the seam returns nullopt), so it lands here too; a STATEMENT TIMEOUT of that
+        // read gets its own text, because the cause is most likely a large retained pending backlog
+        // and re-opening the tab usually will not help until it shrinks.
+        GuardianReadFault fault = GuardianReadFault::kNone;
+        std::optional<GuardianDeviceGuardsReport> guards_result;
+        try {
+            guards_result = guardian_api_->device_guards(id, &fault);
+        } catch (...) {
+            // A read that throws still began a per-device PII read, so it is audited as a failure
+            // here (set-and-proceed) and the exception then propagates to the caller unchanged:
+            // exactly one guardian.device.view row per request on every path.
+            (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "failure",
+                                                "Agent", id, "device Guardian lens (per-guard compliance)");
+            throw;
+        }
+        // Behavioural-PII access audit — set-and-proceed (HTML fragment), parity with the DEX lens
+        // above and the shared #1647 helper. Written AFTER the read so its result is true (a
+        // degraded read audits "failure", as REST and MCP do); a read that throws is audited
+        // "failure" by the catch above, so every path writes exactly one row.
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view",
+                                            guards_result ? "success" : "failure", "Agent", id,
                                             "device Guardian lens (per-guard compliance)");
-        // device_guards() is a single per-agent-scoped SQL read (ADR-0038
-        // catastrophic-read set): a degraded read (std::nullopt) must render an
-        // honest "Guardian store degraded." placeholder (distinct from the
-        // unwired `!guardian_api_` "unavailable" one above), never a silent
-        // empty/partial guard list (which would misreport
-        // a device as having no guards, or drop live drift verdicts, for the
-        // operator viewing this lens).
-        auto guards_result = guardian_api_->device_guards(id);
         if (!guards_result) {
-            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store degraded.",
-                                                            tabs),
-                            "text/html; charset=utf-8");
+            res.set_content(
+                render_device_lens_placeholder(
+                    "guardian", id,
+                    fault == GuardianReadFault::kStatementTimeout
+                        ? "Guardian pending-evidence read timed out. Most likely a large retained "
+                          "pending backlog exceeds the read's time budget; reloading usually will "
+                          "not help until it clears."
+                        : "Guardian store degraded.",
+                    tabs),
+                "text/html; charset=utf-8");
             return;
         }
         std::vector<DeviceGuardRow> guards;
-        guards.reserve(guards_result->size());
-        for (const auto& g : *guards_result) {
+        guards.reserve(guards_result->guards.size());
+        for (const auto& g : guards_result->guards) {
             DeviceGuardRow row;
             row.name = g.name; // already resolved + rule_id-fallback'd by the seam
             row.state = g.state;
             row.updated_at = g.updated_at;
+            row.order_uncertain = g.order_uncertain;
+            row.projection_pending = g.projection_pending;
             guards.push_back(std::move(row));
         }
-        res.set_content(render_device_guardian_lens(id, guards, tabs), "text/html; charset=utf-8");
+        // The unrepresented-pending summary (#7217) reaches the renderer: the lens must not show a
+        // clean state, or "No guards evaluated", over evidence the census has no row for.
+        res.set_content(render_device_guardian_lens(id, guards, tabs,
+                                                    guards_result->unrepresented_pending_guards,
+                                                    guards_result->unrepresented_pending_rule_ids),
+                        "text/html; charset=utf-8");
     });
 }
 

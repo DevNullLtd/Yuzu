@@ -140,14 +140,8 @@ std::optional<LoadedPlugin> load_runtimes_plugin() {
 constexpr const char* kActions[] = {"dotnet", "jvm", "python"};
 
 #if defined(_WIN32) || defined(__APPLE__)
-// The actions whose macOS / Windows leg is still a planned placeholder (python ships on all three).
+// The actions whose macOS / Windows legs were once planned placeholders (all three ship now).
 constexpr const char* kPlannedActions[] = {"dotnet", "jvm"};
-#endif
-
-#if defined(_WIN32)
-constexpr const char* kPlannedToken = "windows:planned";
-#elif defined(__APPLE__)
-constexpr const char* kPlannedToken = "macos:planned";
 #endif
 
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -248,7 +242,7 @@ TEST_CASE("runtimes plugin: python is read on every host and never reports unsup
 
 #if defined(_WIN32) || defined(__APPLE__)
 
-TEST_CASE("runtimes plugin: the planned legs emit exactly the planned status row",
+TEST_CASE("runtimes plugin: the dotnet and jvm legs read the host and no longer report planned",
           "[runtimes][actions]") {
     auto plugin = load_runtimes_plugin();
     if (!plugin) {
@@ -261,12 +255,15 @@ TEST_CASE("runtimes plugin: the planned legs emit exactly the planned status row
         auto result = dispatcher.run(plugin->descriptor, a);
         CHECK(result.rc == 0);
         const auto rows = captured_rows(result.captured);
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0] == std::string{"status|"} + a + "|unsupported|" + kPlannedToken);
-        // The typed status seam agrees: UNAVAILABLE / PARTIAL, the token as provenance.
-        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-        CHECK(result.result_provenance == kPlannedToken);
+        REQUIRE_FALSE(rows.empty());
+        // Host-independent: only the grammar is asserted; populated rows are pinned over
+        // fixtures in the per-OS parser tests.
+        const auto st = split_fields_escape_aware(rows[0]);
+        REQUIRE(st.size() == 4);
+        CHECK(st[0] == "status");
+        CHECK(st[1] == a);
+        CHECK((st[2] == "supported" || st[2] == "constrained"));
+        CHECK(rows[0].find(":planned") == std::string::npos);
     }
 }
 

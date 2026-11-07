@@ -14,11 +14,12 @@ cadences.
   sync calls seven inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
-  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
-  `store_packages` (Linux snaps and flatpaks), and
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
+  Chocolatey and winget on Windows) and `store_packages` (Linux snaps and
+  flatpaks; the Windows Appx roster), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products), `runtimes` `python` (installed
-  Python interpreters), and `middleware` `ibm_mq` (IBM MQ
+  (Windows machine-context MSI products), `runtimes` `python`, `dotnet` and `jvm` (installed
+  Python, .NET and Java runtimes), and `middleware` `ibm_mq` (IBM MQ
   installations; Linux). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
@@ -31,7 +32,11 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  carried. A `constrained` `runtimes` `dotnet` or `jvm` answer that still lists at least one install is
+  accepted the same way: the constraint names a home or root that could not be fully read, the installs
+  found keep their rows and any install the read could not see is deleted server-side with no marker;
+  one that lists none skips the device's whole installed-software report for the day (retried daily
+  on backoff) and keeps the last good state. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
   exception: it withholds only that source's rows and the cycle continues, so the
   stored rows of that source are removed until a later read succeeds (see
   Troubleshooting). A skipped cycle
@@ -48,7 +53,7 @@ cadences.
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
   `windows_optional_features.list`, `msi_packages.list_inventory`,
-  `runtimes.python`, `middleware.ibm_mq`); `package_id`
+  `runtimes.python`, `runtimes.dotnet`, `runtimes.jvm`, `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -85,21 +90,41 @@ cadences.
   `msi_packages` entries for the exact per-action wording.
 - **The honest-empty contract:** a field the ecosystem does not store is the
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
-  epoch). Per-ecosystem availability:
+  epoch), except `publisher`, which is never empty: see below. Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java | Chocolatey | winget | Appx package |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` | `pkg` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` | `chocolatey` | `winget` | `appx` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) | ✓ (package id) | ✓ (`winget`) | ✓ (package name) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) | ✓ (nuspec `<version>`; empty if unreadable) | ✓ (App Installer package version) | ✓ (from the package full name) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ |
+  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+
+  **`publisher` is never empty.** It is the vendor the source itself declares; when a
+  source declares none, it is the label `via:<ecosystem>` (`via:brew`, `via:snap`,
+  `via:deb` and so on), which names where the row came from, not who made the software.
+  A label is a fixed, lower-case, exact `via:` prefix: Homebrew formulae and casks, Snaps
+  and Flatpaks are read without starting a process, so they carry no vendor and always read
+  `via:brew`, `via:snap` and `via:flatpak`; Chocolatey packages, the Chocolatey and winget
+  presence rows and Appx packages carry none either (`via:chocolatey`, `via:winget`,
+  `via:appx`), and of the `pkg_inventory` sources only the Homebrew presence row, `homebrew`,
+  carries a constant publisher, `Homebrew`; `pacman` and `apk` have no vendor field in their package
+  list; a macOS installer receipt id is an identifier, not a vendor. A row with no
+  ecosystem is labelled `via:unknown`, never the bare `via:`. The catalogue treats a
+  label as no vendor: it does not count towards the publisher total, never wins as a
+  title's representative publisher over a declared one, and does not take part in title
+  matching (a title from `via:snap` matches the same title with no publisher). There is
+  no `publisher` filter parameter; the catalogue search matches the publisher text
+  literally, so searching `via:` lists the titles whose representative publisher is a
+  label. The rpm vendor is read from the
+  package's `VENDOR` tag; the `PACKAGER` tag, which is usually a person or a build-system
+  address, is the fallback when a package has no vendor.
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -108,12 +133,13 @@ cadences.
   packages (they are installed). Machine-scope Homebrew
   is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
   `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
-  one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
-  that records Homebrew itself is present — one row however many prefixes
+  one `kind` `app` row named `homebrew` (`publisher` `Homebrew`) with `source`
+  `pkg_inventory.managers` that records Homebrew itself is present — one row however many prefixes
   exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
-  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
-  mapped from `managers` today: the Linux manager rows (dpkg, apt, rpm, dnf,
-  pacman, apk, snap, flatpak) are read but not collected as software, and a
+  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
+  Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
+  apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
+  software, and a
   constrained `managers` answer keeps the sync cycle as long as it names at
   least one present manager.
 
@@ -130,12 +156,43 @@ cadences.
   collected, and an incomplete listing (for example an unreadable flatpak
   directory) skips the cycle rather than publishing a partial roster.
 
+  **Windows package managers and Store apps** are collected through
+  `pkg_inventory` (`source` `pkg_inventory.packages`, `pkg_inventory.managers`
+  and `pkg_inventory.store_packages`). Chocolatey packages are `ecosystem`
+  `chocolatey`, `kind` `pkg`, one per `C:\ProgramData\chocolatey\lib\<id>`
+  directory that holds a loose `<id>.nuspec`, with `version` from the nuspec
+  (empty if it cannot be read); the `chocolatey` bootstrap package has no loose
+  nuspec and is not listed as a package. Presence of Chocolatey and of winget is
+  one `kind` `app` row each (named `chocolatey` / `winget`, `source`
+  `pkg_inventory.managers`); winget is present when the App Installer package is
+  registered, and its `version` is that package's version, while Chocolatey's own
+  version is not read (empty). Store and system apps are `ecosystem` `appx`,
+  `kind` `app`, one row per package registered for all users (the `Applications`
+  and `InboxApplications` roster keys), with `name` the package name, `version`
+  and `arch` taken from the package full name (`neutral` for an
+  architecture-neutral package); a package in the `Deprovisioned` list and a
+  package installed for one user only are not collected. A host where Chocolatey
+  is absent has no Chocolatey rows, which means none was found at the standard
+  location, not that none exists elsewhere. Only winget's presence is collected,
+  not what winget installed; Scoop, portable apps and the contents of the
+  `WindowsApps` folder are not covered. These reads were measured as a non-admin
+  virtual service account (the same account class as `NT SERVICE\YuzuAgent`);
+  `NT SERVICE\YuzuAgent` itself was not used, so a hardened ACL on the roster keys
+  or the Chocolatey `lib` directory on a given host is not excluded. If
+  `C:\ProgramData\chocolatey` or its `lib` folder is a junction or symlink, every
+  Chocolatey package is listed with an empty version and the status stays supported. A roster key or `lib`
+  directory that is denied (`constrained`, reason
+  `windows:pkg_inventory:<source>:access_denied`), over the row or byte cap or
+  cannot be listed makes that daily cycle skip for every source: the previously
+  stored roster is kept and the agent logs a warning (this policy is shared with
+  snaps and flatpaks and is tracked in #6093).
+
   **Windows optional features** are collected with `ecosystem`
   `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
   not. For these rows `version` carries the DISM feature state verbatim
   (`enabled`, `disabled`, `pending_enable`, `pending_disable`, `superseded`,
   `partially_installed`, `unknown`) because a feature has no version of its own;
-  `publisher` is empty. A host with a disabled feature therefore still lists
+  `publisher` is the constant `Microsoft` (DISM features are Windows components). A host with a disabled feature therefore still lists
   it, so the `/software` catalogue count (grouped by name) counts a host with a
   DISABLED feature as having it — read `version` to tell them apart.
 
@@ -146,7 +203,7 @@ cadences.
   product code exactly as the product registers it (no case normalisation).
   Only the machine install context is enumerated: a product installed for one
   user is never listed by this source. A property the product does not have is
-  empty; a product with no name (for example one that is advertised but not
+  empty, except `publisher`, which becomes `via:msi`; a product with no name (for example one that is advertised but not
   installed) is dropped. A property read that fails for any other reason makes
   the whole roster constrained, so the cycle is skipped rather than a product
   silently disappearing. The same product normally also has an `app`/`windows`
@@ -159,7 +216,10 @@ cadences.
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
   `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
-  `ecosystem` `python`, `version` the interpreter version; publisher and the other
+  `ecosystem` `python`, `version` the interpreter version, `publisher` the `PythonCore`
+  registry tag on Windows (`via:python` when it is absent), and always `via:python` on Linux,
+  where the install tree names no vendor, and on macOS, where the metadata names only a bundle
+  identifier, not a vendor; the other
   package fields are empty. No process is started: each OS answers from install
   metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
   registry views (python.org installs; per-user installs and other PEP 514
@@ -178,6 +238,39 @@ cadences.
   software rows, so the stored `python` rows are removed until a read succeeds again
   (see Troubleshooting). A missing or unreadable version file never does this, the
   row reports the version it could determine.
+
+  **.NET runtimes** are collected through `runtimes` `dotnet` (all three OSes; `source`
+  `runtimes.dotnet`) as one `app` row per installed runtime, SDK or Framework version, `ecosystem`
+  `dotnet`, `publisher` `Microsoft`, `version` the install's version, and `name` `.NET Runtime`,
+  `.NET SDK` or `.NET Framework` (any other shared framework reads `.NET`). No process is started.
+  Windows reads the .NET installer registry keys in both registry views (the shared frameworks are
+  registered in the 32-bit view) and the .NET Framework release key (no directory is read, so only a registered install is found; a
+  zip or `dotnet-install` copy is not); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
+  under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
+  `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
+  A constrained read keeps the rows it found (see the managers rule above); if it found none, the day's
+  report is skipped and the stored `dotnet` rows stay.
+
+  **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
+  `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
+  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
+  Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with an openable `Contents` and no `release` file
+  under `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a
+  Windows home known only by its registry key). The publisher is self-reported by the
+  build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
+  the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
+  JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu registry keys and then each home's `release` file; Linux
+  walks `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`; macOS walks
+  `/Library/Java/JavaVirtualMachines`. Version managers and Homebrew JDKs are not walked. On Windows
+  only a JDK that registered itself under one of those keys is found (a zip or tarball install is not),
+  and a home on a removable, optical, remote or otherwise non-fixed drive keeps its row but its
+  `release` file is not read (`windows:runtimes:jvm:release_unreadable`); `supported` with no rows
+  means none was found at the standard roots, not that none is installed. A
+  constrained read keeps the rows it found (installs it could not read are deleted server-side with no
+  marker); if it found none, the device's whole installed-software report is skipped for the day and
+  the stored `jvm` rows stay. The macOS Java leg is verified against fixture
+  trees built from the documented bundle layout, not a real JDK install.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
   `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
@@ -213,7 +306,7 @@ cadences.
   use `signature_status` as tamper detection or as a Gatekeeper/notarization
   result. (Deep verification — `SecStaticCodeCheckValidity` — is not performed;
   adding it would turn this into a validity verdict and need a third state, an
-  open contract decision.) `publisher` is empty for ad-hoc-signed and unsigned
+  open contract decision.) `publisher` is `via:macos` for ad-hoc-signed and unsigned
   apps. Enrichment covers up to 5000 located apps per collection; that guard is
   a runaway bound rather than a routine limit, and reaching it makes the agent
   report the collection degraded (see below) instead of publishing rows whose
@@ -261,11 +354,9 @@ cadences.
   normal, not degraded. A value-level failure (a non-REG_SZ or over-64 KiB
   DisplayName) is not distinguished from an absent value (plugin README caveat
   1).
-- **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
-  the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
-  only — the release moved to its own `release` column (was fused
-  `VERSION-RELEASE`). Fleet-wide version rollups on Linux change shape
-  accordingly on the first post-upgrade sync.
+- **rpm fields:** `publisher` is the rpm **VENDOR** tag, else the **PACKAGER**
+  tag (a person or a build-system address), else `via:rpm`; `version` is the
+  upstream version only and the release is its own `release` column.
 - **No end-user profiles / personal data in the daily sync.** We do **not** use
   the plugin's per-user enumeration (`list_per_user`), so no logged-in-user
   profiles and no usernames are collected by the sync — no end-user PII. The
@@ -674,7 +765,7 @@ place, **Hardware** and **Software**, each its own page:
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
   `tag=<key>[=<value>]` directly), and the device-CI columns from before (manufacturer,
   model, serial, CPU model + cores/threads, RAM, OS version). All columns except DEX are
-  sortable; a server-side search box (hostname/serial/model/CPU), OS/status filter
+  sortable; a server-side search box (hostname, device id, serial, model, manufacturer, CPU, OS, chassis asset tag, chassis serial, board serial and similar identity fields), OS/status filter
   chips, a filter breadcrumb, and pagination narrow a large fleet. A new checkbox column
   plus a sticky bulk-tag bar let you apply or remove one tag across every selected
   device in one action — under the hood it loops the existing single-device tag routes,
@@ -1002,6 +1093,20 @@ mount table could not be read), `macos:runtimes:permission_denied`,
 `windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
 daily sync restores the rows.
 
+**A device's whole installed-software report has frozen; its log shows
+`sync: runtimes.dotnet failed: <tokens> — skipping this cycle` (or `runtimes.jvm`).** The
+`dotnet` or `jvm` read was constrained and found no install at all, so the agent skipped the
+device's whole installed-software report rather than send an empty list, and retries daily on
+backoff while the answer stays constrained; the stored rows are kept and nothing is deleted. A
+constrained read that still found an install is not an error: its rows are sent, and the log shows
+`sync: runtimes.jvm constrained (<tokens>) — rows kept`. The tokens name the cause, for example `windows:runtimes:dotnet_reg:access_denied`,
+`windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`, `windows:runtimes:jvm:home_unusable`,
+`linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
+`runtimes` README lists them all. On Linux a Java home with a java binary but no `release` file keeps the source constrained
+for as long as it is installed; on macOS the bundle's `Info.plist` supplies the version; on Windows
+such a home keeps its row with the registry's version key as its version and the source stays
+supported. Fix the named cause; the next daily sync resumes.
+
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
 APIs, which return the system code page (cp1252 on Western installs), so any
@@ -1278,12 +1383,13 @@ The server turns every distinct installed-software title into a stable identity 
 - **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
 - **Settled titles are re-resolved only when something changes.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale. A curated alias (`POST /api/v1/inventory/software/normalization/aliases`) or a replaced pack (`POST .../pack`) marks every title stale in the same transaction, so the next hourly passes pick the fleet up again; rejecting a queue entry does not.
 - **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **Origin labels.** A publisher of the form `via:<ecosystem>` (for example `via:brew`) names where a row came from, not a vendor, so it normalises to no vendor. It is the title's raw key: the queue and `GET .../queue` show it as `raw_publisher`, and a title the pack or a curated alias covers resolves through that alias like a title with no publisher.
 - **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
 - **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
 - **What is kept, and for how long.** The title dimension is permanent: it keeps one row for every distinct title the fleet has ever reported, and is never pruned. Titles that embed a version in their name (many do) therefore add rows over time, so the table grows with the number of distinct titles ever seen, not with the current fleet. `yuzu_software_titles` shows how many titles are in the current fleet; the table's size is visible in Postgres. A future retention policy would be a separate decision. The curation queue is different: its open rows always mirror the current fleet, and an empty title list (see below) empties it; only each row's first-queued time is lost, because the rows are rebuilt as titles return.
 - **Titles that are too long.** A title whose name, publisher and ecosystem together exceed 2,400 bytes is left out of the title list, and so is never normalised or queued; this is far beyond any real software name and exists so that one malformed report cannot stop the whole catalogue refresh. Each catalogue refresh that leaves such titles out writes one warning to the server log with their count.
 - **Where to look.** `GET /api/v1/inventory/software/normalization/status` gives the pack version and the title and queue counts, and `GET .../queue` lists the titles waiting for curation, most-installed first (see [REST API](rest-api.md#software-normalisation-curation)). There is no MCP tool or page for this yet (the MCP twin is a recorded ADR-1005 exception, revisit by 2026-12-31). The Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and the metrics below, remain available.
-- **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no publisher (`git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
+- **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no vendor (a `via:` label: `git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
 - **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
 - **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
 
@@ -1325,17 +1431,52 @@ sync, defeating the hash-skip protocol.
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
   Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
-  not read; storage topology is planned everywhere), and the stored sections are not yet
-  shown in the Hardware pages or API.
+  not read; storage topology is planned everywhere). The stored sections are served by
+  `GET /api/v1/hardware/{id}` and the MCP `get_hardware_ci` tool (they are not rendered in the
+  dashboard Hardware pages yet).
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
   means the server kept only the first `n` rows; `server:machine_id_shape` on the
-  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  `machine_id` section means the reported machine ID was not a hash and was discarded;
+  `server:row_count_mismatch` means the rows stored for the section no longer match the count
+  recorded when the device last synced in full (rows were lost outside the product, for example
+  a partial database restore), so the section is served `constrained` and incomplete with the
+  rows that remain. `server:content_digest_mismatch` means the number of rows still matches but
+  the rows no longer hash to the digest the server recorded beside the section's status when the
+  device last synced in full (a row was edited, or the rows were swapped for another sync's out
+  of band): the section is served `constrained` and incomplete, with the rows that were read, but
+  those rows are **not** the values the agent reported, so do not rely on them. A lost row
+  reports `server:row_count_mismatch` alone. Neither token is stored: both are worked out each
+  time the record is read, so they never appear in the `device_ci_section` query further down.
+  Reading the record again does not clear either token. **Only a full device-record sync
+  repairs either** (a device whose hardware has not changed sends only a hash on its daily sync,
+  which leaves the rows alone): use **Sync now** on the device's Hardware page, or
+  `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
+  `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed
+  software only and do not repair a section, and there is no MCP tool that does: an agentic
+  client should ask an operator to run Sync now on the device, or call
+  `POST /api/v1/hardware/{id}/sync` if it holds REST access. Otherwise it clears on the device's next hardware
+  change or its weekly full report (at most 7 days). A section stored before these checks existed
+  (before migration 3) has neither a recorded count nor a digest and is not verified until that
+  device's next full sync, so a freshly upgraded server verifies a device only after that sync.
+  The digest is computed by the server from the rows it was about to insert (the same projection
+  that is stored; never taken from the agent) and is an integrity check against accident and
+  non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
+  digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
+  layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
+  version (for example `v2:` followed by a digest) is treated as unverified, because this server
+  cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
+  by a colon and a non-empty remainder). Any other stored value that is not the current form (an
+  empty or damaged value, `V1:`, a bare hex string, a malformed version) is compared as a
+  mismatch and reported as `server:content_digest_mismatch`, so a damaged column cannot let an
+  edited section read as complete. Only an absent value (a section stored before migration 3, or
+  a status-only kind) or a well-formed digest of another layout version is unverified. A section
+  whose row count already disagrees reports the count token alone, and an `unavailable` or
+  `permission_denied` section is never compared.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
-  before the agents. No page or API reads the per-device rows yet: these values are stored
-  now and become visible when the device-CI read surface ships.
+  before the agents.
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:
@@ -1360,7 +1501,7 @@ sync, defeating the hash-skip protocol.
   independently: one section being unavailable never stops the others, or the base device
   fields, from being reported.
 
-On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and are not yet shown on the Hardware pages or returned by the REST or MCP device-record endpoints.
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and returned by `GET /api/v1/hardware/{id}` (the chassis, baseboard and machine-id values in `ci`, and every section's status, reason, source and rows in `ci.sections`; a `constrained` section reads as incomplete, and an `unavailable` or `permission_denied` one shows its reason and no rows). The MCP `get_hardware_ci` tool returns the same body and its output schema declares the new keys. They are not yet shown on the Hardware pages. The Hardware list search (`q`) also matches the chassis asset tag, chassis serial and board serial.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its

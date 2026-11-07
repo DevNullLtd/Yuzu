@@ -141,6 +141,18 @@ std::vector<std::string_view> split_tokens(std::string_view line, std::size_t ma
     return tok;
 }
 
+// Undo yuzu::util::safe_output_field's pipe escape (`\|` -> `|`) on a free-text token.
+std::string unescape_pipes(std::string_view t) {
+    std::string out;
+    out.reserve(t.size());
+    for (std::size_t i = 0; i < t.size(); ++i) {
+        if (t[i] == '\\' && i + 1 < t.size() && t[i + 1] == '|')
+            continue; // drop the escape, keep the pipe
+        out += t[i];
+    }
+    return out;
+}
+
 AdaptedRows failed(std::string reason) {
     AdaptedRows r;
     r.status = AdaptedRows::Status::failed;
@@ -164,7 +176,7 @@ AdaptedRows failed(std::string reason) {
 // What a `constrained` level does is the action's `policy` (the table's
 // `constrained` column). ConstrainedPolicy::fail: the action fails the cycle
 // (packages: a constrained listing is an incomplete package list). When
-// keep_rows_if_present_seen (managers) the constraint names facts the presence
+// keep_rows_if_present_seen (managers, dotnet, jvm) the constraint names facts the presence
 // row does not carry, so the adapted rows are kept (status ok, reason = the status
 // token) -- but ONLY if at least one PRESENT data row of the action's kind was
 // seen, mapped or not (`on_row` returns true for it): constrained with zero such
@@ -224,7 +236,9 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
 // data. `package_action` names the ONE action whose package rows this manager's token maps in
 // (so a snap row inside `packages`, or a homebrew row inside `store_packages`, stays unmapped);
 // `presence_row` is whether a present `managers` row for it becomes an installed_software
-// entry. A manager absent from this table maps to nothing. The ecosystem values are written as
+// entry, and `presence_publisher` the constant vendor of that presence row (empty: the table
+// declares none, so `vendor_or_origin` labels it `via:<ecosystem>`). A manager absent from this
+// table maps to nothing. The ecosystem values are written as
 // `.ecosystem = "..."` so tests/test_software_vocabulary_consistency.py still reads every
 // ecosystem this file emits.
 //
@@ -243,15 +257,25 @@ struct ManagerEcosystem {
     std::string_view ecosystem;
     std::string_view package_action;
     bool presence_row{false};
+    std::string_view presence_publisher{};
 };
 
 constexpr ManagerEcosystem kManagerEcosystems[] = {
     {.manager = "homebrew",
      .ecosystem = "brew",
      .package_action = kActionPackages,
-     .presence_row = true},
+     .presence_row = true,
+     .presence_publisher = "Homebrew"},
     {.manager = "snap", .ecosystem = "snap", .package_action = kActionStorePackages},
     {.manager = "flatpak", .ecosystem = "flatpak", .package_action = kActionStorePackages},
+    // Windows: Chocolatey packages (`pkg` rows) and its presence row; winget has presence only
+    // (its packages are per-user and out of scope); the Appx roster rides store_packages.
+    {.manager = "chocolatey",
+     .ecosystem = "chocolatey",
+     .package_action = kActionPackages,
+     .presence_row = true},
+    {.manager = "winget", .ecosystem = "winget", .package_action = "", .presence_row = true},
+    {.manager = "appx", .ecosystem = "appx", .package_action = kActionStorePackages},
 };
 
 constexpr const ManagerEcosystem* find_manager(std::string_view manager) {
@@ -294,6 +318,12 @@ AdaptedRows adapt_windows_optional_features(const std::string& captured,
     return parse_windows_optional_features_output(captured);
 }
 
+// runtimes.python is bound through a wrapper that supplies the host's vendor-column rule (the
+// collector runs on the agent's own OS), keeping the public adapter testable on any host.
+AdaptedRows adapt_runtimes_python(const std::string& captured, ConstrainedPolicy policy) {
+    return parse_runtimes_python_output(captured, policy, kPythonVendorColumnIsVendor);
+}
+
 const InventoryAction kInventoryActions[] = {
     {.plugin = "installed_apps", .action = "list_inventory", .adapt = adapt_installed_apps},
     {.plugin = "pkg_inventory",
@@ -317,7 +347,7 @@ const InventoryAction kInventoryActions[] = {
     // denied registry key): a constrained answer withholds just the python rows, not the cycle.
     {.plugin = "runtimes",
      .action = "python",
-     .adapt = parse_runtimes_python_output,
+     .adapt = adapt_runtimes_python,
      .constrained = ConstrainedPolicy::drop_source},
     // Metadata-only source whose steady-state constraint is a permission fact: a constrained
     // answer drops just that source (rows withheld) instead of failing the whole cycle.
@@ -327,6 +357,21 @@ const InventoryAction kInventoryActions[] = {
          return parse_middleware_output(o, "ibm_mq", pol);
      },
      .constrained = ConstrainedPolicy::drop_source},
+    // A constrained answer is per-home or per-root (one JDK on a removable drive, one NFS root, one
+    // oversized release file) and still carries a row for every install it found, so the rows are
+    // KEPT when at least one was seen; a constrained answer with ZERO rows skips the cycle (stored
+    // rows untouched) rather than deleting them. The typed answer is CONSTRAINED + PARTIAL, hence
+    // accept_partial, as for managers.
+    {.plugin = "runtimes",
+     .action = "dotnet",
+     .adapt = parse_runtimes_dotnet_output,
+     .accept_partial = true,
+     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
+    {.plugin = "runtimes",
+     .action = "jvm",
+     .adapt = parse_runtimes_jvm_output,
+     .accept_partial = true,
+     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
 };
 
 } // namespace
@@ -376,6 +421,9 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 
 AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, ConstrainedPolicy policy) {
     // package|homebrew|<id>|<version>|<formula|cask>
+    // package|chocolatey|<id>|<version or ->|pkg
+    // A row whose id carries an escaped `\|` splits wider than five tokens, fails the width
+    // check below and is dropped (a gap, never a shifted row); this adapter does not unescape.
     return adapt_pkg_inventory(out, kActionPackages,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
@@ -392,9 +440,13 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, Constrai
             e.kind = "pkg";
         else if (tok[4] == "cask")
             e.kind = "app";
+        else if (tok[4] == "pkg")
+            e.kind = "pkg"; // Chocolatey
         else
             return true;
-        e.version = clamp_field(tok[3], kMaxFieldLen);
+        // `-` is the row grammar's empty-version sentinel (format_package_row), written for a
+        // Chocolatey package whose nuspec was unreadable.
+        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));
         return true;
@@ -403,7 +455,14 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, Constrai
 
 AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
                                                       ConstrainedPolicy policy) {
-    // package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+    // package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+    // Appx: <id> is the PackageFullName (Name_Version_Arch_ResourceId_PublisherId); the entry's
+    // name is the Name part, its version and arch come from tok[3] / tok[6] (`-` = unknown),
+    // there is no release, and a `deprovisioned` row is seen but not mapped. A degraded appx
+    // row whose registry key carries a '|' (an escaped `\|` on the wire; a parseable
+    // PackageFullName never does) splits to ten tokens, fails the `!= 9` check below and is
+    // dropped: a gap, never a shifted row. The split is not escape-aware because this adapter
+    // is shared with snap/flatpak and never unescapes (it would store `Weird\|Key` as a name).
     // ACTIVE rows only: an inactive or unknown revision is on disk but is not
     // installed software. A degraded active row (version `-`, kind `unknown`) is
     // still collected (honest-empty version), never a reason to skip the cycle.
@@ -424,6 +483,16 @@ AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
             return true;
         e.kind = tok[4] == "app" ? "app" : "pkg";
         e.ecosystem = std::string(m->ecosystem);
+        if (m->manager == "appx") {
+            // Name_Version_...: the entry is the package name, never the 5-part identity string.
+            e.name = clamp_field(tok[2].substr(0, tok[2].find('_')), kMaxFieldLen);
+            if (e.name.empty())
+                return true;
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+            e.arch = tok[6] == "-" ? std::string{} : clamp_field(tok[6], kMaxFieldLen);
+            entries.push_back(std::move(e));
+            return true;
+        }
         if (m->manager == "snap")
             e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
         else
@@ -437,10 +506,10 @@ AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
 AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, ConstrainedPolicy policy) {
     // manager|<name>|<present|unavailable>|<version or ->|<root>|<facts>|<reason>
     // A PRESENCE row only (the v2 row has no field for the prefix, so two Homebrew
-    // prefixes collapse to one row after dedup). Homebrew-only: a manager whose
-    // kManagerEcosystems row has no `presence_row` (and any name absent from it:
-    // dpkg/apt/rpm/dnf/pacman/apk) is dropped — the Linux/Windows managers
-    // legs must add a deliberate mapping, and manager facts belong to facet rows.
+    // prefixes collapse to one row after dedup). Only a manager whose kManagerEcosystems row
+    // has `presence_row` (homebrew, chocolatey, winget) becomes an entry; any other manager
+    // (and any name absent from the table: dpkg/apt/rpm/dnf/pacman/apk) is dropped, so a
+    // new managers leg needs a deliberate mapping, and manager facts belong to facet rows.
     return adapt_pkg_inventory(out, kActionManagers,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
@@ -458,6 +527,9 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, Constrai
         SwEntry e;
         e.name = std::string(m->manager);
         e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+        // The vendor the table declares for this presence row (middleware precedent), else
+        // empty, which `vendor_or_origin` labels `via:<ecosystem>`.
+        e.publisher = std::string(m->presence_publisher);
         e.kind = "app";
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));
@@ -492,28 +564,90 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
     }, policy);
 }
 
-AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy) {
+AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy,
+                                         bool vendor_column_is_vendor) {
     // python|<flavour>|<version or ->|<install_path or ->|<vendor or ->, one row per interpreter the
     // runtimes plugin found at the standard machine roots (agents/plugins/runtimes/src/
     // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
     // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
     // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
-    // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
-    // status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
+    // The vendor rides in `publisher` (`-` = unknown) wherever the column is read as a vendor
+    // (Windows PythonCore; the Linux producer always emits `-`); on macOS it is a
+    // CFBundleIdentifier reverse-domain id, an identifier and not a vendor, so it is ignored
+    // there (`vendor_column_is_vendor` false) and the collector labels the row `via:python`,
+    // the same rule as macos_pkgutil. The flavour and path have no installed_software slot and
+    // are dropped. A constrained status withholds these rows only: see the table row's
+    // ConstrainedPolicy::drop_source.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
-    // strict (five logical fields) and only the version, which is dotted digits by construction
-    // on every leg, is stored, so no unescape is needed.
+    // strict (five logical fields); the version is dotted digits by construction on every leg, and
+    // the vendor is unescaped (`\|` -> `|`) before it is stored.
     return adapt_pkg_inventory(out, "python",
-                               [](const std::vector<std::string_view>& tok,
-                                  std::vector<SwEntry>& entries) {
+                               [vendor_column_is_vendor](const std::vector<std::string_view>& tok,
+                                            std::vector<SwEntry>& entries) {
         if (tok[0] != "python" || tok.size() != 5)
             return false;
         SwEntry e;
         e.name = "Python";
         e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        // The vendor column is free text (the producer escapes a literal pipe as `\|`), so it
+        // is unescaped here; `-` = unknown, left empty for the collector's via:python label.
+        if (vendor_column_is_vendor && tok[4] != "-")
+            e.publisher = clamp_field(unescape_pipes(tok[4]), kMaxFieldLen);
         e.kind = "app";
         e.ecosystem = "python";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
+AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPolicy policy) {
+    // dotnet|<flavour>|<version or ->|<install_path or ->|<vendor or -> (runtimes plugin: runtime
+    // /sdk/netfx on Windows, core/sdk/unmodelled on Linux and macOS). Same shape and escape-aware
+    // split as the python adapter; the vendor column is dropped, the publisher is always Microsoft.
+    return adapt_pkg_inventory(out, "dotnet",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "dotnet" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        if (tok[1] == "runtime" || tok[1] == "core")
+            e.name = ".NET Runtime";
+        else if (tok[1] == "sdk")
+            e.name = ".NET SDK";
+        else if (tok[1] == "netfx")
+            e.name = ".NET Framework";
+        else
+            e.name = ".NET";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = "Microsoft";
+        e.kind = "app";
+        e.ecosystem = "dotnet";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
+AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy policy) {
+    // jvm|<flavour>|<version or ->|<install_path or ->|<vendor or ->. The vendor is the release
+    // file's IMPLEMENTOR, free text the producer escapes, so the split is escape-aware; the vendor
+    // is clamped and stored as the publisher.
+    return adapt_pkg_inventory(out, "jvm",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "jvm" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        if (tok[1] == "jdk")
+            e.name = "Java JDK";
+        else if (tok[1] == "jre")
+            e.name = "Java JRE";
+        else
+            e.name = "Java";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = tok[4] == "-" ? std::string{} : clamp_field(tok[4], kMaxFieldLen);
+        e.kind = "app";
+        e.ecosystem = "jvm";
         entries.push_back(std::move(e));
         return true;
     }, policy, /*escaped=*/true);
@@ -577,6 +711,7 @@ AdaptedRows parse_windows_optional_features_output(const std::string& out) {
         if (e.name.empty())
             return true;
         e.version = clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = "Microsoft"; // DISM features are Windows components: constant vendor
         e.kind = "feat";
         e.ecosystem = "optional_feature";
         res.entries.push_back(std::move(e));
@@ -594,6 +729,12 @@ std::vector<std::pair<std::string_view, std::string_view>> installed_software_ac
     for (const auto& row : kInventoryActions)
         out.emplace_back(row.plugin, row.action);
     return out;
+}
+
+void vendor_or_origin(SwEntry& e) {
+    if (e.publisher.empty())
+        e.publisher =
+            std::string(kOriginLabelPrefix) + (e.ecosystem.empty() ? "unknown" : e.ecosystem);
 }
 
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
@@ -728,11 +869,12 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 return skip(source + ":partial");
             }
             if (!rows.reason.empty())
-                spdlog::info("sync: {}.{} constrained ({}) — rows kept: the constraint names facts "
-                             "this row does not carry",
+                spdlog::info("sync: {}.{} constrained ({}) — rows kept: anything the read "
+                             "could not see is absent from this cycle's report",
                              row.plugin, row.action, rows.reason);
             for (auto& e : rows.entries) {
                 e.source = source;
+                vendor_or_origin(e);
                 all.push_back(std::move(e));
             }
         }

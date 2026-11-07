@@ -3503,10 +3503,14 @@ tests:
   # ── YuzuGuardianReadDegraded (#4856) ─────────────────────────────────────
   #
   # `sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason,
-  # source) > 0`, for: 5m, warning. Two sources share the counter:
-  # "guardian_state" (DEX/observation reads, fail-soft) and "guardian_rules"
-  # (authoritative rule/status reads, fail-hard) - both must page on a
-  # sustained non-zero rate, keyed by both labels.
+  # source) > 0`, for: 5m, warning. Four sources share the counter:
+  # "guardian_state" (DEX/observation reads, fail-soft), "guardian_rules"
+  # (authoritative rule/status reads, fail-hard), "guardian_census" (the
+  # census pending-evidence count read, #5690) and "guardian_census_device"
+  # (the two per-device unrepresented-pending reads, #7217, whose reasons add
+  # statement_timeout) - each pages on a sustained non-zero rate, keyed by both
+  # labels (the expr has no source filter; the cases below exercise
+  # guardian_state, guardian_rules and guardian_census_device).
 
   # CASE — a sustained degrade on the DEX/observation family (guardian_state)
   # pages, carrying both its reason and source labels.
@@ -3545,7 +3549,23 @@ tests:
           - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="store_not_open", source="guardian_rules", severity="warning"}'
             value: 1
 
-  # CASE — the boot-time pre-seed alone (both sources x all three reasons
+  # CASE - a sustained statement_timeout on the per-device unrepresented-pending
+  # reads (guardian_census_device, #7217) pages on its OWN source and reason
+  # labels - proof the new source is covered by the unfiltered expr with no
+  # expression change, and that its extra reason is not merged into another.
+  - interval: 1m
+    name: guardian read degraded - a sustained guardian_census_device statement_timeout pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="statement_timeout",source="guardian_census_device"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="statement_timeout", source="guardian_census_device", severity="warning"}'
+            value: 1
+
+  # CASE — the boot-time pre-seed alone (the seeded sources x all three reasons
   # present at zero, never incremented) must stay quiet: present-at-zero is
   # the HEALTHY steady state, not a degrade.
   - interval: 1m
@@ -3562,6 +3582,10 @@ tests:
       - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout",source="guardian_rules"}'
         values: "0x30"
       - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_rules"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_census_device"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="statement_timeout",source="guardian_census_device"}'
         values: "0x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'
@@ -5620,6 +5644,169 @@ tests:
         eval_time: 1690m
         exp_samples: []
 
+  # -- Internal-CA CRL dated in the future (#7097) ---------------------------
+  #
+  # The gauge is the publishing replica's clock at build (published_at, epoch seconds;
+  # thisUpdate is 300 s earlier); promtool's time() is
+  # the eval time, so the rule reads value - eval time against 3600 s (the
+  # gateway's future tolerance). A value of 7200 s is 2 h ahead at 0 m and crosses
+  # the threshold exactly at 60 m (3600 s, `> 3600` is false there): pending from
+  # 0 m, firing from 2 m (for: 2m), gone at 60 m.
+  - interval: 1m
+    name: CA CRL future-dated - fires after 2m, clears exactly at the 3600 s boundary
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "7200x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 1m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 59m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+      # 3600 s ahead exactly is still inside the gateway's tolerance: not firing, not pending.
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 60m
+        exp_samples: []
+  # One second over the threshold at the moment `for:` completes: 3721 s ahead at 0 m is
+  # exactly 3601 s ahead at 2 m, still `> 3600`, so it fires at 2 m. A threshold of 3601
+  # would be false at that sample and never fire.
+  - interval: 1m
+    name: CA CRL future-dated - 3601 s ahead when for completes still fires
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "3721x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+  # Just over the line: 3660 s ahead at 0 m is > 3600 until 1 m, so it is pending for
+  # one minute and never fires (for: 2m). A value that crosses and stays is the case above.
+  - interval: 1m
+    name: CA CRL future-dated - a brief excursion over the threshold does not fire
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "3660x100"
+    promql_expr_test:
+      # Observe the excursion itself: pending at 0 m (3660 s ahead), nothing at 1 m
+      # (3600 s, not above the line), so a rule with no `for:` would be firing at 0 m.
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 0m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="pending"}'
+        eval_time: 0m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="pending", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+  # Healthy sawtooth: a CRL published every 24 h; the gauge is the replica's own clock at
+  # publish, so it is never above the current time. One republish, at 1440 m; checked before it,
+  # just after it, and a day later.
+  # (The series starts at 0, so the first publish is at the epoch itself.)
+  - interval: 1m
+    name: CA CRL future-dated - a healthy sawtooth never fires
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "0x1439 86100x1500"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1435m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1441m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 2870m
+        exp_samples: []
+  # The fix: the clock is corrected and the replica restarted at 20 m, so the new row is
+  # dated at the real time (900 s at 1200 s). Firing at 15 m, clear by 25 m.
+  - interval: 1m
+    name: CA CRL future-dated - a republish at the correct time clears it
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="s1"}'
+        values: "7200x20 900x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 25m
+        exp_samples: []
+  # max by (job) follows the newest row: one replica holds an older value, another the
+  # future-dated one. One page for the job, and a second job with only healthy rows is quiet.
+  - interval: 1m
+    name: CA CRL future-dated - one page per job, an older replica value cannot mask it
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="old"}'
+        values: "0x100"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="new"}'
+        values: "9000x100"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-other",instance="a"}'
+        values: "0x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+  # Two HEALTHY replicas export the same row; a `sum by (job)` mutant would read about twice the
+  # epoch and page forever, and every other multi-replica case here is future-dated (sum and max
+  # agree there), so this is the case that pins the aggregation.
+  - interval: 1m
+    name: CA CRL future-dated - two healthy replicas stay quiet
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="a"}'
+        values: "86100x2000"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="b"}'
+        values: "86100x2000"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 1500m
+        exp_samples: []
+  # The price of `max by (job)`, the reverse of the expiry alerts: after the fix, one replica
+  # whose reads keep failing still exports the OLD future-dated value, `max` selects it, and
+  # the alert keeps firing although the corrected replica reports a healthy value. Documented
+  # in the rule comment and the runbook; pinned here so a change to it is deliberate.
+  - interval: 1m
+    name: CA CRL future-dated - a replica stuck on the old future-dated value keeps the alert firing
+    input_series:
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="stuck"}'
+        values: "9000x100"
+      - series: 'yuzu_server_ca_crl_published_timestamp_seconds{job="yuzu-server",instance="fixed"}'
+        values: "0x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCaCrlFutureDated", alertstate="firing", job="yuzu-server", severity="warning"}'
+            value: 1
+  # No series at all (no CRL, or an install with its own certificates): nothing fires.
+  - interval: 1m
+    name: CA CRL future-dated - no series fires nothing
+    input_series:
+      - series: 'yuzu_server_cert_expiry_timestamp_seconds{job="yuzu-server",instance="s1",cert="unrelated"}'
+        values: "9999999999x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCaCrlFutureDated"}'
+        eval_time: 50m
+        exp_samples: []
+
   # -- Gateway pin file and certificate files unreadable --------------------
   #
   # A pin file whose latest read failed keeps its last key (commands still
@@ -6828,7 +7015,7 @@ tests:
 
   # YuzuExecCorrelationReapSaturated. ONE run, seven instances, because the rule needs a 24 hour `for:`
   # and promtool evaluates every rule in the file each minute of simulated time (a case costs about
-  # 0.17 s per simulated hour, and each parallel shard of the file runs under a 120 s harness
+  # 0.17 s per simulated hour, and each parallel shard of the file runs under a 240 s harness
   # timeout). Hourly passes are modelled as a step of the counter every 12 samples at a 5m
   # input interval; instance = case. The window is 6h, so it holds 5 or 6 passes depending on
   # phase, and the threshold is 200,000 (four caps).
@@ -7671,4 +7858,222 @@ tests:
             value: 1
       - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
         eval_time: 16m
+        exp_samples: []
+
+  # ── YuzuOutboxHeld / YuzuOutboxDeadLettered (#3678, command outbox redelivery limit) ──────────
+  #
+  # Held: a systemic hold repeats every tick, so the counter climbs continuously; the rule needs
+  # the climb to persist for 15m. Dead-lettered: any increase over an hour.
+
+  # CASE — a sustained sequence_unreadable hold fires after the 15m `for:` and not before.
+  - interval: 1m
+    name: outbox held - a sustained sequence_unreadable hold fires after 15 minutes
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CASE — a lone, brief hold (a flapping read that recovered) does NOT fire.
+  - interval: 1m
+    name: outbox held - a brief hold that recovers does not fire
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0x3 1+1x4 6x120"
+    promql_expr_test:
+      # Evaluated DURING and just after the window (the expression is true for the 5-minute hold
+      # plus the 10m window = about 14 minutes, one short of `for: 15m`): a case that evaluates
+      # only at 60m can never fail, which is how `for: 1m` and a wider window used to pass it.
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 17m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE — a hold of about 7 minutes DOES fire, after it has already recovered, and clears about
+  # 10 minutes later: the rule is "stalled for several minutes", not "stalled for 15 minutes".
+  - interval: 1m
+    name: outbox held - a 7 minute hold fires late and clears
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0x3 1+1x7 8x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 19m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+
+  # CASE — stamp_not_committed holds (leader handover noise) are excluded by the rule.
+  - interval: 1m
+    name: outbox held - stamp_not_committed alone does not fire
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="stamp_not_committed"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+
+  # CASE — a lone dead-letter (0 -> 1, then flat) fires, then clears when the hour window passes.
+  - interval: 1m
+    name: outbox dead-lettered - a lone dead-letter fires and then clears
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "0x5 1x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 3h
+        exp_samples: []
+
+  # CASE — a flat zero-seeded counter stays quiet.
+  - interval: 1m
+    name: outbox dead-lettered - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE — a series born already non-zero (a dead-letter on the first leader tick after a restart,
+  # inside one scrape interval) still fires; `increase()` alone would ignore its first sample.
+  - interval: 1m
+    name: outbox dead-lettered - a series born non-zero fires and later clears
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "_x9 3x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 150m
+        exp_samples: []
+
+  # ── YuzuOutboxStampFailing (#3678) ─────────────────────────────────────────────────────────
+
+  # CASE — a PERSISTENT stamp failure fires after the 1h `for:`, and not before.
+  - interval: 1m
+    name: outbox stamp failing - a persistent stamp_not_committed fires after an hour
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="stamp_not_committed"}'
+        values: "0+1x200"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CASE — leader-handover noise (a few failed stamps, then recovery) does not fire.
+  - interval: 1m
+    name: outbox stamp failing - handover noise does not fire
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="stamp_not_committed"}'
+        values: "0x3 1+1x2 3x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 62m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 64m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 66m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE — a systemic hold cause does not fire the stamp rule (each cause has its own alert).
+  - interval: 1m
+    name: outbox stamp failing - sequence_unreadable alone does not fire it
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unreadable"}'
+        values: "0+1x200"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxStampFailing", alertstate="firing"}'
+        eval_time: 120m
+        exp_samples: []
+
+  # ── YuzuOutboxHeld: the OTHER systemic cause, and YuzuOutboxDeadLettered precision (#3678) ──
+
+  # CASE — sequence_unwired (no reader wired) fires the Held rule just like sequence_unreadable.
+  - interval: 1m
+    name: outbox held - sequence_unwired fires too
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_hold_cause_total{job="yuzu",instance="s1",cause="sequence_unwired"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOutboxHeld", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CASE — a series born at ZERO (the normal pre-seed) never fires the newborn clause (`> 0`).
+  - interval: 1m
+    name: outbox dead-lettered - a zero-seeded newborn series stays quiet
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "_x9 0x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE — a long-lived series that sat at 3, went missing for 15 minutes (a scrape gap) and came
+  # back at 3 must NOT re-fire: the newborn clause looks the series up over a RANGE, not at a point.
+  - interval: 1m
+    name: outbox dead-lettered - a scrape gap does not re-fire a long-lived series
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_horizon_exceeded_total{job="yuzu",instance="s1"}'
+        values: "3x59 _x15 3x200"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
+        eval_time: 125m
         exp_samples: []

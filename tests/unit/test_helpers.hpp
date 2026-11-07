@@ -1401,4 +1401,51 @@ static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
 #endif
 }
 
+/// An ISO-8601 UTC instant ("2026-04-19T12:00:00Z", whole seconds) as nanoseconds since the epoch;
+/// 0 when the text does not parse or the instant is past what int64 nanoseconds can hold. The
+/// Guardian census orders by a key the ingest boundary derives from the agent's wire stamp, so a
+/// test that builds an event row directly and wants its timestamp to decide the order supplies the
+/// same instant as `agent_ns`.
+inline std::int64_t iso8601_to_ns(const std::string& ts) {
+    // "YYYY-MM-DDTHH:MM:SSZ": a strtol walk with range checks (the scanf family is not used in
+    // new code, docs/cpp-conventions.md).
+    const char* p = ts.c_str();
+    const auto field = [&p](char sep, long lo, long hi, long& out) {
+        char* end = nullptr;
+        out = std::strtol(p, &end, 10);
+        if (end == p || out < lo || out > hi)
+            return false;
+        if (sep != '\0') {
+            if (*end != sep)
+                return false;
+            ++end;
+        }
+        p = end;
+        return true;
+    };
+    long year_v = 0, month_v = 0, day_v = 0, hour_v = 0, minute_v = 0, second_v = 0;
+    if (!field('-', 1970, 9999, year_v) || !field('-', 1, 12, month_v) ||
+        !field('T', 1, 31, day_v) || !field(':', 0, 23, hour_v) || !field(':', 0, 59, minute_v) ||
+        !field('\0', 0, 60, second_v) || *p != 'Z' || p[1] != '\0')
+        return 0;
+    using namespace std::chrono;
+    const year_month_day ymd{year{static_cast<int>(year_v)},
+                             month{static_cast<unsigned>(month_v)},
+                             day{static_cast<unsigned>(day_v)}};
+    if (!ymd.ok())
+        return 0;
+    const sys_days date{ymd};
+    // 64-bit arithmetic throughout: MSVC's std::chrono::hours and minutes use a 32-bit int, so
+    // summing them as durations wraps for a far-future year (found on Windows CI, PR #7151).
+    const seconds secs{static_cast<std::int64_t>(date.time_since_epoch().count()) * 86400LL +
+                       static_cast<std::int64_t>(hour_v) * 3600LL +
+                       static_cast<std::int64_t>(minute_v) * 60LL +
+                       static_cast<std::int64_t>(second_v)};
+    // Past 2262-04-11 the nanosecond count no longer fits in int64: report it as unparsed rather
+    // than overflow (the same bound guardian_ingest.cpp applies to an agent stamp).
+    if (secs.count() > INT64_MAX / 1'000'000'000LL)
+        return 0;
+    return static_cast<std::int64_t>(secs.count()) * 1'000'000'000LL;
+}
+
 } // namespace yuzu::test

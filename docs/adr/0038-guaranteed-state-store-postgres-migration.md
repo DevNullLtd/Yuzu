@@ -236,6 +236,24 @@ single-event path the ingest error counter moves). The store constructor also ch
 key exists and refuses to open otherwise, because the migration runner cannot tell this schema's
 v3 from another branch's v3. Status reads are unchanged.
 
+## Update (2026-11-03) - census ordering key and durable pending evidence (#5690)
+
+The "Status upserts: fail-soft ... reconcile heals" decision above, and the Retention section's
+statement that the reaper deletes every expired event, are superseded for the compliance census.
+Schema v4 gives the census row an ordering tuple. The key is the agent's event time limited to the
+server's receipt time plus 300 seconds; ties break by `ingest_seq`, the sequence value the event
+INSERT allocates. A verdict whose order cannot be proven marks the row `order_uncertain`. An event
+whose census write fails stays stored with `projection_pending`, a redelivery of it repairs the
+census from its stored ordering inputs, and the retention reaper skips it. Under one `SAVEPOINT
+census_upsert` a writer locks every pending event of the pair in `ingest_seq` order in one
+statement, then the census row; `delete_rule` locks and retires the rule's pending events in the
+same order inside one transaction. The census reads gain `order_uncertain`, `projection_pending`
+and `uncertain_rules`. The migration rewrites the events table under ACCESS EXCLUSIVE, which relies
+on the no-rolling-upgrade exception recorded in ADR-0008. Two classes of pending event are not
+retired automatically (a decommissioned agent's, and one whose rule was deleted mid-ingest); they
+are listed in docs/clock-guarded-retention.md and counted on
+`yuzu_server_guardian_census_pending_events`.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

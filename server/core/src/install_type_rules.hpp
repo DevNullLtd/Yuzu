@@ -47,7 +47,7 @@ struct InstallTypeRow {
 
 /// One row per collector source. `pkg_inventory.managers` (the Homebrew presence row) is
 /// stored in installed_software today, so it is typed like the packages it manages.
-inline constexpr std::array<InstallTypeRow, 8> kInstallTypeBySource{{
+inline constexpr std::array<InstallTypeRow, 10> kInstallTypeBySource{{
     {"installed_apps.list_inventory", "installer"},
     {"pkg_inventory.managers", "package_manager"},
     {"pkg_inventory.packages", "package_manager"},
@@ -55,6 +55,8 @@ inline constexpr std::array<InstallTypeRow, 8> kInstallTypeBySource{{
     {"windows_optional_features.list", "optional_feature"},
     {"msi_packages.list_inventory", "msi"},
     {"runtimes.python", "runtime"},
+    {"runtimes.dotnet", "runtime"},
+    {"runtimes.jvm", "runtime"},
     {"middleware.ibm_mq", "middleware"},
 }};
 
@@ -65,7 +67,7 @@ install_type_for_ecosystem(std::string_view ecosystem) noexcept {
         return "msi";
     if (ecosystem == "optional_feature")
         return "optional_feature";
-    if (ecosystem == "python")
+    if (ecosystem == "python" || ecosystem == "dotnet" || ecosystem == "jvm")
         return "runtime";
     if (ecosystem == "ibm_mq")
         return "middleware";

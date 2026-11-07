@@ -855,11 +855,89 @@ delivery loop then drains the outbox and performs the actual dispatch, within
 Delivery emits its own `command.outbox_delivered` audit event recording the
 real send outcome: `success` (dispatched, with the agents-reached count),
 `failure` (no agents currently in scope — recorded and skipped, not retried;
-or a malformed occurrence), or `denied` (authority was revoked between
-enqueue and delivery). The execution row's targeted-agent count fills in at
+a malformed occurrence; or a redelivery-limit dead-letter, below), or `denied`
+(authority was revoked between enqueue and delivery). The execution row's targeted-agent count fills in at
 delivery, once the real outcome is known. A systemic delivery-gate failure
 (for example, containment status unreadable) is treated as transient: the
 same occurrence is retried with back-off rather than failed outright.
+
+A retry re-sends the occurrence's original command ID, so that an agent which
+already ran it can recognise and absorb the repeat. An agent only remembers the
+most recent 20,000 completed commands, so the server bounds how long an
+occurrence may keep being retried. It records the server's dispatch counts just
+before the first delivery attempt and, once they have advanced by 10,000 (half
+the agent's memory) before a retry, it stops: the occurrence is marked failed
+with the note `redelivery_horizon_exceeded`, a `failure`
+`command.outbox_delivered` audit event is written, and it is never sent again.
+The note is `redelivery_sequence_regressed` instead if the shared dispatch count
+went backwards, which means a database restore or a failover that lost recent
+writes.
+
+A first delivery attempt that reached no agent at all (the delivery gate was
+unreadable) does not start that count: it is recorded again at the next
+attempt. If the dispatch counts cannot be read, or recording them does not
+commit, the occurrence is held (neither sent nor failed) and tried again on the
+next cycle; an unreadable count holds every pending occurrence for that cycle.
+The `yuzu_server_command_outbox_deliver_degrade_total` and
+`yuzu_server_command_outbox_deliver_hold_cause_total{cause}` counters rise while
+that lasts. The `YuzuOutboxHeld` alert fires after a hold of several minutes,
+and `YuzuOutboxStampFailing` if recording the counts keeps failing for roughly 35 to 45 minutes or more.
+An occurrence that was already being retried keeps counting dispatches during a
+hold, so it can be dead-lettered once the counts are readable again.
+
+**After a dead-letter (the run was marked failed and will not be retried).** The failed occurrence may have executed once, or may
+never have been sent at all (for example while a delivery gate stayed unreadable
+on some agents). To find it, use the `query_audit_log` tool (or the dashboard's
+audit page) with action `command.outbox_delivered`, and look for rows whose
+result is `failure` and whose detail contains `redelivery_horizon_exceeded` or
+`redelivery_sequence_regressed`. The detail starts with the scheduled run's
+source, occurrence, plugin and action, so search within it rather than for a
+prefix. Every successful scheduled run writes a row for the same action, so on a
+busy server a failure can be several pages back: give `query_audit_log` a `since`
+and `until` and page with `offset`. The row names the command ID as its target and
+carries the execution ID and the first eight characters of any approval ID. Open
+that execution in the Executions history, check which agents responded, then run
+the instruction again by hand if it did not complete. If the occurrence needed an approval, that ticket is spent (a failed
+occurrence keeps its ticket consumed), so request a new one (see
+[Who can approve](#who-can-approve)). The next scheduled occurrence is
+unaffected and fires normally. The occurrence's execution row is not cancelled by
+this step. If no agent has answered by the next stuck-execution sweep, which runs
+roughly every 15 minutes and looks at executions that are over 30 minutes old,
+the sweep may cancel it, including an execution whose agents were reached but
+have not responded yet; until then it can look in-flight.
+
+The count is an estimate, not a clock, and it can err in both directions.
+
+*It can end a run early (the safe direction).* It is fleet-wide, so any
+operator's or any push's dispatches advance it: a Guardian, asset-tag or sync
+push counts once for every target, and one push to 10,000 devices ends every
+occurrence that is waiting to be retried at that moment. Guardian control messages
+count although they take no place in the agent's memory. A long gateway-directory
+outage in which many occurrences are being retried also ages them, because each
+retry counts as a dispatch. After a change of leadership on the server, the new
+leader also charges every unrecorded dispatch it has made since it started,
+however old, so a server that once failed to record 10,000 dispatches ends every
+waiting occurrence at each later leadership change until it is restarted.
+
+*It can fail to end a run in time (the unsafe direction).* Dispatches whose
+record failed to write are counted only by the server process that made them. A
+different server replica, or an earlier run of the same server that has since
+restarted or been taken over by another replica, takes that count with it: after a
+restart the server cannot tell how many such dispatches passed, so the limit can
+trip late. Four other cases also let it trip late: a command dispatched before the
+first attempt but delivered to the agent after it is not counted; a database
+restore that leaves the dispatch count still above a waiting occurrence's recorded
+value reads as small progress; a server replica working from an out-of-date view
+can still send an occurrence that another replica has just marked failed; and the
+dispatch count cannot see an agent whose own memory was lost. Agents running
+without a working command-dedup store are not protected at all: they re-run every
+redelivery. None of this is closed by this change; the sound close, in which the
+agent refuses an ID older than its own memory, is a protocol change and is not part
+of it.
+
+It is not a time limit, so an occurrence stuck on a quiet fleet is not ended by
+it. The dispatch-count part of the retry limit is delivered under #3678; a
+time-based cap and a retry-count cap remain open under #4167.
 
 Approval-gated runs (the schedule's `requires_approval` flag, or a definition
 whose `approvalMode` is not `auto` — there is no operator session on the

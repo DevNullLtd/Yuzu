@@ -758,12 +758,9 @@ metadata:
   version: 1.0.0
   description: >
     Force an immediate maintenance pass (normally runs every 15 minutes).
-    Aggregates raw capture rows into hourly, daily, and monthly summary tables,
-    permanently deletes rows older than each tier's retention limit, and then
+    Permanently deletes rows older than each tier's retention limit, and then
     enforces the database byte budget (db_budget_bytes): while the database is
-    over it, the pass permanently deletes the oldest raw capture rows that
-    their first summary tier has already passed (hourly, or daily for user
-    and software), never the newest 24 hours, then hourly rows older than 48
+    over it, the pass permanently deletes hourly rows older than 48
     hours (5 days for procperf), even inside their retention window; paused or
     errored sources (an unreadable <source>_enabled counts as errored) are
     exempt. It may also run the one-off VACUUM that converts an older database
@@ -797,7 +794,7 @@ spec:
       - name: rows_aggregated
         type: int32
         description: >-
-          Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.
+          Always 0: Echo folds every event into the hourly, daily and monthly tiers as it arrives, so there is no aggregation pass to count. The field stays in the reply shape so a stored client that parses it keeps working; it is the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: 0.
         example: "-"
         platforms: [windows, linux, darwin]
 

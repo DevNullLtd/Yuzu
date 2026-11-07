@@ -318,8 +318,9 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "that waited out the 1 s hold behind an older entry in the other lane may overtake it "
      "(up to 64 launches), so events may reach the stream out of order (counted even if "
      "nothing launches). Not a loss, but an overtaking sender can, through the "
-     "server's same-second timestamp tie (guard.errored versus a delayed guard.compliant), "
-     "leave a false compliant (#5690, open, a prerequisite for enabling the spark backend). "
+     "server's census ordering (guard.errored versus a delayed guard.compliant), "
+     "leave the pair flagged order_uncertain (#5690; the server no longer keeps a false compliant "
+     "silently, it flags the disagreement). "
      "MONITOR-ONLY - see the alerting note. Compare send_stalls / send_exceptions; no "
      "per-agent tag surface yet: search collected agent.log for 'launch hold released'"},
 };

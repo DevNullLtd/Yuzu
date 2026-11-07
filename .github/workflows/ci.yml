@@ -93,7 +93,7 @@ env:
   # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
   # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
-  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
   VCPKG_BINARY_SOURCES: "default"
   # Bumped 500M → 30G after measuring 94-97% direct-hit rate on the
   # self-hosted runners (originally yuzu-wsl2-linux + yuzu-local-windows, since retired). Yuzu has
@@ -2154,6 +2154,28 @@ jobs:
           Write-Host 'registry leftover check self-test: both decisions hold'
           exit 0
 
+      # #7175: the echo plugin's registry source starts a system-wide real-time ETW session named
+      # YuzuEchoRegistryEtw-<pid>, and a real-time session outlives its process until something stops it, so a test
+      # process that is killed (a meson timeout), crashes or is cancelled leaves one behind. The four runner agents on
+      # this box share one OS identity, so a leaked session is shared state nothing else cleans up. On 2026-11-05 one
+      # for a dead pid was on this box while `echo unit tests` failed on every run (#7173, #7135). This step logs the
+      # session count (the system limit is 64) and stops sessions named Yuzu<letters>Etw-<digits> whose pid is NOT
+      # running, by exact name, so a live job on another runner slot keeps its session. The script never fails the job
+      # (a listing or stop error is a ::warning; a successful stop is annotated too, on purpose, so a leak shows on the
+      # job). Every logman call inside it is killed after 45 s within a 180 s budget, and each step is capped at 5
+      # minutes as a backstop, so a wedged logman cannot hold the runner. The self-test step, by contrast, is allowed to
+      # fail the job: a broken guard should be loud. It proves the decisions without touching a real session. See
+      # scripts/ci/stop-dead-etw-sessions.ps1 and "Leaked ETW sessions" in docs/ci-architecture.md.
+      - name: Self-test the ETW leaked-session cleanup
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./scripts/ci/stop-dead-etw-sessions.ps1 -SelfTest
+
+      - name: Stop ETW sessions leaked by dead Yuzu test processes (pre-test)
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase pre-test
+
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
       # "PG coverage by platform" for the full rationale and the measured
@@ -2240,6 +2262,15 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/ci/check-registry-test-leftovers.ps1 -Scope $env:YUZU_TEST_REGISTRY_SCOPE
+
+      # #7175: the same cleanup after the suite, so a session leaked by THIS job's killed or crashed test process is
+      # stopped now and logged against this job, not left for the next one. always(): a cancelled job still runs it.
+      # Dead-pid sessions only, so a concurrent job's live session is untouched; never fails the job.
+      - name: Stop ETW sessions leaked by dead Yuzu test processes (post-test)
+        if: always()
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase post-test
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
       # debug-only (exclude: above), so PR coverage is unaffected. k=2 was
@@ -3071,12 +3102,14 @@ jobs:
         # the save-always deprecation rationale and the documented split
         # restore + always-save pattern.
         #
-        # The bare `vcpkg-canary-x64-linux-` fallback below is the same
-        # open-prefix shape the ccache step a few lines down used to have
-        # (see that step's comment for why that's a risk). Not fixed here:
-        # `VCPKG_COMMIT` has never changed in this repo's history, so the
-        # path that would resurrect a dead-format entry has never fired —
-        # tracked as #3888.
+        # The only fallback is the `VCPKG_COMMIT`-scoped prefix: a bare
+        # `vcpkg-canary-x64-linux-` prefix is deliberately NOT kept. It
+        # would restore a `vcpkg_installed` tree built for another vcpkg
+        # baseline (the 2026.10.16 bump is the first change of
+        # `VCPKG_COMMIT` since this key was introduced), and every
+        # open-prefix hit would keep such an entry alive in the cache
+        # pool by refreshing its last-accessed time (#3888; see
+        # .claude/skills/ci-cache/SKILL.md).
         #
         # A miss here isn't announced anywhere a human would notice short of
         # reading this step's raw log for "Cache not found" — a silent
@@ -3091,7 +3124,6 @@ jobs:
           key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/x64-linux.cmake') }}
           restore-keys: |
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
-            vcpkg-canary-x64-linux-
 
       - name: Compute ccache time bucket (canary)
         # The ccache key deliberately does NOT hash sources any more. The

@@ -414,14 +414,16 @@ Motivation: the server-authoritative vulnerability-matching direction (ADR-0018)
 needs full EVR (`epoch:version-release`) + `arch` + the host's distro release for
 Lane-1 OVAL matching, and an honest `kind=app` discriminator for the Lane-3
 OS-native tail. The population contract is **honest-empty**: a field the
-ecosystem does not store is `''`, never synthesised (rpm = full NEVRA + PACKAGER
-+ stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
+ecosystem does not store is `''`, never synthesised, except `publisher`, which carries a
+vendor or a `via:` label (the section "2026-11-04 — `installed_software`: a publisher on every
+row, and the `via:` origin label" below states the rule). Per source: rpm = full NEVRA + VENDOR, else
+PACKAGER, + stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
 held; apk = name/version/pkgrel; pacman = name/EVR; Windows/macOS = `kind=app`
 with name/version/publisher only; `distro_id`/`distro_version` from
 `/etc/os-release` stamped on every Linux row; `homebrew` is a reserved
-ecosystem value, not collected). `version` is now the upstream version with the
-release/revision split into its own field, and rpm `publisher` switches
-VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
+ecosystem value, not collected. `version` is the upstream version with the
+release/revision split into its own field, and rpm `publisher` is the `VENDOR` tag,
+else the `PACKAGER` tag.
 
 > **Update (2026-10-04, #5328):** `homebrew` was never emitted as an ecosystem
 > value and is retired. Homebrew (ecosystem `brew`; kind `pkg` for formulae, `app`
@@ -460,6 +462,23 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > agent logs one warn line). The policy exists for a steady-state constraint that
 > is a permission fact, where skipping the cycle would freeze every other source
 > for ever.
+
+> **Update (2026-11-04):** the `pkg_inventory` Windows legs are collected as three
+> ecosystems, all machine scope: `appx` (kind `app`; the packages registered for
+> all users in the `AppxAllUserStore` `Applications` and `InboxApplications`
+> registry keys; name is the package name, version and arch come from the package
+> full name, release empty; a package in the `Deprovisioned` key is read but never
+> collected), `chocolatey` (kind `pkg`; one row per `lib\<id>` directory holding a
+> loose nuspec, version from its `<version>`, empty if unreadable) and `winget`
+> (kind `app`; a presence row from the `managers` action, present when the App
+> Installer package is registered, version from that package). Chocolatey's own
+> presence row has an empty version. No process is spawned and nothing is hashed;
+> the `ConstrainedPolicy` of the three actions is unchanged, so a constrained
+> `packages` or `store_packages` answer still skips the cycle, which is why a
+> per-item shortfall (an unreadable nuspec, an unparsable package name) degrades its
+> own row to an empty version instead of constraining the action. The three values
+> are appended at the tail of the published ecosystem enumeration. The tail
+> `install_location` slot stays reserved and empty.
 
 Mechanics:
 
@@ -690,9 +709,8 @@ agent's next full report on the upgraded server.
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
 serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
 account or a personal label as the OS reports it, so the agent redacts such entries before sending
-(2026-11-01 entry, "Mount points (personal data)"). The sections read has no REST/MCP/UI route yet;
-the later REST read-surface change must serve it behind the same fail-closed audit as the
-audited `inventory.device.ci` read.
+(2026-11-01 entry, "Mount points (personal data)"). As of the 2026-11-04 entry at the end of this
+file (H.7), the sections are served on REST and MCP behind the audited `inventory.device.ci` read.
 
 ### 2026-11-01 — `device_ci` blob v2 (agent writer)
 
@@ -1121,3 +1139,126 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   reports at its next wake. With the 45 minutes above, both stay inside the 48 hour "two missed
   daily cycles" staleness threshold of `docs/user-manual/inventory.md`, and the freshness gauge
   keys on server receipt time, so no freshness expectation is weakened.
+
+### 2026-11-04 — `device_ci` read surface on REST and MCP (H.7)
+
+`GET /api/v1/hardware/{id}` and the MCP tool
+`get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
+The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
+served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
+level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
+generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
+(`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
+unreadable`; it is never a `200` with an empty sections list.
+
+Each table-backed section's status row also records `row_count` (migration v3, additive and
+nullable): the number of child rows the full replace actually inserted for it, taken from the insert in
+the same transaction and never from the agent. The read side compares it with the rows it reads in the
+same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
+restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
+rows that were read are still served.
+
+The status row also records `content_digest` (the same migration v3, additive and nullable): the
+SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
+count, row count, then each row's position and cells, with any NUL byte in a cell skipped because the
+store cannot keep one), computed by the server from the rows it inserts in the same transaction,
+never taken from the agent. It is stored as `v1:<64 hex>`: the prefix names the preimage layout, and a
+stored digest that is a well-formed digest of a different layout version (`v<n>:` with a non-empty
+remainder, n one to six digits, not 1, no leading zero) is treated as unverified, never as a mismatch; every other
+non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex, a malformed version,
+`v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
+same-count edit read as complete. A later layout change or a registry column change (see the warning in
+`device_ci_kinds.hpp`) can therefore be rolled out under a new prefix without raising a false integrity
+alarm on every stored row. (A column change also needs its own ALTER migration; the registry is not the schema, see
+`docs/postgres-store-playbook.md` "Registry-backed tables".) One pure function
+(`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
+read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
+row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
+and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
+reason. The rows that were read are still served, but they are not the values the agent reported. A
+lost row is reported by the count token alone, since it changes the digest too. This is an integrity
+check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
+tables can also rewrite the digest column, and the digest covers the rows only, not the section's
+level or reason. It closes the same-count content drift that the count alone could not see (finding
+`up2r-up-3`). A status-only section (chassis, baseboard, machine_id) and a section written before v3
+store NULL for both, are not verified, and read exactly as before.
+Only a full replace records the count and repairs a mismatched section: a device whose hash is
+unchanged sends only a hash, which leaves the rows alone, so this happens on a hardware change, an
+operator Sync now of the device record (`POST /api/v1/hardware/{id}/sync`; the fleet-wide route and the
+MCP `sync_hardware_software` tool re-send installed software only and do not repair a section), or the
+weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
+for up to a week after upgrade. The wire format and the agent are unchanged. Migration 3 is a single
+additive `ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, ADD COLUMN IF
+NOT EXISTS content_digest TEXT NULL` (the digest column is folded into v3 because v3 had not shipped;
+the runner is gated on the recorded version only, so a development database that already recorded the
+earlier row-count-only v3 must be reset with `UPDATE public.schema_meta SET version = 2 WHERE store =
+'device_inventory_store';` and a server restart, or recreated). The rollback note above
+holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
+there, so the sections it writes are unverified until a v3 server next does a full replace for that
+device.
+
+> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
+
+### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
+
+Every row of every `installed_software` source carries a non-empty `publisher`, so slot 3 of the
+row (hashed on both the v2 and the v3 path) is always populated. The wire layout has no extra
+slot and the parser gains no rule for it: the server parses and hashes slot 3 on both paths, so the
+mechanism is a value rule on the agent, one recognition rule in the server normaliser, and golden
+vectors on both sides.
+
+**The value rule.** A row's publisher is the vendor its source declares; when the source
+declares none it is the origin label `via:<ecosystem>`, where the ecosystem is the row's own
+`ecosystem` value (`via:unknown` when that is empty, never the bare `via:`). The fallback is applied in exactly one place, the collector loop in
+`make_installed_software_source` (`vendor_or_origin`, after each adapter has run and the row's
+`source` is stamped), not inside `installed_software_canonical_blob`. The blob builder hashes the
+publisher as given (a fixture entry with an empty publisher hashes an empty slot), so the fixture
+cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) are independent of
+the fallback.
+
+| Source (`source`) | Publisher | Fallback |
+|---|---|---|
+| `installed_apps.list_inventory`, rpm | package `VENDOR` tag, else `PACKAGER` (a person or a build-system address; kept only when no vendor is set) | `via:rpm` |
+| same, deb | `Maintainer` | `via:deb` |
+| same, pacman, apk | none: `pacman -Q` and `apk info -v` list no vendor and a second subprocess per package is not worth it | `via:pacman`, `via:apk` |
+| same, Windows | the Uninstall key's `Publisher` | `via:windows` |
+| same, macOS apps | the signing certificate's leaf common name | `via:macos` |
+| same, macOS installer receipts | none: a reverse-domain id is an identifier, not a vendor, and no heuristic turns one into the other | `via:macos_pkgutil` |
+| `pkg_inventory.packages` (Homebrew, Chocolatey), `pkg_inventory.store_packages` (snap, flatpak, Appx) | none: `pkg_inventory` starts no process by design | `via:brew`, `via:chocolatey`, `via:snap`, `via:flatpak`, `via:appx` |
+| `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
+| `pkg_inventory.managers` (Chocolatey and winget presence rows) | none: no constant vendor is declared for them | `via:chocolatey`, `via:winget` |
+| `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
+| `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
+| `runtimes.python`, Windows | the row's vendor column (the `PythonCore` registry tag), unescaped | `via:python` when the column is `-` |
+| `runtimes.python`, Linux | none: the Linux producer always emits `-` in the vendor column | `via:python` |
+| `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
+| `middleware.ibm_mq` | `IBM`, from the product table | n/a |
+| `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
+| `runtimes.jvm` | the row's vendor column: the `release` file's self-reported `IMPLEMENTOR`, or on macOS, for a bundle with an openable `Contents` and no `release` file under `Contents/Home`, its `Info.plist` `JVMVendor` | `via:jvm` when the column is `-` (the home reports no vendor, or it is a Windows home known only by its registry tag) |
+
+The rpm `list_inventory` query format has ten columns, `%{VENDOR}` the last; the pinned argv
+literal in `docs/agent-spawn-sink-manifest.md` carries the same format, and `parse_rpm_inv_line`
+takes ten tokens. The `list` action has its own columns.
+
+**The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
+`kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
+is case-sensitive and exact: the agent writes the prefix in lower case, so a Windows publisher of
+`VIA:Acme` is a vendor and normalises as one, and a vendor that merely contains `via:` is not a
+label. A labelled title therefore keys like a vendorless one.
+The catalogue treats a label as no vendor in two more places: `total_publishers` excludes
+`publisher LIKE 'via:%'`, and the representative publisher of a title (the rollup statement and
+the single-device catalogue read) prefers a non-label value and falls back to the plain maximum
+only when every row of the group is labelled.
+
+**Keys of `title_dimension` and `curation_queue`.** Both are keyed on the raw
+`(raw_name, raw_publisher, ecosystem)` triple, so a title with no declared vendor is keyed under
+its `via:` label, not under an empty publisher, and a `via:<ecosystem>` triple has its own
+`title_dimension` row. A label normalises to no vendor, so a pack or curated alias with an empty
+raw publisher covers it (the shipped aliases all have one, and such a title resolves `pack` and is
+not queued); a title no alias covers is `unnormalized` and queued as an open item.
+
+**Hash.** The publisher is part of each row's hash. The agent's collector characterisation
+digests over the real capture samples include it, and the agent and the server pin the same
+labelled row to the same digests.
