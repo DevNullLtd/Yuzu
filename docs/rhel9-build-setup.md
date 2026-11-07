@@ -220,7 +220,7 @@ hard-errors if it fails, because content embedding (`embed_content.py`) needs it
 
 > Do not install the hash-pinned `requirements-ci.txt` here: its meson pin needs Python 3.10+, so
 > under Python 3.9 pip refuses it outright. Install the two packages that matter explicitly.
-> (`gcovr` from that file is only for the nightly coverage job.)
+> (`gcovr` from that file is for the nightly coverage job and the local `/test` coverage gate.)
 
 ### The Python 3.9 ceiling
 
