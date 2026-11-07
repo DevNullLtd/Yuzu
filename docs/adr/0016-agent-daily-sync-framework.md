@@ -1251,13 +1251,12 @@ The catalogue treats a label as no vendor in two more places: `total_publishers`
 the single-device catalogue read) prefers a non-label value and falls back to the plain maximum
 only when every row of the group is labelled.
 
-**Disposition of `title_dimension` and `curation_queue`.** Both are keyed on the raw
+**Keys of `title_dimension` and `curation_queue`.** Both are keyed on the raw
 `(raw_name, raw_publisher, ecosystem)` triple, so a title with no declared vendor is keyed under
-its `via:` label, not under an empty publisher. The candidate query selects only triples present
-in `title_triples`, which is rebuilt from the live inventory. A `via:<ecosystem>` triple has its
-own `title_dimension` row. A label normalises to no vendor, so a pack or curated alias with an
-empty raw publisher covers it (the shipped aliases all have one, and such a title resolves `pack`
-and is not queued); a title no alias covers is `unnormalized` and queued as an open item.
+its `via:` label, not under an empty publisher, and a `via:<ecosystem>` triple has its own
+`title_dimension` row. A label normalises to no vendor, so a pack or curated alias with an empty
+raw publisher covers it (the shipped aliases all have one, and such a title resolves `pack` and is
+not queued); a title no alias covers is `unnormalized` and queued as an open item.
 
 **Hash.** The publisher is part of each row's hash. The agent's collector characterisation
 digests over the real capture samples include it, and the agent and the server pin the same
