@@ -48,7 +48,7 @@ struct EcosystemFamily {
 
 /// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
 /// shifts positions, so say so in the changelog.
-inline constexpr std::array<EcosystemFamily, 14> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 16> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
     {"msi", "windows"},
@@ -63,6 +63,8 @@ inline constexpr std::array<EcosystemFamily, 14> kEcosystemFamilies{{
     {"flatpak", "linux"},
     {"python", "other"},
     {"ibm_mq", "other"},  // middleware (SAM.2): no OS family -- the product runs on several
+    {"dotnet", "other"},
+    {"jvm", "other"},
 }};
 
 /// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is
@@ -123,7 +125,7 @@ inline constexpr std::array<VocabEntry, 4> kSoftwareKinds{{
 /// One row per collector source, in the collector's kInventoryActions order
 /// (agents/core/src/sync_source_installed_software.cpp); the vocabulary test compares the ordered
 /// lists. A new source is one row here.
-inline constexpr std::array<VocabEntry, 8> kSoftwareSources{{
+inline constexpr std::array<VocabEntry, 10> kSoftwareSources{{
     {"installed_apps.list_inventory", "installed_apps.list_inventory",
      "Windows Uninstall registry, Linux dpkg/rpm/pacman/apk, macOS applications and installer "
      "receipts"},
@@ -139,6 +141,12 @@ inline constexpr std::array<VocabEntry, 8> kSoftwareSources{{
      "Python interpreters at the standard machine-wide locations (Windows, macOS, Linux)"},
     {"middleware.ibm_mq", "middleware.ibm_mq",
      "Registered IBM MQ installations, from installer metadata (Linux)"},
+    {"runtimes.dotnet", "runtimes.dotnet",
+     ".NET runtimes, SDKs and Framework at the standard machine-wide locations (Windows, macOS, "
+     "Linux)"},
+    {"runtimes.jvm", "runtimes.jvm",
+     "Java runtimes and development kits at the standard machine-wide locations (Windows, macOS, "
+     "Linux)"},
 }};
 
 /// Non-empty, every value `[a-z_.]+` (the chips splice it into attributes and URLs), non-empty

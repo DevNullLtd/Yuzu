@@ -309,6 +309,23 @@ check_strict(Path) ->
                                       Listeners, Pins),
     ?assertEqual(identity, Mode),
     ?assertEqual(identity, proplists:get_value(mgmt_peer_auth_mode, YuzuEnv, undefined)),
+    %% The CRL source (#6016 PR 4b), as the boot guard resolves it: the reference gateway config
+    %% reads the server's CRL over https with the management listener's CA as the fetch CA, so a
+    %% deleted key (withdrawal silently off) or a typo (boot refused) is a red test here; the
+    %% sys.config.prod copy carries only a commented example and sets none.
+    CrlSource = proplists:get_value(mgmt_crl_source, YuzuEnv, undefined),
+    case lists:suffix("reference-gateway-sys.config", Path) of
+        true ->
+            ?assertMatch({ok, #{source := {url, #{host := "server", port := 8443,
+                                                  path := "/api/v1/ca/crl"}}}},
+                         yuzu_gw_mgmt_crl_source:resolve(CrlSource, undefined, undefined,
+                                                         Listeners));
+        false ->
+            ?assertEqual(undefined, CrlSource),
+            ?assertEqual({ok, none},
+                         yuzu_gw_mgmt_crl_source:resolve(CrlSource, undefined, undefined,
+                                                         Listeners))
+    end,
     %% The shipped path names a CA file this test host does not have, so the
     %% identity derives to nothing here; on a real install it is derived from the
     %% one-certificate default-ca.pem. Give the resolver the value it would find.

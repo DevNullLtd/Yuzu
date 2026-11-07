@@ -72,6 +72,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
@@ -171,6 +172,7 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
     # container would otherwise print NOTHING until the job's own 10-minute
     # timeout killed it -- reporting as "the gate timed out" rather than naming
     # what hung.
+    started = time.monotonic()
     try:
         proc = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=timeout)
@@ -179,6 +181,13 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
         print(f"FAIL: {msg}", flush=True)
         gh_error(msg)
         return 1, ""
+    # Elapsed vs limit on EVERY finished call, quiet or not (#7191): the margin
+    # against the per-call limit was invisible, so a shard creeping toward it
+    # looked identical to a healthy one until it finally timed out. One line,
+    # written in ONE write() call, so parallel shards do not interleave mid-line.
+    sys.stdout.write(f"elapsed {time.monotonic() - started:.1f}s of {timeout}s limit "
+                     f"(rc {proc.returncode}): {argv[-1]}\n")
+    sys.stdout.flush()
     out = proc.stdout + proc.stderr
     if out and not quiet:
         print(out, end="" if out.endswith("\n") else "\n", flush=True)
@@ -192,11 +201,28 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
 # 30 s as 4 parallel processes over a round-robin split. In CI the unsplit call
 # took about 118 s and 120 s on two green docs-lint runs (40663221423,
 # 40688324438; measured between the log lines around the call) against the
-# 120 s per-call timeout below, and timed out on others. Capped at
+# 120 s per-call timeout it had then, and timed out on others. Capped at
 # min(4, os.cpu_count()): a public-repo ubuntu-24.04 runner has 4 vCPUs
 # (cflite-pr.yml). cpu_count ignores CPU affinity and cgroup quotas, which only
 # over-counts on a pinned or quota-limited box; the cap bounds that.
 TEST_SHARDS = max(1, min(4, os.cpu_count() or 1))
+
+# Per-call limit for `promtool test rules` (each shard, and the canary's run).
+# 120 -> 240 for #7191. After sharding, one of four shards intermittently ran
+# past 120 s on CI while the other three passed (see #7191 for the failing
+# runs). The image pull is outside this limit (about 3 s in those jobs), so the
+# 120 s went on the `docker run` itself. The unsplit call measured 118 s / 120 s
+# against this same limit before sharding, so a 4-way split should have left
+# about 4x headroom; that it did not shows a shard can be several times slower
+# than the local 30 s, but WHY (a slow runner, an uneven split, or a stall) is
+# not established. 240 s is simply 2x the old limit. It is not derived from a
+# measured shard cost: the per-shard `elapsed` line `run()` now prints is how
+# to re-tune it from real data. A stalled call still fails, but now after 240 s
+# rather than 120 s. `check rules` calls stay at 120 s: they are a parse,
+# measured in seconds. THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT
+# ENCLOSE IT: a gate is now 120 + 240 + 240 + 120 = 720 s - see main()'s ladder
+# comment, meson's `timeout:` and docs-lint.yml's `timeout-minutes`.
+TEST_RULES_TIMEOUT = 240
 
 
 _YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
@@ -796,7 +822,7 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
     if rc:
         return rc
     rc, test_out = run_test_rules(promtool_argv, tests, REPO_ROOT / tests_rel,
-                                  timeout=120)
+                                  timeout=TEST_RULES_TIMEOUT)
     if rc:
         return rc
     reason = check_gate_output(check_out, test_out,
@@ -824,7 +850,7 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
         # arm below.
         canary_rc, canary_out = run_test_rules(canary_argv, canary_tests,
                                                tmp / tests_rel,
-                                               timeout=120, quiet=True)
+                                               timeout=TEST_RULES_TIMEOUT, quiet=True)
         canary_check_rc, canary_check_out = run(
             canary_argv + ["check", "rules", canary_rules], timeout=120, quiet=True)
     finally:
@@ -955,19 +981,20 @@ def pull_with_retry() -> bool:
     # job timed out", which is the exact diagnosis the per-call timeout was
     # added to prevent (#2553, Gate 5). Pull ladder ceiling is 2x90 + 15 = 195s
     # here, plus ~30s for the daemon probe: 225s before a single promtool call.
-    # ONE full gate() - check + test + the canary's own test + check, all
-    # timeout=120 - is 4x120s = 480s worst case; an earlier version of this
+    # ONE full gate() - check + test + the canary's own test + check - is
+    # 120 + TEST_RULES_TIMEOUT(240) + 240 + 120 = 720s worst case (480s before
+    # #7191 raised the two test calls from 120s); an earlier version of this
     # comment counted only the first two and undercounted its own ceiling by
     # the canary's 240s. #2340 PR-4 (marker-extraction of yuzu-guardian-journal,
     # CH-2 + CH-5-PROM) made `main()` run gate() TWICE per invocation - once for
     # RULES/TESTS, once for the extracted group - so THIS SCRIPT's own worst
-    # case is 225 + 480x2 = 1185s under the docker opt-in (960s on a native
-    # promtool, no pull/probe). meson's `timeout:` on this test covers that
-    # with margin (see tests/meson.build).
+    # case is now 225 + 720x2 = 1665s under the docker opt-in (1440s on a native
+    # promtool, no pull/probe; was 1185s / 960s before #7191). meson's
+    # `timeout:` on this test covers that with margin (see tests/meson.build).
     # `timeout-minutes` on the `prometheus-rules` job covers this script's
-    # docker-path ceiling (1185s) PLUS a second promtool-driven step
+    # docker-path ceiling (1665s) PLUS a second promtool-driven step
     # (`blind_band_sweep.py --check`) sharing the same job, sized in its own
-    # comment to ~915s - see `docs-lint.yml`'s comment on this job for the
+    # comment to ~945s - see `docs-lint.yml`'s comment on this job for the
     # combined arithmetic and current value. Sized to the WORST-CASE SUM of
     # both steps' own documented ceilings, not to either step's typical
     # measured runtime - sizing to typical runtime is exactly what let the

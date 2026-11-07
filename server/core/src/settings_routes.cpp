@@ -1287,7 +1287,7 @@ function arFeedback(msg, isError) {
   fb.textContent = msg;
   fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
-function arPost(url, body, onSuccess) {
+function arPost(url, body, onSuccess, onRefused) {
   fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -1298,8 +1298,12 @@ function arPost(url, body, onSuccess) {
       var data = {};
       try { data = JSON.parse(t); } catch (e) {}
       if (!r.ok) {
-        var msg = (data && (data.error || data.message)) || ('Action failed (' + r.status + ')');
+        // The A4 error body is {error:{code,message,...}}: read the message, never print the object.
+        var e = data && data.error;
+        var msg = (e && typeof e === 'object' ? e.message : e) || (data && data.message) ||
+                  ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
+        if (onRefused) onRefused(r.status);
         return;
       }
       arFeedback('Done.', false);
@@ -1336,7 +1340,9 @@ function arAttest(btn) {
     role_name: d.roleName,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
-  }, function () { arLoadCampaign(d.campaignId); });
+  }, function () { arLoadCampaign(d.campaignId); },
+  // 409: another reviewer decided this grant first (decisions are final) - show the row as decided.
+  function (status) { if (status === 409) arLoadCampaign(d.campaignId); });
 }
 function arCloseCampaign(btn) {
   var id = btn.dataset.campaignId;
@@ -4868,22 +4874,33 @@ void SettingsRoutes::register_routes(
                 // principal strings, not just the count — mirrors the SCIM
                 // seam's `revoke_linked_credentials_or_fail`.
                 enumerate_principals_for_audit(*principals);
-            if (!revoke_result.api_tokens_persisted) {
-                revoke_detail += " api_tokens_db_error=true";
-                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
-                             "persist for one or more principals linked to '{}' — refusing to "
-                             "report a clean delete (ADR-2001 §3 fail-closed)",
+            if (!revoke_result.all_persisted()) {
+                // #4772: the durable session DELETE is held to the same fail-closed contract
+                // as the token revoke (a surviving session row is rehydrated by another
+                // replica or after a restart).
+                if (!revoke_result.api_tokens_persisted)
+                    revoke_detail += " api_tokens_db_error=true";
+                if (!revoke_result.sessions_persisted)
+                    revoke_detail += " sessions_db_error=true";
+                spdlog::error("DELETE /api/settings/users: the credential revoke did not "
+                             "persist (api_tokens={}, sessions={}) for one or more principals "
+                             "linked to '{}' — refusing to report a clean delete (ADR-2001 §3 "
+                             "fail-closed)",
+                             revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                              username);
                 audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                // A fixed literal from `failed_legs_phrase` (never user data), so it is safe
+                // inside the HX-Trigger JSON below.
+                const std::string what(failed_legs_phrase(revoke_result));
                 res.status = 500;
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
-                    R"(linked identities — try again","level":"error"}})");
-                res.set_content(
-                    detail::a4_error(res, "Failed to revoke API tokens for one or more linked "
-                                           "identities — try again"),
-                    "application/json");
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Failed to revoke )" + what +
+                                   R"( for one or more linked identities — try again",)"
+                                   R"("level":"error"}})");
+                res.set_content(detail::a4_error(res, "Failed to revoke " + what +
+                                                          " for one or more linked "
+                                                          "identities — try again"),
+                                "application/json");
                 return;
             }
             erase_principals = std::move(*principals);

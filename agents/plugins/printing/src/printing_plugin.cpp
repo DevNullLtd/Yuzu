@@ -787,7 +787,7 @@ constexpr int kReadTimeoutSec = 5;
 }
 
 // Issues one IPP POST over the CUPS Unix socket (set_address_family(AF_UNIX)
-// BEFORE the first Post — httplib 0.37.1 only emits `Host: localhost` once
+// BEFORE the first Post — httplib (0.37.1 and 0.59.0) only emits `Host: localhost` once
 // address_family_ == AF_UNIX, and cupsd 400s a path-shaped Host otherwise).
 [[nodiscard]] IppResult post_ipp_unix(const std::string& socket_path, const std::string& body,
                                        const httplib::Headers& extra_headers) {
