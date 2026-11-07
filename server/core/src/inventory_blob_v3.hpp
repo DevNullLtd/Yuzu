@@ -12,7 +12,8 @@
 ///     (it ignores a record with an empty name), so no v2 record can be mistaken for it;
 ///   - then sections. Every record is 0x1E-terminated, fields 0x1F-separated, first field = the
 ///     record kind:
-///       S    | facet | status | base | token | duration_ms | bytes_read      opens a section
+///       S    | facet | status | base | token | duration_ms | bytes_read | expect
+///                                                                              opens a section
 ///       +    | name | version | publisher | install_date | kind | ecosystem | epoch | release |
 ///              arch | signature_status | distro_id | distro_version | install_location |
 ///              <slot 14, reserved, always empty> | package_id | source      an install row
@@ -21,6 +22,11 @@
 ///  - `facet` is a `software_catalog::kSoftwareSources` value or `component_inventory`; `status`
 ///    is full | delta | constrained | timeout | oversize | not_collected | disabled; only full
 ///    and delta sections carry records.
+///  - `expect` is the section hash the agent holds AFTER applying this section (64 lowercase
+///    hex). A delta section MUST carry it (refused `bad_record` otherwise): it is the only
+///    per-section check the server has that its own apply produced the agent's row set. A full
+///    section ignores the field (the server recomputes a full section's hash from its rows) and
+///    keeps whatever it carried.
 ///
 /// Two framing rules every record obeys. (1) A record is 0x1E-terminated, the last one too: an
 /// unterminated final record is a truncated blob, so it refuses the section it sits in (or the
@@ -183,7 +189,7 @@ inline constexpr std::array<std::string_view, 9> kV3VersionSources{{
     "unreadable",
 }};
 
-/// One `comp` record: parsed and validated here, stored by a later change.
+/// One `comp` record: parsed and validated here, stored in `software_components`.
 struct V3Component {
     std::string kind;
     std::string name;
@@ -199,6 +205,7 @@ struct V3Section {
     std::string facet;
     V3Status status{V3Status::kNotCollected}; ///< meaningless when refusal == kUnknownStatus
     std::string base;  ///< delta: the section hash the delta applies on top of
+    std::string expect; ///< delta: the section hash after the delta (64 lowercase hex, checked)
     std::string token; ///< agent-reported reason token for a non-full status
     std::int64_t duration_ms{0};
     std::int64_t bytes_read{0};
@@ -393,12 +400,15 @@ parse_v3_blob(std::string_view blob) {
             sec.token = std::move(f[4]);
             sec.duration_ms = v3_detail::parse_nonneg(f[5]);
             sec.bytes_read = v3_detail::parse_nonneg(f[6]);
+            sec.expect = std::move(f[7]);
             if (!is_known_v3_facet(sec.facet)) {
                 refuse_sec(sec, V3Refusal::kUnknownFacet);
             } else if (has_nul) {
                 refuse_sec(sec, V3Refusal::kNulByte);
             } else if (!st) {
                 refuse_sec(sec, V3Refusal::kUnknownStatus);
+            } else if (*st == V3Status::kDelta && !v3_detail::is_hex64_lower(sec.expect)) {
+                refuse_sec(sec, V3Refusal::kBadRecord);
             } else {
                 for (const auto& prev : rep.sections) {
                     if (prev.facet == sec.facet) {
