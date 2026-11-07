@@ -220,8 +220,8 @@ cadences.
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
   or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
   none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
-  Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with no `release` file or no openable
-  `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a
+  Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with an openable `Contents` and no `release` file
+  under `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a
   Windows home known only by its registry key). The publisher is self-reported by the
   build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
   the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
