@@ -20,7 +20,7 @@ FROM ghcr.io/actions/actions-runner:latest@sha256:759a1d94a15b05941aba5196974ff4
 
 USER root
 
-ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
+ARG VCPKG_COMMIT=9eec002df1cd109f8f104cd966a763daf9751489
 
 # ── Build tools (mirrors Dockerfile.ci-linux) ─────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \

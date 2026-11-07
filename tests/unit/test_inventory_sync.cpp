@@ -10,6 +10,7 @@
 #include "middleware_runner.hpp" // yuzu::middleware::run_leg: the REAL runner feeds the middleware cases
 #include "msi_packages_inventory.hpp"
 #include "pkg_inventory_parsers.hpp"
+#include "runtimes_parsers.hpp"
 #include "runtimes_python_parsers.hpp"
 #include "sync_source_installed_software.hpp"
 #include "windows_optional_features_parsers.hpp"
@@ -46,6 +47,8 @@ using yuzu::agent::parse_msi_packages_list_inventory_output;
 using yuzu::agent::parse_pkg_inventory_managers_output;
 using yuzu::agent::parse_pkg_inventory_packages_output;
 using yuzu::agent::parse_pkg_inventory_store_packages_output;
+using yuzu::agent::parse_runtimes_dotnet_output;
+using yuzu::agent::parse_runtimes_jvm_output;
 using yuzu::agent::parse_runtimes_python_output;
 using yuzu::agent::parse_windows_optional_features_output;
 using yuzu::agent::parse_installed_apps_output;
@@ -1337,7 +1340,7 @@ const char* const kFakeIaActions[] = {"list_inventory", nullptr};
 const char* const kFakePkgActions[] = {"managers", "packages", "store_packages", nullptr};
 const char* const kFakeWofActions[] = {"list", nullptr};
 const char* const kFakeMsiActions[] = {"list_inventory", nullptr};
-const char* const kFakeRtActions[] = {"python", nullptr};
+const char* const kFakeRtActions[] = {"python", "dotnet", "jvm", nullptr};
 const char* const kFakeMiddlewareActions[] = {"ibm_mq", nullptr};
 
 #define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
@@ -1367,10 +1370,11 @@ void reset_fakes() {
         f.rc.clear();
         f.result_status.clear();
     }
-    // runtimes.python defaults to a clean empty read (the sample-shaped runs below pin digests that
-    // carry no python rows); the runtimes cases override it.
-    g_fake[4].out["python"] =
-        yuzu::shared::format_status_row("python", yuzu::shared::StatusLevel::supported, "") + "\n";
+    // runtimes.python, .dotnet and .jvm default to a clean empty read (the sample-shaped runs below
+    // pin digests that carry none of their rows); the runtimes cases override them.
+    for (const char* a : {"python", "dotnet", "jvm"})
+        g_fake[4].out[a] =
+            yuzu::shared::format_status_row(a, yuzu::shared::StatusLevel::supported, "") + "\n";
 }
 
 void fake_mac() {
@@ -2967,6 +2971,7 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         bool windows;       // which sample set the other actions come from
         const char* mapped; // a valid row the action maps; empty for managers (they keep it)
         bool withholds = false; // table policy drop_source: constrained withholds the rows, not the cycle
+        bool keeps = false;     // keep_rows_if_present_seen: a constrained answer WITH a mapped row keeps it
     };
     const Case cases[] = {
         {1, "pkg_inventory", "packages", false, "package|homebrew|wget|1.24|formula"},
@@ -2975,7 +2980,11 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         {1, "pkg_inventory", "managers", false, ""},
         {3, "msi_packages", "list_inventory", true,
          "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"},
-        {4, "runtimes", "python", false, "python|cpython|3.14.6|C:/P/|PythonCore", true}};
+        {4, "runtimes", "python", false, "python|cpython|3.14.6|C:/P/|PythonCore", true},
+        {4, "runtimes", "dotnet", false, "dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft", false,
+         true},
+        {4, "runtimes", "jvm", false, "jvm|jdk|21.0.12.1|C:/Program Files/Microsoft/jdk-21.0.12.101-hotspot/|Microsoft", false,
+         true}};
     for (const auto& c : cases) {
         INFO(c.plugin << "." << c.action);
         const std::string source = std::string(c.plugin) + "." + c.action;
@@ -3004,7 +3013,8 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         // `constrained` column is what is pinned, not just the zero-row fallback.
         // Managers is the one action that keeps such a cycle (cases below).
         if (c.mapped[0] != '\0') {
-            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) == constrained_outcome);
+            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) ==
+                  (c.keeps ? std::make_pair(true, std::string{}) : constrained_outcome));
         }
         // zero, two, short and mis-levelled status rows
         CHECK(skip_with("") == std::make_pair(false, source + ":bad status"));
@@ -3648,6 +3658,167 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
         CHECK(count_source(got->first, "runtimes.python") == 1);
         CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
     }
+}
+
+// --- runtimes dotnet / jvm adapters (SAM-32) ---
+
+TEST_CASE("runtimes dotnet and jvm: a constrained answer keeps its rows, and with none never deletes",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    const std::string tok = "windows:runtimes:jvm:release_unreadable";
+    // Constrained WITH a row: the row is kept (status ok, reason = the token).
+    CHECK(show(parse_runtimes_jvm_output(
+              nl({st("jvm", "constrained", tok), "jvm|jdk|17|/x|Acme"}), kKeepPolicy)) ==
+          res("ok", tok, {entry_of("Java JDK", "17", "Acme", "app", "jvm")}));
+    CHECK(show(parse_runtimes_dotnet_output(
+              nl({st("dotnet", "constrained", tok), "dotnet|runtime|8.0.1|/p|Microsoft"}),
+              kKeepPolicy)) ==
+          res("ok", tok, {entry_of(".NET Runtime", "8.0.1", "Microsoft", "app", "dotnet")}));
+    // Constrained with NO row: failed (the collector skips the cycle, so stored rows stay), never
+    // withheld (which would delete them) and never an ok-and-empty answer.
+    for (const char* a : {"jvm", "dotnet"}) {
+        const auto parse = std::string(a) == "jvm" ? parse_runtimes_jvm_output
+                                                   : parse_runtimes_dotnet_output;
+        for (const auto& out : {nl({st(a, "constrained", tok)}),
+                                nl({st(a, "constrained", tok), "garbage|row"})}) {
+            const auto r = parse(out, kKeepPolicy);
+            CHECK(r.status == Status::failed);
+            CHECK(r.entries.empty());
+            CHECK(r.reason == tok);
+        }
+    }
+}
+
+TEST_CASE("collector: a constrained dotnet/jvm answer keeps its rows; with none the cycle is skipped",
+          "[sync][collector][runtimes]") {
+    // The real leg types the answer CONSTRAINED + PARTIAL; the table row opts in to PARTIAL.
+    const auto constrain_leg = [](const char* action) {
+        g_fake[4].result_status[action] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                           YUZU_RESULT_COMPLETENESS_PARTIAL, "tok"};
+    };
+    struct Leg {
+        const char* a;
+        const char* row;
+        const char* src_name;
+    };
+    const Leg legs[] = {
+        {"dotnet", "dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft", "runtimes.dotnet"},
+        {"jvm", "jvm|jdk|21.0.12.1|C:/Program Files/Microsoft/jdk/|Microsoft", "runtimes.jvm"}};
+    for (const auto& leg : legs) {
+        const char* const a = leg.a;
+        const char* const row = leg.row;
+        const char* const src_name = leg.src_name;
+        INFO(a);
+        const auto count = [&](const std::string& blob) {
+            std::size_t n = 0;
+            for (const auto& rec : records_of(blob))
+                if (fields_of(rec).at(15) == src_name)
+                    ++n;
+            return n;
+        };
+        SECTION(std::string(a) + " constrained with a row: the row is in the blob") {
+            fake_mac();
+            g_fake[4].out[a] = nl({st(a, "constrained", "tok"), row});
+            constrain_leg(a);
+            const auto got = collect_with(all_plugins());
+            REQUIRE(got.has_value());
+            CHECK(count(got->first) == 1);
+        }
+        SECTION(std::string(a) + " constrained with no row: the cycle is skipped, not a delete") {
+            fake_mac();
+            g_fake[4].out[a] = nl({st(a, "constrained", "tok")});
+            constrain_leg(a);
+            auto src = make_installed_software_source(all_plugins());
+            CHECK_FALSE(src.collect().has_value());
+            CHECK(src.skip_reason() == std::string("runtimes.") + a + ":tok");
+        }
+    }
+}
+
+TEST_CASE("runtimes dotnet adapter: rows from all three OS legs map to .NET / app / dotnet",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    // Windows rows from the kingsley capture (registry runtime rows), a Windows .NET Framework and SDK
+    // row (flavours netfx / sdk; no SDK was installed on the host, so those two are synthetic), a
+    // Linux directory-walk row (flavour core, vendor `-`) and a macOS Microsoft-installer row.
+    const auto r = parse_runtimes_dotnet_output(
+        nl({"status|dotnet|supported|-",
+            "dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft",
+            "dotnet|runtime|9.0.22|C:/Program Files/dotnet/|Microsoft",
+            "dotnet|sdk|9.0.100|C:/Program Files/dotnet/|Microsoft",
+            "dotnet|netfx|4.8.1|-|Microsoft",
+            "dotnet|core|8.0.31|/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31|-",
+            "dotnet|sdk|8.0.404|/usr/local/share/dotnet/sdk/8.0.404|-",
+            "dotnet|unmodelled|7.0.1|/usr/share/dotnet/shared/Other.App/7.0.1|-",
+            "dotnet|runtime|-|-|-"}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    CHECK(show(r) ==
+          res("ok", "",
+              {entry_of(".NET Runtime", "8.0.33", "Microsoft", "app", "dotnet"),
+               entry_of(".NET Runtime", "9.0.22", "Microsoft", "app", "dotnet"),
+               entry_of(".NET SDK", "9.0.100", "Microsoft", "app", "dotnet"),
+               entry_of(".NET Framework", "4.8.1", "Microsoft", "app", "dotnet"),
+               entry_of(".NET Runtime", "8.0.31", "Microsoft", "app", "dotnet"),
+               entry_of(".NET SDK", "8.0.404", "Microsoft", "app", "dotnet"),
+               entry_of(".NET", "7.0.1", "Microsoft", "app", "dotnet"),
+               entry_of(".NET Runtime", "", "Microsoft", "app", "dotnet")}));
+}
+
+TEST_CASE("runtimes jvm adapter: rows from all three OS legs map to Java / app / jvm",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    // The Microsoft row is the kingsley capture (release IMPLEMENTOR). The Temurin Windows row is
+    // synthetic: its release file was not read in the capture, the vendor is the Uninstall publisher.
+    // The Linux row is the measured Temurin container home; the macOS row is a fixture-tree shape
+    // (no JDK is installed on the development Mac).
+    const auto r = parse_runtimes_jvm_output(
+        nl({"status|jvm|supported|-",
+            "jvm|jdk|21.0.12.1|C:/Program Files/Microsoft/jdk-21.0.12.101-hotspot/|Microsoft",
+            "jvm|jdk|21.0.13|C:/Program Files/Temurin/|Eclipse Adoptium",
+            "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
+            "jvm|jre|11.0.2|/Library/Java/JavaVirtualMachines/x.jdk|Oracle Corporation",
+            "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    CHECK(show(r) ==
+          res("ok", "",
+              {entry_of("Java JDK", "21.0.12.1", "Microsoft", "app", "jvm"),
+               entry_of("Java JDK", "21.0.13", "Eclipse Adoptium", "app", "jvm"),
+               entry_of("Java JDK", "17.0.20", "Eclipse Adoptium", "app", "jvm"),
+               entry_of("Java JRE", "11.0.2", "Oracle Corporation", "app", "jvm"),
+               entry_of("Java", "", "", "app", "jvm")}));
+}
+
+TEST_CASE("runtimes dotnet and jvm adapters: producer rows round-trip; bad shapes and statuses",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    // A vendor with a literal pipe is escaped by the producer; width stays five logical fields.
+    const auto row = yuzu::runtimes::format_runtime_row("jvm", "jdk", "17.0.1", "/opt/j", "A|B");
+    REQUIRE(row == "jvm|jdk|17.0.1|/opt/j|A\\|B");
+    const auto r = parse_runtimes_jvm_output(nl({"status|jvm|supported|-", row}), kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 1);
+    CHECK(r.entries[0].version == "17.0.1");
+    // malformed width and another action's tag are dropped, the status keeps the cycle ok
+    const auto d = parse_runtimes_dotnet_output(
+        nl({"status|dotnet|supported|-", "dotnet|runtime|8.0.1|/p", "jvm|jdk|17|/x|-",
+            "dotnet|runtime|8.0.1|/p|Microsoft|extra"}),
+        kFailPolicy);
+    REQUIRE(d.status == Status::ok);
+    CHECK(d.entries.empty());
+    // status grammar: a status row for the wrong action fails; constrained is withheld under
+    // drop_source (the adapter still honours it for any caller); unsupported is skipped.
+    CHECK(parse_runtimes_dotnet_output(nl({"status|jvm|supported|-"}), kFailPolicy).status ==
+          Status::failed);
+    CHECK(show(parse_runtimes_jvm_output(
+              nl({"status|jvm|constrained|windows:runtimes:jvm_reg:access_denied",
+                  "jvm|jdk|17|/x|Acme"}),
+              ConstrainedPolicy::drop_source)) ==
+          res("withheld", "windows:runtimes:jvm_reg:access_denied"));
+    const auto u = parse_runtimes_dotnet_output(nl({"status|dotnet|unsupported|macos:planned"}), kFailPolicy);
+    CHECK(u.status == Status::unsupported);
+    CHECK(u.entries.empty());
 }
 
 // ---------------------------------------------------------------------------

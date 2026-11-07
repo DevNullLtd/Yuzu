@@ -16,6 +16,7 @@
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "me_response.hpp" // shared get_me body builder (REST /api/v1/me + legacy /api/me twin)
+#include "rbac_enforcement_read.hpp" // shared builder behind get_rbac_enforcement (REST twin: GET /api/v1/rbac/enforcement, #6033)
 #include "mcp_policy.hpp"
 #include "hardware_routes.hpp"   // HardwareRoutes::*Fn: the static_asserts pinning ToolDeps
 #include "mcp_tool_registry.hpp" // ToolRecord/ToolCallContext: the registry seam (merged by catalogue())
@@ -4451,7 +4452,8 @@ static const ToolDef kTools[] = {
      "session view only and are NOT an authority summary: with RBAC on, authority is decided per "
      "permission, so call check_permission for a specific permission; for an engine principal "
      "read rbac_roles. rbac_enabled is the server's cached view of the RBAC switch, can lag, and "
-     "does not report the degraded state in which enforcement fails closed (tracked in #6033); "
+     "does not report the degraded state in which enforcement fails closed (call "
+     "get_rbac_enforcement for that bit and for the administrator verdict); "
      "rbac_roles_resolved reports only whether the role-store read succeeded (true also when no "
      "read was needed because RBAC reads as off), and false means "
      "rbac_role and rbac_roles are omitted, never guessed, so retry later. rbac_roles lists the "
@@ -4476,7 +4478,7 @@ static const ToolDef kTools[] = {
      R"j("auth_source":{"type":"string","description":"How the caller authenticated: local, oidc, saml, api_token, mcp_token or engine_token"},)j"
      R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; always present over MCP, which refuses a credential with no tier"},)j"
      R"j("scope_service":{"type":"string","description":"Service the token is scoped to; empty when unscoped. Always empty over MCP because a service-scoped token is refused"},)j"
-     R"j("rbac_enabled":{"type":"boolean","description":"The server's cached view of the RBAC switch; can lag and does not report the degraded fail-closed state (#6033)"},)j"
+     R"j("rbac_enabled":{"type":"boolean","description":"The server's cached view of the RBAC switch; can lag and does not report the degraded fail-closed state; call get_rbac_enforcement for the unconfirmed bit"},)j"
      R"j("rbac_role":{"type":"string","description":"Deprecated display field: the first DIRECT role by role_name order, or for a human with none a legacy Administrator/Viewer label that is not a grant. Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Not an authority summary: call check_permission"},)j"
      R"j("rbac_roles":{"type":"array","items":{"type":"string"},"description":"DIRECT role assignments for this principal only; roles granted through group membership are NOT included and this is not access-review evidence. Empty when RBAC is off. Omitted when rbac_roles_resolved is false"},)j"
      R"j("rbac_roles_resolved":{"type":"boolean","description":"Whether the role-store read succeeded; false means rbac_role and rbac_roles are omitted. Also true when no read was needed because RBAC reads as off (the cached view), so true is not proof that enforcement is off"},)j"
@@ -4486,6 +4488,54 @@ static const ToolDef kTools[] = {
      R"j("can_access_settings":{"type":"boolean","description":"Whether the admin-only settings pages admit this session; always false for an MCP tier or service-scoped token"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["username","display_name","role","principal_kind","auth_source","mcp_tier","scope_service","rbac_enabled","rbac_roles_resolved","effective_role","elevated","can_access_settings"],"additionalProperties":false})j"},
+    // Twin of REST GET /api/v1/rbac/enforcement and the HTML fragment GET
+    // /fragments/access/enforcement (#6033): the ONE shared builder
+    // read_rbac_enforcement (rbac_enforcement_read.hpp). Legacy (non-registry) tool because the
+    // handler needs AuthDB and RbacStore, which registry handlers cannot reach. Appended at the
+    // END of the array. Like get_me it takes the generic tier gate only and NO perm_fn: the
+    // REST route and the fragment are session-only as well. The security row is
+    // {"Infrastructure","Read"} with the default `denied` service-scope class, so a
+    // service-scoped token is refused at C8; do NOT add it to kServiceScopeGlobalSafe.
+    {"get_rbac_enforcement",
+     "Read the RBAC enforcement state and whether the calling credential could administer RBAC "
+     "right now. Call it before attempting set_rbac_enforcement, assign_rbac_role or "
+     "unassign_rbac_role to learn whether enforcement is on and whether this credential is "
+     "likely to be admitted; use get_me for who you are and check_permission for one "
+     "securable and operation. Returns enabled (this replica's cached view of the RBAC switch), "
+     "unconfirmed (true when that cached view could not be re-confirmed against the store; when "
+     "true, treat enforcement as ON whatever enabled says, because enabled:false with "
+     "unconfirmed:true is a stale off that is treated as on), administrator (may, may_not or "
+     "unconfirmed) and audit_persisted. administrator is an ADVISORY hint about the caller's "
+     "own durable authority: may means the RBAC administration routes (assign_rbac_role, "
+     "unassign_rbac_role, set_rbac_enforcement) would admit this credential's durable "
+     "authority now; may_not means they would refuse it, which includes an account whose "
+     "Administrator authority is not a durable grant on an active local account (for example "
+     "a SAML sign-in, a SCIM-deactivated account, a temporarily elevated session, or an "
+     "Administrator held only through a group); unconfirmed means a required store "
+     "could not answer, so retry shortly and never read it as may_not (a successful read "
+     "carries no retry_after_ms; the store-unavailable error does; poll no faster than 5000 "
+     "ms, because each call writes an audit row, two on MCP; treat any value you do not "
+     "recognise the same way). may is NOT a go signal: it excludes the MCP tier "
+     "and approval ladder (a readonly-tier administrator reads may and the tool's own tier check "
+     "still refuses the mutation), REST MFA step-up, and the enforcement change's "
+     "destination-regime refusal (409 on REST), so never mutate on may alone; a human "
+     "approver or an Administrator decides. The top-level unconfirmed boolean and the "
+     "administrator value unconfirmed answer different questions, and every combination is "
+     "a valid answer. Takes no arguments and cannot name another principal: the answer is about "
+     "the caller, and nothing about other principals is returned. Read-only, available at "
+     "every MCP tier, no RBAC permission required. A service-scoped token is refused. Every "
+     "successful read is audited twice, as rbac.enforcement.read and as "
+     "mcp.get_rbac_enforcement, on a deployment with a wired audit sink; audit_persisted is "
+     "false when either row is dropped, and the data is still returned. An internal error "
+     "means the RBAC store is not available: it is retryable after retry_after_ms and writes "
+     "no audit row. Mirrors REST GET /api/v1/rbac/enforcement.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("enabled":{"type":"boolean","description":"This replica's cached view of the RBAC switch, for display; true means enforcement is on"},)j"
+     R"j("unconfirmed":{"type":"boolean","description":"True when the cached enabled view could not be re-confirmed against the store. When true, treat enforcement as ON whatever enabled says. A different question from the administrator value unconfirmed"},)j"
+     R"j("administrator":{"type":"string","enum":["may","may_not","unconfirmed"],"description":"Advisory. may: the RBAC administration routes would admit this credential's durable authority now (excludes the MCP tier and approval ladder, REST MFA step-up and the enforcement change's destination-regime refusal). may_not: they would refuse it. unconfirmed: a required store could not answer; retry later and do not read it as may_not. Advisory only, never a go signal for a mutation. Treat an unrecognised value as unconfirmed"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"False when either audit row (rbac.enforcement.read or mcp.get_rbac_enforcement) failed to persist; the data is still returned. True when both persisted, or when no audit sink is wired"})j"
+     R"j(},"required":["enabled","unconfirmed","administrator","audit_persisted"],"additionalProperties":false})j"},
 };
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
@@ -4998,6 +5048,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // every tier). Default `denied` service-scope class on purpose: do NOT widen it, and it is
     // not in kServiceScopeGlobalSafe.
     {"get_me", {"Infrastructure", "Read"}},
+    // get_rbac_enforcement: twin of GET /api/v1/rbac/enforcement, which is session-only (no
+    // perm_fn), like get_me above. This row drives ONLY the generic tier gate (Read is allowed
+    // at every tier). Default `denied` service-scope class on purpose: do NOT widen it, and it
+    // is not in kServiceScopeGlobalSafe.
+    {"get_rbac_enforcement", {"Infrastructure", "Read"}},
     // B4 (#2146 API-parity) — matches the REST route's own perm_fn op exactly.
     {"unlock_account", {"UserManagement", "Write"}},
     // A2 discovery tools (mirrors of GET /api/v1/discover/*).
@@ -5536,6 +5591,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_api_tokens", {ToolEffect::ReadOnly, true, "List own API tokens"}},
     {"check_permission", {ToolEffect::ReadOnly, true, "Check own RBAC permission"}},
     {"get_me", {ToolEffect::ReadOnly, true, "Get my identity and roles"}},
+    {"get_rbac_enforcement",
+     {ToolEffect::ReadOnly, true, "Get RBAC enforcement state and my administrator hint"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
     {"get_execution_children", {ToolEffect::ReadOnly, true, "List execution children"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
@@ -29803,6 +29860,72 @@ McpServer::HandlerFn McpServer::build_handler(
                     me_body = me_response::dump_me_json(me_json);
                 }
                 res.set_content(success_response(id, tool_result(me_body, kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── get_rbac_enforcement (#6033) ───────────────────────────────
+            // Twin of GET /api/v1/rbac/enforcement and the HTML fragment: the SAME builder
+            // (rbac_enforcement_read.hpp), so the bodies cannot drift. Mirrors get_me's
+            // posture: the generic tier gate only, NO perm_fn (the REST route and the fragment
+            // are session-only), and it describes the CALLING session alone. The surface passed
+            // to the builder is kMcp: that surface applies no tier rule (MCP's own tier and
+            // approval ladder govern the mutations), so an MCP-tier administrator reads `may`
+            // here where the same principal's REST read is `may_not`.
+            //
+            // The input schema's additionalProperties:false is NOT enforced for a tool that is
+            // not approval-gated, so the handler refuses any supplied argument itself.
+            //
+            // A null or closed RBAC store is the builder's only error. It answers a retryable
+            // error with NO audit row (matches the PUT route and the fragment); the builder's
+            // fixed string is logged and never echoed to the caller.
+            // On success the body is serialised FIRST (a serialisation failure must not leave
+            // an audit row behind), then BOTH rows are attempted independently: the domain row
+            // rbac.enforcement.read and the generic mcp.get_rbac_enforcement row. Either one
+            // dropping reports audit_persisted:false; the data is still returned. The detail
+            // string is built from the builder result alone, never from the session.
+            if (tool_name == "get_rbac_enforcement") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!args.is_null() && !(args.is_object() && args.empty())) {
+                    res.set_content(a4_error(kInvalidParams, "get_rbac_enforcement takes no arguments"),
+                                    "application/json");
+                    return;
+                }
+                auto enforcement = read_rbac_enforcement(*session, auth_db, rbac_store,
+                                                         RbacAdminSurface::kMcp);
+                if (!enforcement) {
+                    spdlog::warn("get_rbac_enforcement: {}", enforcement.error());
+                    res.set_content(a4_error(kInternalError, "RBAC store not available",
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const std::string_view administrator =
+                    yuzu::server::to_string(enforcement->administrator);
+                nlohmann::json payload = {{"enabled", enforcement->enabled},
+                                          {"unconfirmed", enforcement->unconfirmed},
+                                          {"administrator", std::string(administrator)},
+                                          {"audit_persisted", true}};
+                std::string body = payload.dump();
+                const std::string audit_detail =
+                    "enabled=" + std::string(enforcement->enabled ? "true" : "false") +
+                    "; unconfirmed=" + std::string(enforcement->unconfirmed ? "true" : "false") +
+                    "; administrator=" + std::string(administrator);
+                const bool domain_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "rbac.enforcement.read", "success", "Setting", "rbac_enabled",
+                    audit_detail);
+                const bool generic_ok = mcp_audit("success");
+                if (!domain_ok || !generic_ok) {
+                    payload["audit_persisted"] = false;
+                    body = payload.dump();
+                }
+                res.set_content(success_response(id, tool_result(body, kObjectOutputSchema)),
                                 "application/json");
                 return;
             }

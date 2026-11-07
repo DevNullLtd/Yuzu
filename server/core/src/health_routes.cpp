@@ -1,4 +1,5 @@
 #include "health_routes.hpp"
+#include "model_param_helpers.hpp"
 
 #include "home_panels_render.hpp"
 #include "http_route_sink.hpp"
@@ -1218,19 +1219,27 @@ void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string we
             if (!req.params.empty()) {
                 location += "?";
                 bool first = true;
-                for (const auto& [k, v] : req.params) {
+                for (const auto& [k, v] : model_detail::to_params(req.params)) {
                     if (!first)
                         location += "&";
                     location += k + "=" + v;
                     first = false;
                 }
             }
-            // set_redirect (void in httplib 0.37.1) silently ignores a location carrying a
+            // set_redirect (void in httplib 0.37.1 and 0.59.0) silently ignores a location carrying a
             // CR/LF/control byte (a decoded %00 in the path) and leaves the status unset, which
             // would answer an empty 200.
             res.set_redirect(location, 301);
             if (res.status != 301)
                 res.status = 400;
+            // This listener answers before any body is read and never consumes one. From
+            // httplib 0.59 a response below 400 that leaves a declared request body unread must
+            // carry `Connection: close` (httplib.h v0.59.0:14797-14806); the response therefore
+            // closes the connection. The redirect answer closes unconditionally, with
+            // or without a declared body; the probe requests this handler leaves to the normal
+            // routes (Unhandled above) are not affected.
+            // Pinned by test_health_routes.cpp (the 301 head and EOF over a raw socket).
+            res.set_header("Connection", "close");
             return httplib::Server::HandlerResponse::Handled;
         });
 }
