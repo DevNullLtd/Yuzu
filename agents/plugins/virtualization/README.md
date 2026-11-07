@@ -74,7 +74,7 @@ The order matters: a positive identification is never outranked by a negative or
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`host` / Windows** — container not read: always unknown, windows:virtualization:container:not_read; ARM64 has no CPUID: a Windows-on-ARM device reads unknown (windows:virtualization:cpuid:unavailable) unless SMBIOS names a VM vendor, and a Hyper-V or VBS host is not detected on ARM64
+- **`host` / Windows** — container not read: always unknown, windows:virtualization:container:not_read; an ARM64 build has no CPUID and reads unknown (windows:virtualization:cpuid:unavailable) unless SMBIOS names a VM vendor, and does not detect a Hyper-V or VBS host; no ARM64 build ships, and the x64 agent on a Windows-on-ARM device reads whatever CPUID the emulation presents (not measured)
 - **`host` / macOS** — no CPUID on arm64: the sysctl is the readable negative; container is always no
 - **`host` / Linux** — ARM has no CPUID: SMBIOS and OS hints alone decide, and a host with neither reads unknown, never bare_metal; a KVM host reads bare_metal (its own CPUID is not virtualised) but a Xen dom0 reads guest/xen; a cgroup-v2 namespace-obscured root reads container unknown; a container without a marker file or systemd record can read container no when its readable, non-root cgroup path has no recognised runtime signature
 <!-- END GENERATED -->

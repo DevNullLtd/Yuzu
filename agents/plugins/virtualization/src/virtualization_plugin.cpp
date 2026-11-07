@@ -47,10 +47,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "CPUID leaves 1 and 0x40000000-0x40000003 (__cpuid, x86) and the SMBIOS System "
          "Information table via GetSystemFirmwareTable('RSMB')",
-         "container not read: always unknown, windows:virtualization:container:not_read; ARM64 "
-         "has no CPUID: a Windows-on-ARM device reads unknown "
-         "(windows:virtualization:cpuid:unavailable) unless SMBIOS names a VM vendor, and a "
-         "Hyper-V or VBS host is not detected on ARM64"},
+         "container not read: always unknown, windows:virtualization:container:not_read; an "
+         "ARM64 build has no CPUID and reads unknown (windows:virtualization:cpuid:unavailable) "
+         "unless SMBIOS names a VM vendor, and does not detect a Hyper-V or VBS host; no ARM64 "
+         "build ships, and the x64 agent on a Windows-on-ARM device reads whatever CPUID the "
+         "emulation presents (not measured)"},
     },
 };
 
