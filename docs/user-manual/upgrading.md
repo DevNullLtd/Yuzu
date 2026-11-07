@@ -47,6 +47,14 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rollback.** No migration and no schema change, and this change writes no new durable state. A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this page, and it does not reverse the Echo changes described in the "Echo stores roll-ups only" and "Echo holds `echo.db` to a byte budget" sections below.
 
+## Behaviour change: the device inventory store refuses to start on a schema it cannot read (`device_inventory_store`)
+
+**Scope of this note.** The device-CI v2 record (migrations v2 and v3 of `device_inventory_store`) has not shipped in a release. A deployment that starts from a fresh database is not affected, and this note matters only to a development or UAT database that ran an earlier build of it.
+
+**What changed.** After its migrations the store now reads every table and column it uses (a zero-row `SELECT` per table). If the database lacks one, the store does not open and the server logs `DeviceInventoryStore: post-migration schema projection check failed on <table>`. Before this change the store opened and every device record read with sections answered 503 (REST) or a retryable error (MCP) until the schema was repaired. Migration v2 is also now fixed text, not generated from the section list.
+
+**What to do.** Back up the database, stop the server, then either drop the store's schema (`DROP SCHEMA device_inventory_store CASCADE;` and `DELETE FROM public.schema_meta WHERE store = 'device_inventory_store';`, which deletes the stored device records until each device's next full sync) or, for a database that ran only the earlier row-count-only v3, `UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store';`. Then start the server. A column added to the database by an operator does not trigger the refusal.
+
 ## Behaviour change: the Guardian compliance census orders by an event key and says when it cannot (`guaranteed_state_store` schema v4)
 
 **Scope of this note.** A supported deployment starts from a fresh database (see "Fresh deployment only" and "Deployment contract (hard cutover)" in this document), where the v4 migration runs over empty tables and none of the headroom below applies. The procedure below is for a database already at schema v3, such as a development or test deployment; it is not an upgrade path from an earlier build.
