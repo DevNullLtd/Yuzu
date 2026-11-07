@@ -125,6 +125,14 @@ Both refusals write `result=denied` under the existing `access_review.attested` 
 - **PostgreSQL 16 or newer is required** (the documented minimum): the attestation write uses `pg_input_is_valid`. On an older server the first attestation answers `503` and the server log shows SQLSTATE `42883`.
 - **Rolling back** restores the old overwrite behaviour. Nothing is stored differently, so decisions recorded under the new rules stay valid and nothing needs converting.
 
+## Behaviour change: Windows software counts include Store apps, Chocolatey packages and winget presence
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a fleet forward.
+
+- **What changed:** the Windows agent now reports the `pkg_inventory` Windows legs in its daily installed-software sync. Each Windows endpoint adds `appx` rows (every Store and inbox app registered for all users, roughly 100-300 rows per host, inbox apps included), `chocolatey` rows (one per Chocolatey package, plus a presence row) and a `winget` presence row.
+- **Affected:** per-device software counts and the `/software` catalogue for Windows devices rise, and a saved filter on `ecosystem` or "Found by" now also matches the new rows. A client that validates `ecosystem` against a fixed list (the MCP `get_crypto_libraries` tool refuses an unknown value) must add `chocolatey`, `winget` and `appx`.
+- **Not affected:** per-user Store packages and anything winget itself installed are not collected. Servers need no setting; the server learns the three ecosystems from its own build, so bring up every server replica before the agents of the same build enroll.
+
 ## Behaviour change: installed-software schema v10 (the server accepts the sectioned report)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.
