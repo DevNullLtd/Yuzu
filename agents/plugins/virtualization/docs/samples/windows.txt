@@ -1,0 +1,7 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-07 · interactive user (elevated) · leg-hash d3f729438b24
+== action=host
+status|host|supported|-
+host|no|host_with_hypervisor|hyperv|EliteMini Series|cpuid|high
+container|unknown|windows:virtualization:container:not_read
+[result_status] OK / FULL / 
+

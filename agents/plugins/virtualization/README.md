@@ -83,9 +83,9 @@ The order matters: a positive identification is never outranked by a negative or
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent daemon (LocalSystem today, `docs/agent-privilege-model.md`) | None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable` | Not measured yet: the Windows capture is taken on a bare-metal host with Hyper-V enabled and replaces this cell | `CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine |
+| Windows | agent daemon (LocalSystem today, `docs/agent-privilege-model.md`) | None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable` | Measured 2026-11-07 on a Windows 11 host with Hyper-V, VBS and WSL2 enabled, from an elevated interactive session (not LocalSystem): CPUID and the firmware table both answered; whether an unelevated caller gets the table was not measured | `CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine |
 | macOS | agent daemon (root under the shipped LaunchDaemon today, `docs/agent-privilege-model.md`) | None: both sysctls answer an unprivileged caller | The sample was captured as an unprivileged user, not under the LaunchDaemon account | `CONSTRAINED` / partial with `macos:virtualization:hv_vmm_present:unreadable` or `macos:virtualization:hw_model:unreadable`; the kind is `unknown` |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None: the DMI attributes and `/run/systemd/container` read are world-readable; the root-only `product_serial` and `product_uuid` are never read | Not measured yet: the Linux capture is taken inside a WSL2 distribution (a Hyper-V guest) and replaces this cell | `CONSTRAINED` / partial; a refused host-decision source (SMBIOS, CPUID, OS hint) reports `linux:virtualization:<source>:<cause>` and the kind `unknown` (or the kind another source already established), never `bare_metal`; a refused container read reports `linux:virtualization:container:<cause>`, constrains the status and does not block `bare_metal` |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None: the DMI attributes and `/run/systemd/container` read are world-readable; the root-only `product_serial` and `product_uuid` are never read | Measured 2026-11-07 inside a WSL2 distribution as root (not the packaged `yuzu-agent` account): `/run/systemd/container` is mode 0644 root:root under a 0755 `/run/systemd`; that kernel exposes no `/sys/class/dmi/id` or `/sys/hypervisor`, so the DMI modes were not measured and the host answer came from CPUID alone | `CONSTRAINED` / partial; a refused host-decision source (SMBIOS, CPUID, OS hint) reports `linux:virtualization:<source>:<cause>` and the kind `unknown` (or the kind another source already established), never `bare_metal`; a refused container read reports `linux:virtualization:container:<cause>`, constrains the status and does not block `bare_metal` |
 
 No subprocess, no shell and no network use: every leg is an in-process read (CPUID, sysctl, bounded file reads, `access(2)`, the Windows firmware table). The Linux file reads are size-bounded but have no deadline of their own, like every `posix_secure_read` consumer (#4875): a hung procfs or sysfs read would hold one agent pool worker until it returns.
 
@@ -142,6 +142,16 @@ A refusal is reported as `CONSTRAINED` with a `permission_denied` token, not as 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-07 · interactive user (elevated) · leg-hash d3f729438b24
+
+```
+== action=host
+status|host|supported|-
+host|no|host_with_hypervisor|hyperv|EliteMini Series|cpuid|high
+container|unknown|windows:virtualization:container:not_read
+[result_status] OK / FULL
+```
+
 **macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-06 · euid 501 · leg-hash d3f729438b24
 
 ```
@@ -149,6 +159,16 @@ A refusal is reported as `CONSTRAINED` with a `permission_denied` token, not as 
 status|host|supported|-
 host|no|bare_metal|Apple Inc.|Mac16,10|sysctl|high
 container|no|macos:no_container_runtime
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-06 · euid 0 · leg-hash d3f729438b24
+
+```
+== action=host
+status|host|supported|-
+host|yes|guest|hyperv|-|cpuid|high
+container|no|linux:no_container_marker
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->

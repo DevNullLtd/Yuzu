@@ -177,7 +177,7 @@
     {
       "grant": "None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable`",
       "if_refused": "`CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine",
-      "measured": "Not measured yet: the Windows capture is taken on a bare-metal host with Hyper-V enabled and replaces this cell",
+      "measured": "Measured 2026-11-07 on a Windows 11 host with Hyper-V, VBS and WSL2 enabled, from an elevated interactive session (not LocalSystem): CPUID and the firmware table both answered; whether an unelevated caller gets the table was not measured",
       "os": "Windows",
       "runs_as": "agent daemon (LocalSystem today, `docs/agent-privilege-model.md`)"
     },
@@ -191,7 +191,7 @@
     {
       "grant": "None: the DMI attributes and `/run/systemd/container` read are world-readable; the root-only `product_serial` and `product_uuid` are never read",
       "if_refused": "`CONSTRAINED` / partial; a refused host-decision source (SMBIOS, CPUID, OS hint) reports `linux:virtualization:<source>:<cause>` and the kind `unknown` (or the kind another source already established), never `bare_metal`; a refused container read reports `linux:virtualization:container:<cause>`, constrains the status and does not block `bare_metal`",
-      "measured": "Not measured yet: the Linux capture is taken inside a WSL2 distribution (a Hyper-V guest) and replaces this cell",
+      "measured": "Measured 2026-11-07 inside a WSL2 distribution as root (not the packaged `yuzu-agent` account): `/run/systemd/container` is mode 0644 root:root under a 0755 `/run/systemd`; that kernel exposes no `/sys/class/dmi/id` or `/sys/hypervisor`, so the DMI modes were not measured and the host answer came from CPUID alone",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
     }
@@ -248,6 +248,36 @@
     }
   ],
   "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "host",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|host|supported|-",
+            "host|yes|guest|hyperv|-|cpuid|high",
+            "container|no|linux:no_container_marker"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-11-06",
+        "host_class": "vm",
+        "leg_hash": "d3f729438b24",
+        "os": "linux",
+        "os_version": "Ubuntu 26.04.1 LTS x86_64",
+        "privilege": "euid 0"
+      }
+    },
     "macos": {
       "actions": [
         {
@@ -276,6 +306,36 @@
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "host",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|host|supported|-",
+            "host|no|host_with_hypervisor|hyperv|EliteMini Series|cpuid|high",
+            "container|unknown|windows:virtualization:container:not_read"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-11-07",
+        "host_class": "bare-metal",
+        "leg_hash": "d3f729438b24",
+        "os": "windows",
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "interactive user (elevated)"
       }
     }
   },
