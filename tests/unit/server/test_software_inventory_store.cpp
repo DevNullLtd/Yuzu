@@ -5944,6 +5944,7 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
         std::map<std::string, SoftwareChange> out;
         for (const auto& c : ch)
             out.emplace(c.name, c);
+        REQUIRE(out.size() == ch.size()); // a repeated name would otherwise be dropped silently
         return out;
     };
 
@@ -5955,19 +5956,37 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
             {row("Contoso.Calc", "1.0", "appx", "x64"), row("Contoso.Calc", "3.0", "appx", "x86")},
             {row("Contoso.Calc", "4.0", "appx", "x64"), row("Contoso.Calc", "3.5", "appx", "x86")});
         REQUIRE(ch.size() == 2);
-        std::map<std::string, std::string> from_by_to;
+        std::map<std::string, SoftwareChange> by_to;
         for (const auto& c : ch) {
             CHECK(c.kind == Kind::kUpgrade);
             CHECK(c.name == "Contoso.Calc");
-            from_by_to[c.to_version] = c.from_version;
+            by_to.emplace(c.to_version, c);
         }
-        CHECK(from_by_to == (std::map<std::string, std::string>{{"4.0", "1.0"}, {"3.5", "3.0"}}));
+        REQUIRE(by_to.size() == 2);
+        CHECK(by_to.at("4.0").from_version == "1.0");
+        CHECK(by_to.at("4.0").instance_key ==
+              row("Contoso.Calc", "4.0", "appx", "x64").instance_key);
+        CHECK(by_to.at("3.5").from_version == "3.0");
+        CHECK(by_to.at("3.5").instance_key ==
+              row("Contoso.Calc", "3.5", "appx", "x86").instance_key);
+    }
+    SECTION("the same Appx version in two architectures is two rows: dropping one is a remove") {
+        // The two rows differ only in the architecture. If the architecture were left out of
+        // the instance key they would be one row and dropping the x86 one would be no event.
+        const auto ch = SoftwareInventoryStore::diff_changes(
+            {row("Contoso.Calc", "1.0", "appx", "x64"), row("Contoso.Calc", "1.0", "appx", "x86")},
+            {row("Contoso.Calc", "1.0", "appx", "x64")});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].kind == Kind::kRemove);
+        CHECK(ch[0].from_version == "1.0");
+        CHECK(ch[0].instance_key == row("Contoso.Calc", "1.0", "appx", "x86").instance_key);
     }
     SECTION("an unreadable Chocolatey version is a version like any other") {
         // The collector writes version '' for a package whose nuspec it cannot read (a junction
-        // lib directory does that to every package at once). The pairing rule does not treat ''
-        // as unknown: the flip is one upgrade per package with an empty side, in both
-        // directions, and a package that appears beside it is an install.
+        // lib directory does that to every package at once). The pairing rule as it stands does
+        // not treat '' as unknown: the flip is one upgrade per package with an empty side, in
+        // both directions, and a package that appears beside it is an install. This pins that
+        // rule; whether '' should mean unknown is a design question this test does not settle.
         const auto lost = by_name(SoftwareInventoryStore::diff_changes(
             {row("git", "2.45", "chocolatey"), row("nodejs", "20.1", "chocolatey")},
             {row("git", "", "chocolatey"), row("nodejs", "", "chocolatey"),
