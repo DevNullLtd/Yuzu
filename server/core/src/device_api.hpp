@@ -117,8 +117,10 @@ public:
     /// fleet-wide, no tags. Never fails (a registry read has no degraded
     /// state) — an empty fleet is a valid, honest empty vector.
     ///
-    /// COST: each row's `guardian_backend` costs one health-store lookup, taken under that
-    /// store's single mutex (the heartbeat upsert path) for one pass over the fleet. Six
+    /// COST: each row's `guardian_backend` costs one health-store lookup. They are taken under
+    /// that store's mutex (the heartbeat upsert path) in slices of kGuardianBackendSlice ids with
+    /// a short pause between slices, so the list is not one snapshot and an upsert waits for one
+    /// slice, not the whole fleet (agent_registry.hpp has the measurements). Six
     /// production callers use this method and four discard the field (the dashboard device
     /// fragment, the crypto hostname map, and two `.size()`-only counts); they pay the lookup
     /// anyway. That cost was accepted deliberately (#2240) in preference to a second seam method.

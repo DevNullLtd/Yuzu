@@ -1480,17 +1480,32 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog();
 /// drift this constant removes.
 inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
 
-/// Bulk guardian_backend_for takes mu_ in slices of this many ids and sleeps kGuardianBackendPause
-/// between slices, so heartbeat ingest (upsert) waits for one slice and never the whole list.
-/// MEASURED at 500k ids (real store, -O2): one unsliced call held mu_ about 150-200 ms and
-/// stalled a concurrent upsert by about the same; 4096-id slices alone did NOT help (std::mutex is
-/// unfair, the reader re-takes it before the woken writer runs; yield() did not help either);
-/// 4096 ids plus a 50 us sleep took the worst upsert stall to 2-4 ms for about 10 ms more per
-/// call. The pause is therefore load-bearing: do not remove it as "dead sleep". Slices are not a
-/// point-in-time snapshot, which list_devices never was (the registry lock is released before
-/// the health lock is taken).
+/// Bulk guardian_backend_for takes mu_ in slices of kGuardianBackendSlice ids and pauses
+/// kGuardianBackendPause between slices with the lock RELEASED, so a heartbeat upsert waits for one
+/// slice and not the whole list. That bounds the stall caused by THIS accessor only: the 15 s
+/// recompute_metrics sweep, perf_snapshot and net_snapshot still hold mu_ for a whole pass
+/// (recompute_metrics about 1.2 s at 500k).
+/// MEASURED on a prototype copy of this logic (not the committed code): 500k ids, 30 tags per
+/// agent, the two production files built -O2 on Linux, idle 32-core box, ONE closed-loop writer.
+/// Unsliced, one call held mu_ about 150-200 ms and stalled an upsert by about as long. Slices
+/// alone did NOT help (std::mutex is unfair: the releasing thread re-takes it before the woken
+/// writer runs) and neither did yield(). Slices plus a 50 us sleep took the worst upsert stall to
+/// 2-4 ms for about 15-20 ms more per call. A separate model with 16-64 open-loop writers at the
+/// heartbeat rate gave a worst stall of 9-20 ms. The pause is therefore load-bearing: do not
+/// remove it as a dead sleep.
+/// PLATFORM: POSIX sleeps. MSVC rounds sleep_for up to a scheduler tick (1-15.6 ms) and nothing in
+/// the server raises the timer resolution, which would add up to about 1.9 s per call at 500k, so
+/// _WIN32 busy-waits on steady_clock instead (about 6 ms of CPU per 500k call). The _WIN32 path has
+/// NOT been measured: no Windows run of this change exists.
+/// Slices are not a point-in-time snapshot, which list_devices never was (the registry lock is
+/// released before the health lock is taken).
 inline constexpr std::size_t kGuardianBackendSlice = 4096;
 inline constexpr std::chrono::microseconds kGuardianBackendPause{50};
+static_assert(kGuardianBackendSlice > 0, "a zero slice would never advance the bulk loop");
+static_assert(kGuardianBackendPause >= std::chrono::microseconds{1} &&
+                  kGuardianBackendPause <= std::chrono::milliseconds{1},
+              "the pause must be real (it is what lets ingest in) and must stay small (it is paid "
+              "once per slice on the request thread)");
 
 struct AgentHealthSnapshot {
     std::string agent_id;
@@ -1563,9 +1578,10 @@ public:
     /// no string copies, taking mu_ per kGuardianBackendSlice ids with a kGuardianBackendPause
     /// sleep between slices (list_devices has six callers, four of which discard the field; see
     /// device_api.hpp). Because mu_ is released between slices an entry can be refreshed or pruned
-    /// mid-call: each id is read consistently, the list is not one snapshot. `guardian_backend_of` is the O(1) point lookup for
-    /// lookup_device (#3564: no scan, so a miss costs the same as a hit). Neither may be called
-    /// from a hot path; both are for Infrastructure:Read device reads.
+    /// mid-call: each id is read consistently, the list is not one snapshot.
+    /// `guardian_backend_of` is the O(1) point lookup for lookup_device (#3564: no scan, so a miss
+    /// costs the same as a hit). Neither may be called from a hot path; both are for
+    /// Infrastructure:Read device reads.
     [[nodiscard]] std::vector<std::optional<std::string_view>>
     guardian_backend_for(std::span<const std::string> agent_ids,
                          std::chrono::seconds staleness) const;

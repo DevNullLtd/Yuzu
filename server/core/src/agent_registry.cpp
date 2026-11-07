@@ -1,13 +1,13 @@
 #include "agent_registry.hpp"
 
 #include <algorithm>
-#include <thread>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <map>
 #include <string_view>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2432,6 +2432,25 @@ guardian_backend_from_snapshot(const AgentHealthSnapshot& snap,
 }
 } // namespace
 
+namespace {
+/// A busy-wait on steady_clock. Used only where sleep_for cannot honour a microsecond request
+/// (see kGuardianBackendPause). Compiled on every platform so the POSIX build still checks it.
+[[maybe_unused]] void spin_for(std::chrono::microseconds d) {
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+}
+
+/// The pause between slices of guardian_backend_for. Called with mu_ RELEASED.
+void pause_between_slices() {
+#ifdef _WIN32
+    spin_for(kGuardianBackendPause); // MSVC sleep_for rounds up to a 1-15.6 ms tick
+#else
+    std::this_thread::sleep_for(kGuardianBackendPause);
+#endif
+}
+} // namespace
+
 std::vector<std::optional<std::string_view>>
 AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
                                        std::chrono::seconds staleness) const {
@@ -2440,7 +2459,7 @@ AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
     const auto now = std::chrono::steady_clock::now();
     for (std::size_t base = 0; base < agent_ids.size(); base += kGuardianBackendSlice) {
         if (base != 0)
-            std::this_thread::sleep_for(kGuardianBackendPause); // lock NOT held; see the constant
+            pause_between_slices(); // lock NOT held; see the constant
         const auto end = std::min(agent_ids.size(), base + kGuardianBackendSlice);
         std::lock_guard lock(mu_);
         for (std::size_t i = base; i < end; ++i) {

@@ -306,7 +306,8 @@ TEST_CASE("AgentHealthStore guardian_backend_for: results stay aligned across lo
     CHECK_FALSE(small[1].has_value());
 }
 
-TEST_CASE("AgentHealthStore guardian_backend_for: concurrent upserts never tear a result",
+TEST_CASE("AgentHealthStore guardian_backend_for: entries no writer touches stay exact under "
+          "concurrent upserts and removes",
           "[device_api][guardian_backend]") {
     using yuzu::server::detail::kGuardianBackendSlice;
     using yuzu::server::detail::kGuardianBackendTokens;
@@ -318,33 +319,66 @@ TEST_CASE("AgentHealthStore guardian_backend_for: concurrent upserts never tear 
         ids.push_back("cc-" + std::to_string(i));
         beat(health, ids.back(), std::string{kGuardianBackendTokens[0]});
     }
-    // The writer flips tokens (and adds garbage) while the reader runs bulk calls whose lock is
-    // released between slices. Every entry must be nullopt or one of the four table tokens, the
-    // list must stay aligned, and a sanitizer build must see no race on the snapshot map.
+
+    // The writer touches ONLY even indices (upserts, garbage values, and remove-then-re-add), so
+    // every odd index must read back as exactly kGuardianBackendTokens[0] on every round: that
+    // is a content assertion that does not depend on timing, and it fails if a slice shifts the
+    // alignment while the map is mutating. An even index may be nullopt (removed), a rejected
+    // value (nullopt) or any table token.
+    //
+    // HONEST LIMIT: in a plain build this cannot show that the lock is doing anything; the data
+    // race it exists to expose is visible only to a ThreadSanitizer build.
     std::atomic<bool> stop{false};
+    std::atomic<std::size_t> upserts{0};
     std::thread writer([&] {
         std::size_t k = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            const auto& id = ids[(k * 7919) % n];
-            beat(health, id, (k % 3 == 0) ? std::string{"garbage"}
-                                           : std::string{kGuardianBackendTokens[k % 4]});
+            const auto& id = ids[2 * ((k * 7919) % (n / 2))];
+            if (k % 5 == 0)
+                health.remove(id);
+            else
+                beat(health, id,
+                     (k % 3 == 0) ? std::string{"garbage"}
+                                  : std::string{kGuardianBackendTokens[k % 4]});
+            upserts.fetch_add(1, std::memory_order_relaxed);
             ++k;
         }
     });
-    for (int round = 0; round < 12; ++round) {
+    // A REQUIRE below throws; the guard sets `stop` and joins so a failure is reported by Catch2
+    // and never reaches std::terminate through a joinable std::thread destructor.
+    struct JoinGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~JoinGuard() {
+            stop.store(true, std::memory_order_relaxed);
+            if (t.joinable())
+                t.join();
+        }
+    } guard{stop, writer};
+
+    // Best-effort overlap: wait (bounded, never asserted, so a starved CI runner cannot flake)
+    // for the writer to have done something before the first round.
+    for (int spin = 0; spin < 100000 && upserts.load(std::memory_order_relaxed) == 0; ++spin)
+        std::this_thread::yield();
+    const std::size_t started_at = upserts.load(std::memory_order_relaxed);
+
+    for (int round = 0; round < 200; ++round) {
+        if (round >= 12 && upserts.load(std::memory_order_relaxed) - started_at >= 1000)
+            break; // enough real overlap observed
         const auto out = health.guardian_backend_for(ids, std::chrono::seconds{300});
         REQUIRE(out.size() == n);
-        for (const auto& v : out) {
-            if (!v)
-                continue;
-            const bool known = std::any_of(
-                std::begin(kGuardianBackendTokens), std::end(kGuardianBackendTokens),
-                [&](const char* t) { return *v == std::string_view{t}; });
-            REQUIRE(known);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i % 2 == 1) {
+                REQUIRE(out[i].has_value());
+                REQUIRE(*out[i] == kGuardianBackendTokens[0]);
+            } else if (out[i]) {
+                const bool known = std::any_of(
+                    std::begin(kGuardianBackendTokens), std::end(kGuardianBackendTokens),
+                    [&](const char* t) { return *out[i] == std::string_view{t}; });
+                REQUIRE(known);
+            }
         }
     }
-    stop.store(true, std::memory_order_relaxed);
-    writer.join();
 }
 
 TEST_CASE("AgentHealthStore guardian_backend accessors: staleness uses the sweep's clock and parse",
