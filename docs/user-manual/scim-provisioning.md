@@ -25,9 +25,9 @@ using a bearer token you configure. From then on:
   `POST /scim/v2/Users` → a Yuzu account is created automatically, ready to
   sign in via SSO.
 - **Employee terminated / unassigned from the app in the IdP** → the IdP
-  calls `PATCH`, `PUT` (or `DELETE`) → the Yuzu account is disabled
-  immediately, and any active session for that user is revoked. No admin
-  has to remember to go disable the account by hand.
+  calls `PATCH`, `PUT` (or `DELETE`) → the Yuzu account is disabled, and
+  the user's sessions and API tokens are revoked once the call returns a
+  success. No admin has to remember to go disable the account by hand.
 - **Employee later re-assigned / re-hired** → the IdP re-activates the same
   SCIM resource → the Yuzu account is restored (any stale account lockout
   is cleared). The user re-enrolls MFA on their next login — a reactivation
@@ -341,9 +341,10 @@ When your IdP deactivates or removes a user's app assignment, it sends a
 `PATCH` or `PUT` (setting `active: false`) or a `DELETE`. Any of the three
 has the same effect:
 
-- The Yuzu account is disabled immediately.
+- The Yuzu account is disabled when the call returns a success (`2xx`).
 - Any session the user currently holds is revoked — they are logged out,
-  not just blocked from a future login.
+  not just blocked from a future login. Other server replicas see the revoke
+  within about a second (up to 30 seconds during a PostgreSQL brownout).
 - The action is recorded in the audit log (`scim.user.deactivated` /
   `scim.user.deleted`), giving you a timestamped record for termination
   evidence (CC6.8).
@@ -378,12 +379,45 @@ has the same effect:
 
 Deprovision is **credentials-first**: tokens and sessions are revoked for
 the slug and every linked identity *before* the account is marked inactive
-or deleted, and if any token revoke does not durably persist, the whole
-deprovision call fails with a **`500`** rather than reporting success — this
-is new behavior your IdP connector's retry/alerting should account for: a
-`500` on a deactivate/delete call means the underlying store had a transient
-problem persisting the revoke, and the IdP should retry the call rather
-than treat it as a permanent rejection.
+or deleted, and if any token revoke **or any session delete** does not durably persist,
+the whole deprovision call fails with a **`500`** rather than reporting
+success — this is behavior your IdP connector's retry/alerting should account
+for: a `500` on a `PATCH`/`PUT` `active:false` or a `DELETE` means the
+underlying store had a transient problem persisting the revoke, and the IdP
+should retry the call rather than treat it as a permanent rejection. The
+account stays active and the SCIM resource and identity links are untouched by
+that `500`, but credentials whose revoke did persist stay revoked (a sessions-only
+failure leaves the API tokens already revoked, and in a call that covers
+several linked identities the other identities' sessions stay deleted), so the
+retry completes the deprovision. The body names the failed step:
+`failed to revoke API tokens for one or more linked identities`,
+`failed to revoke sessions for one or more linked identities` or
+`failed to revoke API tokens and sessions for one or more linked identities`.
+The audit row (`scim.user.deactivated` / `scim.user.deleted`) is `partial`
+with `api_tokens_db_error=true` and/or `sessions_db_error=true`. This does
+**not** apply to `POST /Users` with `active:false` (a user staged as
+deactivated): its token step still fails closed with `500`, but the account
+was already created, so the IdP's retry meets `409`; reconcile with a
+`GET` and a `PATCH` `active:false`. When the principal set is only the local username, its session step
+is covered by the account removal that follows, and a failed delete there is
+noted in the audit detail as `sessions_db_error=true session_leg_backstopped=true`
+(on the `scim.user.provisioned` `success` row, or on its `failure` row
+`account deactivated; durable session wipe failed`, but not on the row for a refused API-token revoke);
+if the set has any additional linked `oidc:` or `saml:` principal, the session
+step is gated like the other calls. While the session store is degraded a
+deprovision cannot complete; there is no override. Wait for PostgreSQL to
+recover (the `YuzuSessionStoreDegraded` alert needs the session-store degrade
+counter to rise for a full 10 minutes, so a short outage may never fire it;
+search the audit log for `partial` rows), then retry.
+
+This case answers `500`, not `503` with `Retry-After` (tracked separately), so
+configure the connector to retry a `500`. Some identity providers pause or
+quarantine the provisioning app after repeated 5xx responses (Microsoft Entra
+does); after the store recovers, confirm the provisioning job is running and
+re-trigger a sync. If the post-deactivation session wipe itself fails, a
+surviving durable session is not checked against account state by session
+validation and can keep validating until it expires; end it with
+`DELETE /api/v1/sessions?username=<name>`.
 
 **SCIM will not deactivate an account that is currently `role=admin`,**
 whether that admin role came from a dashboard promotion or from
@@ -781,6 +815,8 @@ and now also carry `Retry-After: 2`.
 | Store fault in `GET /Users/{id}`, `GET /Groups/{id}` or a `userName eq` / `displayName eq` filter query | `503` | `2` | none | `yuzu_scim_guard_store_unavailable_total{guard="resource"}` and `YuzuScimGuardStoreUnavailable` | Retry. Nothing was changed. |
 | Store fault in the provenance or role guard of a deactivate, delete, reactivate, update or revive (#6836) | `503` | `2` | `failure` on the request's own action, detail `store_unavailable: provenance check`, `role check` or `revive role check` | `yuzu_scim_guard_store_unavailable_total{guard="provenance"\|"role"}` and `YuzuScimGuardStoreUnavailable` | Retry. A `PUT` or `PATCH` may already have applied its `active` change; the retry completes. A revive whose undo also fails is `500` (`scim.user.compensation_failed`): an operator checks the account. |
 | Group membership read fault | `503` ("membership unavailable") | `2` | `failure` on a Group `POST`, `PUT`, `PATCH` or `DELETE`; none on a `GET` | none | Retry. **`POST /Groups`:** the members are resolved before the group row is created, so on this `503` nothing is created, no rollback runs, and the retry creates the group normally (`201`, never a `409` against an empty group). The failure audit row `scim.group.created` has an empty target id and the detail `member resolution unavailable; no group was created`. A failure of the membership write after the group was created is a different case: the `500` `failed to persist group membership` leaves the empty group in place (limit 4 under "Known limits of the Group role recompute"). |
+| API-token revoke or durable session delete did not persist during a `PATCH`/`PUT` `active:false` or a `DELETE` of an active user (#4772) | `500` (`failed to revoke <API tokens \| sessions \| API tokens and sessions> for one or more linked identities`) | none | `scim.user.deactivated` or `scim.user.deleted`, `partial`, detail `api_tokens_db_error=true` and/or `sessions_db_error=true` | `YuzuSessionStoreDegraded` (`increase(yuzu_auth_session_store_degrade_total[10m]) > 0` held for 10 minutes, any `op`; it can miss a short outage) | Retry; the account stays active and the SCIM resource and links are untouched, but credentials that did revoke stay revoked. Configure the connector to retry a `500`. |
+| Same, on `POST /Users` with `active:false` (#4772) | `500` for a token step that did not persist, with audit `scim.user.provisioned` `partial`; when the principal set is only the local username, a session delete that did not persist is not a failure unless the account removal's own session wipe also fails (the backstop marker `session_leg_backstopped=true` is noted with `sessions_db_error=true`) (`500`, audit `failure`, `account deactivated; durable session wipe failed`) | none | as stated | as above | The account already exists and is mapped, so a retry meets `409`. Reconcile: `GET` the user, then `PATCH` `active:false`. |
 | Resource does not exist | `404` | none | none | none | Treat as gone. |
 | Provenance or role refusal (account not created by SCIM, or role other than `user`) | `404` | none | `scim.user.provenance_denied` (`denied`) | `yuzu_scim_provenance_denied_total` | Stop. This is a refusal, not a fault. |
 | Duplicate `userName` or `displayName` | `409` (`scim_type=uniqueness`) | none | `denied` on the create or update action | none | Update the existing resource instead. On `POST /Groups` the members are resolved before the duplicate check, so while the store is faulting a duplicate whose members cannot be resolved answers `503` rather than `409`; the retry then meets the `409`. |
@@ -972,11 +1008,15 @@ assuming a wave of terminated users is trying to log back in.
 
 ### The ~60 second window
 
-A deprovision revokes tokens and sessions **immediately** at the store
-level, but an already-validated API/MCP token can keep passing validation
-for **up to ~60 seconds** afterward due to an in-memory cache — a
-concurrently in-flight request may briefly still see the old "valid"
-answer. Cookie sessions have no such cache and are revoked instantly. The
+A deprovision revokes tokens and sessions at the store level, but an
+already-validated API/MCP token can keep passing validation for **up to ~60
+seconds** afterward due to an in-memory cache — a concurrently in-flight
+request may briefly still see the old "valid" answer. Cookie sessions are
+durable rows with a short per-replica cache: other replicas see the revoke
+within about a second (up to 30 seconds during a PostgreSQL brownout), and
+only once the durable delete has persisted. If it does not persist, the
+deprovision call fails with `500` (see "Deprovisioning and termination").
+The
 honest guarantee is "revoked within about a minute of the deprovision
 reaching Yuzu," not instantaneous — plan any time-sensitive incident
 response (e.g. a hostile termination) with that window in mind, and
