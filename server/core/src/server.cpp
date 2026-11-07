@@ -4245,15 +4245,20 @@ public:
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
-        // #4856: sources share this counter ("guardian_census" added for the census
-        // pending-evidence count read, #5690), each by reason
+        // #4856: sources share this counter, each by reason
         // (store_not_open/pool_acquire_timeout/query_error) — "guardian_state"
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
         // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
         // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count, fail-hard: the
         // caller gets a std::expected error and aborts the push/reconcile
-        // rather than fan out empty/stale data). Pre-seeded below (same closed
+        // rather than fan out empty/stale data); "guardian_census" (#5690) is the
+        // census pending-evidence COUNT read only (the gauge keeps its last value);
+        // "guardian_census_device" (#7217) is the per-device unrepresented-pending
+        // reads behind the device-compliance and all-guards routes (fail-hard: REST
+        // 503 / MCP error), and is the only source with the extra reason
+        // "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog symptom whose
+        // retry usually fails identically). Pre-seeded below (same closed
         // {reason x source} cross-product pre-seed pattern as
         // yuzu_server_kek_operations_total above) so absent()/rate() alerting
         // is meaningful before the first degrade ever fires.
@@ -4262,21 +4267,29 @@ public:
                           "read) rather than a genuine result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
                           "concurrency_budget for a guardian_state read refused over its "
-                          "in-flight budget) and source "
+                          "in-flight budget, plus statement_timeout for a guardian_census_device "
+                          "read that exceeded its time budget) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
                           "served; guardian_rules = authoritative rule/status reads, fail-hard, "
                           "push/reconcile aborts rather than fans out empty; guardian_census = "
                           "the census pending-evidence count read, whose gauge keeps its last "
-                          "value). A sampled warn "
-                          "accompanies each new degrade episode.",
+                          "value; guardian_census_device = the per-device unrepresented-pending "
+                          "reads, fail-hard, the device request is refused and a statement_timeout "
+                          "most likely means a large retained pending backlog, which a retry usually "
+                          "does not clear). "
+                          "A sampled warn accompanies each new degrade episode.",
                           "counter");
-        for (const auto source : {"guardian_state", "guardian_rules", "guardian_census"})
+        for (const auto source : {"guardian_state", "guardian_rules", "guardian_census",
+                                  "guardian_census_device"})
             for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
                 metrics_.counter("yuzu_server_guardian_read_degrade_total",
                                  {{"reason", reason}, {"source", source}});
         // The Apps stability read's in-flight budget refusal (guardian_state only).
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "concurrency_budget"}, {"source", "guardian_state"}});
+        // The per-device unrepresented-pending read's statement timeout (guardian_census_device only).
+        metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                         {{"reason", "statement_timeout"}, {"source", "guardian_census_device"}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
