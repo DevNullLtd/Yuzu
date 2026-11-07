@@ -387,8 +387,8 @@ inline constexpr std::array<SoftwareChangeKind, 3> kSoftwareChangeKinds = {
 /// One ledger row (see `SoftwareInventoryStore::diff_changes`). `instance_key` is the NEW row's
 /// for install/upgrade and the removed row's for remove. A version is compared as written, so a row
 /// whose version could not be read ('') moves to or from a real version as an `upgrade` with an
-/// empty `from_version` or `to_version`; a reader that wants only real version steps skips the
-/// upgrades that have an empty side.
+/// empty `from_version` or `to_version` (when the row has no epoch or release either); a reader
+/// that wants only real version steps skips the upgrades that have an empty side.
 struct SoftwareChange {
     SoftwareChangeKind kind{SoftwareChangeKind::kInstall};
     std::string name;
