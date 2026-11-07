@@ -46,6 +46,7 @@
 #include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
 #include "guaranteed_state_store.hpp" // kUnrepresentedPendingIdCap: the cap the maxItems literals mirror
 #include "license_store.hpp"
+#include "openapi_body_check.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_model.hpp"
@@ -2744,4 +2745,64 @@ TEST_CASE("openapi documents: the plugin-config success responses reference the 
                 CHECK(keys_of(*properties) == row.required);
         }
     }
+}
+
+// #6500 item 7: the value-level body checker (openapi_body_check.hpp) that the /config and
+// /dex/score-policy route tests use is itself pinned here, on hand-made bodies against the real
+// served schemas, so a checker that quietly stopped catching a kind of disagreement fails here
+// instead of turning those route tests into false greens.
+TEST_CASE("openapi body checker: a conforming body passes and each kind of disagreement is caught",
+          "[openapi][value]") {
+    namespace oa = yuzu::test::openapi;
+    const json spec = json::parse(openapi_spec_json());
+    const json set_schema = oa::ok_response_schema(spec, "/config/{key}", "put");
+    const json policy_schema = oa::ok_response_schema(spec, "/dex/score-policy", "get");
+    REQUIRE(set_schema.is_object());
+    REQUIRE(policy_schema.is_object());
+
+    const json good_set = {{"data", {{"key", "log_level"}, {"value", "debug"}, {"applied", true},
+                                     {"effect", "immediate"}}},
+                           {"meta", {{"api_version", "v1"}}}};
+    CHECK(oa::body_violations(spec, set_schema, good_set).empty());
+    const auto mutated = [&](const std::function<void(json&)>& f) {
+        json b = good_set;
+        f(b);
+        return oa::body_violations(spec, set_schema, b);
+    };
+    const auto mentions = [](const std::vector<std::string>& v, const std::string& needle) {
+        return std::any_of(v.begin(), v.end(), [&](const std::string& m) {
+            return m.find(needle) != std::string::npos;
+        });
+    };
+
+    // A wrong JSON type: a string where a boolean is declared, a number where a string is.
+    CHECK(mentions(mutated([](json& b) { b["data"]["applied"] = "true"; }), "$.data.applied"));
+    CHECK(mentions(mutated([](json& b) { b["data"]["key"] = 7; }), "$.data.key"));
+    // A required member missing.
+    CHECK(mentions(mutated([](json& b) { b["data"].erase("effect"); }), "'effect' is missing"));
+    CHECK(mentions(mutated([](json& b) { b.erase("meta"); }), "'meta' is missing"));
+    // An undeclared member, in the data object and in the referenced meta.
+    CHECK(mentions(mutated([](json& b) { b["data"]["extra"] = 1; }), "$.data.extra"));
+    CHECK(mentions(mutated([](json& b) { b["meta"]["extra"] = 1; }), "$.meta.extra"));
+    // A value outside the declared enum.
+    CHECK(mentions(mutated([](json& b) { b["data"]["effect"] = "later"; }), "enum"));
+    // A whole number is an integer; a fraction is not.
+    json doc = {{"data", {{"document", {{"version", 1.5}}}, {"revision", "default"},
+                          {"source", "default"}}},
+                {"meta", {{"api_version", "v1"}}}};
+    CHECK(mentions(oa::body_violations(spec, policy_schema, doc), "$.data.document.version"));
+    doc["data"]["document"]["version"] = 1;
+    CHECK(oa::body_violations(spec, policy_schema, doc).empty());
+    // Recursion through allOf -> $ref -> array items: an override with an unknown key.
+    doc["data"]["document"]["overrides"] = json::array({{{"image", "a.exe"}, {"bogus", 1}}});
+    CHECK(mentions(oa::body_violations(spec, policy_schema, doc),
+                   "$.data.document.overrides[0].bogus"));
+    // The coverage helpers agree with the schema's own spelling.
+    const auto declared = oa::declared_member_paths(spec, policy_schema);
+    CHECK(declared.contains("$.data.document.overrides[].model.per_device_event_cap"));
+    CHECK(declared.contains("$.data.dry_run"));
+    CHECK(oa::seen_member_paths(doc).contains("$.data.document.overrides[].image"));
+    // A schema keyword the checker does not model is reported, never skipped.
+    CHECK(mentions(oa::body_violations(spec, json{{"not", json::object()}}, json::object()),
+                   "not modelled"));
 }

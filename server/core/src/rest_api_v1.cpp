@@ -1105,6 +1105,7 @@ const std::string& openapi_spec() {
       "DexScorePolicyData": {
         "type": "object",
         "description": "Body of every 200 answer of /dex/score-policy (GET, PUT, DELETE): the data envelope plus meta.",
+        "required": ["data", "meta"],
         "properties": {
           "data": {
             "type": "object",
