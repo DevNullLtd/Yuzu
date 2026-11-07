@@ -5921,6 +5921,87 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
     }
 }
 
+TEST_CASE("diff_changes: Windows package rows (appx, chocolatey, winget) (pure)",
+          "[software_inventory][v3][ledger]") {
+    // The row shapes the Windows pkg_inventory legs emit: no publisher, no release, no install
+    // location; an Appx row is named by the part of its PackageFullName before the first '_' and
+    // carries the architecture; a Chocolatey package whose nuspec is unreadable has version ''.
+    const auto row = [](const std::string& name, const std::string& version,
+                        const std::string& ecosystem, const std::string& arch = "") {
+        SoftwareEntry e;
+        e.name = name;
+        e.version = version;
+        e.kind = ecosystem == "chocolatey" ? "pkg" : "app";
+        e.ecosystem = ecosystem;
+        e.arch = arch;
+        e.source = ecosystem == "appx"        ? "pkg_inventory.store_packages"
+                   : ecosystem == "chocolatey" ? "pkg_inventory.packages"
+                                               : "pkg_inventory.managers";
+        return keyed(std::move(e));
+    };
+    using Kind = SoftwareChangeKind;
+
+    SECTION("one Appx name in two architectures is two installs, each upgraded on its own") {
+        // x64 goes 1.0 -> 4.0 and x86 goes 3.0 -> 3.5. Without the architecture in the pairing
+        // stem the removed {1.0, 3.0} would pair with the added {3.5, 4.0} in tuple order and
+        // record 1.0 -> 3.5 and 3.0 -> 4.0.
+        const auto ch = SoftwareInventoryStore::diff_changes(
+            {row("Contoso.Calc", "1.0", "appx", "x64"), row("Contoso.Calc", "3.0", "appx", "x86")},
+            {row("Contoso.Calc", "4.0", "appx", "x64"), row("Contoso.Calc", "3.5", "appx", "x86")});
+        REQUIRE(ch.size() == 2);
+        std::map<std::string, std::pair<std::string, std::string>> by_to;
+        for (const auto& c : ch) {
+            CHECK(c.kind == Kind::kUpgrade);
+            by_to[c.to_version] = {c.from_version, c.name};
+        }
+        CHECK(by_to["4.0"] == std::pair<std::string, std::string>{"1.0", "Contoso.Calc"});
+        CHECK(by_to["3.5"] == std::pair<std::string, std::string>{"3.0", "Contoso.Calc"});
+    }
+    SECTION("an unchanged roster, reordered, is no event") {
+        CHECK(SoftwareInventoryStore::diff_changes(
+                  {row("Contoso.A", "1.0", "appx", "x64"), row("winget", "1.8", "winget"),
+                   row("git", "", "chocolatey")},
+                  {row("git", "", "chocolatey"), row("winget", "1.8", "winget"),
+                   row("Contoso.A", "1.0", "appx", "x64")})
+                  .empty());
+    }
+    SECTION("a manager presence row whose version moves is one upgrade of that manager") {
+        const auto ch = SoftwareInventoryStore::diff_changes({row("winget", "1.8", "winget")},
+                                                             {row("winget", "1.9", "winget")});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].kind == Kind::kUpgrade);
+        CHECK(ch[0].name == "winget");
+        CHECK(ch[0].from_version == "1.8");
+        CHECK(ch[0].to_version == "1.9");
+    }
+    SECTION("an unreadable Chocolatey version is a version like any other") {
+        // The collector writes version '' for a package whose nuspec it cannot read (a junction
+        // lib directory does that to every package at once). The pairing rule does not treat ''
+        // as unknown: the flip is one upgrade per package with an empty side, in both
+        // directions, and a package that appears beside it is an install.
+        const auto lost = SoftwareInventoryStore::diff_changes(
+            {row("git", "2.45", "chocolatey"), row("nodejs", "20.1", "chocolatey")},
+            {row("git", "", "chocolatey"), row("nodejs", "", "chocolatey"),
+             row("7zip", "", "chocolatey")});
+        REQUIRE(lost.size() == 3);
+        std::map<std::string, Kind> kinds;
+        for (const auto& c : lost) {
+            kinds[c.name] = c.kind;
+            if (c.kind == Kind::kUpgrade)
+                CHECK(c.to_version.empty());
+        }
+        CHECK(kinds["git"] == Kind::kUpgrade);
+        CHECK(kinds["nodejs"] == Kind::kUpgrade);
+        CHECK(kinds["7zip"] == Kind::kInstall);
+        const auto back = SoftwareInventoryStore::diff_changes({row("git", "", "chocolatey")},
+                                                               {row("git", "2.45", "chocolatey")});
+        REQUIRE(back.size() == 1);
+        CHECK(back[0].kind == Kind::kUpgrade);
+        CHECK(back[0].from_version.empty());
+        CHECK(back[0].to_version == "2.45");
+    }
+}
+
 TEST_CASE("component row hash and component section hash are pinned",
           "[software_inventory][v3][hash][components]") {
     // The agent writer must reproduce these bytes. Recipe (8 fields, 0x1F between, 0x1E ends the
