@@ -1253,22 +1253,11 @@ only when every row of the group is labelled.
 
 **Disposition of `title_dimension` and `curation_queue`.** Both are keyed on the raw
 `(raw_name, raw_publisher, ecosystem)` triple, so a title with no declared vendor is keyed under
-its `via:` label, not under an empty publisher, and a triple keyed `''` and the same title keyed
-`via:<ecosystem>` are two different keys. The candidate query selects only triples present in
-`title_triples`, which is rebuilt from the live inventory. For a `''` triple that is absent from
-`title_triples`:
-
-- its `title_dimension` row persists (dimension rows are permanent by design);
-- its OPEN `curation_queue` row is deleted by the queue prune in `reconcile_queue`, which removes
-  an open row whose triple is absent from `title_triples`;
-- its REJECTED `curation_queue` row stays, because a rejection outlives the title's absence.
-
-The `via:<ecosystem>` triple is a new key: it gets a new `title_dimension` row. A label normalises to no vendor, so a pack or curated alias
-with an empty raw publisher covers it (the shipped aliases all have one, and such a title
-resolves `pack` and is not queued); a title no alias covers is `unnormalized` and queued as a
-new open item. A rejection recorded
-against the `''` triple is not carried over to it, so a curator rejects the labelled title again
-if it is still unwanted.
+its `via:` label, not under an empty publisher. The candidate query selects only triples present
+in `title_triples`, which is rebuilt from the live inventory. A `via:<ecosystem>` triple has its
+own `title_dimension` row. A label normalises to no vendor, so a pack or curated alias with an
+empty raw publisher covers it (the shipped aliases all have one, and such a title resolves `pack`
+and is not queued); a title no alias covers is `unnormalized` and queued as an open item.
 
 **Hash.** The publisher is part of each row's hash. The agent's collector characterisation
 digests over the real capture samples include it, and the agent and the server pin the same
