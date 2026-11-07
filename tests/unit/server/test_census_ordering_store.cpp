@@ -12,8 +12,10 @@
 #include "pg/pg_raii.hpp"
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
+#include "test_events_table_lock.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <libpq-fe.h>
 
@@ -22,9 +24,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <future>
 #include <algorithm>
 #include <initializer_list>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1980,4 +1984,446 @@ TEST_CASE("census ordering: iso8601_to_ns reports an instant past int64 nanoseco
     CHECK(yuzu::test::iso8601_to_ns("2262-04-11T23:47:16Z") == 9'223'372'036'000'000'000LL);
     CHECK(yuzu::test::iso8601_to_ns("2262-04-11T23:47:17Z") == 0);
     CHECK(yuzu::test::iso8601_to_ns("9999-12-31T23:59:59Z") == 0);
+}
+
+// ── #7217: unrepresented pending evidence for one device ─────────────────────
+
+namespace {
+
+// A retained, pending event with NO census row: written raw so nothing projects it. The event id
+// carries a suffix so one pair can hold several of them.
+void raw_pending(const std::string& dsn, const std::string& agent, const std::string& rule,
+                 const std::string& suffix = "") {
+    exec_sql(dsn, std::string("INSERT INTO ") + kSchema +
+                      ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                      "severity, timestamp, proj_key, projection_pending) VALUES ('up-" +
+                      agent + "-" + rule + suffix + "', '" + rule + "', '" + agent +
+                      "', 'guard.compliant', 'high', 't', 100, true)");
+}
+
+void raw_census(const std::string& dsn, const std::string& agent, const std::string& rule) {
+    exec_sql(dsn, std::string("INSERT INTO ") + kSchema +
+                      ".guardian_agent_rule_status (agent_id, rule_id, state, updated_at) "
+                      "VALUES ('" + agent + "', '" + rule + "', 'compliant', 't')");
+}
+
+using PendingScope = std::optional<std::vector<std::string>>;
+
+} // namespace
+
+TEST_CASE("census ordering: unrepresented pending lists pairs with pending evidence and no census row",
+          "[pg][guaranteed_state_store][db][census][ordering][unrepresented]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+    REQUIRE(store.create_rule(make_rule("r3", "guard-three")));
+
+    SECTION("a pending-only pair is returned") {
+        raw_pending(db.dsn(), "A", "r1");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 1);
+        CHECK(s->rule_ids == std::vector<std::string>{"r1"});
+    }
+
+    SECTION("a pair that has a census row is excluded even with a pending event") {
+        raw_pending(db.dsn(), "A", "r1");
+        raw_pending(db.dsn(), "A", "r2");
+        raw_census(db.dsn(), "A", "r1");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 1);
+        CHECK(s->rule_ids == std::vector<std::string>{"r2"});
+    }
+
+    SECTION("a non-pending event is not evidence") {
+        exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                               ".guaranteed_state_events (event_id, rule_id, agent_id, "
+                               "event_type, severity, timestamp, proj_key, projection_pending) "
+                               "VALUES ('np', 'r1', 'A', 'guard.compliant', 'high', 't', 100, "
+                               "false)");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 0);
+        CHECK(s->rule_ids.empty());
+    }
+
+    SECTION("the rule filter keeps only the listed rules") {
+        raw_pending(db.dsn(), "A", "r1");
+        raw_pending(db.dsn(), "A", "r2");
+        raw_pending(db.dsn(), "A", "r3");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{{"r1", "r3"}});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 2);
+        CHECK(s->rule_ids == std::vector<std::string>{"r1", "r3"});
+        const auto none = store.unrepresented_pending_for_agent("A", PendingScope{{"nope"}});
+        REQUIRE(none.has_value());
+        CHECK(none->count == 0);
+        CHECK(none->rule_ids.empty());
+    }
+
+    SECTION("another agent's pending evidence is not counted") {
+        raw_pending(db.dsn(), "B", "r1");
+        raw_pending(db.dsn(), "A", "r2");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 1);
+        CHECK(s->rule_ids == std::vector<std::string>{"r2"});
+    }
+
+    SECTION("duplicate pending events of one pair count once") {
+        raw_pending(db.dsn(), "A", "r1", "-1");
+        raw_pending(db.dsn(), "A", "r1", "-2");
+        raw_pending(db.dsn(), "A", "r1", "-3");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 1);
+        CHECK(s->rule_ids == std::vector<std::string>{"r1"});
+    }
+
+    SECTION("a pending event whose rule has no rule row is still counted (no live-rule join)") {
+        raw_pending(db.dsn(), "A", "ghost");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 1);
+        CHECK(s->rule_ids == std::vector<std::string>{"ghost"});
+        const auto f = store.unrepresented_pending_for_agent("A", PendingScope{{"ghost"}});
+        REQUIRE(f.has_value());
+        CHECK(f->count == 1);
+    }
+}
+
+TEST_CASE("census ordering: unrepresented pending caps the id list but never the count",
+          "[pg][guaranteed_state_store][db][census][ordering][unrepresented]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    // 57 distinct pairs, two events each for the first ones so duplicates cannot inflate the count.
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                           "severity, timestamp, proj_key, projection_pending) "
+                           "SELECT 'cap-' || g || '-' || d, 'rule-' || lpad(g::text, 3, '0'), "
+                           "'A', 'guard.compliant', 'high', 't', 100, true "
+                           "FROM generate_series(1, 57) g, generate_series(1, 2) d");
+    const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+    REQUIRE(s.has_value());
+    CHECK(s->count == 57);
+    REQUIRE(s->rule_ids.size() == kUnrepresentedPendingIdCap);
+    CHECK(std::is_sorted(s->rule_ids.begin(), s->rule_ids.end()));
+    CHECK(std::adjacent_find(s->rule_ids.begin(), s->rule_ids.end()) == s->rule_ids.end());
+    CHECK(s->rule_ids.front() == "rule-001");
+    CHECK(s->rule_ids.back() == "rule-050");
+
+    // The filtered form caps the same way and still reports the exact count.
+    std::vector<std::string> all;
+    for (int i = 1; i <= 57; ++i) {
+        all.emplace_back(std::format("rule-{:03}", i));
+    }
+    const auto f = store.unrepresented_pending_for_agent("A", PendingScope{all});
+    REQUIRE(f.has_value());
+    CHECK(f->count == 57);
+    CHECK(f->rule_ids.size() == kUnrepresentedPendingIdCap);
+}
+
+namespace {
+
+constexpr const char* kDegradeCounter = "yuzu_server_guardian_read_degrade_total";
+constexpr const char* kSourceDevice = "guardian_census_device";
+constexpr const char* kSourceGauge = "guardian_census";
+
+double degrade_count(yuzu::MetricsRegistry& metrics, const char* source, const char* reason) {
+    return metrics.counter(kDegradeCounter, {{"reason", reason}, {"source", source}}).value();
+}
+
+// Sum over the reasons the per-device read can report, for one source.
+double degrade_total(yuzu::MetricsRegistry& metrics, const char* source) {
+    double total = 0;
+    for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error", "statement_timeout"})
+        total += degrade_count(metrics, source, reason);
+    return total;
+}
+
+// After any fault arm the pool holds no lease and the store still serves a read AND a write.
+// `tag` keeps the rule id of the write distinct per call.
+void expect_pool_and_store_intact(PgPool& pool, GuaranteedStateStore& store, const std::string& dsn,
+                                  const std::string& tag) {
+    CHECK(pool.in_use() == 0);
+    raw_pending(dsn, "intact-" + tag, "r-" + tag);
+    const auto read = store.unrepresented_pending_for_agent("intact-" + tag, PendingScope{});
+    REQUIRE(read.has_value());
+    CHECK(read->count == 1);
+    CHECK(read->rule_ids == std::vector<std::string>{"r-" + tag});
+    CHECK(store.create_rule(make_rule("w-" + tag, "intact-write-" + tag)).has_value());
+    CHECK(pool.in_use() == 0);
+}
+
+// Pending event whose agent and rule travel as bind parameters, so a hostile id is stored as is.
+void raw_pending_param(const std::string& dsn, const std::string& agent, const std::string& rule) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r = pg::exec_params(
+        conn.get(),
+        (std::string("INSERT INTO ") + kSchema +
+         ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, severity, timestamp, "
+         "proj_key, projection_pending) VALUES ('hp-' || $2::text || '-' || $1::text, $2::text, $1::text, 'guard.compliant', "
+         "'high', 't', 100, true)")
+            .c_str(),
+        std::vector<std::string>{agent, rule});
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+} // namespace
+
+TEST_CASE("census ordering: unrepresented pending fails hard and never reads as zero",
+          "[pg][guaranteed_state_store][db][census][ordering][unrepresented]") {
+    SECTION("a store that is not open") {
+        yuzu::MetricsRegistry metrics;
+        PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        GuaranteedStateStore closed(dead);
+        closed.set_metrics(&metrics);
+        REQUIRE_FALSE(closed.is_open());
+        const auto a = closed.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE_FALSE(a.has_value());
+        CHECK(a.error().kind == UnrepresentedPendingFault::kUnavailable);
+        CHECK_FALSE(a.error().message.empty());
+        const auto b = closed.unrepresented_pending_for_agent("A", PendingScope{{"r1"}});
+        REQUIRE_FALSE(b.has_value());
+        CHECK(b.error().kind == UnrepresentedPendingFault::kUnavailable);
+        // An engaged-empty filter is answered without touching the store, so it holds on a store that
+        // is down, and it is not counted as a degrade.
+        const auto e = closed.unrepresented_pending_for_agent("A", PendingScope{std::vector<std::string>{}});
+        REQUIRE(e.has_value());
+        CHECK(e->count == 0);
+        CHECK(e->rule_ids.empty());
+        CHECK(degrade_count(metrics, kSourceDevice, "store_not_open") == 2);
+        CHECK(degrade_total(metrics, kSourceDevice) == 2);
+        // The gauge read's source is untouched by the per-device read.
+        CHECK(degrade_total(metrics, kSourceGauge) == 0);
+    }
+
+    SECTION("the fault seam fails only this read and recovers when cleared") {
+        YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+        // Declared before the store that owns the seam: the lambda holds its own reference.
+        yuzu::MetricsRegistry metrics;
+        const auto calls = std::make_shared<std::atomic<int>>(0);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        GuaranteedStateStore store(pool);
+        store.set_metrics(&metrics);
+        REQUIRE(store.is_open());
+        raw_pending(db.dsn(), "A", "r1");
+        store.set_unrepresented_pending_fault_for_test([calls] {
+            calls->fetch_add(1);
+            return true;
+        });
+        const auto first = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE_FALSE(first.has_value());
+        CHECK(first.error().kind == UnrepresentedPendingFault::kUnavailable);
+        CHECK(calls->load() == 1);
+        CHECK_FALSE(store.unrepresented_pending_for_agent("A", PendingScope{{"r1"}}).has_value());
+        CHECK(calls->load() == 2);
+        // Counted once per failed read, on the per-device source and as query_error.
+        CHECK(degrade_count(metrics, kSourceDevice, "query_error") == 2);
+        CHECK(degrade_total(metrics, kSourceDevice) == 2);
+        CHECK(degrade_total(metrics, kSourceGauge) == 0);
+        // Another read on the same store is unaffected, and does not move the per-device source.
+        CHECK(store.pending_projection_count_checked().has_value());
+        CHECK(degrade_total(metrics, kSourceDevice) == 2);
+        // The engaged-empty short-circuit never reaches the seam.
+        const auto e = store.unrepresented_pending_for_agent("A", PendingScope{std::vector<std::string>{}});
+        REQUIRE(e.has_value());
+        CHECK(e->count == 0);
+        CHECK(calls->load() == 2);
+        // The injected fault leaked nothing: no lease is out.
+        CHECK(pool.in_use() == 0);
+
+        store.set_unrepresented_pending_fault_for_test({});
+        const auto ok = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(ok.has_value());
+        CHECK(ok->count == 1);
+        CHECK(calls->load() == 2);
+        expect_pool_and_store_intact(pool, store, db.dsn(), "seam");
+    }
+
+    SECTION("a pool that cannot lease in time is a pool_acquire_timeout and leaves no lease behind") {
+        YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+        yuzu::MetricsRegistry metrics;
+        PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+        GuaranteedStateStore store(pool);
+        store.set_metrics(&metrics);
+        REQUIRE(store.is_open());
+        {
+            // The saboteur holds the pool's only connection for the whole read.
+            auto held = pool.try_acquire_for(std::chrono::seconds(5));
+            REQUIRE(static_cast<bool>(held));
+            const auto r = store.unrepresented_pending_for_agent("A", PendingScope{});
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().kind == UnrepresentedPendingFault::kUnavailable);
+            CHECK(degrade_count(metrics, kSourceDevice, "pool_acquire_timeout") == 1);
+            CHECK(degrade_total(metrics, kSourceDevice) == 1);
+            CHECK(pool.in_use() == 1); // the saboteur's, not the read's
+        }
+        expect_pool_and_store_intact(pool, store, db.dsn(), "pool");
+    }
+}
+
+TEST_CASE("census ordering: unrepresented pending reports a statement timeout as its own fault",
+          "[pg][guaranteed_state_store][db][census][ordering][unrepresented]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    yuzu::MetricsRegistry metrics;
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    store.set_metrics(&metrics);
+    REQUIRE(store.is_open());
+    raw_pending(db.dsn(), "A", "r1");
+    store.set_unrepresented_pending_timeout_ms_for_test(50);
+
+    const bool filtered = GENERATE(false, true);
+    CAPTURE(filtered);
+    const PendingScope scope = filtered ? PendingScope{{"r1"}} : PendingScope{};
+    const double before = degrade_count(metrics, kSourceDevice, "statement_timeout");
+    {
+        // The read blocks behind the lock until its 50 ms statement timeout cancels it (57014).
+        yuzu::test::EventsTableLock lock(db.dsn());
+        const auto r = store.unrepresented_pending_for_agent("A", scope);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == UnrepresentedPendingFault::kStatementTimeout);
+        CHECK_FALSE(r.error().message.empty());
+        CHECK(degrade_count(metrics, kSourceDevice, "statement_timeout") == before + 1);
+        // Counted as a timeout and NOT also as a generic query error, on the per-device source only.
+        CHECK(degrade_count(metrics, kSourceDevice, "query_error") == 0);
+        CHECK(degrade_total(metrics, kSourceGauge) == 0);
+        // The failed transaction was rolled back and its connection returned.
+        CHECK(pool.in_use() == 0);
+    }
+    // Lock released: restore the production budget, then the same store answers the same read and
+    // a follow-up read and write succeed.
+    store.set_unrepresented_pending_timeout_ms_for_test(5000);
+    const auto ok = store.unrepresented_pending_for_agent("A", scope);
+    REQUIRE(ok.has_value());
+    CHECK(ok->count == 1);
+    CHECK(ok->rule_ids == std::vector<std::string>{"r1"});
+    expect_pool_and_store_intact(pool, store, db.dsn(), filtered ? "to-f" : "to-u");
+}
+
+TEST_CASE("census ordering: unrepresented pending orders ids by byte value and keeps the byte-order cap",
+          "[pg][guaranteed_state_store][db][census][ordering][unrepresented]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    SECTION("mixed case and punctuation sort as bytes, whatever the cluster locale") {
+        for (const char* id : {"g-a", "g_a", "gA", "g-b", "g.b", "G-c"})
+            raw_pending_param(db.dsn(), "A", id);
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 6);
+        // 'G' < 'g'; after "g": '-' (0x2d) < '.' (0x2e) < 'A' (0x41) < '_' (0x5f).
+        CHECK(s->rule_ids == std::vector<std::string>{"G-c", "g-a", "g-b", "g.b", "gA", "g_a"});
+    }
+
+    SECTION("the cap keeps the first ids in byte order") {
+        // 50 lowercase ids and one uppercase id: byte order puts the uppercase one first, so the
+        // last lowercase id is the one the cap drops. A locale collation would keep it instead.
+        for (int i = 1; i <= 50; ++i)
+            raw_pending_param(db.dsn(), "A", std::format("m-{:03}", i));
+        raw_pending_param(db.dsn(), "A", "Z-last");
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 51);
+        REQUIRE(s->rule_ids.size() == kUnrepresentedPendingIdCap);
+        CHECK(s->rule_ids.front() == "Z-last");
+        CHECK(s->rule_ids.back() == "m-049");
+        CHECK(std::is_sorted(s->rule_ids.begin(), s->rule_ids.end()));
+    }
+}
+
+TEST_CASE("census ordering: unrepresented pending carries hostile and empty ids through the filter",
+          "[pg][guaranteed_state_store][db][census][ordering][unrepresented]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    // Quotes, backslash, braces, commas, whitespace, a newline, SQL and array-literal look-alikes,
+    // a NULL look-alike and multi-byte UTF-8: agent-reported ids are not validated at ingest.
+    const std::vector<std::string> hostile{
+        "a'b",         "a\"b",    "a\\b",   "a,b",         "{a}",      "a b",
+        "a\nb",        "x'; DROP TABLE t; --", "{\"k\":1}", "NULL",   "\xC3\xBC-\xE6\x97\xA5\xE6\x9C\xAC",
+        "\\\"",        "'",       "\"",     "\\"};
+    for (const std::string& id : hostile)
+        raw_pending_param(db.dsn(), "A", id);
+    std::vector<std::string> expected = hostile;
+    std::sort(expected.begin(), expected.end()); // std::string compares bytes, like COLLATE "C"
+    expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+
+    SECTION("unfiltered: every id comes back verbatim, byte-sorted") {
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == static_cast<std::int64_t>(expected.size()));
+        CHECK(s->rule_ids == expected);
+    }
+
+    SECTION("filtered by the same ids: the array literal round-trips every byte") {
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{hostile});
+        REQUIRE(s.has_value());
+        CHECK(s->count == static_cast<std::int64_t>(expected.size()));
+        CHECK(s->rule_ids == expected);
+    }
+
+    SECTION("one hostile filter id selects only itself") {
+        const auto s = store.unrepresented_pending_for_agent("A", PendingScope{{"a'b"}});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 1);
+        CHECK(s->rule_ids == std::vector<std::string>{"a'b"});
+        const auto none = store.unrepresented_pending_for_agent("A", PendingScope{{"a'"}});
+        REQUIRE(none.has_value());
+        CHECK(none->count == 0);
+    }
+
+    SECTION("an agent id with SQL metacharacters is bound, not interpolated") {
+        raw_pending_param(db.dsn(), "ev'il\"A", "r1");
+        const auto s = store.unrepresented_pending_for_agent("ev'il\"A", PendingScope{});
+        REQUIRE(s.has_value());
+        CHECK(s->count == 1);
+        CHECK(s->rule_ids == std::vector<std::string>{"r1"});
+    }
+}
+
+TEST_CASE("census ordering: an empty-string rule id is an id, not a wildcard",
+          "[pg][guaranteed_state_store][db][census][ordering][unrepresented]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    raw_pending_param(db.dsn(), "A", "r1");
+
+    // The only pending pair is r1, so a filter holding just "" matches nothing (and is not the
+    // engaged-empty short-circuit, which would also say zero but without reading).
+    const auto only_empty = store.unrepresented_pending_for_agent("A", PendingScope{{""}});
+    REQUIRE(only_empty.has_value());
+    CHECK(only_empty->count == 0);
+    CHECK(only_empty->rule_ids.empty());
+
+    // An empty element next to a real one does not widen the filter or drop the real one.
+    const auto mixed = store.unrepresented_pending_for_agent("A", PendingScope{{"", "r1"}});
+    REQUIRE(mixed.has_value());
+    CHECK(mixed->count == 1);
+    CHECK(mixed->rule_ids == std::vector<std::string>{"r1"});
+
+    // A pending pair whose rule id really is the empty string is found by a filter that names it.
+    raw_pending_param(db.dsn(), "A", "");
+    const auto both = store.unrepresented_pending_for_agent("A", PendingScope{{""}});
+    REQUIRE(both.has_value());
+    CHECK(both->count == 1);
+    CHECK(both->rule_ids == std::vector<std::string>{""});
+    const auto all = store.unrepresented_pending_for_agent("A", PendingScope{});
+    REQUIRE(all.has_value());
+    CHECK(all->count == 2);
+    CHECK(all->rule_ids == std::vector<std::string>{"", "r1"});
 }

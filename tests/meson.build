@@ -651,6 +651,7 @@ agent_test_exe = executable(
     'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
     'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
     'unit/test_pkg_inventory_linux_parsers.cpp',    # pkg_inventory Linux legs: injected-root Linux snap/flatpak/managers walk over a REAL CAPTURE tree manifest (body POSIX-only)
+    'unit/test_pkg_inventory_win_parsers.cpp',      # pkg_inventory Windows legs: nuspec tag scanner, Appx PackageFullName parser, rows and the three legs over a FakeOps seam (REAL CAPTURE names/versions plus labelled synthetic cases; runs on every OS, RealOps cases Windows-only)
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
@@ -3663,6 +3664,18 @@ test('instructions runner hardening',
   timeout: 300,
 )
 
+# scripts/test/ensure-puppeteer.sh and ensure-gcovr.sh, the /test Phase 0b installers, run against
+# stub node/npm/npx/python3 executables in a temp HOME (never the real HOME or repo tree): every
+# ready / NOT READY branch, the hash-verified pip install, the interrupted-install repairs and the
+# refuse-to-delete guards. Bash only; the gcovr cases skip off Linux (the script is Linux-only) and
+# the whole file skips on Windows. Suite docs, which CI runs on the Linux leg and /test runs natively.
+test('ensure install helpers',
+  _python3_test,
+  args: [files('test_ensure_install_helpers.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
@@ -4538,6 +4551,15 @@ test('assert-suite-cover selftest',
 test('issue lifecycle docs',
   _python3_test,
   args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# The Windows package-sources upgrade note states the fresh-deployment contract (routed
+# Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
+test('upgrade notes contract',
+  _python3_test,
+  args: [files('test_upgrade_notes_contract.py')],
   suite: 'docs',
   timeout: 10,
 )

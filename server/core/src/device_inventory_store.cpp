@@ -107,17 +107,6 @@ std::string bigint_param(const std::string& s) {
     return std::to_string(v);
 }
 
-// The 11 scalars appended to device_ci at wire positions 22-32 (device_ci_kinds.hpp).
-constexpr const char* kV2ScalarCols[] = {
-    "chassis_type",   "chassis_serial", "chassis_asset_tag", "chassis_source",
-    "board_vendor",   "board_product",  "board_serial",      "board_source",
-    "machine_id_hash", "machine_id_algorithm", "machine_id_source",
-};
-// Ties the migration DDL to the wire: positions 0-21 are the frozen v1 fields, the rest are
-// the appended scalars named here.
-static_assert(std::size(kV2ScalarCols) == kDeviceCiScalarFields - 22,
-              "kV2ScalarCols must name every appended scalar position (22..kDeviceCiScalarFields-1)");
-
 // Split a kDeviceCiSections column list ("a,b,c") into names.
 std::vector<std::string> split_columns(std::string_view columns) {
     std::vector<std::string> out;
@@ -127,34 +116,72 @@ std::vector<std::string> split_columns(std::string_view columns) {
 }
 
 // Migration v2 (additive, online-safe: constant defaults make the ALTER metadata-only,
-// ADR-0008): the v2 blob's identity scalars on device_ci, a per-section status table, and
-// one child table per list kind (typed TEXT columns, driven by kDeviceCiSections so a kind
-// costs one registry entry). Children cascade from device_ci so delete_agent stays one
-// statement. Unqualified DDL — the runner sets search_path to the store schema.
-std::string migration_v2_sql() {
-    std::string sql =
-        "ALTER TABLE device_ci ADD COLUMN blob_version SMALLINT NOT NULL DEFAULT 1";
-    for (const char* c : kV2ScalarCols)
-        sql += std::string(", ADD COLUMN ") + c + " TEXT NOT NULL DEFAULT ''";
-    sql += ";";
-    sql += "CREATE TABLE device_ci_section ("
-           "  agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
-           "  kind     TEXT NOT NULL,"
-           "  level    TEXT NOT NULL DEFAULT '',"
-           "  reason   TEXT NOT NULL DEFAULT '',"
-           "  PRIMARY KEY (agent_id, kind));";
-    for (const auto& d : kDeviceCiSections) {
-        if (d.table == nullptr)
-            continue;
-        sql += std::string("CREATE TABLE ") + d.table +
-               " (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
-               " ord INTEGER NOT NULL";
-        for (const auto& col : split_columns(d.columns))
-            sql += ", " + col + " TEXT NOT NULL DEFAULT ''";
-        sql += ", PRIMARY KEY (agent_id, ord));";
-    }
-    return sql;
-}
+// ADR-0008): the v2 blob's identity scalars on device_ci (wire positions 22-32 of
+// device_ci_kinds.hpp), a per-section status table, and one child table per list kind
+// (typed TEXT columns). Children cascade from device_ci so delete_agent stays one statement.
+// Unqualified DDL - the runner sets search_path to the store schema.
+//
+// FROZEN (#7164): this is a checked-in literal, NOT generated from kDeviceCiSections. The
+// runner skips a migration whose version is already recorded, so a generated v2 changes what a
+// FRESH database gets and nothing about a deployed one. Never edit it: a new table-backed kind,
+// or a changed column list, ships its own migration (v4 or later) - see "Registry-backed tables"
+// in docs/postgres-store-playbook.md. What ties the registry to the schema is now (a) the
+// projection check in the constructor (a registry table or column the database lacks refuses
+// at boot) and (b) the schema test in test_device_inventory_store.cpp. The compile-time tie
+// between kDeviceCiScalarFields and the scalar DDL that the old generator carried is replaced
+// by those two. It is byte-identical (3311 bytes, sha256
+// 1e6e39f4f195e20b1d0253ab1fc7bc6d48401162e78371df3ebecaaabaf41f6c) to what the generator emitted
+// when it was frozen, so a database that already ran v2 on today's registry needs nothing.
+constexpr const char* kMigrationV2Sql =
+    "ALTER TABLE device_ci ADD COLUMN blob_version SMALLINT NOT NULL DEFAULT 1,"
+    " ADD COLUMN chassis_type TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_serial TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_asset_tag TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_source TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_vendor TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_product TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_serial TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_source TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_hash TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_algorithm TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_source TEXT NOT NULL DEFAULT '';"
+    "CREATE TABLE device_ci_section (  agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    "  kind     TEXT NOT NULL,  level    TEXT NOT NULL DEFAULT '',"
+    "  reason   TEXT NOT NULL DEFAULT '',  PRIMARY KEY (agent_id, kind));"
+    "CREATE TABLE device_ci_cpu (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, idx TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',"
+    " cores TEXT NOT NULL DEFAULT '', threads TEXT NOT NULL DEFAULT '',"
+    " clock_mhz TEXT NOT NULL DEFAULT '', socket_designation TEXT NOT NULL DEFAULT '',"
+    " stepping TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_dimm (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, slot TEXT NOT NULL DEFAULT '',"
+    " size_mb TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT '',"
+    " speed_mhz TEXT NOT NULL DEFAULT '', manufacturer TEXT NOT NULL DEFAULT '',"
+    " part_number TEXT NOT NULL DEFAULT '', serial TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_disk (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, idx TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',"
+    " size_gb TEXT NOT NULL DEFAULT '', media_type TEXT NOT NULL DEFAULT '',"
+    " interface TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_swap (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '',"
+    " total_mb TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_volume (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, volume TEXT NOT NULL DEFAULT '',"
+    " mount_points TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '',"
+    " fstype TEXT NOT NULL DEFAULT '', total_bytes TEXT NOT NULL DEFAULT '',"
+    " detail TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_partition (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, disk TEXT NOT NULL DEFAULT '',"
+    " partition TEXT NOT NULL DEFAULT '', size_bytes TEXT NOT NULL DEFAULT '',"
+    " type TEXT NOT NULL DEFAULT '', mount_points TEXT NOT NULL DEFAULT '',"
+    " detail TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_topology (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, topo_kind TEXT NOT NULL DEFAULT '',"
+    " name TEXT NOT NULL DEFAULT '', uuid TEXT NOT NULL DEFAULT '',"
+    " members TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));";
 
 // Migration v3 (additive, online-safe, ADR-0008): the number of child rows stored for the
 // section (`row_count`) and the SHA-256 of their canonical serialization (`content_digest`),
@@ -164,11 +191,11 @@ std::string migration_v2_sql() {
 // v3 is unreleased, so the digest column is folded into it rather than adding a v4. The ADDs are
 // IF NOT EXISTS so a re-run is harmless, BUT the runner is gated on the recorded version number
 // only (no checksum): a database that already recorded the earlier row_count-only v3 will NOT run
-// this again and lacks content_digest: every full ingest then fails at section_insert, and the
-// sections read fails (the REST record route answers 503, the MCP tool a retryable error). Reset
-// such a dev/UAT database before use, then restart the server:
-//   UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store';
-// or recreate the store schema.
+// this again and lacks content_digest. The constructor's projection check then refuses to open the
+// store (and server.cpp refuses to start the server) with a log line naming device_ci_section. The
+// reset for such a dev/UAT database is in docs/user-manual/upgrading.md ("the server refuses to
+// start on a device inventory schema it cannot read"): UPDATE public.schema_meta SET version = 2
+// WHERE store = 'device_inventory_store', then restart.
 // Unqualified DDL - the runner sets search_path to the store schema.
 constexpr const char* kMigrationV3Sql =
     "ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, "
@@ -213,7 +240,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "  last_seen     BIGINT NOT NULL);"
          // Roster reads order by hostname; the index keeps the LIMIT scan ordered.
          "CREATE INDEX device_ci_hostname_idx ON device_ci (hostname);"},
-        {2, migration_v2_sql()},
+        {2, kMigrationV2Sql},
         {3, kMigrationV3Sql},
     };
     return kMigrations;
@@ -315,6 +342,66 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("DeviceInventoryStore: schema migration failed — device-CI persistence "
                       "disabled");
         return;
+    }
+    // Post-migration projection check (postgres-store-playbook "Runner guards"; the same shape as
+    // ApiTokenStore and SoftwareInventoryStore). The runner skips any version at or below the
+    // stored high-water mark, so a database that ran an earlier revision of v2 or v3 (or one
+    // stamped by a different binary) can lack a table or column this binary reads while run()
+    // still reports success - and every sections read then fails with 42P01/42703 on the first
+    // request. One LIMIT 0 SELECT per table, over every column the runtime uses, touches no rows
+    // and refuses here instead (server.cpp then refuses to start). The child tables are driven by
+    // the registry, so a registry kind with no table fails at boot. Column PRESENCE only: an extra
+    // column is tolerated (#3894's ahead-database stance); names, types, nullability, order and
+    // the key shape are pinned for the shipped literals by the schema test in
+    // test_device_inventory_store.cpp, column defaults are not pinned by anything.
+    {
+        struct Probe {
+            std::string table;
+            std::string columns;
+        };
+        std::vector<Probe> probes;
+        probes.push_back({"device_ci", std::string("content_hash, ") + kSelectCols});
+        probes.push_back(
+            {"device_ci_section", "agent_id, kind, level, reason, row_count, content_digest"});
+        for (const auto& d : kDeviceCiSections) {
+            if (d.table == nullptr)
+                continue;
+            probes.push_back({d.table, std::string("agent_id, ord, ") + d.columns});
+        }
+        for (const auto& p : probes) {
+            const std::string sql =
+                "SELECT " + p.columns + " FROM device_inventory_store." + p.table + " LIMIT 0";
+            pg::PgResult probe =
+                pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+            if (probe.status() != PGRES_TUPLES_OK) {
+                // SQLSTATE 42P01 (undefined table) / 42703 (undefined column) is a schema defect;
+                // anything else (a dropped connection, a statement timeout, a permission error)
+                // is not evidence of one, and a restart is the retry. The message names no
+                // destructive step: the supported reset for a development or UAT database is in
+                // the upgrade notes, and it is not advice for any other database.
+                const char* state = PQresultErrorField(probe.get(), PG_DIAG_SQLSTATE);
+                const std::string sqlstate = state != nullptr ? state : "";
+                const bool schema_defect = sqlstate == "42P01" || sqlstate == "42703";
+                const bool permission = sqlstate == "42501";
+                spdlog::error(
+                    "DeviceInventoryStore: post-migration schema projection check failed on {} "
+                    "(SQLSTATE {}) - {} The server will not start; see docs/user-manual/"
+                    "upgrading.md, \"the server refuses to start on a device inventory schema it "
+                    "cannot read\". Database said: {}",
+                    p.table, sqlstate.empty() ? "none" : sqlstate,
+                    schema_defect
+                        ? "the database lacks a table or column this build reads (an earlier "
+                          "revision of the unreleased migration v2/v3, a skipped or partial "
+                          "migration, or a database from a different build)."
+                        : permission
+                              ? "the server's database role cannot read it (grant SELECT on the "
+                                "store's schema; a restart will not fix a permission error)."
+                              : "this is not a missing-object error (a dropped connection or a "
+                                "timeout); restart once before treating the schema as damaged.",
+                    PQresultErrorMessage(probe.get()));
+                return;
+            }
+        }
     }
     open_ = true;
 }

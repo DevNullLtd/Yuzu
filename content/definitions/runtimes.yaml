@@ -173,7 +173,7 @@ spec:
         platforms: [windows, darwin, linux]
       - name: vendor
         type: string
-        description: 'IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or "-" when the key is absent (or the home has no release file).'
+        description: 'IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified; on macOS, a bundle with an openable Contents and no release file under Contents/Home reports JVMVendor from its Info.plist instead; "-" when the source gives no vendor.'
         example: Eclipse Adoptium
         platforms: [windows, darwin, linux]
 
