@@ -575,6 +575,8 @@ TEST_CASE("install_type_for: the source table is total over kSoftwareSources",
     CHECK(install_type_for("windows_optional_features.list", "") == "optional_feature");
     CHECK(install_type_for("msi_packages.list_inventory", "") == "msi");
     CHECK(install_type_for("runtimes.python", "") == "runtime");
+    CHECK(install_type_for("runtimes.dotnet", "") == "runtime");
+    CHECK(install_type_for("runtimes.jvm", "") == "runtime");
     CHECK(install_type_for("middleware.ibm_mq", "") == "middleware");
 }
 
