@@ -295,7 +295,7 @@
           "values": null
         },
         {
-          "description": "IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or \"-\" when the key is absent (or the home has no release file).",
+          "description": "IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified; on macOS, for a bundle with no usable release file, JVMVendor from its Info.plist; \"-\" when neither gives a vendor.",
           "example": "Eclipse Adoptium",
           "name": "vendor",
           "platforms": [
