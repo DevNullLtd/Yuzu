@@ -47,6 +47,14 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rollback.** No migration and no schema change, and this change writes no new durable state. A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this page, and it does not reverse the Echo changes described in the "Echo stores roll-ups only" and "Echo holds `echo.db` to a byte budget" sections below.
 
+## Behaviour change: the server refuses to start on a device inventory schema it cannot read (`device_inventory_store`)
+
+**Scope of this note.** The device-CI v2 record (migrations v2 and v3 of `device_inventory_store`) has not shipped in a release. A supported deployment starts from a fresh database (see "Deployment contract (hard cutover)" in the Forensics section of this page) and is not affected; this note matters only to a development or UAT database that ran an earlier build of the unreleased migrations. It is not a procedure for any other database: if a production database reaches this refusal, stop, do not run the statements below, and open an issue.
+
+**What changed.** After its migrations the store now reads every table and column it uses (a zero-row `SELECT` per table). If the database lacks one, the store does not open and the server refuses to start. The log shows two lines: `DeviceInventoryStore: post-migration schema projection check failed on <table> (SQLSTATE ...)`, then `[PG] Refusing to start: device inventory store migration/open failed`. SQLSTATE `42P01` or `42703` means the schema lacks a table or column; `42501` is a permission error on the store's schema (grant `SELECT`; a restart will not fix it); any other state (a dropped connection, a timeout) is not evidence of a schema defect, so restart once before changing the database. Before this change the store opened and every device record read with sections answered 503 (REST) or a retryable error (MCP) until the schema was repaired. Migration v2 is also now fixed text, not generated from the section list. There is no new durable state, and returning to an earlier build is outside the contract.
+
+**What to do.** For a development or UAT database only: stop the server, back up the database (the backup holds the same device records, including serial numbers, UUIDs and MAC addresses, which are personal data, so it carries the same retention and erasure obligations), then either drop the store's schema (`DROP SCHEMA device_inventory_store CASCADE;` and `DELETE FROM public.schema_meta WHERE store = 'device_inventory_store';`, run in one session; this deletes the stored device records until each device's next full sync) or, if you have confirmed the database ran only the earlier row-count-only v3, `UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store';`. Then start the server. A column added to the database by an operator does not trigger the refusal.
+
 ## Behaviour change: the Guardian compliance census orders by an event key and says when it cannot (`guaranteed_state_store` schema v4)
 
 **Scope of this note.** A supported deployment starts from a fresh database (see "Fresh deployment only" and "Deployment contract (hard cutover)" in this document), where the v4 migration runs over empty tables and none of the headroom below applies. The procedure below is for a database already at schema v3, such as a development or test deployment; it is not an upgrade path from an earlier build.
@@ -122,6 +130,16 @@ Both refusals write `result=denied` under the existing `access_review.attested` 
   A decision that was **overwritten** before the upgrade cannot be seen in this table, which keeps only the last decision. The only trace is the audit log: more than one `access_review.attested` or `access_review.flagged` row with `result=success` for the same `target_id` (inside the audit retention, 365 days by default).
 - **PostgreSQL 16 or newer is required** (the documented minimum): the attestation write uses `pg_input_is_valid`. On an older server the first attestation answers `503` and the server log shows SQLSTATE `42883`.
 - **Rolling back** restores the old overwrite behaviour. Nothing is stored differently, so decisions recorded under the new rules stay valid and nothing needs converting.
+
+## Behaviour change: installed-software `publisher` is never empty (`via:` origin labels)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.
+
+- **What the agent sends:** every row has a non-empty publisher: the declared vendor, else the origin label `via:<ecosystem>`; the per-source table is in the installed-software inventory manual.
+- **Hash:** the publisher is part of the inventory hash, which the agent and the server of the same build compute identically. Bring up every server replica before the agents of the same build enroll.
+- **What the server does with a label:** it treats a `via:` publisher as no vendor. The catalogue's publisher total excludes labels, a title's representative publisher prefers a declared vendor, and title matching ignores the label. The match is exact and case-sensitive on the lower-case prefix the agent writes, so a real publisher that happens to start with `VIA:` is still a vendor.
+- **Title dimension:** the software title dimension and curation queue are keyed on the raw (name, publisher, ecosystem) triple, so a title with no declared vendor is recorded under its `via:` label, not under an empty publisher.
+- **Scripts that read `publisher`:** it is never empty; test for the `via:` prefix to find rows with no declared vendor.
 
 ## Behaviour change: Windows software counts include Store apps, Chocolatey packages and winget presence
 
