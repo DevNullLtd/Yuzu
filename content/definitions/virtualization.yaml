@@ -77,7 +77,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:virtualization:dmi:permission_denied, linux:virtualization:cpuid:unavailable, windows:virtualization:smbios:truncated, macos:virtualization:hw_model:unreadable, linux:leg:exception. host: the hypervisor vendor (kvm, hyperv, vmware, xen, virtualbox, parallels, bhyve, qemu, acrn, aws, gce, alibaba, openstack, nutanix, apple or other) for a guest or host_with_hypervisor, the hardware manufacturer for bare_metal and unknown, "-" when not read.'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:virtualization:dmi:permission_denied, linux:virtualization:cpuid:unavailable, windows:virtualization:smbios:truncated, macos:virtualization:hw_model:unreadable, linux:leg:exception. host: the virtualization platform (kvm, hyperv, vmware, xen, virtualbox, parallels, bhyve, qemu, acrn, aws, gce, alibaba, openstack, nutanix, apple or other) for a guest or host_with_hypervisor, the hardware manufacturer for bare_metal and unknown, "-" when not read.'
         example: Apple Inc.
         platforms: [windows, linux, darwin]
       - name: field_4
