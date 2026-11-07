@@ -17,6 +17,9 @@
 ///       +    | name | version | publisher | install_date | kind | ecosystem | epoch | release |
 ///              arch | signature_status | distro_id | distro_version | install_location |
 ///              <slot 14, reserved, always empty> | package_id | source      an install row
+///              (publisher is never empty from a v3 writer: the declared vendor, else the
+///              origin label `via:<ecosystem>`; the parser takes it verbatim, see
+///              product_normalize.hpp kOriginLabelPrefix)
 ///       -    | row_hash                                                      a row-hash deletion
 ///       comp | kind | name | version | version_source | path | size | mtime | anchor_app
 ///  - `facet` is a `software_catalog::kSoftwareSources` value or `component_inventory`; `status`

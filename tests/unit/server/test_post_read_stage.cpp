@@ -352,6 +352,62 @@ TEST_CASE("post-read stage: an exempt server with no stage installed serves its 
     CHECK(PostReadStageRegistry::instance().stage_for(&s.svr) == nullptr);
 }
 
+TEST_CASE("post-read stage: the two process-global registries are safe under concurrent "
+          "install, record, lookup and forget on distinct servers",
+          "[postread][registry][concurrency]") {
+    // Socket-free: the registry and the inventory are process-wide. A production boot registers
+    // the main listener and the plaintext redirect listener (two server keys) from one thread,
+    // and tests or a later listener may touch them from others. Each worker owns its own
+    // never-listening server. A start gate makes the workers overlap, so a plain (non-TSan)
+    // build also has a chance to see a lost update; TSan is the detector that proves the
+    // mutexes do their job.
+    constexpr int kThreads = 8;
+    constexpr int kRounds = 100;
+    std::atomic<bool> go{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    // Joins every started worker on every exit, including a failed thread start part-way through
+    // the loop: a joinable std::thread destroyed during unwinding would terminate the whole test
+    // binary. (No std::jthread: Apple libc++ lacks it.)
+    yuzu::test::ScopeExit joiner{[&] {
+        go = true;
+        for (auto& w : workers)
+            if (w.joinable())
+                w.join();
+    }};
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&] {
+            try {
+                httplib::Server svr;
+                auto& reg = PostReadStageRegistry::instance();
+                Clean clean(&svr);
+                while (!go.load())
+                    std::this_thread::yield();
+                for (int r = 0; r < kRounds; ++r) {
+                    reg.install(&svr, pass_stage());
+                    HttplibRouteSink sink(svr);
+                    sink.Get("/yuzu_test_concurrent_registry", kNoop);
+                    if (reg.stage_for(&svr) == nullptr ||
+                        RouteInventory::instance().routes_for(&svr).empty())
+                        failures.fetch_add(1);
+                    RouteInventory::instance().forget(&svr);
+                    reg.forget(&svr);
+                    if (reg.stage_for(&svr) != nullptr ||
+                        !RouteInventory::instance().routes_for(&svr).empty())
+                        failures.fetch_add(1);
+                }
+            } catch (...) {
+                failures.fetch_add(1);
+            }
+        });
+    }
+    go = true;
+    for (auto& w : workers)
+        w.join();
+    CHECK(failures.load() == 0);
+}
+
 TEST_CASE("post-read stage: a regex route does not match a path longer than httplib's regex "
           "route path limit, so neither the stage nor the handler runs for it",
           "[postread][wiring][regex_cap][body_cap][bounds][integration]") {

@@ -81,23 +81,29 @@ public:
         return guardian_rule_agent_status_rows(*store_, rule_id);
     }
 
-    [[nodiscard]] std::optional<std::vector<GuardianDeviceGuardRow>>
-    device_guards(const std::string& agent_id) const override {
-        if (!store_)
+    [[nodiscard]] std::optional<GuardianDeviceGuardsReport>
+    device_guards(const std::string& agent_id, GuardianReadFault* fault) const override {
+        if (!store_) {
+            if (fault)
+                *fault = GuardianReadFault::kTransient;
             return std::nullopt;
-        return guardian_device_all_guards(*store_, agent_id);
+        }
+        return guardian_device_all_guards(*store_, agent_id, fault);
     }
 
     [[nodiscard]] std::optional<GuardianDeviceComplianceRollup>
     device_compliance(const std::string& baseline_name, const std::string& agent_id,
-                      bool* store_degraded, bool* pii_access_began) const override {
+                      bool* store_degraded, bool* pii_access_began,
+                      GuardianReadFault* fault) const override {
         if (!store_ || !baseline_store_) {
             *store_degraded = true;
             *pii_access_began = false;
+            if (fault)
+                *fault = GuardianReadFault::kTransient;
             return std::nullopt;
         }
         return guardian_device_compliance_rollup(*baseline_store_, *store_, baseline_name, agent_id,
-                                                  store_degraded, pii_access_began);
+                                                  store_degraded, pii_access_began, fault);
     }
 
     [[nodiscard]] std::vector<GuaranteedStateEventRow>

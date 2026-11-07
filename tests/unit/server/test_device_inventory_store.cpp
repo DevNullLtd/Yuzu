@@ -25,6 +25,7 @@
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1010,6 +1011,243 @@ TEST_CASE("device_ci section registry self-check", "[device_ci][v2]") {
     }
     CHECK(status_only == 3);
     CHECK(std::string(kDeviceCiSections[0].section) == "chassis");
+}
+
+namespace {
+
+// "name:type:nullable" for every column of a device_inventory_store table, in ordinal order.
+std::vector<std::string> live_columns(PgPool& pool, const std::string& table) {
+    std::vector<std::string> out;
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = 'device_inventory_store' AND table_name = $1 "
+        "ORDER BY ordinal_position",
+        std::vector<std::string>{table});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out.push_back(std::string(PQgetvalue(res.get(), i, 0)) + ":" +
+                      PQgetvalue(res.get(), i, 1) + ":" + PQgetvalue(res.get(), i, 2));
+    return out;
+}
+
+// "p" (primary key) and "f:c" (foreign key, ON DELETE CASCADE) rows of a device_inventory_store
+// table, sorted, with the constrained columns: e.g. "f:c:agent_id", "p:agent_id,ord".
+std::vector<std::string> live_constraints(PgPool& pool, const std::string& table) {
+    std::vector<std::string> out;
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT c.contype::text || CASE WHEN c.contype = 'f' THEN ':' || c.confdeltype::text "
+        "ELSE '' END || ':' "
+        "|| (SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM unnest(c.conkey) "
+        "WITH ORDINALITY AS k(attnum, ord) JOIN pg_attribute a ON a.attrelid = c.conrelid AND "
+        "a.attnum = k.attnum) FROM pg_constraint c WHERE c.conrelid = $1::regclass "
+        "AND c.contype IN ('p', 'f') ORDER BY 1",
+        std::vector<std::string>{"device_inventory_store." + table});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
+} // namespace
+
+// #7164: migration v2 is a frozen literal, so this is the tripwire that a registry edit made
+// WITHOUT a new migration cannot slip past. It runs the literal migrations on a fresh database
+// and compares what they created with what the live registry says the runtime reads. A new
+// table-backed kind, or a changed/reordered column list, fails here until a migration (v4+) and
+// this expectation move together. Expected shapes are written out, not derived, where the
+// registry is not the subject.
+TEST_CASE("device_ci schema created by the frozen migrations matches the section registry",
+          "[pg][device_ci][v2][migration]") {
+    // The pre-migrated template database is built by constructing the store, so it carries exactly
+    // what the frozen literals create; it is used (read-only) instead of a private database.
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    int table_backed = 0;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        if (d.table == nullptr)
+            continue;
+        ++table_backed;
+        std::vector<std::string> expected{"agent_id:text:NO", "ord:integer:NO"};
+        std::string cols = d.columns;
+        std::size_t pos = 0;
+        while (true) {
+            const auto comma = cols.find(',', pos);
+            expected.push_back(cols.substr(pos, comma == std::string::npos ? comma : comma - pos) +
+                               ":text:NO");
+            if (comma == std::string::npos)
+                break;
+            pos = comma + 1;
+        }
+        INFO("table " << d.table);
+        CHECK(live_columns(pool, d.table) == expected);
+        // The key shape delete_agent and the ON CONFLICT upserts depend on: one primary key on
+        // (agent_id, ord) and one cascading foreign key on agent_id (confdeltype 'c').
+        CHECK(live_constraints(pool, d.table) ==
+              std::vector<std::string>{"f:c:agent_id", "p:agent_id,ord"});
+    }
+    CHECK(table_backed == 7);
+
+    CHECK(live_columns(pool, "device_ci_section") ==
+          std::vector<std::string>{"agent_id:text:NO", "kind:text:NO", "level:text:NO",
+                                   "reason:text:NO", "row_count:integer:YES",
+                                   "content_digest:text:YES"});
+
+    // The 11 scalars appended to device_ci at wire positions 22-32, after the 26 v1 columns
+    // (v1 ends at last_seen) and blob_version.
+    const auto dev = live_columns(pool, "device_ci");
+    // 26 v1 columns, blob_version, then the appended scalars: tied to the wire constant, so a new
+    // scalar (kDeviceCiScalarFields grows) fails here until a migration adds its column.
+    REQUIRE(dev.size() == 26 + 1 + (yuzu::server::kDeviceCiScalarFields - 22));
+    CHECK(dev[26] == "blob_version:smallint:NO");
+    const std::vector<std::string> scalars{
+        "chassis_type",    "chassis_serial",      "chassis_asset_tag", "chassis_source",
+        "board_vendor",    "board_product",       "board_serial",      "board_source",
+        "machine_id_hash", "machine_id_algorithm", "machine_id_source"};
+    for (std::size_t i = 0; i < scalars.size(); ++i)
+        CHECK(dev[27 + i] == scalars[i] + ":text:NO");
+}
+
+// #7164: a database the runner calls current but whose schema lacks something this binary reads
+// (an earlier revision of the unreleased v2/v3, a stamped-by-another-binary schema_meta) must
+// refuse at construction, naming the table, not 503 on the first sections read.
+TEST_CASE("DeviceInventoryStore refuses at construction when the schema lacks a registry table "
+          "or column",
+          "[pg][device_ci][v2][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore first{pool}; // migrates a clean database
+        REQUIRE(first.is_open());
+    }
+    const auto exec = [&](const std::string& sql) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+
+    struct Case {
+        const char* what;
+        const char* breakage;
+        const char* named; // the table the log must name
+        const char* restore;
+    };
+    const Case cases[] = {
+        {"a registry kind with no table", "DROP TABLE device_inventory_store.device_ci_swap",
+         "device_ci_swap",
+         "CREATE TABLE device_inventory_store.device_ci_swap (agent_id TEXT NOT NULL REFERENCES "
+         "device_inventory_store.device_ci (agent_id) ON DELETE CASCADE, ord INTEGER NOT NULL, "
+         "device TEXT NOT NULL DEFAULT '', total_mb TEXT NOT NULL DEFAULT '', source TEXT NOT NULL "
+         "DEFAULT '', PRIMARY KEY (agent_id, ord))"},
+        {"a missing child-table column",
+         "ALTER TABLE device_inventory_store.device_ci_dimm DROP COLUMN part_number",
+         "device_ci_dimm",
+         "ALTER TABLE device_inventory_store.device_ci_dimm ADD COLUMN part_number TEXT NOT NULL "
+         "DEFAULT ''"},
+        {"the v3 content_digest column absent",
+         "ALTER TABLE device_inventory_store.device_ci_section DROP COLUMN content_digest",
+         "device_ci_section",
+         "ALTER TABLE device_inventory_store.device_ci_section ADD COLUMN content_digest TEXT NULL"},
+        {"the v3 row_count column absent",
+         "ALTER TABLE device_inventory_store.device_ci_section DROP COLUMN row_count",
+         "device_ci_section",
+         "ALTER TABLE device_inventory_store.device_ci_section ADD COLUMN row_count INTEGER NULL"},
+        {"the content_hash column absent",
+         "ALTER TABLE device_inventory_store.device_ci DROP COLUMN content_hash", "device_ci",
+         "ALTER TABLE device_inventory_store.device_ci ADD COLUMN content_hash TEXT NOT NULL "
+         "DEFAULT ''"},
+        {"a missing appended scalar on device_ci",
+         "ALTER TABLE device_inventory_store.device_ci DROP COLUMN machine_id_source",
+         "device_ci",
+         "ALTER TABLE device_inventory_store.device_ci ADD COLUMN machine_id_source TEXT NOT NULL "
+         "DEFAULT ''"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        exec(c.breakage);
+        {
+            yuzu::test::LogCapture cap(spdlog::level::err);
+            DeviceInventoryStore broken{pool};
+            CHECK_FALSE(broken.is_open());
+            const std::string logs = cap.text();
+            CHECK(logs.find("projection check failed on " + std::string(c.named) + " (SQLSTATE 42") !=
+                  std::string::npos);
+        }
+        exec(c.restore);
+        DeviceInventoryStore healed{pool};
+        CHECK(healed.is_open()); // each case is isolated: the restore returns a usable store
+    }
+
+    // Every table-backed registry kind, last column dropped in turn: a probe that skipped a table
+    // or a column of the registry's list would let one of these open.
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        if (d.table == nullptr)
+            continue;
+        const std::string cols = d.columns;
+        const std::string last = cols.substr(cols.rfind(',') + 1);
+        INFO("kind " << d.section << " column " << last);
+        exec("ALTER TABLE device_inventory_store." + std::string(d.table) + " DROP COLUMN " + last);
+        {
+            yuzu::test::LogCapture cap(spdlog::level::err);
+            DeviceInventoryStore broken{pool};
+            CHECK_FALSE(broken.is_open());
+            CHECK(cap.text().find("projection check failed on " + std::string(d.table) +
+                                  " (SQLSTATE 42703)") != std::string::npos);
+        }
+        exec("ALTER TABLE device_inventory_store." + std::string(d.table) + " ADD COLUMN " + last +
+             " TEXT NOT NULL DEFAULT ''");
+        DeviceInventoryStore healed{pool};
+        CHECK(healed.is_open());
+    }
+
+    // An EXTRA column (an operator addition, or a later migration this binary predates) is
+    // tolerated: the check is presence-only, in line with the ahead-database stance (#3894).
+    exec("ALTER TABLE device_inventory_store.device_ci_cpu ADD COLUMN operator_note TEXT NULL");
+    DeviceInventoryStore ahead{pool};
+    CHECK(ahead.is_open());
+}
+
+// #7164: the stored row_count / content_digest of a kind bind its section name, n_fields and
+// column order (device_ci_section_digest.hpp). Nothing else fails when a registry column list
+// changes, so this pins the shipped lists: an edit here must come WITH a migration that ALTERs the
+// table and NULLs row_count/content_digest for that kind (or a kSectionDigestPrefix bump), per
+// docs/postgres-store-playbook.md "Registry-backed tables". Update the expectation only together
+// with that migration.
+TEST_CASE("device_ci registry column lists are pinned to the stored digest layout",
+          "[device_ci][v2]") {
+    CHECK(std::string(yuzu::server::kSectionDigestPrefix) == "v1:");
+    const std::vector<std::pair<std::string, std::string>> pinned{
+        {"cpu", "idx,model,cores,threads,clock_mhz,socket_designation,stepping"},
+        {"dimm", "slot,size_mb,type,speed_mhz,manufacturer,part_number,serial"},
+        {"disk", "idx,model,size_gb,media_type,interface"},
+        {"swap", "device,total_mb,source"},
+        {"volume", "volume,mount_points,device,fstype,total_bytes,detail"},
+        {"partition", "disk,partition,size_bytes,type,mount_points,detail"},
+        {"topology", "topo_kind,name,uuid,members,detail"},
+    };
+    std::size_t seen = 0;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        if (d.table == nullptr)
+            continue;
+        ++seen;
+        const auto it = std::find_if(pinned.begin(), pinned.end(),
+                                     [&](const auto& p) { return p.first == d.section; });
+        INFO("kind " << d.section);
+        REQUIRE(it != pinned.end());
+        CHECK(it->second == d.columns);
+    }
+    CHECK(seen == pinned.size());
 }
 
 TEST_CASE("DeviceInventoryStore degrades (not empty) on a broken pool", "[device_ci]") {

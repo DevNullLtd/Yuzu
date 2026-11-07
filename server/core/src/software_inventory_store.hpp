@@ -79,7 +79,11 @@ struct SoftwareCursor {
 /// global-gated. Callers caveat the counts, exactly like the `query_software` route.
 struct SoftwareCatalogRow {
     std::string name;
-    std::string publisher; ///< representative publisher (max over the group); may vary
+    /// Representative publisher of the group: the greatest non-empty publisher that is not a
+    /// `via:` label (a declared vendor), else the greatest publisher overall (a
+    /// `via:<ecosystem>` label, or '' when every row has none). A label never wins over a
+    /// vendor. May vary across the group's rows.
+    std::string publisher;
     /// EXACT count of distinct devices carrying the title under the active
     /// kind/ecosystem/source filters (a device carrying it through two sources counts
     /// ONCE). One precomputed row per (title, filter grain, distinct dimension
@@ -169,7 +173,7 @@ struct CatalogRollupMeta {
     std::int64_t refreshed_at{0}; ///< epoch seconds of the last successful refresh; 0 = never
     std::int64_t total_titles{0};
     std::int64_t total_devices{0};
-    std::int64_t total_publishers{0};  ///< distinct non-empty publishers
+    std::int64_t total_publishers{0};  ///< distinct non-empty publishers; no `via:` labels
     std::int64_t total_installs{0};    ///< distinct (device, title) pairs
     std::int64_t installs_windows{0};  ///< EXACT distinct (device, title) pairs per OS family
     std::int64_t installs_macos{0};

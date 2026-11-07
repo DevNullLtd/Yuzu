@@ -314,17 +314,25 @@ check_strict(Path) ->
     %% deleted key (withdrawal silently off) or a typo (boot refused) is a red test here; the
     %% sys.config.prod copy carries only a commented example and sets none.
     CrlSource = proplists:get_value(mgmt_crl_source, YuzuEnv, undefined),
+    MaxValidity = proplists:get_value(mgmt_crl_max_validity_s, YuzuEnv, undefined),
     case lists:suffix("reference-gateway-sys.config", Path) of
         true ->
+            %% 8 days (#7070): above the 7 days a pre-#6919 server publishes (plus its 300 s
+            %% backdating), so a gateway upgraded first does not refuse every CRL mid-rollout, and
+            %% far below the far-future nextUpdate the bound exists to refuse.
+            ?assertEqual(691200, MaxValidity),
+            ?assert(MaxValidity > 7 * 86400 + 300),
             ?assertMatch({ok, #{source := {url, #{host := "server", port := 8443,
-                                                  path := "/api/v1/ca/crl"}}}},
+                                                  path := "/api/v1/ca/crl"}},
+                                max_validity_s := 691200}},
                          yuzu_gw_mgmt_crl_source:resolve(CrlSource, undefined, undefined,
-                                                         Listeners));
+                                                         Listeners, MaxValidity));
         false ->
             ?assertEqual(undefined, CrlSource),
+            ?assertEqual(undefined, MaxValidity),
             ?assertEqual({ok, none},
                          yuzu_gw_mgmt_crl_source:resolve(CrlSource, undefined, undefined,
-                                                         Listeners))
+                                                         Listeners, MaxValidity))
     end,
     %% The shipped path names a CA file this test host does not have, so the
     %% identity derives to nothing here; on a real install it is derived from the

@@ -482,11 +482,19 @@ groups:
             it did not answer in time; fetch_status means it answered with a
             status other than 200 (503 is "CRL not yet published": the server
             is still starting or its CA is unavailable); malformed or
-            too_large means the bytes are not a usable CRL (malformed also
-            covers a well-formed CRL that is not the issuer's complete base
-            list: a delta, a scoped or indirect one, or one with an
-            extension the gateway cannot process; the Yuzu server publishes
-            none of these, a corporate CA feed can); unverified or
+            too_large means the bytes are not a usable CRL; unsupported means
+            a well-formed CRL the gateway refuses by policy (not the issuer's
+            complete base list: a delta, a scoped or indirect one, or one
+            with an extension the gateway cannot process; the Yuzu server
+            publishes none of these, a corporate CA feed can);
+            validity_too_long means the CRL's nextUpdate is further past its
+            thisUpdate than mgmt_crl_max_validity_s allows (the same refused
+            bytes are counted once in a row and again once an hour, not once
+            per refresh, so read the gateway log and the state gauges, or
+            increase() over a long window, rather than the rate; this applies
+            to malformed, unsupported, unverified, issuer_mismatch and
+            validity_too_long, while future_dated, replay, the fetch reasons
+            and a fetch-reported too_large count every attempt); unverified or
             issuer_mismatch means the CRL was not signed by the CA the
             management listener trusts, or by a CA whose key type the
             gateway cannot bind (RSA, EC and EdDSA are supported); future_dated means the CRL is dated
@@ -512,9 +520,13 @@ groups:
             still admits the server until nextUpdate plus mgmt_crl_grace_s
             (default 24 hours), then refuses every stream as
             revocation_stale. The CRL is not being refreshed: the server
-            stopped publishing, or this gateway cannot fetch it. Check
-            yuzu_gw_mgmt_crl_rejected_total{reason} for the failing class and
-            the server's own CRL publication (the elected server leader
+            stopped publishing, this gateway cannot fetch it, or it fetches
+            a CRL it refuses because of its bytes (malformed, unsupported,
+            unverified, issuer_mismatch or validity_too_long). Check
+            yuzu_gw_mgmt_crl_rejected_total{reason} for the failing class
+            (refused bytes are counted once in a row and again once an hour,
+            so read the value or increase() over a long window, not the rate)
+            and the server's own CRL publication (the elected server leader
             republishes when under 24 hours remain, so a period with no
             leader stops it, and so does a server that cannot reach the CA
             key; restarting a server replica republishes at startup); restore
@@ -545,11 +557,17 @@ groups:
             file_unreadable means a {file, Path}
             source or a cacertfile on a dead mount that has stopped
             answering; malformed and too_large mean the bytes are not a
-            usable CRL (malformed includes a well-formed delta, scoped or
+            usable CRL; unsupported means a well-formed delta, scoped or
             indirect CRL, or one with an unprocessable critical extension,
-            from a feed that is not the Yuzu server's); unverified,
+            from a feed that is not the Yuzu server's; validity_too_long
+            means a CRL wider than mgmt_crl_max_validity_s; unverified,
             issuer_mismatch, replay and future_dated
-            mean the server is serving a CRL this gateway will not take. A
+            mean the server is serving a CRL this gateway will not take. The
+            same refused bytes are counted once in a row and again once an hour,
+            not once per refresh (replay, future_dated, too_large and the
+            fetch reasons count every attempt), so a quiet counter behind
+            this alert is expected for a CRL that is refused for the same
+            reason on every refresh. A
             watcher process that is itself wedged shows no new rejections and
             no new log lines. The rule compares the Prometheus clock with the
             gateway's clock, so keep both on NTP. If you raised
@@ -4670,11 +4688,16 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Three sources on the SAME counter (guardian_census, #5690, is the census
-      # pending-evidence count read: it serves no empty result, its gauge keeps
-      # its last value), each keyed by reason
+      # Four sources on the SAME counter (guardian_census, #5690, covers the
+      # census pending-evidence count read: it serves no empty result, its
+      # gauge keeps its last value; guardian_census_device, #7217, covers the
+      # two per-device unrepresented-pending reads: their degrade is a REST 503 /
+      # MCP error, never an empty result, and does not touch the gauge), each
+      # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
-      # on guardian_state for the Apps list's in-flight budget): "guardian_state"
+      # on guardian_state for the Apps list's in-flight budget, and
+      # statement_timeout on guardian_census_device for a read that ran past its
+      # 5 s budget, most likely because of a large retained pending backlog): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -4703,9 +4726,23 @@ groups:
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
             source="guardian_census" means the census pending-evidence count
-            read (#5690) failed, which only freezes the
+            read failed (#5690), which freezes the
             yuzu_server_guardian_census_pending_events gauge at its last value (or
             leaves it absent before the first successful read).
+            source="guardian_census_device" means one of the two per-device
+            unrepresented-pending reads failed (#7217; device-compliance and the
+            per-device guards read): the degrade is a 503 on REST or an MCP
+            error, never an empty result, and the gauge is not affected.
+            reason="statement_timeout" on that source is not transient: the
+            read ran past its 5 s budget, most likely because the retained
+            pending backlog is large (a lock wait, a loaded database or an
+            administrator cancel is reported the same way), the REST 503
+            carries retry_after_ms null and the MCP error is non-retryable, and
+            the remediation in both says a retry usually fails identically
+            until the cause clears; compare
+            max(yuzu_server_guardian_census_pending_events) and see "When a
+            verdict is flagged or does not move", step 5, in the Guaranteed
+            State guide.
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
             errored_rule_count/uncertain_rule_count) is degrading: the read itself returns a typed
