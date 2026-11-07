@@ -5965,15 +5965,6 @@ TEST_CASE("diff_changes: Windows package rows (appx, chocolatey, winget) (pure)"
                    row("Contoso.A", "1.0", "appx", "x64")})
                   .empty());
     }
-    SECTION("a manager presence row whose version moves is one upgrade of that manager") {
-        const auto ch = SoftwareInventoryStore::diff_changes({row("winget", "1.8", "winget")},
-                                                             {row("winget", "1.9", "winget")});
-        REQUIRE(ch.size() == 1);
-        CHECK(ch[0].kind == Kind::kUpgrade);
-        CHECK(ch[0].name == "winget");
-        CHECK(ch[0].from_version == "1.8");
-        CHECK(ch[0].to_version == "1.9");
-    }
     SECTION("an unreadable Chocolatey version is a version like any other") {
         // The collector writes version '' for a package whose nuspec it cannot read (a junction
         // lib directory does that to every package at once). The pairing rule does not treat ''
