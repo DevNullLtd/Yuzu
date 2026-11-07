@@ -7,7 +7,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--export([handle_event/4]).
+-export([handle_event/4, log/2]).
 
 %% thisUpdate / nextUpdate of every fixture CRL (nextUpdate is thisUpdate + 300 s + 48 h).
 -define(THIS, 1793628888).
@@ -149,7 +149,8 @@ authz_test_() ->
 %%--------------------------------------------------------------------
 
 guard_test_() ->
-    Keys = [mgmt_crl_source, mgmt_crl_grace_s, mgmt_crl_refresh_ms, grpc_listeners],
+    Keys = [mgmt_crl_source, mgmt_crl_grace_s, mgmt_crl_refresh_ms, mgmt_crl_max_validity_s,
+            grpc_listeners],
     Mgmt = #{name => mgmt, service_protos => [management_pb],
              tls => #{certfile => "gw.pem", keyfile => "gw.key",
                       cacertfile => yuzu_gw_crl_fixture:path("root-ca.pem")},
@@ -218,6 +219,46 @@ guard_test_() ->
            application:set_env(yuzu_gw, mgmt_crl_refresh_ms, 10),
            ?assertEqual({error, bad_mgmt_crl_source}, yuzu_gw_app:check_mgmt_crl_source())
        end},
+      {"mgmt_crl_max_validity_s is unset by default and published when set",
+       fun() ->
+           application:set_env(yuzu_gw, mgmt_crl_source, {file, "/x"}),
+           ?assertEqual(ok, yuzu_gw_app:check_mgmt_crl_source()),
+           ?assertNot(maps:is_key(max_validity_s, yuzu_gw_mgmt_crl_source:policy())),
+           application:set_env(yuzu_gw, mgmt_crl_max_validity_s, 691200),
+           ?assertEqual(ok, yuzu_gw_app:check_mgmt_crl_source()),
+           ?assertMatch(#{max_validity_s := 691200}, yuzu_gw_mgmt_crl_source:policy())
+       end},
+      {"mgmt_crl_max_validity_s with no source logs one line saying it is inert",
+       fun() ->
+           Handler = yuzu_test_crl_inert_key_log,
+           Prev = maps:get(level, logger:get_primary_config()),
+           try
+               %% the DEFAULT level: the line must be visible without raising it
+               ok = logger:set_primary_config(level, notice),
+               catch logger:remove_handler(Handler),
+               ok = logger:add_handler(Handler, ?MODULE,
+                                       #{level => all, config => #{test => self()}}),
+               application:set_env(yuzu_gw, mgmt_crl_max_validity_s, 691200),
+               ?assertEqual(ok, yuzu_gw_app:check_mgmt_crl_source()),
+               ?assertEqual(none, yuzu_gw_mgmt_crl_source:policy()),
+               ?assertEqual(1, length(inert_lines())),
+               application:unset_env(yuzu_gw, mgmt_crl_max_validity_s),
+               ?assertEqual(ok, yuzu_gw_app:check_mgmt_crl_source()),
+               ?assertEqual(0, length(inert_lines()))
+           after
+               catch logger:remove_handler(Handler),
+               logger:set_primary_config(level, Prev)
+           end
+       end},
+      {"an out-of-range mgmt_crl_max_validity_s refuses the boot and publishes nothing",
+       fun() ->
+           application:set_env(yuzu_gw, mgmt_crl_source, {file, "/x"}),
+           [begin
+                application:set_env(yuzu_gw, mgmt_crl_max_validity_s, V),
+                ?assertEqual({error, bad_mgmt_crl_source}, yuzu_gw_app:check_mgmt_crl_source()),
+                ?assertEqual(none, yuzu_gw_mgmt_crl_source:policy())
+            end || V <- [0, -1, 3599, 31536001, "691200", 1.5, infinity]]
+       end},
       {"a url source with no CA to trust refuses the boot (a plaintext lab listener has none)",
        fun() ->
            application:set_env(yuzu_gw, grpc_listeners,
@@ -233,3 +274,23 @@ guard_test_() ->
            ?assert(Pos(check_mgmt_auth_config) < Pos(check_mgmt_crl_source)),
            ?assert(Pos(check_mgmt_crl_source) < Pos(check_mgmt_listener_posture))
        end}]}.
+
+%% logger handler for the test above
+log(#{msg := Msg}, #{config := #{test := Pid}}) ->
+    Text = case Msg of
+               {string, S} -> lists:flatten(io_lib:format("~ts", [S]));
+               {F, A} -> lists:flatten(io_lib:format(F, A));
+               _ -> ""
+           end,
+    Pid ! {inert_log, Text},
+    ok.
+
+inert_lines() ->
+    receive
+        {inert_log, Text} ->
+            case string:find(Text, "has no effect") of
+                nomatch -> inert_lines();
+                _ -> [Text | inert_lines()]
+            end
+    after 100 -> []
+    end.

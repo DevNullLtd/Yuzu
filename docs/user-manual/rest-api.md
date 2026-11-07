@@ -40,7 +40,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
 
 #### `Sec-Audit-Failed` and the behavioural-PII audit posture
 
-Routes that serve per-person behavioural / compliance PII (the `dex.device.view`, `dex.device.app_perf.view`, `guardian.device.view`, and `dex.signal.view` verbs) audit the access **before** serving. If that audit row cannot durably persist (audit DB locked/full, or an allocation failure), the gap is surfaced — never silently swallowed — but the posture differs by surface, by design:
+Routes that serve per-person behavioural / compliance PII (the `dex.device.view`, `dex.device.app_perf.view`, `guardian.device.view`, and `dex.signal.view` verbs) audit the access. Most of these verbs write the row before the read, while `guardian.device.view` (REST, the MCP tool and the device Guardian lens) writes it after the read, by the read's outcome (see [Audit Log](audit-log.md), "Behavioural-PII access-audit rows"). If that audit row cannot durably persist (audit DB locked/full, or an allocation failure), the gap is surfaced — never silently swallowed — but the posture differs by surface, by design:
 
 - **REST JSON endpoints fail closed:** they return `503` + `Sec-Audit-Failed: true` and serve **no** data, so a machine integration (CMDB / ServiceNow / agentic worker) never records evidence-less PII as audited. Distinguish this transient, retryable `503` from a non-transient misconfiguration `503` by the presence of the `Sec-Audit-Failed` header.
 - **Dashboard HTMX fragments set-and-proceed:** they set `Sec-Audit-Failed: true` but **still render**, so a transient audit hiccup never blanks a human operator's lens.
@@ -8449,6 +8449,8 @@ Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, 
 
 Every row carries `source` — the `<plugin>.<action>` that produced it (an **open set**; `""` for rows ingested before the field existed). Rows therefore have **14 fields**.
 
+`publisher` is an unverified attribution and is never empty: the declared vendor, else the origin label `via:<ecosystem>` (for example `via:snap`) when the source declares none.
+
 **Pagination (keyset).** `next_cursor` is non-null when more rows may exist (`result_truncated_by_cap: true` is set at the same moment — also in export mode); pass it back as `cursor` to continue. The cursor is **opaque** — never parse it. It is bound to the filter set: a malformed cursor, or one issued for a different filter set, is a `400` (`invalid cursor` / `cursor was issued for a different filter set`), never a silent restart. Under push-down the cursor is the last row of the page. When the page was post-filtered (below), a page can be short or empty while `next_cursor` is non-null — keep paging until `next_cursor` is `null`; that cursor never names a row you were not served (see the Scope paragraph).
 
 **Scope (`devices_omitted` — re-specified).** The gate's composed `meet(management-group, service-scope)` visibility set is **pushed into SQL** (`agent_id = ANY(...)`) for up to 10 000 visible devices, so a confined caller (management-group-confined operator or a correctly-confined service-scoped token) gets **complete pages of its own devices** and nothing is hidden. `devices_omitted` is the count of distinct devices hidden by the **in-process post-filter** used only for a scope wider than that bound. It is `0` under push-down, so there an empty page means no matching software in your scope. Above 10 000 visible devices it is a distinct-device count **within the scanned window(s)** and still signals that out-of-scope matches exist (bounded and audited). A `denied` audit row is written when it is greater than `0`, or when the request names an `agent_id` outside the caller's scope (the response is then empty with `devices_omitted` unchanged; the row says `agent_id outside the caller's scope`). On a wide scope the page is refilled with at most four bounded store reads, so a page can be empty with a non-null `next_cursor`; the cursor then re-anchors at the last row **you were served** (or at the start) and carries a count of the rows scanned since, which the next request passes over — no identifier, name or version of an out-of-scope row is ever in it. A row inserted inside that skipped span during a walk can be missed or repeated, the same class as the `install_id` churn already noted for concurrent resyncs; a wide-scope walk is best-effort under concurrent change, because the count is of positions: deleting an out-of-scope row inside the skipped span between pages, or widening the caller's scope between pages, can make the next page skip or repeat a row. A long run of out-of-scope rows costs proportionally more to resume, and a statement timeout there degrades the page to a 503 (tracked in #5698). An export on a wide scope reads at most four bounded windows, so it can hold fewer than `limit` rows with `X-Result-Truncated-By-Cap` set. `result_truncated_by_cap` is present only when more rows may exist (push-down: `count == limit`; wide scope: the page filled early or the read bound was reached). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
@@ -8523,6 +8525,7 @@ A repeated parameter, a parameter that is not valid UTF-8 or contains a NUL byte
 ```
 
 - `totals{titles,installs}` cover **every row matching the filters**, not just this page (same predicate as the rows), so a client can say "N of M". `installs` sums each title's exact distinct-device count (a device carrying two matching titles counts twice); unfiltered, it equals `kpis.installs`.
+- `titles[].publisher` is the declared vendor when any row of the title has one, else the origin label `via:<ecosystem>`. `kpis.publishers` counts distinct declared vendors and excludes labels. `q` matches the publisher text literally, so `q=via:` lists the label-only titles.
 - `kpis` is present on the **first fleet page only** — it is `null` on continuation pages and on the per-device view. The headline numbers come from the hourly refresh; percentages are derived (`os_pct` of installs, rounded; `stay_current.pct` is `null` when no title has a known version; `sprawl.pct` to one decimal). `coverage` is **counts**, not a ratio: `reporting` = devices with stored inventory, `connected` = devices currently connected (a registry read, `null` when unavailable), `stale` = devices not seen in 48 hours (`null` when that bounded count is unavailable). There is deliberately no coverage percentage — no honest denominator exists. `building: true` with zero counts means the rollup has never been computed: the JSON page is still a `200` (the page must render), but the fleet `format=csv` export is a `503` until the first refresh lands, because an empty file would read as "no titles" (the per-device export's rows and counts do not depend on the rollup and it still answers `200`; its `newest_version` column is blank until the first refresh). If the `503` persists past one hourly refresh the catalogue is not building but failing (a fleet above the ~6,000-endpoint refresh ceiling, #5545, or a database role without `TEMPORARY`): see [inventory.md](inventory.md) "Scale ceiling" and `yuzu_inventory_catalog_rollup_total{outcome="error"}`, and do not retry in a loop.
 - **Cursor.** `next_cursor` is non-null when the page is full. It is bound to the filter set **and to the catalogue refresh generation** (`kpis.refreshed_at`, 1-second granularity — two refreshes inside one second share a generation). A malformed cursor, a cursor from a different filter set, or one issued **before the latest refresh** is a `400` (`invalid cursor` / `cursor was issued for a different filter set` / `cursor predates the current catalogue refresh; restart from the first page`) — a client holding a stale cursor restarts from the first page. If a refresh lands *during* a first-page read the server re-reads once; a second move is a `503`.
 - **Per-device view** (`agent_id`): admitted for an in-scope device. For a confined caller `newest_version` is blank and `newest_omitted: true` (the newest version is a fleet-wide fact). A device outside the caller's scope returns an empty page with `devices_omitted: 1` and a `denied` audit row (no oracle on whether the device exists).
@@ -8617,7 +8620,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet` and `jvm`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget` and `appx`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -8731,7 +8734,7 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | Parameter | Meaning |
 |---|---|
 | `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
-| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
 
 ```json
 {
@@ -10453,8 +10456,8 @@ A failed read of the execution store answers `503` with `retry_after_ms: 2000`, 
 
 Server-side per-plugin configuration, sealed plugin secrets, and the plugin/action **kill switch**
 (the `plugin_config_store` Postgres schema; decision record
-[ADR-3005](../adr/3005-plugin-config-store.md)). Every response uses the `{data, meta}` envelope and
-every error the A4 envelope. Plugin and action names must start with a lowercase ASCII letter, followed
+[ADR-3005](../adr/3005-plugin-config-store.md)). Every success response carries `meta`: reads and writes use the `{data, meta}` envelope and both
+`DELETE`s return `{deleted, meta}`. Every error uses the A4 envelope. Plugin and action names must start with a lowercase ASCII letter, followed
 by lowercase letters, digits or `_` (1–64 bytes). A key follows the same rule but may also contain
 internal dots for a nested path such as `smtp.host`, up to 128 bytes. A store that is unavailable
 answers `503` with `retry_after_ms: 2000`.
@@ -10493,10 +10496,10 @@ administrator can read this route but not the panel.
 }
 ```
 
-**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, a
-service-scoped token, or an authorization store that is closed or degraded, which fails closed),
-`503` (the plugin config store is unavailable, or the authorization store is unavailable to an engine
-principal).
+**Errors:** `400` (the `plugin` query parameter is not a valid plugin name), `401` (not signed in),
+`403` (no global `PluginConfig:Read`, a confined grant, a service-scoped token, or an authorization
+store that is closed or degraded, which fails closed), `503` (the plugin config store is
+unavailable, or the authorization store is unavailable to an engine principal).
 
 #### `GET /api/v1/plugin-config/{plugin}/{key}`
 
@@ -10579,7 +10582,8 @@ counts as disabled. This view instead reports the store error. If no row has eve
 reads `enabled: true`. Without `os` the route reports only the all-OS layer and never shows a per-OS
 OFF row. With `os`, `enabled` is the effective state of the two layers combined: the OS layer can
 narrow the all-OS layer but never widen it, and within the OS layer an `action@os` ON row overrides a
-`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row).
+`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row), and
+`reason`, `set_by` and `updated_at_ms` come from that same row.
 
 ```json
 {
@@ -10616,8 +10620,72 @@ rule delivery, disable or remove the rules instead. The response returns the row
 not the effective state, in the same shape as the `GET` above.
 
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
-plugin/action/os/reason, or `?os=` present but empty), `413`, `500`, `503` (store unavailable, or the
-audit row could not be saved).
+plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
+may not have been applied: see "After a `500`" below), `503` (store unavailable, or the audit row could not be saved).
+
+**After a `500`.** The write may or may not have been applied, and the `GET` cannot always tell. Read
+the switch back with a `GET` for the same `plugin`, `action` and `os` (needs `PluginConfig:Read`), then:
+
+- If the `GET` answers `503`, the store is unavailable. Wait until the server is ready and read the switch
+  back again, then follow the rest of this list. If you cannot read it back: for a stop (`enabled` false),
+  repeat the `PUT`; for an enable, ask a holder of `PluginConfig:Read` to read it, and do not repeat it.
+- If the `GET` answers `403`, either you hold `PluginConfig:Write` but not `PluginConfig:Read`, or the
+  authorization store is degraded (it shares the database with the plugin config store, so the fault behind
+  the `500` can cause this too). Wait until the server is ready and read the switch back again. If it
+  still answers `403`, ask a holder of `PluginConfig:Read`, or, for a stop, repeat the `PUT`.
+- If `source` is empty, no row exists for this scope key, yours included: repeat the `PUT`.
+- If `source` names the row you wrote (`plugin`, `plugin.action`, with `@os` appended when `os` was set),
+  `enabled` and `reason` are what you sent and `set_by` is you, the write applied. For a whole-plugin stop
+  (`action` omitted) that covers the plugin row only: an action with its own ON row keeps running, so check
+  any action that matters with `?action=`.
+- If `source` names the plugin row of your own layer where you wrote an action row (`plugin` where you wrote
+  `plugin.action`, `plugin@os` where you wrote `plugin.action@os`), your action row is absent: within a layer
+  the `GET` picks an action row over the plugin row, and the server never deletes a kill-switch row. This is
+  the same state as an empty `source`: repeat the `PUT`.
+- If `source` names your row but `enabled`, `reason` or `set_by` differ, either your write did not apply
+  and the row still holds an earlier value, or someone changed the switch after it; the `GET` cannot tell
+  which. Do the audit check below.
+- If you set `os` and `source` names a row without `@os`, the all-OS layer decided the effective state, and
+  your `@os` row, if it exists, can be masked by a disabling all-OS row, so the `GET` does not show whether
+  your write applied. Do the audit check below for your own scope key, and read the `source` key as well.
+
+**Audit check.** Read the rows with
+`GET /api/v1/audit?action=plugin_config.kill_switch.set&target_type=PluginConfig&target_id=<scope key>&since=<epoch seconds>&limit=1000`
+(needs `AuditLog:Read`, which is admin-only while RBAC is off). The scope key is the `target_id` shown
+above, `<plugin>[.<action>][@<os>]`; use your own. Set `since` at least 10 minutes before your first
+request: the server clock stamps the rows, not yours, and a `since` that is too late hides your own rows
+and other writers' rows, which would read below as if nobody had written. Rows come back newest first;
+each has an `id`, a `principal`, a `detail` (`enabled=true` or `enabled=false`, plus the `reason` when one
+was given) and a `result` of `attempted`, `success` or `failure`. Timestamps are whole seconds, so "after"
+below means a higher `id`, never a later timestamp. Your own `attempted` row must be in the result; if it
+is not, widen `since` or page with `offset` before concluding anything.
+
+Take your own failed requests out first. Every `attempted` or `failure` row with your `principal` and
+exactly your `detail` is yours, from this request or an earlier retry, and a row from your own other
+session with that same `detail` cannot differ from your write, so ignore all of them. Then count the rest,
+from any principal (a row from your own account with a different `detail` counts): a `success` or `failure`
+row with a higher `id` than your first `attempted` row (a `failure` row means the write errored, not that
+it did not apply); and any `attempted` row with no `success` or `failure` row of the same `principal` and
+`detail` after it, whatever its `id`, because that write may land after yours or its outcome row was lost.
+If there is no such row, no other write is recorded: repeat the `PUT`. If there is one, do not repeat the `PUT` until you have agreed the intended
+state with that operator. The exception is a stop (`enabled` false): repeat it and tell them. A repeated
+stop replaces whatever the row holds, including their re-enable, which is the safe direction for an
+emergency but not harmless.
+
+If `source` named another key, read that key's rows the same way to understand the effective state: a
+change at that row decides it, so agree it first, and a repeated enable will not change the effective
+state while that row stands. Only rows on your own scope key decide whether to repeat.
+
+If you do not hold `AuditLog:Read`, or the audit read answers `403` or `503` and keeps doing so after the
+server is ready (the authorization or audit store is degraded, which the fault behind the `500` can cause
+too), you cannot read the audit rows: wait and retry first, then ask a holder of `AuditLog:Read` to check,
+giving them your `principal`, your exact `detail`, your first request time and the scope key, so they ignore
+your own rows by the rule above. If nobody can and your request was a stop, repeat it; if it was an enable,
+do not repeat it.
+
+A repeat is idempotent: it leaves the same `enabled` and `reason` but replaces `set_by` and
+`updated_at_ms`, and writes its own audit rows. The `attempted` row of the failed request stays in the
+trail, with a `failure` row after it when that row could be saved.
 
 ---
 
@@ -10663,6 +10731,11 @@ Mint a one-time upload grant for an agent. Operator-facing.
 SHA-256 digest. The response is sent `Cache-Control: no-store, no-cache, must-revalidate`
 and `Pragma: no-cache`.
 
+**Audit:** `upload_grant.mint` is written after the grant is created, or when the store refuses the mint. It
+is set-and-proceed: a row that cannot be saved sets `Sec-Audit-Failed` and the grant stands (the MCP twin
+`mint_upload_grant` reports `audit_persisted:false` in its result instead). **Known defect (#5626):** the
+shipped agent client cannot yet redeem a grant, see [Uploads](#uploads).
+
 #### `GET /api/v1/upload-grants`
 
 List upload grants. **Permission:** `UploadGrant:Read`, routed through
@@ -10678,10 +10751,15 @@ the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permiss
 
 Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
-revocable (already redeemed or already revoked). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
+revocable (already redeemed or already revoked), and `503` if the store is unavailable or the
+`attempted` audit row cannot be saved. When the audit row could not be saved nothing was revoked, so
+retry. After a store error the revoke may or may not have applied: retry, and a `404` on the retry then
+means the first call applied, the grant was redeemed or revoked by someone else in the meantime, or it never
+existed; read the grant's state with `GET /api/v1/upload-grants` (needs `UploadGrant:Read`). The two `503`
+causes carry different messages. An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
-upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
+upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads) (read its known-defect note first).
 The `content_dist` agent plugin's `upload_file` action is the reference
 client — see its [InstructionDefinition](../../content/definitions/t2_capabilities.yaml)
 for the operator-facing parameters (`path`, `grant_id`, `grant_secret`).
@@ -10698,6 +10776,21 @@ session credential (`X-Yuzu-Upload-Session`). There is no `Permission:` line for
 MCP twin: MCP authenticates as an operator, and this credential belongs to the agent (a permanent
 ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the reference client.
 
+**Known defect (#5626).** The server's session check does not yet exempt these five routes,
+so a request that carries only the grant or session header is answered `401` with the generic
+`{"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}}` body before the handler
+runs. That body has no `reason`, unlike the handler's own `401` values below. Until #5626 is fixed, a
+client that presents only the grant or session header, as the shipped `upload_file` client does, cannot
+open an upload, so the protocol described here cannot start. There is no supported workaround: minting a
+grant succeeds, but the agent cannot redeem it and an unredeemed grant expires. Never put an operator
+credential on the agent to get past the refusal: it would give the endpoint operator authority, and the
+shipped client cannot send one. Server-side the refusal leaves no audit row and no per-route metric (only
+the fleet-wide `yuzu_http_requests_total` 401 count moves). To check for it, look for `upload_grant.mint`
+success rows older than 15 minutes (the longest grant lifetime) with no `upload_grant.session_open` row of any
+result for that grant id, or grants that `GET /api/v1/upload-grants` still lists as minted past their
+`expires_at` (needs `UploadGrant:Read`), while agents report `401` and `yuzu_server_audit_emit_failed_total` is flat (a lost row looks the same).
+Revoke the unused grants or let them expire.
+
 **Common to all five routes:**
 
 - **TLS required.** On a deployment serving plain HTTP, every route returns `400` with `reason: tls_required`.
@@ -10710,16 +10803,19 @@ ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the ref
 - **Credentials.** Both headers are `<id>.<secret>`. An unknown id and a wrong secret get the same
   `401` (`grant_unknown` / `session_unknown`). For the four `{upload_id}` routes, the id in
   `X-Yuzu-Upload-Session` must equal the `{upload_id}` path segment, or the request also gets `401 session_unknown`.
-- **Expiry.** A session expires when its grant expires. The first request after `expires_at` (status,
-  chunk, commit or cancel) discards the partial file and returns `410 expired`.
+- **Expiry.** A session expires when its grant expires. A request after `expires_at` (status, chunk,
+  commit or cancel) on a session that is still open or already expired returns `410 expired`. A
+  session that was committed or cancelled before then keeps answering as terminal (`409 session_terminal`;
+  status answers `200`). The request that wins the expiry transition also tries to discard the partial
+  file; a removal that fails is logged and the file stays.
 - **Body cap.** Every `/api/v1/uploads` route is capped at 8 MiB before authentication and must send a
-  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps).
+  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407).
 - **Store unavailable:** `503`.
 
 #### `POST /api/v1/uploads`
 
 Redeems a grant and opens an upload session. Send header `X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`
-and no body. Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
+and no body (send `Content-Length: 0`; a `POST` without a `Content-Length` is answered `411`). Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
 
 **Response (`201`):**
 
@@ -10742,8 +10838,8 @@ Returns the session's status, for example so an agent can resume. Send `X-Yuzu-U
 `open`, `committed` or `cancelled`; a committed or cancelled session still answers `200` with its
 final state. An expired session never answers `200`: it gets `410 expired`. Neither `upload_id` nor the declared size is returned.
 
-**Errors:** `401 session_unknown`; `410 expired`. When this request is the first one after expiry, it
-also discards the partial file.
+**Errors:** `401 session_unknown`; `410 expired`. When this request wins the expiry transition, it
+also tries to discard the partial file (a removal that fails is logged and the file stays).
 
 #### `PUT /api/v1/uploads/{upload_id}/chunk`
 
@@ -10759,10 +10855,14 @@ from there); `409 session_terminal`; `410 expired`; `413 chunk_too_large`; `413 
 asserted `total` or the running total exceeds the grant's `declared_max_size`); `500` (the file could
 not be opened or written).
 
-**`size_exceeded` ends the session:** the server cancels it and discards the partial file.
+**`size_exceeded` attempts to end the session:** the server tries to cancel it and, when that cancel succeeds, discards the partial file. The request answers `413` either way.
 
 **Audit:** chunks are not audited one by one. Only `upload_grant.chunk` `failure` rows for `expired`
-and `size_exceeded` are written.
+and `size_exceeded` are written. Like the other device-side upload rows, this is set-and-proceed: a row
+that cannot be persisted sets `Sec-Audit-Failed` on the response and the request still completes.
+The header reaches the calling agent; operators see a dropped row through
+`yuzu_server_audit_emit_failed_total` and the `YuzuAuditPersistFailures` alert (an audit hook that throws
+is logged as a WARN line beginning `audit_fn threw` and still sets the header, but is not counted).
 
 #### `POST /api/v1/uploads/{upload_id}/commit`
 
@@ -10780,14 +10880,15 @@ and it must match the grant's `expected_sha256` if one was set. The file must al
 
 **Errors:** `400` (`sha256` missing); `401 session_unknown`; `409 session_terminal` (including when a
 concurrent commit or cancel got there first); `410 expired`; `422 hash_mismatch` (the session is
-cancelled and the partial file discarded); `500` (the stored file could not be read back for
-verification).
+cancelled and the server tries to discard the partial file); `500` (the stored file could not be read back for
+verification; the session stays open, so the commit can be retried); `503` (store unavailable; read the
+session status before retrying).
 
 **Audit:** `upload_grant.commit` (`success` with `size=<n>`, or `failure`).
 
 #### `DELETE /api/v1/uploads/{upload_id}`
 
-Cancels an open session and discards the partial file. Header `X-Yuzu-Upload-Session`; no body.
+Cancels an open session and tries to discard the partial file (a removal that fails is logged and the file stays). Header `X-Yuzu-Upload-Session`; no body.
 
 **Response:** `204`.
 
@@ -10904,9 +11005,27 @@ Per-guard fleet-wide agent-status drilldown (#4037, api-parity #2146 Batch A) �
 Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's state for ONE device, unscoped to any Baseline. Machine-readable twin of the dashboard's per-device Guardian lens (`/fragments/device/guardian`). Genuinely distinct from `GET .../device-compliance` below, which answers "is this device compliant with this ONE named Baseline" (requires both `agent_id` **and** `baseline`, and returns a baseline-shaped response) — this route has no `baseline` parameter and returns every guard the device has EVER reported, regardless of Baseline membership.
 
 - **Permission:** `GuaranteedState:Read`, per-device scoped (management-group aware) — same `scoped_perm_fn(GuaranteedState, Read, agent_id)` gate `GET .../device-compliance` and the dashboard Guardian device lens both use.
-- **Response:** `data.agent_id`, `data.guards[]` of `{rule_id, name, state, updated_at, order_uncertain, projection_pending}`, `data.total_guards`. A device with no reported guards returns an empty `guards[]`, not an error. `order_uncertain` is sticky: the verdict persisted for the pair cannot be proven to be the latest (a refused older arrival, a key below the high-water mark, two different verdicts with the same key, a pending event that out-ranks, shares, or arrived later with a lower key than the verdict, an unusable or capped agent stamp, or a verdict applied by the stale-mark recovery described in the Guardian guide). `projection_pending` means a retained event for the pair has not reached the row, so `state` may lag it. A `false` in either field does not establish freshness or completeness: an event that never arrived leaves no trace. The device-compliance route does not yet report ordering uncertainty.
-- **5xx:** `503` if the scoped-permission gate is unwired, the store is degraded (A4 envelope, `retry_after_ms: 5000`), or the `guardian.device.view` audit row cannot persist (fail-closed).
+- **Response:** `data.agent_id`, `data.guards[]` of `{rule_id, name, state, updated_at, order_uncertain, projection_pending}`, `data.total_guards` (always the number of `guards[]` rows), `data.unrepresented_pending_guards` and `data.unrepresented_pending_rule_ids`. A device with no reported guards returns an empty `guards[]`, not an error. `order_uncertain` is sticky: the verdict persisted for the pair cannot be proven to be the latest (a refused older arrival, a key below the high-water mark, two different verdicts with the same key, a pending event that out-ranks, shares, or arrived later with a lower key than the verdict, an unusable or capped agent stamp, or a verdict applied by the stale-mark recovery described in the Guardian guide). `projection_pending` means a retained event for the pair has not reached the row, so `state` may lag it. A `false` in either field does not establish freshness or completeness: an event that never arrived leaves no trace.
+- **Unrepresented pending evidence.** `unrepresented_pending_guards` is the exact number of distinct `rule_id`s, over ALL rules (not scoped to any Baseline), that have a retained `projection_pending` event for this device and **no census row** for this device. Such a pair is evidence that has not reached the census yet, so it appears in no `guards[]` row and is not in `total_guards`. A nonzero count with an empty `guards[]` therefore means evidence exists; it does not mean the device reported nothing. `unrepresented_pending_rule_ids` lists the first 50 of them in ascending byte order of the rule id (the same members on every database, whatever its locale); a count greater than the list length means the list is truncated. The ids are identifiers the agent reported, not resolved names: an id may not correspond to any rule in the catalogue (for example a rule since deleted) and may be long, so treat each one as untrusted text. The unrepresented-pending count and the census rows behind this response are two separate, **non-atomic observations**, and the count is read first. A pair repaired between the two reads can therefore appear in both `guards[]` and the unrepresented list for that one request (an over-report), and is not lost from both; each count is exact for its own read, not a joint snapshot. `0` does not establish freshness or completeness (see the sentence above). The count read runs under a 5 s statement timeout (a server-side budget, not a request parameter). Its expiry is not an empty result and not a `0`, and it is **not transient**: it most likely means the retained pending backlog for the read is too large to count in the budget (a lock wait, a loaded database or an administrator cancel is reported the same way), so the same request usually fails identically until the cause clears (see the `503` shapes below). The sibling reads `GET .../status/{agent_id}` and the fleet status do not count pairs that have no census row; use this route or `device-compliance` for that evidence.
+- **5xx:** `503` in three shapes. (1) The scoped-permission gate is unwired: a misconfiguration, `retry_after_ms` is `null`, do not auto-retry. (2) The store is degraded for an ordinary reason, including a failed unrepresented-pending count read that is not a timeout (store not open, pool acquire timeout, a failed statement): the A4 envelope carries `retry_after_ms: 5000` and the read is never rendered as `0`. (3) The unrepresented-pending count read exceeded its 5 s statement timeout: the A4 envelope carries `"retry_after_ms": null` (the key is always present), its `message` states that the pending-evidence read exceeded its time budget, most likely because of a large retained pending backlog (a lock wait, a loaded database or an administrator cancel can also cause it), and its `remediation` field says not to retry in a loop because a retry usually fails identically until the cause clears. Shape (3) is counted on `yuzu_server_guardian_read_degrade_total{source="guardian_census_device",reason="statement_timeout"}`; do not retry-loop on it, page or triage instead (see [Guaranteed State](guaranteed-state.md), troubleshooting step 5 under "When a verdict is flagged or does not move"). A `503` with `Sec-Audit-Failed: true` is the separate audit-persistence case: the `guardian.device.view` audit row cannot persist (fail-closed), also with `retry_after_ms: 5000`. In every shape the body is withheld, and a degraded read never writes a `success` audit row. When the audit store is also unavailable, the fail-closed audit failure is answered first (a `503` with `Sec-Audit-Failed: true` and `retry_after_ms: 5000`, on this route and on the per-device guards read), which can mask the non-retryable timeout answer: That audit `503` carries a non-null `retry_after_ms`, so the ordinary bounded-retry rule applies to it; if the `503` keeps coming after the audit subsystem has recovered, consider the timeout case (most likely cause: a large retained pending backlog).
 - **Audit:** `guardian.device.view`, `target_type=Agent`, `target_id=<agent_id>` — the SAME verb `GET .../status/{agent_id}` and the dashboard Guardian device lens emit. MCP twin: `get_guardian_device_guards` (`audit_persisted:false` posture instead of fail-closed).
+
+Example, a device whose only evidence for `g-new` is a retained event that has not reached the census (`unrepresented_pending_guards` is nonzero, so `total_guards: 1` is not the whole picture):
+
+```json
+{
+  "data": {
+    "agent_id": "031e63a1-3139-48e6-beb6-50e3db062d0f",
+    "guards": [
+      {"rule_id": "g-fw", "name": "Windows Firewall on", "state": "compliant", "updated_at": "2026-06-20T13:45:00Z", "order_uncertain": false, "projection_pending": false}
+    ],
+    "total_guards": 1,
+    "unrepresented_pending_guards": 1,
+    "unrepresented_pending_rule_ids": ["g-new"]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
 
 #### `POST /api/v1/guaranteed-state/push`
 
@@ -11026,7 +11145,7 @@ management-group dimension. **A real grant that resolves to ZERO visible agents
 actually covers the agents it should.
 
 - **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via `AuthRoutes::require_list_read`, ADR-0017)
-- **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`), and `uncertain_rules`: live rules with at least one reported pair that is order-uncertain or has a pending event, within the caller's scope. `uncertain_rules: 0` does not prove the census is fresh or complete.
+- **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`), and `uncertain_rules`: live rules with at least one reported pair that is order-uncertain or has a pending event, within the caller's scope. `uncertain_rules: 0` does not prove the census is fresh or complete, and the rollup does not count a pending event whose pair has no census row (see `unrepresented_pending_guards` on the per-device reads).
 - **4xx/5xx:** `403` for a service-scoped token, a caller with no `GuaranteedState:Read` grant anywhere, **or an unreachable/corrupt RBAC or management-group store for an ordinary caller** — `authorize_list_read` fails closed to the SAME `403` as a genuine no-grant denial, not a `503`, for every non-engine caller (the two are not currently distinguished in the response code). `503` only for: an unwired list-read gate or a null Guaranteed State store (server misconfiguration, no `retry_after_ms`); a Guaranteed State store query-time degrade (transient, `retry_after_ms: 5000`); or, for an **engine-principal** caller specifically, an unreachable/unopened RBAC store (engine sessions get a distinct `503` here, unlike human/service sessions) — never a silent `0`.
 - **MCP twin:** `get_guardian_status` (#4037) — calls the SAME `guardian_status_rollup` builder and the SAME `require_list_read` gate (via `McpServer::set_list_read_fn`, wired from the identical server.cpp lambda REST uses), so REST and MCP cannot observe a different admit decision or a different rollup for the same caller.
 
@@ -11044,6 +11163,7 @@ if the audit row cannot persist.
 
 - **Permission:** `GuaranteedState:Read`, per-device scoped
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`, `uncertain_rules` (this device's rules whose row is order-uncertain or pending; `0` does not prove freshness).
+- **Does not count pairs without a census row.** A device whose only evidence is a retained pending event with no census row returns an all-zero rollup here, including `uncertain_rules: 0`. Read `GET .../agents/{agent_id}/rules` or `GET .../device-compliance` (`unrepresented_pending_guards`) for that evidence; the fleet status route does not count such pairs either.
 - **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store (A4 envelope, `retry_after_ms: 5000`) — never a silent `0`.
 - **MCP twin:** `get_guardian_agent_status` (#2146 Batch B1) — calls the SAME `guardian_agent_status_rollup` builder and the SAME `scoped_perm_fn` gate, so REST and MCP cannot observe a different admit decision or a different rollup for the same caller.
 
@@ -11051,14 +11171,25 @@ if the audit row cannot persist.
 
 Name-anchored, device-applicable Guardian compliance — the machine-readable sibling of the dashboard Baseline page, built for embedding a device's compliance against a curated Baseline into an external CMDB / ITSM record. Looks the Baseline up by **name** and returns the Guards **actually applicable to the device**, each with that device's last reported verdict.
 
-- **Ordering uncertainty is NOT reported here.** Counts and states cover represented pairs only: a guard reading `compliant` may still be `order_uncertain` or `projection_pending`. Read `GET /guaranteed-state/agents/{agent_id}/rules` (MCP `get_guardian_device_guards`) for those flags before treating the device as settled. This route does not yet carry them.
+- **Ordering uncertainty and unrepresented pending evidence are reported here.** Each `guards[]` row carries `order_uncertain` (the verdict persisted for the pair cannot be proven to be the latest) and `projection_pending` (a retained event for the pair has not reached the census row, so `status` may lag it), with the same meaning as on `GET /guaranteed-state/agents/{agent_id}/rules`. The response adds three fields. They are easy to confuse with the existing `pending` count, so the table separates it and the three new fields:
+
+  | Field | What it counts |
+  |---|---|
+  | `pending` (rollup count) and a guard's `status: "pending"` | A guard this device reported with a verdict token this server build does not recognise (normally `0`). It is **not** a projection backlog. |
+  | `uncertain_guards` | Emitted `guards[]` rows with `order_uncertain` or `projection_pending` (either or both), each counted once. It overlaps the verdict counts: a `compliant` guard can also be counted here. |
+  | `unrepresented_pending_guards` | The exact number of distinct deployed-snapshot `rule_id`s that have a retained `projection_pending` event for this device and **no census row** for it. Those pairs are excluded from `guards[]`, `total_guards` and every verdict count. |
+  | `unrepresented_pending_rule_ids` | The first 50 of those `rule_id`s in ascending byte order of the rule id. A count greater than the list length means the list is truncated. Names are not resolved, and each id is an agent-reported identifier that may not correspond to any rule and may be long. |
+
+  A `false` in either per-guard field, or a zero in either count, does not establish freshness or completeness: an event that never arrived leaves no trace. A nonzero `unrepresented_pending_guards` together with `assessable: false` means evidence exists that has not reached the census yet; do not read that device as simply unreported. `assessable` itself is unchanged (`deployed` and `total_guards > 0`), so `assessable: true` is compatible with a nonzero `uncertain_guards` or `unrepresented_pending_guards`. `last_updated` stays census-only: an unrepresented pending event has no census timestamp and never moves it. The unrepresented-pending count and the census rows are two sequential, **non-atomic observations**, and the count is read first. A pair repaired between the two reads can therefore appear in both `guards[]` and the unrepresented list for that one request, and is not lost from both; each count is exact for its own read, not a joint snapshot.
+
+  **Consumer rules.** (1) Never render a clean state, and never render a compliance percentage, while `uncertain_guards` or `unrepresented_pending_guards` is nonzero, including when `assessable` is `true`: the verdict counts exclude the unrepresented pairs and `assessable` does not look at them. (2) A response that lacks `uncertain_guards`, `unrepresented_pending_guards` or `unrepresented_pending_rule_ids` (for example from a replica that has not been upgraded yet during a rolling upgrade) means the evidence is unknown; it is never `0`. (3) The count read runs under a 5 s statement timeout. Its expiry, like any failure of the read, is a store degrade (a `503`), never an empty result or a `0`. Only the ordinary degrade carries `retry_after_ms: 5000`; the timeout `503` carries `"retry_after_ms": null` and is **not transient** (see the `503` description below).
 - **Why name, not id.** An integration pins one stable constant (e.g. `ServiceNow Compliance`) once. Baseline names are unique and survive reseeds/rebuilds, where a `baseline_id` churns — so there is no per-environment id to reconfigure.
 - **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
 - **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
-- **MCP twin:** `get_guardian_device_compliance` (#2146 Batch B1) — calls the SAME `guardian_device_compliance_rollup` builder and the SAME `scoped_perm_fn` gate; all four underlying reads complete before the access audit fires on either transport, so a degrade can never surface after an audited "success".
+- **MCP twin:** `get_guardian_device_compliance` (#2146 Batch B1) — calls the SAME `guardian_device_compliance_rollup` builder and the SAME `scoped_perm_fn` gate; every underlying read (the Baseline, its deployed members, the rule names, the unrepresented-pending count and the census rows) completes before the access audit fires on either transport, so a degrade can never surface after an audited "success".
 - **Evidence integrity — fail-closed (CC7.2).** This is a behavioural-PII read, so if the `guardian.device.view` audit row cannot persist (locked store, disk-full, or a pipeline exception — including a throwing audit pipeline) the endpoint **refuses to serve**: it returns **`503` + `Sec-Audit-Failed: true`** with an A4 envelope carrying a `retry_after_ms` hint, and **withholds the compliance body** — parity with `GET /api/v1/dex/devices/{id}`. Serving audited per-device compliance while the evidence row is known-lost is exactly what audit-on-open prevents. The `503` is returned **before** the `404`, so an audit outage never reveals baseline existence without durable evidence. A CMDB integration should treat `Sec-Audit-Failed: true` as "retry after the audit subsystem recovers," not a permanent error; an audit-off deployment (no audit callback wired) serves normally. (The realistic failure modes also increment `yuzu_server_audit_emit_failed_total` and log to `spdlog`.) **Blast radius:** because this is the fleet-polled CMDB endpoint and there is no degraded-serve fallback, a *sustained* audit-store outage 503s **every** poll fleet-wide — size audit-store availability for the polling load, and expect a compliance-data blackout (not stale data) for the duration. (Per-route retry jitter to avoid synchronized retries across pollers is a tracked platform-wide hardening, #1647.)
 - **Query params:** `baseline` (the Baseline **name**, unique; URL-encode spaces, e.g. `ServiceNow%20Compliance`), `agent_id` (the device). Both required.
-- **`400`** if either param is missing, exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected), or contains control characters (bytes `< 0x20`); **`403`** if the caller lacks `Read` on the device's scope (checked **before** the baseline lookup, so an out-of-scope caller gets `403` even for an unknown name — no name-existence oracle); **`404`** if no Baseline has that name; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry, no `retry_after_ms`) **or if the baseline store or the guaranteed-state store itself faults** (DB locked/corrupt — *retryable*, A4 envelope with `retry_after_ms: 5000`; a transient store fault returns `503`, not the `404` a CMDB would otherwise read as "no such baseline → delete this CI"). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
+- **`400`** if either param is missing, exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected), or contains control characters (bytes `< 0x20`); **`403`** if the caller lacks `Read` on the device's scope (checked **before** the baseline lookup, so an out-of-scope caller gets `403` even for an unknown name — no name-existence oracle); **`404`** if no Baseline has that name; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry, `retry_after_ms` is `null`) **or if the baseline store or the guaranteed-state store itself faults** (DB locked/corrupt, or a failed unrepresented-pending count read that is not a timeout — *retryable*, A4 envelope with `retry_after_ms: 5000`; a transient store fault returns `503`, not the `404` a CMDB would otherwise read as "no such baseline → delete this CI"). **A `503` whose `retry_after_ms` is `null` is not always a misconfiguration:** when the unrepresented-pending count read exceeds its 5 s statement timeout the route also answers `503` in the A4 envelope with `"retry_after_ms": null` (the key is always present), the `message` states that the pending-evidence read exceeded its time budget, most likely because of a large retained pending backlog (a lock wait, a loaded database or an administrator cancel can also cause it), and the `remediation` field says not to retry in a loop because a retry usually fails identically until the cause clears. That case is counted on `yuzu_server_guardian_read_degrade_total{source="guardian_census_device",reason="statement_timeout"}`. Treat a `503` whose `retry_after_ms` is `null` as a page-or-triage condition and do not retry-loop on it; for the ordinary `503` with a non-null `retry_after_ms`, cap the number of retries and add jitter so that a fleet of pollers does not retry in step (for example at most 3 retries with exponential backoff and jitter, then page). If the audit store is also unavailable, the fail-closed audit failure (`503` with `Sec-Audit-Failed: true` and `retry_after_ms: 5000`) is answered before the timeout answer and can mask it: That audit `503` carries a non-null `retry_after_ms`, so the ordinary bounded-retry rule applies to it; if the `503` keeps coming after the audit subsystem has recovered, consider the timeout case (most likely cause: a large retained pending backlog). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
 - **Response keys:**
   - `baseline` — `{ baseline_id, name, lifecycle }`.
   - `deployed` — `true` when the Baseline's lifecycle is `deployed`. When `false`, `guards` is empty and `total_guards` is `0` — render a "No Baseline Deployed" placeholder.
@@ -11066,8 +11197,10 @@ Name-anchored, device-applicable Guardian compliance — the machine-readable si
   - `agent_id`.
   - `total_guards`, `compliant`, `drifted`, `errored`, `pending` — counts over the Guards **applicable to this device** (see Semantics + the **compliance-percentage caution** below). Invariant: `total_guards == compliant + drifted + errored + pending`.
   - `snapshot_total` — the Baseline's full deployed-member count (the **superset** across all devices, an upper bound — **not** this device's in-scope count). `total_guards <= snapshot_total`; a gap is expected for a per-machine-scoped Baseline, but a large gap is a cue that this device's coverage may be partial.
-  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp); `null` **only when this device has reported no applicable guard**. A guard the device *did* report contributes its timestamp even if its verdict token is unrecognized (`pending`).
-  - `guards[]` — `{ rule_id, name, status, updated_at }` per **applicable** Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, `null` **only when this device has not reported the guard** (a reported guard carries its timestamp even when `status` is `pending`).
+  - `last_updated` — the newest `updated_at` across the guards (a "compliance as of" stamp; census-only, never moved by an unrepresented pending event); `null` **only when this device has reported no applicable guard**. A guard the device *did* report contributes its timestamp even if its verdict token is unrecognized (`pending`).
+  - `guards[]` — `{ rule_id, name, status, updated_at, order_uncertain, projection_pending }` per **applicable** Guard. `status` is `compliant` | `drifted` | `errored` | `pending`; `updated_at` is the ISO-8601 time this device last reported that Guard's verdict, `null` **only when this device has not reported the guard** (a reported guard carries its timestamp even when `status` is `pending`).
+  - `uncertain_guards`: emitted `guards[]` rows with `order_uncertain` or `projection_pending`, each counted once (overlaps the verdict counts; see the contract table above).
+  - `unrepresented_pending_guards`, `unrepresented_pending_rule_ids`: deployed-snapshot rules with a retained pending event and no census row for this device: excluded from `guards[]`, `total_guards` and the verdict counts; ids are the first 50 in ascending byte order of the rule id, a count greater than the list length means truncation; the ids are agent-reported identifiers, not resolved names.
 
 **Semantics — device-applicable subset.** One Baseline can carry a **superset** of Guards, each with its own `scope_expr`; the push fan-out arms a **different subset on each machine**. This endpoint returns only the Guards **actually applicable to the device** — the Baseline's `deployed_snapshot` intersected with the Guards the device has reported. A Guard that is out of scope for this device (never armed → never reported) is **absent** (not `pending`), so `total_guards` and `guards[]` reflect *this machine's* applicable set: different machines, querying the **same** Baseline name, legitimately see different Guards. (`pending` therefore means a Guard the device reported with an unrecognized verdict — normally `0`; an elevated `pending` after a partial fleet upgrade can indicate **agent/server version skew** — a newer agent emitting a verdict token this server build does not yet recognize, which upgrading the server resolves. The Guard still carries its real `updated_at` in that case.) Verdicts are the device's last *reported*, Observe-mode state, with no device-liveness fold.
 
@@ -11100,12 +11233,37 @@ curl -s -H "Authorization: Bearer $TOKEN" --get \
     "total_guards": 3,
     "snapshot_total": 3,
     "compliant": 2, "drifted": 1, "errored": 0, "pending": 0,
+    "uncertain_guards": 0,
+    "unrepresented_pending_guards": 0,
+    "unrepresented_pending_rule_ids": [],
     "last_updated": "2026-06-20T13:45:00Z",
     "guards": [
-      {"rule_id": "g-fw",  "name": "Windows Firewall on", "status": "compliant", "updated_at": "2026-06-20T13:45:00Z"},
-      {"rule_id": "g-rdp", "name": "RDP NLA required",    "status": "drifted",   "updated_at": "2026-06-20T12:30:00Z"},
-      {"rule_id": "g-blk", "name": "BitLocker enabled",   "status": "compliant", "updated_at": "2026-06-20T13:44:00Z"}
+      {"rule_id": "g-blk", "name": "BitLocker enabled",   "status": "compliant", "updated_at": "2026-06-20T13:44:00Z", "order_uncertain": false, "projection_pending": false},
+      {"rule_id": "g-fw",  "name": "Windows Firewall on", "status": "compliant", "updated_at": "2026-06-20T13:45:00Z", "order_uncertain": false, "projection_pending": false},
+      {"rule_id": "g-rdp", "name": "RDP NLA required",    "status": "drifted",   "updated_at": "2026-06-20T12:30:00Z", "order_uncertain": false, "projection_pending": false}
     ]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+A second example: the same Baseline for a device whose only evidence is a retained event that has not reached the census. Here `assessable` is `false`, `total_guards` is `0` and `guards` is empty, but `unrepresented_pending_guards` is `1`, so evidence exists and the device must not be read as simply unreported. A consumer that renders a clean state or a percentage from this body is wrong:
+
+```json
+{
+  "data": {
+    "baseline": {"baseline_id": "ab12cd34ef56", "name": "ServiceNow Compliance", "lifecycle": "deployed"},
+    "deployed": true,
+    "assessable": false,
+    "agent_id": "031e63a1-3139-48e6-beb6-50e3db062d0f",
+    "total_guards": 0,
+    "snapshot_total": 3,
+    "compliant": 0, "drifted": 0, "errored": 0, "pending": 0,
+    "uncertain_guards": 0,
+    "unrepresented_pending_guards": 1,
+    "unrepresented_pending_rule_ids": ["g-fw"],
+    "last_updated": null,
+    "guards": []
   },
   "meta": {"api_version": "v1"}
 }

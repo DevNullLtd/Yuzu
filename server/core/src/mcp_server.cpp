@@ -919,8 +919,10 @@ static const ToolDef kTools[] = {
     {"query_installed_software",
      "Query the typed installed-software inventory collected by the agent daily-sync framework "
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
-     "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
-     "Publisher), install_date, kind (package|app|pkg|feat), "
+     "version (upstream, release stripped), publisher (the declared vendor: rpm VENDOR else PACKAGER, "
+     "deb Maintainer, Windows Publisher, macOS signer; or, when the source declares none, the "
+     "origin label via:<ecosystem> such as via:brew, which names where the row came from, not a "
+     "vendor), install_date, kind (package|app|pkg|feat), "
      "ecosystem (@@ECOSYSTEM_LIST@@), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
@@ -1784,7 +1786,9 @@ static const ToolDef kTools[] = {
      "one reported (agent, rule) pair whose census ordering cannot be proven (order_uncertain) or "
      "whose retained event is not yet reflected (projection_pending), within the caller's scope; "
      "0 does NOT prove the census is fresh or complete, since an event that never arrived leaves "
-     "no trace, and a pending event whose pair has no census row is not counted. A service-scoped "
+     "no trace, and a pending event whose pair has no census row is not counted (the per-device "
+     "reads get_guardian_device_guards and get_guardian_device_compliance report those as "
+     "unrepresented_pending_guards). A service-scoped "
      "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
      "to).",
      R"({"type":"object","properties":{}})",
@@ -1830,10 +1834,23 @@ static const ToolDef kTools[] = {
      "named Baseline). Mirrors the new GET /api/v1/guaranteed-state/agents/{agent_id}/rules "
      "exactly, same shared builder. Each guard carries order_uncertain and projection_pending "
      "with the meaning documented on get_guardian_rule_status; a guard reading compliant with "
-     "either true must not be reported as settled. Per-device scoped (management-group aware) via the same "
+     "either true must not be reported as settled. guards[] lists represented pairs only (a "
+     "pair with a census row); a pair for which this device holds retained projection-pending "
+     "census evidence but no census row yet is not a guard and appears only as "
+     "unrepresented_pending_guards (exact count, any rule) and unrepresented_pending_rule_ids "
+     "(first 50 in ascending byte order of the rule id; a count above the list length means "
+     "truncation; an id is an agent-reported identifier that may not correspond to any rule and "
+     "may be long; names are not resolved). A nonzero count with an empty guards[] means evidence "
+     "exists that has not reached the census. total_guards is the length of "
+     "guards[] and excludes them. The census read and that evidence read are two separate "
+     "non-atomic observations (a pair may appear in both guards[] and the unrepresented list); a "
+     "zero count or false flag establishes neither freshness nor "
+     "completeness. A pending-evidence read that times out answers a non-retryable error (no "
+     "retry hint): the most likely cause is a large retained pending backlog. Per-device scoped "
+     "(management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"}},"required":["agent_id","guards","total_guards"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids"]})j"},
 
     // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
     // Closes the remaining MCP gap on the Guaranteed State surface: the 6
@@ -2005,7 +2022,10 @@ static const ToolDef kTools[] = {
      "the SAME gate get_guardian_device_guards uses; a service-scoped API token is confined "
      "to its own service's agents rather than denied outright. uncertain_rules counts this "
      "device's rules whose row is order_uncertain or projection_pending; 0 does not prove "
-     "freshness.",
+     "freshness. This rollup counts only pairs that have a census row; a device whose only "
+     "evidence is pending events with no census row reads all-zero here. Read "
+     "get_guardian_device_guards (GET /guaranteed-state/agents/{agent_id}/rules) or "
+     "get_guardian_device_compliance for unrepresented_pending_guards.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"note":{"type":"string"},"audit_persisted":{"type":"boolean"}},"required":["agent_id","total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules"]})j"},
 
@@ -2015,12 +2035,29 @@ static const ToolDef kTools[] = {
      "last reported verdict. Mirrors GET /api/v1/guaranteed-state/device-compliance exactly, "
      "same baseline + guaranteed-state store reads. assessable is false when there is no "
      "compliance signal to act on (draft Baseline, or nothing reported yet) — do not compute "
-     "a percentage when false. Per-device behavioral read — every call is audit-logged "
+     "a percentage when false. Never render a clean state or a compliance percentage while "
+     "uncertain_guards or unrepresented_pending_guards is nonzero, even when assessable is "
+     "true. Per-device behavioral read — every call is audit-logged "
      "(guardian.device.view). Per-device scoped (management-group aware) via the SAME gate "
-     "get_guardian_agent_status uses. Counts and states cover REPRESENTED pairs only and do not "
-     "report ordering uncertainty or pending census evidence: a guard reading compliant here may "
-     "still be order_uncertain or projection_pending; call get_guardian_device_guards for those "
-     "flags before reporting the device as settled.",
+     "get_guardian_agent_status uses. Counts and states cover REPRESENTED pairs only (pairs with a "
+     "census row for this device). Each guards[] row carries order_uncertain (sticky: the "
+     "ordering of the persisted verdict cannot be proven) and projection_pending (a retained "
+     "event for the pair is not yet reflected in the row); uncertain_guards counts emitted "
+     "guards with either flag, each once, and overlaps the verdict counts. A true flag means "
+     "do not report the guard as settled. unrepresented_pending_guards (exact) and "
+     "unrepresented_pending_rule_ids (first 50 in ascending byte order; a larger count means "
+     "truncation; an id is an agent-reported identifier that may not correspond to any rule) "
+     "report deployed-snapshot members for which "
+     "this device holds retained projection-pending census evidence but no census row yet: "
+     "excluded from guards[], total_guards and every verdict count. A nonzero unrepresented "
+     "count with assessable false means evidence exists that has not reached the census. The "
+     "census read and that evidence read are two separate non-atomic observations (a pair may "
+     "appear in both guards[] and the unrepresented list); last_updated "
+     "stays census-only; a zero count or false flag establishes neither freshness nor "
+     "completeness. A pending-evidence read that times out answers a non-retryable error (no "
+     "retry hint): the most likely cause is a large retained pending backlog. "
+     "get_guardian_device_guards lists every rule of the device, not limited to "
+     "this Baseline.",
      R"j({"type":"object","properties":{)j"
      R"j("baseline":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline name (stable across reseeds, unlike baseline_id)"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256})j"
@@ -2030,10 +2067,13 @@ static const ToolDef kTools[] = {
      R"j("deployed":{"type":"boolean"},"assessable":{"type":"boolean"},"agent_id":{"type":"string"},)j"
      R"j("total_guards":{"type":"integer"},"snapshot_total":{"type":"integer"},"compliant":{"type":"integer"},)j"
      R"j("drifted":{"type":"integer"},"errored":{"type":"integer"},"pending":{"type":"integer"},)j"
+     R"j("uncertain_guards":{"type":"integer","minimum":0},)j"
+     R"j("unrepresented_pending_guards":{"type":"integer","minimum":0},)j"
+     R"j("unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},)j"
      R"j("last_updated":{"type":["string","null"]},)j"
-     R"j("guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"status":{"type":"string"},"updated_at":{"type":["string","null"]}},"required":["rule_id","name","status"]}},)j"
+     R"j("guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"status":{"type":"string"},"updated_at":{"type":["string","null"]},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","status","order_uncertain","projection_pending"]}},)j"
      R"j("audit_persisted":{"type":"boolean"})j"
-     R"j(},"required":["baseline","deployed","assessable","agent_id","total_guards","snapshot_total","compliant","drifted","errored","pending","guards"]})j"},
+     R"j(},"required":["baseline","deployed","assessable","agent_id","total_guards","snapshot_total","compliant","drifted","errored","pending","uncertain_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids","guards"]})j"},
 
     // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
     {"list_dex_signals",
@@ -4526,7 +4566,11 @@ static const ToolDef kTools[] = {
     {"query_software_catalogue",
      "Fleet software title catalogue: one row per title rolled up across the whole fleet "
      "(installs = distinct devices, versions = distinct versions, ecosystems and kinds present, "
-     "newest_version), ordered by installs descending then name. totals{titles,installs} cover "
+     "newest_version), ordered by installs descending then name. A title's publisher is the "
+     "declared vendor when any row of the title has one, else the origin label via:<ecosystem> "
+     "(such as via:brew), which names where the row came from, not a vendor; kpis.publishers "
+     "counts distinct declared vendors and excludes labels; q matches the publisher text "
+     "literally, so q=via: lists the label-only titles. totals{titles,installs} cover "
      "EVERY row matching the filters, not just this page, so report 'N of M'. The first page also "
      "carries kpis (headline numbers from the hourly rollup refresh, plus coverage as counts: "
      "reporting devices, connected devices, devices not seen in 48 hours); continuation pages "
@@ -17191,8 +17235,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards.
-                auto rows = guardian_api_->device_guards(agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards. `fault` says
+                // WHY a failed read failed (#7217): a pending-evidence statement timeout is
+                // deterministic for a given backlog and must not advertise a retry.
+                GuardianReadFault fault = GuardianReadFault::kNone;
+                auto rows = guardian_api_->device_guards(agent_id, &fault);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/agents/{agent_id}/rules and the
                 // dashboard Guardian device lens. MCP set-and-proceed
@@ -17202,14 +17249,28 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "guardian.device.view", rows ? "success" : "failure", "Agent",
                     agent_id, "per-device all-guards view via MCP");
                 if (!rows) {
+                    if (fault == GuardianReadFault::kStatementTimeout) {
+                        // Not transient: the pending-evidence read timed out because of the
+                        // size of the retained pending backlog, so a retry fails identically.
+                        // The failure audit above was written exactly as for any degrade; a
+                        // dropped row is signalled with audit_persisted:false.
+                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, audit_ok), "application/json"); // retry-hint-exempt: statement timeout (SQLSTATE 57014), most likely a large retained pending backlog, so a retry usually fails identically until the cause clears
+                        return;
+                    }
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
                         "application/json");
                     return;
                 }
+                // #7217: same shape as the REST twin. The unrepresented pending
+                // pairs (retained projection-pending events with no census row)
+                // are NOT guards: excluded from guards[] and total_guards, and
+                // reported as an exact count + bounded sorted rule_id list. A
+                // failure of that read already surfaced as the degraded error
+                // above (rows has no value), never as zeros.
                 JArr arr;
-                for (const auto& r : *rows) {
+                for (const auto& r : rows->guards) {
                     arr.add(JObj()
                                 .add("rule_id", r.rule_id)
                                 .add("name", r.name)
@@ -17218,10 +17279,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("order_uncertain", r.order_uncertain)
                                 .add("projection_pending", r.projection_pending));
                 }
+                JArr unrepresented_ids;
+                for (const auto& rid : rows->unrepresented_pending_rule_ids)
+                    unrepresented_ids.add(rid);
                 JObj payload;
                 payload.add("agent_id", agent_id)
                     .raw("guards", arr.str())
-                    .add("total_guards", static_cast<int64_t>(rows->size()));
+                    .add("total_guards", static_cast<int64_t>(rows->guards.size()))
+                    .add("unrepresented_pending_guards", rows->unrepresented_pending_guards)
+                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(
@@ -18344,35 +18410,53 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #2146 Batch B1 review fix: all four underlying reads (baseline
-                // lookup, deployed_member_rule_ids, rule_names_for,
-                // agent_rule_statuses_for_agent) now complete BEFORE the audit
-                // fires below - the prior inline version audited "success" right
-                // after the first read, so a degrade in any of the other three
-                // still surfaced a 500 the audit had already called successful.
+                // #2146 Batch B1 review fix: all five underlying reads (baseline
+                // lookup, deployed_member_rule_ids, unrepresented_pending_for_agent,
+                // rule_names_for, agent_rule_statuses_for_agent) now
+                // complete BEFORE the audit fires below - the prior inline version
+                // audited "success" right after the first read, so a degrade in any
+                // of the other reads still surfaced a 500 the audit had already
+                // called successful. The unrepresented-pending and census reads are
+                // separate non-atomic observations (#7217): a pair repaired between
+                // them may appear both in guards[] and in the unrepresented list for
+                // one request, never in neither (the unrepresented read is issued
+                // first), and the counts are exact per read, not a joint snapshot.
                 // ADR-0031 WS-A4 (ninth family): GuardianApi::device_compliance
                 // wraps guardian_device_compliance_rollup verbatim.
                 bool store_degraded = false;
                 bool pii_access_began = false;
+                GuardianReadFault fault = GuardianReadFault::kNone;
                 auto rollup = guardian_api_->device_compliance(baseline_name, agent_id,
-                                                                &store_degraded, &pii_access_began);
+                                                                &store_degraded, &pii_access_began,
+                                                                &fault);
                 if (store_degraded) {
                     // Scoped re-review fix: a degrade in the baseline lookup itself is
                     // genuinely pre-PII (no audit owed, same posture as before), but a
-                    // degrade in any of the other three reads happens only after this
+                    // degrade in any of the other four reads happens only after this
                     // agent's per-baseline PII has already been touched - that MUST
                     // still be audited as "failure", never silently dropped (a
                     // completed PII read leaving zero audit trail is worse than the
                     // mislabeled-"success" bug this whole extraction fixed).
+                    // MCP is set-and-proceed: the error is returned either way, and a dropped
+                    // failure-audit row is signalled with audit_persisted:false.
+                    bool degrade_audit_ok = true;
                     if (pii_access_began) {
-                        (void)yuzu::server::detail::try_persist_audit(
+                        degrade_audit_ok = yuzu::server::detail::try_persist_audit(
                             audit_fn, req, "guardian.device.view", "failure", "Agent", agent_id,
                             "baseline '" + baseline_name +
                                 "' per-device guard status via MCP - store degraded");
                     }
+                    if (fault == GuardianReadFault::kStatementTimeout) {
+                        // Not transient (#7217): the pending-evidence read timed out because of
+                        // the size of the retained pending backlog, so a retry fails
+                        // identically.
+                        res.set_content(a4_error(kInternalError, mcp::kGuardianCensusDeviceTimeoutMessage, mcp::kGuardianCensusDeviceTimeoutRemedy, -1, {}, degrade_audit_ok), "application/json"); // retry-hint-exempt: statement timeout (SQLSTATE 57014), most likely a large retained pending backlog, so a retry usually fails identically until the cause clears
+                        return;
+                    }
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
+                                degrade_audit_ok),
                         "application/json");
                     return;
                 }
@@ -18403,8 +18487,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         gj.raw("updated_at", "null");
                     else
                         gj.add("updated_at", g.updated_at);
+                    // #7217: same two census flags as the REST twin.
+                    gj.add("order_uncertain", g.order_uncertain)
+                        .add("projection_pending", g.projection_pending);
                     guards.add(std::move(gj));
                 }
+                JArr unrepresented_ids;
+                for (const auto& rid : rollup->unrepresented_pending_rule_ids)
+                    unrepresented_ids.add(rid);
 
                 JObj b;
                 b.add("baseline_id", rollup->baseline_id)
@@ -18421,7 +18511,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("compliant", rollup->compliant)
                     .add("drifted", rollup->drifted)
                     .add("errored", rollup->errored)
-                    .add("pending", rollup->pending);
+                    .add("pending", rollup->pending)
+                    .add("uncertain_guards", rollup->uncertain_guards)
+                    .add("unrepresented_pending_guards", rollup->unrepresented_pending_guards)
+                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str());
                 if (rollup->last_updated.empty())
                     payload.raw("last_updated", "null");
                 else
