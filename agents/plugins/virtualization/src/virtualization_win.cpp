@@ -75,9 +75,10 @@ struct RealRegOps {
     long open_key(void* parent, const wchar_t* name, void*& out) {
         // REG_OPTION_OPEN_LINK opens a registry link object itself instead of following it. The
         // Lxss subtree sits in a hive its owning user can write, and a link planted there (an
-        // `Lxss` or `{GUID}` key pointing elsewhere) carries none of the five value names this walk
-        // reads, so it reads as no WSL / an empty row, never as a read of another key. The flag
-        // applies to the leaf only; an ancestor link is a disclosed residual (README caveat).
+        // `Lxss` or `{GUID}` key pointing elsewhere) is never read through: the walk probes the
+        // opened Lxss key and each distribution key for a `SymbolicLinkValue` and reports
+        // `lxss_link`. The flag applies to the leaf only; an ancestor link is a disclosed residual
+        // (README caveat), and the HKLM `...\Lxss\MSI` key is opened the same way but not probed.
         HKEY k = nullptr;
         const LONG rc =
             RegOpenKeyExW(static_cast<HKEY>(parent), name, REG_OPTION_OPEN_LINK, KEY_READ, &k);

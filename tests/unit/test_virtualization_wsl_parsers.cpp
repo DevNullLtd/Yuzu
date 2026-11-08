@@ -1341,13 +1341,19 @@ TEST_CASE("wsl: a link planted at a distribution key is a typed unknown row; its
 
 TEST_CASE("wsl: a link probe that fails is a token, and the key is then read as a plain one",
           "[virtualization][wsl][link]") {
+    // Each site on its own: dropping the token at only one of them must fail a section.
+    const auto fail_probe = [](Node& key, long rc) {
+        FakeOps::set_link(key);
+        key.values[L"SymbolicLinkValue"].fail_rc = rc; // the probe itself is unreadable
+    };
     FakeOps ops;
     Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
-    FakeOps::set_link(lxss_of(hive));
-    lxss_of(hive).values[L"SymbolicLinkValue"].fail_rc = wsl::kErrorAccessDenied; // unreadable
-    Node& child = *lxss_of(hive).children.front().second;
-    FakeOps::set_link(child);
-    child.values[L"SymbolicLinkValue"].fail_rc = 1450;
+    SECTION("the Lxss probe fails") {
+        fail_probe(lxss_of(hive), wsl::kErrorAccessDenied);
+    }
+    SECTION("a distribution's probe fails") {
+        fail_probe(*lxss_of(hive).children.front().second, 1450);
+    }
     FakeAccess acc;
     acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
     const auto r = run({profile(kSidA, "alice")}, acc, ops);
