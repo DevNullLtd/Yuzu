@@ -7870,6 +7870,8 @@ surfaces, not reads. `from-echo-query` runs SQL on Echo agents; `from-instructio
 runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
 re-runs a set's own source query and creates a **sibling** (same parent, new id).
 
+A `name` that contains a NUL byte (and, on the two producers that take one, a matcher or source payload that does) is refused with `400` before anything is dispatched, so a command is never run and then reported as failed because the result-set row could not be stored. The MCP twins refuse it as invalid params (-32602).
+
 **Permission:** `Execution:Execute`, **confined per device**
 
 > **Per-device confinement (#1788).** These routes admit on a global

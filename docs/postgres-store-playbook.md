@@ -165,6 +165,10 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    pooled connections carry **no** per-store `search_path`. Bind parameters with
    `pg::exec_params` (`$1..$N`); never string-concat SQL. Mutate-and-return uses `RETURNING`
    (the #1033-banning idiom), never `sqlite3_changes()`.
+   `pg::exec_params` refuses a bound text parameter that contains an embedded NUL byte (a failed
+   result, SQLSTATE 22021, statement not executed) instead of letting libpq cut it at the NUL, so a
+   store that accepts free text still validates or sanitizes first, and treats that failed result as
+   an error, never as "not found" or "not denied".
 
 5. **Lease discipline** (ADR-0012 §2): every runtime acquire is **bounded**
    (`try_acquire_for(deadline)`) — pick the deadline from posture (hot-path fail-soft: short,
