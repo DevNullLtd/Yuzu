@@ -424,8 +424,9 @@ inline constexpr std::size_t kAuditDefinitionIdMax = 128;
 
 /// The step-0 predicate: the id holds a control byte OR is not well-formed UTF-8. Such an id is
 /// refused (`invalid_definition_id`, 400 / -32602) before ANY store read. One predicate, used by
-/// the shared core (and the REST route's audit target cleaning) only, so REST and MCP cannot
-/// drift. A valid multibyte id (U+00E9, CJK, ...) is NOT malformed and goes to the lookup.
+/// the shared core, the REST route's audit target cleaning and the workflow twins' id check
+/// (`check_workflow_id`, workflow_execute.hpp), so REST and MCP cannot drift.
+/// A valid multibyte id (U+00E9, CJK, ...) is NOT malformed and goes to the lookup.
 [[nodiscard]] inline bool definition_id_is_malformed(std::string_view id) noexcept {
     return definition_id_has_control_byte(id) || definition_id_is_invalid_utf8(id);
 }
