@@ -393,8 +393,8 @@ it cannot refuse any existing database.
 
 Hash identity is the exact bytes of `PgMigration::sql`, with no normalisation, because
 normalising would hide a real change. Every migration at this change is a deterministic function
-of fixed text (52 of 58 vectors are pure literals; six concatenate compile-time constants, and one,
-`instruction_store`'s v3, is generated at first call from a fixed column list), so the bytes are
+of fixed text (52 of 58 vectors are pure literals; the other six build text from compile-time constants or,
+for `instruction_store`'s v3, generate it at first call from a fixed column list), so the bytes are
 the same in every process and deployment. A migration must stay that way: no clock, locale,
 environment, address or unordered-container iteration may reach its text.
 

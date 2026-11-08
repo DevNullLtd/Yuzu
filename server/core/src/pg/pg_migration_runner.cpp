@@ -228,8 +228,8 @@ bool verify_recorded_hashes(PGconn* conn, const std::string& store, int current,
             "ON CONFLICT (store, version) DO NOTHING",
             std::vector<std::string>{store, std::to_string(version), *e});
         if (res.status() != PGRES_COMMAND_OK) {
-            spdlog::error("PgMigrationRunner: failed to record the hash of v{} for {}: {}",
-                          version, store, PQerrorMessage(conn));
+            spdlog::error("PgMigrationRunner: failed to record the hash of v{} for {}: {}", version,
+                          store, PQerrorMessage(conn));
             return false;
         }
     }
@@ -425,11 +425,26 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
         PgResult drift = exec_param(
             conn, "SELECT 1 FROM information_schema.tables WHERE table_schema = $1 LIMIT 1", store);
         if (drift.status() == PGRES_TUPLES_OK && PQntuples(drift.get()) > 0) {
-            spdlog::error("PgMigrationRunner: store '{}' is at version 0 in schema_meta but its "
-                          "schema already contains tables — schema_meta loss/poisoning or "
-                          "out-of-band DDL. Refusing to migrate (manual reconciliation required).",
-                          store);
-            return false;
+            // The version above was read without the per-store lock, so a runner that
+            // read 0 just before a concurrent first boot committed would see that
+            // boot's tables here and refuse spuriously. A migration's tables and its
+            // schema_meta row commit in ONE transaction, so a re-read made after the
+            // tables are visible cannot miss a committed version: only a version that
+            // is still 0 is the loss/poisoning this guard exists for (ADR-0012 treats a
+            // concurrent first boot as safe).
+            const int reread = read_version(conn, store, /*missing_table_ok=*/false);
+            if (reread < 0)
+                return false;
+            if (reread > 0) {
+                current = reread;
+            } else {
+                spdlog::error(
+                    "PgMigrationRunner: store '{}' is at version 0 in schema_meta but its "
+                    "schema already contains tables — schema_meta loss/poisoning or "
+                    "out-of-band DDL. Refusing to migrate (manual reconciliation required).",
+                    store);
+                return false;
+            }
         }
     }
 
@@ -444,9 +459,10 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
         spdlog::warn(
             "PgMigrationRunner: store '{}' is at schema v{} in the database but this binary only "
             "knows migrations up to v{} — a newer build has already migrated this database (or "
-            "the version record is wrong). Nothing was applied and this check does not refuse "
-            "the start, but this binary may fail, misbehave or enforce less than the newer build "
-            "on schema it does not know. Run the build that matches this database, or recover by "
+            "the version record is wrong). Nothing was applied and this warning does not itself "
+            "refuse the start (the recorded-hash check that follows can), but this binary may "
+            "fail, misbehave or enforce less than the newer build on schema it does not know. Run "
+            "the build that matches this database, or recover by "
             "rolling forward or restoring this deployment's own backup into a fresh deployment "
             "(docs/user-manual/upgrading.md, \"When a server build finds its database ahead of "
             "it (every Postgres store)\").",

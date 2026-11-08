@@ -648,8 +648,8 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
 - **Version-ahead warning (#3894):** when a store's recorded `schema_meta` version is HIGHER than
   the highest version in the calling binary's own `migrations()` vector (an older build started
   against a database a newer one already migrated), `run()` logs one `warn` per call naming the
-  store and both versions, applies nothing and still returns true
-  (`PgMigrationRunner::is_schema_ahead` is the pure decision). It is **warn-only on purpose**, not
+  store and both versions, applies nothing and the ahead check itself still returns true (the #7158 hash
+  check that follows can still refuse; `PgMigrationRunner::is_schema_ahead` is the pure decision). It is **warn-only on purpose**, not
   a refusal: the situation is already outside the supported procedure (rolling upgrades and a
   return to an earlier build are not supported at this stage; see the "Recorded exception" in the
   migrations section above and ADR-0053 "Update (2026-10-20)"), and a refusal would add a second
@@ -679,8 +679,8 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   config value, environment variable, timestamp or random value into it (a deterministic
   generator over fixed text is fine). This detects accidental or procedural drift, not
   tampering: whoever can write the table can rewrite `schema_meta`, and a deleted row is recorded
-  again as `'tofu'`. It does not see a version recorded by a DIFFERENT binary that predates it
-  either (#3013). A test that hand-copies a migration vector under a SHIPPED store name and then
+  again as `'tofu'`. Nor does it see drift in a version recorded by a build that predates the
+  table. A test that hand-copies a migration vector under a SHIPPED store name and then
   opens the real store will be refused as drift: use a unique store name, slice the store's own
   vector, or delete that store's `public.yuzu_schema_migrations` rows to model a database that
   predates the table. The per-store

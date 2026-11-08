@@ -89,7 +89,7 @@ public:
     /// (an in-place edit of an already-applied migration): `run()` refuses
     /// (returns false, one error line naming the store, the version and both
     /// hashes) instead of letting the store open and fail at its first query.
-    /// Unlike the ahead case below this is ON-procedure (same build lineage)
+    /// Unlike the ahead check below (which only warns) this is ON-procedure (same build lineage)
     /// and the refusal is the FIRST failure, so it fails closed; there is
     /// deliberately no override. A version applied before this table existed
     /// has no recorded hash: it is recorded as it is first seen
@@ -115,11 +115,13 @@ public:
     /// binary's vector (an older build started against a database a newer one
     /// migrated). That situation is outside the supported procedure (rolling
     /// upgrades and a return to an earlier build are not supported at this
-    /// stage), so this is WARN-ONLY, never a refusal: a refusal would add a
+    /// stage), so the ahead check ITSELF is WARN-ONLY, never a refusal: a refusal would add a
     /// second failure to a situation that is already off-procedure, and the
     /// owner chose to end the silence without changing what boots. `run()`
     /// applies nothing, logs one actionable warning per CALL naming the store
-    /// and both versions, and returns true. Some stores call `run()` more than
+    /// and both versions, and returns true unless the #7158 hash check that follows
+    /// refuses (a version this binary carries whose text differs from the recorded
+    /// one). Some stores call `run()` more than
     /// once per process start (the auth and secrets stores are opened twice;
     /// `LeaderElector` re-runs it on every reconnect), so the warning can
     /// repeat. A store's own constructor can still refuse afterwards (e.g. a

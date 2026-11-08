@@ -377,13 +377,16 @@ TEST_CASE("PgMigrationRunner check_recorded_hashes decision (#7158)", "[pg][migr
         CHECK(v.drifted.empty());
     }
     SECTION("a differing hash is drift, at any applied version") {
-        const auto v1 = PgMigrationRunner::check_recorded_hashes(3, expected, {{1, "X"}, {2, "b"}, {3, "c"}});
+        const auto v1 =
+            PgMigrationRunner::check_recorded_hashes(3, expected, {{1, "X"}, {2, "b"}, {3, "c"}});
         CHECK(v1.drifted == std::vector<int>{1});
-        const auto v2 = PgMigrationRunner::check_recorded_hashes(3, expected, {{1, "a"}, {2, "X"}, {3, "c"}});
+        const auto v2 =
+            PgMigrationRunner::check_recorded_hashes(3, expected, {{1, "a"}, {2, "X"}, {3, "c"}});
         CHECK(v2.drifted == std::vector<int>{2});
     }
     SECTION("versions above the recorded schema version are not judged (rewound schema_meta)") {
-        const auto v = PgMigrationRunner::check_recorded_hashes(1, expected, {{1, "a"}, {2, "OLD"}});
+        const auto v =
+            PgMigrationRunner::check_recorded_hashes(1, expected, {{1, "a"}, {2, "OLD"}});
         CHECK(v.missing.empty());
         CHECK(v.drifted.empty());
     }
@@ -423,11 +426,15 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
     const std::string t2 = "ALTER TABLE items ADD COLUMN IF NOT EXISTS name TEXT";
     const std::string t3 = "ALTER TABLE items ADD COLUMN IF NOT EXISTS note TEXT";
     const std::vector<PgMigration> v3 = {{1, t1}, {2, t2}, {3, t3}};
-    const auto hash_of = [](const std::string& sql) { return *yuzu::server::sha256_hex(sql); };
+    const auto hash_of = [](const std::string& sql) {
+        return *yuzu::server::sha256_hex(sql);
+    };
     const auto recorded = [&](int version, const char* col) {
-        return text_scalar(conn.get(), std::string("SELECT ") + col +
-                                           " FROM public.yuzu_schema_migrations WHERE store = 'store_h' "
-                                           "AND version = " + std::to_string(version));
+        return text_scalar(conn.get(),
+                           std::string("SELECT ") + col +
+                               " FROM public.yuzu_schema_migrations WHERE store = 'store_h' "
+                               "AND version = " +
+                               std::to_string(version));
     };
     const auto row_count = [&] {
         return scalar(conn.get(),
@@ -467,8 +474,7 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
 
     SECTION("drift at the first version refuses too") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
-        const std::vector<PgMigration> edited = {
-            {1, t1 + "-- edited"}, {2, t2}, {3, t3}};
+        const std::vector<PgMigration> edited = {{1, t1 + "-- edited"}, {2, t2}, {3, t3}};
         CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", edited));
     }
 
@@ -489,7 +495,8 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
 
     SECTION("a database that predates the table is recorded as first seen, then checked") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
-        exec_ok_or_fail(conn.get(), "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_h'");
+        exec_ok_or_fail(conn.get(),
+                        "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_h'");
         REQUIRE(row_count() == 0);
 
         std::string logs;
@@ -527,7 +534,8 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
         CHECK(recorded(2, "sha256") == hash_of(t2));
     }
 
-    SECTION("a foreign public.schema_migrations table is left alone and does not break the runner") {
+    SECTION(
+        "a foreign public.schema_migrations table is left alone and does not break the runner") {
         exec_ok_or_fail(conn.get(),
                         "CREATE TABLE public.schema_migrations (version bigint PRIMARY KEY, "
                         "dirty boolean NOT NULL)");
@@ -619,11 +627,14 @@ TEST_CASE("PgMigrationRunner hash recording under concurrent runners (#7158)",
         {2, "ALTER TABLE items ADD COLUMN IF NOT EXISTS name TEXT"},
         {3, "ALTER TABLE items ADD COLUMN IF NOT EXISTS note TEXT"}};
     const auto rows = [&](const std::string& store, const char* extra = "") {
-        return scalar(conn.get(), "SELECT count(*) FROM public.yuzu_schema_migrations WHERE store = '" +
-                                      store + "' " + extra);
+        return scalar(conn.get(),
+                      "SELECT count(*) FROM public.yuzu_schema_migrations WHERE store = '" + store +
+                          "' " + extra);
     };
 
     SECTION("same vector on a fresh store: every runner succeeds, one apply row per version") {
+        // Pins the re-read in the version-0-with-tables guard: a loser that read 0 just
+        // before the winner committed must not be refused as "schema_meta loss".
         const auto r = run_concurrently(db.dsn(), "store_c", {v3, v3, v3, v3});
         for (int x : r)
             CHECK(x == 1);
@@ -647,7 +658,8 @@ TEST_CASE("PgMigrationRunner hash recording under concurrent runners (#7158)",
 
     SECTION("a pre-table store opened by several runners at once is recorded once each") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_p", v3));
-        exec_ok_or_fail(conn.get(), "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_p'");
+        exec_ok_or_fail(conn.get(),
+                        "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_p'");
         const auto r = run_concurrently(db.dsn(), "store_p", {v3, v3, v3, v3});
         for (int x : r)
             CHECK(x == 1);
