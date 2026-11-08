@@ -667,7 +667,8 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   bumps `schema_meta`, as an UPSERT (a rewound `schema_meta` re-applies and overwrites the row:
   the text that just ran is the authority). On every `run()` the hash of each version at or
   below the recorded schema version is compared with this build's; a difference makes `run()`
-  return false with one error line (store, version, both hashes) and the store does not open.
+  return false with one error line (store, version, the first 12 characters of both hashes) and the
+  store does not open.
   It fails closed, with no override, because it is on-procedure (same build lineage) and the
   refusal is the first failure, unlike the ahead-database case (#3894, WARN-only). A version
   applied before the table existed has no row and is recorded as first seen
