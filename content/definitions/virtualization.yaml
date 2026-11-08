@@ -159,7 +159,7 @@ metadata:
     profiles whose hive could not be reached and the WSL package version. A profile whose hive
     was not reached, or whose mount could not be released, is reported on its own profile row;
     the status row is constrained whenever anything was not read in full, and a registry link
-    planted at a distribution key is reported rather than followed. Install paths, disk image
+    planted at the Lxss key or at a distribution key is reported rather than followed. Install paths, disk image
     paths, SIDs, user ids and mount names are never reported.
   tags: [inventory, virtualization, wsl, per-user]
 
@@ -203,7 +203,7 @@ spec:
         platforms: [windows]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:lxss_link, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was opened or found absent (it need not add up with field 4 to the profile count: a reached hive whose Lxss key could not be opened, or is a registry link, appears only as a status token). profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown.'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:lxss_link, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was read or found absent (it need not add up with field 4 to the profile count: a reached hive whose Lxss key could not be opened, or is a registry link, appears only as a status token). profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown.'
         example: '2'
         platforms: [windows]
       - name: field_4

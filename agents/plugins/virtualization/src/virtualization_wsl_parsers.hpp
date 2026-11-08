@@ -211,7 +211,7 @@ struct DistroValues {
 struct HiveRead {
     std::string account; // wire_field'd profile-folder name, `-` when unresolvable
     std::vector<DistroValues> distros;
-    bool read_ok = false; // the Lxss open succeeded or was NOT_FOUND
+    bool read_ok = false; // Lxss read or absent, or opened but not examined (a cap refused the link probe); false for an open failure or a registry link
     std::vector<std::string> tokens;
 };
 
