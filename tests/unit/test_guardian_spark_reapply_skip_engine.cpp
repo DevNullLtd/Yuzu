@@ -63,6 +63,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -3002,4 +3004,322 @@ TEST_CASE("#5547: an inherited latch survives a full_sync that fails to reconcil
     CHECK(r.engine->policy_generation() == kNext); // no tick between the dispatch and this read
     REQUIRE(r.persisted_generation().has_value());
     CHECK(*r.persisted_generation() == kNext);
+}
+
+// -------------------------------------------------------------------------------------------------
+// #5719 (C2b). The ENGINE half of the `full_sync rebuilt` line: what apply_rules reports, per push,
+// for the rules a full_sync carried and rebuilt. RED-FIRST: these cases are intentionally red until
+// the engine wiring (C5) lands. The expectations are built with GuardianRebuildTally::format() so a
+// line is compared byte for byte; the tally's own format is pinned against the golden fixture by the
+// C1 cases above, and the dormancy case reads the all-zero golden straight from that fixture.
+//
+// The Rig's mechanisms are io-class, so a forced disarm leaves its claim queued and the async
+// KeyBusy branch is what a forced rebuild shows at the RUNTIME level; at ENGINE level the reported
+// reason must still be the FORCED one (faulted_key), never key_busy or first_attach. The inline
+// FirstAttach race branch of that same window (an inline SparkType, or a disarm that already
+// completed) is not reachable from this Rig, whose File and Service mechanisms are both io-class;
+// it is pinned at the runtime level only if the FakeBackend there supports an inline type.
+// -------------------------------------------------------------------------------------------------
+namespace {
+
+std::string expected_rebuild_line(
+    std::initializer_list<std::pair<std::string, GuardianRebuildReason>> notes) {
+    GuardianRebuildTally t;
+    for (const auto& [id, why] : notes)
+        t.note(id, why);
+    return t.format();
+}
+
+std::string preserved_line(const std::string& n, const std::string& ids) {
+    return "Guardian: full_sync preserved " + n + " rule(s) (skipped re-arm) ids=[" + ids + "] more=0";
+}
+
+/// The `all_zero` golden from the shared fixture (the dormancy line).
+std::string golden_all_zero_rebuild_line() {
+    std::ifstream f(fs::path{YUZU_TEST_FIXTURE_DIR} / "spark" / "rebuild_line.json");
+    REQUIRE(f.good());
+    const auto fixture = nlohmann::json::parse(f);
+    for (const auto& c : fixture.at("cases"))
+        if (c.at("name").get<std::string>() == "all_zero")
+            return c.at("expected_line").get<std::string>();
+    FAIL("rebuild_line.json has no all_zero case");
+    return {};
+}
+
+} // namespace
+
+// (a) The line across pushes: first_attach=R on the first push, `rebuilt 0` on an identical re-push,
+// content_changed=1 after a rename, and a DELTA push logs nothing, so the stored line is the last
+// full_sync's. The preserved line is re-asserted with the PR-A (10) literals, byte for byte, in the
+// same run: this change must not move it. (The `detach_all complete` line is runtime spdlog output
+// that an engine-level test cannot capture, #3355; its shape is pinned by test_log_handoff.cpp and
+// the lockstep test, and this change does not touch its call site.)
+// Mutations: never note() a first attach (the first line reads first_attach=0); note an identical
+// skip as a rebuild (the second line is not `rebuilt 0`); report content_changed under any other
+// token; log the line from a delta push or leave the tally unreset (the delta/identical step
+// goes red); drop the rebuild line (every CHECK on it goes red).
+TEST_CASE("#5719 engine: the full_sync rebuild line reports first_attach, then rebuilt 0, then "
+          "content_changed, and a delta push leaves the stored line alone",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    constexpr int R = 4;
+    Rig r;
+    r.open();
+    std::vector<fs::path> paths;
+    std::vector<std::string> ids;
+    for (int i = 0; i < R; ++i) {
+        paths.push_back(r.make_file("t" + std::to_string(i)));
+        ids.push_back("r" + std::to_string(i));
+    }
+    // names[i] empty = the rule's default name (its id); a non-empty name changes its content.
+    const auto build = [&](const std::array<std::string, R>& names, std::uint64_t gen = kGen) {
+        std::vector<gpb::GuaranteedStateRule> v;
+        for (int i = 0; i < R; ++i)
+            v.push_back(file_rule(ids[static_cast<std::size_t>(i)], paths[static_cast<std::size_t>(i)],
+                                  names[static_cast<std::size_t>(i)]));
+        return push_bytes(v, gen);
+    };
+
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test().empty()); // nothing emitted yet
+
+    // First push: every rule is built for the first time.
+    r.dispatch(build({}));
+    REQUIRE(r.wait_armed(R));
+    REQUIRE(r.wait_compliant(ids));
+    REQUIRE(r.wait_generation(kGen));
+    REQUIRE(r.settle());
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test() ==
+          expected_rebuild_line({{"r0", GuardianRebuildReason::FirstAttach},
+                                 {"r1", GuardianRebuildReason::FirstAttach},
+                                 {"r2", GuardianRebuildReason::FirstAttach},
+                                 {"r3", GuardianRebuildReason::FirstAttach}}));
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test().find("first_attach=4") != std::string::npos);
+    CHECK(r.engine->last_full_sync_preserved_line_for_test() ==
+          "Guardian: full_sync preserved 0 rule(s) (skipped re-arm) ids=[] more=0"); // as PR-A (10)
+
+    // Identical re-push: nothing is rebuilt.
+    r.dispatch(build({}));
+    REQUIRE(r.settle());
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test() == golden_all_zero_rebuild_line());
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test().find("rebuilt 0 rule(s)") != std::string::npos);
+    CHECK(r.engine->last_full_sync_preserved_line_for_test() ==
+          "Guardian: full_sync preserved 4 rule(s) (skipped re-arm) ids=[r0,r1,r2,r3] more=0");
+
+    // A rename of r2: its content changed, so it is rebuilt (count-only, no id) and not preserved.
+    r.dispatch(build({"", "", "renamed-r2", ""}));
+    REQUIRE(r.settle());
+    const std::string renamed_line = expected_rebuild_line({{"r2", GuardianRebuildReason::ContentChanged}});
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test() == renamed_line);
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test().find("content_changed=1") != std::string::npos);
+    CHECK(r.engine->last_full_sync_preserved_line_for_test() ==
+          "Guardian: full_sync preserved 3 rule(s) (skipped re-arm) ids=[r0,r1,r3] more=0");
+
+    // A DELTA that renames r1 rebuilds it, but a delta logs no line: both stored lines stay.
+    {
+        std::vector<gpb::GuaranteedStateRule> v{file_rule("r1", paths[1], "renamed-r1")};
+        r.dispatch(push_bytes(v, kGen + 1, /*full_sync=*/false));
+        REQUIRE(r.settle());
+        CHECK(r.engine->last_full_sync_rebuild_line_for_test() == renamed_line);
+        CHECK(r.engine->last_full_sync_preserved_line_for_test() ==
+              "Guardian: full_sync preserved 3 rule(s) (skipped re-arm) ids=[r0,r1,r3] more=0");
+    }
+
+    // A full_sync that matches the state the delta left: nothing is rebuilt, and the delta's own
+    // rebuild did not leak into this push's tally.
+    r.dispatch(build({"", "renamed-r1", "renamed-r2", ""}, kGen + 1));
+    REQUIRE(r.settle());
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test() == golden_all_zero_rebuild_line());
+    CHECK(r.engine->last_full_sync_preserved_line_for_test() ==
+          "Guardian: full_sync preserved 4 rule(s) (skipped re-arm) ids=[r0,r1,r2,r3] more=0");
+}
+
+// (b) A kept rule on a faulted key, torn down by the full_sync's scoped detach, is reported with the
+// FORCED cause (faulted_key, with its id), never key_busy and never first_attach, even though the
+// attach path itself sees one of those after the teardown. A shared key reports BOTH siblings.
+// Mutations: drop forced_rebuilds_ (the rule shows key_busy or first_attach: red); consult
+// forced_rebuilds_ only for a first_attach (the io-class key_busy shows: red); record the forced
+// reason for one sibling of a shared key only (the shared case lists one id: red).
+TEST_CASE("#5719 engine: a kept rule on a faulted key is reported faulted_key with its id, never "
+          "key_busy or first_attach",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    SECTION("one faulted key") {
+        Rig r;
+        r.open();
+        const auto p0 = r.make_file("s0"), p1 = r.make_file("s1"), p2 = r.make_file("s2");
+        const std::string k0 = file_key(p0), k1 = file_key(p1), k2 = file_key(p2);
+        const std::string bytes =
+            push_bytes({file_rule("s0", p0), file_rule("s1", p1), file_rule("s2", p2)}, kGen);
+
+        r.dispatch(bytes);
+        REQUIRE(r.wait_armed(3));
+        REQUIRE(r.wait_compliant({"s0", "s1", "s2"}));
+        REQUIRE(r.wait_generation(kGen));
+        REQUIRE(r.settle());
+
+        r.fm->fire_fault(k1, true, "handle went deaf");
+        REQUIRE(yuzu::test::spin_until([&] { return r.health_events("s1", /*healthy=*/false) >= 1; }, 15s));
+        r.dispatch(bytes);
+        CHECK(r.settle());
+        const auto line = r.engine->last_full_sync_rebuild_line_for_test();
+        CHECK(line == expected_rebuild_line({{"s1", GuardianRebuildReason::KeyFaulted}}));
+        CHECK(line.find("faulted_key=1 ids=[s1]") != std::string::npos);
+        CHECK(line.find("key_busy=0") != std::string::npos);
+        CHECK(line.find("first_attach=0") != std::string::npos);
+        CHECK(r.engine->last_full_sync_preserved_line_for_test() == preserved_line("2", "s0,s2"));
+        check_rebuilt_once(*r.fm, "s1 (faulted subscription)", k1); // premise, green today
+        check_untouched(*r.fm, "s0", k0);
+        check_untouched(*r.fm, "s2", k2);
+    }
+    SECTION("two rules sharing one faulted key report both siblings") {
+        Rig r;
+        r.open();
+        const auto shared = r.make_file("shared"), other = r.make_file("other");
+        const std::string ks = file_key(shared), ko = file_key(other);
+        const std::string bytes = push_bytes(
+            {file_rule("a", shared), file_rule("b", shared), file_rule("s", other)}, kGen);
+
+        r.dispatch(bytes);
+        REQUIRE(r.wait_armed(3));
+        REQUIRE(r.wait_compliant({"a", "b", "s"}));
+        REQUIRE(r.wait_generation(kGen));
+        REQUIRE(r.settle());
+        REQUIRE(r.fm->watch_calls(ks) == 1);
+
+        r.fm->fire_fault(ks, true, "handle went deaf");
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return r.health_events("a", false) >= 1 && r.health_events("b", false) >= 1; }, 15s));
+        r.dispatch(bytes);
+        CHECK(r.settle());
+        const auto line = r.engine->last_full_sync_rebuild_line_for_test();
+        CHECK(line == expected_rebuild_line({{"a", GuardianRebuildReason::KeyFaulted},
+                                             {"b", GuardianRebuildReason::KeyFaulted}}));
+        CHECK(line.find("faulted_key=2 ids=[a,b]") != std::string::npos);
+        CHECK(line.find("key_busy=0") != std::string::npos);
+        CHECK(line.find("first_attach=0") != std::string::npos);
+        CHECK(r.engine->last_full_sync_preserved_line_for_test() == preserved_line("1", "s"));
+        check_untouched(*r.fm, "s (healthy sibling)", ko);
+    }
+}
+
+// (c) An Unknown-eval episode and an empty persisted baseline are reported under their own tokens,
+// with the id, and the healthy siblings are preserved (recipes 5a and 4b).
+// Mutations: map UnknownEpisode or BaselineEmpty to Other, or to another token in the runtime's
+// reuse_existing_locked (the token CHECK goes red); never note() a non-skipped Armed outcome
+// (both lines stay `rebuilt 0`).
+TEST_CASE("#5719 engine: an Unknown-episode rule and an empty-baseline rule are reported under "
+          "unknown_episode and baseline_empty",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    SECTION("Unknown episode") {
+        Rig r;
+        r.open();
+        const fs::path a = r.dir.path / "loop_a", b = r.dir.path / "loop_b";
+        std::error_code link_ec;
+        fs::create_symlink("loop_b", a, link_ec);
+        if (!link_ec)
+            fs::create_symlink("loop_a", b, link_ec);
+        if (link_ec)
+            SKIP("symlinks are unavailable here (" << link_ec.message() << "): the Unknown-read premise needs a loop");
+        const auto p0 = r.make_file("s0"), p1 = r.make_file("s1");
+        const std::string bytes =
+            push_bytes({file_rule("u1", a), file_rule("s0", p0), file_rule("s1", p1)}, kGen);
+
+        r.dispatch(bytes);
+        REQUIRE(r.wait_armed(3));
+        REQUIRE(r.wait_compliant({"s0", "s1"}));
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                const auto st = r.rt().status_for_rule("u1");
+                return st.has_value() && st->in_unknown;
+            },
+            15s));
+        REQUIRE(r.wait_generation(kGen));
+        REQUIRE(r.settle());
+
+        r.dispatch(bytes);
+        CHECK(r.settle());
+        const auto line = r.engine->last_full_sync_rebuild_line_for_test();
+        CHECK(line == expected_rebuild_line({{"u1", GuardianRebuildReason::UnknownEpisode}}));
+        CHECK(line.find("unknown_episode=1 ids=[u1]") != std::string::npos);
+        CHECK(r.engine->last_full_sync_preserved_line_for_test() == preserved_line("2", "s0,s1"));
+    }
+    SECTION("empty persisted baseline") {
+        BaselineRig b;
+        b.build();
+        auto& r = b.r;
+        REQUIRE(r.kv->del(GuardianEngine::kv_namespace(), "baseline:hr"));
+        REQUIRE_FALSE(b.baseline_hash().has_value());
+
+        r.dispatch(b.bytes);
+        CHECK(r.settle());
+        const auto line = r.engine->last_full_sync_rebuild_line_for_test();
+        CHECK(line == expected_rebuild_line({{"hr", GuardianRebuildReason::BaselineEmpty}}));
+        CHECK(line.find("baseline_empty=1 ids=[hr]") != std::string::npos);
+        CHECK(r.engine->last_full_sync_preserved_line_for_test() == preserved_line("2", "s0,s1"));
+    }
+}
+
+// (d) A wedge re-observation (the retained wedged arm of rule h, seen again by a forced Reapply)
+// carries no rebuild reason, so it appears in NEITHER the rebuild line nor the preserved line. The
+// first push's line also pins that an in-flight (Accepted) arm counts as a rebuild attempt: the
+// "rebuild attempted" wording of the line. Recipe: PR-A (6).
+// Mutations: give the retained-wedge pre-check Reobserved return a reason (h appears in the
+// rebuild line: red); note an outcome whose reason is None (the same); preserve the wedge (h
+// appears in the preserved line: red).
+TEST_CASE("#5719 engine: a wedge re-observation appears in neither the rebuild line nor the "
+          "preserved line",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("s0"), p1 = r.make_file("s1");
+    const std::string ksvc = service_key("yuzu-4415-hung");
+    const std::string bytes = push_bytes(
+        {service_rule("h", "yuzu-4415-hung"), file_rule("s0", p0), file_rule("s1", p1)}, kGen);
+
+    r.sm->hang_next_watch();
+    r.dispatch(bytes);
+    const std::string hk = park_and_wedge(r, *r.sm, /*expected_armed=*/2);
+    REQUIRE(hk == ksvc);
+    REQUIRE(r.wait_compliant({"s0", "s1"}));
+    // The first push attempted all three arms, the hung one included (it is Accepted, not armed).
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test() ==
+          expected_rebuild_line({{"h", GuardianRebuildReason::FirstAttach},
+                                 {"s0", GuardianRebuildReason::FirstAttach},
+                                 {"s1", GuardianRebuildReason::FirstAttach}}));
+    suppressed_repushes(r, bytes, hk, kValve); // spend the safety valve with pure holds
+
+    r.dispatch(bytes); // the forced Reapply: h's wedge is re-observed, the siblings are skipped
+    CHECK(r.settle());
+    CHECK(r.sm->watch_calls(hk) == 1); // premise: re-observed, never re-armed
+    const auto rebuild = r.engine->last_full_sync_rebuild_line_for_test();
+    const auto preserved = r.engine->last_full_sync_preserved_line_for_test();
+    CHECK(rebuild == golden_all_zero_rebuild_line());
+    CHECK(rebuild.find("ids=[") == std::string::npos);
+    CHECK(preserved == preserved_line("2", "s0,s1"));
+    CHECK(preserved.find("[h") == std::string::npos);
+    CHECK(preserved.find(",h") == std::string::npos);
+    CHECK(preserved.find("pending_reused") == std::string::npos);
+}
+
+// (e) DORMANCY. With prefer_spark=false (the production configuration, KV-9's precedent) the line is
+// absent before the first full_sync and is the all-zero golden after it, byte for byte, however many
+// rules the push carried: the attach path is never reached, so no reason is ever recorded.
+// Mutations: log the line only when prefer_spark_ is true (it stays empty: red); note a rule on the
+// legacy path (the line stops being all-zero: red); print a different zero line (golden mismatch).
+TEST_CASE("#5719 engine: on the legacy path (prefer_spark=false) the rebuild line is empty before "
+          "the first full_sync and the all-zero golden after it",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    Rig r;
+    r.prefer_spark = false;
+    r.open();
+    const auto p0 = r.make_file("d0"), p1 = r.make_file("d1"), p2 = r.make_file("d2");
+    const std::string bytes =
+        push_bytes({file_rule("d0", p0), file_rule("d1", p1), file_rule("d2", p2)}, kGen);
+
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test().empty());
+    r.dispatch(bytes);
+    REQUIRE(r.wait_generation(kGen));
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test() == golden_all_zero_rebuild_line());
+    CHECK(r.engine->spark_armed_rule_count() == 0); // premise: nothing armed on the Spark path
+
+    r.dispatch(bytes); // an identical re-push: still all zero
+    CHECK(r.engine->last_full_sync_rebuild_line_for_test() == golden_all_zero_rebuild_line());
 }

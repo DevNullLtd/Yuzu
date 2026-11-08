@@ -2951,6 +2951,11 @@ std::string GuardianEngine::last_full_sync_preserved_line_for_test() const {
     return last_full_sync_preserved_line_for_test_;
 }
 
+std::string GuardianEngine::last_full_sync_rebuild_line_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_full_sync_rebuild_line_for_test_;
+}
+
 GuardianEngine::UnsupportedLogRecord GuardianEngine::last_unsupported_log_for_test() const {
     std::lock_guard lock(mtx_);
     return last_unsupported_log_for_test_;
