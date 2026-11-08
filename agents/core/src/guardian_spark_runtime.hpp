@@ -436,8 +436,17 @@ public:
     /// when attach_rule re-observes it. A kept rule whose key is faulted (reported, or found so
     /// by the backend health check) or dead is detached as well, so a key shared by several rules
     /// is torn down and re-armed rather than rejoined by each of them.
-    /// #5719 C2 (API surface only, no behaviour yet): the kept rules this call detaches because
-    /// their key was faulted or dead, each with the key's cause. Always empty until C3.
+    /// #5719: the kept rules this call detaches because their key's faulted bit was set (reported
+    /// by the mechanism, or found Faulted, Dead or unreadable by the backend health sweep it runs
+    /// first), one entry per such rule (a key shared by several kept rules yields one entry per
+    /// sibling), each with `why` = the key's recorded first cause (PerKey::unhealthy_why, else
+    /// KeyFaulted). Rules omitted from `keep` are NOT listed (they are not "kept"), and a healthy
+    /// kept rule is not listed. Built under the same registry_mu_ hold as the detach and reserved
+    /// with its rule-id list; detach_all() discards it. It exists because, after this call, the
+    /// kept rule's own attach sees EITHER KeyBusy (an io-class key whose disarm claim is still
+    /// queued) OR FirstAttach (an inline type, or a disarm that already completed), never the
+    /// key's cause: the return value is the only place the cause survives. A caller on the engine
+    /// apply thread should prefer it over the reason attach_rule reports for these rules.
     struct ForcedRebuild {
         std::string rule_id;
         GuardianRebuildReason why{GuardianRebuildReason::None};
@@ -1322,8 +1331,13 @@ private:
         /// reuse_existing_locked and detach_rules_except. A key torn down and re-armed gets a
         /// fresh PerKey that starts clear: the skip decision does not rely on the bit alone.
         bool faulted{false};
-        /// #5719: why `faulted` (or the backend's Dead/unknown answer) was recorded; None while
-        /// the key is healthy. C2: declared, never written yet.
+        /// #5719: why `faulted` was recorded; None while the key is healthy (registry_mu_-guarded).
+        /// Written at exactly the three `faulted` write sites: on_subscription_faulted (the event
+        /// edge, authoritative: KeyFaulted when set, None when cleared), and sweep_key_health and
+        /// the attach_core probe repair (only while None: the FIRST cause wins; the sweep maps
+        /// Faulted to KeyFaulted, Dead to KeyDead and an unreadable answer to HealthUnknown, the
+        /// probe repair writes KeyFaulted). Read by reuse_existing_locked and
+        /// detach_rules_except. Never written from a mechanism worker or callback thread.
         GuardianRebuildReason unhealthy_why{GuardianRebuildReason::None};
     };
 
@@ -1565,7 +1579,8 @@ private:
         /// #4415: set only by the reuse_existing_locked() skip (state Armed or Reobserved);
         /// the retained-wedge re-observation paths leave it false.
         bool skipped{false};
-        /// #5719: why attach_core did NOT skip (None on a skip). C2: declared, never set yet.
+        /// #5719: why attach_core did NOT skip (None on a skip, a Failed result and the
+        /// retained-wedge re-observation that runs before reuse_existing_locked).
         GuardianRebuildReason rebuild_reason{GuardianRebuildReason::None};
     };
 
@@ -1778,7 +1793,8 @@ public:
         /// #4415: true iff reuse_existing_locked() skipped this push (a healthy, unchanged
         /// committed rule, or an identical live arm already in flight); no teardown, no new claim.
         bool skipped{false};
-        /// #5719: why this attach was not skipped (None on a skip). C2: declared, never set yet.
+        /// #5719: why this attach was not skipped (None on a skip, a failure and a wedge
+        /// re-observation); see GuardianRebuildReason and reuse_existing_locked.
         GuardianRebuildReason rebuild_reason{GuardianRebuildReason::None};
     };
 
@@ -2059,7 +2075,10 @@ private:
     /// copy keys_[key]'s subscription id, releases it, then asks the backend (the engine's own
     /// state, the authority a lost Faulted event cannot corrupt). nullopt when there is nothing
     /// committed to probe (stopping, no such rule or key, a claim on the key) or the backend
-    /// threw; the caller then does not skip. Must not be called with registry_mu_ held.
+    /// threw; the caller then does not skip. #5719: reuse_existing_locked reads a nullopt probe on
+    /// the committed path as HealthUnknown (a first attach and a claimed key never reach that term:
+    /// they are decided by the claims and no-committed-entry steps first). Must not be called with
+    /// registry_mu_ held.
     [[nodiscard]] std::optional<KeyHealthProbe>
     probe_key_health(const std::string& key, const std::string& rule_id);
 
@@ -2074,15 +2093,34 @@ private:
     /// #4415: the skip decision, called from attach_core() under registry_mu_ and before
     /// anything is mutated. Returns Armed (a healthy committed rule whose pushed content is
     /// identical: the existing generation, no receipt) or Reobserved (a live in-flight or
-    /// queued same-rule claim whose content is identical: that claim), else nullopt and the
-    /// caller rebuilds as before. A skip is a claim that the rule is healthy, so a rule that is
-    /// in an Unknown episode, whose key the mechanism reported faulted (the recorded bit, or
-    /// `probe` not Healthy or taken against another subscription), whose key still has any claim
-    /// other than this rule's own identical live arm (the Reobserved case), whose baseline
-    /// differs, or that has a retained wedge never reaches it (the wedge has its own
-    /// Reobserved path in attach_core). `probe` is required for the Armed skip: a null one
+    /// queued same-rule claim whose content is identical: that claim), else the reason it did
+    /// not skip (#5719) and the caller rebuilds as before. A skip is a claim that the rule is
+    /// healthy, so a rule that is in an Unknown episode, whose key the mechanism reported faulted
+    /// (the recorded bit, or `probe` not Healthy or taken against another subscription), whose
+    /// key still has any claim other than this rule's own identical live arm (the Reobserved
+    /// case), whose baseline differs, or that has a retained wedge never reaches it (the wedge has
+    /// its own Reobserved path in attach_core). `probe` is required for the Armed skip: a null one
     /// means health is unknown, which is not healthy. Reads only; may not throw.
-    [[nodiscard]] std::optional<AttachCoreResult>
+    ///
+    /// #5719 reason semantics. The error is the FIRST rebuild condition that holds, evaluated in
+    /// this order (the order of GuardianRebuildReason after None, and the precedence documented in
+    /// guardian_rebuild_tally.hpp):
+    ///   1. the key has any claim: this rule's own live arm with identical content is the
+    ///      Reobserved success; this rule's own live arm with other content, spec or ownership is
+    ///      ContentChanged; any other claim (another rule's arm, a disarm, a parked or retained
+    ///      head) is KeyBusy;
+    ///   2. no committed rules_ entry for the rule or keys_ entry for the key: FirstAttach;
+    ///   3. health, before content: the recorded faulted bit (PerKey::unhealthy_why, KeyFaulted
+    ///      when none was recorded), an absent probe (HealthUnknown), a probe of another
+    ///      subscription (SubscriptionReplaced), a Dead probe (KeyDead), any other non-Healthy
+    ///      probe (KeyFaulted), an Unknown evaluation episode (UnknownEpisode);
+    ///   4. content: a changed content id (ContentChanged), then FileHashEquals' empty
+    ///      (BaselineEmpty) or differing (BaselineDiffers) pushed hash;
+    ///   5. defensive invariants (inactive generation, spec mismatch, index ownership): Other,
+    ///      unreachable through the public API.
+    /// The reason only labels conditions that already rebuilt; it never decides skip versus
+    /// rebuild. It is never None.
+    [[nodiscard]] std::expected<AttachCoreResult, GuardianRebuildReason>
     reuse_existing_locked(const std::string& key, const std::string& rule_id,
                           const SparkSpec& spec, const RuleGeneration& pushed,
                           const std::optional<KeyHealthProbe>& probe) const noexcept;
