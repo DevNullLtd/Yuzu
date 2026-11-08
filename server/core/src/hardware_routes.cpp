@@ -1,6 +1,7 @@
 /// @file hardware_routes.cpp
 /// /hardware route registration — the page shells + the read-only HTMX fragments +
-/// the REST v1 twins (`GET /api/v1/hardware`, `GET /api/v1/hardware/{id}`), all
+/// the REST v1 twins (`GET /api/v1/hardware`, `GET /api/v1/hardware/{id}`, and the bulk
+/// `GET /api/v1/hardware/ci` keyset page of stored CI rows), all
 /// self-registered on the shared `HttpRouteSink` (the preflight_routes.cpp pattern)
 /// so this module owns its own REST surface without growing rest_api_v1.cpp's
 /// register_routes argument list. Renderers live in hardware_ui.cpp; query/sort/
@@ -12,7 +13,9 @@
 #include "app_shell.hpp"
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "authz_model.hpp"          // authz::in_scope
+#include "hardware_ci_page_model.hpp"
 #include "http_route_sink.hpp"
+#include "model_param_helpers.hpp" // model_detail::to_params
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
 
@@ -702,6 +705,87 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             {"meta", {{"api_version", "v1"}}},
         };
         res.set_content(out.dump(), "application/json");
+    });
+
+    // -- REST v1: GET /api/v1/hardware/ci — the bulk CI read, one keyset page per call --
+    // Registered BEFORE `GET /api/v1/hardware/{id}`: that pattern matches any single segment, so
+    // registered first it would take `/ci` as a device id. The router takes the first registered
+    // match; the cost is that a device whose agent_id is literally `ci` is only reachable here
+    // (as `?agent_id=ci`), not through the per-id route.
+    //
+    // Reads the stored `device_ci` rows directly (NOT the 30-day roster `GET /api/v1/hardware`
+    // rebuilds on every request), ordered by agent_id, with the caller's scope pushed into SQL;
+    // the page logic is hardware_ci_page_model.hpp. SOLE gate: fleet_read_fn (never stacked).
+    // Serial / system UUID / MAC / chassis and board serials are behavioural PII, so each served
+    // page is ONE `inventory.devices.ci` audit row written AFTER the read (it carries the row
+    // count) and FAIL-CLOSED: a row that does not persist withholds the page.
+    sink.Get("/api/v1/hardware/ci", [this](const httplib::Request& req, httplib::Response& res) {
+        detail::ensure_correlation_id(res);
+        if (!deps_.fleet_read_fn) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware service unavailable"), "application/json");
+            return;
+        }
+        auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
+        if (!gate.admitted) return;
+
+        if (!deps_.ci_page_reader) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices.ci", "failure",
+                                            "Inventory", "fleet", "hardware CI provider unwired");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware CI records unavailable"), "application/json");
+            return;
+        }
+        const auto parsed = hardware_ci_page::parse_params(model_detail::to_params(req.params));
+        if (!parsed) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+            return;
+        }
+        const hardware_ci_page::Request& rq = *parsed;
+        const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope);
+        if (!read) {
+            if (read.error()) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, std::string(hardware_ci_page::cursor_error_message(*read.error()))),
+                    "application/json");
+                return;
+            }
+            // A failed store read is never an empty page (ADR-0016 section 7).
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.devices.ci",
+                                                "failure", hardware_ci_page::audit_target_type(rq),
+                                                hardware_ci_page::audit_target_id(rq),
+                                                "hardware CI records (REST) state=store unreadable");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware CI records unavailable",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+        const hardware_ci_page::Page& page = *read;
+
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "inventory.devices.ci", "success",
+            hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
+            hardware_ci_page::audit_detail(page, rq, "REST", gate.scope.has_value(),
+                                           /*include_omitted=*/true));
+        if (!persisted) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+
+        nlohmann::json out = {
+            {"data", hardware_ci_page::page_json(page)},
+            {"meta", {{"api_version", "v1"}}},
+        };
+        // The scalar fields are agent-supplied bytes: a byte that is not valid UTF-8 must not
+        // throw out of dump() AFTER the access audit row persisted (the per-id route's rule).
+        res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
     });
 
     // -- REST v1: GET /api/v1/hardware/{id} --

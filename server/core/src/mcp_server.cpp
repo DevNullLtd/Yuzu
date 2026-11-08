@@ -6270,6 +6270,9 @@ static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
               "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
 static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
               "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<decltype(ToolDeps::ci_page_reader),
+                             decltype(HardwareRoutes::Deps::ci_page_reader)>,
+              "ToolDeps::ci_page_reader drifted from HardwareRoutes::Deps::ci_page_reader");
 static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
 static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,

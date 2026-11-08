@@ -2781,3 +2781,187 @@ TEST_CASE("every registered kind persists its row count and a v1 digest and stat
         CHECK(served_section(store, "agent-all", d.section)["complete"] == true);
     }
 }
+
+// ── list_device_ci_after: the keyset read behind GET /api/v1/hardware/ci ──────────────────────
+
+TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in SQL",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Five agents stored out of key order; agent-c is a v1 record, the rest are v2. Every id
+    // carries its own content hash so a row can be told from its neighbour by it.
+    std::map<std::string, std::string> hash_of;
+    for (const char* id : {"agent-d", "agent-b", "agent-e", "agent-a", "agent-c"}) {
+        DeviceCiRecord r = std::string(id) == "agent-c" ? parse_device_ci_blob(sample_blob())
+                                                        : distinct_v2_record("A");
+        r.hostname = std::string("host-") + id;
+        if (r.blob_version >= 2)
+            r.content_hash = std::string("hash-") + id;
+        hash_of[id] = DeviceInventoryStore::canonical_hash(r);
+        REQUIRE(store.apply_device_ci(id, hash_of[id], std::optional<DeviceCiRecord>{r}, 1) ==
+                InventoryIngestOutcome::kStored);
+    }
+    const auto ids_of = [](const std::vector<DeviceCiRecord>& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : rows)
+            out.push_back(r.agent_id);
+        return out;
+    };
+
+    SECTION("walking with after = the last id visits every row once, in agent_id order") {
+        std::vector<std::string> seen;
+        std::string after;
+        int pages = 0;
+        for (;;) {
+            yuzu::server::DeviceCiKeysetQuery q;
+            q.after = after;
+            q.limit = 2;
+            const auto page = store.list_device_ci_after(q);
+            REQUIRE(page.has_value());
+            REQUIRE(++pages < 10);
+            if (page->empty())
+                break;
+            for (const auto& r : *page)
+                seen.push_back(r.agent_id);
+            after = page->back().agent_id;
+        }
+        CHECK(seen == std::vector<std::string>{"agent-a", "agent-b", "agent-c", "agent-d", "agent-e"});
+        CHECK(pages == 4); // 2 + 2 + 1, then the empty read that ends the walk
+    }
+
+    SECTION("a row carries its scalar fields, the stored hash and its blob version") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 5);
+        for (const auto& r : *page) {
+            INFO(r.agent_id);
+            CHECK(r.content_hash == hash_of[r.agent_id]);
+            CHECK(r.hostname == "host-" + r.agent_id);
+            CHECK(r.serial == "ABC123");
+            CHECK(r.sections.empty()); // scalars only: the sections stay on the per-id read
+        }
+        const auto& v1 = (*page)[2];
+        REQUIRE(v1.agent_id == "agent-c");
+        CHECK(v1.blob_version == 1);
+        CHECK(v1.chassis_type.empty());
+        CHECK(v1.machine_id_hash.empty());
+        const auto& v2 = (*page)[0];
+        CHECK(v2.blob_version == 2);
+        CHECK(v2.chassis_type == "chassis-type-A");
+        // the keyset read and the per-id read agree on the scalars
+        const auto one = store.get_device_ci("agent-a");
+        REQUIRE(one.has_value());
+        REQUIRE(one->has_value());
+        CHECK((**one).serial == v2.serial);
+        CHECK((**one).last_seen == v2.last_seen);
+    }
+
+    SECTION("skip passes over rows after the anchor") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.skip = 2;
+        q.limit = 2;
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c", "agent-d"});
+        q.after = "agent-b";
+        q.skip = 1;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d", "agent-e"});
+        q.skip = -5; // a negative skip is no skip, never an SQL error
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c", "agent-d"});
+    }
+
+    SECTION("agent_id and agent_ids narrow the read") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_id = "agent-d";
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d"});
+
+        q.agent_id = "no-such-agent";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+
+        q.agent_id.reset();
+        q.agent_ids = std::vector<std::string>{"agent-e", "agent-a", "ghost"};
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-a", "agent-e"});
+
+        q.after = "agent-a"; // the keyset bound and the id set compose
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-e"});
+
+        // agent_id inside agent_ids is an intersection
+        q.after.clear();
+        q.agent_id = "agent-b";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    SECTION("a present-empty agent_ids is an empty page") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_ids = std::vector<std::string>{};
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    SECTION("a limit of zero or below is the store's row ceiling, not zero rows") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 0;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->size() == 5);
+    }
+
+    SECTION("ids with quote, backslash, comma and brace characters travel as data") {
+        const std::string odd = "we\"ird,\\id{}";
+        DeviceCiRecord r = distinct_v2_record("A");
+        r.hostname = "odd-host";
+        r.content_hash = "hash-odd";
+        REQUIRE(store.apply_device_ci(odd, DeviceInventoryStore::canonical_hash(r),
+                                      std::optional<DeviceCiRecord>{r}, 1) ==
+                InventoryIngestOutcome::kStored);
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_ids = std::vector<std::string>{odd, "agent-a"};
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->size() == 2);
+        q.agent_ids.reset();
+        q.agent_id = odd;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 1);
+        CHECK((*page)[0].agent_id == odd);
+        q.agent_id.reset();
+        q.after = odd;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value()); // a bound parameter, not SQL text
+    }
+}
+
+TEST_CASE("list_device_ci_after degrades (not empty) on a closed store", "[device_ci][keyset]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
+    yuzu::server::DeviceCiKeysetQuery deny_all;
+    deny_all.agent_ids = std::vector<std::string>{};
+    // a closed store is a degrade even for a deny-all read
+    CHECK_FALSE(store.list_device_ci_after(deny_all).has_value());
+}

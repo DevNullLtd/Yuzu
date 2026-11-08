@@ -255,7 +255,9 @@ constexpr const char* kSelectCols =
     "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
     "board_source, machine_id_hash, machine_id_algorithm, machine_id_source";
 
-void fill_record(PGresult* res, int row, DeviceCiRecord& out) {
+/// Returns the index of the first column after the ones it read, so a query that appends columns
+/// to `kSelectCols` can continue from there.
+int fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     int c = 0;
     const auto col = [&]() { return PQgetvalue(res, row, c++); };
     out.agent_id = col();
@@ -295,6 +297,7 @@ void fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     out.machine_id_hash = col();
     out.machine_id_algorithm = col();
     out.machine_id_source = col();
+    return c;
 }
 
 } // namespace
@@ -741,6 +744,66 @@ std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(
     for (int i = 0; i < rows; ++i) {
         DeviceCiRecord r;
         fill_record(res.get(), i, r);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<DeviceCiRecord>>
+DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: keyset list on a closed store");
+        return std::nullopt;
+    }
+    if (q.agent_ids && q.agent_ids->empty())
+        return std::vector<DeviceCiRecord>{}; // a deny-all scope: nothing to read, no SQL
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: keyset list skipped, no connection in time ({})",
+                         pool_.last_error());
+        return std::nullopt;
+    }
+    const int eff = q.limit > 0 && q.limit < kListRowCap ? q.limit : kListRowCap;
+    // The bound parameters are built alongside the placeholders, in order.
+    std::vector<std::string> params;
+    std::string sql = std::string("SELECT ") + kSelectCols +
+                      ", content_hash FROM device_inventory_store.device_ci WHERE true";
+    if (!q.after.empty()) {
+        params.push_back(q.after);
+        sql += " AND agent_id > $" + std::to_string(params.size());
+    }
+    if (q.agent_id) {
+        params.push_back(*q.agent_id);
+        sql += " AND agent_id = $" + std::to_string(params.size());
+    }
+    if (q.agent_ids) {
+        const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        params.push_back(pg::to_text_array(ids));
+        sql += " AND agent_id = ANY($" + std::to_string(params.size()) + "::text[])";
+    }
+    params.push_back(std::to_string(std::max<std::int64_t>(q.skip, 0)));
+    const std::string skip_ph = "$" + std::to_string(params.size());
+    params.push_back(std::to_string(eff));
+    sql += " ORDER BY agent_id ASC OFFSET " + skip_ph + "::bigint LIMIT $" +
+           std::to_string(params.size()) + "::bigint";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: keyset list failed: {}", PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    const int rows = PQntuples(res.get());
+    std::vector<DeviceCiRecord> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        DeviceCiRecord r;
+        const int next = fill_record(res.get(), i, r);
+        r.content_hash = PQgetvalue(res.get(), i, next);
         out.push_back(std::move(r));
     }
     return out;

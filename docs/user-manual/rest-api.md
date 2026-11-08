@@ -570,7 +570,7 @@ existence-oracle closure exactly).
 
 ### Hardware
 
-The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet). Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
+The Hardware CI list, the single-device CI record and the bulk CI page: the three read routes of the OpenAPI tag `Hardware`, followed by short entries for the on-demand syncs `POST /api/v1/hardware/{id}/sync` (one device) and `POST /api/v1/hardware/sync` (a scope or the fleet). All three read routes are audited on a served read, and with `result=failure` when the device roster (or, for the bulk page, the CI store) could not be read.
 
 #### `GET /api/v1/hardware`
 
@@ -614,6 +614,39 @@ One device's CI record: identity, device-CI blob, the per-section hardware recor
 | `503` | Route misconfigured, audit row not persisted, the authorization store unavailable (`retry_after_ms` 5000), or the device roster could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags), or the record's hardware sections could not be read after the record itself was read (message `hardware sections unavailable`, `retry_after_ms` 5000; a failure at or before the record read is a `200` with `ci: null` instead). The roster case is never a `404`, and a failed sections read is never a `200` with an empty sections list (an empty list with `sections_state` `absent` is a different answer: nothing is stored). |
 
 **Audit:** `inventory.device.ci`; `result=failure` when the roster read or the sections read failed (detail `state=roster unreadable` or `state=sections unreadable` on the `503`, `state=<...> identity=roster unreadable` on a served `200`).
+
+---
+
+#### `GET /api/v1/hardware/ci`
+
+The bulk CI read: one keyset page of every stored device-CI record, built for a daily pull into an external CMDB (one call per page instead of one `GET /api/v1/hardware/{id}` per device). Each row carries the same `ci` object as the per-device record, without `sections`, plus the stored `content_hash` and `blob_version`, so a caller can compare `content_hash` with its own copy and skip a device that did not change.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter), the only gate on the route. The caller's scope is applied in the query itself, so a device outside it is never returned. MCP twin: `list_hardware_ci_records` (see `docs/user-manual/mcp.md`).
+
+**It reads the stored CI table, not the device roster.** `GET /api/v1/hardware` lists the devices seen in the last 30 days; this route lists every device that has a CI record, so a device that has been offline for longer than that is still returned while its record exists. A record is removed when the device's stored data is removed (decommissioning). The route carries no online state, tags or DEX score, and no `sections` or installed software: those stay on `GET /api/v1/hardware/{id}`. A device whose `agent_id` is literally `ci` cannot be fetched at `GET /api/v1/hardware/ci` as a record; read it with `GET /api/v1/hardware/ci?agent_id=ci`.
+
+**Query parameters:**
+
+| Parameter | Meaning |
+|---|---|
+| `limit` | Devices per page, `1` to `1000`, default `100`. An integer outside the range is clamped; anything that is not a plain decimal integer is a `400`. |
+| `cursor` | The `next_cursor` of the previous page. Omit it for the first page. |
+| `agent_id` | Read only this device (at most 256 bytes, no byte below `0x20`). A device outside the caller's scope reads as an empty page, the same as a device with no record. |
+
+A repeated parameter keeps its first value and an unknown parameter is ignored.
+
+**Response:** `{ "data": { "devices": [...], "next_cursor": "", "devices_omitted": 0 }, "meta": { "api_version": "v1" } }`. Each device is `{ "agent_id", "hostname", "ci", "content_hash", "blob_version" }`: `hostname` is the CI record's own (`null` when blank); `ci` has the scalar fields of `GET /api/v1/hardware/{id}` (`manufacturer` through `machine_id_source`, with the same null rules, so a record from an agent that predates the v2 record has `null` chassis, board and machine-id values); `content_hash` is the stored hash of the record (`null` when none is stored); `blob_version` is `1` for the older record and `2` for the versioned one. Rows are in ascending `agent_id` order.
+
+**Paging:** follow `data.next_cursor` as `cursor` until it is empty. An empty `next_cursor` means there is nothing further to read. A non-empty one is an opaque token (the last device served, and for a very wide scope a count of rows passed over): do not parse it, and do not reuse it with a different `agent_id`. A cursor is not authenticated: handing a forged one to the route can only change where the walk starts within what the caller may already read. The walk is a keyset walk, so a device that is added or removed between pages cannot make another device skipped or served twice; a device added behind the cursor is not returned until the next walk. When the caller's scope covers more than 10,000 devices the scope is applied to the rows after they are read rather than in the query: `devices_omitted` counts the devices it dropped from the pages read, a page can be empty while `next_cursor` is not (keep following `next_cursor`), and the cursor then counts the rows passed over since the last device served, so a device added inside that run of passed-over rows between two requests can be missed by that walk. In every other case `devices_omitted` is `0`.
+
+| Status | Meaning |
+|---|---|
+| `200` | A page. |
+| `400` | `limit` is not an integer, `agent_id` is over 256 bytes or carries a byte below `0x20`, or `cursor` is malformed, over 2,048 bytes or was issued for a different `agent_id`. Restart from the first page. |
+| `403` | Caller lacks `Inventory:Read`. |
+| `503` | The CI provider is unwired, the CI store could not be read (`retry_after_ms` 5000), the authorization store is unavailable (`retry_after_ms` 5000), or the audit row for the page could not be persisted (the page is withheld; the response carries `Sec-Audit-Failed: true` and `retry_after_ms` 5000). A failed store read is never a `200` with an empty page. |
+
+**Audit:** `inventory.devices.ci`, one row per served page, written after the read and fail-closed: serial, system UUID, MAC and the chassis and board serials are personal data, so a page whose audit row does not persist is not served. The detail records the row count, `omitted` and `scope=fleet|confined`, and `page=continuation` on a page after the first; the target is `Inventory`/`fleet`, or `Agent`/`<agent_id>` when `agent_id` was given. A failed store read writes the same verb with `result=failure`. A malformed request (`400`) writes no row, because nothing was served.
 
 ---
 

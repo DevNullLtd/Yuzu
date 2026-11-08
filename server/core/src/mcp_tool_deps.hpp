@@ -48,6 +48,7 @@
 #include "authz_gates.hpp"        // authz::FleetReadGate
 #include "crypto_api.hpp"         // CryptoApi's query / result types (the abstract seam, no store)
 #include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate
+#include "hardware_ci_page_model.hpp" // hardware_ci_page::Reader
 #include "hardware_list_model.hpp" // HardwareCiDetail
 #include "inventory_types.hpp"    // InventoryDevicesResult
 #include "quarantine_visible.hpp" // QuarantineListFn
@@ -84,6 +85,7 @@ struct ToolDeps {
     AuditFn audit_fn;
     RosterFn roster_fn;      // build_hw_roster: UNFILTERED, the gate's scope is the sole filter
     CiDetailFn ci_detail_fn; // hw_ci_detail_fn: the full per-device CI record composition
+    hardware_ci_page::Reader ci_page_reader; // hw_ci_page_reader: the keyset read of the stored CI rows
     DexScoreFn dex_score_fn; // page rows only, never the whole roster (one query per call)
     QuarantineListFn quarantine_list_fn;
 

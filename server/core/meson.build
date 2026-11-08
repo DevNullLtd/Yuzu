@@ -842,6 +842,7 @@ yuzu_server_core_lib = static_library(
     'src/group_agent_count_preview.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
+    'src/hardware_ci_page_model.cpp', # bulk device-CI keyset page (GET /api/v1/hardware/ci + MCP twin)
     'src/device_containment_render.cpp',
     'src/device_estate_render.cpp',
     'src/software_catalog_rollup.cpp',
