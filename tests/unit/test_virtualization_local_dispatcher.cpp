@@ -25,7 +25,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <fstream>
 #include <filesystem>
 #include <initializer_list>
 #include <optional>
@@ -344,6 +343,13 @@ TEST_CASE("virtualization execute seam: a leg that throws after reporting keeps 
 
 TEST_CASE("virtualization plugin: wsl answers per OS (one unsupported row off Windows)",
           "[virtualization][dispatcher][wsl]") {
+#if defined(_WIN32)
+    // The Windows leg walks the machine's real ProfileList and may mount every logged-off
+    // NTUSER.DAT (disk I/O, and it changes those hives' sequence numbers, #4977): not something a
+    // unit suite does on a shared runner. Its content-bearing evidence is the plugin-capture
+    // `--action host --action wsl` run on a Windows host, recorded in the PR body.
+    SKIP("the Windows wsl leg reads the live profile list and hives; see the PR's Windows capture");
+#else
     auto plugin = load_plugin();
     if (!plugin) {
         require_plugin_or_skip();
@@ -354,38 +360,6 @@ TEST_CASE("virtualization plugin: wsl answers per OS (one unsupported row off Wi
     CHECK(result.rc == 0); // a degraded read is never a failed command
     CHECK_FALSE(result.truncated);
     const auto rows = captured_rows(result.captured);
-    REQUIRE_FALSE(rows.empty());
-#if defined(_WIN32)
-    INFO("status row: " << rows[0]);
-    REQUIRE(starts_with(rows[0], "status|wsl|"));
-    CHECK((starts_with(rows[0], "status|wsl|supported|") ||
-           starts_with(rows[0], "status|wsl|constrained|")));
-    REQUIRE(rows.size() >= 2);
-    REQUIRE(starts_with(rows[1], "summary|"));
-    CHECK(field_count(rows[1]) == 6);
-    for (std::size_t i = 1; i <= 4; ++i)
-        CHECK(field(rows[1], i).find_first_not_of("0123456789") == std::string::npos);
-    for (std::size_t i = 2; i < rows.size(); ++i) {
-        INFO("row: " << rows[i]);
-        if (starts_with(rows[i], "profile|")) {
-            CHECK(field_count(rows[i]) == 4);
-            CHECK(one_of(field(rows[i], 2), {"not_found", "privilege_missing", "mount_failed",
-                                             "access_denied", "file_refused", "unload_failed",
-                                             "backup_skipped", "sid_invalid"}));
-        } else {
-            REQUIRE(starts_with(rows[i], "distribution|"));
-            CHECK(field_count(rows[i]) == 7);
-            CHECK(one_of(field(rows[i], 3), {"1", "2", "unknown"}));
-            CHECK(one_of(field(rows[i], 5), {"yes", "no"}));
-        }
-    }
-    for (const auto& r : rows) {
-        CHECK(r.find("S-1-5-") == std::string::npos);
-        CHECK(r.find("YUZU_HIVE") == std::string::npos);
-        CHECK(r.find("\\AppData\\") == std::string::npos);
-        CHECK(r.find("NTUSER") == std::string::npos);
-    }
-#else
     REQUIRE(rows.size() == 1);
 #if defined(__APPLE__)
     CHECK(rows[0] == "status|wsl|unsupported|macos:virtualization:wsl:unsupported");
@@ -395,6 +369,38 @@ TEST_CASE("virtualization plugin: wsl answers per OS (one unsupported row off Wi
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
 #endif
+}
+
+TEST_CASE("virtualization descriptor advertises wsl and version 1.1.0",
+          "[virtualization][dispatcher][wsl]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    const YuzuPluginDescriptor& d = *plugin->descriptor;
+    CHECK(std::string{d.version} == "1.1.0");
+
+    REQUIRE(d.actions != nullptr);
+    std::vector<std::string> actions;
+    for (const char* const* a = d.actions; *a != nullptr; ++a)
+        actions.emplace_back(*a);
+    CHECK(actions == std::vector<std::string>{"host", "wsl"});
+
+    REQUIRE(d.action_descriptors != nullptr);
+    REQUIRE(d.action_descriptor_count == 2);
+    const YuzuActionDescriptor* wsl = nullptr;
+    for (std::size_t i = 0; i < d.action_descriptor_count; ++i)
+        if (std::string{d.action_descriptors[i].action} == "wsl")
+            wsl = &d.action_descriptors[i];
+    REQUIRE(wsl != nullptr);
+    // Windows-only: constrained at rung 1 there, unsupported at rung 0 elsewhere.
+    CHECK(wsl->linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+    CHECK(wsl->linux_leg.rung == 0);
+    CHECK(wsl->macos_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+    CHECK(wsl->macos_leg.rung == 0);
+    CHECK(wsl->windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(wsl->windows_leg.rung == 1);
 }
 
 TEST_CASE("virtualization execute seam: a throwing wsl leg is contained under its own action name",
@@ -415,49 +421,4 @@ TEST_CASE("virtualization execute seam: a throwing wsl leg is contained under it
     const auto hrows = captured_rows(h.captured);
     REQUIRE(hrows.size() == 1);
     CHECK(hrows[0] == "status|host|supported|-");
-}
-
-TEST_CASE("virtualization windows shell: with_user_hive is called with the default-on guard and the "
-          "mount name only reaches the log",
-          "[virtualization][wsl][lexical]") {
-    // A lexical pin on the Windows shell (readable on every host): the one place the offline
-    // arm is entered must stay exactly the shared ladder. The source is found by its repo-relative
-    // path: the compile-time fixture dir (an absolute path under the source root, defined for
-    // every agent-suite build; `meson test` does not export MESON_SOURCE_ROOT), then
-    // $MESON_SOURCE_ROOT, then the CWD. No candidate FAILS the pin; it is never a soft skip.
-    const std::string rel = "agents/plugins/virtualization/src/virtualization_win.cpp";
-    std::vector<std::string> candidates;
-#ifdef YUZU_TEST_FIXTURE_DIR
-    candidates.push_back(std::string{YUZU_TEST_FIXTURE_DIR} + "/../../../" + rel);
-#endif
-    if (const char* root = std::getenv("MESON_SOURCE_ROOT"))
-        candidates.push_back(std::string{root} + "/" + rel);
-    candidates.push_back(rel);
-    std::ifstream in;
-    for (const auto& c : candidates) {
-        in.open(c);
-        if (in)
-            break;
-        in.clear();
-    }
-    REQUIRE(in);
-    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-
-    const auto call = src.find("with_user_hive(");
-    REQUIRE(call != std::string::npos);
-    CHECK(src.find("with_user_hive(", call + 1) == std::string::npos); // exactly one call
-    const std::string stmt = src.substr(call, 300); // the call, lambda body included
-    CHECK(stmt.find("&report)") != std::string::npos);        // four arguments, ending in the report
-    CHECK(stmt.find("OfflineHiveFileCheck") == std::string::npos);
-    CHECK(src.find("kOfflineHiveFileUnguarded") == std::string::npos);
-    CHECK(src.find("enumerate_hku_subkeys") == std::string::npos);
-    // The registry is opened without following a link planted in the user-writable Lxss subtree.
-    CHECK(src.find("REG_OPTION_OPEN_LINK") != std::string::npos);
-
-    // Every mention of mount_name sits inside a spdlog:: call.
-    std::string rest = src;
-    for (std::size_t p; (p = rest.find("spdlog::error(")) != std::string::npos;)
-        rest.erase(p, rest.find(';', p) - p);
-    CHECK(rest.find("mount_name") == std::string::npos);
-    CHECK(src.find("mount_name") != std::string::npos);
 }

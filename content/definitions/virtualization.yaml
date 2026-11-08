@@ -204,7 +204,6 @@ spec:
         type: string
         description: 'summary: the WSL package version, "-" when unavailable. distribution: whether this is the account''s default distribution, yes or no.'
         example: 'yes'
-        values: ['yes', 'no']
         platforms: [windows]
       - name: field_6
         type: string

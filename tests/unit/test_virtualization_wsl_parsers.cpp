@@ -10,6 +10,7 @@
 #include "virtualization_wsl_parsers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <deque>
 #include <map>
@@ -18,6 +19,8 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace wsl = yuzu::virtualization::wsl;
@@ -36,6 +39,30 @@ constexpr const char* kMountName =
 
 constexpr const char* kGuid1 = "{11111111-2222-3333-4444-555555555555}";
 constexpr const char* kGuid2 = "{AAAAAAAA-bbbb-CCCC-dddd-EEEEEEEEEEEE}";
+
+/// The profile-row `outcome` vocabulary (closed): the oracle the production literals are held to.
+constexpr std::array<std::string_view, 8> kProfileOutcomes = {
+    "not_found",    "privilege_missing", "mount_failed",   "access_denied",
+    "file_refused", "unload_failed",     "backup_skipped", "sid_invalid",
+};
+
+/// REG_SZ values the README names as never emitted, each seeded with a distinct sentinel so a
+/// read-and-emit shows up as that sentinel on the wire (BasePath, VhdFileName and DefaultUid are
+/// seeded separately by make_hive). Distribution-key values, then Lxss-key values.
+struct Excluded {
+    const wchar_t* value;
+    const char* sentinel;
+};
+constexpr Excluded kExcludedDistroValues[] = {
+    {L"ShortcutPath", "SECRETSHORTCUT"},
+    {L"TerminalProfilePath", "SECRETTERMINAL"},
+    {L"PackageFamilyName", "SECRETPKGFAMILY"},
+    {L"KernelCommandLine", "SECRETKERNELCMD"},
+};
+constexpr Excluded kExcludedLxssValues[] = {
+    {L"NatIpAddress", "SECRETNATIP"},
+    {L"NatNetwork", "SECRETNATNET"},
+};
 
 std::wstring w(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
@@ -62,6 +89,8 @@ struct FakeOps {
     int opens = 0, closes = 0, enums = 0, queries = 0, probes = 0, fills = 0;
     bool throw_on_enum = false;
     std::vector<std::size_t> payload_sizes; // what the REG_SZ decoder was handed, per call
+    /// Every (key, value name) the walk asked for, in call order (probe and fill both record).
+    std::vector<std::pair<const Node*, std::wstring>> queried;
 
     /// Every enum_key/query_value call the walk made (each one is preceded by a budget visit).
     std::size_t calls() const { return static_cast<std::size_t>(enums + queries); }
@@ -73,7 +102,8 @@ struct FakeOps {
         return c;
     }
 
-    static void set_sz(Node& n, const wchar_t* name, const std::string& v, std::uint32_t type = wsl::kRegSz) {
+    static void set_sz(Node& n, const wchar_t* name, const std::string& v,
+                       std::uint32_t type = wsl::kRegSz) {
         Val val;
         val.type = type;
         for (char c : v)
@@ -119,6 +149,7 @@ struct FakeOps {
                      std::uint32_t& size) {
         ++queries;
         auto* n = static_cast<Node*>(key);
+        queried.emplace_back(n, name);
         auto it = n->values.find(name);
         if (it == n->values.end())
             return wsl::kErrorFileNotFound;
@@ -163,11 +194,14 @@ struct Distro {
 };
 
 /// A hive root holding Lxss with the given distributions; `default_guid` empty = none set.
-Node& make_hive(FakeOps& ops, const std::vector<Distro>& distros, const std::string& default_guid = {}) {
+Node& make_hive(FakeOps& ops, const std::vector<Distro>& distros,
+                const std::string& default_guid = {}) {
     Node& root = ops.node();
     Node& lx = ops.child(root, wsl::detail::kLxssPath);
     if (!default_guid.empty())
         FakeOps::set_sz(lx, L"DefaultDistribution", default_guid);
+    for (const auto& e : kExcludedLxssValues)
+        FakeOps::set_sz(lx, e.value, e.sentinel);
     for (const auto& d : distros) {
         Node& dk = ops.child(lx, w(d.guid));
         FakeOps::set_sz(dk, L"DistributionName", d.name);
@@ -178,6 +212,8 @@ Node& make_hive(FakeOps& ops, const std::vector<Distro>& distros, const std::str
         FakeOps::set_sz(dk, L"BasePath", "D:\\wsl-store\\SECRETPATH\\Packages");
         FakeOps::set_sz(dk, L"VhdFileName", "ext4.SECRETVHD");
         FakeOps::set_dword(dk, L"DefaultUid", 424242);
+        for (const auto& e : kExcludedDistroValues)
+            FakeOps::set_sz(dk, e.value, e.sentinel);
     }
     return root;
 }
@@ -356,8 +392,9 @@ TEST_CASE("wsl: every failed status x live-root code maps to one outcome, access
             FakeOps ops;
             Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
             FakeAccess acc;
-            acc.cfg[kSidA] = {c.st, nullptr, c.st == HiveAccessStatus::file_refused ? "hive_hardlinked" : "",
-                              false, live};
+            const char* const refusal =
+                c.st == HiveAccessStatus::file_refused ? "hive_hardlinked" : "";
+            acc.cfg[kSidA] = {c.st, nullptr, refusal, false, live};
             acc.cfg[kSidB] = {HiveAccessStatus::ok, &hive};
             const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob")}, acc, ops);
             INFO(c.outcome << " live=" << live);
@@ -401,7 +438,8 @@ TEST_CASE("wsl: unload_failed is independent of the access status and never carr
             CHECK(has_row(r.posture, c.failure_row));
             CHECK(r.posture.rows[0].starts_with("summary|0|0|0|1|"));
         } else {
-            // The hive was read: the distribution stays, profiles_read counts it, not_loaded does not.
+            // The hive was read: the distribution stays, profiles_read counts it, not_loaded
+            // does not.
             CHECK(r.posture.rows[0] == "summary|1|1|1|0|-");
             CHECK(has_row(r.posture, "distribution|alice|Ubuntu|2|installed|no|ubuntu"));
         }
@@ -412,7 +450,8 @@ TEST_CASE("wsl: unload_failed is independent of the access status and never carr
     }
 }
 
-TEST_CASE("wsl: a .bak entry and an invalid SID are named and never accessed", "[virtualization][wsl]") {
+TEST_CASE("wsl: a .bak entry and an invalid SID are named and never accessed",
+          "[virtualization][wsl]") {
     FakeOps ops;
     FakeAccess acc;
     acc.cfg[kSidA] = {HiveAccessStatus::not_found};
@@ -514,7 +553,8 @@ TEST_CASE("wsl: the byte bound trips alone, at the exact byte", "[virtualization
     CHECK(tight.ops.opens == tight.ops.closes); // the mid-walk stop closed every key
 }
 
-TEST_CASE("wsl: the visited-entry bound trips alone and stops the loop", "[virtualization][wsl][budget]") {
+TEST_CASE("wsl: the visited-entry bound trips alone and stops the loop",
+          "[virtualization][wsl][budget]") {
     Fleet f(2);
     wsl::WalkBudget big;
     (void)run(f.profiles, f.acc, f.ops, big);
@@ -572,8 +612,8 @@ TEST_CASE("wsl: the per-hive call bound ends that hive alone; later hives are st
     // (1 + 2 x 7 + 1 = 16) fit. The dispatch-wide caps are the production ones.
     wsl::WalkBudget b(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, wsl::kDefaultMaxVisited,
                       /*max_visited_per_hive=*/20, wsl::kDefaultMaxRowsPerHive);
-    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")}, acc,
-                       ops, b);
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")},
+                       acc, ops, b);
 
     CHECK(has_token(r.posture, "hive_entry_cap"));
     CHECK_FALSE(has_token(r.posture, "entry_cap"));
@@ -604,8 +644,8 @@ TEST_CASE("wsl: the per-hive row bound ends that hive alone; later hives are sti
     acc.cfg[kSidC] = {HiveAccessStatus::ok, &hc};
     wsl::WalkBudget b(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, wsl::kDefaultMaxVisited,
                       wsl::kDefaultMaxVisitedPerHive, /*max_rows_per_hive=*/3);
-    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")}, acc,
-                       ops, b);
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")},
+                       acc, ops, b);
 
     CHECK(has_token(r.posture, "hive_row_cap"));
     CHECK_FALSE(has_token(r.posture, "row_cap"));
@@ -675,7 +715,8 @@ TEST_CASE("wsl: retained values are the sanitized, charged ones; e-mail shapes a
     const auto& d = r.reads.hives[0].distros[0];
     CHECK(*d.name == "[redacted-email]");
     CHECK(*d.flavor == "[redacted-email]");
-    CHECK(has_row(r.posture, "distribution|alice|[redacted-email]|2|installed|no|[redacted-email]"));
+    CHECK(has_row(r.posture,
+                  "distribution|alice|[redacted-email]|2|installed|no|[redacted-email]"));
     // charged == formatted row + newline, on top of the reserved header
     const std::string row = wsl::format_distribution_row("alice", d);
     CHECK(b.rows.bytes == wsl::kHeaderReserveBytes + row.size() + 1);
@@ -730,7 +771,8 @@ TEST_CASE("wsl: the Lxss key open maps NOT_FOUND to read-ok, denial and failure 
     acc.cfg[kSidA] = {HiveAccessStatus::ok, &none};
     acc.cfg[kSidB] = {HiveAccessStatus::ok, &denied};
     acc.cfg[kSidC] = {HiveAccessStatus::ok, &broken};
-    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")}, acc, ops);
+    const auto r =
+        run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")}, acc, ops);
     CHECK(has_token(r.posture, "hive_access_denied"));
     CHECK(has_token(r.posture, "hive_open_failed"));
     CHECK(r.posture.rows[0] == "summary|0|0|1|0|-"); // only the NOT_FOUND hive counts as read
@@ -746,7 +788,8 @@ TEST_CASE("wsl: only GUID-shaped children are opened; others are skipped silentl
     for (const wchar_t* junk : {L"InstallStatus", L"AppxInstallerCache", L"{not-a-guid}",
                                 L"{11111111-22223333-4444-555555555555}", L""})
         ops.child(lx, junk);
-    ops.child(lx, std::wstring(L"{11111111-2222-3333-4444-55555555555") + std::wstring(1, L'\0') + L"}");
+    ops.child(lx, std::wstring(L"{11111111-2222-3333-4444-55555555555") + std::wstring(1, L'\0') +
+                      L"}");
     FakeAccess acc;
     acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
     const auto r = run({profile(kSidA, "alice")}, acc, ops);
@@ -760,7 +803,8 @@ TEST_CASE("wsl: only GUID-shaped children are opened; others are skipped silentl
 TEST_CASE("wsl: an enumeration failure mid-walk keeps the rows so far and is a token",
           "[virtualization][wsl]") {
     FakeOps ops;
-    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}, {kGuid2, "Debian", 2, 1, "debian"}});
+    Node& hive =
+        make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}, {kGuid2, "Debian", 2, 1, "debian"}});
     lxss_of(hive).enum_fail_idx = 1;
     lxss_of(hive).enum_fail_rc = wsl::kErrorAccessDenied;
     FakeAccess acc;
@@ -775,7 +819,8 @@ TEST_CASE("wsl: an enumeration failure mid-walk keeps the rows so far and is a t
 TEST_CASE("wsl: an enumeration MORE_DATA skips that index and the walk goes on",
           "[virtualization][wsl]") {
     FakeOps ops;
-    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}, {kGuid2, "Debian", 2, 1, "debian"}});
+    Node& hive =
+        make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}, {kGuid2, "Debian", 2, 1, "debian"}});
     lxss_of(hive).enum_fail_idx = 0;
     lxss_of(hive).enum_fail_rc = wsl::kErrorMoreData;
     FakeAccess acc;
@@ -787,7 +832,8 @@ TEST_CASE("wsl: an enumeration MORE_DATA skips that index and the walk goes on",
     CHECK(r.posture.rows.size() == 2);
     CHECK(r.posture.rows[0] == "summary|1|1|1|0|-");
     CHECK(has_row(r.posture, "distribution|alice|Debian|2|installed|no|debian"));
-    // The skipped index was charged: DefaultDistribution + 3 enums (skipped, listed, end) + 6 values.
+    // The skipped index was charged: DefaultDistribution + 3 enums (skipped, listed, end) + 6
+    // values.
     CHECK(ops.enums == 3);
     CHECK(b.visited == 1 + 3 + 6);
     CHECK(ops.calls() == b.visited);
@@ -912,7 +958,8 @@ TEST_CASE("wsl: a value-sized redaction worst case is bounded and emitted as is"
           "[virtualization][wsl]") {
     // The densest `@(` run a REG_SZ of kMaxValueBytes can hold: every `@` opens a comment that is
     // never closed, which is the e-mail scan's quadratic input. The input is bounded BEFORE
-    // redaction, so the test pins the bound (the value is read whole and is not an address), not a time.
+    // redaction, so the test pins the bound (the value is read whole and is not an address), not a
+    // time.
     std::string hostile = "a";
     while (hostile.size() + 2 <= wsl::kMaxValueBytes - 1)
         hostile += "@(";
@@ -939,8 +986,8 @@ TEST_CASE("wsl: an e-mail-shaped profile folder name is redacted on every row th
     FakeAccess acc;
     acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
     acc.cfg[kSidB] = {HiveAccessStatus::not_found};
-    const auto r = run({profile(kSidA, "jsmith@corp.example"), profile(kSidB, "kjones@corp.example")},
-                       acc, ops);
+    const auto r = run(
+        {profile(kSidA, "jsmith@corp.example"), profile(kSidB, "kjones@corp.example")}, acc, ops);
     CHECK(has_row(r.posture, "distribution|[redacted-email]|Ubuntu|2|installed|no|ubuntu"));
     CHECK(has_row(r.posture, "profile|[redacted-email]|not_found|-"));
     const std::string all = joined(r.posture);
@@ -949,7 +996,7 @@ TEST_CASE("wsl: an e-mail-shaped profile folder name is redacted on every row th
     CHECK(all.find("kjones") == std::string::npos);
 }
 
-TEST_CASE("wsl: nothing on the never-emit list reaches a row", "[virtualization][wsl]") {
+TEST_CASE("wsl: nothing on the never-emit list is read or reaches a row", "[virtualization][wsl]") {
     FakeOps ops;
     Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}}, kGuid1);
     FakeAccess acc;
@@ -957,9 +1004,43 @@ TEST_CASE("wsl: nothing on the never-emit list reaches a row", "[virtualization]
     acc.cfg[kSidB] = {HiveAccessStatus::not_found};
     const auto r = run({profile(kSidA, ""), profile(kSidB, "bob")}, acc, ops);
     const std::string all = joined(r.posture);
-    for (const char* secret : {"SECRETPATH", "SECRETVHD", "424242", "S-1-5-", "YUZU_HIVE", kGuid1})
+    for (const char* secret :
+         {"SECRETPATH", "SECRETVHD", "424242", "S-1-5-", "YUZU_HIVE", kGuid1})
         CHECK(all.find(secret) == std::string::npos);
-    CHECK(has_row(r.posture, "distribution|-|Ubuntu|2|installed|yes|ubuntu")); // empty folder name -> "-"
+    for (const auto& e : kExcludedDistroValues)
+        CHECK(all.find(e.sentinel) == std::string::npos);
+    for (const auto& e : kExcludedLxssValues)
+        CHECK(all.find(e.sentinel) == std::string::npos);
+    // An empty folder name reads "-".
+    CHECK(has_row(r.posture, "distribution|-|Ubuntu|2|installed|yes|ubuntu"));
+
+    // The exclusion is also a read-side contract: only the intended values are ever asked for,
+    // each on its own key (a value read on the wrong key would pass a whole-run name check).
+    std::map<const Node*, std::set<std::wstring>> by_key;
+    for (const auto& [key, name] : ops.queried)
+        by_key[key].insert(name);
+    const Node& lxss = lxss_of(hive);
+    const Node& distro = *lxss.children.front().second;
+    CHECK(by_key.size() == 2);
+    CHECK(by_key[&lxss] == std::set<std::wstring>{L"DefaultDistribution"});
+    CHECK(by_key[&distro] ==
+          std::set<std::wstring>{L"DistributionName", L"Version", L"State", L"Flavor"});
+
+    // The package key: only Version, even with another value present beside it.
+    FakeOps pkg_ops;
+    Node& hklm = pkg_ops.node();
+    Node& msi = pkg_ops.child(hklm, wsl::detail::kMsiPath);
+    FakeOps::set_sz(msi, L"Version", "3.0.3.0");
+    FakeOps::set_sz(msi, L"InstallLocation", "SECRETMSIPATH");
+    wsl::WalkBudget b;
+    wsl::WslReads pkg_reads;
+    wsl::read_package_version(pkg_ops, &hklm, b, pkg_reads);
+    REQUIRE(pkg_ops.queried.size() >= 1);
+    for (const auto& [key, name] : pkg_ops.queried) {
+        CHECK(key == &msi);
+        CHECK(name == L"Version");
+    }
+    CHECK(pkg_reads.package_version == "3.0.3.0");
 }
 
 TEST_CASE("wsl: hostile names stay seven fields", "[virtualization][wsl]") {
@@ -1003,7 +1084,9 @@ TEST_CASE("wsl: the package version is read, bounded and tokenised", "[virtualiz
     CHECK_FALSE(longv.package_version);
     CHECK(longv.tokens == std::vector<std::string>{"package_malformed"});
 
-    auto keyfail = read([](FakeOps& o, Node& h) { o.child(h, wsl::detail::kMsiPath).open_rc = wsl::kErrorAccessDenied; });
+    auto keyfail = read([](FakeOps& o, Node& h) {
+        o.child(h, wsl::detail::kMsiPath).open_rc = wsl::kErrorAccessDenied;
+    });
     CHECK(keyfail.tokens == std::vector<std::string>{"package_access_denied"});
 
     auto valfail = read([](FakeOps& o, Node& h) {
@@ -1022,11 +1105,14 @@ TEST_CASE("wsl: the package version is read, bounded and tokenised", "[virtualiz
 TEST_CASE("wsl: ProfileList discovery is classified, never a prefix read as complete",
           "[virtualization][wsl]") {
     using E = wsl::ProfileListEnd;
-    CHECK(wsl::classify_profile_list_end(wsl::kErrorNoMoreItems, wsl::kErrorSuccess) == E::complete);
-    CHECK(wsl::classify_profile_list_end(wsl::kErrorAccessDenied, wsl::kErrorNoMoreItems) == E::enum_failed);
-    CHECK(wsl::classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorNoMoreItems) == E::complete);
-    CHECK(wsl::classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorSuccess) == E::cap);
-    CHECK(wsl::classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorAccessDenied) == E::enum_failed);
+    using wsl::classify_profile_list_end;
+    CHECK(classify_profile_list_end(wsl::kErrorNoMoreItems, wsl::kErrorSuccess) == E::complete);
+    CHECK(classify_profile_list_end(wsl::kErrorAccessDenied, wsl::kErrorNoMoreItems) ==
+          E::enum_failed);
+    CHECK(classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorNoMoreItems) == E::complete);
+    CHECK(classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorSuccess) == E::cap);
+    CHECK(classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorAccessDenied) ==
+          E::enum_failed);
 
     CHECK_FALSE(wsl::profile_list_token(0, wsl::kErrorNoMoreItems, 0));
     CHECK(wsl::profile_list_token(wsl::kErrorAccessDenied, 0, 0) == "profile_list_access_denied");
@@ -1069,19 +1155,59 @@ TEST_CASE("wsl: rows sort by account then name; profile rows by account then out
     CHECK(r.posture.rows[2].find("Alpha") != std::string::npos);
 }
 
+TEST_CASE("wsl: profile rows sort by account then outcome", "[virtualization][wsl]") {
+    // Inserted in the reverse of the expected order. A profile always emits its access outcome
+    // before `unload_failed`, so the outcome key is only observable across two profiles that
+    // share a folder name: the first leaves a mount behind, the second is refused by the guard.
+    FakeOps ops;
+    FakeAccess acc;
+    acc.cfg[kSidC] = {HiveAccessStatus::not_found};
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, nullptr, "", true};
+    acc.cfg[kSidB] = {HiveAccessStatus::file_refused, nullptr, "hive_path_unc"};
+    const auto r =
+        run({profile(kSidC, "zed"), profile(kSidA, "amy"), profile(kSidB, "amy")}, acc, ops);
+    std::vector<std::string> profile_rows;
+    for (const auto& row : r.posture.rows)
+        if (row.starts_with("profile|"))
+            profile_rows.push_back(row);
+    CHECK(profile_rows == std::vector<std::string>{"profile|amy|file_refused|hive_path_unc",
+                                                   "profile|amy|unload_failed|-",
+                                                   "profile|zed|not_found|-"});
+}
+
+TEST_CASE("wsl: a defect repeated across profiles stays one token in the reads",
+          "[virtualization][wsl]") {
+    // Deduped at push (not only by the ConstraintAccumulator in decide_wsl), so 512 refused
+    // profiles never become a 512-entry token vector.
+    FakeOps ops;
+    FakeAccess acc;
+    std::vector<ProfileInfo> ps;
+    for (int i = 0; i < 40; ++i) {
+        const std::string sid = "S-1-5-21-9-9-9-" + std::to_string(2000 + i);
+        acc.cfg[sid] = {HiveAccessStatus::not_found};
+        ps.push_back(profile(sid, "u" + std::to_string(i)));
+    }
+    const auto r = run(ps, acc, ops);
+    CHECK(r.reads.profile_rows.size() == 40);
+    CHECK(r.reads.tokens == std::vector<std::string>{"hive_not_found"});
+}
+
 TEST_CASE("wsl: every emitted token matches the class (a) grammar", "[virtualization][wsl]") {
     const std::regex re{"^windows:virtualization:wsl:[a-z0-9_]+$"};
     for (const auto s : wsl::kFixedTokenSuffixes)
         CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + std::string{s}, re));
-    CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + "package_" + wsl::win32_cause(1450), re));
-    CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + "profile_list_" + wsl::win32_cause(5), re));
-    CHECK(wsl::kProfileOutcomes.size() == 8);
+    CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + "package_" + wsl::win32_cause(1450),
+                           re));
+    CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + "profile_list_" + wsl::win32_cause(5),
+                           re));
+    CHECK(kProfileOutcomes.size() == 8);
 
     // Every profile-row outcome decide can produce is one of the eight literals.
     FakeOps ops;
     FakeAccess acc;
-    const HiveAccessStatus all[] = {HiveAccessStatus::not_found, HiveAccessStatus::privilege_missing,
-                                    HiveAccessStatus::mount_failed, HiveAccessStatus::file_refused};
+    const HiveAccessStatus all[] = {
+        HiveAccessStatus::not_found, HiveAccessStatus::privilege_missing,
+        HiveAccessStatus::mount_failed, HiveAccessStatus::file_refused};
     const char* sids[] = {kSidA, kSidB, kSidC, "S-1-5-21-9-9-9-1004"};
     std::vector<ProfileInfo> ps;
     for (int i = 0; i < 4; ++i) {
@@ -1101,14 +1227,15 @@ TEST_CASE("wsl: every emitted token matches the class (a) grammar", "[virtualiza
             outcomes.insert(row.substr(a + 1, row.find('|', a + 1) - a - 1));
         }
     for (const auto& o : outcomes)
-        CHECK(std::find(wsl::kProfileOutcomes.begin(), wsl::kProfileOutcomes.end(), o) !=
-              wsl::kProfileOutcomes.end());
+        CHECK(std::find(kProfileOutcomes.begin(), kProfileOutcomes.end(), o) !=
+              kProfileOutcomes.end());
     CHECK(outcomes.size() == 8);
     for (const char* tok : {"windows:virtualization:wsl:hive_not_found",
                             "windows:virtualization:wsl:hive_access_denied"})
         CHECK(r.posture.reason.find(tok) != std::string::npos);
-    for (std::size_t pos = 0; (pos = r.posture.reason.find("windows:", pos)) != std::string::npos; ++pos) {
-        const auto end = r.posture.reason.find(',', pos);
-        CHECK(std::regex_match(r.posture.reason.substr(pos, end == std::string::npos ? end : end - pos), re));
+    const std::string& reason = r.posture.reason;
+    for (std::size_t pos = 0; (pos = reason.find("windows:", pos)) != std::string::npos; ++pos) {
+        const auto end = reason.find(',', pos);
+        CHECK(std::regex_match(reason.substr(pos, end == std::string::npos ? end : end - pos), re));
     }
 }

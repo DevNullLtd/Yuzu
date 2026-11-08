@@ -100,12 +100,6 @@ inline constexpr std::size_t kMaxCauseChars = 6 + 11;
     return rc == kErrorAccessDenied ? std::string{"access_denied"} : "win32_" + std::to_string(rc);
 }
 
-/// The profile-row `outcome` vocabulary (closed).
-inline constexpr std::array<std::string_view, 8> kProfileOutcomes = {
-    "not_found",    "privilege_missing", "mount_failed", "access_denied",
-    "file_refused", "unload_failed",     "backup_skipped", "sid_invalid",
-};
-
 namespace detail {
 
 constexpr std::size_t token_bytes_total() {
@@ -684,9 +678,9 @@ inline void add_profile_row(WslReads& out, WalkBudget& budget, bool& stop, std::
                             std::string_view token) {
     ProfileOutcome p{std::move(account), std::string{outcome},
                      detail.empty() ? std::string{"-"} : std::move(detail)};
-    out.tokens.emplace_back(token);
+    add_token(out.tokens, token);
     if (!budget.charge_row(format_profile_row(p))) {
-        out.tokens.emplace_back("row_cap");
+        add_token(out.tokens, "row_cap");
         stop = true;
         return;
     }
@@ -802,9 +796,10 @@ void collect_wsl(std::span<const yuzu::profiles::ProfileInfo> profiles, const Hi
     });
 
     std::vector<ProfileOutcome> prof = r.profile_rows;
-    std::stable_sort(prof.begin(), prof.end(), [](const ProfileOutcome& a, const ProfileOutcome& b) {
-        return std::tie(a.account, a.outcome) < std::tie(b.account, b.outcome);
-    });
+    std::stable_sort(prof.begin(), prof.end(),
+                     [](const ProfileOutcome& a, const ProfileOutcome& b) {
+                         return std::tie(a.account, a.outcome) < std::tie(b.account, b.outcome);
+                     });
 
     Posture p;
     p.status = acc.any_failure() ? StatusState::constrained : StatusState::supported;

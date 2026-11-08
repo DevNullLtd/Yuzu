@@ -61,15 +61,18 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "wsl",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows-only: WSL distributions are a Windows feature"},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+         "Windows-only: WSL distributions are a Windows feature"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows-only: WSL distributions are a Windows feature"},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+         "Windows-only: WSL distributions are a Windows feature"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "Reg*W reads of HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\\MSI and each "
-         "local profile's Software\\Microsoft\\Windows\\CurrentVersion\\Lxss key through the shared "
-         "with_user_hive ladder (loaded HKU hive first, else a guarded offline NTUSER.DAT mount "
-         "under SeBackup/SeRestore and the process-wide offline-hive lock); no subprocess",
+         "local profile's Software\\Microsoft\\Windows\\CurrentVersion\\Lxss key through the "
+         "shared with_user_hive ladder (loaded HKU hive first, else a guarded offline "
+         "NTUSER.DAT mount under SeBackup/SeRestore and the process-wide offline-hive lock); "
+         "no subprocess",
          "a profile whose hive was reached by neither arm is counted and reported on its own "
          "profile row, never read as having no distributions; wsl2 counts version-2 "
          "distributions and is not a VM count (the utility VM's running state is not read); "
@@ -94,7 +97,8 @@ public:
     std::string_view name() const noexcept override { return "virtualization"; }
     std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
-        return "Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions";
+        return "Virtualization facts: VM or not, which hypervisor, container membership, "
+               "WSL distributions";
     }
 
     const char* const* actions() const noexcept override {

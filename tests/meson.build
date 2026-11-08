@@ -4149,6 +4149,17 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
   timeout: 30,
 )
 
+# virtualization `wsl`: static lexical gate over the Windows shell's wiring -- the one
+# with_user_hive call (default-on hive-file guard, no check argument), no HKEY_USERS enumeration,
+# REG_OPTION_OPEN_LINK on every registry open, and the SID-bearing mount name only in the agent
+# log. Source text only (the Windows body cannot run in the unit suites), so Python, no build.
+test('virtualization wsl Windows shell wiring lexical gate',
+  _python3_test,
+  args: [files('test_virtualization_wsl_pin_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
 # flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build

@@ -144,7 +144,8 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0;
 // hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned;
 // middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
-// added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added by PR12.1-b1), 247 rows.
+// added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08),
+// 247 rows.
 inline constexpr std::array<UnitOsRow, 247> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},

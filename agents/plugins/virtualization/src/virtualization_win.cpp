@@ -100,9 +100,9 @@ struct RealRegOps {
                      std::span<std::byte> buf, std::uint32_t& size) {
         DWORD t = 0;
         DWORD sz = static_cast<DWORD>(buf.size());
-        const LONG rc = RegQueryValueExW(static_cast<HKEY>(key), value_name, nullptr, &t,
-                                         buf.empty() ? nullptr : reinterpret_cast<BYTE*>(buf.data()),
-                                         &sz);
+        const LONG rc = RegQueryValueExW(
+            static_cast<HKEY>(key), value_name, nullptr, &t,
+            buf.empty() ? nullptr : reinterpret_cast<BYTE*>(buf.data()), &sz);
         type = t;
         size = sz;
         return rc;
@@ -139,10 +139,12 @@ int run_windows_wsl(yuzu::CommandContext& ctx) {
     // Every outcome of the ProfileList walk is consumed, the cap probe included.
     const auto list = yuzu::win::enumerate_profile_list();
     if (const auto t = wsl::profile_list_token(list.root_rc, list.last_rc, list.probe_rc))
-        reads.tokens.push_back(*t);
+        wsl::detail::add_token(reads.tokens, *t);
+    // Mirrors build_profile_list's is_system_sid filter (user_profile_model.hpp): a system
+    // account's record failure concerns a profile this action never walks, so it is not reported.
     for (const auto& rf : list.record_failures) {
         if (!yuzu::profiles::is_system_sid(rf.sid)) {
-            reads.tokens.emplace_back("profile_unreadable");
+            wsl::detail::add_token(reads.tokens, "profile_unreadable");
             break;
         }
     }

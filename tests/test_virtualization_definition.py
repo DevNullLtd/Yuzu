@@ -72,6 +72,13 @@ class VirtualizationDefinitionColumns(unittest.TestCase):
         self.assertEqual(field_2["name"], "field_2")
         self.assertNotIn("values", field_2)
 
+    def test_wsl_field_5_accepts_summary_package_version(self):
+        # field_5 is multiplexed on the wsl document: the summary row's package version ("3.0.3.0",
+        # or "-") and the distribution row's yes/no, so no closed value list.
+        field_5 = _definitions()["wsl"]["spec"]["result"]["columns"][5]
+        self.assertEqual(field_5["name"], "field_5")
+        self.assertNotIn("values", field_5)
+
     def test_operational_defaults_are_pinned(self):
         spec = _definitions()["host"]["spec"]
         self.assertEqual(spec["type"], "question")
