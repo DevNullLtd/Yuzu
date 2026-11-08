@@ -1384,7 +1384,8 @@ replica, review the window's `auth.login` and `mfa.enroll.verified` rows afterwa
 **During a rolling upgrade.** Counters are per replica. An un-upgraded replica still reports a Shape 1
 fault as `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` (and at sign-in also
 `yuzu_auth_read_degrade_total{route="login"}`) with a `store_unavailable` audit detail. Alert on both signals
-until every replica runs the same build.
+until every replica runs the same build. This applies to the #6995 counters only: the #6079 build forbids
+mixed-version operation (see [Upgrading](../user-manual/upgrading.md)).
 
 ## Enrolling a non-admin approver
 
@@ -2057,14 +2058,16 @@ check the gauges, then the generation query there. The approver routes answer th
 three causes are sticky and carry no `retry_after_ms` (the remediation points here): the account-store
 trigger observed not in force (`mfa_binding_unenforced`), the session store's rebind guard latched not in
 force (`mfa_proof_unavailable`), and an enrolled row whose factor generation is not positive
-(`mfa_proof_unavailable`). A transient cause (an unreadable enrolment or stored-proof read, or, on the
-`auth` side only, an inconclusive trigger validation, a catalog query that could not run) keeps `retry_after_ms: 5000`. That
+(`mfa_proof_unavailable`). A transient cause (an unreadable enrolment or stored-proof read, or an inconclusive trigger validation, a catalog query
+that could not run, on either store) keeps `retry_after_ms: 5000`. That
 inconclusive validation latches `binding_inconclusive`: EVERY read reports the binding not enforced until a later check
 returns valid, and the next read retries the check at once. A reader arriving while the first-ever inconclusive check
 is still in flight sees the previous state, a window bounded by one catalog query. The transition logs a warning
 naming the inconclusive trigger validation once per episode, and the gauge `yuzu_auth_mfa_binding_enforcement_ok{store="auth"}`
-still reads `1` while the latch is set (only `YuzuStepUpGateUnavailable` fires, and only when the refusals hold its rate: at least 3 in 10 minutes on one `surface`, sustained for 5 minutes, so a replica with less MFA traffic than that raises no alert while the latch is set). The session store does not refuse on
-such a query: it serves the row and retries the check on the next read.
+still reads `1` while the latch is set (only `YuzuStepUpGateUnavailable` fires, and only when the refusals hold its rate: at least 3 in 10 minutes on one `surface`, sustained for 5 minutes, so a replica with less MFA traffic than that raises no alert while the latch is set). On the session store the same
+query does not refuse session validation (the row is served), but that one read is flagged unverified, so a local binding
+read is refused as a transient `mfa_proof_unavailable`, counted as `yuzu_auth_session_store_degrade_total{op="validate"}` with
+both gauges still `1`; the next read retries the check, and the server log names it ("rebind-guard check could not run").
 
 **What the gauge can and cannot tell you.** It reads an in-process flag that a request-driven
 validation sets (at most one catalog query per minute per process while checks succeed, on an MFA

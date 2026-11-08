@@ -1173,7 +1173,12 @@ window is 0 or less. This release has no supported return to v0.14.1 (see "Deplo
 
 **This build is a hard cutover.** It has no upgrade path, no rolling or mixed-version window (mixed-version
 operation is unsupported) and no rollback of the new binary's migrations: the only way back is restoring the backup
-taken in step 2 below, which puts the previous build's data back (it does not undo the migrations in place). The
+taken in step 2 below, which puts the previous build's data back (it does not undo the migrations in place). That backup covers the `auth` and
+`session_store` schemas only, so it is a complete way back only while the new build has not yet started (step 4): the first
+start also applies the build's other schema migrations, and a previous build run against a database that is ahead of it
+logs a warning and starts anyway (see [When a server build finds its database ahead of it](#when-a-server-build-finds-its-database-ahead-of-it-every-postgres-store)).
+For a way back that still works after step 4, also take a whole-database `pg_dump` in step 2 and restore that into a fresh
+database. The
 carry-over procedure below only carries an existing deployment's data across the cutover; it is not an upgrade path and does not
 change the fresh-deployment contract stated for the Forensics tier elsewhere in this guide.
 The `auth` v3 migration seeds nothing and starts every existing row at factor generation `0`; the trigger
@@ -1356,7 +1361,9 @@ alone. It is not an upgrade path and widens nothing else.
    two version numbers you recorded before the cutover if they differ from 2 and 2; without the `UPDATE`
    statements the restored tables would sit under `schema_meta` rows that still say 3 and 3. The `DELETE` ends
    every session: the restored rows (including ones that were revoked after the dump was taken) would otherwise
-   be valid until you end them by hand; run it now, with the replicas stopped, before the previous build starts.
+   be valid until you end them by hand; run it now, with the replicas stopped, before the previous build starts. This sequence returns only the two schemas: after
+step 4 has run, the database's other stores are ahead of the previous build, so restore a whole-database dump into a fresh
+database instead.
    The `tar` command restores the keys directory from the same pair (`certs` under `/etc/yuzu`, ownership and
    modes kept). Then start the previous build (the binary or image you kept), and follow the runbook's
    [restore steps](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) ("A restore rolls credentials

@@ -1117,8 +1117,9 @@ gate applied.
   for the three causes that do not clear by themselves, namely an auth trigger observed not in force (or
   a recovery bypass), the session store's rebind guard latched not in force, and an enrolled row whose
   factor generation is not positive; every transient cause (an unreadable enrolment or stored-proof read,
-  or, on the `auth` side only, an inconclusive trigger validation, for as long as the latch is set) keeps `retry_after_ms` 5000;
-  the session store serves the row on such a check and retries on the next read. At the central gate the
+  or an inconclusive trigger validation: on the `auth` side for as long as the latch is set, on the session store for the one
+  read whose check could not run) keeps `retry_after_ms` 5000; session validation itself is unaffected and the session store
+  retries the check on the next read. At the central gate the
   not-positive generation is a `503` (audit `reason=mfa_proof_unavailable`), decided after the unenforced arm. Sign-in
   and step-up proving keep working. `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` drops
   to `0` and `YuzuMfaBindingNotEnforced` fires; the operator procedure is
