@@ -91,6 +91,7 @@
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
+#include "workflow_execute.hpp" // #2146 batch B: execute_workflow shares this sequence with POST /api/v1/workflows/{id}/execute
 #include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
@@ -1290,11 +1291,17 @@ static const ToolDef kTools[] = {
      "Record-level confined (#4030 Gate 8 fix): a caller with no agent visible in the "
      "execution's agent_ids gets the same not-found error as a nonexistent id, not a "
      "narrower-but-still-present record; an admitted confined caller's agent_ids is narrowed "
-     "to their visible agents and each step's result.agents_reached is stripped. Audited as "
+     "to their visible agents and each step's result.agents_reached is stripped. A run row "
+     "stores each distinct id once, at most 1000 of them and at most 131072 bytes: when they do not "
+     "all fit agent_ids_truncated is true, plus agent_ids_total for a caller with no device "
+     "scope, and a confined reader may not see the run if none of its devices were stored, the "
+     "creator included unless the run names a device inside its Execution:Execute scope and that "
+     "scope lies within its Workflow:Read scope (overlap alone is not enough) (an owner-accepted "
+     "residual). Audited as "
      "workflow_execution.detail.fetch (set-and-proceed, audit_persisted:false on an admitted "
      "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed — the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"agent_ids_truncated":{"type":"boolean","description":"Present and true only when the run named more distinct agent ids than the row stores; agent_ids then holds only stored ids. The run itself sent to every id it named."},"agent_ids_total":{"type":"integer","description":"Present only when agent_ids_truncated is true and the caller has no device scope: the number of distinct agent ids the run named."},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed: the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
 
     {"list_workflow_executions", "List workflow executions (runs) — WorkflowEngine's own multi-step "
      "run records, a DIFFERENT data model from list_executions's single-instruction fan-out "
@@ -1335,6 +1342,155 @@ static const ToolDef kTools[] = {
      R"j("next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows exist"},)j"
      R"j("result_truncated_by_cap":{"type":"boolean","description":"Present (true) only under latest_per_workflow when more workflows matched than limit"})j"
      R"j(},"required":["executions","next_cursor"]})j"},
+
+    // Workflow execute twin (#2146 batch B). Shares workflow_execute.hpp's sequence with
+    // POST /api/v1/workflows/{id}/execute.
+    {"execute_workflow",
+     "Run a multi-step workflow (see list_workflows / get_workflow) against the named devices. "
+     "SEND AN idempotency_key (REQUIRED): a fresh unique string per intended run, 8 to 128 "
+     "characters from A-Z a-z 0-9 . _ : -, scoped to you. A repeat of the SAME key and the same "
+     "request is SAFE: it sends nothing and answers with the run the key is bound to (status "
+     "completed, partial, failed, aborted, interrupted, running or indeterminate, "
+     "idempotent_replay true; a replay says the class the first answer said, judged from the "
+     "run's stored steps, and is completed ONLY for a run that succeeded), needs no new approval "
+     "and no approval_id, and is answered even while the server is shutting down or at the run "
+     "cap. NEVER re-send this call without the key you first used. A deliberate second run needs "
+     "a NEW key; the key stays bound to its run for the life of the run record. The same key with "
+     "a different workflow_id or agent_ids is refused -32602 reason idempotency_key_conflict "
+     "(terminal). A workflow_id that holds a control byte (NUL included), is not valid UTF-8 or "
+     "is over 128 bytes is refused -32602 reason invalid_workflow_id (never retryable) before "
+     "anything is read or minted; an empty or non-string id is refused -32602 earlier with no "
+     "reason token, and so is an id over 128 characters (by the input schema). A replay's status running (retry_after_ms 2000) means POLL get_workflow_execution, "
+     "never re-send; once a run has been running for 180 seconds the server answers "
+     "indeterminate (retryable false) and you should treat it the same way: "
+     "read get_workflow_execution and inspect the step results before deciding on a new key: a "
+     "step recorded pending or skipped may still have been sent; check the audit and response "
+     "stores by plugin and time before re-running. "
+     "SYNCHRONOUS DISPATCH, ASYNC DEVICE WORK: the call returns once every step's command has "
+     "been SENT (it can take as long as the workflow's step retries and delays, up to a 60 second "
+     "run budget that is checked before each send, so a send already in flight is not cut "
+     "short), not when devices "
+     "finish; read the outcome with get_workflow_execution on the returned execution_id, and the "
+     "devices' own results with query_responses by each step's command_id. A call without a "
+     "key must never be re-sent to 'retry' (it is refused here): a second run sends every step "
+     "to the devices a second time. "
+     "agent_ids is REQUIRED (1 to 10000 ids): a workflow run names its devices; there is no scope "
+     "and no fleet-wide default. Each step is sent only to the agents you can see; ids outside "
+     "your visibility are silently dropped, and a step that then reaches nobody is reported in "
+     "steps with its reason. "
+     "AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Before anything is sent every step is "
+     "checked against YOU: its instruction must exist and have approval_mode auto (a role-gated "
+     "step runs only for an administrator; an always-approval step, or an unknown mode, refuses "
+     "the whole call with a permission error (-32003) and a message naming the step - run that instruction through its "
+     "own approval instead), and you must be allowed to dispatch its plugin.action (RBAC, the "
+     "action's admin-or-approval gate, the action's kill switch): if not, the whole call is "
+     "refused with a permission error (-32003), reason dispatch_denied, naming the step, permanently for you (retrying "
+     "will not help) and nothing is sent. An approval ticket for this call does NOT lift either "
+     "check. A Destructive-classified step needs the explicit agent_ids (always true here) and "
+     "at least one of them visible to you, else the call is refused; a Forensics step needs "
+     "exactly one agent id. A step whose plugin.action is not in the capability catalogue "
+     "refuses the call. If the instruction store, the approval gate or the dispatcher is not "
+     "available the call is refused with an internal error (-32603) and NOTHING is sent. Which DEVICES a step reaches "
+     "is decided per step at send time and is NOT checked up front: an earlier step may already "
+     "have been sent when a later one reaches nobody. "
+     "TIER AND TICKET: the operator tier is denied. At the supervised tier the first call returns "
+     "kApprovalRequired with an approval_id; repeat the SAME arguments plus that approval_id "
+     "after an administrator approves. The ticket binds workflow_id, agent_ids and the ORDERED "
+     "step effects (each step's instruction id, plugin.action, approval mode and concurrency "
+     "mode; the approver is shown the step count and the first plugin.actions, then a digest "
+     "of all of them). If any step's instruction is repointed before the repeat call it is "
+     "refused -32003 with error.data.reason definition_changed (ticket unspent; repointing back "
+     "restores it, or request a fresh approval); a repoint landing after that check sends "
+     "nothing for that step and answers -32602 definition_changed with the ticket SPENT. An "
+     "edit to anything else in a definition runs as edited, with every precheck re-run at send "
+     "time. "
+     "RUN BUDGET AND ADMISSION: the call holds a server worker for the whole run, so at most 2 "
+     "runs per principal (and a server-wide limit shared with the streams) are admitted; a "
+     "refusal is HTTP 429 / -32012 with error.data.reason per_principal_stream_cap or "
+     "global_stream_cap, or 503 / -32015 reason draining while the server shuts down, with "
+     "retry_after_ms 5000: no workflow or instruction was read (your key was looked up first), "
+     "nothing was sent or audited and NO approval ticket was spent, so re-call with the same "
+     "approval_id. A workflow whose worst-case retry sleep (the sum over its "
+     "steps of retryCount x retryDelay) exceeds 60 seconds is refused -32602 reason "
+     "workflow_exceeds_sync_budget before a ticket is minted. The run has 60 seconds from the call: "
+     "no send starts after the deadline (a credential check already waiting on a database that has "
+     "stopped answering is not interrupted by it), the remaining steps are skipped and the run is closed "
+     "failed: status aborted with reason deadline_exceeded if something had been sent, or, if no "
+     "step had reached an agent, status deadline_exceeded (not retryable either way). "
+     "CREDENTIAL CHECK: before each step's first send, before each foreach item, and after waking from each retry delay, the "
+     "run re-validates the credential this call was made with. A revoked or expired credential "
+     "(or an engine principal that is no longer active) stops the run with status aborted, reason "
+     "credential_revoked; a check that cannot be answered is asked once more and then stops it "
+     "with reason credential_indeterminate. Either way the remaining steps are skipped, steps "
+     "already sent are not recalled, retryable is false, and this holds even when nothing was "
+     "sent. A role grant removed mid-run is caught per step at the dispatch chokepoint; an "
+     "administrator elevation that expires, or a device-group narrowing, during the run is only "
+     "bounded by the 60 second deadline. "
+     "AUDIT: a 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
+     "it cannot be saved the call fails with an internal error (-32603, retry_after_ms 5000) and "
+     "nothing was sent, but the approval ticket is already spent: a retry needs a NEW approval, "
+     "and a store fault after the ticket was consumed is the same. A step "
+     "refused at send time because its definition changed is audited at that moment and is not "
+     "retried. A closing row records the outcome (audit_persisted:false if that one was lost). "
+     "A run that THROWS after that row is answered -32603 with error.data.reason "
+     "dispatch_exception, error.data.execution_id and error.data.agents_sent (a lower bound, "
+     "present when known) and retry_after_ms null: steps may already have been sent, so do NOT "
+     "re-send; read get_workflow_execution. A throw before that row is -32603 with "
+     "retry_after_ms 5000 because nothing was sent, but a ticket already consumed stays spent "
+     "and the retry needs a new approval. "
+     "RESULT: a success envelope with execution_id, workflow_id, status and steps (one entry per "
+     "send attempt: instruction_id, attempt (1-based; a retry has the next number and a new step "
+     "starts at 1), command_id, agents_reached; when 0, a reason). status is "
+     "\"completed\" ONLY if the engine recorded the run completed, no step was refused at send "
+     "time and every step's FINAL attempt reached at least one agent (a step that failed and was "
+     "retried to success counts; it means sent, not finished). "
+     "Otherwise, when something was sent, status is \"partial\" (some step's final attempt reached "
+     "nobody, or the engine did not complete after a send) or \"aborted\" (a step was refused at send time "
+     "because its definition changed (later steps still run when it was an onFailure continue "
+     "step), or the run reached its 60 second deadline, reason deadline_exceeded, or the "
+     "credential check stopped it, reason credential_revoked or credential_indeterminate; the "
+     "rest did not run for those two) or \"interrupted\" (the server began stopping: "
+     "reason server_shutdown, the unstarted steps are skipped, and this holds even when nothing "
+     "was sent), with run_status (the engine's own "
+     "status), message, retryable false and retry_after_ms null: the run is NOT a success and "
+     "must not be re-sent; read get_workflow_execution and each step's reason. A server that is "
+     "only draining lets a run finish its steps (it gives up retries it had not made). The closing "
+     "audit row is result failure with run_outcome=failed|partial|interrupted|aborted. If "
+     "NO step reached any agent the envelope instead carries status set to the cause with "
+     "agents_reached 0 on every step, one of: \"containment_unreadable\", \"route_unreadable\", "
+     "\"os_gate_unreadable\", \"no_agents_reached\" (offline devices, or a concurrency claim), "
+     "\"quarantined\", \"plugin_not_found\", \"kill_switched_os\", \"late_denied\", "
+     "\"definition_changed\", \"deadline_exceeded\" (the 60 second budget ended the run before "
+     "any step reached an agent) or \"run_failed\" (the engine closed the run without a single "
+     "dispatch attempt). This call always carries an idempotency_key and the key is bound to the "
+     "run, so EVERY one of them has retryable false, retry_after_ms null and remediation \"use a "
+     "new idempotency key (MCP: a new approval)\": repeating the call replays this run (status failed, or "
+     "aborted when the stored steps show a deadline stop, a send-time refusal or a definition "
+     "change) and never runs again, so read the run first and decide on a new key and a new approval. The "
+     "execution still exists and is readable. "
+     "Mirrors REST POST /api/v1/workflows/{id}/execute. Requires Workflow:Execute; a "
+     "service-scoped token is denied.",
+     R"j({"type":"object","properties":{)j"
+     R"j("workflow_id":{"type":"string","minLength":1,"maxLength":128,"description":"Workflow id from list_workflows"},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128},"description":"Agent ids to run the workflow against. Required: there is no scope and no fleet-wide default"},)j"
+     R"j("idempotency_key":{"type":"string","minLength":8,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$","description":"REQUIRED. A unique string per intended run, scoped to you and bound to the run for the life of its record; repeat the same key (with the same workflow_id and agent_ids) to learn what happened to a call whose answer was lost, never to run again"},)j"
+     R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"})j"
+     R"j(},"required":["workflow_id","agent_ids","idempotency_key"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("execution_id":{"type":"string","description":"Read the run with get_workflow_execution"},)j"
+     R"j("idempotent_replay":{"type":"boolean","description":"Present (true) only when the idempotency_key was already bound to a run and this call sent nothing: the other fields then describe that run, thinly (status, started_at, message), and steps and late_denied are absent"},)j"
+     R"j("started_at":{"type":"integer","description":"Present only on an idempotent replay: when the run started, epoch seconds"},)j"
+     R"j("workflow_id":{"type":"string"},)j"
+     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent (one of containment_unreadable, route_unreadable, os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, kill_switched_os, late_denied, definition_changed, deadline_exceeded, run_failed). On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
+     R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
+     R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"attempt":{"type":"integer","minimum":1,"description":"The 1-based send attempt of this step this entry records: a retry has the next number and the next step starts again at 1. A step is judged by its last attempt"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
+     R"j("remediation":{"type":"string","description":"Present on an idempotent replay of every status but completed and running, and when no step reached any agent (use a new idempotency key (MCP: a new approval) for another run). A replay's text says a step recorded pending or skipped may still have been sent"},)j"
+     R"j("message":{"type":"string","description":"Present when no step reached any agent, and on an idempotent replay"},)j"
+     R"j("reason":{"type":"string","enum":["deadline_exceeded","server_shutdown","credential_revoked","credential_indeterminate"],"description":"Present only when the run was stopped: the 60 second run budget (deadline_exceeded), the server stopping (server_shutdown, status interrupted), or the caller's credential check before a step (credential_revoked, or credential_indeterminate when it could not be confirmed after one retry; status aborted)"},)j"
+     R"j("retryable":{"type":"boolean","description":"Present when no step reached any agent, for partial, aborted and interrupted, and on every idempotent replay but completed and running: always false here, because the idempotency_key is bound to the run and a repeat of the call replays it"},)j"
+     R"j("retry_after_ms":{"type":["integer","null"],"description":"Present when no step reached any agent, and null on every such answer from this tool (the key is bound to the run: a retry replays it); also 2000 on a running idempotent replay"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row failed to persist after the run had started"})j"
+     R"j(},"required":["execution_id","workflow_id","status"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
@@ -4600,6 +4756,7 @@ static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
 static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
     "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
+    "execute_workflow",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
@@ -4818,6 +4975,13 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // get_definition above, not a per-agent read.
     {"list_workflows", {"Workflow", "Read"}},
     {"get_workflow", {"Workflow", "Read"}},
+    // #2146 batch B. ServiceScopeClass is the `denied` default: the REST twin's perm_fn refuses a
+    // service-scoped token (Workflow:Execute is not on kServiceScopeGlobalSafe, which is empty),
+    // and the only confinement the steps have is the caller's exec_visible at the dispatch
+    // chokepoint, a management-group mechanism, not a service-scope one. `confined` would claim
+    // a downstream service-scope mechanism that does not exist. Approval: requires_approval()
+    // gates the supervised tier on this pair (mcp_policy.hpp); the operator tier is denied.
+    {"execute_workflow", {"Workflow", "Execute"}},
     // get_workflow_execution DOES carry per-agent data (agent_ids) and is
     // gated on fleet_read_fn — a real confinement mechanism, so it earns the
     // `confined` tag (same precedent as query_responses/get_agent_details).
@@ -5773,6 +5937,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"execute_instruction", {ToolEffect::Destructive, false, "Execute instruction"}},
     {"execute_instruction_definition", {ToolEffect::Destructive, false, "Execute stored instruction definition"}},
     {"execute_bundle", {ToolEffect::Destructive, false, "Execute live-query bundle"}},
+    // A workflow's steps are caller-chosen instructions, so the worst case is whatever those
+    // instructions can do (Destructive); each call sends every step again (not idempotent).
+    {"execute_workflow", {ToolEffect::Destructive, false, "Execute workflow"}},
     // approve/reject: one-way pending→decided transition (approve also arms a live
     // one-time execution ticket) → destructive + non-idempotent.
     {"approve_request", {ToolEffect::Destructive, false, "Approve request"}},
@@ -7847,6 +8014,16 @@ McpServer::HandlerFn McpServer::build_handler(
             // the dispatch stage so the definition that RUNS is the one the human approved.
             // Unset on the operator tier (no ticket, nothing to hold the lookup to).
             std::optional<std::string> ticket_bound_effect;
+            // The same binding for execute_workflow (#2146 sec-1): the per-step tuples the ticket's
+            // effect line was computed over, set by the C8 probe on the mint AND the recall and
+            // handed to the run as `expected_step_effects`. Unset when no ticket is in play.
+            std::optional<WorkflowStepEffects> workflow_bound_effects;
+            // The held-open lease of an execute_workflow run (SseSurface::kWorkflowRun, #2146 D3).
+            // Acquired by the C8 recall arm immediately BEFORE the approval ticket is consumed (so
+            // a refusal spends no ticket) or, for a caller that never reaches that arm, by the
+            // handler; carried to the handler and released with this request, on any return or
+            // throw. Declared here so both sites see the one object.
+            std::optional<yuzu::server::detail::StreamBudget::Lease> workflow_run_lease;
 
             // Audit helper. Returns true when the audit row persisted, false when it was
             // dropped, so SOC 2 read/write surfaces can
@@ -8454,6 +8631,398 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── execute_workflow, the parts the C8 pre-mint probe and the handler share ──
+            // (#2146 batch B). One copy of argument parsing, port wiring and refusal rendering,
+            // so the probe a supervised caller hits BEFORE a ticket is minted refuses exactly as
+            // the handler would after one is consumed. All three are inert unless called.
+            struct WorkflowMcpCall {
+                std::string workflow_id;
+                WorkflowExecuteRequest wreq;
+            };
+            // The call's ONE correlation id: the response header, every error body this tool
+            // answers, the run's own row and the `correlation_id=` token of every row this call
+            // writes (the `workflow.execute` rows through the request, the `mcp.execute_workflow`
+            // rows through `mcp_workflow_audit`). `ensure_correlation_id` reuses the header, so the
+            // probe and the handler agree.
+            const auto wf_cid = [&]() { return yuzu::server::detail::ensure_correlation_id(res); };
+            // The approval ticket the call presented, bounded and cleaned for a row; empty when it
+            // presented none. On a recall it is the id the `approved ... consumed approval_id=`
+            // row names, which is how an audit reader joins the run to the human approval.
+            const auto wf_approval_id = [&]() -> std::string {
+                if (const auto it = args.find("approval_id");
+                    it != args.end() && it->is_string())
+                    return it->get<std::string>();
+                return {};
+            };
+            const auto mcp_workflow_audit = [&](const std::string& result_status,
+                                                const std::string& detail_text) {
+                std::string d = detail_text;
+                if (!d.empty())
+                    d += ' ';
+                d += "correlation_id=" + ::yuzu::log_token(wf_cid());
+                if (const auto ap = wf_approval_id(); !ap.empty())
+                    d += " approval_id=" + audit_caller_id(ap);
+                return mcp_audit(result_status, d);
+            };
+            // Writes the refusal into `res` and returns nullopt.
+            const auto parse_workflow_call = [&]() -> std::optional<WorkflowMcpCall> {
+                // Strict arguments: the C8 schema check only runs for approval-gated callers.
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "workflow_id" && it.key() != "agent_ids" &&
+                        it.key() != "idempotency_key" && it.key() != "approval_id") {
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "unknown argument '" + it.key().substr(0, 64) +
+                                         "'; execute_workflow takes workflow_id, agent_ids, "
+                                         "idempotency_key and approval_id",
+                                     {}, -1, wf_cid()),
+                            "application/json");
+                        return std::nullopt;
+                    }
+                }
+                const auto wf_id = param_string_strict(args, "workflow_id");
+                if (!wf_id || wf_id->empty()) {
+                    res.set_content(a4_error(kInvalidParams,
+                                             "workflow_id must be a non-empty string of at "
+                                             "most 128 bytes",
+                                             {}, -1, wf_cid()),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                // Length, control bytes (NUL included) and UTF-8 validity, before the targeting
+                // parse, the key, the replay lookup, the lease or any ticket. The audit detail
+                // carries the id only bounded and cleaned, never raw.
+                if (const auto bad_id = check_workflow_id(*wf_id)) {
+                    const bool audit_ok = mcp_workflow_audit(
+                        "denied", "reason=" + bad_id->reason + " workflow=" +
+                                      ::yuzu::log_token(
+                                          instruction_execute::bounded_definition_id(*wf_id)));
+                    res.set_content(a4_error(kInvalidParams, bad_id->message,
+                                             "fix the workflow id; this input can never succeed "
+                                             "as sent",
+                                             -1, wf_cid(), audit_ok, bad_id->reason),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                auto agent_ids = parse_workflow_execute_body(args);
+                if (!agent_ids) {
+                    if (metrics) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_target_rejected_total",
+                                          {{"route", "workflow"},
+                                           {"reason", agent_ids.error().reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                        }
+                    }
+                    const bool audit_ok =
+                        mcp_workflow_audit("denied", "reason=" + agent_ids.error().reason);
+                    res.set_content(a4_error(kInvalidParams, agent_ids.error().message, {}, -1, // retry-hint-exempt: input-parse failure, not a store fault
+                                             wf_cid(), audit_ok),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                // The idempotency key is REQUIRED here (the blind-retry surface: every MCP caller
+                // is supervised, so a keyless retry is a fresh mint plus a second human approval
+                // plus a full re-send). Bound-checked before anything is minted, leased or read.
+                const auto key = param_string_strict(args, "idempotency_key");
+                const auto key_error =
+                    !key ? std::optional<WorkflowExecuteBodyError>{WorkflowExecuteBodyError{
+                               "idempotency_key_required",
+                               "idempotency_key is required: send a unique string of 8 to 128 "
+                               "characters from A-Z a-z 0-9 . _ : - and repeat the SAME key to "
+                               "learn the outcome of a call whose answer was lost, never to run "
+                               "again"}}
+                         : check_workflow_idempotency_key(*key);
+                if (key_error) {
+                    const bool audit_ok =
+                        mcp_workflow_audit("denied", "reason=" + key_error->reason);
+                    res.set_content(a4_error(kInvalidParams, key_error->message, {}, -1, // retry-hint-exempt: input-parse failure, not a store fault
+                                             wf_cid(), audit_ok),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                WorkflowMcpCall call;
+                call.workflow_id = *wf_id;
+                call.wreq.idempotency_key = *key;
+                call.wreq.workflow_id = *wf_id;
+                call.wreq.agent_ids = std::move(*agent_ids);
+                // The caller's REAL DispatchCaller; an unwired derivation fails CLOSED on
+                // visibility (present-EMPTY set, never nullopt - ADR-0033 section 1).
+                // approval_provenance stays None whether or not a ticket was consumed.
+                call.wreq.caller =
+                    caller_fn ? caller_fn(*session)
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                call.wreq.audit_context = "surface=mcp";
+                call.wreq.correlation_id = wf_cid();
+                call.wreq.approval_id = wf_approval_id();
+                // The run's clock starts when the call is taken, so prepare counts against it.
+                call.wreq.deadline = std::chrono::steady_clock::now() + kWorkflowSyncBudget;
+                return call;
+            };
+            const auto make_workflow_ports = [&]() {
+                WorkflowExecutePorts ports;
+                ports.api = workflow_api_.get();
+                ports.run = workflow_run_fn_;
+                ports.idempotency_lookup = workflow_idempotency_lookup_fn_;
+                ports.digest = workflow_digest_fn_;
+                ports.instruction_store_open = instruction_store && instruction_store->is_open();
+                ports.approval_gate_available = approval_manager != nullptr;
+                ports.lookup = make_instruction_lookup(instruction_store);
+                ports.classify = classify_fn_;
+                ports.authorize = authorize_dispatch_fn_;
+                if (dispatch_fn) {
+                    ports.dispatch = [&](const WorkflowStepInstruction& def,
+                                         const std::vector<std::string>& ids,
+                                         const std::unordered_map<std::string, std::string>& params,
+                                         const DispatchCaller& c) {
+                        return workflow_concurrency_dispatch_fn_
+                                   ? workflow_concurrency_dispatch_fn_(
+                                         def.plugin, def.action, ids, "", params,
+                                         /*execution_id=*/"", c, def.id, def.concurrency_mode)
+                                   : dispatch_fn(def.plugin, def.action, ids, "", params,
+                                                 /*execution_id=*/"", c);
+                    };
+                }
+                ports.audit = [&](const std::string& action, const std::string& result_status,
+                                  const std::string& target_id, const std::string& detail_text) {
+                    return yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, action, result_status, "workflow", target_id, detail_text);
+                };
+                // The legacy route's workflow.executed, published by the run itself.
+                ports.emit = bind_event_emit(emit_event_fn_, req, metrics);
+                ports.count_target_rejected = [&](std::string_view reason) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "workflow"}, {"reason", std::string(reason)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                    }
+                };
+                ports.count_dispatch_denied = [&](std::string_view reason) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_denied_total",
+                                      {{"reason", std::string(reason)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                    }
+                };
+                ports.count_run_threw = [&] {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_fanout_throw_total",
+                                      {{"route", "workflow"}, {"phase", "dispatch"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the answer
+                    }
+                };
+                ports.count_run_outcome = make_workflow_run_outcome_counter(metrics);
+                ports.count_idempotent = [&](std::string_view outcome) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter(kWorkflowRunIdempotentMetric,
+                                      {{"outcome", std::string(outcome)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
+                    }
+                };
+                return ports;
+            };
+            // Reached only for a throw BEFORE the sequence's `requested` row (the prepare half):
+            // nothing was sent, so the retry hint is honest. A throw after that row is answered
+            // by the sequence itself as kRunFailed (no retry hint, see render_workflow_refusal).
+            const auto respond_workflow_threw = [&](const char* what) {
+                spdlog::error("MCP execute_workflow: threw: {}", what);
+                const bool audit_ok = mcp_workflow_audit("failure", "exception");
+                res.set_content(
+                    a4_error(kInternalError, "workflow execution failed",
+                             approval_ticket_just_consumed
+                                 ? "nothing was sent, but the approval ticket is spent; request a "
+                                   "new approval for the same call and re-call with the same "
+                                   "idempotency_key"
+                                 : std::string{},
+                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, wf_cid(), audit_ok),
+                    "application/json");
+            };
+            // An execute_workflow run refused at ADMISSION (cap or draining): the same HTTP 429 /
+            // 503 + Retry-After and honest retry_after_ms the streamed-POST cap answers, with the
+            // budget's own reason token. No workflow or instruction was read, nothing was sent or
+            // audited (the counter is the record; a keyed call has had only its key looked up)
+            // and no approval ticket was spent. The code is the existing stream-cap code
+            // (-32012) for a cap and the existing shutdown code (-32015) while draining.
+            const auto respond_workflow_admission_refused = [&](const WorkflowExecuteOutcome& out) {
+                const bool draining = out.status == WorkflowExecuteStatus::kDraining;
+                res.status = draining ? 503 : 429;
+                res.set_header("Retry-After",
+                               std::to_string((kWorkflowRunCapRetryAfterMs + 999) / 1000));
+                res.set_content(a4_error(draining ? kMcpShuttingDown : kMcpStreamCap, out.message,
+                                         out.remediation,
+                                         static_cast<long>(kWorkflowRunCapRetryAfterMs), wf_cid(),
+                                         true, out.reason),
+                                "application/json");
+            };
+            // Leases the run's slot from the ONE shared budget, or answers the refusal. True ==
+            // the lease is held in `workflow_run_lease` for the rest of the request.
+            const auto admit_workflow_run_mcp = [&]() -> bool {
+                auto admission = admit_workflow_run(stream_budget, draining_fn_, session->username,
+                                                    metrics);
+                if (admission.refusal) {
+                    respond_workflow_admission_refused(*admission.refusal);
+                    return false;
+                }
+                if (admission.lease)
+                    workflow_run_lease.emplace(std::move(admission.lease));
+                return true;
+            };
+            // Renders any status the sequence refuses with (everything but kOk, kRunIncomplete and
+            // kNoAgentsReached, which are success envelopes).
+            const auto render_workflow_refusal = [&](const WorkflowExecuteOutcome& out) {
+                using WES = WorkflowExecuteStatus;
+                const bool audit_ok = mcp_workflow_audit(
+                    out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
+                            out.status == WES::kUnavailable ||
+                            out.status == WES::kEffectDigestFailed || out.status == WES::kRunFailed
+                        ? "error"
+                        : "denied",
+                    "reason=" + out.reason);
+                const std::string cid = wf_cid();
+                switch (out.status) {
+                case WES::kRunFailed: {
+                    // The run THREW after steps may have been sent: -32603 with NO retry hint
+                    // (retry_after_ms null on purpose; a blind re-send could dispatch twice) and
+                    // the typed handles a worker reads the run with, as execute_instruction_definition's
+                    // dispatch_exception carries them.
+                    nlohmann::json data{{"correlation_id", cid},
+                                        {"retry_after_ms", nullptr},
+                                        {"remediation", out.remediation},
+                                        {"reason", out.reason},
+                                        {"execution_id", out.execution_id}};
+                    if (out.agents_sent > 0)
+                        data["agents_sent"] = out.agents_sent;
+                    if (!out.audit_persisted)
+                        data["audit_persisted"] = false;
+                    res.set_content(error_response(id, kInternalError, out.message, data.dump()),
+                                    "application/json");
+                    return;
+                }
+                case WES::kStoreFailed:
+                case WES::kAuditFailed:
+                    // Nothing was sent. Once the ticket was consumed (every call that reaches the
+                    // handler at the supervised tier) it is spent, so the retry the hint offers
+                    // needs a NEW approval; a refusal from the probe, before any mint or consume,
+                    // spent nothing.
+                    res.set_content(
+                        a4_error(kInternalError, out.message,
+                                 approval_ticket_just_consumed
+                                     ? "nothing was sent, but the approval ticket is spent; "
+                                       "request a new approval for the same call and re-call "
+                                       "with the same idempotency_key"
+                                     : std::string{},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, cid, audit_ok),
+                        "application/json");
+                    return;
+                case WES::kUnavailable:
+                case WES::kNoPrincipal:
+                case WES::kEffectDigestFailed:
+                    res.set_content(a4_error(kInternalError, out.message, {}, -1, cid, audit_ok), // retry-hint-exempt: a missing dependency or an unusable request, not a transient fault
+                                    "application/json");
+                    return;
+                case WES::kDefinitionChanged:
+                    // Reached only after the ticket was consumed (a repoint before that is the
+                    // generic -32003 ticket-match refusal): the ticket is spent.
+                    res.set_content(a4_error(kInvalidParams, out.message,
+                                             "the approval ticket is spent; re-request approval "
+                                             "for the workflow as it is now and re-call",
+                                             -1, cid, audit_ok, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kApprovalRequired:
+                    res.set_content(
+                        a4_error(kPermissionDenied, out.message,
+                                 "run each instruction through its own approval; a workflow only "
+                                 "runs steps this caller may run without one. An approval ticket "
+                                 "for this call does not lift a step's own approval mode",
+                                 -1, cid, audit_ok),
+                        "application/json");
+                    return;
+                case WES::kDispatchDenied:
+                    // Permanent for this caller: retry_after_ms stays null, and `reason` is the
+                    // stable token a worker branches on.
+                    res.set_content(a4_error(kPermissionDenied, out.message, out.remediation, -1,
+                                             cid, audit_ok, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kRunCapReached:
+                case WES::kDraining:
+                    respond_workflow_admission_refused(out);
+                    return;
+                case WES::kExceedsSyncBudget:
+                    // A property of the stored workflow, permanent until it is replaced: no hint.
+                    res.set_content(a4_error(kInvalidParams, out.message, out.remediation, -1, cid,
+                                             audit_ok, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kIdempotencyConflict: {
+                    // The key is bound to a DIFFERENT request: terminal, no retry hint. The run it
+                    // is bound to is the caller's own, so its id is handed back.
+                    nlohmann::json data{{"correlation_id", cid},
+                                        {"retry_after_ms", nullptr},
+                                        {"remediation", out.remediation},
+                                        {"reason", out.reason},
+                                        {"execution_id", out.execution_id}};
+                    res.set_content(error_response(id, kInvalidParams, out.message, data.dump()),
+                                    "application/json");
+                    return;
+                }
+                case WES::kIdempotentReplay: // answered by respond_workflow_idempotency, never here
+                case WES::kOk:
+                case WES::kRunIncomplete:
+                case WES::kNoAgentsReached:
+                case WES::kInvalidWorkflow:
+                case WES::kWorkflowNotFound:
+                case WES::kUnknownInstruction:
+                case WES::kUnclassifiedStep:
+                case WES::kDestructiveUntargeted:
+                case WES::kDestructiveNoVisibleTarget:
+                case WES::kExecuteFailed:
+                    break;
+                }
+                res.set_content(a4_error(kInvalidParams, out.message, {}, -1, cid, audit_ok), // retry-hint-exempt: a permanent refusal of this input, not a store fault
+                                "application/json");
+            };
+
+            // The answer to the idempotency pre-check (`check_workflow_idempotency`): a replay is a
+            // SUCCESS envelope carrying the thin body (nothing was sent), anything else is the
+            // refusal the shared sequence rendered. A terminal replay is audited here as well as by
+            // the sequence (workflow.execute); a running replay writes no row (polling must not).
+            const auto respond_workflow_idempotency = [&](const WorkflowExecuteOutcome& out,
+                                                          const std::string& workflow_id) {
+                if (out.status != WorkflowExecuteStatus::kIdempotentReplay) {
+                    render_workflow_refusal(out);
+                    return;
+                }
+                if (out.replay_status != kReplayRunning)
+                    mcp_workflow_audit("success", "execution_id=" + audit_caller_id(out.execution_id) +
+                                                      " idempotent_replay=true run_status=" +
+                                                      out.replay_status);
+                res.set_content(
+                    success_response(id, tool_result(workflow_idempotent_replay_json(out, workflow_id)
+                                                         .dump(),
+                                                     kObjectOutputSchema)),
+                    "application/json");
+            };
+
             // ── C8: Generic tier + approval checks via catalogue().security ──
             // Look up the tool's (securable_type, operation) pair and run
             // tier_allows() / requires_approval() generically.  This fires
@@ -8830,6 +9399,57 @@ McpServer::HandlerFn McpServer::build_handler(
                                     : std::string(yuzu::server::instruction_execute::
                                                       kUnresolvedEffect);
                         canon = *ticket_bound_effect + args_canon;
+                    }
+                    // #2146 execute_workflow: the caller-level half of the sequence (prepare:
+                    // wiring, the workflow and every step's instruction, the chokepoint dry run
+                    // per distinct step pair, approval mode, targeting) runs HERE, before a
+                    // ticket is minted or consumed, so a call that is going to be refused mints
+                    // no ticket and burns none. Order is tier -> RBAC -> probe -> mint (sg-b1,
+                    // as execute_instruction_definition above). The probe is ADVISORY: the
+                    // handler runs the whole sequence again after the ticket is consumed against
+                    // fresh reads, and that run is authoritative. It dispatches nothing and
+                    // writes no `requested` row.
+                    if (tool_name == "execute_workflow") {
+                        if (!perm_fn(req, res, "Workflow", "Execute"))
+                            return;
+                        const auto call = parse_workflow_call();
+                        if (!call)
+                            return;
+                        try {
+                            const auto ports = make_workflow_ports();
+                            // A repeat of the idempotency key is answered HERE, after the tier and
+                            // Workflow:Execute gates above and before the probe, the ticket mint
+                            // and the lease: a retry whose ticket is spent, or that carries none,
+                            // gets the run the key is bound to with no -32006 and no new approval
+                            // (it sends nothing and discloses only the caller's own row). Allowed
+                            // while draining and at the run cap: it is a short read.
+                            if (auto early = check_workflow_idempotency(ports, call->wreq)) {
+                                respond_workflow_idempotency(*early, call->workflow_id);
+                                return;
+                            }
+                            const auto plan = prepare_workflow_execute(ports, call->wreq);
+                            if (!plan) {
+                                render_workflow_refusal(plan.error());
+                                return;
+                            }
+                            // Bind the ORDERED step effects into the ticket's subject, exactly as
+                            // execute_instruction_definition binds its resolved pair: the approver
+                            // sees the step count and the first plugin.actions, and a repoint of
+                            // any step between approval and recall fails the ordinary match below
+                            // (no consume, nothing sent). A digest failure refuses here, before
+                            // any ticket exists.
+                            const auto effect = workflow_effect_binding(ports, *plan);
+                            if (!effect) {
+                                render_workflow_refusal(effect.error());
+                                return;
+                            }
+                            ticket_bound_effect = *effect;
+                            canon = *ticket_bound_effect + args_canon;
+                            workflow_bound_effects = workflow_step_effects(*plan);
+                        } catch (const std::exception& e) {
+                            respond_workflow_threw(e.what());
+                            return;
+                        }
                     }
                     if (tool_name == "execute_instruction") {
                         if (auto bv = check_exec_instruction_shape(args)) {
@@ -9650,6 +10270,13 @@ McpServer::HandlerFn McpServer::build_handler(
                             return rotation_precondition(row);
                         return {};
                     };
+                    // #2146 execute_workflow: the run's held-open slot is taken BEFORE the
+                    // one-time ticket is spent, so a cap or draining refusal burns nothing and
+                    // the client re-calls with the same approval_id. Every check that can still
+                    // refuse WITHOUT consuming has run above; the consume is the first thing
+                    // that spends. (The handler acquires for a caller that never gets here.)
+                    if (tool_name == "execute_workflow" && !admit_workflow_run_mcp())
+                        return;
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
                     if (auto consumed = approval_manager->consume_ticket(
@@ -22129,6 +22756,108 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload.add("audit_persisted", false);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            // ── execute_workflow (#2146 batch B) ──────────────────────────
+            // REST v1 twin: POST /api/v1/workflows/{id}/execute (workflow_execute_routes.cpp).
+            // Both run workflow_execute.hpp's apply_workflow_execute, so the precheck, the
+            // fail-closed wiring, the requested-before-effect audit and the per-step confinement
+            // are one copy. The tier and ticket are decided BEFORE this branch by the generic C8
+            // gate (tier_allows denies operator; requires_approval gates supervised on
+            // Workflow:Execute). A consumed ticket does NOT change what the steps may do:
+            // approval_provenance is left None, so an AdminOrApproval step still needs an
+            // administrator, exactly as on REST.
+            if (tool_name == "execute_workflow") {
+                if (!perm_fn(req, res, "Workflow", "Execute"))
+                    return;
+                const auto call = parse_workflow_call();
+                if (!call)
+                    return;
+                const auto ports = make_workflow_ports();
+                WorkflowExecuteRequest wreq = call->wreq;
+                // Admission: the recall arm normally holds the lease already (it took it before
+                // the ticket was spent, and ran the idempotency pre-check before that); a caller
+                // that did not go through it checks the key, then takes the lease here, before any
+                // read of the workflow. A repeat of the key precedes the lease: it is a short read.
+                if (!workflow_run_lease) {
+                    try {
+                        if (auto early = check_workflow_idempotency(ports, wreq)) {
+                            respond_workflow_idempotency(*early, call->workflow_id);
+                            return;
+                        }
+                    } catch (const std::exception& e) {
+                        respond_workflow_threw(e.what());
+                        return;
+                    }
+                    if (!admit_workflow_run_mcp())
+                        return;
+                }
+                wreq.idempotency_prechecked = true;
+                // The effects the consumed ticket was bound to: the run holds every fresh read to
+                // them, and sends nothing for a step that moved (definition_changed).
+                wreq.expected_step_effects = workflow_bound_effects;
+                // The credential liveness check before each step: the authoritative question
+                // (`set_workflow_revalidate_fn`, NOT the cached `revalidate_fn` the held-open
+                // streams tick on), asked against the principal and request of THIS call. The
+                // run is synchronous on this thread, so `req` outlives the closure. An unwired
+                // seam (test harnesses) is no check.
+                wreq.reauthorize_retry_delay =
+                    workflow_reauthorize_retry_delay_.value_or(kReauthorizeRetryDelay);
+                if (workflow_revalidate_fn_) {
+                    wreq.reauthorize = [&] {
+                        return workflow_revalidate_fn_(req, session->username);
+                    };
+                }
+
+                WorkflowExecuteOutcome out;
+                try {
+                    // The real sequence, authoritative after any C8 probe: the whole of prepare
+                    // runs again here against fresh reads, then the run.
+                    out = apply_workflow_execute(ports, wreq);
+                } catch (const std::exception& e) {
+                    respond_workflow_threw(e.what());
+                    return;
+                }
+                using WES = WorkflowExecuteStatus;
+                if (out.status == WES::kIdempotentReplay) {
+                    // The race: this call lost the engine's atomic claim to one with the same key.
+                    respond_workflow_idempotency(out, call->workflow_id);
+                    return;
+                }
+                if (out.status == WES::kOk || out.status == WES::kRunIncomplete ||
+                    out.status == WES::kNoAgentsReached) {
+                    auto payload = workflow_execute_result_json(out, call->workflow_id);
+                    if (out.status == WES::kRunIncomplete) {
+                        // Same typed status as REST's 202 (`partial` / `aborted`): a success
+                        // envelope that says the run did not succeed, never a retry hint.
+                        payload["retry_after_ms"] = nullptr;
+                    }
+                    if (out.status == WES::kNoAgentsReached) {
+                        // Same envelope shape as execute_instruction's zero-agents branch: a
+                        // success result carrying the cause, never a bare "reached 0".
+                        payload["status"] = out.reason;
+                        payload["message"] = out.message;
+                        payload["retryable"] = out.retryable;
+                        payload["retry_after_ms"] =
+                            out.retryable ? nlohmann::json(mcp::kMcpStoreFaultRetryMs)
+                                          : nlohmann::json(nullptr);
+                        if (!out.remediation.empty())
+                            payload["remediation"] = out.remediation;
+                    }
+                    mcp_workflow_audit(
+                        out.status == WES::kOk ? "success" : "failure",
+                        "execution_id=" + audit_caller_id(out.execution_id) +
+                            (out.status == WES::kOk
+                                 ? std::string{}
+                                 : " run_outcome=" +
+                                       std::string(workflow_run_outcome_token(out.run_outcome))));
+                    res.set_content(
+                        success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                        "application/json");
+                    return;
+                }
+                render_workflow_refusal(out);
                 return;
             }
 

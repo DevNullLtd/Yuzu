@@ -114,6 +114,23 @@ enum class CredentialCheck : int {
     kValidStale,
 };
 
+/// Where a credential re-check may take its answer from. Passed explicitly (no default) to
+/// `AuthRoutes::revalidate_stream`, so each caller states which question it asks.
+///
+/// Pinned `: int` like `CredentialCheck`, so a forward declaration elsewhere names the same type.
+enum class CredentialReadMode : int {
+    /// The held-open stream pump's tick: the process-local API-token cache (60 s) and the
+    /// engine-principal liveness cache (15 s) may answer, and a revoke handled by another
+    /// replica is seen only when they age out (#4766, #2367).
+    kCached,
+    /// A boundary check on an already-authenticated operation (the workflow run's per-step
+    /// check): API tokens and the backing engine principal are read from their durable rows,
+    /// never from those caches, so a revoke committed by any replica before the read is seen.
+    /// A cookie session has no such cache to bypass: it is adjudicated by
+    /// `AuthManager::validate_session` in both modes (see `revalidate_stream`).
+    kAuthoritative,
+};
+
 struct UserEntry {
     std::string username;
     Role role;
