@@ -327,9 +327,9 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
     }
     // The v1/v2 text above is a hand copy, not the store's own bytes, so its hashes differ
     // from the store's (#7158 would read that as drift). This models a database that applied
-    // v1/v2 before `public.schema_migrations` existed: drop the rows the runner just wrote, and
+    // v1/v2 before `public.yuzu_schema_migrations` existed: drop the rows the runner just wrote, and
     // the store records its own text as first seen.
-    exec_sql(db.dsn(), "DELETE FROM public.schema_migrations WHERE store = 'plugin_config_store'");
+    exec_sql(db.dsn(), "DELETE FROM public.yuzu_schema_migrations WHERE store = 'plugin_config_store'");
     CHECK(query1(db.dsn(), "SELECT to_regclass('plugin_config_store.enablement_meta') IS NULL") == "t");
     CHECK(query1(db.dsn(), "SELECT version FROM public.schema_meta WHERE store='plugin_config_store'") == "2");
 

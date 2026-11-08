@@ -13,7 +13,9 @@
 #include <libpq-fe.h>
 
 #include <cstdlib>
+#include <latch>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::pg::PgConn;
@@ -415,19 +417,21 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
-    const std::string t1 = "CREATE TABLE items (id INT PRIMARY KEY)";
+    // Newlines and a trailing newline on purpose: the recorded hash is compared to
+    // hash_of(t1) below, so a runner that trimmed or folded whitespace fails here.
+    const std::string t1 = "CREATE TABLE items (\n  id INT PRIMARY KEY\n);\n";
     const std::string t2 = "ALTER TABLE items ADD COLUMN IF NOT EXISTS name TEXT";
     const std::string t3 = "ALTER TABLE items ADD COLUMN IF NOT EXISTS note TEXT";
     const std::vector<PgMigration> v3 = {{1, t1}, {2, t2}, {3, t3}};
     const auto hash_of = [](const std::string& sql) { return *yuzu::server::sha256_hex(sql); };
     const auto recorded = [&](int version, const char* col) {
         return text_scalar(conn.get(), std::string("SELECT ") + col +
-                                           " FROM public.schema_migrations WHERE store = 'store_h' "
+                                           " FROM public.yuzu_schema_migrations WHERE store = 'store_h' "
                                            "AND version = " + std::to_string(version));
     };
     const auto row_count = [&] {
         return scalar(conn.get(),
-                      "SELECT count(*) FROM public.schema_migrations WHERE store = 'store_h'");
+                      "SELECT count(*) FROM public.yuzu_schema_migrations WHERE store = 'store_h'");
     };
 
     SECTION("apply records one verified row per version") {
@@ -464,7 +468,7 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
     SECTION("drift at the first version refuses too") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
         const std::vector<PgMigration> edited = {
-            {1, "CREATE TABLE items (id INT PRIMARY KEY) -- edited"}, {2, t2}, {3, t3}};
+            {1, t1 + "-- edited"}, {2, t2}, {3, t3}};
         CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", edited));
     }
 
@@ -485,7 +489,7 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
 
     SECTION("a database that predates the table is recorded as first seen, then checked") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
-        exec_ok_or_fail(conn.get(), "DELETE FROM public.schema_migrations WHERE store = 'store_h'");
+        exec_ok_or_fail(conn.get(), "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_h'");
         REQUIRE(row_count() == 0);
 
         std::string logs;
@@ -514,6 +518,24 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
         CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", edited));
     }
 
+    SECTION("a database with no table at all (the real upgrade shape) creates it and records") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        exec_ok_or_fail(conn.get(), "DROP TABLE public.yuzu_schema_migrations");
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        CHECK(row_count() == 3);
+        CHECK(recorded(2, "recorded_by") == "tofu");
+        CHECK(recorded(2, "sha256") == hash_of(t2));
+    }
+
+    SECTION("a foreign public.schema_migrations table is left alone and does not break the runner") {
+        exec_ok_or_fail(conn.get(),
+                        "CREATE TABLE public.schema_migrations (version bigint PRIMARY KEY, "
+                        "dirty boolean NOT NULL)");
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        CHECK(row_count() == 3);
+        CHECK(scalar(conn.get(), "SELECT count(*) FROM public.schema_migrations") == 0);
+    }
+
     SECTION("a database ahead of this binary is not judged on versions it does not know") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
         const std::vector<PgMigration> older = {{1, t1}, {2, t2}};
@@ -523,8 +545,113 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
 
     SECTION("an unreadable hash record fails closed") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
-        exec_ok_or_fail(conn.get(), "ALTER TABLE public.schema_migrations RENAME COLUMN sha256 TO sha");
-        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", v3));
-        exec_ok_or_fail(conn.get(), "ALTER TABLE public.schema_migrations RENAME COLUMN sha TO sha256");
+        exec_ok_or_fail(conn.get(),
+                        "ALTER TABLE public.yuzu_schema_migrations RENAME COLUMN sha256 TO sha");
+        std::string logs;
+        bool ok = true;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::err};
+            ok = PgMigrationRunner::run(conn.get(), "store_h", v3);
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK_FALSE(ok);
+        CHECK(logs.find("reading recorded migration hashes failed for store_h") !=
+              std::string::npos);
+        exec_ok_or_fail(conn.get(),
+                        "ALTER TABLE public.yuzu_schema_migrations RENAME COLUMN sha TO sha256");
+    }
+
+    SECTION("a recorded hash that is not lowercase hex is refused with its own message") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        exec_ok_or_fail(conn.get(),
+                        "UPDATE public.yuzu_schema_migrations SET sha256 = repeat('Z', 64) "
+                        "WHERE store = 'store_h' AND version = 2");
+        std::string logs;
+        bool ok = true;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::err};
+            ok = PgMigrationRunner::run(conn.get(), "store_h", v3);
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK_FALSE(ok);
+        CHECK(logs.find("not a lowercase SHA-256") != std::string::npos);
+        CHECK(logs.find("ZZZZ") == std::string::npos); // the bad value never reaches a log
+        CHECK(logs.find("was changed after") == std::string::npos); // not misdescribed as drift
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_h") == 3);
+    }
+}
+
+namespace {
+
+// One thread per vector, each on its OWN connection, released together by a latch (no
+// sleeps). Results are collected and asserted on the calling thread only: Catch2's
+// assertion macros are not safe to call from the workers.
+std::vector<int> run_concurrently(const std::string& dsn, const std::string& store,
+                                  const std::vector<std::vector<PgMigration>>& vectors) {
+    std::vector<int> results(vectors.size(), -1);
+    std::latch start{1};
+    std::vector<std::thread> workers;
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+        workers.emplace_back([&, i] {
+            PgConn conn{PQconnectdb(dsn.c_str())};
+            if (PQstatus(conn.get()) != CONNECTION_OK)
+                return;
+            start.wait();
+            results[i] = PgMigrationRunner::run(conn.get(), store, vectors[i]) ? 1 : 0;
+        });
+    }
+    start.count_down();
+    for (auto& w : workers)
+        w.join();
+    return results;
+}
+
+} // namespace
+
+TEST_CASE("PgMigrationRunner hash recording under concurrent runners (#7158)",
+          "[pg][migration][drift][concurrency]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgConn conn = connect(db.dsn());
+    const std::vector<PgMigration> v3 = {
+        {1, "CREATE TABLE IF NOT EXISTS items (id INT PRIMARY KEY)"},
+        {2, "ALTER TABLE items ADD COLUMN IF NOT EXISTS name TEXT"},
+        {3, "ALTER TABLE items ADD COLUMN IF NOT EXISTS note TEXT"}};
+    const auto rows = [&](const std::string& store, const char* extra = "") {
+        return scalar(conn.get(), "SELECT count(*) FROM public.yuzu_schema_migrations WHERE store = '" +
+                                      store + "' " + extra);
+    };
+
+    SECTION("same vector on a fresh store: every runner succeeds, one apply row per version") {
+        const auto r = run_concurrently(db.dsn(), "store_c", {v3, v3, v3, v3});
+        for (int x : r)
+            CHECK(x == 1);
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_c") == 3);
+        CHECK(rows("store_c") == 3);
+        CHECK(rows("store_c", "AND recorded_by = 'apply'") == 3);
+    }
+
+    SECTION("competing text for one version: exactly one text wins, the other refuses") {
+        // Whichever interleaving, the loser dies either at the verify read or in the apply
+        // loop's skip branch, so removing the skip-branch compare turns this red.
+        for (int round = 0; round < 5; ++round) {
+            const std::string store = "store_x" + std::to_string(round);
+            const std::vector<PgMigration> a = {{1, "CREATE TABLE IF NOT EXISTS items_a (id INT)"}};
+            const std::vector<PgMigration> b = {{1, "CREATE TABLE IF NOT EXISTS items_b (id INT)"}};
+            const auto r = run_concurrently(db.dsn(), store, {a, b});
+            CHECK(r[0] + r[1] == 1);
+            CHECK(rows(store) == 1);
+        }
+    }
+
+    SECTION("a pre-table store opened by several runners at once is recorded once each") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_p", v3));
+        exec_ok_or_fail(conn.get(), "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_p'");
+        const auto r = run_concurrently(db.dsn(), "store_p", {v3, v3, v3, v3});
+        for (int x : r)
+            CHECK(x == 1);
+        CHECK(rows("store_p") == 3);
+        CHECK(rows("store_p", "AND recorded_by = 'tofu'") == 3);
     }
 }

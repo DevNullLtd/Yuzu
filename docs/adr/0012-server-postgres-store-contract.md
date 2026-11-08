@@ -375,7 +375,7 @@ whole hourly refresh. Such a title is not normalised. The catalogue rollup's own
 ## Update (2026-11-08) -- the runner records and checks each migration's hash (#7158)
 
 Decision. Option (a) of #7158: `PgMigrationRunner` records the SHA-256 of every applied
-migration's SQL in `public.schema_migrations (store, version, sha256, recorded_by, recorded_at)`,
+migration's SQL in `public.yuzu_schema_migrations (store, version, sha256, recorded_by, recorded_at)`,
 written in the transaction that bumps `schema_meta` (an UPSERT, because a rewound `schema_meta`
 re-applies a version), and every `run()` compares the recorded hash of each version at or below
 the recorded schema version with this build's text. Option (b), a per-store projection smoke-read
@@ -392,9 +392,15 @@ no warn-only phase: drift can only be detected against a hash this feature wrote
 it cannot refuse any existing database.
 
 Hash identity is the exact bytes of `PgMigration::sql`, with no normalisation, because
-normalising would hide a real change. Every migration at this change's HEAD is built from literals
-or compile-time constants, so the bytes are the same in every process and deployment; a migration
-must stay that way.
+normalising would hide a real change. Every migration at this change is a deterministic function
+of fixed text (52 of 58 vectors are pure literals; six concatenate compile-time constants, and one,
+`instruction_store`'s v3, is generated at first call from a fixed column list), so the bytes are
+the same in every process and deployment. A migration must stay that way: no clock, locale,
+environment, address or unordered-container iteration may reach its text.
+
+The table is named `yuzu_schema_migrations` because `public` is shared with whatever else lives in
+the database. A foreign `schema_migrations` (golang-migrate, Rails, Flyway) would make the
+`IF NOT EXISTS` skip silently and fail every store on a missing column.
 
 Trust on first use. A version applied before the table existed has no row. It is recorded as
 first seen with `recorded_by = 'tofu'`, so an auditor can tell it from a hash verified when
@@ -403,6 +409,18 @@ cannot both believe they verified; steady state takes no lock. Not detected, and
 hard-cutover deployment contract: drift that predates the table, and a database that two build
 lineages touched (a long-lived newer replica records whatever an older binary applied, with the
 newer text).
+
+What this is not. It detects accidental or procedural drift. It is not tamper evidence: whoever
+can write `yuzu_schema_migrations` can also rewrite `schema_meta`, a deleted row is simply recorded
+again as `'tofu'`, and `recorded_by` is not authenticated. A rewound `schema_meta` that re-applies
+an idempotent migration overwrites its recorded hash by design. A questionnaire must not cite it as
+a data-integrity control. A recorded hash that is not 64 lowercase hex digits is refused with its
+own message, never compared.
+
+A version that is at or below the recorded version and that this binary also carries is judged
+even when the database is ahead of the binary's vector (#3894), so a downgrade onto edited text now
+refuses with a diagnosed log line where it used to warn. Versions above the recorded version, and
+versions this binary does not carry, are never judged.
 
 Operator consequence: an in-place edit of an already-applied migration now refuses the boot
 (`docs/user-manual/upgrading.md`). The golden-hash CI test (#3895) is the matching author-side

@@ -82,7 +82,7 @@ public:
     /// loses the `<= current` race in the apply loop below.
     ///
     /// #7158: every applied migration's SHA-256 is recorded in
-    /// `public.schema_migrations`, and every `run()` compares the recorded hash
+    /// `public.yuzu_schema_migrations`, and every `run()` compares the recorded hash
     /// of each version at or below the recorded schema version with this
     /// binary's text. A DIFFERENT hash means the database recorded a version
     /// whose DDL is not what this build's runtime queries were written against
@@ -98,7 +98,18 @@ public:
     /// (the hard-cutover deployment contract): a binary that applied different
     /// text and was later replaced is recorded as whatever the current build
     /// holds. Steady state is one lock-free read; only first sight of an
-    /// unhashed version takes the per-store lock.
+    /// unhashed version takes the per-store lock. The table has a
+    /// Yuzu-specific name because `public` is shared with whatever else lives
+    /// in the database: a foreign `schema_migrations` (golang-migrate, Rails,
+    /// Flyway) would make `CREATE TABLE IF NOT EXISTS` skip silently and every
+    /// store then fail on a missing column. This detects accidental or
+    /// procedural drift, NOT tampering: whoever can write the table can also
+    /// rewrite `schema_meta`, and a deleted row is simply recorded again.
+    /// A recorded hash that is not 64 lowercase hex digits (a hand-edited row)
+    /// is refused with its own message and never reaches a compare or a log.
+    /// Versions at or below the recorded version that this binary also carries
+    /// are judged even when the database is ahead of the vector (below), so a
+    /// downgrade onto edited text now refuses where it used to warn.
     ///
     /// #3894: the complementary case — a database already AHEAD of this
     /// binary's vector (an older build started against a database a newer one
@@ -128,7 +139,7 @@ public:
                                               const std::vector<PgMigration>& migrations);
 
     /// One (version, SHA-256 hex) pair: what this binary's migration text hashes
-    /// to (`expected`) or what `public.schema_migrations` recorded (`recorded`).
+    /// to (`expected`) or what `public.yuzu_schema_migrations` recorded (`recorded`).
     struct VersionHash {
         int version;
         std::string sha256;

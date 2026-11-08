@@ -8,10 +8,10 @@
 
 #include <libpq-fe.h>
 
-#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <utility>
 
 namespace yuzu::server::pg {
 
@@ -81,10 +81,10 @@ bool exec_ok(PGconn* conn, const std::string& sql, std::string_view what, std::s
     return true;
 }
 
-
-// The heading the drift log line points at. Kept in one place so the log, the
-// header comment and docs/user-manual/upgrading.md cannot drift apart (#7164
-// had exactly that defect between a log line and a renamed heading).
+// The heading the drift log line points at. Kept in one place so the log and the
+// header comment agree; docs/user-manual/upgrading.md must carry the same words
+// (nothing checks that mechanically, which is the defect #7164 had between a log
+// line and a renamed heading).
 constexpr const char* kDriftDocHeading =
     "the server refuses to start when a recorded migration differs from this build "
     "(every Postgres store)";
@@ -93,13 +93,25 @@ std::string short_hash(const std::string& h) {
     return h.substr(0, 12);
 }
 
+/// A recorded hash this runner could have written: 64 lowercase hex digits. The
+/// table's CHECK only bounds the length, so a hand-edited row (uppercase, junk,
+/// control bytes) is caught here and never reaches a log line or a compare.
+bool is_lower_hex_sha256(const std::string& h) {
+    if (h.size() != 64)
+        return false;
+    for (char c : h)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+
 /// Reads every recorded (version, sha256) row for `store`, ascending. False on
 /// a query error: an unreadable record is a refusal, never "nothing recorded".
 bool read_recorded_hashes(PGconn* conn, const std::string& store,
                           std::vector<PgMigrationRunner::VersionHash>& out) {
     out.clear();
     PgResult res = exec_param(conn,
-                              "SELECT version, sha256 FROM public.schema_migrations "
+                              "SELECT version, sha256 FROM public.yuzu_schema_migrations "
                               "WHERE store = $1 ORDER BY version",
                               store);
     if (res.status() != PGRES_TUPLES_OK) {
@@ -108,8 +120,21 @@ bool read_recorded_hashes(PGconn* conn, const std::string& store,
         return false;
     }
     const int n = PQntuples(res.get());
-    for (int i = 0; i < n; ++i)
-        out.push_back({std::atoi(PQgetvalue(res.get(), i, 0)), PQgetvalue(res.get(), i, 1)});
+    for (int i = 0; i < n; ++i) {
+        const int version = std::atoi(PQgetvalue(res.get(), i, 0));
+        std::string sha = PQgetvalue(res.get(), i, 1);
+        if (!is_lower_hex_sha256(sha)) {
+            // Fail closed, but say what is wrong: this is a damaged record, not
+            // a changed migration, and the drift message would misdescribe it.
+            spdlog::error("PgMigrationRunner: the recorded hash of v{} for {} is not a lowercase "
+                          "SHA-256 (the record was edited or damaged); refusing to start this "
+                          "store. See docs/user-manual/upgrading.md, \"{}\".",
+                          version, store, kDriftDocHeading);
+            out.clear();
+            return false;
+        }
+        out.push_back({version, std::move(sha)});
+    }
     return true;
 }
 
@@ -124,8 +149,9 @@ void log_drift(const std::string& store, int version, const std::string& recorde
                const std::string& expected) {
     spdlog::error("PgMigrationRunner: store '{}' recorded migration v{} with SHA-256 {}... but "
                   "this build's v{} hashes to {}... - the migration text was changed after this "
-                  "database applied it, so its schema may not match what this build's queries "
-                  "expect. Refusing to start this store; nothing was applied or changed. See "
+                  "database recorded it (an earlier build applied different text, or the record "
+                  "was edited), so its schema may not match what this build's queries expect. "
+                  "Refusing to start this store; nothing was applied or changed. See "
                   "docs/user-manual/upgrading.md, \"{}\".",
                   store, version, short_hash(recorded), version, short_hash(expected),
                   kDriftDocHeading);
@@ -137,7 +163,8 @@ bool upsert_applied_hash(PGconn* conn, const std::string& store, int version,
                          const std::string& sha) {
     PgResult res = exec_params(
         conn,
-        "INSERT INTO public.schema_migrations (store, version, sha256, recorded_by, recorded_at) "
+        "INSERT INTO public.yuzu_schema_migrations "
+        "(store, version, sha256, recorded_by, recorded_at) "
         "VALUES ($1, $2::int, $3, 'apply', extract(epoch FROM now())::bigint) "
         "ON CONFLICT (store, version) DO UPDATE "
         "SET sha256 = EXCLUDED.sha256, recorded_by = 'apply', recorded_at = EXCLUDED.recorded_at",
@@ -190,11 +217,13 @@ bool verify_recorded_hashes(PGconn* conn, const std::string& store, int current,
     verdict = PgMigrationRunner::check_recorded_hashes(current, expected, recorded);
     if (!verdict.drifted.empty())
         return refuse(verdict.drifted.front());
+    if (verdict.missing.empty())
+        return true; // another process recorded them first; nothing to write or log
     for (int version : verdict.missing) {
         const std::string* e = find_hash(expected, version);
         PgResult res = exec_params(
             conn,
-            "INSERT INTO public.schema_migrations (store, version, sha256, recorded_by, "
+            "INSERT INTO public.yuzu_schema_migrations (store, version, sha256, recorded_by, "
             "recorded_at) VALUES ($1, $2::int, $3, 'tofu', extract(epoch FROM now())::bigint) "
             "ON CONFLICT (store, version) DO NOTHING",
             std::vector<std::string>{store, std::to_string(version), *e});
@@ -293,14 +322,14 @@ bool PgMigrationRunner::ensure_meta_and_schema(PGconn* conn, std::string_view st
     // `recorded_by` separates "verified when applied" from "recorded as first
     // seen on a database that predates this table" (trust on first use).
     if (!exec_ok(conn,
-                 "CREATE TABLE IF NOT EXISTS public.schema_migrations ("
+                 "CREATE TABLE IF NOT EXISTS public.yuzu_schema_migrations ("
                  "  store       TEXT    NOT NULL,"
                  "  version     INTEGER NOT NULL,"
                  "  sha256      TEXT    NOT NULL CHECK (length(sha256) = 64),"
                  "  recorded_by TEXT    NOT NULL CHECK (recorded_by IN ('apply', 'tofu')),"
                  "  recorded_at BIGINT  NOT NULL,"
                  "  PRIMARY KEY (store, version))",
-                 "CREATE schema_migrations", store))
+                 "CREATE yuzu_schema_migrations", store))
         return false;
     // store_name is validated as [a-z_][a-z0-9_]* by run(); quoted anyway.
     if (!exec_ok(conn, "CREATE SCHEMA IF NOT EXISTS \"" + store + "\"", "CREATE SCHEMA", store))

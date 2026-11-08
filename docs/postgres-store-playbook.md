@@ -455,12 +455,12 @@ from the registry changes what a FRESH database gets and nothing about a deploye
   `version` per store in `schema_meta`, so an in-place edit to a migration that already ran
   against a real deployed database never runs there and diverges that deployment's schema from
   what a fresh install now creates. Since #7158 the runner records each applied migration's
-  SHA-256 in `public.schema_migrations` and REFUSES to start the store when a recorded hash
+  SHA-256 in `public.yuzu_schema_migrations` and REFUSES to start the store when a recorded hash
   differs from this build's text, so the edit is now caught at boot on any database that
   recorded the old text after that change landed (a database that predates the table is
-  recorded as first seen and cannot be checked retroactively); it is still wrong, and the
-  refusal is a boot failure. Safe **only** when the migration has never shipped to any real deployment (confirm via
-  `git merge-base --is-ancestor <the-migrating-PR> origin/main` returning false, or an equivalent
+  recorded as first seen and cannot be checked retroactively). It is still wrong, and the
+  refusal is a boot failure. Safe **only** when the migration has never shipped to any real
+  deployment (confirm via `git merge-base --is-ancestor <the-migrating-PR> origin/main` returning false, or an equivalent
   release-history check) — PolicyStore's `sqlite_backfill_source` table removal (ADR-0009's
   fresh-start-by-default retirement, 2026-08-25) is the reference case: its PG migration never
   reached a release, so the edit carried no drift risk. Every other case needs a proper
@@ -663,7 +663,7 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   section. Operator text: `upgrading.md` "When a server build finds its database ahead of it
   (every Postgres store)".
 - **Recorded-hash drift guard (#7158)**: every applied migration's SHA-256 (exact bytes of the
-  SQL, no normalisation) is written to `public.schema_migrations` in the same transaction that
+  SQL, no normalisation) is written to `public.yuzu_schema_migrations` in the same transaction that
   bumps `schema_meta`, as an UPSERT (a rewound `schema_meta` re-applies and overwrites the row:
   the text that just ran is the authority). On every `run()` the hash of each version at or
   below the recorded schema version is compared with this build's; a difference makes `run()`
@@ -676,7 +676,14 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   different text and was then replaced is recorded as whatever the current build holds, which
   the hard-cutover deployment contract excludes). Steady state is one lock-free read. A migration's
   SQL must therefore be byte-identical across processes and deployments: never interpolate a
-  config value, environment variable, timestamp or random value into it. The per-store
+  config value, environment variable, timestamp or random value into it (a deterministic
+  generator over fixed text is fine). This detects accidental or procedural drift, not
+  tampering: whoever can write the table can rewrite `schema_meta`, and a deleted row is recorded
+  again as `'tofu'`. It does not see a version recorded by a DIFFERENT binary that predates it
+  either (#3013). A test that hand-copies a migration vector under a SHIPPED store name and then
+  opens the real store will be refused as drift: use a unique store name, slice the store's own
+  vector, or delete that store's `public.yuzu_schema_migrations` rows to model a database that
+  predates the table. The per-store
   projection smoke-read below remains the second line of defence (column presence, which a hash
   cannot tell you); it is not mass-adopted by this change.
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
