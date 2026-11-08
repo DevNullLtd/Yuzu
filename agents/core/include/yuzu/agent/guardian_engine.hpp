@@ -1483,7 +1483,7 @@ private:
     /// start of each apply_rules' rule loop).
     GuardianRebuildTally rebuild_tally_;
     /// #5719: rule_id -> the cause a full_sync's scoped detach forced (mtx_-guarded; cleared at the
-    /// top of every apply_rules). Not populated until the engine wiring lands.
+    /// top of every apply_rules; installed from detach_rules_except's return on a full_sync).
     std::unordered_map<std::string, GuardianRebuildReason> forced_rebuilds_;
     /// TEST-ONLY (see last_full_sync_rebuild_line_for_test); empty = none emitted yet.
     std::string last_full_sync_rebuild_line_for_test_;

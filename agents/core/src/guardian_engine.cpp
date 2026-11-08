@@ -2165,6 +2165,12 @@ std::map<SparkType, std::uint64_t> GuardianEngine::unsupported_counts_by_type() 
 std::expected<std::size_t, std::string>
 GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     std::lock_guard lock(mtx_);
+    // #5719: a previous push's forced-rebuild record must never outlive that push. Cleared
+    // before ANY early return below (stopped, no kv, lower generation, invalid id, a later
+    // put_rule_locked failure), so a delta that follows a push which bailed out cannot consume
+    // stale reasons. noexcept (unordered_map::clear), so it cannot itself throw before the lock
+    // is released.
+    forced_rebuilds_.clear();
     if (stopped_)
         return std::unexpected("guardian engine stopped");
     if (!kv_)
@@ -2553,8 +2559,29 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // then proceed to re-arm what we can.
         try {
             stop_all_guards_locked();
-            if (spark_runtime_)
-                spark_runtime_->detach_rules_except(push_ids);
+            if (spark_runtime_) {
+                // #5719: the scoped detach returns the kept rules it tore down because their key
+                // was faulted, dead or unreadable, with the key's recorded first cause. It is
+                // installed as the engine's override so reconcile_rule_locked reports THAT reason
+                // for them: after the detach the kept rule's own attach sees KeyBusy (an io-class
+                // mechanism whose disarm claim is still queued) or FirstAttach (an inline type, or
+                // a disarm that already completed) depending on timing, never the key's cause.
+                // The local map is built first and installed with a move-assign (noexcept), so
+                // nothing can throw between the detach succeeding and the override being stored
+                // beyond the map construction itself. RESIDUAL: a throw while constructing the
+                // map (allocation failure) lands in the teardown catch below, after the detach
+                // has already happened: the generation is held for a retry, the forced reasons for
+                // this push are lost (the kept rules are already detached, so nothing re-derives
+                // them), and those rules are reported under whichever reason their own attach
+                // observes (KeyBusy or FirstAttach). The line is diagnostic only: no arm, skip or
+                // generation decision reads it.
+                const auto forced = spark_runtime_->detach_rules_except(push_ids);
+                std::unordered_map<std::string, GuardianRebuildReason> forced_map;
+                forced_map.reserve(forced.size());
+                for (const auto& f : forced)
+                    forced_map.emplace(f.rule_id, f.why);
+                forced_rebuilds_ = std::move(forced_map);
+            }
             // F7: deliberately NOT unsupported_rules_.clear() here - that would make
             // every rule the loop below re-classifies Unsupported look "newly"
             // unsupported (the per-outcome erase/insert in reconcile_rule_locked can't
@@ -2574,6 +2601,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     }
 
     preserved_tally_.reset(); // #4415: this push's skipped-rule record starts empty
+    rebuild_tally_.reset();   // #5719: this push's rebuilt-rule record starts empty
     for (const auto& rule : push.rules()) {
         // #4665: an empty rule_id is one shape of an invalid rule_id, already
         // rejected for the WHOLE push by the pre-validation scan at the top of
@@ -2651,6 +2679,25 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             auto line = preserved_tally_.format();
             spdlog::info("{}", line);
             last_full_sync_preserved_line_for_test_ = std::move(line);
+        } catch (...) {
+        }
+        // #5719: one bounded line per full_sync naming WHY each carried rule was rebuilt rather
+        // than preserved. In its OWN try so a throw formatting one line never suppresses the
+        // other. Notes the reader needs:
+        //  - It prints `rebuilt 0` on a legacy-path agent (prefer_spark_ false, the production
+        //    default): the attach path that feeds the tally is never reached, so the counters
+        //    stay zero until Spark enforcement is enabled. The line itself is NOT gated on
+        //    prefer_spark_.
+        //  - The count includes Pending/Accepted outcomes that may still fail asynchronously
+        //    (hence "rebuild attempted"): there is no pending split.
+        //  - Only a full_sync logs it. A delta push and the boot re-arm loop populate the tally
+        //    but never log it, and an apply_rules that returns early on a persist failure (the
+        //    put_rule_locked return above) logs neither this line nor the preserved one.
+        //  - A wedge re-observation carries no reason and appears in neither line.
+        try {
+            auto line = rebuild_tally_.format();
+            spdlog::info("{}", line);
+            last_full_sync_rebuild_line_for_test_ = std::move(line);
         } catch (...) {
         }
         // F7: a rule_id that was Unsupported before this full_sync but is absent from
@@ -3749,6 +3796,20 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                     preserved_tally_.note(rule.rule_id());
                 else
                     preserved_tally_.note_pending(rule.rule_id());
+            } else {
+                // #5719: a NON-skipped Armed or Accepted outcome is a rule the runtime (re)built.
+                // Why: the cause a full_sync's scoped detach forced for this rule, if any (the
+                // override), else the reason attach_rule reported. The override wins because,
+                // after a scoped detach, the kept rule's attach sees KeyBusy (io-class mechanism,
+                // disarm still queued) or FirstAttach (inline type, or disarm complete) depending
+                // on timing, never the key's faulted/dead/unknown cause. Same thread and lock as
+                // the preserved tally above (apply_rules or start_local under mtx_). note() with
+                // None is a no-op, so a wedge re-observation (reason None) appears in neither
+                // line. A skipped outcome is never noted here: it is the preserved tally's.
+                const auto forced = forced_rebuilds_.find(rule.rule_id());
+                rebuild_tally_.note(rule.rule_id(), forced != forced_rebuilds_.end()
+                                                        ? forced->second
+                                                        : res->rebuild_reason);
             }
             if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
                 return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry,
