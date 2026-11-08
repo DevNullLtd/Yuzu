@@ -7786,6 +7786,426 @@ tests:
         eval_time: 16m
         exp_samples: []
 
+  # -- Workflow-run saturation and integrity (group yuzu-dispatch, #2146) -----------------------
+  #
+  # Four rules, four metric families, every series pre-seeded to 0 at boot by
+  # `seed_workflow_run_metrics`. The metric names and label values these cases feed are checked
+  # against the C++ source by tests/test_workflow_run_metrics_wiring_lexical.py, so a rename there
+  # cannot leave a rule that parses and can never fire (#2553).
+  #
+  # These cases were first written without promtool (no native binary, no pulled image), copying
+  # the measured shapes of their siblings. They have since been run: the whole file passed under
+  # the pinned image with `YUZU_TEST_ENABLE_PROMTOOL_DOCKER=1 python3
+  # tests/prometheus/run_promtool_tests.py` (exit 0, sharded alerts file ran, canary red) on the
+  # tree that added YuzuWorkflowExecutionsTableLarge (196 rules). Only that rule's cases were
+  # mutation-run (see the table-growth section below); the cases for the four rules in this
+  # section were run green but their "which case catches which change" lines are still reasoned,
+  # NOT mutation-run.
+  #
+  # Which case is meant to catch which change to which rule (reasoned, NOT mutation-run):
+  #   YuzuHeldOpenUtilisationHigh
+  #     * `> 0.8` weakened to `>= 0.8`                -> held-open case B (exactly 0.8 must be quiet)
+  #     * `for: 5m` shortened to 2m or lengthened     -> held-open cases A and C (pending at 6m,
+  #                                                      quiet at 8m, firing at 10m; a 3 sample
+  #                                                      spike must never fire)
+  #     * the join narrowed with on()/ignoring()      -> held-open case D (s2's saturation must not
+  #                                                      be reported under s1)
+  #   YuzuWorkflowFinalizeFailed
+  #     * `> 0` weakened to `>= 0`                    -> finalize case B (a flat series fires)
+  #     * the metric name lost                        -> finalize case A (no sample)
+  #     * an `increase(...[1m])` window               -> finalize case A (still firing at 30m)
+  #   YuzuWorkflowRunGlobalCapRefused
+  #     * the `reason="global_stream_cap"` filter lost -> global-cap case E (per_principal and
+  #                                                      draining must stay quiet)
+  #     * `for:` below 10m                            -> global-cap case C (a single event must not fire)
+  #   YuzuWorkflowIndeterminateReplays
+  #     * the `outcome="indeterminate"` filter lost   -> indeterminate case C (a replayed-only
+  #                                                      series must stay quiet)
+  #     * `> 0` weakened to `>= 0`                    -> indeterminate case B
+
+  # HELD-OPEN CASE A -- utilisation above 80% (90 of 100) from minute 4 is pending, quiet at 8m,
+  # firing from 10m (`for: 5m`), labeled with job and instance (the division keeps both).
+  - interval: 1m
+    name: held open utilisation - above 80 percent for 5 minutes fires
+    input_series:
+      - series: 'yuzu_http_held_open_responses{job="yuzu",instance="s1"}'
+        values: "10x3 90x40"
+      - series: 'yuzu_http_held_open_capacity{job="yuzu",instance="s1"}'
+        values: "100x43"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="pending"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # HELD-OPEN CASE B -- exactly 80% (80 of 100) and a comfortable 50% are quiet: the threshold is
+  # strictly greater than 0.8.
+  - interval: 1m
+    name: held open utilisation - exactly 80 percent and below are quiet
+    input_series:
+      - series: 'yuzu_http_held_open_responses{job="yuzu",instance="s1"}'
+        values: "80x30"
+      - series: 'yuzu_http_held_open_capacity{job="yuzu",instance="s1"}'
+        values: "100x30"
+      - series: 'yuzu_http_held_open_responses{job="yuzu",instance="s2"}'
+        values: "50x30"
+      - series: 'yuzu_http_held_open_capacity{job="yuzu",instance="s2"}'
+        values: "100x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate=~"firing|pending"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # HELD-OPEN CASE C -- a three-sample spike above 80% (minutes 4 to 6) is pending at most: it is
+  # gone before 5 minutes of continuous truth, so it never fires. The pending sample at 5m proves
+  # the expression IS true (the case is not vacuous).
+  - interval: 1m
+    name: held open utilisation - a short spike does not fire
+    input_series:
+      - series: 'yuzu_http_held_open_responses{job="yuzu",instance="s1"}'
+        values: "10x3 90x2 10x40"
+      - series: 'yuzu_http_held_open_capacity{job="yuzu",instance="s1"}'
+        values: "100x45"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="pending"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # HELD-OPEN CASE D -- two servers: only the saturated one is reported, under its own labels.
+  # Cross-metric rules use PromQL's default all-label matching, so s2's capacity cannot stand in
+  # for s1's.
+  - interval: 1m
+    name: held open utilisation - only the saturated instance fires
+    input_series:
+      - series: 'yuzu_http_held_open_responses{job="yuzu",instance="s1"}'
+        values: "10x40"
+      - series: 'yuzu_http_held_open_capacity{job="yuzu",instance="s1"}'
+        values: "100x40"
+      - series: 'yuzu_http_held_open_responses{job="yuzu",instance="s2"}'
+        values: "95x40"
+      - series: 'yuzu_http_held_open_capacity{job="yuzu",instance="s2"}'
+        values: "100x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuHeldOpenUtilisationHigh", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # FINALIZE CASE A -- a run whose final status write failed twice (one increment at minute 5)
+  # is pending at 6m and firing from 8m (`for: 2m`), and `increase(...[1h])` keeps it firing at
+  # 30m. RED if the window shrinks to minutes, or the metric name is lost.
+  - interval: 1m
+    name: workflow finalize failed - one orphaned run fires and stays visible
+    input_series:
+      - series: 'yuzu_server_workflow_finalize_failed_total{job="yuzu",instance="s1"}'
+        values: "0x4 1x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate="pending"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # FINALIZE CASE B -- a healthy server (the pre-seeded series never moves) is quiet, and so is a
+  # series whose FIRST scrape already reads 1: increase() of a flat run of 1s is 0. That second
+  # half is why the counter is pre-seeded at boot (observability-conventions.md): a series that
+  # first appears at 1 would never alert. RED if the rule fires on a flat series.
+  - interval: 1m
+    name: workflow finalize failed - a flat series is quiet
+    input_series:
+      - series: 'yuzu_server_workflow_finalize_failed_total{job="yuzu",instance="s1"}'
+        values: "0x70"
+      - series: 'yuzu_server_workflow_finalize_failed_total{job="yuzu",instance="s2"}'
+        values: "1x70"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowFinalizeFailed", alertstate=~"firing|pending"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # GLOBAL-CAP CASE A -- refusals that keep recurring (one more every minute from minute 2) fire,
+  # labeled with instance. First true at minute 2, so `for: 10m` fires at minute 12. Copy of
+  # YuzuDispatchRecordWriteFailing case A: the same expression shape.
+  - interval: 1m
+    name: workflow run global cap refused - sustained refusals fire
+    input_series:
+      - series: 'yuzu_server_workflow_run_refused_total{job="yuzu",instance="s1",reason="global_stream_cap"}'
+        values: "0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # GLOBAL-CAP CASE B -- a healthy server (the pre-seeded series never moves) is quiet.
+  - interval: 1m
+    name: workflow run global cap refused - a healthy server is quiet
+    input_series:
+      - series: 'yuzu_server_workflow_run_refused_total{job="yuzu",instance="s1",reason="global_stream_cap"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # GLOBAL-CAP CASE C -- a single refusal (at minute 2) is pending at most, never firing: the 5
+  # minute rate cannot stay true for the 10 minutes `for:` needs. The pending sample at 4m proves
+  # the expression IS true. RED if `for:` drops below 10m.
+  - interval: 1m
+    name: workflow run global cap refused - a single refusal does not page
+    input_series:
+      - series: 'yuzu_server_workflow_run_refused_total{job="yuzu",instance="s1",reason="global_stream_cap"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="pending"}'
+        eval_time: 4m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # GLOBAL-CAP CASE D -- a short episode (refusals at minutes 2, 3 and 4, then recovery) does not
+  # page: the rate is true from minute 2 to about minute 8, under the 10 minutes `for:` needs, and
+  # gone by minute 12. Copy of YuzuDispatchRecordWriteFailing case D.
+  - interval: 1m
+    name: workflow run global cap refused - a short episode that recovers does not page
+    input_series:
+      - series: 'yuzu_server_workflow_run_refused_total{job="yuzu",instance="s1",reason="global_stream_cap"}'
+        values: "0 0 1 2 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="pending"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+
+  # GLOBAL-CAP CASE E -- the same recurring refusals under the OTHER two reasons stay quiet: a
+  # caller at its per-principal cap is a client pacing itself, and `draining` is a shutdown. RED
+  # if the `reason="global_stream_cap"` filter is lost.
+  - interval: 1m
+    name: workflow run global cap refused - per-principal and draining refusals are excluded
+    input_series:
+      - series: 'yuzu_server_workflow_run_refused_total{job="yuzu",instance="s1",reason="per_principal_stream_cap"}'
+        values: "0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30"
+      - series: 'yuzu_server_workflow_run_refused_total{job="yuzu",instance="s1",reason="draining"}'
+        values: "0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowRunGlobalCapRefused", alertstate=~"firing|pending"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # INDETERMINATE CASE A -- a repeat of a key whose run cannot be proven (one increment at minute
+  # 5) is pending at 6m and firing from 8m (`for: 2m`), and still firing at 12m.
+  - interval: 1m
+    name: workflow indeterminate replays - one indeterminate replay fires
+    input_series:
+      - series: 'yuzu_server_workflow_run_idempotent_total{job="yuzu",instance="s1",outcome="indeterminate"}'
+        values: "0x4 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate="pending"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # INDETERMINATE CASE B -- a flat pre-seeded series is quiet. RED if `> 0` is weakened to `>= 0`.
+  - interval: 1m
+    name: workflow indeterminate replays - a flat series is quiet
+    input_series:
+      - series: 'yuzu_server_workflow_run_idempotent_total{job="yuzu",instance="s1",outcome="indeterminate"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # INDETERMINATE CASE C -- plain replays, in-progress polls and conflicts are the intended use of
+  # an idempotency key and never fire this rule, however fast they grow. RED if the
+  # `outcome="indeterminate"` filter is lost.
+  - interval: 1m
+    name: workflow indeterminate replays - replayed, in_progress and conflict are excluded
+    input_series:
+      - series: 'yuzu_server_workflow_run_idempotent_total{job="yuzu",instance="s1",outcome="replayed"}'
+        values: "0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100"
+      - series: 'yuzu_server_workflow_run_idempotent_total{job="yuzu",instance="s1",outcome="in_progress"}'
+        values: "0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100"
+      - series: 'yuzu_server_workflow_run_idempotent_total{job="yuzu",instance="s1",outcome="conflict"}'
+        values: "0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100"
+      - series: 'yuzu_server_workflow_run_idempotent_total{job="yuzu",instance="s1",outcome="indeterminate"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowIndeterminateReplays", alertstate=~"firing|pending"}'
+        eval_time: 18m
+        exp_samples: []
+
+  # -- Workflow run table growth (group yuzu-dispatch, #2146) ------------------------------------
+  #
+  # YuzuWorkflowExecutionsTableLarge reads yuzu_server_workflow_executions_rows, a gauge every
+  # replica exports for the same shared table, and collapses them with `max by (job)`. Names are
+  # checked against the C++ source by tests/test_workflow_run_metrics_wiring_lexical.py.
+  #
+  # TABLE CASE A -- two replicas report the same table above 100,000 from minute 5: pending at 20m,
+  # still quiet at 30m (`for: 30m`, firing from 35m), firing at 40m and 60m, and exactly ONE alert
+  # for the two replicas. RED if the `max by (job)` collapse becomes a per-instance rule (two
+  # samples), if `for:` is shortened below 25m (firing at 30m) or lengthened past 35m (quiet at 40m).
+  # MUTATION-RUN on the pinned image, each reddening this file and each restored byte-identical
+  # (sha256 checked): threshold 100000 -> 200000 (cases A and C), `>` -> `>=` (case B), `for: 30m`
+  # -> `for: 10m` (case A fires at 30m), and `max by (job) (...)` -> the bare selector (case A sees
+  # two per-instance alerts).
+  - interval: 1m
+    name: workflow executions table - two replicas above 100000 for 30 minutes fire one alert
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "1000x4 150000x80"
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s2"}'
+        values: "1000x4 150000x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="pending"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="pending", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # TABLE CASE B -- exactly 100,000 rows and a table well under it are quiet: the threshold is
+  # strictly greater than 100000. RED if `>` is weakened to `>=` or the number is lowered.
+  - interval: 1m
+    name: workflow executions table - exactly 100000 rows and below are quiet
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "100000x80"
+      - series: 'yuzu_server_workflow_executions_rows{job="other",instance="s2"}'
+        values: "5000x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 70m
+        exp_samples: []
+
+  # TABLE CASE C -- a table that crosses 100,000 for ten minutes and then falls back (a DBA
+  # cleanup, a wrong estimate corrected by autovacuum) never reaches the 30 minute `for:`. RED if
+  # `for:` is lost.
+  - interval: 1m
+    name: workflow executions table - a ten minute excursion above 100000 never fires
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "1000x4 150000x9 1000x70"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate="pending", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # TABLE CASE D -- two replicas that each report the shared table at 60,000 rows (so each is below
+  # the threshold, and their sum of 120,000 is above it) stay quiet: the replicas read ONE table, so
+  # the collapse must be `max`, never `sum`. RED if `max by (job)` becomes `sum by (job)`, which
+  # multiplies the row count by the replica count and fires at 100,000 / N real rows.
+  # MUTATION-RUN on the pinned image in a scratch copy of the rules file: `max by (job)` ->
+  # `sum by (job)` reddened this case alone (it fired at 70m); cases A to C stay green under it.
+  - interval: 1m
+    name: workflow executions table - two replicas below the threshold whose sum is above it stay quiet
+    input_series:
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s1"}'
+        values: "60000x80"
+      - series: 'yuzu_server_workflow_executions_rows{job="yuzu",instance="s2"}'
+        values: "60000x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWorkflowExecutionsTableLarge", alertstate=~"firing|pending"}'
+        eval_time: 70m
+        exp_samples: []
+
   # ── YuzuOutboxHeld / YuzuOutboxDeadLettered (#3678, command outbox redelivery limit) ──────────
   #
   # Held: a systemic hold repeats every tick, so the counter climbs continuously; the rule needs

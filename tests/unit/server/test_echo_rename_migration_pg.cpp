@@ -86,6 +86,19 @@ void roll_back(const std::string& dsn, const char* store, int to_version) {
                       " WHERE store = '" + store + "'");
 }
 
+// Roll workflow_engine back to v1. Its v3 adds columns, a CHECK and an index (re-run safe, but a
+// rolled-back store should look like the one an earlier build left); take the v3 artifacts out the
+// way test_workflow_engine.cpp's v2->v3 case does.
+void roll_back_workflow_engine_to_v1(const std::string& dsn) {
+    exec_sql(dsn, "DROP INDEX workflow_engine.idx_wf_exec_idem");
+    exec_sql(dsn, "ALTER TABLE workflow_engine.workflow_executions "
+                  "DROP CONSTRAINT wf_exec_idem_complete");
+    exec_sql(dsn, "ALTER TABLE workflow_engine.workflow_executions DROP COLUMN principal, "
+                  "DROP COLUMN idempotency_key, DROP COLUMN request_fingerprint, "
+                  "DROP COLUMN correlation_id");
+    roll_back(dsn, "workflow_engine", 1);
+}
+
 std::string version_of(const std::string& dsn, const char* store) {
     return one(dsn, std::string("SELECT version FROM public.schema_meta WHERE store = '") + store +
                         "'");
@@ -555,7 +568,7 @@ TEST_CASE("Echo rename: definition-id references follow in schedules and executi
     roll_back(dsn, "approval_manager", 3);
     roll_back(dsn, "device_token_store", 1);
     roll_back(dsn, "policy_store", 4);
-    roll_back(dsn, "workflow_engine", 1);
+    roll_back_workflow_engine_to_v1(dsn);
     roll_back(dsn, "response_store", 2);
     {
         PgPool pool{{.conninfo = dsn, .size = 4}};
@@ -579,7 +592,7 @@ TEST_CASE("Echo rename: definition-id references follow in schedules and executi
     CHECK(version_of(dsn, "approval_manager") == "4");
     CHECK(version_of(dsn, "device_token_store") == "2");
     CHECK(version_of(dsn, "policy_store") == "5");
-    CHECK(version_of(dsn, "workflow_engine") == "2");
+    CHECK(version_of(dsn, "workflow_engine") == "3");
     CHECK(version_of(dsn, "response_store") == "4");
 
     CHECK(one(dsn, "SELECT definition_id FROM schedule_engine.schedules WHERE id = 's1'") ==

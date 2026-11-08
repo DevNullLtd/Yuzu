@@ -299,6 +299,7 @@
 #include "integrations_routes.hpp" // System "Integrations" page + its page script
 #include "viz_routes.hpp"
 #include "webhook_routes.hpp"
+#include "workflow_execute.hpp" // #2146: kWorkflowRun metric names, admit_workflow_run budget
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
 #include "secure_buffer.hpp"
@@ -974,10 +975,17 @@ public:
                           "pins one HTTP worker)",
                           "gauge");
         metrics_.describe("yuzu_http_held_open_responses",
-                          "SSE responses held open right now across ALL surfaces (MCP GET, "
-                          "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events) - "
-                          "each pins one HTTP worker thread",
+                          "Responses held open right now across ALL surfaces (MCP GET, "
+                          "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events, "
+                          "synchronous workflow runs) - each pins one HTTP worker thread",
                           "gauge");
+        metrics_.describe(yuzu::server::kWorkflowRunsInFlightMetric,
+                          "Synchronous workflow runs holding an HTTP worker right now (REST v1 "
+                          "execute, MCP execute_workflow and the legacy "
+                          "POST /api/workflows/{id}/execute); the workflow-run share of "
+                          "yuzu_http_held_open_responses. Sampled every ~15 seconds",
+                          "gauge");
+        metrics_.gauge(yuzu::server::kWorkflowRunsInFlightMetric).set(0);
         metrics_.describe("yuzu_http_held_open_capacity",
                           "Held-open responses this server is sized for (--max-sse-streams, "
                           "clamped to the worker pool). Utilisation = responses / capacity",
@@ -1538,7 +1546,11 @@ public:
                           "all (#2500), plus Destructive-class capabilities targeted without "
                           "explicit agent_ids on REST (route=command, route=command_v1), MCP "
                           "execute_instruction (route=mcp) or the dashboard exec console "
-                          "(route=dashboard) (#3685). "
+                          "(route=dashboard) (#3685), plus the workflow-run surfaces "
+                          "(route=workflow: the v1 REST and MCP execute_workflow twins and the "
+                          "legacy POST /api/workflows/{id}/execute): a refused body, "
+                          "or a step that is Destructive or Forensics without explicit agent_ids "
+                          "or with no visible target. "
                           "Both labels are closed sets; every reachable pair "
                           "is pre-seeded at boot so absent() stays meaningful. The "
                           "withhold reasons quarantined, unknown_plugin and "
@@ -1576,18 +1588,13 @@ public:
         // `evaluate_destructive_targeting` into `/api/instructions/{id}/execute`
         // (workflow_routes.cpp) — `instruction_execute` too (the exclusion
         // this comment used to state, "that route has no Destructive gate
-        // yet", is stale: it does now). `workflow`: the SAME
-        // evaluate_destructive_targeting call, now run as a whole-request
-        // preflight over every step of `/api/workflows/{id}/execute` before
-        // WorkflowEngine::execute() is invoked at all — a genuinely NEW
-        // emission point, not a relabeling of the per-step dispatch_fn refusal
-        // (that refusal has no metrics/audit_fn/req access and stays a silent
-        // failed-step result by construction).
+        // yet", is stale: it does now). `workflow` is seeded below from
+        // `workflow_target_reject_reasons()` with the rest of its reachable set.
         // "dashboard" seeded alongside the other two (PR6.0b): a series created
         // only on first use reads as ABSENT until the first refusal, which is
         // exactly the absent()-alerting break the single-array discipline exists
         // to prevent -- and three docs tell operators to alert on this series.
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
@@ -1612,13 +1619,73 @@ public:
         for (const auto reason : yuzu::server::instruction_execute::kApprovalRefusedReasons)
             metrics_.counter(yuzu::server::instruction_execute::kApprovalRefusedMetric,
                              {{"reason", std::string(reason)}});
+        // Workflow runs refused at ADMISSION, by reason: a held-open cap (global_stream_cap: the
+        // shared budget is full; per_principal_stream_cap: this principal already has 2 runs) or
+        // a draining server. Closed set, every member pre-seeded so an absent() alert reads
+        // "never happened", not "no series yet". No workflow or instruction was read, nothing
+        // was sent or audited (a keyed call has had only its key looked up).
+        metrics_.describe(yuzu::server::kWorkflowRunRefusedMetric,
+                          "Workflow runs (POST /api/v1/workflows/{id}/execute, MCP "
+                          "execute_workflow, and the legacy POST /api/workflows/{id}/execute) "
+                          "refused before any workflow or instruction was read and before "
+                          "anything was sent, by reason: "
+                          "global_stream_cap (the shared held-open budget is full; HTTP 429, MCP "
+                          "-32012), per_principal_stream_cap (this principal already has 2 runs in "
+                          "progress; 429), draining (the server is shutting down; HTTP 503, MCP "
+                          "-32015). No audit row and no approval ticket is spent on a refusal",
+                          "counter");
+        // Repeats of a workflow-run idempotency key answered WITHOUT sending anything, by
+        // outcome: replayed (the run it is bound to is terminal and its stored rows prove how it
+        // ended), indeterminate (it is not provable, or the run is past the stale bound),
+        // in_progress (that run is still running: the caller is told to poll), conflict (the same
+        // key with a different request, HTTP 422 / MCP -32602). Closed set, every member
+        // pre-seeded. A running replay writes no audit row, so this counter is its only record.
+        metrics_.describe(yuzu::server::kWorkflowRunIdempotentMetric,
+                          "Repeats of a workflow-run idempotency key (POST /api/v1/workflows/{id}/"
+                          "execute Idempotency-Key header, MCP execute_workflow idempotency_key) "
+                          "answered without sending anything, by outcome: replayed (the run the "
+                          "key is bound to is terminal and its stored rows prove how it ended), "
+                          "indeterminate (the rows cannot prove it, or it has been running past "
+                          "the stale bound: the caller cannot know whether steps were sent), "
+                          "in_progress "
+                          "(that run is still running; the caller polls get_workflow_execution), "
+                          "conflict (the key is bound to a different request; HTTP 422, MCP "
+                          "-32602, terminal). A sustained in_progress rate means clients poll by "
+                          "repeating the call, which is correct; a rising conflict rate means "
+                          "clients reuse keys across different requests",
+                          "counter");
+        // How every workflow run the v1 / MCP twins started and answered ended, counted once at its
+        // first answer. The closed (outcome, reason) pair set is workflow_run_outcome_series(): only
+        // reachable pairs are seeded, so a zero is "has not happened" and never "cannot happen".
+        metrics_.describe(yuzu::server::kWorkflowRunOutcomeMetric,
+                          "Workflow runs (POST /api/v1/workflows/{id}/execute, MCP "
+                          "execute_workflow) by how the run ended, counted once when it is first "
+                          "answered; an idempotent replay never moves it. outcome is succeeded, "
+                          "partial, failed, aborted or interrupted. reason says what cut the run "
+                          "short or why it reached nobody: deadline_exceeded (the 60 second budget), "
+                          "server_shutdown, credential_revoked, credential_indeterminate (the "
+                          "caller's credential was checked before a step), late_denied or "
+                          "definition_changed (a step was refused at send time), a zero-reach cause "
+                          "(containment_unreadable, route_unreadable, os_gate_unreadable, "
+                          "no_agents_reached, quarantined, plugin_not_found, kill_switched_os), "
+                          "run_failed (the engine ended the run before any dispatch), "
+                          "dispatch_exception (the run threw after its requested audit row; steps "
+                          "may have been sent), or none. A run killed with the process never "
+                          "answers and is never counted here; a run whose final status write "
+                          "failed (yuzu_server_workflow_finalize_failed_total) is counted when "
+                          "its call is answered by the same order as any run: failed if it threw, "
+                          "aborted after a deadline, credential or send-time stop, interrupted by "
+                          "a shutdown, else partial if something was sent and failed if not.",
+                          "counter");
+        yuzu::server::seed_workflow_run_metrics(metrics_);
         // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
         // `event_type` set, pre-seeded. Only the v1 / MCP twins count here (event_emit_hook.hpp);
         // the legacy routes' own emit calls do not touch this counter.
         metrics_.describe(yuzu::server::kEventEmitFailedMetric,
                           "Legacy-equivalent platform events (execution.created, "
                           "execution.completed, command.dispatched, instruction.executed, "
-                          "approval.created) that the v1 REST and MCP twins tried to publish "
+                          "approval.created, workflow.executed) that the v1 REST and MCP twins "
+                          "tried to publish "
                           "after a successful effect and whose emit hook THREW (a payload "
                           "serialisation or hook defect). NOT an analytics-drop signal: the "
                           "analytics emit itself is fail-soft, so an event that is dropped (for "
@@ -1632,7 +1699,7 @@ public:
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them
         // (a Forensics row is never Destructive, but reaches the same gate).
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
@@ -1652,11 +1719,15 @@ public:
         // #2146: the v1 instruction-definition execute twin (instruction_execute.cpp) confines a
         // Destructive / Forensics pair's named targets to the operator's visible agents exactly
         // as `/api/command` does, so it emits the same reason; the MCP twin shares the `mcp`
-        // route label and is seeded with it.
+        // route label and is seeded with it. The v1 workflow run twins (REST and MCP
+        // `execute_workflow`) confine each step the same way and count under `workflow`.
         for (const char* route : {"instruction_execute", "mcp"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
+        // `route="workflow"` (the REST v1 and MCP `execute_workflow` twins plus the legacy
+        // `POST /api/workflows/{id}/execute`) is seeded with the other workflow-run families by
+        // `seed_workflow_run_metrics` above, from `workflow_target_reject_reasons()`.
         for (const auto reason : {yuzu::server::kReasonParentIdType,
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
@@ -1745,7 +1816,10 @@ public:
             "guarded() post-dispatch helper) that THREW rather than failing cleanly, "
             "by which one; and, with phase=\"dispatch\" on route command_v1, "
             "instruction_execute or mcp, the dispatch call itself throwing (its execution "
-            "row is left running). A well-behaved sink/helper should fail via its own "
+            "row is left running), and, with route workflow, a workflow run throwing after its "
+            "requested audit row (steps may already have been sent; the run is a workflow "
+            "execution, read with get_workflow_execution, not an executions-ledger row). A "
+            "well-behaved sink/helper should fail via its own "
             "return value, not an exception; a non-zero rate points at a bug in that sink/"
             "helper rather than at ordinary degradation.",
             "counter");
@@ -1759,10 +1833,12 @@ public:
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
                              {{"route", "command"}, {"phase", phase}});
         // `phase="dispatch"` is the dispatch call ITSELF throwing (not a post-dispatch helper),
-        // counted by the three v1/MCP surfaces that catch it: POST /api/v1/commands, the
-        // instruction-definition execute twins (REST + MCP). The legacy /api/command route does
-        // not catch a throwing dispatch, so it has no such series. The same alert covers them.
-        for (const char* route : {"command_v1", "instruction_execute", "mcp"})
+        // counted by the surfaces that catch it: POST /api/v1/commands, the
+        // instruction-definition execute twins (REST + MCP) and, as route `workflow`, a workflow
+        // run that throws after its `requested` row (REST v1 + MCP execute_workflow). The legacy
+        // /api/command route does not catch a throwing dispatch, so it has no such series. The
+        // same alert covers them.
+        for (const char* route : {"command_v1", "instruction_execute", "mcp", "workflow"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
                              {{"route", route}, {"phase", "dispatch"}});
 
@@ -7764,6 +7840,45 @@ public:
                 startup_failed_ = true;
             } else {
                 workflow_engine_->set_metrics(&metrics_);
+                // Every run, the legacy route's included, learns of a shutdown here:
+                // `draining_` makes a run give up retries it has not made, `stop_requested_`
+                // ends it (steps skipped `server_shutdown`). The closure outlives no run: the
+                // web server is joined before the engine is destroyed.
+                workflow_engine_->set_should_stop([this] {
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        return yuzu::server::WorkflowStopLevel::kStop;
+                    if (draining_.load(std::memory_order_acquire))
+                        return yuzu::server::WorkflowStopLevel::kDraining;
+                    return yuzu::server::WorkflowStopLevel::kNone;
+                });
+                metrics_.describe("yuzu_server_workflow_finalize_failed_total",
+                                  "Workflow runs whose final status write failed twice (a lease "
+                                  "timeout or a failed statement, then one retry with a longer "
+                                  "lease), leaving the execution row 'running'. Any increase is "
+                                  "an orphan nothing closes. #2146.",
+                                  "counter");
+                metrics_.counter("yuzu_server_workflow_finalize_failed_total", {});
+                // Run-table size (ADR-1005 residual 13: rows are never pruned). The gauges are
+                // sampled on health_recompute_thread_ and are ABSENT until the first successful
+                // sample, never a fabricated 0; only the failure counter is pre-seeded.
+                metrics_.describe(yuzu::server::kWorkflowExecutionsRowsMetric,
+                                  "Estimated rows in workflow_engine.workflow_executions, the "
+                                  "larger of the planner's reltuples and n_live_tup, sampled "
+                                  "about every 15 seconds without a table scan. Absent until the "
+                                  "first successful sample; a failed sample keeps the previous "
+                                  "value. Run rows are never pruned. #2146.",
+                                  "gauge");
+                metrics_.describe(yuzu::server::kWorkflowExecutionsBytesMetric,
+                                  "pg_total_relation_size of workflow_engine.workflow_executions "
+                                  "(heap, TOAST and indexes) in bytes, sampled with the row "
+                                  "estimate. The step results table is not included. #2146.",
+                                  "gauge");
+                metrics_.describe(yuzu::server::kWorkflowExecutionsStatsUnavailableMetric,
+                                  "Samples of the workflow run table size that failed (no pool "
+                                  "lease within 250 ms, statement timeout or query error); the "
+                                  "two gauges keep their previous value. #2146.",
+                                  "counter");
+                metrics_.counter(yuzu::server::kWorkflowExecutionsStatsUnavailableMetric, {});
                 metrics_.describe("yuzu_server_workflow_engine_writes_total",
                                   "WorkflowEngine create_workflow/delete_workflow/execute/"
                                   "cancel_execution outcomes, by op and result. ADR-0064.",
@@ -9553,7 +9668,17 @@ public:
                 if (stream_budget_) {
                     metrics_.gauge("yuzu_http_held_open_responses")
                         .set(static_cast<double>(stream_budget_->active()));
+                    // The workflow-run share of the number above (a synchronous run holds its
+                    // worker for the whole run, up to kWorkflowSyncBudget).
+                    metrics_.gauge(yuzu::server::kWorkflowRunsInFlightMetric)
+                        .set(static_cast<double>(stream_budget_->active_for_surface(
+                            yuzu::server::detail::SseSurface::kWorkflowRun)));
                 }
+                // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
+                // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
+                // connection), noexcept (a failed sample keeps the previous gauge values).
+                if (workflow_engine_)
+                    workflow_engine_->refresh_table_size_metrics();
                 if (pg_pool_) {
                     metrics_.gauge("yuzu_pg_pool_in_use")
                         .set(static_cast<double>(pg_pool_->in_use()));
@@ -10781,10 +10906,24 @@ public:
                 // has no client-side deadline and can overrun the cap.
                 if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
                     running = execution_tracker_->query_executions({.status = "running"}).size();
-                if (!shutdown_drain::keep_draining(elapsed, min_grace, running > 0))
+                // Workflow runs this process holds (a synchronous run pins an HTTP worker): the
+                // engine's in-process counter and the kWorkflowRun leases, both lock-light
+                // reads taken every tick whatever the tracker says, and never a table count
+                // (orphans and other replicas must not hold this replica's shutdown). The lease
+                // is taken before prepare, so a run that has not reached the engine yet is
+                // counted. The same cap bounds it.
+                const int workflow_runs = shutdown_drain::workflow_runs_to_drain(
+                    workflow_engine_ ? workflow_engine_->in_flight_runs() : 0,
+                    stream_budget_ ? stream_budget_->active_for_surface(
+                                         yuzu::server::detail::SseSurface::kWorkflowRun)
+                                   : 0);
+                if (!shutdown_drain::keep_draining_for_work(elapsed, min_grace, running,
+                                                            workflow_runs))
                     break;
-                if (running > 0) {
-                    spdlog::info("Draining: {} executions in flight, waiting...", running);
+                if (running > 0 || workflow_runs > 0) {
+                    spdlog::info("Draining: {} executions and {} workflow runs in flight, "
+                                 "waiting...",
+                                 running, workflow_runs);
                 } else if (steady_clock::now() - last_log >= seconds(10)) {
                     // A countdown, so a long grace does not read as a hang and invite
                     // the second signal that hard-exits (UP-11).
@@ -16545,7 +16684,7 @@ private:
                 }
                 res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
                 res.set_header("Access-Control-Allow-Headers",
-                               "Content-Type, Authorization, X-Yuzu-Token");
+                               "Content-Type, Authorization, X-Yuzu-Token, Idempotency-Key");
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
@@ -19676,6 +19815,32 @@ private:
         std::shared_ptr<yuzu::server::WorkflowApi> workflow_api;
         if (workflow_engine_)
             workflow_api = make_local_workflow_api(*workflow_engine_);
+        // The run port behind POST /api/v1/workflows/{id}/execute and MCP execute_workflow
+        // (workflow_run_port.hpp): ONE closure over the engine, shared by both, kept out of the
+        // read seam above. Null when the engine was never opened, like `workflow_api`. The engine
+        // consumes the whole WorkflowRunControl; shutdown reaches it through the
+        // engine-level `set_should_stop` wired at the engine's construction.
+        yuzu::server::WorkflowRunFn workflow_run_fn;
+        if (workflow_engine_)
+            workflow_run_fn = [engine = workflow_engine_.get()](
+                                  const std::string& workflow_id,
+                                  const std::vector<std::string>& agent_ids,
+                                  yuzu::server::StepDispatchFn dispatch_fn,
+                                  yuzu::server::ConditionEvalFn condition_fn,
+                                  const yuzu::server::WorkflowRunControl& control) {
+                return engine->execute(workflow_id, agent_ids, std::move(dispatch_fn),
+                                       std::move(condition_fn), control);
+            };
+        // The idempotency pre-check beside the run port (workflow_run_port.hpp): core-internal, NOT
+        // a WorkflowApi method. The principal is the authenticated caller's own, never a parameter
+        // a presentation or MCP client can supply.
+        yuzu::server::WorkflowIdempotencyLookupFn workflow_idempotency_lookup_fn;
+        if (workflow_engine_)
+            workflow_idempotency_lookup_fn = [engine = workflow_engine_.get()](
+                                                 const yuzu::server::DispatchCaller& caller,
+                                                 const std::string& idempotency_key) {
+                return engine->find_execution_by_key(caller.principal, idempotency_key);
+            };
         // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam — ONE
         // instance backing 8 of the 9 GET /api/v1/guaranteed-state/* resources
         // (all but the store-free `schemas`) and their MCP twins, so the two
@@ -20974,6 +21139,72 @@ private:
             // for the same caller).
             &metrics_, instruction_store_.get(), response_visible_set_fn);
 
+        // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
+        // handed to REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
+        // param), to MCP (set_authorize_dispatch_fn, wired further below) and to the workflow
+        // execute twins (`wf_deps.authorize_dispatch` here; MCP's copy is the same
+        // set_authorize_dispatch_fn), so the surfaces cannot observe a different admit decision
+        // for the same caller
+        // (never bind a route-local copy). Each consumer holds its own COPY of this
+        // one lambda; the copies cannot diverge because it captures only `this` and
+        // everything it reads is live -- a stateful capture added here would break
+        // that, and tests/test_tier_policy_wiring_lexical.py pins "one definition,
+        // two uses". Formerly an inline lambda at the MCP wiring site; its
+        // rationale follows.
+        // Composes the SAME two DECISIONS build_classified_command
+        // makes, in the SAME order, and NEITHER is a re-implemented slice:
+        // the classify+authorize half calls classify_and_authorize_dispatch
+        // via the SAME has_permission binder (dispatch_has_permission
+        // above); the kill-switch half calls the SAME kill_switch_denial
+        // (agent_registry.hpp) finalize_classified_command itself calls -
+        // Gate 6 governance fix: an earlier round of this PR re-expressed
+        // that boolean inline instead of sharing code with
+        // finalize_classified_command, reintroducing the exact
+        // "from-scratch copy drifts from what production enforces" shape
+        // that function's own M6/wave1 extraction closed once already;
+        // this wiring now shares the extracted function instead.
+        // `action_allowed`'s construction (nullptr-guarded
+        // plugin_config_store_ wrap) is the SAME literal composition
+        // build_classified_command uses ahead of its own
+        // finalize_classified_command call, above. `plugin_config_store_`
+        // is read live through `this` (not captured by value), so this
+        // wiring is safe regardless of construction order relative to
+        // that store; an unset store means legacy-open for the
+        // kill-switch gate ONLY, mirroring build_classified_command's own
+        // unwired contract. Per McpServer::AuthorizeDispatchFn's
+        // fail-closed contract (mcp_server.hpp), omitting this whole call
+        // refuses every execute_instruction call outright, not merely a
+        // degraded tool.
+        const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =
+            [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+                   std::string_view action)
+                -> std::expected<yuzu::server::CommandCapability,
+                                 yuzu::server::detail::DispatchDenial> {
+                auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
+                    capability_registry_, caller, plugin, action,
+                    [this](std::string_view principal, std::string_view securable,
+                           yuzu::server::authz::Operation op) {
+                        return dispatch_has_permission(principal, securable, op);
+                    });
+                if (!decision)
+                    return decision;
+                const yuzu::server::detail::KillSwitchFn action_allowed =
+                    plugin_config_store_ != nullptr
+                        ? yuzu::server::detail::KillSwitchFn(
+                              [this](std::string_view p, std::string_view a) {
+                                  return plugin_config_store_->kill_switch_decision(p, a);
+                              })
+                        : yuzu::server::detail::KillSwitchFn{};
+                // The dry run has no target, so it cannot see the per-OS
+                // layer (only the all-OS denial); a per-OS withhold shows
+                // up at dispatch as kill_switched_os_count > 0.
+                if (auto os_set =
+                        yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
+                    !os_set) {
+                    return std::unexpected(os_set.error());
+                }
+                return decision;
+            };
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
         //
@@ -21002,6 +21233,7 @@ private:
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);
         };
+        wf_deps.emit_event_fn = emit_event_fn; // the v1 execute twin's workflow.executed
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
@@ -21031,6 +21263,17 @@ private:
         // ADR-0031 WS-A4 (eighth family): the SAME workflow_api instance
         // constructed above (shared with mcp_server_->set_workflow_api below).
         wf_deps.workflow_api = workflow_api;
+        wf_deps.workflow_run = workflow_run_fn; // same closure MCP execute_workflow gets
+        wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn; // and the same lookup
+        wf_deps.authorize_dispatch = authorize_dispatch; // the step-pair dry run (sec-4)
+        // The per-step credential liveness check of the v1 execute run: the SAME function MCP's
+        // held-open streams re-validate through (tri-state; an engine principal's Active check
+        // included), asked authoritatively: the API-token row and an engine principal are read
+        // from Postgres at each step boundary, never from the 60 s / 15 s caches.
+        wf_deps.revalidate = [this](const httplib::Request& req, const std::string& principal) {
+            return auth_routes_->revalidate_stream(req, principal,
+                                                   yuzu::server::auth::CredentialReadMode::kAuthoritative);
+        };
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
@@ -21061,6 +21304,10 @@ private:
         // subscribes per-connection.
         wf_deps.execution_event_bus = execution_event_bus_.get();
         wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
+        wf_deps.draining = [this] {
+            return draining_.load(std::memory_order_acquire) ||
+                   stop_requested_.load(std::memory_order_acquire);
+        };
         wf_deps.metrics = &metrics_;                  // #2500 targeting-refusal counter
         // BR-001 — the SAME capability_registry_ classifier /api/command, MCP
         // execute_instruction and the exec console consult, so a fourth
@@ -22103,70 +22350,6 @@ private:
                  .provider = dex_score_policy_provider_,
                  .audit = {}});
         }
-        // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
-        // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
-        // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
-        // surfaces cannot observe a different admit decision for the same caller
-        // (never bind a route-local copy). Each consumer holds its own COPY of this
-        // one lambda; the copies cannot diverge because it captures only `this` and
-        // everything it reads is live -- a stateful capture added here would break
-        // that, and tests/test_tier_policy_wiring_lexical.py pins "one definition,
-        // two uses". Formerly an inline lambda at the MCP wiring site; its
-        // rationale follows.
-        // Composes the SAME two DECISIONS build_classified_command
-        // makes, in the SAME order, and NEITHER is a re-implemented slice:
-        // the classify+authorize half calls classify_and_authorize_dispatch
-        // via the SAME has_permission binder (dispatch_has_permission
-        // above); the kill-switch half calls the SAME kill_switch_denial
-        // (agent_registry.hpp) finalize_classified_command itself calls —
-        // Gate 6 governance fix: an earlier round of this PR re-expressed
-        // that boolean inline instead of sharing code with
-        // finalize_classified_command, reintroducing the exact
-        // "from-scratch copy drifts from what production enforces" shape
-        // that function's own M6/wave1 extraction closed once already;
-        // this wiring now shares the extracted function instead.
-        // `action_allowed`'s construction (nullptr-guarded
-        // plugin_config_store_ wrap) is the SAME literal composition
-        // build_classified_command uses ahead of its own
-        // finalize_classified_command call, above. `plugin_config_store_`
-        // is read live through `this` (not captured by value), so this
-        // wiring is safe regardless of construction order relative to
-        // that store; an unset store means legacy-open for the
-        // kill-switch gate ONLY, mirroring build_classified_command's own
-        // unwired contract. Per McpServer::AuthorizeDispatchFn's
-        // fail-closed contract (mcp_server.hpp), omitting this whole call
-        // refuses every execute_instruction call outright, not merely a
-        // degraded tool.
-        const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =
-            [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
-                   std::string_view action)
-                -> std::expected<yuzu::server::CommandCapability,
-                                 yuzu::server::detail::DispatchDenial> {
-                auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
-                    capability_registry_, caller, plugin, action,
-                    [this](std::string_view principal, std::string_view securable,
-                           yuzu::server::authz::Operation op) {
-                        return dispatch_has_permission(principal, securable, op);
-                    });
-                if (!decision)
-                    return decision;
-                const yuzu::server::detail::KillSwitchFn action_allowed =
-                    plugin_config_store_ != nullptr
-                        ? yuzu::server::detail::KillSwitchFn(
-                              [this](std::string_view p, std::string_view a) {
-                                  return plugin_config_store_->kill_switch_decision(p, a);
-                              })
-                        : yuzu::server::detail::KillSwitchFn{};
-                // The dry run has no target, so it cannot see the per-OS
-                // layer (only the all-OS denial); a per-OS withhold shows
-                // up at dispatch as kill_switched_os_count > 0.
-                if (auto os_set =
-                        yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
-                    !os_set) {
-                    return std::unexpected(os_set.error());
-                }
-                return decision;
-            };
         // REST and MCP name this type separately; they must stay the SAME type, or the
         // copies handed to each could silently drift behind a std::function conversion.
         static_assert(std::is_same_v<RestApiV1::AuthorizeDispatchFn,
@@ -23036,6 +23219,21 @@ private:
             // unavailable", matching the pre-seam !workflow_engine guard
             // exactly.
             mcp_server_->set_workflow_api(workflow_api);
+            mcp_server_->set_workflow_concurrency_dispatch_fn(command_dispatch_concurrency_fn);
+            mcp_server_->set_workflow_run_fn(workflow_run_fn);
+            mcp_server_->set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_fn);
+            // execute_workflow's per-step credential check, authoritative (the stream pump's
+            // function passed to build_handler stays on the cached read).
+            mcp_server_->set_workflow_revalidate_fn(
+                [this](const httplib::Request& req,
+                       const std::string& principal) -> mcp::StreamRevalidate {
+                    return auth_routes_->revalidate_stream(req, principal,
+                                                           yuzu::server::auth::CredentialReadMode::kAuthoritative);
+                });
+            mcp_server_->set_draining_fn([this] {
+                return draining_.load(std::memory_order_acquire) ||
+                       stop_requested_.load(std::memory_order_acquire);
+            });
             // ADR-0031 WS-A4 (ninth family): the SAME Guardian-read API seam
             // instance the REST GET /api/v1/guaranteed-state/* handlers use
             // (constructed unconditionally above), so the 8 seamed MCP Guardian
@@ -23274,7 +23472,8 @@ private:
                 stream_budget_.get(),
                 [this](const httplib::Request& req,
                        const std::string& principal) -> mcp::StreamRevalidate {
-                    return auth_routes_->revalidate_stream(req, principal);
+                    return auth_routes_->revalidate_stream(req, principal,
+                                                           yuzu::server::auth::CredentialReadMode::kCached);
                 },
                 // The operator's --mcp-max-streams-per-principal. Passing it is what
                 // makes the flag mean anything: the attach site previously read the

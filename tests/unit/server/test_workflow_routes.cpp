@@ -42,6 +42,7 @@
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
 #include "workflow_engine.hpp"
+#include "workflow_model.hpp" // kStoredAgentIdsMax
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -53,12 +54,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
@@ -153,6 +157,8 @@ struct ExecHarness {
     /// Optional shared admission budget (ADR-0034). Default nullptr keeps every
     /// pre-existing test on the unmetered path; the admission tests pass one in.
     yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+    /// The server's draining state, read by the synchronous workflow-run routes (unset = never).
+    std::function<bool()> draining;
 
     fs::path instr_db, wf_db;
     std::unique_ptr<ExecutionTracker> tracker;
@@ -356,7 +362,9 @@ struct ExecHarness {
                          std::shared_ptr<WorkflowApi> workflow_api_override = {},
                          // #5562: the shared parameter_schema validator cache
                          // ServerImpl owns. Empty = register_routes builds its own.
-                         std::shared_ptr<instr::ParamValidatorCache> param_validators_override = {})
+                         std::shared_ptr<instr::ParamValidatorCache> param_validators_override = {},
+                         // The legacy execute route's run bound (unset = the production 60 s).
+                         std::optional<std::chrono::milliseconds> workflow_run_budget_arg = {})
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -584,6 +592,8 @@ struct ExecHarness {
         // nullptr but is still registered, which is the qe-S1 path.
         wf_deps.execution_event_bus = event_bus.get();
         wf_deps.stream_budget = stream_budget; // ADR-0034 admission (nullptr = unmetered)
+        wf_deps.draining = [this] { return draining && draining(); };
+        wf_deps.workflow_run_budget = workflow_run_budget_arg;
         wf_deps.metrics = &metrics;            // #2500 targeting-refusal counter
         wf_deps.capability_registry = &capability_registry; // BR-001 targeting gate
         wf_deps.param_validators = std::move(param_validators_override);
@@ -4840,6 +4850,121 @@ TEST_CASE("CDX-FV-03 — workflow execute threads the caller's exec_visible into
     CHECK(h.last_dispatch_exec_visible->count("agent-B") == 0);
 }
 
+TEST_CASE("POST /api/workflows/:id/execute: a list over the stored-id cap dispatches to every id "
+          "and stores a bounded copy that keeps the caller's own device (#2146 g8-sre-1)",
+          "[pg][workflow][executions][execute][scope][stored_ids]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WFCAP", "wfcap");
+    auto wf_id = h.make_workflow("wf-cap", "def-WFCAP");
+    h.dispatch_cmd_override = "cmd-wfcap";
+    h.dispatch_sent_override = 1;
+
+    const std::size_t count = yuzu::server::kStoredAgentIdsMax + 500;
+    const std::string mine = "agent-" + std::to_string(count - 1);
+    h.caller_fn = [mine](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{
+            .exec_visible =
+                yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{mine}}};
+    };
+    nlohmann::json body{{"agent_ids", nlohmann::json::array()}};
+    for (std::size_t i = 0; i < count; ++i)
+        body["agent_ids"].push_back("agent-" + std::to_string(i));
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", body.dump());
+    REQUIRE(res);
+    REQUIRE(res->status == 202);
+    const auto exec_id = nlohmann::json::parse(res->body)["execution_id"].get<std::string>();
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_agent_ids.size() == count); // the step reached the FULL list
+
+    pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult len{PQexec(conn.get(), "SELECT length(agent_ids_json) FROM "
+                                        "workflow_engine.workflow_executions")};
+    REQUIRE(len.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(len.get()) == 1);
+    CHECK(std::strtoll(PQgetvalue(len.get(), 0, 0), nullptr, 10) < 140000);
+
+    // The confined caller's own device was stored first, so the run is still readable to it.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{mine}};
+    auto got = h.sink.Get("/api/v1/workflow-executions/" + exec_id);
+    REQUIRE(got);
+    REQUIRE(got->status == 200);
+    const auto detail = nlohmann::json::parse(got->body)["data"];
+    CHECK(detail["agent_ids"] == nlohmann::json::array({mine}));
+    CHECK(detail["agent_ids_truncated"] == true);
+    CHECK_FALSE(detail.contains("agent_ids_total"));
+
+    // An unconfined reader sees the bounded list and the true count.
+    h.fleet_read_scope = std::nullopt;
+    auto open = h.sink.Get("/api/v1/workflow-executions/" + exec_id);
+    REQUIRE(open);
+    REQUIRE(open->status == 200);
+    const auto all = nlohmann::json::parse(open->body)["data"];
+    CHECK(all["agent_ids"].size() == yuzu::server::kStoredAgentIdsMax);
+    CHECK(all["agent_ids_total"] == static_cast<std::int64_t>(count));
+
+    // The legacy detail route applies the same disclosure bound: a confined reader is told the
+    // list was cut but not how many devices the run named beyond its scope.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{mine}};
+    auto legacy = h.sink.Get("/api/workflow-executions/" + exec_id);
+    REQUIRE(legacy);
+    REQUIRE(legacy->status == 200);
+    const auto legacy_detail = nlohmann::json::parse(legacy->body);
+    CHECK(legacy_detail["agent_ids"] == nlohmann::json::array({mine}));
+    CHECK(legacy_detail["agent_ids_truncated"] == true);
+    CHECK_FALSE(legacy_detail.contains("agent_ids_total"));
+    h.fleet_read_scope = std::nullopt;
+    auto legacy_open = h.sink.Get("/api/workflow-executions/" + exec_id);
+    REQUIRE(legacy_open);
+    REQUIRE(legacy_open->status == 200);
+    CHECK(nlohmann::json::parse(legacy_open->body)["agent_ids_total"] ==
+          static_cast<std::int64_t>(count));
+}
+
+TEST_CASE("POST /api/workflows/:id/execute: ids of several KB each dispatch in full and the stored "
+          "column stays under the byte budget (#2146)",
+          "[pg][workflow][executions][execute][stored_ids]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WFKB", "wfkb");
+    auto wf_id = h.make_workflow("wf-kb", "def-WFKB");
+    h.dispatch_cmd_override = "cmd-wfkb";
+    h.dispatch_sent_override = 1;
+
+    nlohmann::json body{{"agent_ids", nlohmann::json::array({"agent-mine"})}};
+    for (std::size_t i = 0; i < 1000; ++i)
+        body["agent_ids"].push_back(std::string(3000, 'w') + std::to_string(i));
+    SECTION("over-long ids") {
+        auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", body.dump());
+        REQUIRE(res);
+        REQUIRE(res->status == 202);
+        CHECK(h.last_dispatch_agent_ids.size() == 1001); // the step reached every id as sent
+    }
+    SECTION("ids at the longest an agent can have") {
+        body["agent_ids"] = nlohmann::json::array({"agent-mine"});
+        for (std::size_t i = 0; i < 1000; ++i)
+            body["agent_ids"].push_back(std::string(250, 'w') + std::to_string(100 + i));
+        auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", body.dump());
+        REQUIRE(res);
+        REQUIRE(res->status == 202);
+        CHECK(h.last_dispatch_agent_ids.size() == 1001);
+    }
+
+    pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult len{PQexec(conn.get(), "SELECT octet_length(agent_ids_json) FROM "
+                                        "workflow_engine.workflow_executions")};
+    REQUIRE(len.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(len.get()) == 1);
+    CHECK(std::strtoll(PQgetvalue(len.get(), 0, 0), nullptr, 10) < 140000);
+}
+
 TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible derivation is unwired",
           "[pg][workflow][executions][execute][scope][security]") {
     // Genuinely UNWIRED CallerFn. ADR-0033 §1: the handler must hand step
@@ -4860,6 +4985,276 @@ TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible der
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
     CHECK(h.last_dispatch_exec_visible->empty());      // EMPTY → production sink reaches no one
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Legacy POST /api/workflows/:id/execute: the held-open lease (#2146 op-3)
+//
+// The legacy handler holds a worker for the whole synchronous run, so it takes the SAME
+// kWorkflowRun lease through the SAME admit_workflow_run() as POST /api/v1/workflows/{id}/execute
+// and MCP execute_workflow. Without it, a twin's 429 is escaped by walking to this route.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+yuzu::server::DispatchCaller legacy_run_caller(const std::string& principal) {
+    return yuzu::server::DispatchCaller{.principal = principal,
+                                        .exec_visible = yuzu::server::authz::VisibleSet{}};
+}
+double legacy_run_refused(ExecHarness& h, const std::string& reason) {
+    return h.metrics
+        .counter("yuzu_server_workflow_run_refused_total", {{"reason", reason}})
+        .value();
+}
+constexpr const char* kLegacyBody = R"({"agent_ids":["agent-A"]})";
+} // namespace
+
+TEST_CASE("legacy workflow execute: the per-principal run cap answers 429 with Retry-After before "
+          "anything is read or sent; another principal is unaffected; a slot freed is reusable",
+          "[pg][workflow][executions][execute][cap][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 16}};
+    ExecHarness h(pool, /*with_bus=*/true, &budget, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-LC1", "lc1");
+    auto wf_id = h.make_workflow("wf-lc1", "def-LC1");
+    h.dispatch_cmd_override = "cmd-lc1";
+    h.dispatch_sent_override = 1;
+    h.caller_fn = [](const httplib::Request& req) {
+        return legacy_run_caller(req.get_header_value("X-Test-User"));
+    };
+
+    // alice already has the two runs a principal may hold (e.g. a v1 run and an MCP run).
+    const std::function<bool()> never = [] { return false; };
+    auto held1 = admit_workflow_run(&budget, never, "alice", &h.metrics);
+    auto held2 = admit_workflow_run(&budget, never, "alice", &h.metrics);
+    REQUIRE(held1.lease);
+    REQUIRE(held2.lease);
+
+    h.sink.default_headers["X-Test-User"] = "alice";
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 429);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK(body["error"]["message"].get<std::string>().find("workflow runs") != std::string::npos);
+    CHECK_FALSE(body["error"]["remediation"].get<std::string>().empty());
+    // Nothing sent, no audit row (the counter is the record), no execution row.
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.audit_calls.empty());
+    auto rows = h.workflows->list_executions(wf_id, 10);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+    CHECK(legacy_run_refused(h, "per_principal_stream_cap") == 1.0);
+    CHECK(legacy_run_refused(h, "global_stream_cap") == 0.0);
+    CHECK(budget.active_for_surface(yuzu::server::detail::SseSurface::kWorkflowRun) == 2);
+
+    // A different principal is unaffected.
+    h.sink.default_headers["X-Test-User"] = "bob";
+    auto other = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(other);
+    CHECK(other->status == 202);
+    CHECK(h.dispatch_calls == 1);
+
+    // One of alice's slots frees: her next legacy run is admitted.
+    held1.lease.release();
+    h.sink.default_headers["X-Test-User"] = "alice";
+    auto again = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(again);
+    CHECK(again->status == 202);
+    CHECK(h.dispatch_calls == 2);
+}
+
+TEST_CASE("legacy workflow execute: the global held-open cap answers 429, a draining server 503, "
+          "both with nothing sent and the one shared refusal counter",
+          "[pg][workflow][executions][execute][cap][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 1}};
+    ExecHarness h(pool, /*with_bus=*/true, &budget, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-LC2", "lc2");
+    auto wf_id = h.make_workflow("wf-lc2", "def-LC2");
+    h.dispatch_cmd_override = "cmd-lc2";
+    h.dispatch_sent_override = 1;
+    h.caller_fn = [](const httplib::Request&) { return legacy_run_caller("alice"); };
+
+    // One held-open response of ANY surface fills the global cap.
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kDashboardExec, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalDashboard);
+    REQUIRE(held.lease);
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"] == 5000);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.audit_calls.empty());
+    CHECK(legacy_run_refused(h, "global_stream_cap") == 1.0);
+
+    // Draining wins over a budget with room, and takes no lease.
+    held.lease.release();
+    h.draining = [] { return true; };
+    auto drain = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(drain);
+    CHECK(drain->status == 503);
+    CHECK(drain->get_header_value("Retry-After") == "5");
+    CHECK(nlohmann::json::parse(drain->body)["error"]["retry_after_ms"] == 5000);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.audit_calls.empty());
+    CHECK(legacy_run_refused(h, "draining") == 1.0);
+    CHECK(budget.active() == 0);
+
+    // Not draining and room again: the run goes ahead.
+    h.draining = [] { return false; };
+    auto ok = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(ok);
+    CHECK(ok->status == 202);
+    CHECK(h.dispatch_calls == 1);
+}
+
+TEST_CASE("legacy workflow execute: the lease is held for exactly the run and released on success, "
+          "on a refusal after admission and on a throw",
+          "[pg][workflow][executions][execute][cap][security]") {
+    using yuzu::server::detail::SseSurface;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 16}};
+    ExecHarness h(pool, /*with_bus=*/true, &budget, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-LC3", "lc3");
+    auto wf_id = h.make_workflow("wf-lc3", "def-LC3");
+    h.dispatch_cmd_override = "cmd-lc3";
+    h.dispatch_sent_override = 1;
+    h.caller_fn = [](const httplib::Request&) { return legacy_run_caller("alice"); };
+
+    std::size_t during = 99;
+    h.dispatch_side_effect = [&] { during = budget.active_for_surface(SseSurface::kWorkflowRun); };
+
+    SECTION("success") {
+        auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(during == 1);
+    }
+    SECTION("a refusal after admission (unknown workflow)") {
+        auto res = h.sink.Post("/api/workflows/no-such-workflow/execute", kLegacyBody);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.dispatch_calls == 0);
+    }
+    SECTION("a throw out of a step") {
+        h.dispatch_side_effect = [&] {
+            during = budget.active_for_surface(SseSurface::kWorkflowRun);
+            throw std::runtime_error("dispatch blew up");
+        };
+        CHECK_THROWS_AS(h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody),
+                        std::runtime_error);
+        CHECK(during == 1);
+    }
+    CHECK(budget.active_for_surface(SseSurface::kWorkflowRun) == 0);
+    CHECK(budget.active() == 0);
+}
+
+TEST_CASE("legacy workflow execute shares the per-principal run budget with the v1 twin: a held "
+          "slot on either route refuses the other (the bypass test)",
+          "[pg][workflow][executions][execute][cap][security]") {
+    using yuzu::server::detail::SseSurface;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 16}};
+    ExecHarness h(pool, /*with_bus=*/true, &budget, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-LC4", "lc4");
+    auto wf_id = h.make_workflow("wf-lc4", "def-LC4");
+    h.dispatch_cmd_override = "cmd-lc4";
+    h.dispatch_sent_override = 1;
+    h.caller_fn = [](const httplib::Request&) { return legacy_run_caller("alice"); };
+
+    // A v1/MCP run of alice's is in flight: it holds one of her two slots.
+    const std::function<bool()> never = [] { return false; };
+    auto twin_run = admit_workflow_run(&budget, never, "alice", &h.metrics);
+    REQUIRE(twin_run.lease);
+
+    // The legacy run takes the second slot; while it runs, the v1 twin AND a nested legacy
+    // request of the same principal are both refused on the per-principal cap.
+    int twin_status = 0;
+    int legacy_status = 0;
+    bool probed = false; // once: a nested run that WAS admitted must not recurse into this hook
+    h.dispatch_side_effect = [&] {
+        if (std::exchange(probed, true))
+            return;
+        auto v1 = h.sink.Post("/api/v1/workflows/" + wf_id + "/execute", kLegacyBody);
+        twin_status = v1 ? v1->status : -1;
+        auto nested = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+        legacy_status = nested ? nested->status : -1;
+    };
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(twin_status == 429);
+    CHECK(legacy_status == 429);
+    CHECK(legacy_run_refused(h, "per_principal_stream_cap") == 2.0);
+    CHECK(h.dispatch_calls == 1); // only the outer legacy run sent anything
+    CHECK(budget.active_for_surface(SseSurface::kWorkflowRun) == 1); // the twin's slot is untouched
+
+    // With the legacy run over, the twin is no longer refused for capacity.
+    h.dispatch_side_effect = nullptr;
+    auto v1 = h.sink.Post("/api/v1/workflows/" + wf_id + "/execute", kLegacyBody);
+    REQUIRE(v1);
+    CHECK(v1->status != 429);
+}
+
+TEST_CASE("legacy workflow execute: a run past its bound stops dispatching, the execution closes "
+          "failed and the audit row says why; the success path and 202 body are unchanged",
+          "[pg][workflow][executions][execute][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    SECTION("an exhausted bound: no step is sent, the row is failed") {
+        ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                      /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                      /*with_product_pack_store=*/false, /*auth_override=*/{},
+                      /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                      /*schedule_api_override=*/{}, /*workflow_api_override=*/{},
+                      /*param_validators_override=*/{}, std::chrono::milliseconds{0});
+        h.make_def("def-LC5", "lc5");
+        auto wf_id = h.make_workflow("wf-lc5", "def-LC5");
+        h.dispatch_cmd_override = "cmd-lc5";
+        h.dispatch_sent_override = 1;
+        auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+        REQUIRE(res);
+        CHECK(res->status == 202); // the legacy answer shape is unchanged
+        CHECK(h.dispatch_calls == 0);
+        const auto exec_id = nlohmann::json::parse(res->body)["execution_id"].get<std::string>();
+        auto exec = h.workflows->get_execution(exec_id);
+        REQUIRE(exec.has_value());
+        REQUIRE(exec->has_value());
+        CHECK((*exec)->status == "failed");
+        REQUIRE_FALSE(h.audit_calls.empty());
+        CHECK(h.audit_calls.back().action == "workflow.execute");
+        CHECK(h.audit_calls.back().detail.find("deadline_exceeded") != std::string::npos);
+    }
+    SECTION("the production bound leaves a normal run alone") {
+        ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                      /*with_workflow_engine=*/true);
+        h.make_def("def-LC6", "lc6");
+        auto wf_id = h.make_workflow("wf-lc6", "def-LC6");
+        h.dispatch_cmd_override = "cmd-lc6";
+        h.dispatch_sent_override = 1;
+        auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", kLegacyBody);
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(h.dispatch_calls == 1);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["status"] == "running");
+        const auto exec_id = body["execution_id"].get<std::string>();
+        REQUIRE_FALSE(h.audit_calls.empty());
+        CHECK(h.audit_calls.back().result == "success");
+        CHECK(h.audit_calls.back().detail == "execution_id=" + exec_id);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

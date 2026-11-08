@@ -6735,24 +6735,54 @@ pre-migration `{"deleted": false}`.
 
 #### `POST /api/workflows/{id}/execute`
 
-Execute a workflow against targeted agents. Fails (workflow-not-found, `400`) if the workflow
-does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064).
+Execute a workflow against named agents. Fails (workflow-not-found, `400`) if the workflow
+does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064). The
+versioned twin with a fail-closed precheck and a pre-dispatch audit row is
+[`POST /api/v1/workflows/{id}/execute`](#post-apiv1workflowsidexecute); prefer it.
+
+**Permission:** `Workflow:Execute`. A supervised-tier MCP token is refused (`403`, use the MCP
+ticket flow); this route never accepted an operator-tier one.
 
 **Request body:**
 
 ```json
 {
-  "scope": "os = 'windows' AND tag:environment = 'production'",
-  "parameters": {}
+  "agent_ids": ["agent-1", "agent-2"]
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `scope` | string | Yes | Scope expression selecting target agents |
-| `parameters` | object | No | Override parameters for workflow steps |
+| `agent_ids` | array of strings | Yes | The agents to run the workflow against (`400` if missing or empty). There is no `scope` field. |
 
-**Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). No MCP tool maps to `Workflow:Execute` yet, so such a token has no ticket path to run a workflow until the `execute_workflow` tool ships; use a session or a non-MCP API token. Treat that as temporary and do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
+The per-step approval check (a step whose instruction is not `auto` is refused with `403`) and the
+unknown-instruction `400` run only when the approval manager and the instruction store are both
+wired and open; if either is not, this legacy route skips them and goes on to dispatch. The v1 twin
+refuses with `503` instead. The route replies `202` after the steps have been dispatched.
+A step refused at send time by the targeting gate is recorded failed at once, with no retry and no
+retry sleep. If a step throws, the engine closes the execution `failed`, marks its remaining steps
+`skipped`, and the request fails with the server's generic `500` (an empty body). The close is one
+write, tried once more with a longer lease when the first fails; if both fail the row stays
+`running` (counted on `yuzu_server_workflow_finalize_failed_total`; see "A workflow run left
+`running`" in [server-admin.md](server-admin.md#a-workflow-run-left-running)).
+
+**Admission and run bound (#2146).** This route holds one HTTP worker for the whole run, so it
+takes the same held-open slot as [`POST /api/v1/workflows/{id}/execute`](#post-apiv1workflowsidexecute)
+and MCP `execute_workflow`, through the same admission step and keyed by the same principal: a
+slot held by a run on any of the three counts against all of them. It is taken after the
+permission check and the body check and before the workflow or any instruction is read. A
+principal that already has 2 runs in progress, or a full server-wide held-open budget, is refused
+`429`, and a draining server `503`, each with `Retry-After: 5`, `retry_after_ms: 5000` in the
+error body, no workflow or instruction read and nothing sent or audited (the refusal is counted on
+`yuzu_server_workflow_run_refused_total{reason}`). The slot is released when the response is
+written, whatever the outcome. The run is bounded to 60 seconds from the moment the request is
+taken: no dispatch attempt starts after that, a retry delay is cut to the time left, the remaining
+steps are skipped and the execution is closed `failed`. The answer is unchanged (`202`, `status: running`), so a stopped run reads as a started one; the `workflow.execute` audit detail gains ` (run stopped: deadline_exceeded)`, so
+read the run with `GET /api/workflow-executions/{id}`. Unlike the v1 twin, this route does not
+refuse up front a workflow whose retry sleeps could exceed 60 seconds, and does not re-check the
+caller's credential between steps.
+
+**Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). Such a token runs a workflow through the MCP tool `execute_workflow`, which takes an approval ticket (`-32006` with an `approval_id`, approval, recall), or from a session or a non-MCP API token. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
 
 #### `GET /api/workflow-executions/{id}`
 
@@ -6825,6 +6855,279 @@ you've already narrowed them.
 twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
 soft-deleted id.
 
+#### `POST /api/v1/workflows/{id}/execute`
+
+**Permission:** `Workflow:Execute` (global). Run a workflow against named agents. The v1 twin of
+`POST /api/workflows/{id}/execute`, MCP twin `execute_workflow` (#2146); both run one shared
+sequence, so they cannot disagree about what a run may do. A service-scoped token and an
+operator-tier MCP token are refused; a supervised-tier MCP token is refused with `403` here and
+must use `execute_workflow`'s ticket flow (`docs/user-manual/mcp.md`).
+
+**Headers:** `Idempotency-Key` (optional on REST, required on the MCP twin): send one on every call
+whose answer you could lose, see **Idempotency** below.
+
+**Request body:** `{"agent_ids": ["agent-1", "agent-2"]}`. `agent_ids` is required: 1 to 10000 ids
+of at most 128 bytes each. `scope` is not accepted (`400`, `reason: scope_unsupported`); there is no
+fleet-wide default. A body nested deeper than 32 levels is `400`.
+
+**Authority is all-or-nothing; reach is per step.** Before anything is sent, every step of the
+workflow is checked against the CALLER, and one refused step refuses the whole run with nothing
+sent. For every step: its instruction must exist (`400 unknown_instruction`); the caller must be
+allowed to dispatch its `plugin.action` (RBAC on the action's securable, the action's
+admin-or-approval gate judged against the caller's real administrator status, and the action's kill
+switch), else `403 dispatch_denied` naming the step, which is permanent for that caller (`retry_after_ms:
+null`, retrying cannot help; the chokepoint's own reason is in the audit row and in
+`yuzu_server_dispatch_denied_total{reason}`); and its approval mode must admit the caller (`auto`
+always; `role-gated` only for an administrator, JIT elevation included; `always` or an unknown mode
+never, `403 approval_required` naming the step). A step whose `plugin.action` is not in the
+capability catalogue is refused (`400 step_unclassified`). A Destructive or Forensics step needs
+`agent_ids` with at least one agent visible to the caller (`404 destructive_no_visible_target`
+otherwise); a Forensics step needs exactly one id (`400 forensic_untargeted`), and the permission
+check comes first (`403` before `400`). This does NOT promise that every step will reach a device:
+which devices a step reaches (visibility, containment, plugin presence, the per-OS kill switch,
+concurrency claims) is decided per step at send time, so an earlier step may already have been sent
+when a later one reaches nobody (see the `503` below). Unlike the legacy route, if the instruction
+store, the approval gate, the dispatcher or the authorizer is not available the answer is `503` and
+nothing is sent.
+
+| Status | `error.reason` | Meaning |
+|---|---|---|
+| `400` | `body_type`, `agent_ids_required`, `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `agent_id_len`, `agent_ids_count`, `scope_unsupported` | The body failed the targeting shape check. A `denied` audit row is written. |
+| `400` | `body_depth`, `invalid_json` | The body nests too deeply or is not JSON. A `denied` audit row is written. |
+| `400` | `invalid_workflow_id` | The workflow id in the path is empty, longer than 128 bytes, holds a control byte (below `0x20` or `0x7F`, NUL included) or is not valid UTF-8 (for example a percent-encoded `%00` or `%FF`). Never retryable: it can never succeed as sent. Checked first, before the key, the body, admission or any read, so nothing is leased, read or sent; the message does not echo the id. One `denied` audit row is written, carrying the id cut to 128 bytes and neutralised. |
+| `400` | `idempotency_key_invalid` | The `Idempotency-Key` header is not 8 to 128 characters from `A-Z a-z 0-9 . _ : -`, or was sent more than once. Checked before anything is read or leased. A `denied` audit row is written. |
+| `400` | `workflow_no_steps` | The workflow exists but has no steps. |
+| `400` | `unknown_instruction` | A step names an instruction that does not exist. |
+| `400` | `step_unclassified` | A step's `plugin.action` is not in the capability catalogue. |
+| `400` | `destructive_untargeted`, `forensic_untargeted` | A Destructive or Forensics step is not explicitly targeted. |
+| `400` | `workflow_exceeds_sync_budget` | The sum over the workflow's steps of `retryCount` x `retryDelay` exceeds the 60 second run budget (see **Run budget** below). Nothing was done and no row is written; the workflow cannot be run until it is replaced by one with fewer retries or shorter delays. |
+| `400` | `rejected` | The engine refused the run after the preflight; `error.message` carries its reason, and a closing `failure` audit row is written. |
+| `403` | `approval_required` | A step's approval mode does not admit the caller. |
+| `403` | `dispatch_denied` | The caller may not dispatch a step's `plugin.action`. Not retryable. |
+| `404` | `workflow_not_found` | Unknown or soft-deleted workflow. |
+| `404` | `destructive_no_visible_target` | A Destructive or Forensics step whose named agents are all outside the caller's view. |
+| `422` | `idempotency_key_conflict` | The `Idempotency-Key` is already bound to a DIFFERENT request (another workflow, or another set of agent ids). Terminal: nothing was sent, `error.execution_id` names the run the key is bound to. Use a new key for a different request. |
+| `429` | `per_principal_stream_cap`, `global_stream_cap` | Admission: the caller already has 2 workflow runs in progress (counted per principal and per server process), or the server's shared held-open budget (`--max-sse-streams`) is full. `Retry-After: 5` and `retry_after_ms: 5000`. No workflow or instruction was read, nothing was sent or audited; a call that carries an `Idempotency-Key` has had the key looked up first (a read), and a repeat of a key already bound to a run is answered with the replay instead of this refusal. Retrying is safe. |
+| `500` | `no_principal`, `idempotency_requires_principal` | The session has no principal (the second reason: a call that carries a key). Nothing was sent. |
+| `500` | `request_fingerprint_unavailable` | A keyed call whose request fingerprint (a SHA-256) could not be computed. Audited (`failure`); nothing was sent. |
+| `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
+| `503` | `draining` | Admission: the server is shutting down and starts no new run. `Retry-After: 5` and `retry_after_ms: 5000`; no workflow or instruction was read and nothing was sent or audited (a keyed call has had its key looked up). Retry against another replica or after the restart. |
+| `503` | `audit_unavailable` | The server has no audit sink wired (a configuration defect, `retry_after_ms: null`, `Sec-Audit-Failed: true`), or the `requested` row could not be saved. Nothing was read, leased, run or sent. |
+| `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
+| `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). A failed idempotency lookup is this too: it is never treated as "no run is bound to the key", so nothing is written and nothing is sent. |
+| `503` | `internal_error` | The idempotency pre-check or the preflight (before the `requested` row) THREW an exception (`retry_after_ms: 5000`, message `workflow execution failed`; the detail is in the server log). Nothing was sent and no run was started, so retrying is safe, with the same key if one was sent: the key is not bound before the claim. |
+| `503` | a zero-reach cause | The run started and no step reached any agent (below). |
+
+**Events.** As the legacy `POST /api/workflows/{id}/execute` does, a call whose run the engine admitted publishes the platform event `workflow.executed` once, after the closing audit row and whatever the run's outcome (`completed`, `partial`, `aborted`, `interrupted`, or a run that reached no agent), with no attributes or payload (see [analytics-events.md](../analytics-events.md)). A refusal, an idempotent replay (a repeat of a key, or a call that lost the engine's claim), an engine refusal and a run that threw publish nothing, and a failed publish never changes the answer; it is counted on `yuzu_server_event_emit_failed_total{event_type="workflow.executed"}` when the hook itself throws.
+
+**Audit.** Every `workflow.execute` row of a call starts `surface=rest correlation_id=<id>`, the value of the response's `X-Correlation-Id` header and of the error body's `correlation_id`; the run's own row stores the same `correlation_id` and the caller's `principal`, keyed or not, so a `requested` row (written before any execution id exists) and an orphaned run join by it. A keyed call carries `idempotency_key=<key>` in its `requested` and closing rows. A refusal before the sequence runs (`invalid_workflow_id`, `idempotency_key_invalid`, `body_depth`, `invalid_json`, the body-shape reasons above) writes ONE `denied` row (`reason=<reason> workflow=<id cut to 128 bytes and neutralised>`; `target_id` is the same cleaned id, never the raw malformed one) and nothing else; a lost row adds `Sec-Audit-Failed: true` and the `400` stands. A server with no audit sink wired answers every call `503` `audit_unavailable` with `Sec-Audit-Failed: true` and `retry_after_ms: null` (a configuration defect) right after the permission check, before anything is read, leased or sent. A terminal
+replay (every status but `running`) writes one `success` row (`idempotent_replay=true
+run_status=<the replay's status>`, the first-answer class in the table below, not the engine's
+word); a `running` replay writes none (counted on
+`yuzu_server_workflow_run_idempotent_total{outcome="in_progress"}`); a conflict is `denied`
+(`reason=idempotency_key_conflict`) and a lost claim race closes its `requested` row `denied`
+(`reason=idempotent_duplicate`). A `workflow.execute` row with `result=requested` is written before anything is sent; if
+it cannot be saved the answer is `503` with `Sec-Audit-Failed: true` and nothing was sent. A step
+refused at send time because its definition changed after the preflight is audited as `denied` at
+that moment (detail ends `(late)`). A closing row records the outcome: `success` ONLY for a run
+whose `data.status` is `completed`, otherwise `failure` with `run_outcome=failed|partial|aborted|interrupted`
+in the detail (the same tokens as the `partial`/`aborted`/`interrupted` status, and `failed` for the `503` where
+nothing reached; `interrupted` is a run stopped by a server shutdown, with `reason=server_shutdown`; `aborted` also covers a run the credential check stopped, with `reason=credential_revoked` or `reason=credential_indeterminate`); if that one is lost the `202` carries `data.audit_persisted: false` and
+`Sec-Audit-Failed: true`. A refusal by the per-step checks (`approval_required`, `dispatch_denied`,
+`step_unclassified`, the targeting refusals) is audited as `denied` with the `reason`, and writes no
+`requested` row. A wiring failure, an unknown or empty workflow, an unknown instruction and a store
+read failure write no `workflow.execute` row at all. Audit details are neutralised (CWE-117); the
+full row list is in [audit-log.md](audit-log.md).
+
+**Idempotency.** A caller whose answer is lost (a timeout, a dropped connection, a proxy) cannot
+tell "never started" from "started", and a blind re-send dispatches every step twice. Send an
+`Idempotency-Key` header: a fresh unique string per intended run, 8 to 128 characters from
+`A-Z a-z 0-9 . _ : -`, sent exactly once. The key belongs to the calling principal (another principal's
+identical key is a different key) and stays bound to its run for the life of the run record; nothing
+prunes it. The run record also keeps your account name, the call's correlation id and the agent ids it named (distinct ids, capped at 1,000 and at 131,072 bytes, then a count and digest marker), so
+what is stored about whom is listed under "Workflow run records are not pruned" in
+[server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146). A repeat of the SAME key with the SAME request (the workflow id and the SET of agent ids:
+order and repeats do not matter; the stored step definitions are not part of it, so an instruction
+edited since does not turn a retry into a conflict) sends nothing and answers `202` with the thin body
+of the run the key is bound to. The replay says the class the FIRST answer said: it is judged from
+the run's stored step results (each step's final outcome), not from the engine's own run status,
+because the engine closes a run `completed` when an `onFailure: continue` step reached nobody. The
+two outcomes cannot disagree: the same rule classifies both.
+
+| `data.status` | Meaning | Extra fields |
+|---|---|---|
+| `completed` | The run succeeded: the engine recorded it completed, no step was refused at send time, and every step's final attempt reached an agent. The ONLY status that means success. | none |
+| `partial` | Something was sent but the run did not succeed: some step's final attempt reached nobody (an `onFailure: continue` step), or the engine did not complete after a send. Final. | `retryable: false`, `remediation` |
+| `failed` | No step is recorded as sent, or the run threw. A step the store did not record may still have been sent (the write that stores a step's command id can be dropped, and a thrown dispatch can follow a partial send), so read the run before deciding. Final: the key stays bound; a deliberate re-run needs a NEW key. | `retryable: false`, `remediation` |
+| `aborted` | A step was refused at send time (its definition changed after approval or the preflight, or its approval mode was raised), or the run was stopped by its 60 second deadline or by the credential check. A step after a refused `onFailure: continue` step may still have run; after a deadline or credential stop the rest did not. The replay does not say which of the stop causes (`data.reason` is absent). Final. | `retryable: false`, `remediation` |
+| `interrupted` | The stopping server ended the run. Final. | `retryable: false`, `remediation` |
+| `running` | The run is still in progress. **Poll `GET /api/v1/workflow-executions/{id}`; never re-send.** | `retry_after_ms: 2000`, `Retry-After: 2` |
+| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running. A run read on a replica whose clock is far ahead can still be live: if it may be, wait for it before re-running. Treat a `running` answer older than 180 seconds the same way. | `retryable: false`, `remediation` |
+
+What the stored rows can and cannot say: a run the engine recorded `failed` or `cancelled` whose rows cannot be read back replays `failed`. A step-result write the engine dropped under a database brownout costs precision (a run may replay `partial` or `failed` where the first answer said `interrupted` or `aborted`), and a step whose write was dropped is recorded `pending` or `running` although it may have been sent, so a `failed` replay does not prove nothing was sent: every replay but `completed` and `running` carries a `remediation` that says so. The replay is never `completed` for a run it cannot prove succeeded. A `foreach` step is judged by its last attempt (every item of that attempt must have reached an agent); the engine sends one item today.
+
+Every replay body also carries `execution_id`, `workflow_id`, `idempotent_replay: true`, `started_at`
+(epoch seconds) and a `message`; every status but `completed` and `running` adds `retryable: false` and a
+`remediation` (read the run, a step recorded `pending` or `skipped` may still have been sent, a deliberate
+re-run needs a NEW key). It has NO `steps` and no `late_denied`: the engine does not keep a
+per-step answer, so the original response cannot be rebuilt; read the run instead. A replay is a
+short read, so it is answered while the server is draining and when the run cap is full, takes no
+slot and writes no `requested` row. A call that raced the original (it passed the lookup before the
+original claimed the key) loses the claim inside the database, closes its own `requested` row
+`denied` (`reason=idempotent_duplicate`) and is answered the same way. A call WITHOUT a key is
+unchanged, and must never be re-sent to retry.
+
+**Run budget (60 seconds) and admission.** A run is synchronous, so it holds one of the server's
+HTTP worker threads for its whole length. Three things bound that. (1) *Admission:* before the
+workflow is read or any row is written (a keyed call's key is looked up first), the run takes a slot from the same held-open budget the streaming
+endpoints share (`--max-sse-streams`; `yuzu_http_held_open_responses`), at most 2 per principal. A
+principal at its limit, a full server budget and a draining server are refused up front (`429`
+`per_principal_stream_cap` / `global_stream_cap`, `503` `draining`) with `Retry-After: 5`; the
+refusal is counted on `yuzu_server_workflow_run_refused_total{reason}` and writes no audit row.
+The slot is held until the response is written, whatever the outcome. (2) *Precheck:* a workflow
+whose worst-case retry sleep, the sum over its steps of `retryCount` x `retryDelay`, exceeds 60
+seconds is refused `400 workflow_exceeds_sync_budget` (exactly 60 is accepted). This models sleeps
+only; dispatch time and `foreach` fan-out are not modelled, so it is a prefilter. (3) *Deadline:*
+the run has 60 seconds from the moment the request is taken. No send attempt starts after the
+deadline, and a retry delay is cut to the time left. At the deadline the engine stops the run: the
+step in progress is recorded `failed`, the remaining steps are `skipped` (`run stopped`, the step's
+`on_failure` policy does not apply), the execution is closed `failed`, and the answer is the typed
+`202` below with `data.status: "aborted"`, `data.reason: "deadline_exceeded"` and `retryable:
+false` (or, if no step reached any agent, the `503` `deadline_exceeded`, also not retryable). A send
+already in flight is not interrupted. The closing audit row is `failure` with
+`run_outcome=aborted reason=deadline_exceeded`.
+
+**Limits are per server process.** The 2-runs-per-principal cap, the held-open budget behind it and
+the gauge `yuzu_server_workflow_runs_in_flight` are all counted inside one server process. With N
+replicas a principal can have up to 2N runs in progress, and each replica's `429` says nothing about
+the others; to see the fleet-wide number, sum the gauge across replicas
+(`sum(yuzu_server_workflow_runs_in_flight)`). A repeat of an `Idempotency-Key` is the exception: it
+is looked up in the shared database, so any replica answers it.
+
+**Shutdown.** A server that is *draining* (it has been told to stop and is holding its listener open
+for in-flight work) lets a run in flight finish its dispatching: a retry the run had not yet made is
+abandoned at once (the pending retry counts as exhausted and no delay is slept; the wait is checked
+every 250 ms, so a run asleep in a retry delay wakes within a quarter of a second), the step then
+fails under its own `on_failure` policy, and the run goes on with its remaining steps. The shutdown
+waits for these runs, counted inside the server process (never from the table, so a run left
+`running` by a crash or owned by another replica does not hold it), up to the same 30 second cap it
+applies to tracked executions. A server that is *stopping* ends the run: nothing more is sent, the
+steps not yet started are `skipped` with reason `server_shutdown`, the execution is closed `failed`
+(it is not marked `cancelled`), and the answer is the typed `202` below with `data.status:
+"interrupted"`, `data.reason: "server_shutdown"` and `retryable: false`, even when nothing had been
+sent. Steps already sent are not recalled. The closing audit row is `failure` with
+`run_outcome=interrupted reason=server_shutdown`. Read the run with `GET
+/api/v1/workflow-executions/{id}`: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running.
+
+**Credential check before every step.** A run asks, before each step's first send and again on
+waking from each retry delay (once per wake, not once per 250 ms wait slice), whether the credential
+that made the call is still live: the same re-validation that cuts a held-open MCP stream, applied to
+this request's own cookie, `Authorization: Bearer` or `X-Yuzu-Token` and to the session's principal
+(for an engine principal, whether the principal is still `Active`). A live credential continues,
+whatever the answer's source. A revoked, expired or rebound
+credential stops the run before the next send. An answer that cannot be given (the auth store did
+not respond) is asked once more after at most one second, never past the run's deadline, and a
+second non-answer stops the run too: fail closed. A `foreach` step is asked once per item, since
+each item is a send. A stopped run is the typed `202` below with `data.status: "aborted"`,
+`data.reason: "credential_revoked"` (or `"credential_indeterminate"`) and `retryable: false`, even
+when nothing had been sent; the steps not yet started are `skipped` (`run stopped`, as for a
+deadline stop), the execution is closed `failed`, steps already sent are not recalled, and the
+closing audit row is `failure` with `run_outcome=aborted reason=credential_revoked` (or
+`credential_indeterminate`). **What this does not do:** it re-checks that the credential is live; it
+does not rebuild the caller. A role grant removed during the run is caught per step, because the
+shared dispatch chokepoint judges each send against the live RBAC store. An administrator
+elevation that expires during the run, and a device-group narrowing, are not re-read: the caller's
+elevation flag and visible device set are those taken when the call was accepted, so they are
+bounded only by the 60 second deadline.
+
+**Where the check reads from.** For a caller authenticated with an API token (an ordinary, MCP or
+engine token) the check reads the token's row from the server's Postgres at every step boundary, and,
+for an engine token, the backing engine principal's row too. It does not use the 60 second token
+cache or the 15 second engine-principal cache that the held-open streams use. So a token revoked
+through ANY replica before the read is seen at the next step boundary of a run on any replica: the
+next step is not sent. The cost is one indexed read per presented token header (an `Authorization: Bearer` and an
+`X-Yuzu-Token` header make up to two) plus, for an engine token, one read of the principal row. A check
+runs before every send attempt: each step's first send, each wake from a retry delay, and each item
+of a `foreach` step (so a `foreach` over N items makes N checks), and a check whose answer cannot be
+given is asked once more. A run is capped at 2 per principal and 60 seconds. If the database does
+not answer within the 1.5 second lease wait or the query fails, the answer is "cannot be given", not
+"revoked" and not "valid": it is asked once more and a second non-answer stops the run. Under a
+connection-pool brownout one boundary can wait about 4 seconds when every pooled connection is in
+use, or about 21 seconds when the database accepts connections but does not answer. A database that
+stops answering on a connection a read is already using can hold that read for longer than the 60
+second run cap (a test saw no return in 150 seconds), because the cap is checked between attempts;
+the run still fails closed whenever a read returns. What is not covered: a step already sent when the revoke lands
+is not recalled, a token's expiry time is still judged against the clock of the replica running the
+call, and a cookie session is decided by the durable session store's generation, which each replica
+polls at most once per second, so while the session store answers a sign-out on another replica is
+seen within about a second rather than at the very next boundary, and while a replica's poll is
+failing it can keep serving the cached session for up to 30 seconds before failing closed. A cookie session whose
+store read still fails after that is stopped as `credential_revoked`; only token reads report
+`credential_indeterminate`. The 60
+second deadline, the live RBAC check at each send and the revoke itself apply as before. Other
+callers of the token store, including the held-open MCP streams (see the MCP manual), keep the cached
+read and its lag (#4766).
+
+**Dispatch is synchronous, device work is not.** The call returns after every step's command has
+been sent, including step retries and delays (within the run budget above), so it can be slow. Each step is sent only to the
+agents the caller can see (the same confinement as every other dispatch); a named agent outside the
+caller's view is dropped silently. Read the run with `GET /api/v1/workflow-executions/{execution_id}`
+and each device's output with the step's `command_id`. Without an `Idempotency-Key`, do not repeat the
+call to retry: every step is sent again. A started run that fails part-way is never retried blind: a step the engine records as
+failed is retried only when its failure is transient (`retry_count` times, with `retry_delay_seconds`
+between attempts); a step refused at send time (its definition changed, or it no longer passes the
+caller's approval or targeting checks) is a permanent failure, recorded at once with no retry and no
+sleep, and the step's `on_failure` policy applies. A fault that throws out of the run closes the
+execution `failed` and answers `500 dispatch_exception` as above. The close is a single write
+retried once; if both tries fail the row stays `running` (see "A workflow run left `running`" in
+[server-admin.md](server-admin.md#a-workflow-run-left-running)).
+
+**Success `202`** (a repeat of an `Idempotency-Key` answers with the thin body under **Idempotency**
+instead): `data.execution_id`, `data.workflow_id`, `data.status`, `data.late_denied` and
+`data.steps`, one entry per send attempt (retries and `foreach` add entries): `instruction_id`,
+`attempt` (1-based: a retry of a step has the next number and the next step starts again at 1, so a
+reader can tell a retry from a new step), `command_id`, `agents_reached`, and, when `agents_reached` is `0`, `reason`, `retryable` and the
+withheld counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`.
+`data.status` is `completed` ONLY when the engine recorded the run `completed`, no step was refused
+at send time and every step's FINAL send attempt reached at least one agent (commands were sent;
+devices have not necessarily finished). A run that sent something and did not meet all three is still a `202` (a
+`5xx` would invite a blind re-send of steps already sent) but is NOT a success: `data.status` is
+`partial` (some step's final attempt reached nobody, or the engine did not complete after a send), `aborted` (a
+step was refused at send time because its definition changed, the run reached its 60 second
+deadline, or the credential check stopped it: `data.reason` `deadline_exceeded`,
+`credential_revoked` or `credential_indeterminate`; after a deadline or credential stop the rest did not run, but a step after a refused `onFailure: continue` step may still have run) or `interrupted` (the server began stopping: `data.reason`
+`server_shutdown`), with
+`data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
+with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step is judged
+by its LAST attempt: one that reached nobody and was retried to success is reached, and a run whose
+every step ends reached reads `completed` (its earlier zero-reach entry stays in `data.steps` with
+its `attempt` number, and the closing audit row is a `success`). A step the engine left failed (an
+`onFailure: continue` step that never reached anyone) makes the run `partial`, retried or not. The same
+rule classifies a repeat of the key, so the replay says `completed` for a retried-to-success run and
+`partial` for the continue case.
+
+**Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
+with `error.reason` and `error.execution_id` (the run exists and is readable). The reasons are
+`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached` (offline
+devices, or a per-device concurrency claim), `quarantined`, `plugin_not_found`, `kill_switched_os`,
+`late_denied`, `deadline_exceeded` (the 60 second run budget ended the run before any step reached
+an agent) and `run_failed` (the engine ended the run without a single dispatch attempt, or its final
+state could not be read).
+
+*With an `Idempotency-Key`* the key was bound to the run when it started, so a repeat of the call
+replays this run (`202`; `data.status` is `failed`, or `aborted` when the stored steps show a deadline stop (`deadline_exceeded`) or a send-time refusal (`late_denied`)) and never runs again: every one of these
+answers has `retry_after_ms: null`, no `Retry-After` header and `error.remediation` naming the way
+forward (use a new idempotency key). Read the run with `GET /api/v1/workflow-executions/{id}`, then
+start another under a new key.
+
+*Without a key* nothing was sent, so a retry is safe for the causes that carry `retry_after_ms: 5000`
+(`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`);
+`quarantined`, `plugin_not_found`, `kill_switched_os`, `late_denied`, `deadline_exceeded` and
+`run_failed` are permanent (`retry_after_ms: null`). Send a key anyway: it is what makes a lost
+answer safe to ask about.
+
+A missing `Workflow:Execute` permission is a `403` from the surface gate, before any of the above.
+
 #### `GET /api/v1/workflow-executions`
 
 **Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (ADR-0017), the same sole gate as
@@ -6837,8 +7140,9 @@ workflow was soft-deleted; its history is kept), `status`, `current_step`, `star
 `completed_at`. Never agent ids, step results or `agents_reached` (use the detail route for those).
 Newest first by `(started_at, id)`.
 
-A confined caller (management-group or service-scoped) sees only runs with at least one agent in
-its scope. The scope is applied in the database **before** ordering and the page limit, so a run
+A confined caller (management-group or service-scoped) sees only runs with at least one of the
+stored agent ids in its scope (for a run that named more ids than a row stores, see the cap note
+under `GET /api/v1/workflow-executions/{id}`). The scope is applied in the database **before** ordering and the page limit, so a run
 the caller cannot see never takes a page slot, `next_cursor` and the page length depend only on
 runs the caller may see, and a hand-made cursor naming a hidden run reveals nothing. A run whose
 stored agent list is malformed, empty or not an array is invisible to a confined caller.
@@ -6916,6 +7220,27 @@ REST's usual fail-closed-on-audit-failure posture — this file's `AuditFn` pred
 
 For an unconfined (global-grant) caller, each step's `result` also carries `agents_reached` (the
 step's dispatch-time target-agent count) — stripped above for a confined caller, as described.
+
+A run row stores each distinct agent id the run named once, in the order first named, at most
+1,000 of them and at most 131,072 bytes of JSON text (the run itself still sends to every id as
+sent). When the distinct ids do not all fit (or one was skipped: an id over 256 bytes or holding a
+NUL byte is never stored), `agent_ids` holds only the stored ids (when the creator is a confined
+caller, the ids in the creator's own dispatch scope, its `Execution:Execute` visibility, are
+stored first; the creator keeps seeing the run exactly while at least one stored id lies in the scope
+its reads are checked against, `Workflow:Read`, which is guaranteed when the run names a device inside
+its `Execute` scope and that scope lies within its `Read` scope; a confined creator is a custom role
+that holds `Workflow:Execute` globally plus a scoped grant, since no seeded role below `Administrator`
+can start a run), `agent_ids_truncated` is `true`,
+and a caller with no device scope also gets `agent_ids_total`, the number of distinct ids the run
+named. Both fields are absent for a run stored whole, and `agent_ids_total` is never sent to a
+confined caller. A confined caller sees a truncated run only if one of the stored ids is in its
+scope, so a confined reader whose devices fall past the stored ids does not see the run, and that
+includes the creator unless the run names at least one device inside its `Execution:Execute` scope and
+that scope lies within its `Workflow:Read` scope (overlapping scopes are not enough; a global `Execute`
+grant with a group-scoped `Read` grant stores the ids in the order named, so the creator loses its run
+when none of its group's devices is among those stored) (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
+unconfined readers and the audit log still see it. The same applies to
+`GET /api/workflow-executions/{id}` and MCP `get_workflow_execution`.
 
 #### `GET /api/v1/executions`
 
@@ -7113,8 +7438,9 @@ flag, parameters and creator are in no read that carries another user's schedule
 are not rendered for one. The page view also carries `data-can-write`, `data-can-enable` and
 `data-can-delete` on its list root (render hints probed once per render from `Schedule:Write`,
 `Execution:Execute` and `Schedule:Delete`, never a gate; each probe refused writes one
-`auth.permission_required` audit row) and per-row Enable/Disable and Delete buttons, disabled for
-a row the caller did not create. The default view is unchanged.
+`auth.permission_required` audit row; a supervised-tier MCP token's approval-gated pairs are not
+probed and write none, so those two hints are `0` for it) and per-row Enable/Disable and Delete
+buttons, disabled for a row the caller did not create. The default view is unchanged.
 
 #### `GET /fragments/workflows`
 
@@ -7129,7 +7455,10 @@ up and shown only when the caller also holds `InstructionDefinition:Read` (a sep
 `data-can-delete` (`0` or `1`): render hints probed once per render from `Workflow:Execute`,
 `Workflow:Write` and `Workflow:Delete`, deciding which controls the page offers. They are not an
 authorization decision; the run, create and delete routes check their own grant. Each refused probe
-writes one `auth.permission_required` audit row. Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+writes one `auth.permission_required` audit row, except for a supervised-tier MCP token: its
+approval-gated pairs (`Workflow:Execute`, `Workflow:Delete`) are not probed, so a render writes no
+`auth.approval_required` row, the list root carries `data-run-gate="approval"` and Run now is
+disabled with the reason that the token must use the MCP `execute_workflow` ticket flow. Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
 
 #### `GET /fragments/workflow-runs`
 
@@ -13305,7 +13634,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 
 This stream holds an HTTP worker thread for as long as the drawer stays open, so it leases
 from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, MCP streamed POST,
-`GET /api/v1/events`, and the legacy `/events` stream (ADR-0034). That means enough open
+`GET /api/v1/events`, the legacy `/events` stream and synchronous workflow runs (ADR-0034). That means enough open
 drawers — or enough traffic on any of the other surfaces — can cause a *new* drawer to be
 refused with `429`. A live stream is never evicted to make room.
 
@@ -13411,7 +13740,7 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 
 This endpoint holds an HTTP worker thread open for the life of the subscription, so it
 leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
-executions drawer, MCP streamed POST, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+executions drawer, MCP streamed POST, the legacy `/events` stream and synchronous workflow runs (ADR-0034). A cap hit rejects the
 *new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:
