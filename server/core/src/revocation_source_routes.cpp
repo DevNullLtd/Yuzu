@@ -229,7 +229,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- GET /api/v1/crypto/revocation-sources/{id}
     sink.Get(R"(/api/v1/crypto/revocation-sources/([0-9]+))",
-             [this, gate](const httplib::Request& req, httplib::Response& res) {
+             [this, gate, unknown_id](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::ensure_correlation_id(res);
                  const std::string verb(rs::kAuditView);
                  const std::string raw = req.matches[1].str();
@@ -310,7 +310,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- PUT /api/v1/crypto/revocation-sources/{id} - replace name, keys and URLs.
     sink.Put(R"(/api/v1/crypto/revocation-sources/([0-9]+))",
-             [this, gate, parse_body, recheck](const httplib::Request& req, httplib::Response& res) {
+             [this, gate, parse_body, recheck, unknown_id](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::ensure_correlation_id(res);
                  const std::string verb(rs::kAuditUpdate);
                  const std::string raw = req.matches[1].str();
@@ -362,7 +362,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- DELETE /api/v1/crypto/revocation-sources/{id} - remove a source (a Write, not a Delete).
     sink.Delete(R"(/api/v1/crypto/revocation-sources/([0-9]+))",
-                [this, gate](const httplib::Request& req, httplib::Response& res) {
+                [this, gate, unknown_id](const httplib::Request& req, httplib::Response& res) {
                     const auto cid = detail::ensure_correlation_id(res);
                     const std::string verb(rs::kAuditRemove);
                     const std::string raw = req.matches[1].str();
@@ -401,7 +401,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- POST /api/v1/crypto/revocation-sources/{id}/reset-high-water
     sink.Post(R"(/api/v1/crypto/revocation-sources/([0-9]+)/reset-high-water)",
-              [this, gate, parse_body, recheck](const httplib::Request& req, httplib::Response& res) {
+              [this, gate, parse_body, recheck, unknown_id](const httplib::Request& req, httplib::Response& res) {
                   const auto cid = detail::ensure_correlation_id(res);
                   const std::string verb(rs::kAuditResetHighWater);
                   const std::string raw = req.matches[1].str();

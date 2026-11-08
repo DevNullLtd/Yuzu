@@ -30,7 +30,7 @@
 /// replica's addresses; resolution at registration is one lookup, and the fetcher re-resolves and
 /// pins on every fetch. Registration runs one name lookup per URL through `net::bounded_resolve`:
 /// the lookup runs on a pool-capped worker thread, and the request handler waits for it for at
-/// most the resolver timeout, on every platform.
+/// most the resolver timeout.
 
 #include "revocation_source_store.hpp"
 
