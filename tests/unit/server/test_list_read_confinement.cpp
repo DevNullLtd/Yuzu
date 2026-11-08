@@ -483,7 +483,7 @@ TEST_CASE("authorize_list_read: read_failed is true for each failed-read arm, an
     SECTION("the group-membership reads fail (the global read and the group-names read both)") {
         REQUIRE(r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt).decision ==
                 ListReadDecision::AdmitScoped);
-        break_table(rbac_db_.dsn(), "rbac_store.group_members"); // user_rbac_group_names
+        break_table(rbac_db_.dsn(), "rbac_store.group_members"); // user_rbac_group_names_checked
         // "bob" has no cached verdict, so the global read runs; the group-names read then fails.
         auto d = r.rbac.authorize_list_read("bob", "Response", "Read", &r.mgmt);
         CHECK(d.decision == ListReadDecision::DenyAll);

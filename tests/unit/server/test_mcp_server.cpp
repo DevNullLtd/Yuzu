@@ -10,6 +10,7 @@
  * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
+#include "access_review_store.hpp" // kHistoryJustificationPreviewChars (description drift pin)
 #include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
@@ -124,6 +125,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -2533,6 +2535,133 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
                 token_id_required = true;
         CHECK(token_id_required);
     }
+}
+
+// #4752: the access-review decision history is part of the served contract. record_attestation
+// stays destructive (the current decision is replaced and a grant cannot go back to pending) but
+// its prose must no longer claim the earlier decision is lost, and get_access_review types the
+// attestation items, decision_seq and history, not a bare array.
+TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the append contract; "
+          "get_access_review types decision_seq and history",
+          "[mcp][2g][4752]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const nlohmann::json* record = nullptr;
+    const nlohmann::json* get = nullptr;
+    for (const auto& t : tools) {
+        if (t["name"] == "record_attestation")
+            record = &t;
+        if (t["name"] == "get_access_review")
+            get = &t;
+    }
+    REQUIRE(record != nullptr);
+    REQUIRE(get != nullptr);
+
+    CHECK((*record)["annotations"]["destructiveHint"] == true);
+    const auto rdesc = (*record)["description"].get<std::string>();
+    // The descriptions state the preview length from the constant, so a change to one that
+    // leaves the other behind fails.
+    const std::string first_n =
+        "first " + std::to_string(yuzu::server::kHistoryJustificationPreviewChars) + " characters";
+    for (const std::string& needle : std::vector<std::string>{
+             "destructiveHint:true", "every decision is kept", "decision_seq",
+             "must differ from the subject of the grant",
+             "the reviewer must differ from the subject of this grant; ask another "
+             "reviewer to record this decision",
+             "at most 1024 bytes each and justification at most 4096 bytes", "the 100th is final",
+             "until the grant reaches its limit of 100 decisions", "at most 100 recorded decisions",
+             "refused with invalid params and records nothing", "returns decision_seq",
+             "previous_decision", "retry_after_ms can mean the decision was recorded anyway",
+             "before retrying, call get_access_review, compare decision_seq",
+             "match reviewer, justification and decided_at_ms",
+             "an earlier entry shows at most its " + first_n,
+             "a blind retry appends another identical decision"})
+        CHECK(rdesc.find(needle) != std::string::npos);
+    for (const char* stale : {"UPSERT", "OVERWRITES", "not retained"})
+        CHECK(rdesc.find(stale) == std::string::npos);
+
+    const auto gdesc = (*get)["description"].get<std::string>();
+    CHECK(gdesc.find("decision_seq") != std::string::npos);
+    CHECK(gdesc.find("history") != std::string::npos);
+    CHECK(gdesc.find("justification_truncated") != std::string::npos);
+    CHECK(gdesc.find("at most its " + first_n) != std::string::npos);
+
+    const auto& items = (*get)["outputSchema"]["properties"]["attestations"]["items"];
+    REQUIRE(items.is_object());
+    CHECK(items["properties"]["decision_seq"]["type"] == "integer");
+    const auto& hist = items["properties"]["history"];
+    CHECK(hist["type"] == "array");
+    for (const char* k : {"seq", "decision", "previous_decision", "reviewer", "justification",
+                          "justification_truncated", "decided_at_ms"}) {
+        CHECK(hist["items"]["properties"].contains(k));
+        const auto& hreq = hist["items"]["required"];
+        CHECK(std::find(hreq.begin(), hreq.end(), k) != hreq.end());
+    }
+    CHECK(hist["items"]["properties"]["justification_truncated"]["type"] == "boolean");
+    CHECK(hist["items"]["properties"]["seq"]["type"] == "integer");
+    CHECK(hist["items"]["properties"]["previous_decision"]["enum"] ==
+          nlohmann::json::array({"", "pending", "attested", "flagged_revoke"}));
+    const auto required = items["required"];
+    CHECK(std::find(required.begin(), required.end(), "decision_seq") != required.end());
+    CHECK(std::find(required.begin(), required.end(), "history") != required.end());
+}
+
+// #4752: the history preview length appears as a literal number in many description strings.
+// The tests above tie some of them to kHistoryJustificationPreviewChars; this sweeps the whole
+// served OpenAPI document and the whole MCP tools/list for every "first|than|to N characters"
+// phrase within 200 characters of the word "justification" and requires N to equal the
+// constant, so a stale literal anywhere fails rather than only the sites a test names.
+TEST_CASE("MCP 4752: every history-preview length in the OpenAPI document and tools/list "
+          "equals kHistoryJustificationPreviewChars",
+          "[mcp][2g][4752][openapi]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+
+    struct Sweep {
+        std::size_t matched = 0;
+        std::vector<std::string> wrong; // context of every site whose number is stale
+    };
+    const auto sweep = [](const std::string& text) {
+        std::string lowered = text;
+        for (auto& c : lowered)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        static const std::regex phrase(R"((first|than|to) (\d+) characters)");
+        constexpr std::size_t kNear = 200;
+        Sweep out;
+        for (std::sregex_iterator it(text.begin(), text.end(), phrase), end; it != end; ++it) {
+            const auto pos = static_cast<std::size_t>(it->position());
+            const std::size_t from = pos > kNear ? pos - kNear : 0;
+            const std::size_t len = std::min(
+                lowered.size() - from, kNear + static_cast<std::size_t>(it->length()) + kNear);
+            if (lowered.substr(from, len).find("justification") == std::string::npos)
+                continue; // an unrelated numeric phrase
+            ++out.matched;
+            if (std::stoll((*it)[2].str()) !=
+                static_cast<long long>(yuzu::server::kHistoryJustificationPreviewChars))
+                out.wrong.push_back(text.substr(from, len));
+        }
+        return out;
+    };
+
+    const auto openapi = sweep(yuzu::server::openapi_spec_with_guides_json());
+    const auto mcp = sweep(res->body);
+    // Floors so a rephrase cannot make the sweep pass vacuously. Counted when this was written:
+    // 7 in the OpenAPI document with guides (the history entry's justification and
+    // justification_truncated descriptions, the Access Reviews guide's decision-history note
+    // twice, GET /access-reviews/{id}, and the POST attestations description twice) and 3 in
+    // tools/list (get_access_review once, record_attestation twice). The sweep also sees, and
+    // skips as unrelated, phrases such as "longer than 512 characters" and "up to 128
+    // characters", which sit more than 200 characters from the word justification.
+    CHECK(openapi.matched >= 7);
+    CHECK(mcp.matched >= 3);
+    // Comparing against an empty vector makes Catch print the stale contexts on failure.
+    CHECK(openapi.wrong == std::vector<std::string>{});
+    CHECK(mcp.wrong == std::vector<std::string>{});
 }
 
 // #2383: C8 fail-closed. The boot validator and the three-way dispatch
@@ -38313,6 +38442,157 @@ TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with
         CHECK(body["error"]["code"] == kInvalidParams);
         CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
               std::string::npos);
+    }
+}
+
+// Roll-up only: a result set reports the failure signal, and a set stored over a raw capture table
+// is refused rather than re-run to an empty membership. The nine row schemas share one macro, so one
+// tool pins the fields.
+TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed and partial as required",
+          "[mcp][integration][result-sets][agents_failed]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const nlohmann::json* schema = nullptr;
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    for (const auto& t : tools)
+        if (t["name"] == "get_result_set")
+            schema = &t["outputSchema"];
+    REQUIRE(schema != nullptr);
+    CHECK((*schema)["properties"]["agents_failed"]["type"] == "integer");
+    CHECK((*schema)["properties"]["partial"]["type"] == "boolean");
+    const auto& req = (*schema)["required"];
+    CHECK(std::find(req.begin(), req.end(), "agents_failed") != req.end());
+    CHECK(std::find(req.begin(), req.end(), "partial") != req.end());
+}
+
+TEST_CASE("MCP result-sets: a query over a raw capture table is refused with the stale-source token",
+          "[pg][mcp][integration][result-sets][stale_source]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+
+    int dispatched = 0;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const auto seed = [&](const std::string& kind, const nlohmann::json& payload) {
+        CreateRequest cr;
+        cr.owner_principal = "test-user"; // McpTestServer's default session principal
+        cr.name = "seed";
+        cr.source_kind = kind;
+        cr.source_payload = payload.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+        return seeded->id;
+    };
+    const auto reeval = [&](const std::string& id) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            id + R"("}}})");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto is_stale = [](const nlohmann::json& body) {
+        return body.contains("error") && body["error"]["code"] == kInvalidParams &&
+               body["error"]["message"].get<std::string>().find(
+                   "RESULT_SET_REEVAL_STALE_SOURCE") != std::string::npos;
+    };
+
+    SECTION("reevaluate_result_set over $Process_Live") {
+        const auto id = seed(std::string(source_kind::kEchoQuery),
+                             nlohmann::json{{"sql", "SELECT pid FROM $Process_Live"}});
+        CHECK(is_stale(reeval(id)));
+        CHECK(dispatched == 0);
+    }
+    SECTION("reevaluate_result_set over $Process_Hourly is not refused") {
+        const auto id = seed(std::string(source_kind::kEchoQuery),
+                             nlohmann::json{{"sql", "SELECT name FROM $Process_Hourly"}});
+        CHECK_FALSE(is_stale(reeval(id)));
+        CHECK(dispatched == 1);
+    }
+    SECTION("reevaluate_result_set of an instruction_result whose definition default is stale") {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Canned echo query";
+        def.version = "1.0";
+        def.plugin = "echo";
+        def.action = "sql";
+        def.type = "question";
+        def.description = "canned";
+        def.parameter_schema =
+            R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $TCP_Live"}}})";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        const auto id = seed(std::string(source_kind::kInstructionResult),
+                             nlohmann::json{{"instruction_id", *created}, {"params", nlohmann::json::object()}});
+        CHECK(is_stale(reeval(id)));
+        CHECK(dispatched == 0);
+    }
+    SECTION("create_result_set_from_echo_query over $Process_Live") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT pid FROM $Process_Live"}}})");
+        REQUIRE(res);
+        CHECK(is_stale(nlohmann::json::parse(res->body)));
+        CHECK(dispatched == 0);
+    }
+    SECTION("create_result_set_from_instruction_result on the SQL the definition will run") {
+        const auto define = [&](const std::string& sql_default) {
+            yuzu::server::InstructionDefinition def;
+            def.name = "Canned echo query";
+            def.version = "1.0";
+            def.plugin = "echo";
+            def.action = "sql";
+            def.type = "question";
+            def.description = "canned";
+            def.parameter_schema =
+                nlohmann::json{{"type", "object"},
+                               {"properties",
+                                {{"sql", {{"type", "string"}, {"default", sql_default}}}}}}
+                    .dump();
+            def.enabled = true;
+            auto created = instr.create_definition(def);
+            REQUIRE(created.has_value());
+            return *created;
+        };
+        const auto create = [&](const std::string& iid, const nlohmann::json& params) {
+            nlohmann::json args{{"instruction_id", iid}};
+            if (!params.is_null())
+                args["params"] = params;
+            auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                              {"method", "tools/call"},
+                                              {"id", 3},
+                                              {"params",
+                                               {{"name", "create_result_set_from_instruction_result"},
+                                                {"arguments", args}}}}
+                                   .dump());
+            REQUIRE(res);
+            return nlohmann::json::parse(res->body);
+        };
+        // The definition's own default is stale: refused, nothing dispatched.
+        CHECK(is_stale(create(define("SELECT 1 FROM $TCP_Live"), nullptr)));
+        CHECK(dispatched == 0);
+        // A caller param that reads a raw table overrides a clean default.
+        CHECK(is_stale(create(define("SELECT 1 FROM $TCP_Hourly"),
+                              nlohmann::json{{"sql", "SELECT 1 FROM tcp_live"}})));
+        CHECK(dispatched == 0);
+        // A clean default proceeds to dispatch.
+        CHECK_FALSE(is_stale(create(define("SELECT 1 FROM $TCP_Hourly"), nullptr)));
+        CHECK(dispatched == 1);
     }
 }
 

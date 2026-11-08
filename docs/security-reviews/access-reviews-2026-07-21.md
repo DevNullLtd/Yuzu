@@ -13,6 +13,27 @@ listed **MISSING**; Priority-2 item **13** — item 12 at the time this record
 was written, renumbered on 2026-07-25 when a duplicate `10` in that section
 was corrected).
 
+> **Addendum (2026-11-03, #4752, amended 2026-11-04).** The statements below that `record_attestation` is an UPSERT
+> that overwrites a prior decision (under "What shipped", and the `destructiveHint` rationale), that
+> a decision is "recorded once and then final" or "final, irreversible", and that the store has
+> "two tables" are superseded: every decision is now kept in the grant's history (schema v3, three
+> tables), a later decision replaces the current one, the grant cannot go back to `pending`, and the
+> reviewer must differ from the subject of the grant. See "Addendum (2026-11-03, #4752, amended
+> 2026-11-04)" at the end of this document.
+>
+> **Amended 2026-11-07 (CC8.1 traceability).** Statements in this document were rewritten in place, not
+> only superseded below, by the #4752 review rounds: (a) the "recorded once and then final", "final,
+> irreversible" and "two tables" statements were replaced by the append-only history (schema v3, three
+> tables); (b) the CC6.2 assurance of "auditable proof that a human reviewer looked" was narrowed to a
+> reviewer ACCOUNT; (c) the residual lock-wait statement (the pool's 10 s `lock_timeout`) was replaced by the
+> store's own 3 s `SET LOCAL lock_timeout` per lock wait; (d) the audit-row attribution wording was
+> corrected; (e) the cap-refusal remedy now says to open a new campaign (closing the old one is a separate
+> choice); (f) the campaign list is metadata only and is not proof that a review was completed; (g)
+> `created_at_ms`, `decided_at_ms` and `closed_at_ms` come from the database clock; (h) the engine-owner
+> rule gained an in-transaction comparison with the owner frozen at campaign open, and the pre-read window
+> and group staleness carry a recorded owner acceptance (2026-11-07). The reasons are in "Amended 2026-11-07"
+> at the end of this document.
+
 ## What shipped
 
 - **Export (stateless):** `GET /api/v1/access-reviews/export?format=json|csv`
@@ -33,20 +54,23 @@ was corrected).
   quoting.
 - **Campaign list:** `GET /api/v1/access-reviews` (hardening round) lists
   every campaign's metadata (not its attestations), newest-first, capped at
-  the most recent 500 — the surface an auditor needs to prove reviews ran
-  on cadence without already knowing a `campaign_id` out-of-band.
+  the most recent 500, so a `campaign_id` need not be known out-of-band. It
+  carries no decided or pending counts and is not by itself proof that a
+  review was completed: read a campaign (`GET /api/v1/access-reviews/{id}`)
+  for `pending_count` and the attestation rows.
 - **Attestation campaigns (durable):** `POST /api/v1/access-reviews` opens a
   campaign that **freezes the complete current grant population** as
   `pending` attestation rows in one transaction; `POST
   /api/v1/access-reviews/{id}/attestations` records a reviewer decision
   (`attested`/`flagged_revoke`) against one frozen `(principal, role)` grant
-  — recorded once and then final (an UPSERT until #4752, see "Update 2026-11-05" below); `POST
+  — every decision is kept in the grant's history, the latest is the current decision and the grant cannot return to `pending` (an UPSERT until #4752, see the addendum at the end of this document); `POST
   /api/v1/access-reviews/{id}/close` closes the campaign; `GET
   /api/v1/access-reviews/{id}` returns the full evidentiary state
   (metadata + every attestation row + `pending_count`).
 - **Store:** `AccessReviewStore` (`server/core/src/access_review_store.{hpp,cpp}`,
-  schema `access_review_store`) — born-on-Postgres (ADR-0006), two tables
-  (`access_review_campaign`, `access_review_attestation`), authoritative/
+  schema `access_review_store`) — born-on-Postgres (ADR-0006), three tables
+  (`access_review_campaign`, `access_review_attestation`,
+  `access_review_attestation_history`, the last from schema v3), authoritative/
   fail-hard posture (ADR-0012 §1).
 > **Addendum (2026-08-05, #2376) — read the "granted only to" claims below as
 > RBAC-ON-scoped until #2376.** This document describes the `AccessReview`
@@ -73,8 +97,9 @@ was corrected).
   (hardening round), `close_access_review` (hardening round) — JSON only;
   the REST `?format=csv` export has no MCP equivalent.
   `record_attestation` carries `destructiveHint:true` (hardening round —
-  it writes a final, irreversible decision; it was a decision-overwriting UPSERT until #4752); every other twin is
-  `destructiveHint:false`.
+  it replaces the current decision and the grant cannot return to `pending`, although the earlier decision stays in
+  the history; it was a decision-overwriting UPSERT until #4752); every other twin is
+  `destructiveHint:false` except `close_access_review`, which is also `destructiveHint:true`.
 - **Audit actions:** `access_review.exported`, `.list` (hardening round),
   `.campaign_opened`, `.attested`, `.flagged`, `.closed`, `.get`.
 - **Metrics (hardening round):** `yuzu_access_review_export_total{format}`,
@@ -94,8 +119,16 @@ was corrected).
   opening one) carries no side effect beyond its own audit row.
 - **The attestation campaign** (`open_campaign` → `record_attestation` →
   `close_campaign`) is the **"manager/security sign-off"** half — the
-  auditable proof that a *human* reviewer looked at each grant and made an
-  explicit decision, not just that a list was generated. `pending_count` on
+  auditable record that a reviewer account looked at each grant and made an
+  explicit decision, not just that a list was generated. "Reviewer" is an
+  account, not proof of a person at a keyboard: engine principal sessions,
+  service-scoped tokens (403) and the MCP read-only and operator tiers are
+  refused; an API-token caller (acting as its owning user) and a
+  supervised-tier MCP token can still attest. The three write routes are exempt
+  from MFA step-up (`kEvidenceCapture`), which covers the REST and dashboard
+  path only (MCP is not step-up gated and token principals do not take the MFA
+  path), so no fresh MFA proof is required. The history row stores only
+  `reviewer`; `principal_class` is a persisted column stamped only by how the credential was presented (an `Authorization` or `X-Yuzu-Token` header gives `agent`, a `yuzu_session` cookie gives `human`), so an API-token caller and an MCP-token caller cannot be told apart on the `access_review.attested` row, and there is no auth-source field. `AuditEvent::mcp_tool` is never persisted: on MCP the tool name is on the separate companion row `mcp.record_attestation` (`target_type=mcp_tool`). The domain row is set-and-proceed, so it can be absent (`Sec-Audit-Failed` on REST, `audit_persisted:false` on MCP). Audit rows are kept 365 days by default. `pending_count` on
   a closed campaign is the "how complete was this review" number an
   auditor needs without re-deriving it from the attestation rows.
 - Read together, the two pieces answer CC6.2's actual question: not just
@@ -459,27 +492,222 @@ reference.
   or an external scheduler (e.g. a cron'd `open_access_review` MCP call)
   must drive the cadence today.
 
-## Update 2026-11-05 (#4752): separation of duties and final decisions
+## Addendum (2026-11-03, #4752, amended 2026-11-04): reviewer differs from the subject of the grant; every decision kept
 
-The first version of `record_attestation` had no reviewer-versus-subject check and
-no once-only guard. A holder of `AccessReview:Attest` (the seeded non-admin
-`Reviewer` role has it) could sign off their own grant, and a subject could
-replace another reviewer's `flagged_revoke` with `attested` while the campaign was
-open, leaving the closed campaign showing only the self-signed result.
+**What changed.** The original design let a reviewer record a decision on a grant that named
+them, and a later decision on the same grant overwrote the earlier one. Now:
 
-Owner ruling (2026-11-05): decisions are final. Now, inside the single `UPDATE`:
+- `POST /api/v1/access-reviews/{id}/attestations` and MCP `record_attestation` share one rule
+  (`server/core/src/access_review_attest_gate.hpp`) that requires the reviewer to differ from the
+  subject of the grant: a `user` grant whose `principal_id` equals the reviewer's account name
+  (byte-exact), an engine principal the reviewer owns now or owned when the campaign opened (revoked
+  ones included; the store compares the owner frozen into the grant inside the locked transaction, so a
+  former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner), or a group the reviewer belongs to is refused with `403`
+  and nothing is recorded. The `403` names no
+  `permission`, because the caller already holds `AccessReview:Attest`. The rule applies to
+  `Administrator` as well as `Reviewer`, and to an administrator with RBAC off. A lookup that
+  cannot be answered fails closed (`503`, nothing recorded).
+- Every decision is appended to `access_review_attestation_history` (schema v3) with the decision
+  it replaced and a sequence number; the grant row keeps the latest decision and `decision_seq`.
+  `GET /api/v1/access-reviews/{id}` and `get_access_review` return `decision_seq` and `history`.
+  `record_attestation` keeps `destructiveHint:true`, now because the current decision is replaced
+  with no route back to `pending`, not because the earlier decision is lost.
+- Input bounds: `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without NUL
+  and `justification` is at most 4096 bytes; a grant keeps at most 100 decisions (the 100th is
+  final: the 101st is refused with `400`, nothing written, and the grant can be reviewed again
+  only by opening a new campaign, which re-freezes the whole population as pending, while closing the old one is a separate choice that leaves every undecided grant pending; the history and audit rows identify who
+  wrote the entries) and a history read returns at most the latest 100 entries
+  of a grant (for rows written through the application path; rows added by other means, such as
+  owner-level SQL with the guard triggers disabled, are outside that guarantee). Every entry except the latest also returns at most the first 64 characters of its
+  justification (cut in SQL, counted in characters, so on a UTF8 database a multibyte character is never split; see
+  "Database encoding" in `docs/auth-architecture.md`), flagged by `justification_truncated`: the
+  per-grant limit alone does not bound a campaign with many grants (100 x 4096 bytes x grants, about
+  410 MB of text per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
+  preview the response grows linearly with the number of frozen grants (the per-grant ceiling bounds one grant, not the
+  response, because there is no cap on the factor); there is no per-campaign budget and the frozen grant count is not
+  capped (a recorded residual, accepted by the project owner on 2026-11-04 at the measured figures).
 
-- the reviewer may not be the subject of a `user` grant, nor the owner (frozen
-  into `grant_snapshot` at open) of an `engine` principal, and
-- a grant that already has a decision is not written again.
+  Measured 2026-11-04 on Linux (glibc), with a FRESH server process per case (baseline server peak RSS about 104 to 105 MB),
+  one `GET /api/v1/access-reviews/{id}` on a campaign of 1000 frozen grants with 100 decisions each (built by
+  inserting rows directly into a throwaway database), with the 64-character preview: 4096-character ASCII text,
+  a 32.3 MB response and a server peak (`VmHWM`) of about 331 MB; 1024 four-byte (emoji) characters, 51.3 MB and
+  about 464 MB; 4096 control characters, each escaped by JSON to six bytes, 105.0 MB and about 779 MB. With 200
+  grants of ASCII text: 6.47 MB and about 154 MB. The same measurement with the former 512-character preview gave
+  76.7 MB and about 716 MB (ASCII) and 371.1 MB and about 2.4 GB (control characters). For the three 1000-grant
+  cases the peak was about 7 to 10 times the response, baseline included (the 200-grant case, which is mostly
+  baseline, was about 24 times), allocator dependent. The 64-character cases were run three times each, in fresh
+  processes, with peaks within about 1 percent of each other; the 512-character comparison is one run per case.
+  They are measurements on one host, not a guarantee. About 50 MB more would be added by reviewer ids of about
+  520 bytes (an estimate, not measured). The response is built whole in memory (the store result, the view
+  structures, the JSON builders and the serialised body are live together), the route has no concurrency limit
+  of its own, so each request in flight holds its own copies, and the MCP twin puts its payload in the result twice
+  (2.04 to 2.16 times the REST body; at 1000 grants of 100 decisions each the peak memory is about 1.3 to 1.5 times
+  the REST peak, about 453 MB against 323 MB and 1.09 GB against 0.75 GB, and about 1.14 times at 200 grants;
+  fresh processes, three runs for each MCP figure and one for each REST figure in the comparison, VmHWM divided by
+  1024). The Access page fragment peaks at about 195 MB for 1000 grants with 100 decisions each (about 255 MB with
+  four-byte characters; it renders at most 1000 grants), a 27 to 46 MB body; the browser's own cost for it was not
+  measured. No
+  shipped deployment configuration sets a memory limit and the only shipped server-restart alert is
+  `YuzuServerRestartLoop`; the sizing advice, the scaled break-even and the existing `yuzu_server_memory_bytes{type="rss"}` metric are in
+  `docs/auth-architecture.md`, "The decision history". The full
+  text of a superseded entry stays in the database and is not returned; an assessor obtains it with
+  a database read of `access_review_store.access_review_attestation_history` (queries and caveats: "Obtaining the full
+  justification of a superseded decision" in `docs/auth-architecture.md`). A success answers `{recorded, decision_seq, previous_decision}`.
+- Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
+  outcome that reaches the gate or the store (the refusal of an engine session and the
+  unsupported-media-type refusal carry an empty `target_id`). Audit rows written before this
+  build keep the old target shape (`<campaign>:<type>:<id>:<role>`), so archives hold both. A
+  store fault that is not the caller's writes a `failure` row with a fixed message, not database
+  text (the raw error goes to the server log). A refusal is `result=denied` with `sod_self_subject`, `sod_engine_owner` or
+  `sod_group_member`; an unanswerable check is `result=failure` with `sod_check_unavailable
+  store=engine|rbac`; a success carries `decision= previous= seq= sod=pass`. The metric
+  `yuzu_access_review_attestation_refused_total{surface,reason}` covers both surfaces.
 
-Refusals are audited `result=denied` (`self_attestation_blocked`,
-`already_decided`) and answered 403/409 on REST and permission-denied/invalid-params
-on MCP. Group grants have no owner and are not covered. This also closes #2326
-item 2. Full statement of the rule and its limits: `docs/auth-architecture.md`
-"Periodic access reviews".
+**Residuals, stated as limits.**
 
-Decisions recorded before this change are not invalidated, and an overwritten decision cannot
-be reconstructed from the table (only from the audit log). The detection query and the
-rolling-upgrade ordering are in `docs/user-manual/upgrading.md`; the assessment-period
-statement is the #4752 addendum in `docs/enterprise-readiness-soc2-first-customer.md`.
+1. The group-member rule, and an engine ownership acquired after the campaign opened, are decided
+   from a read before the write transaction (the store contract forbids a store consulting another
+   store while it holds a lease). A change that lands between the read and the commit is not seen, and
+   nothing re-reads after the commit. The user rule is decided in C++ from the arguments before any
+   lease, and the comparison with the engine owner frozen into the grant at campaign open is made
+   inside the locked transaction, so neither has such a window. Revisit under epic #6060. Separately,
+   the pre-reads see the state at the moment of the attest: the current owner is read live, but
+   group membership is read from Yuzu's stored membership, which an
+   identity provider updates only when that member signs in. A change at the identity provider is
+   not seen until that member next signs in interactively (a long-lived API or MCP token can
+   outlast it), and a token that skips the
+   membership refresh (for example Entra groups-overage) is not refreshed. For
+   identity-provider-governed groups the rule is therefore not a current-membership check; a
+   review of those groups at the identity provider at campaign close is the compensating step.
+   A member who left a group before attesting is admitted; an owner who transferred an engine away is
+   still refused by the frozen owner comparison. For engine and group grants the history row does not record the ownership or
+   membership basis: independence is evidenced by the `sod=pass` audit row (set-and-proceed, kept
+   for the audit retention period), so export audit rows to the evidence store within that
+   period; if that row was not persisted (`audit_persisted:false` on MCP, `Sec-Audit-Failed` on
+   REST), treat that grant's independence as unevidenced. Recording the basis in the history
+   row is tracked under #6060.
+
+   **Recorded acceptance (2026-11-07).** Accepted by Dave Rae (project owner), questions-window ruling 2026-11-07, for the
+   release carrying #4752. (1) The group-member check, and an engine ownership acquired after the campaign
+   opened, are decided from a read made before the attest transaction; a membership or ownership change
+   committed between that read and the attest COMMIT is not seen. Normally milliseconds; worst case about
+   4 s acquire plus up to 6 s of lock waits plus statement time; no bound is promised. (2) "Member" means
+   a row in `rbac_store.group_members`. For identity-provider groups (entra, saml) that row is written
+   only when the member signs in interactively; token sessions and groups-overage tokens do not refresh
+   it. Precision notes (drafted by the session, from the code): membership held only at the provider or in the SCIM store is not consulted and bears no Yuzu role grant. This is not a current-membership check. Not covered by this acceptance: the user rule and
+   the frozen engine owner (no window), in-flight reviewer revocation, anything after COMMIT.
+   Compensating control: review of provider-governed groups at the provider at campaign close,
+   procedural, not enforced by Yuzu. Precision notes (drafted by the session, from the code): the evidence of independence is the set-and-proceed `sod=pass` audit row only.
+2. The history is append-only against the application path and ordinary SQL (triggers, `RESTRICT`
+   keys and a deferred consistency check), not against the application's database credential, a
+   role granted TRUNCATE, or a database administrator. A data-only restore into a migrated schema
+   is refused; restore schema and data together. On these tables the owner can also run `DISABLE TRIGGER USER`
+   (`DISABLE TRIGGER ALL` is refused to a non-superuser), drop a trigger, replace the guard function and `DROP TABLE`; nothing in Yuzu records either, or a
+   `TRUNCATE`, so detection is database statement logging (`pgaudit` classes `ddl` and `write`, or `log_statement = mod`;
+   `ddl` alone does not log a `TRUNCATE`) plus reconciling each grant's `decision_seq` with its history row count and
+   the audit rows' `seq`; the reconciliation does not depend on logging. The audit rows are evidence independent of these tables,
+   not of the database credential: the audit store is in the same database and has no guard triggers, so they are
+   independent of it only to the extent audit rows are exported off the database. A closed campaign and its history
+   persist indefinitely while audit rows are kept for the audit retention period (365 days by default), so after
+   that period the campaign tables are the only on-database record unless the audit rows were exported. The authorised
+   redaction procedure below also disables the triggers, and Yuzu does not audit it. The guard triggers protect the frozen grants, the decisions and the
+   history; the campaign row (status, `closed_at_ms`, `closed_by`, title) is protected by the
+   application only, which refuses further decisions on a closed campaign, so a database
+   credential holder can reopen a closed campaign. Personal-data redaction has no application
+   path. It is a database-administrator procedure that must cover the state row's latest reviewer
+   and justification, the history rows, the subject id (part of a primary key and of a restricted
+   foreign key, so redacting key columns is not feasible without rewriting keys and the frozen
+   snapshot), the frozen `grant_snapshot` of each grant (it holds `display_name` and
+   `owner_or_email`, an email address for a user; the state row's guard trigger pins it as
+   immutable, so redacting it needs that trigger disabled too), the campaign's `title` (free
+   text), `created_by` and `closed_by`, and the audit rows (kept for the audit retention period); "re-verify" means checking that the guard triggers are enabled again and
+   that the consistency trigger holds. The procedure has not been exercised.
+3. A person with two identities (a local account and an SSO identity) counts as two reviewers (the
+   accepted exception in `docs/enterprise-readiness-soc2-first-customer.md`).
+4. Every attestation audit row records the grant through the audit token filter, which folds
+   spaces and a few separators, so two grants whose ids fold to the same audit text cannot be
+   told apart in a row; this applies to success rows as well as refusal rows. `seq` numbers the
+   decisions of one grant, so with the campaign id and the grant it identifies one history entry,
+   subject to that folding.
+5. The decision is committed before its audit row is written, and a failed audit write never undoes
+   it. After a dropped connection the outcome of an attestation can be unknown: read the campaign
+   and compare `decision_seq` before retrying; a retry appends an identical decision until the
+   grant reaches its limit of 100 decisions, after which the request is refused. A
+   superseded entry is returned truncated (and an earlier history entry shows at most its first 64
+   characters), so match an earlier entry on those.
+6. Under a continuous stream of attestations a `close` can wait up to 3 seconds for the campaign row
+   (a `SET LOCAL lock_timeout` set inside the close transaction, independent of the DSN, and replacing
+   a stricter DSN value) and answer `503`; nothing was committed on that path, so retry it. The 3-second
+   bound applies to each lock wait: an attestation waits on its grant row and then, behind a queued
+   close, on the campaign row, so its lock waits can total about 6 seconds on the leased connection (the
+   4-second acquire wait comes before the lease). Only an attest returns the fixed store-failure message;
+   a close fault returns the store string (`close_campaign lock_timeout failed`,
+   `close_campaign write failed` or `database unavailable — try again`). A close whose COMMIT
+   acknowledgement is lost may leave the campaign closed while the caller sees the `503`; a retry then
+   answers `404`, so read the campaign first.
+7. **Recorded residual and options under consideration (memory use of the history read).** The project owner
+   ruled on 2026-11-04 to cut the preview of a superseded entry to 64 characters as the immediate response to the
+   measured memory use of the history read (about 2.4 GB for the worst measured case with the former 512-character
+   preview). The project owner also accepted the remaining exposure on 2026-11-04 at the measured figures. It is a recorded residual: there is no per-campaign budget, no cap on the number of
+   frozen grants, no concurrency limit on the route and no shipped memory limit, so the response and its memory still
+   grow linearly with the number of frozen grants and with the number of requests in flight (the scaled break-even is
+   in `docs/auth-architecture.md`, "The decision history", and is not measured). The structural options under
+   consideration are a per-grant history read (the campaign `GET` returning only each grant's latest decision), a
+   streamed or paged response, a per-campaign budget and a concurrency cap on heavy reads. None is decided and none is
+   scheduled by this record.
+
+**Deployment.** A database that holds a `user` grant decided by the account it names makes the
+server refuse to start (the schema v3 migration fails and the store does not open), on every boot,
+until the database is replaced. Only that case is detected: decisions on engine or group grants
+made by earlier builds are not checked and read as "previous: not recorded". This is the hard-cutover posture in `docs/user-manual/upgrading.md`
+("Deployment contract (hard cutover)"): fresh database only.
+
+### Amended 2026-11-07 (CC8.1 traceability): statements rewritten in place
+
+The 2026-11-03 addendum above lists statements it supersedes, but several were rewritten in place in this
+document rather than left standing. This entry records each change and why, so a reader comparing an earlier
+copy of the file can account for the difference.
+
+- **Immutability and table count.** The "recorded once and then final", "final, irreversible" and "two
+  tables" statements were replaced by the append-only history (schema v3, three tables). Reason: the
+  upsert-then-final design was replaced by #4752, so the old text no longer described the code.
+- **Reviewer assurance (CC6.2).** The assurance of "auditable proof that a human reviewer looked" was
+  narrowed to a reviewer ACCOUNT. Reason: an API-token caller (acting as its owning user) and a
+  supervised-tier MCP token can attest, and the write routes need no fresh MFA proof (the step-up exemption
+  covers the REST and dashboard path only; MCP is not step-up gated). Engine sessions, service-scoped tokens
+  and the MCP read-only and operator tiers are refused.
+- **Residual 6, lock wait.** The statement that a starved close waits for the pool's 10 s `lock_timeout` was
+  replaced by the store's own `SET LOCAL lock_timeout = '3s'`, which applies to each lock wait and replaces
+  the DSN value; an attest can wait on two rows in turn (about 6 s of lock waits). Reason: the earlier
+  figure did not describe the code.
+- **Audit-row attribution.** "The actor class (and, on MCP, the tool name) is on the audit row" was
+  corrected: `principal_class` is stamped only by how the credential was presented, so API-token and
+  MCP-token callers are indistinguishable on the `access_review.attested` row; `AuditEvent::mcp_tool` is not
+  persisted (the MCP tool name is on the companion `mcp.record_attestation` row); there is no auth-source
+  field; and the domain row is set-and-proceed, so it can be absent. Reason: the earlier wording overstated
+  what the audit trail attributes.
+- **Cap-refusal remedy.** The text "Close the campaign and open a new one" for a grant at its 100-decision
+  limit was replaced by the current constant: "To review it again, open a new campaign (closing this one is
+  a separate choice: it leaves every undecided grant pending)". Reason: closing is not required to open a
+  new campaign, a new campaign re-freezes the whole population as pending, and closing the old one leaves
+  every undecided grant pending.
+- **Campaign list.** The statement that the list is "the surface an auditor needs to prove reviews ran on
+  cadence" was removed. Reason: `GET /api/v1/access-reviews` and `list_access_reviews` return campaign
+  metadata only, with no decided or pending counts, so they are not by themselves proof that a review was
+  completed; read a campaign for `pending_count` and the attestation rows.
+- **Timestamps.** `created_at_ms`, `decided_at_ms` and `closed_at_ms` are authored by the database clock
+  (the write transaction's `now()`, epoch milliseconds), no longer each replica's system clock, so the
+  replica-clock limit is removed. The stamp of a decision is the transaction START time (it can precede the
+  COMMIT by the lock wait; the history entry and the state row carry the identical value), and
+  `decision_seq` remains the ordering authority for the decisions on one grant (a decision queued behind a
+  lock can carry an earlier stamp than the one it follows). A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host.
+- **Engine-owner rule and window.** The engine rule now has two parts: the route layer reads the live owner
+  before the write, and the store, inside the locked transaction, refuses the owner frozen into the grant at
+  campaign open (same `403` body, audit reason `sod_engine_owner`, metric reason `engine_owner`; these cover BOTH the live-owner refusal and the frozen-owner refusal and cannot tell them apart.), so a former
+  owner stays refused after a transfer. The window statements were narrowed accordingly: group membership
+  and an engine ownership acquired after the campaign opened are pre-read; the user rule and the frozen
+  owner have no window. An orphan engine id, or an empty or unparsable snapshot, has no owner to compare.
+- **Owner acceptance.** The pre-read window and the group-membership staleness carry the recorded
+  acceptance in residual 1 above (Dave Rae, project owner, 2026-11-07, for the release carrying #4752),
+  replacing any wording that described them as maintainer-accepted. Reason: the acceptance names its
+  scope, its worst-case timing, what it does not cover and the compensating control.
