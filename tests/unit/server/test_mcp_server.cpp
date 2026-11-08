@@ -27,6 +27,8 @@
 #include "mcp_stream_bridge.hpp"   // 2f PR 3a
 
 #include "agent_registry.hpp"
+#include "device_routes.hpp" // #2240: device_agent_row_json, the REST builder the MCP rows mirror
+#include "guardian_backend_fleet_tags.hpp" // #2240: the closed token table the device schema enums mirror
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError for classify_fn_for_test
@@ -1377,6 +1379,9 @@ struct McpTestServer {
     std::shared_ptr<yuzu::server::test::JsonDeviceApi> device_api_for_test_;
     /// Leaves build_handler's DeviceApi null, for the tools' wiring-fault branch.
     bool device_api_unwired_for_test{false};
+    /// #2240: agent_id -> guardian_backend token the DeviceApi double reports for that agent.
+    /// Empty (the default) means no agent has reported one, so every row reads null.
+    std::map<std::string, std::string> guardian_backend_for_test;
 
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
@@ -1642,17 +1647,23 @@ private:
         };
 
         // Mock agents: return two test agents
-        auto agents_fn = []() -> nlohmann::json {
-            return nlohmann::json::array({{{"agent_id", "agent-001"},
-                                           {"hostname", "web-01"},
-                                           {"os", "linux"},
-                                           {"arch", "x64"},
-                                           {"agent_version", "0.1.3"}},
-                                          {{"agent_id", "agent-002"},
-                                           {"hostname", "db-01"},
-                                           {"os", "windows"},
-                                           {"arch", "x64"},
-                                           {"agent_version", "0.1.3"}}});
+        auto agents_fn = [this]() -> nlohmann::json {
+            auto agents = nlohmann::json::array({{{"agent_id", "agent-001"},
+                                                  {"hostname", "web-01"},
+                                                  {"os", "linux"},
+                                                  {"arch", "x64"},
+                                                  {"agent_version", "0.1.3"}},
+                                                 {{"agent_id", "agent-002"},
+                                                  {"hostname", "db-01"},
+                                                  {"os", "windows"},
+                                                  {"arch", "x64"},
+                                                  {"agent_version", "0.1.3"}}});
+            // #2240: the DeviceApi double reads an optional guardian_backend per agent.
+            for (auto& a : agents)
+                if (const auto it = guardian_backend_for_test.find(a["agent_id"].get<std::string>());
+                    it != guardian_backend_for_test.end())
+                    a["guardian_backend"] = it->second;
+            return agents;
         };
         // ADR-0031 WS-A4 wave 2: list_agents/get_agent_details now source from
         // DeviceApi instead of agents_fn directly — wrap the SAME mock data
@@ -6295,6 +6306,13 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(sc["agents"][1]["agent_id"] == "agent-002");
     CHECK(sc["agents"] == agents); // same rows, just wrapped
 
+    // #2240: guardian_backend is ALWAYS present on a row; the fixture rows carry no heartbeat
+    // tag, so it reads JSON null (never "legacy") in both content and structuredContent.
+    for (const auto& a : agents) {
+        REQUIRE(a.contains("guardian_backend"));
+        CHECK(a["guardian_backend"].is_null());
+    }
+
     // Verify audit was recorded
     REQUIRE(ts.audit_log.size() >= 1);
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
@@ -6476,6 +6494,167 @@ TEST_CASE("MCP list_agents (#4041): tools/list states the scope contract",
     CHECK(description.find("scope_basis") != std::string::npos);
     CHECK(description.find("never disclosed") != std::string::npos);
     CHECK((*tool)["outputSchema"]["properties"].contains("scope_basis"));
+}
+
+TEST_CASE("MCP list_agents / get_agent_details (#2240): tools/list types guardian_backend as a "
+          "nullable closed enum and requires it",
+          "[mcp][integration][a5][guardian_backend]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2240})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    nlohmann::json expected_enum = nlohmann::json::array();
+    for (const char* t : yuzu::server::detail::kGuardianBackendTokens)
+        expected_enum.push_back(t);
+    expected_enum.push_back(nullptr);
+
+    auto find_tool = [&](const char* name) -> const nlohmann::json* {
+        for (const auto& t : body["result"]["tools"])
+            if (t["name"] == name)
+                return &t;
+        return nullptr;
+    };
+    auto field_schema = [&](const nlohmann::json& tool) -> const nlohmann::json& {
+        const auto& schema = tool["outputSchema"];
+        // list_agents nests the row schema under agents.items; get_agent_details is the row.
+        if (schema["properties"].contains("agents"))
+            return schema["properties"]["agents"]["items"];
+        return schema;
+    };
+
+    for (const char* name : {"list_agents", "get_agent_details"}) {
+        INFO("tool: " << name);
+        const auto* tool = find_tool(name);
+        REQUIRE(tool != nullptr);
+        const auto& row = field_schema(*tool);
+        REQUIRE(row["properties"].contains("guardian_backend"));
+        const auto& prop = row["properties"]["guardian_backend"];
+        // JSON Schema (not OpenAPI 3.0): a type array carries the null.
+        CHECK(prop["type"] == nlohmann::json::array({"string", "null"}));
+        CHECK(prop["enum"] == expected_enum);
+        bool required = false;
+        for (const auto& r : row["required"])
+            required = required || r == "guardian_backend";
+        CHECK(required);
+        // A5 item 2: the description must say what the field and null mean.
+        const auto desc = (*tool)["description"].get<std::string>();
+        CHECK(desc.find("guardian_backend") != std::string::npos);
+    }
+}
+
+TEST_CASE("MCP list_agents / get_agent_details (#2240): a reported backend is a token, an "
+          "unreported one is null, in both channels",
+          "[mcp][integration][guardian_backend]") {
+    McpTestServer ts;
+    ts.guardian_backend_for_test["agent-001"] = "spark_failed"; // agent-002 reports nothing
+    ts.start();
+
+    auto list = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2241,"params":{"name":"list_agents"}})");
+    REQUIRE(list);
+    const auto lbody = nlohmann::json::parse(list->body);
+    const auto agents =
+        nlohmann::json::parse(lbody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(agents.size() == 2);
+    // One non-null token AND one null in the same case: a handler that emitted a constant null
+    // (or a constant "legacy") fails here.
+    CHECK(agents[0]["guardian_backend"] == "spark_failed");
+    CHECK(agents[1]["guardian_backend"].is_null());
+    CHECK(lbody["result"]["structuredContent"]["agents"] == agents);
+
+    auto detail = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2242,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(detail);
+    const auto dbody = nlohmann::json::parse(detail->body);
+    const auto text =
+        nlohmann::json::parse(dbody["result"]["content"][0]["text"].get<std::string>());
+    CHECK(text["guardian_backend"] == "spark_failed");
+    CHECK(dbody["result"]["structuredContent"] == text);
+
+    auto other = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2243,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    REQUIRE(other);
+    const auto obody = nlohmann::json::parse(other->body);
+    const auto otext =
+        nlohmann::json::parse(obody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(otext.contains("guardian_backend"));
+    CHECK(otext["guardian_backend"].is_null());
+}
+
+TEST_CASE("MCP list_agents (#2240): the REST row builder and the MCP row agree semantically",
+          "[mcp][integration][guardian_backend]") {
+    // REST serialises through nlohmann (sorted keys), MCP through JObj (insertion order), so the
+    // two were never byte-identical. The parity contract is the same key set, the same values
+    // and the same null semantics, compared here as parsed JSON.
+    McpTestServer ts;
+    ts.guardian_backend_for_test["agent-001"] = "unwired";
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2244,"params":{"name":"list_agents"}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    const auto mcp_rows =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(mcp_rows.size() == 2);
+
+    ts.device_api_for_test_->degrade = false;
+    const auto api_rows = ts.device_api_for_test_->list_devices();
+    REQUIRE(api_rows.size() == 2);
+    for (std::size_t i = 0; i < api_rows.size(); ++i) {
+        INFO("row " << i);
+        const auto rest = yuzu::server::device_agent_row_json(api_rows[i]);
+        CHECK(mcp_rows[i] == rest);
+    }
+    CHECK(mcp_rows[0]["guardian_backend"] == "unwired"); // a token row
+    CHECK(mcp_rows[1]["guardian_backend"].is_null());    // a null row
+}
+
+TEST_CASE("MCP list_agents / get_agent_details (#2240): a confined caller opens no new read",
+          "[mcp][integration][guardian_backend]") {
+    McpTestServer ts;
+    ts.guardian_backend_for_test["agent-001"] = "legacy";
+    ts.guardian_backend_for_test["agent-002"] = "spark_failed";
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-001"}};
+    };
+    ts.start();
+
+    auto list = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2245,"params":{"name":"list_agents"}})");
+    REQUIRE(list);
+    CHECK(list->body.find("spark_failed") == std::string::npos); // agent-002's value never leaves
+
+    auto detail = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2246,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    REQUIRE(detail);
+    CHECK(detail->body.find("spark_failed") == std::string::npos);
+    CHECK(detail->body.find("Agent not found") != std::string::npos);
+    REQUIRE(ts.device_api_for_test_);
+    CHECK(ts.device_api_for_test_->lookup_calls == 0);
+}
+
+TEST_CASE("MCP get_agent_details (#2240): a degraded tag store is retryable with retry_after_ms",
+          "[mcp][integration][a5][guardian_backend]") {
+    McpTestServer ts;
+    ts.start();
+    REQUIRE(ts.device_api_for_test_);
+    ts.device_api_for_test_->degrade = true;
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2247,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "Tag store unavailable");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
 }
 
 TEST_CASE("MCP fleet_overview (#4041): the prompt does not read a confined list as the fleet",
@@ -17207,6 +17386,9 @@ TEST_CASE("MCP Integration: tools/call get_agent_details", "[mcp][integration]")
     CHECK(text["agent_id"] == "agent-001");
     CHECK(text["hostname"] == "web-01");
     CHECK(text["os"] == "linux");
+    // #2240: the key is always present; no heartbeat tag in the fixture, so null.
+    REQUIRE(text.contains("guardian_backend"));
+    CHECK(text["guardian_backend"].is_null());
 
     // #2712: this tool already returned a flat object pre-#2712 (no bare-
     // array wire-format concern), so structuredContent is just the SAME

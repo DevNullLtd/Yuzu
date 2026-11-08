@@ -1831,6 +1831,7 @@ if build_server
       'unit/server/test_guardian_rule_scope_preflight.cpp', # #5610: the fan-out resolves every rule scope before sending and aborts on a transient failure
       'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
+      'unit/server/test_guardian_backend_fleet_tags.cpp', # #2240: yuzu.guardian_backend writer/reader pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -2086,6 +2087,15 @@ if build_server
       # matching server-side *_fleet_tags.hpp table - a full writer↔reader compile/run
       # bind, no silent zero-reporting drift. Header-only templates - no link to
       # yuzu_agent_core, just the include path.
+      #
+      # #2240: test_guardian_backend_fleet_tags.cpp includes guardian_backend.hpp
+      # (emit_guardian_backend_heartbeat_tag), the first server test TU to pull in
+      # guardian_engine.hpp. Its include chain is <yuzu/plugin.h>, kv_store.hpp,
+      # guard.hpp and guardian_preserved_tally.hpp (-> common/include/yuzu/log_token.hpp)
+      # and spark.hpp: all header-only, found through this block plus the common/include
+      # root that yuzu_server_core_dep already carries (server/core/meson.build,
+      # its include_directories('include') and '../../common/include'); no link to
+      # yuzu_agent_core.
       #
       # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
@@ -4239,6 +4249,21 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
   args: [files('test_dedup_fleet_tags_lexical.py')],
   suite: 'agent',
   timeout: 30,
+)
+
+# guardian_backend reader wiring (#2240): lexical pins for what no unit test can see. Every
+# health-store freshness read (sweep, perf/net snapshot, both device accessors) passes the ONE
+# kAgentHealthStaleness constant (the tests only ever use windows of 0 and 300 s); the field is
+# absent from AgentRegistry::to_json_obj(), server.cpp, the legacy /api/agents routes and the
+# dashboard row (HARD RULE); and ServerImpl::health_store_ is declared before every DeviceApi
+# holder (destruction order). Carries its own in-memory mutation self-test. No build required.
+# Suite 'docs', like the other server-source lexical gates: a 'server'-only label is covered by
+# neither the Windows --suite list nor its --exclude-suite list (assert-suite-cover.py).
+test('guardian_backend reader wiring lexical gate (#2240)',
+  _python3_test,
+  args: [files('test_guardian_backend_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested

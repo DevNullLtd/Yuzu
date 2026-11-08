@@ -7,6 +7,7 @@
 #include <map>
 #include <string_view>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "custom_properties_store.hpp"
 #include "dedup_fleet_tags.hpp" // agent command-dedup store fleet telemetry (#3663)
 #include "dex_perf_rules.hpp"
+#include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet rollup + device accessors (#2240)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
@@ -2423,6 +2425,78 @@ AgentHealthStore::net_snapshot(std::chrono::seconds staleness) const {
     return out;
 }
 
+namespace {
+/// The shared body of guardian_backend_for / guardian_backend_of: staleness filter, then the SAME
+/// closed-set parse recompute_metrics uses. nullopt for absent, empty, rejected or stale; never a
+/// default. Caller holds AgentHealthStore::mu_.
+std::optional<std::string_view>
+guardian_backend_from_snapshot(const AgentHealthSnapshot& snap,
+                               std::chrono::steady_clock::time_point now,
+                               std::chrono::seconds staleness) {
+    if ((now - snap.last_seen) > staleness)
+        return std::nullopt; // the sweep prunes only every 15 s, so the accessor filters itself
+    static const std::string kKeyGuardianBackend{kGuardianBackendTag};
+    const auto it = snap.status_tags.find(kKeyGuardianBackend);
+    if (it == snap.status_tags.end() || it->second.empty())
+        return std::nullopt; // NotReported
+    const auto idx = parse_guardian_backend_token(it->second);
+    if (!idx)
+        return std::nullopt; // rejected: counted by the gauge, null on the device
+    return guardian_backend_token_view(*idx);
+}
+} // namespace
+
+namespace {
+/// A busy-wait on steady_clock. Used only where sleep_for cannot honour a microsecond request
+/// (see kGuardianBackendPause). Compiled on every platform so the POSIX build still checks it.
+[[maybe_unused]] void spin_for(std::chrono::microseconds d) {
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+}
+
+/// The pause between slices of guardian_backend_for. Called with mu_ RELEASED.
+void pause_between_slices() {
+#ifdef _WIN32
+    spin_for(kGuardianBackendPause); // MSVC sleep_for rounds up to a 1-15.6 ms tick
+#else
+    std::this_thread::sleep_for(kGuardianBackendPause);
+#endif
+}
+} // namespace
+
+std::vector<std::optional<std::string_view>>
+AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
+                                       std::chrono::seconds staleness) const {
+    std::vector<std::optional<std::string_view>> out;
+    out.reserve(agent_ids.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (std::size_t base = 0; base < agent_ids.size(); base += kGuardianBackendSlice) {
+        if (base != 0)
+            pause_between_slices(); // lock NOT held; see the constant
+        const auto end = std::min(agent_ids.size(), base + kGuardianBackendSlice);
+        std::lock_guard lock(mu_);
+        for (std::size_t i = base; i < end; ++i) {
+            const auto it = snapshots_.find(agent_ids[i]);
+            out.push_back(it == snapshots_.end()
+                              ? std::nullopt
+                              : guardian_backend_from_snapshot(it->second, now, staleness));
+        }
+    }
+    return out;
+}
+
+std::optional<std::string_view>
+AgentHealthStore::guardian_backend_of(const std::string& agent_id,
+                                      std::chrono::seconds staleness) const {
+    std::lock_guard lock(mu_);
+    const auto it = snapshots_.find(agent_id);
+    if (it == snapshots_.end())
+        return std::nullopt;
+    return guardian_backend_from_snapshot(it->second, std::chrono::steady_clock::now(),
+                                          staleness);
+}
+
 void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                          std::chrono::seconds staleness) {
     std::lock_guard lock(mu_);
@@ -2470,6 +2544,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_spark_quarantined");
     metrics.clear_gauge_family("yuzu_fleet_spark_slow_op");
     metrics.clear_gauge_family("yuzu_fleet_spark_unsupported"); // F7, #2298 rung 2
+    // #2240: categorical family, rebuilt each sweep (absent-not-zero). The two meta gauges
+    // (_reporting, _tag_rejected) are NOT cleared: they are re-set unconditionally below, so a
+    // cleared-then-unpublished window can never read as "sweep did not run".
+    metrics.clear_gauge_family(kGuardianBackendGauge);
     // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Same rule, and it
     // bites hardest here: the writer is sparse (a 0 counter ships no tag), so on a
     // healthy or inert fleet NOBODY reports and every family must be ABSENT. A
@@ -2685,6 +2763,15 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             keys[i] = kGuardianIoCeilingMetrics[i].tag;
         return keys;
     }();
+    // #2240: yuzu.guardian_backend. A categorical partition count: each recognised agent is in
+    // exactly one {os,backend} bucket. gb_reporting is the valid-tag denominator, gb_tag_rejected
+    // the non-empty-but-unparseable count (never bucketed, never `legacy`).
+    std::unordered_map<std::string, std::array<int, kNGuardianBackendTokens>> guardian_backend_os;
+    int gb_reporting = 0;
+    int gb_tag_rejected = 0;
+    // Same static-destruction-safety rationale as gj_keys above: built once, get_view takes a
+    // const std::string& so the C-string constant would otherwise heap-construct a key per agent.
+    static const std::string kKeyGuardianBackend{kGuardianBackendTag};
     int gh_reporting = 0;
     int gh_tag_rejected = 0;
     // Same static-destruction-safety rationale as gj_keys above.
@@ -3068,6 +3155,22 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             }
         }
 
+        // #2240: Guardian detection backend (legacy/spark/spark_failed/unwired). A categorical
+        // partition by net_os. EMPTY (absent key or present-empty value) is NotReported: skipped,
+        // not rejected, and never read as `legacy` (guardian_backend_fleet_tags.hpp). A non-empty
+        // value outside the closed table is REJECTED: counted once, in no bucket. CLOCK: this
+        // read, like the staleness prune above, keys off last_seen because the tag rides every
+        // beat today; a status-beat split (H4a) must move it (see the header's CLOCK paragraph).
+        if (const std::string_view backend_raw = get_view(kKeyGuardianBackend);
+            !backend_raw.empty()) {
+            if (const auto idx = parse_guardian_backend_token(backend_raw)) {
+                ++guardian_backend_os[net_os][*idx];
+                ++gb_reporting;
+            } else {
+                ++gb_tag_rejected;
+            }
+        }
+
         // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Unconditional -
         // unlike spark there is no posture/denominator tag to gate on: the writer is
         // sparse, so simply having a key IS the report. Reads go through get_view() so
@@ -3415,6 +3518,21 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));
+
+    // #2240: one series per (os, backend) that has at least one agent; a pair nobody is in stays
+    // ABSENT (the > 0 guard), never a pre-seeded 0. Label values come from the closed token
+    // table and the normalize_os allowlist, never from agent bytes. The meta gauges publish
+    // every sweep including 0.
+    for (const auto& [os, counts] : guardian_backend_os)
+        for (std::size_t i = 0; i < kNGuardianBackendTokens; ++i)
+            if (counts[i] > 0)
+                metrics
+                    .gauge(kGuardianBackendGauge,
+                           {{kGuardianBackendLabelOs, os},
+                            {kGuardianBackendLabelBackend, kGuardianBackendTokens[i]}})
+                    .set(static_cast<double>(counts[i]));
+    metrics.gauge(kGuardianBackendReportingGauge).set(static_cast<double>(gb_reporting));
+    metrics.gauge(kGuardianBackendTagRejectedGauge).set(static_cast<double>(gb_tag_rejected));
 }
 
 void AgentHealthStore::recompute_perf_os_gauges(
