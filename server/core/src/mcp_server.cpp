@@ -11739,6 +11739,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     rs_fail(bad.error());
                     return;
                 }
+                // Re-admitted after validation, like register and update (and the REST twin).
+                if (!rs_admit(true, verb, target, /*check_grant=*/false))
+                    return;
                 if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, target,
                               rs::audit_detail_reset("", body))) {
                     mcp_audit("failure", "audit unavailable; marks not reset");

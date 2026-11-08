@@ -147,7 +147,8 @@ struct NewRevocationSource {
         std::vector<std::string> confirmed_address_classes;
     };
     std::vector<Url> urls;
-    /// `replace` only: refuse (kVersionConflict) unless the stored config_version equals this.
+    /// `replace` only: a body that would change the stored configuration is refused
+    /// (kVersionConflict) unless this is set and equals the stored config_version.
     std::optional<std::int64_t> expected_config_version;
 };
 

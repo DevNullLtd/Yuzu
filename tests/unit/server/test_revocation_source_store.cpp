@@ -63,6 +63,12 @@ NewRevocationSource make_source(const std::string& name, char ca_digit,
     return n;
 }
 
+/// The caller's precondition on a changing replace (the store refuses a body without it).
+NewRevocationSource at_version(NewRevocationSource n, std::int64_t version) {
+    n.expected_config_version = version;
+    return n;
+}
+
 } // namespace
 
 #define RS_STORE(store_var)                                                                        \
@@ -241,8 +247,9 @@ TEST_CASE("RevocationSourceStore: a full replace; an equal body changes nothing"
 
     // A renamed, re-keyed, re-URLed source bumps the version exactly once.
     const auto changed = store.replace(
-        *id, make_source("Corp CA (renewed)", '1', {'a', 'b'},
-                         {"http://crl.example.com/a.crl", "http://crl2.example.com/b.crl"}));
+        *id, at_version(make_source("Corp CA (renewed)", '1', {'a', 'b'},
+                                    {"http://crl.example.com/a.crl", "http://crl2.example.com/b.crl"}),
+                        1));
     REQUIRE(changed.has_value());
     CHECK(changed->changed);
     CHECK(changed->dropped_urls == 0);
@@ -289,7 +296,8 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
 
     // Drop URL b and key 'b': URL b's fetch_status and CRL go (cascade), and so does any CRL that
     // verified only under key b (here the same row). CRL a (key 'a') survives.
-    const auto r = store.replace(*id, make_source("Corp CA", '1', {'a'}, {"http://crl.example.com/a.crl"}));
+    const auto r = store.replace(
+        *id, at_version(make_source("Corp CA", '1', {'a'}, {"http://crl.example.com/a.crl"}), 1));
     REQUIRE(r.has_value());
     CHECK(r->changed);
     CHECK(r->dropped_urls == 1);
@@ -307,11 +315,28 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
 
     // Dropping only key 'a' now (keeping a different cert over the same SPKI would keep the CRL;
     // here a new key 'c' replaces it): the CRL that verified under SPKI 1.. is deleted.
-    const auto r2 = store.replace(*id, make_source("Corp CA", '1', {'c'}, {"http://crl.example.com/a.crl"}));
+    const auto r2 = store.replace(
+        *id, at_version(make_source("Corp CA", '1', {'c'}, {"http://crl.example.com/a.crl"}), 2));
     REQUIRE(r2.has_value());
     CHECK(r2->dropped_keys == 1);
     CHECK(r2->crls_deleted == 1);
     CHECK(r2->source.held_crl_count == 0);
+}
+
+TEST_CASE("RevocationSourceStore: a changing replace that names no version is refused",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    const auto r = store.replace(*id, make_source("Renamed", '1')); // no expected_config_version
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == RKind::kVersionConflict);
+    CHECK(r.error().existing_id == 1); // carries the stored version
+    CHECK(store.get(*id)->name == "Corp CA");
+    // An equal body needs no version: it writes nothing.
+    const auto same = store.replace(*id, make_source("Corp CA", '1'));
+    REQUIRE(same.has_value());
+    CHECK_FALSE(same->changed);
 }
 
 TEST_CASE("RevocationSourceStore: a replace naming a different CA subject is refused",

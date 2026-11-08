@@ -978,6 +978,39 @@ TEST_CASE("revocation source REST: the audit rows of a lifecycle", "[revocation_
           std::vector<std::string>{"attempted", "success"});
 }
 
+TEST_CASE("revocation source REST: an id that cannot be a source id is a 404 with an audit row",
+          "[revocation_source][pg]") {
+    Fx fx;
+    fx.admin(false);
+    // The routes admit any run of digits; 20 of them cannot be a source id. Each answers 404 and
+    // leaves the not-found result label against a fixed target.
+    const std::string want = rs::audit_result_for(
+        rs::ServiceError{rs::ServiceError::Kind::kNotFound, "no such revocation source", "", 0});
+    const std::string huge = "99999999999999999999";
+    const std::string base(kBase);
+    const auto g = fx.h.sink.Get(base + "/" + huge);
+    const auto p = fx.h.sink.Put(base + "/" + huge, R"({"expected_config_version":1})");
+    const auto d = fx.h.sink.Delete(base + "/" + huge);
+    const auto r = fx.h.sink.Post(base + "/" + huge + "/reset-high-water", "{}");
+    for (const auto* resp : {&g, &p, &d, &r}) {
+        REQUIRE(*resp);
+        CHECK((*resp)->status == 404);
+    }
+    for (const char* action :
+         {"crypto.revocation_source.view", "crypto.revocation_source.remove",
+          "crypto.revocation_source.reset_high_water"}) {
+        INFO(action);
+        const auto rows = fx.rows(action);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows.back().target_id == "invalid-id");
+        CHECK(rows.back().result == want);
+    }
+    const auto upd = fx.rows("crypto.revocation_source.update");
+    REQUIRE(upd.size() == 1);
+    CHECK(upd.back().target_id == "invalid-id");
+    CHECK(upd.back().result == want);
+}
+
 TEST_CASE("revocation source REST: hostile free text is neutralised in audit details",
           "[revocation_source][pg]") {
     Fx fx;

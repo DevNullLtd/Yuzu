@@ -170,6 +170,19 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         return true;
     };
 
+    // A path id that is not a valid source id (the route admits any run of digits) answers 404 and
+    // leaves an audit row, like every other refusal on this surface. The target is a fixed token,
+    // never the caller's digits.
+    const auto unknown_id = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& verb, const std::string& cid) {
+        const rs::ServiceError e{rs::ServiceError::Kind::kNotFound, "no such revocation source", "",
+                                 0};
+        (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, verb, audit_result_for(e),
+                                            kTargetType, "invalid-id",
+                                            rs::audit_detail_error(cid, e));
+        rest_error(res, 404, "no such revocation source");
+    };
+
     // Re-run the administrator decision AFTER name resolution and before the `attempted` row and
     // the commit: validation can take many seconds, and a demotion applied meanwhile (on this or
     // another replica) must not still commit a durable egress target.
@@ -225,7 +238,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  const auto id = rs::parse_source_id(raw);
                  if (!id) {
-                     rest_error(res, 404, "no such revocation source");
+                     unknown_id(req, res, verb, cid);
                      return;
                  }
                  auto src = deps_.service->get(*id);
@@ -309,7 +322,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  const auto id = rs::parse_source_id(raw);
                  if (!id) {
-                     rest_error(res, 404, "no such revocation source");
+                     unknown_id(req, res, verb, cid);
                      return;
                  }
                  nlohmann::json body;
@@ -362,7 +375,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         return;
                     const auto id = rs::parse_source_id(raw);
                     if (!id) {
-                        rest_error(res, 404, "no such revocation source");
+                        unknown_id(req, res, verb, cid);
                         return;
                     }
                     if (!detail::audit_attempted(deps_.audit_fn, req, res, verb, kTargetType, raw,
@@ -401,7 +414,7 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                       return;
                   const auto id = rs::parse_source_id(raw);
                   if (!id) {
-                      rest_error(res, 404, "no such revocation source");
+                      unknown_id(req, res, verb, cid);
                       return;
                   }
                   // An empty body is the same as `{}` (reset to now).

@@ -619,9 +619,10 @@ RevocationSourceStore::replace(std::int64_t id, const NewRevocationSource& src) 
     // version moved because of it), which is a no-op success, never a conflict. Only a body that
     // would CHANGE the configuration must prove it was read from the current version, so a stale
     // body (an approved MCP call, a form loaded before another administrator's change) cannot
-    // silently revert a newer configuration.
-    if (!equal && src.expected_config_version &&
-        *src.expected_config_version != cur.config_version) {
+    // silently revert a newer configuration. A changing body that names no version is refused too:
+    // the precondition is part of the contract, not an option a caller can omit.
+    if (!equal && (!src.expected_config_version ||
+                   *src.expected_config_version != cur.config_version)) {
         return std::unexpected(RevocationSourceStoreError{
             Kind::kVersionConflict, "config_version has moved on", cur.config_version});
     }
