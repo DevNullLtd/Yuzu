@@ -427,13 +427,24 @@ TEST_CASE("Echo rename: the migrated crossplatform.tar.query row equals the fres
     }
 
     // Every column of the table, read from the catalogue so a column added later is compared
-    // too. Only the three write-time stamps are exempt: they record when and by whom the row was
-    // written, which is the migration's moment on one side and the reseed's on the other.
+    // too. Two kinds are exempt from equality:
+    //  - the three write-time stamps: they record when and by whom the row was written, which is
+    //    the migration's moment on one side and the reseed's on the other;
+    //  - the three TEXT columns this change rewrites in content/definitions/echo.yaml for the
+    //    roll-up-only release (description, yaml_source and result_schema carry the reworded
+    //    query prose and result-column descriptions). kPreRenameQueryEnvelope is frozen at the
+    //    pre-rename wording, so after the reword these three can no longer be equal; they are
+    //    pinned structurally below instead. Everything else (id, name, plugin, action, type,
+    //    platforms, approval and concurrency mode, the parameter schema, ...) must still match.
     const auto columns = split_csv(
         one(dsn, "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM "
                  "information_schema.columns WHERE table_schema = 'instruction_store' AND "
                  "table_name = 'instruction_definitions'"));
     const std::vector<std::string> stamps{"created_at", "updated_at", "created_by"};
+    const std::vector<std::string> reworded{"description", "yaml_source", "result_schema"};
+    const auto is_in = [](const std::vector<std::string>& v, const std::string& c) {
+        return std::find(v.begin(), v.end(), c) != v.end();
+    };
     const auto differs = [&](const std::string& col) {
         return one(dsn, "SELECT count(*) FROM instruction_store.migrated_oracle m JOIN "
                         "instruction_store.instruction_definitions d USING (id) WHERE m." +
@@ -441,10 +452,10 @@ TEST_CASE("Echo rename: the migrated crossplatform.tar.query row equals the fres
     };
     CHECK(one(dsn, "SELECT count(*) FROM instruction_store.migrated_oracle m JOIN "
                    "instruction_store.instruction_definitions d USING (id)") == "1");
-    REQUIRE(columns.size() > stamps.size());
+    REQUIRE(columns.size() > stamps.size() + reworded.size());
     std::size_t compared = 0;
     for (const auto& col : columns) {
-        if (std::find(stamps.begin(), stamps.end(), col) != stamps.end())
+        if (is_in(stamps, col) || is_in(reworded, col))
             continue;
         ++compared;
         if (differs(col) != "0") {
@@ -456,7 +467,35 @@ TEST_CASE("Echo rename: the migrated crossplatform.tar.query row equals the fres
                                  << "]");
         }
     }
-    CHECK(compared == columns.size() - stamps.size()); // the stamps exist; nothing else was skipped
+    // the stamps and the reworded columns exist; nothing else was skipped
+    CHECK(compared == columns.size() - stamps.size() - reworded.size());
+
+    // Structural identity of the reworded columns: the migration must have left the migrated row
+    // a well-formed echo definition whose shape is the shipped one's, whatever the prose says.
+    const auto migrated = [&](const char* col) {
+        return one(dsn, std::string("SELECT ") + col +
+                            " FROM instruction_store.migrated_oracle");
+    };
+    const auto shape = [](const std::string& result_schema_json) {
+        // (name, type, platforms) of each result column; descriptions and examples are prose.
+        nlohmann::json out = nlohmann::json::array();
+        const auto doc = nlohmann::json::parse(result_schema_json, nullptr, false);
+        REQUIRE_FALSE(doc.is_discarded());
+        for (const auto& c : doc.at("columns"))
+            out.push_back({c.at("name"), c.at("type"), c.at("platforms")});
+        return out;
+    };
+    const auto fresh_env = nlohmann::json::parse(fresh);
+    CHECK(shape(migrated("result_schema")) == shape(fresh_env.at("result_schema").get<std::string>()));
+    CHECK(shape(migrated("result_schema")).size() == 5);
+    const auto yaml = migrated("yaml_source");
+    for (const char* needle : {"id: crossplatform.echo.query", "plugin: echo", "action: query",
+                               "requiredPlugins: [echo]", "kind: InstructionDefinition"})
+        CHECK(yaml.find(needle) != std::string::npos);
+    for (const char* stale : {"plugin: tar", "requiredPlugins: [tar]", "crossplatform.tar", "TAR"})
+        CHECK(yaml.find(stale) == std::string::npos);
+    CHECK(migrated("description").rfind("Queries the Echo event database", 0) == 0);
+    CHECK(migrated("description").find("TAR") == std::string::npos);
 
     // Positive control: the comparison does see a difference when one exists.
     exec_sql(dsn, "UPDATE instruction_store.migrated_oracle SET yaml_source = yaml_source || 'x'");
@@ -752,7 +791,7 @@ TEST_CASE("Echo rename: result_set_store v3 rewrites the source kind and matcher
         yuzu::server::ResultSetStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "result_set_store") == "3");
+    CHECK(version_of(dsn, "result_set_store") == "4"); // v3 rewrote the rows, v4 adds agents_failed
     CHECK(one(dsn, "SELECT source_kind || '|' || matcher FROM result_set_store.result_sets WHERE "
                    "id = 'rs_legacy1'") == "echo_query|{\"kind\":\"echo_rows_ge\",\"n\":1}");
     CHECK(one(dsn, "SELECT source_kind || '|' || matcher FROM result_set_store.result_sets WHERE "
