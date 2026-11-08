@@ -828,7 +828,8 @@ int main(int argc, char* argv[]) {
     app.add_option("--mfa-reset", mfa_reset_user,
                    "Break-glass: clear MFA enrollment for the named user and end its sessions, "
                    "then exit (audited recovery from MFA lockout; applies the auth and "
-                   "session_store v3 migrations, after which the previous build cannot start)");
+                   "session_store v3 migrations, after which the previous build is not supported "
+                   "against this database)");
 
     // Break-glass arm mode (runs and exits, no server startup). Arms the
     // configured --break-glass-user for --break-glass-window-secs so it can log

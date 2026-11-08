@@ -1762,8 +1762,9 @@ them. A gated route answers **`503`** and does not run in four cases:
   [Post-restore verification](#post-restore-verification)). Reason `mfa_binding_unenforced`: the
   database trigger that binds a proof to the factor generation is **not observed in force** on the
   account store. The ordinary read fault is transient, and so is an inconclusive trigger validation (a
-  catalog query that could not run: it is answered with `mfa_binding_unenforced` until a later check
-  succeeds). The remaining causes are sticky and do not clear by themselves: the two trigger failures are the incident in
+  catalog query that could not run: on the account store it is answered with `mfa_binding_unenforced` until a later check
+  succeeds; on the session store it is answered with `mfa_proof_unavailable` for the read whose check could not run and
+  counts `yuzu_auth_session_store_degrade_total{op="validate"}`). The remaining causes are sticky and do not clear by themselves: the two trigger failures are the incident in
   [MFA binding enforcement failed](#mfa-binding-enforcement-failed) (a SIEM rule for it must key on both
   tokens, and `mfa_proof_unavailable` also covers the ordinary read fault, so read the gauges before
   concluding), and a non-positive generation is repaired per account as described under
@@ -2065,7 +2066,7 @@ returns valid, and the next read retries the check at once. A reader arriving wh
 is still in flight sees the previous state, a window bounded by one catalog query. The transition logs a warning
 naming the inconclusive trigger validation once per episode, and the gauge `yuzu_auth_mfa_binding_enforcement_ok{store="auth"}`
 still reads `1` while the latch is set (only `YuzuStepUpGateUnavailable` fires, and only when the refusals hold its rate: at least 3 in 10 minutes on one `surface`, sustained for 5 minutes, so a replica with less MFA traffic than that raises no alert while the latch is set). On the session store the same
-query does not refuse session validation (the row is served), but that one read is flagged unverified, so a local binding
+query does not refuse session validation (the row is served), but that read (and any read that overlaps it before a check succeeds) is flagged unverified, so a local binding
 read is refused as a transient `mfa_proof_unavailable`, counted as `yuzu_auth_session_store_degrade_total{op="validate"}` with
 both gauges still `1`; the next read retries the check, and the server log names it ("rebind-guard check could not run").
 

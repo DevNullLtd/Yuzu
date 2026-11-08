@@ -1312,7 +1312,8 @@ public:
         REQUIRE(lease_);
         PgResult begin = pg::exec_params(lease_.get(), "BEGIN", std::vector<std::string>{});
         REQUIRE(begin.status() == PGRES_COMMAND_OK);
-        open_ = true; // a failing REQUIRE below still rolls back through the destructor
+        open_ = true; // a failing REQUIRE below throws out of this constructor, so the destructor
+                      // does not run: the lease's release in the pool rolls the open transaction back
         PgResult lock = pg::exec_params(
             lease_.get(), "LOCK TABLE session_store.sessions IN ACCESS EXCLUSIVE MODE",
             std::vector<std::string>{});
@@ -1374,12 +1375,12 @@ TEST_CASE("SessionStore v3: a find keeps its own inconclusive verdict when a con
     REQUIRE(store.create(make_params("h1", "pia")).has_value());
     store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
 
-    SessionsTableLock lock(pool);
-    yuzu::test::Workers workers([&] { lock.rollback(); }); // declared AFTER the lock it releases
-    bool a_served = false;
+    bool a_served = false; // written by one worker each, read only after join_all()
     bool a_unverified = false;
     bool b_served = false;
     bool b_unverified = true;
+    SessionsTableLock lock(pool);
+    yuzu::test::Workers workers([&] { lock.rollback(); }); // declared AFTER the lock it releases
 
     store.set_binding_validation_inconclusive_for_test(true);
     workers.add([&] {

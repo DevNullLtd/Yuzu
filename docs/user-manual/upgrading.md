@@ -368,7 +368,7 @@ All six `site` series of `yuzu_secure_random_failure_total` (the four token site
 
 **Who is affected.** Anyone with a SIEM or webhook rule keyed on `mfa.enroll.failed` with `reason=store_unavailable` or on the old audit detail text, and anyone with a Prometheus rule on `yuzu_auth_secret_unavailable_total{route="mfa_enroll"|"login"}` or `yuzu_auth_read_degrade_total` who relied on it to see a random-number failure. Those rules stop matching this condition without an error. An operator who already pages on `rate(yuzu_secure_random_failure_total[5m]) > 0` now also gets paged for MFA faults.
 
-**What to do.** Re-key SIEM filters to `csprng_unavailable`, and add your own Prometheus rule if you do not have one (none ships): `sum by (site) (rate(yuzu_secure_random_failure_total[5m])) > 0`. **During a rolling upgrade** counters and audit text are per replica, so an un-upgraded replica still reports this fault the old way. Alert on both until every replica runs the same build. Response steps are in the [auth-store recovery runbook](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503); see also [Secret-minting failure metric](metrics.md#secret-minting-csprng-failure-metric).
+**What to do.** Re-key SIEM filters to `csprng_unavailable`, and add your own Prometheus rule if you do not have one (none ships): `sum by (site) (rate(yuzu_secure_random_failure_total[5m])) > 0`. **During a rolling upgrade** counters and audit text are per replica, so an un-upgraded replica still reports this fault the old way. Alert on both until every replica runs the same build. This applies to the #6995 counters only: the #6079 build forbids mixed-version operation (see [the cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079)). Response steps are in the [auth-store recovery runbook](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503); see also [Secret-minting failure metric](metrics.md#secret-minting-csprng-failure-metric).
 
 ## ⚠️ Breaking: four dashboard mutations are refused (503) while the audit store is unavailable (#3619)
 
@@ -1172,11 +1172,11 @@ window is 0 or less. This release has no supported return to v0.14.1 (see "Deplo
 ## Breaking: MFA proofs are bound to the factor they were earned with; hard cutover with no upgrade path or rollback (#6079)
 
 **This build is a hard cutover.** It has no upgrade path, no rolling or mixed-version window (mixed-version
-operation is unsupported) and no rollback of the new binary's migrations: the only way back is restoring the backup
+operation is unsupported) and no rollback of the new binary's migrations: the way back is restoring the backup
 taken in step 2 below, which puts the previous build's data back (it does not undo the migrations in place). That backup covers the `auth` and
 `session_store` schemas only, so it is a complete way back only while the new build has not yet started (step 4): the first
 start also applies the build's other schema migrations, and a previous build run against a database that is ahead of it
-logs a warning and starts anyway (see [When a server build finds its database ahead of it](#when-a-server-build-finds-its-database-ahead-of-it-every-postgres-store)).
+starts anyway, and a build from before that warning existed, which includes v0.14.1, logs nothing at all (see [When a server build finds its database ahead of it](#when-a-server-build-finds-its-database-ahead-of-it-every-postgres-store)).
 For a way back that still works after step 4, also take a whole-database `pg_dump` in step 2 and restore that into a fresh
 database. The
 carry-over procedure below only carries an existing deployment's data across the cutover; it is not an upgrade path and does not
@@ -1303,7 +1303,7 @@ alone. It is not an upgrade path and widens nothing else.
    `--schema` options to the `pg_dump` call. Go on only after `OK:` (or the form's own success line). This cutover
    rotates no KEK, so the keys archive is the directory as it stands now.
 
-   **Restoring this backup is the only way back, and it is a restore of the previous build's data, not a rollback.**
+   **Restoring a backup taken in this step is the only way back, and it is a restore of the previous build's data, not a rollback.**
    A restore rolls credentials and sessions back to the dump (passwords, session rows, lockout state and MFA
    enrolments return to that moment), and only the `auth` and `session_store` schemas: the role grants, SCIM,
    API-token and group rows written after the cutover stay as they are. A grant for a user created after the dump
@@ -1361,9 +1361,8 @@ alone. It is not an upgrade path and widens nothing else.
    two version numbers you recorded before the cutover if they differ from 2 and 2; without the `UPDATE`
    statements the restored tables would sit under `schema_meta` rows that still say 3 and 3. The `DELETE` ends
    every session: the restored rows (including ones that were revoked after the dump was taken) would otherwise
-   be valid until you end them by hand; run it now, with the replicas stopped, before the previous build starts. This sequence returns only the two schemas: after
-step 4 has run, the database's other stores are ahead of the previous build, so restore a whole-database dump into a fresh
-database instead.
+   be valid until you end them by hand; run it now, with the replicas stopped, before the previous build starts. This sequence returns only the two schemas; the way back
+after step 4 is the whole-database dump described below.
    The `tar` command restores the keys directory from the same pair (`certs` under `/etc/yuzu`, ownership and
    modes kept). Then start the previous build (the binary or image you kept), and follow the runbook's
    [restore steps](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) ("A restore rolls credentials
@@ -1372,12 +1371,21 @@ database instead.
    that apply to the previous build: expect `auth` 2 and `session_store` 2, no binding trigger and no binding
    gauge there. The dump has no binding triggers, so there is nothing to check for them on the previous-build path.
    Starting the new build again afterwards re-runs the two migrations from the restored versions.
+
+   **Way back after step 4: a whole-database dump.** The sequence above returns only the two schemas. For a way back that
+   still works once the new build has started and applied its other migrations, also take a whole-database dump in this
+   step: the same `pg_dump` command without any `--schema` option, written next to the pair with the same `STAMP`. To use it,
+   create a fresh database, point `YUZU_POSTGRES_DSN` at it, run `pg_restore --single-transaction --no-owner
+   --exit-on-error` of that dump into it, restore the keys archive from the same `STAMP`, and run
+   `DELETE FROM session_store.sessions;` before the previous build starts (a restore brings back sessions that were
+   revoked after the dump). The `schema_meta` updates of the two-schema sequence are not needed, because that dump predates
+   the cutover. Everything written after the dump is lost, including agent registrations, tokens and audit rows.
 3. Install the new build but do not start any replica yet, then run `yuzu-server --mfa-reset <user>` on the host
    for each enrolled operator, administrators first. This works before any replica has served: the command opens
    the auth store itself (which applies the `auth` v3 migration), clears the factor, and then opens the session
    store (which applies the `session_store` v3 migration) to end the account's sessions, so no enrolled account is
    ever refused by a serving replica. Two consequences: the first
-   reset migrates the database, so from that point the previous build can no longer be started without the
+   reset migrates the database, so from that point the previous build is not supported against this database without the
    restore in step 2, and a reset ends that account's sessions. The command takes one user per run, needs a host
    shell, the Postgres DSN and the keys directory (`docs/ops-runbooks/auth-db-recovery.md`, "The `--mfa-reset` CLI
    (audited)"), and an affected user cannot recover on their own. `yuzu-server --mfa-reset ""` does not reset
