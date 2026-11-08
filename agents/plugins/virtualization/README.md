@@ -3,12 +3,12 @@
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 | | |
 |---|---|
-| **What it does** | Virtualization facts: VM or not, which hypervisor, container membership |
-| **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · gathered (crossplatform.virtualization.host) |
+| **What it does** | Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions |
+| **Version** | 1.1.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.virtualization.host, windows.virtualization.wsl) |
 | **Platforms** | Windows 🟡 constrained · macOS ✅ · Linux ✅ |
-| **Actions** | `host` (definition `crossplatform.virtualization.host`) |
-| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Actions** | `host` (definition `crossplatform.virtualization.host`) · `wsl` (definition `windows.virtualization.wsl`) |
+| **Security** | `host`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `wsl`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -79,19 +79,23 @@ The order matters: a positive identification is never outranked by a negative or
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `host` | 🟡 constrained · rung 1 · CPUID leaves 1 and 0x40000000-0x40000003 (__cpuid, x86) and the SMBIOS System Information table via GetSystemFirmwareTable('RSMB') | ✅ supported · rung 1 · sysctlbyname kern.hv_vmm_present and hw.model | ✅ supported · rung 1 · CPUID leaves 1 and 0x40000000-0x40000003 (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type, /.dockerenv, /run/.containerenv, /run/systemd/container and /proc/self/cgroup (bounded reads, no subprocess) |
+| `wsl` | 🟡 constrained · rung 1 · Reg*W reads of HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\\MSI, the HKLM ProfileList (profile SIDs and folder paths; no privilege) and each local profile's Software\\Microsoft\\Windows\\CurrentVersion\\Lxss key through the shared with_user_hive ladder (loaded HKU hive first, else a guarded offline NTUSER.DAT mount under SeBackup/SeRestore and the process-wide offline-hive lock); no subprocess | ⛔ unsupported | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
 - **`host` / Windows** — container not read: always unknown, windows:virtualization:container:not_read; an ARM64 build has no CPUID and reads unknown (windows:virtualization:cpuid:unavailable) unless SMBIOS names a VM vendor, and does not detect a Hyper-V or VBS host; no ARM64 build ships, and the x64 agent on a Windows-on-ARM device reads whatever CPUID the emulation presents (not measured)
 - **`host` / macOS** — no CPUID on arm64: the sysctl is the readable negative; container is always no
 - **`host` / Linux** — ARM has no CPUID: SMBIOS and OS hints alone decide, and a host with neither reads unknown, never bare_metal; a KVM host reads bare_metal (its own CPUID is not virtualised) but a Xen dom0 reads guest/xen; a cgroup-v2 namespace-obscured root reads container unknown; a container without a marker file or systemd record can read container no when its readable, non-root cgroup path has no recognised runtime signature
+- **`wsl` / Windows** — a profile whose hive was reached by neither arm is counted and reported on its own profile row, never read as having no distributions; a registry link planted at the Lxss key or at a distribution key is detected and reported (windows:virtualization:wsl:lxss_link), never followed; wsl2 counts version-2 distributions and is not a VM count (the utility VM's running state is not read); base, VHD and shortcut paths, SIDs, uids and hive mount names are never emitted; package version - means unavailable; the offline mount calls have no deadline (the walk is bounded in work, not in time: at most 512 profiles are mounted per dispatch)
+- **`wsl` / macOS** — Windows-only: WSL distributions are a Windows feature
+- **`wsl` / Linux** — Windows-only: WSL distributions are a Windows feature
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent daemon (LocalSystem today, `docs/agent-privilege-model.md`) | `host`: None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable`. `wsl`: None beyond what the agent account already holds: the action uses the same `with_user_hive` span `installed_apps.list_per_user` already uses. The `HKLM` ProfileList (profile SIDs and folder paths) and the WSL package `Version` need no privilege, nor does a loaded `HKU\<SID>` hive; a logged-off profile's `NTUSER.DAT` is mounted offline with `SeBackupPrivilege` and `SeRestorePrivilege`, already held by the agent account and enabled only inside the offline arm, under the process-wide offline-hive lock and the default-on hive-file guard | `host`: Measured 2026-11-07 on a Windows 11 host with Hyper-V, VBS and WSL2 enabled, from an elevated interactive session (not LocalSystem): CPUID and the firmware table both answered; whether an unelevated caller gets the table was not measured. `wsl`: Not yet measured on a Windows host in this revision (the unit tests drive the walk and the hive-access outcomes through fakes); the Windows sample header records the identity and whether a logged-off profile existed | `host`: `CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine. `wsl`: a hardened install that strips the two privileges still reads every logged-on profile; a logged-off one is a `profile` row with outcome `privilege_missing` and the token `windows:virtualization:wsl:hive_privilege_missing`. A refused hive file is `file_refused` with the guard's reason, a refused live root `access_denied`; none is read as having no distributions |
+| Windows | agent daemon (LocalSystem today, `docs/agent-privilege-model.md`) | `host`: None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable`. `wsl`: None beyond what the agent account already holds: the action uses the same `with_user_hive` span `installed_apps.list_per_user` already uses. The `HKLM` ProfileList (profile SIDs and folder paths) and the WSL package `Version` need no privilege, nor does a loaded `HKU\<SID>` hive; a logged-off profile's `NTUSER.DAT` is mounted offline with `SeBackupPrivilege` and `SeRestorePrivilege`, already held by the agent account and enabled only inside the offline arm, under the process-wide offline-hive lock and the default-on hive-file guard | `host`: Measured 2026-11-07 on a Windows 11 host with Hyper-V, VBS and WSL2 enabled, from an elevated interactive session (not LocalSystem): CPUID and the firmware table both answered; whether an unelevated caller gets the table was not measured. `wsl`: Measured 2026-11-08 on the same host as `host`, as LocalSystem (a scheduled task, the agent's own identity), with the native MSVC build. The loaded `HKU` hive of the logged-on profile was read live (the sample); no real account on that host was logged off with a Lxss key, so the offline arm was measured on a disposable local account that had never logged on and was logged off: its `NTUSER.DAT` was mounted and read through `SeBackupPrivilege` and `SeRestorePrivilege`, a registry link planted at the `Lxss` key or at a distribution key was reported as `lxss_link` and never read through (no decoy row appeared), a mount that could not be unloaded gave `hive_unload_failed` with the mount name only in the agent log, and a leftover `YUZU_HIVE_*` mount gave `hive_mount_failed` on the next run; a planted link was not followed by the kernel across hives from a user hive either. The account was removed afterwards | `host`: `CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine. `wsl`: a hardened install that strips the two privileges still reads every logged-on profile; a logged-off one is a `profile` row with outcome `privilege_missing` and the token `windows:virtualization:wsl:hive_privilege_missing`. A refused hive file is `file_refused` with the guard's reason, a refused live root `access_denied`; none is read as having no distributions |
 | macOS | agent daemon (root under the shipped LaunchDaemon today, `docs/agent-privilege-model.md`) | None: both sysctls answer an unprivileged caller | The sample was captured as an unprivileged user, not under the LaunchDaemon account | `CONSTRAINED` / partial with `macos:virtualization:hv_vmm_present:unreadable` or `macos:virtualization:hw_model:unreadable`; the kind is `unknown` unless the other sysctl still identifies a guest |
 | Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None: the DMI attributes and `/run/systemd/container` read are world-readable; the root-only `product_serial` and `product_uuid` are never read | Measured 2026-11-07 inside a WSL2 distribution as root (not the packaged `yuzu-agent` account): `/run/systemd/container` is mode 0644 root:root under a 0755 `/run/systemd`; that kernel exposes no `/sys/class/dmi/id` or `/sys/hypervisor`, so the DMI modes were not measured and the host answer came from CPUID alone | `CONSTRAINED` / partial; a refused host-decision source (SMBIOS, CPUID, OS hint) reports `linux:virtualization:<source>:<cause>` and the kind `unknown` (or the kind another source already established), never `bare_metal`; a refused container read reports `linux:virtualization:container:<cause>`, constrains the status and does not block `bare_metal` |
 
@@ -102,7 +106,7 @@ No subprocess, no shell and no network use: every leg is an in-process read (CPU
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-The action takes no parameters.
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -123,6 +127,18 @@ Every row is pipe-delimited and field 0 is the row kind; `-` is an absent value.
 | `field_4` | string | - | Windows, Linux, macOS | `Mac16,10` | host: the SMBIOS product name or macOS hw.model, "-" when not read. Not used by the other kinds. |
 | `field_5` | string | - | Windows, Linux, macOS | `sysctl` | host: the evidence source that decided the kind (cpuid, smbios, sysctl or sys_hypervisor); when the kind is unknown, the joined reason tokens instead. Not used by the other kinds. |
 | `field_6` | string | `high` `medium` `low` | Windows, Linux, macOS | `high` | host: confidence, high, medium or low (an unknown is low). Not used by the other kinds. |
+
+**`windows.virtualization.wsl` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `summary` `profile` `distribution` | Windows | `distribution` | Row shape discriminator (field 0). Values: status, summary, profile, distribution. |
+| `field_1` | string | - | Windows | `alice` | status: the literal "wsl". summary: the number of distributions listed. profile and distribution: the account, the profile folder name ("-" when it cannot be resolved), never the SID. |
+| `field_2` | string | - | Windows | `Ubuntu-26.04` | status: supported, constrained or unsupported (a leg that threw). summary: the number of WSL 2 distributions (not a VM count). profile: the outcome, not_found, privilege_missing, mount_failed, access_denied, file_refused, unload_failed, backup_skipped or sid_invalid. distribution: the distribution name as WSL records it (an e-mail-shaped name is replaced by [redacted-email]). |
+| `field_3` | string | - | Windows | `2` | status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:lxss_link, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was read or found absent (it need not add up with field 4 to the profile count: a reached hive whose Lxss key could not be opened, or is a registry link, appears only as a status token). profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown. |
+| `field_4` | string | - | Windows | `installed` | summary: the number of profiles whose hive was reached by neither the loaded hive nor the offline mount (a .bak entry or an invalid SID counts, and so does a profile never reached because a dispatch-wide limit stopped the walk). distribution: the install state, installed, installing, uninstalling, converting, exporting, compacting, state_<n> for an unrecognised value or unknown. |
+| `field_5` | string | - | Windows | `yes` | summary: the WSL package version, "-" when unavailable. distribution: whether this is the account's default distribution, yes or no. |
+| `field_6` | string | - | Windows | `ubuntu` | distribution: the flavor WSL records (for example ubuntu), "-" when absent; an e-mail-shaped value is replaced by [redacted-email]. Not used by the other kinds. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -165,7 +181,7 @@ A refusal is reported as `CONSTRAINED` with a `permission_denied` token, not as 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-07 · interactive user (elevated) · leg-hash d3f729438b24
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-08 · LocalSystem (elevated; account names replaced with jsmith) · leg-hash 2a955b994291
 
 ```
 == action=host
@@ -173,9 +189,15 @@ status|host|supported|-
 host|no|host_with_hypervisor|hyperv|EliteMini Series|cpuid|high
 container|unknown|windows:virtualization:container:not_read
 [result_status] OK / FULL
+
+== action=wsl
+status|wsl|supported|-
+summary|1|1|6|0|3.0.3.0
+distribution|jsmith|Ubuntu-26.04|2|installed|yes|ubuntu
+[result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-06 · euid 501 · leg-hash d3f729438b24
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-08 · euid 501 · leg-hash 2a955b994291
 
 ```
 == action=host
@@ -183,9 +205,13 @@ status|host|supported|-
 host|no|bare_metal|Apple Inc.|Mac16,10|sysctl|high
 container|no|macos:no_container_runtime
 [result_status] OK / FULL
+
+== action=wsl
+status|wsl|unsupported|macos:virtualization:wsl:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / macos:virtualization:wsl:unsupported
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-06 · euid 0 · leg-hash d3f729438b24
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-08 · euid 0 · leg-hash 2a955b994291
 
 ```
 == action=host
@@ -193,6 +219,10 @@ status|host|supported|-
 host|yes|guest|hyperv|-|cpuid|high
 container|no|linux:no_container_marker
 [result_status] OK / FULL
+
+== action=wsl
+status|wsl|unsupported|linux:virtualization:wsl:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / linux:virtualization:wsl:unsupported
 ```
 <!-- END GENERATED -->
 
@@ -207,10 +237,10 @@ container|no|linux:no_container_marker
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/virtualization/src/virtualization_legs.hpp` · `agents/plugins/virtualization/src/virtualization_linux.cpp` · `agents/plugins/virtualization/src/virtualization_macos.cpp` · `agents/plugins/virtualization/src/virtualization_parsers.hpp` · `agents/plugins/virtualization/src/virtualization_plugin.cpp` · `agents/plugins/virtualization/src/virtualization_win.cpp`
+- Plugin: `agents/plugins/virtualization/src/virtualization_legs.hpp` · `agents/plugins/virtualization/src/virtualization_linux.cpp` · `agents/plugins/virtualization/src/virtualization_macos.cpp` · `agents/plugins/virtualization/src/virtualization_parsers.hpp` · `agents/plugins/virtualization/src/virtualization_plugin.cpp` · `agents/plugins/virtualization/src/virtualization_win.cpp` · `agents/plugins/virtualization/src/virtualization_wsl_parsers.hpp`
 - Definitions: `content/definitions/virtualization.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp`
-- Tests: `tests/test_virtualization_definition.py` · `tests/unit/test_virtualization_local_dispatcher.cpp` · `tests/unit/test_virtualization_parsers.cpp`
+- Tests: `tests/test_virtualization_definition.py` · `tests/test_virtualization_wsl_pin_lexical.py` · `tests/unit/test_virtualization_local_dispatcher.cpp` · `tests/unit/test_virtualization_parsers.cpp` · `tests/unit/test_virtualization_wsl_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/pr12-1a-virtualization-host.added.md`
+- Changelog: `changelog.d/2026-11-08-virtualization-wsl.added.md` · `changelog.d/pr12-1a-virtualization-host.added.md`
 <!-- END GENERATED -->
