@@ -146,6 +146,7 @@ SCAN_TARGETS = {
     "help_tables": [
         "server/core/src/guardian_journal_fleet_tags.hpp",
         "server/core/src/guardian_health_fleet_tags.hpp",
+        "server/core/src/guardian_backend_fleet_tags.hpp",
     ],
     # (c) roots whose apps' src/ and include/ *.erl/*.hrl are scanned for {help, ...} tuples.
     "erl_help_dirs": ["gateway/apps"],
