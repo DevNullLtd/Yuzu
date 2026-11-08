@@ -8679,7 +8679,7 @@ Resets the CA's anti-rollback marks and discards the source's held CRLs. Use it 
 ##### Audit, errors and degrade
 
 - **Audit:** reads write `crypto.revocation_source.list` / `.view` and **fail closed** on REST (a row that does not persist answers `503` with `Sec-Audit-Failed: true` and no data). Mutations write `crypto.revocation_source.register` / `.update` / `.remove` / `.reset_high_water` with **no audit row, no mutation**: an `attempted` row first (if it cannot be stored the answer is `503` and nothing changes), then the outcome row. A lost outcome row keeps the `2xx`, sets `Sec-Audit-Failed: true` and adds `audit_persisted: false`; an `attempted` row with no outcome row means the outcome was not recorded, not that the change was not applied. See the [audit log catalogue](audit-log.md).
-- **Errors** are the A4 envelope: `400` (a field outside its rule, including a missing `expected_config_version`; `remediation` names the parameter), `401` (including a stale MFA step-up proof: `meta.challenge_url`), `403` (`error.message` says an administrator role is required; an MCP-tier token is refused), `404` (no such source, or a non-numeric id), `409` (CA already registered, 64 sources, or a stale `expected_config_version` whose `remediation` names the current one), `413` (body over 192 KiB), `503` (`retry_after_ms: 5000`: store degraded, the `attempted` audit row could not be written, the change outcome is unknown, **this server's own addresses could not be determined, or a name lookup timed out / had no capacity** (nothing was registered; retry); read the source to check an unknown outcome).
+- **Errors** are the A4 envelope: `400` (a field outside its rule, including a missing `expected_config_version`; `remediation` names the parameter), `401` (including a stale MFA step-up proof: `meta.challenge_url`), `403` (`error.message` says an administrator role is required; an MCP-tier token is refused), `404` (no such source, or an id that cannot be a source id: more than 18 digits or a leading zero. An id with a non-digit character matches no route and gets the server's plain `404`), `409` (CA already registered, 64 sources, or a stale `expected_config_version` whose `remediation` names the current one), `413` (body over 192 KiB), `503` (`retry_after_ms: 5000`: store degraded, the `attempted` audit row could not be written, the change outcome is unknown, **this server's own addresses could not be determined, or a name lookup timed out / had no capacity** (nothing was registered; retry); read the source to check an unknown outcome).
 
 
 ---
@@ -10235,7 +10235,7 @@ answers `503` with `retry_after_ms: 2000`.
 `success` or `failure` row once the store answers. If the `attempted` row cannot be saved, the route
 answers `503` and makes no change. Audit actions: `plugin_config.set`, `plugin_config.delete`,
 `plugin_secret.set`, `plugin_secret.delete`, `plugin_config.kill_switch.set` (see
-[Audit Log](audit-log.md)). Request bodies over 256 KiB are refused with `413`.
+[Audit Log](audit-log.md)). Request bodies over 128 KiB are refused with `413`.
 
 **Secrets are write-only.** You can set or delete a secret, but no REST route or MCP tool ever returns
 its value. Secret responses carry metadata only.
