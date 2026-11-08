@@ -529,9 +529,10 @@ TEST_CASE("revocation source validation: refused address classes, no override",
 
 TEST_CASE("revocation source validation: a wildcard bind expands to every local address",
           "[revocation_source][pg]") {
-    // The production environment builder, with the resolver faked: a wildcard listener makes
-    // every interface address "own". The interface list is the host's, so this asserts only the
-    // properties that hold on any host: a listener with a LITERAL address names exactly it.
+    // The production environment builder: a wildcard listener makes every interface address
+    // "own". The interface list is the host's (read live), so this asserts only the properties
+    // that hold on any host: a listener with a LITERAL address names exactly it. No name lookup
+    // runs here; the unresolvable-listen-host branch is not covered by a unit test.
     auto env = rs::make_system_egress_env({"10.9.9.9:50051", "[2001:db8::7]:8080"});
     const auto own_opt = env.local_addresses(std::chrono::seconds(5));
     REQUIRE(own_opt.has_value());
@@ -550,9 +551,6 @@ TEST_CASE("revocation source validation: a wildcard bind expands to every local 
     auto disabled = rs::make_system_egress_env({"", "10.9.9.9:1"});
     REQUIRE(disabled.local_addresses(std::chrono::seconds(5)).has_value());
     CHECK(*disabled.local_addresses(std::chrono::seconds(5)) == std::vector<std::string>{"10.9.9.9"});
-    // A listen host that does not resolve makes the set unknown: nullopt, never "fewer".
-    auto unresolvable = rs::make_system_egress_env({"nonexistent-host.invalid:1"});
-    CHECK_FALSE(unresolvable.local_addresses(std::chrono::seconds(5)).has_value());
 }
 
 TEST_CASE("revocation source validation: address classes are shown, then confirmed",
