@@ -73,8 +73,14 @@ static_assert(wsl::kRegDword == REG_DWORD);
 /// The registry as the Ops-templated walk sees it: one Reg*W call per method, raw codes out.
 struct RealRegOps {
     long open_key(void* parent, const wchar_t* name, void*& out) {
+        // REG_OPTION_OPEN_LINK opens a registry link object itself instead of following it. The
+        // Lxss subtree sits in a hive its owning user can write, and a link planted there (an
+        // `Lxss` or `{GUID}` key pointing elsewhere) carries none of the five value names this walk
+        // reads, so it reads as no WSL / an empty row, never as a read of another key. The flag
+        // applies to the leaf only; an ancestor link is a disclosed residual (README caveat).
         HKEY k = nullptr;
-        const LONG rc = RegOpenKeyExW(static_cast<HKEY>(parent), name, 0, KEY_READ, &k);
+        const LONG rc =
+            RegOpenKeyExW(static_cast<HKEY>(parent), name, REG_OPTION_OPEN_LINK, KEY_READ, &k);
         if (rc == ERROR_SUCCESS)
             out = k;
         return rc;
@@ -150,7 +156,8 @@ int run_windows_wsl(yuzu::CommandContext& ctx) {
                                         const std::function<void(void*)>& fn) {
         yuzu::win::HiveAccessReport report;
         const auto log_unload_failed = [&] {
-            const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
+            // The folder name is user-influenced text: scrubbed like the wire field it also feeds.
+            const std::string pname = wire_field(profile.profile_name);
             // The mount name embeds the SID: the agent log is the only place it appears.
             spdlog::error("virtualization wsl: hive unload failed for profile {} (HKU\\{}): its "
                           "NTUSER.DAT stays locked until `reg unload HKU\\{}` succeeds",

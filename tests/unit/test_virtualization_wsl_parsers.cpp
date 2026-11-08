@@ -9,8 +9,11 @@
 
 #include "virtualization_wsl_parsers.hpp"
 
+#include <algorithm>
+#include <cstdio>
 #include <deque>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -43,6 +46,7 @@ struct Val {
     std::vector<std::byte> data;
     long fail_rc = 0;      // returned for any query when non-zero
     long fill_rc = 0;      // returned by the FILL call only
+    std::optional<std::uint32_t> fill_size_override; // a hostile FILL: SUCCESS, but this size
 };
 
 struct Node {
@@ -55,8 +59,12 @@ struct Node {
 
 struct FakeOps {
     std::deque<Node> arena;
-    int opens = 0, closes = 0, enums = 0, probes = 0, fills = 0;
+    int opens = 0, closes = 0, enums = 0, queries = 0, probes = 0, fills = 0;
     bool throw_on_enum = false;
+    std::vector<std::size_t> payload_sizes; // what the REG_SZ decoder was handed, per call
+
+    /// Every enum_key/query_value call the walk made (each one is preceded by a budget visit).
+    std::size_t calls() const { return static_cast<std::size_t>(enums + queries); }
 
     Node& node() { return arena.emplace_back(); }
     Node& child(Node& parent, const std::wstring& name) {
@@ -109,6 +117,7 @@ struct FakeOps {
     }
     long query_value(void* key, const wchar_t* name, std::uint32_t& type, std::span<std::byte> buf,
                      std::uint32_t& size) {
+        ++queries;
         auto* n = static_cast<Node*>(key);
         auto it = n->values.find(name);
         if (it == n->values.end())
@@ -131,11 +140,12 @@ struct FakeOps {
             return wsl::kErrorMoreData;
         }
         std::copy(v.data.begin(), v.data.end(), buf.begin());
-        size = need;
+        size = v.fill_size_override ? *v.fill_size_override : need;
         return wsl::kErrorSuccess;
     }
     std::string utf8(std::wstring_view s) const { return std::string(s.begin(), s.end()); }
-    std::string reg_sz_utf8(std::span<const std::byte> p) const {
+    std::string reg_sz_utf8(std::span<const std::byte> p) {
+        payload_sizes.push_back(p.size());
         std::string out;
         for (auto b : p) {
             if (b == std::byte{0})
@@ -165,7 +175,7 @@ Node& make_hive(FakeOps& ops, const std::vector<Distro>& distros, const std::str
         FakeOps::set_dword(dk, L"State", d.state);
         FakeOps::set_sz(dk, L"Flavor", d.flavor);
         // Values that must never be read or emitted.
-        FakeOps::set_sz(dk, L"BasePath", "C:\\Users\\SECRETPATH\\AppData\\Local\\Packages");
+        FakeOps::set_sz(dk, L"BasePath", "D:\\wsl-store\\SECRETPATH\\Packages");
         FakeOps::set_sz(dk, L"VhdFileName", "ext4.SECRETVHD");
         FakeOps::set_dword(dk, L"DefaultUid", 424242);
     }
@@ -173,6 +183,17 @@ Node& make_hive(FakeOps& ops, const std::vector<Distro>& distros, const std::str
 }
 
 Node& lxss_of(Node& root) { return *root.children.front().second; }
+
+/// `n` distributions with distinct GUIDs (`tag` keeps them distinct across hives).
+std::vector<Distro> many(unsigned tag, int n, const std::string& label) {
+    std::vector<Distro> ds;
+    for (int k = 0; k < n; ++k) {
+        char g[64];
+        std::snprintf(g, sizeof g, "{%08x-0000-0000-0000-%012x}", tag, static_cast<unsigned>(k));
+        ds.push_back({g, label + "-" + std::to_string(k), 2, 1, "x"});
+    }
+    return ds;
+}
 
 // -- fake access seam ------------------------------------------------------------------------
 
@@ -468,7 +489,8 @@ TEST_CASE("wsl: the row bound trips alone, inside the second hive, and the third
     CHECK(g.acc.calls[kSidC] == 0); // ... and C was never reached
     // 12 rows - 2 reserved = 10 retained distributions; the summary counts exactly those.
     CHECK(r.posture.rows.size() == 1 + 10);
-    CHECK(r.posture.rows[0].starts_with("summary|10|"));
+    // C was never reached: it is counted as not loaded, with no row (the budget is spent).
+    CHECK(r.posture.rows[0] == "summary|10|10|2|1|-");
     CHECK(g.ops.opens == g.ops.closes);
 }
 
@@ -489,6 +511,7 @@ TEST_CASE("wsl: the byte bound trips alone, at the exact byte", "[virtualization
     CHECK(has_token(r.posture, "row_cap"));
     CHECK(under.rows.bytes <= exact - 1);
     CHECK(r.posture.rows.size() == 1 + 8);
+    CHECK(tight.ops.opens == tight.ops.closes); // the mid-walk stop closed every key
 }
 
 TEST_CASE("wsl: the visited-entry bound trips alone and stops the loop", "[virtualization][wsl][budget]") {
@@ -501,14 +524,19 @@ TEST_CASE("wsl: the visited-entry bound trips alone and stops the loop", "[virtu
     Fleet fit(2);
     wsl::WalkBudget at(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, exact);
     CHECK_FALSE(has_token(run(fit.profiles, fit.acc, fit.ops, at).posture, "entry_cap"));
+    CHECK(fit.ops.calls() <= at.max_visited); // every registry call was preceded by a visit
+    CHECK(fit.ops.calls() == at.visited);
 
     Fleet cut(2);
     wsl::WalkBudget under(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, exact - 1);
     const auto r = run(cut.profiles, cut.acc, cut.ops, under);
     CHECK(has_token(r.posture, "entry_cap"));
     CHECK_FALSE(has_token(r.posture, "row_cap"));
+    CHECK_FALSE(has_token(r.posture, "hive_entry_cap"));
     CHECK(cut.acc.calls[kSidC] == 1); // the last call of the last hive was the one refused
     CHECK(cut.ops.opens == cut.ops.closes);
+    CHECK(cut.ops.calls() <= under.max_visited);
+    CHECK(cut.ops.calls() == exact - 1); // the refused call was never made
 
     Fleet early(2);
     wsl::WalkBudget tiny(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, 3);
@@ -516,12 +544,82 @@ TEST_CASE("wsl: the visited-entry bound trips alone and stops the loop", "[virtu
     CHECK(has_token(e.posture, "entry_cap"));
     CHECK(early.acc.calls[kSidB] == 0); // stopped in A: later profiles never accessed
     CHECK(early.acc.calls[kSidC] == 0);
+    CHECK(early.ops.calls() <= tiny.max_visited);
+    CHECK(early.ops.opens == early.ops.closes);
+    // B and C were never reached: counted (A was reached, its hive read).
+    CHECK(e.reads.profiles_not_loaded == 2);
 
     // Production limits are the documented ones.
     wsl::WalkBudget prod;
     CHECK(prod.rows.max_rows == 1024);
     CHECK(prod.rows.max_bytes == 262144);
     CHECK(prod.max_visited == 4096);
+    CHECK(prod.max_visited_per_hive == 512);
+    CHECK(prod.max_rows_per_hive == 128);
+}
+
+TEST_CASE("wsl: the per-hive call bound ends that hive alone; later hives are still walked",
+          "[virtualization][wsl][budget]") {
+    FakeOps ops;
+    Node& ha = make_hive(ops, many(1, 8, "hostile"));
+    Node& hb = make_hive(ops, many(2, 2, "bob"));
+    Node& hc = make_hive(ops, many(3, 2, "carol"));
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &ha};
+    acc.cfg[kSidB] = {HiveAccessStatus::ok, &hb, "", false, wsl::kErrorAccessDenied};
+    acc.cfg[kSidC] = {HiveAccessStatus::ok, &hc};
+    // 20 calls per hive: A (1 + 7 per distribution) is cut inside its third distribution; B and C
+    // (1 + 2 x 7 + 1 = 16) fit. The dispatch-wide caps are the production ones.
+    wsl::WalkBudget b(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, wsl::kDefaultMaxVisited,
+                      /*max_visited_per_hive=*/20, wsl::kDefaultMaxRowsPerHive);
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")}, acc,
+                       ops, b);
+
+    CHECK(has_token(r.posture, "hive_entry_cap"));
+    CHECK_FALSE(has_token(r.posture, "entry_cap"));
+    CHECK_FALSE(has_token(r.posture, "row_cap"));
+    CHECK(r.posture.status == StatusState::constrained);
+    CHECK(acc.calls[kSidB] == 1); // the trip was NOT a dispatch stop
+    CHECK(acc.calls[kSidC] == 1);
+    // alice keeps the two distributions read whole; the half-read third is discarded.
+    CHECK(r.posture.rows[0] == "summary|6|6|3|0|-");
+    CHECK(has_row(r.posture, "distribution|alice|hostile-1|2|installed|no|x"));
+    CHECK_FALSE(has_row(r.posture, "distribution|alice|hostile-2|2|installed|no|x"));
+    CHECK(has_row(r.posture, "distribution|carol|carol-1|2|installed|no|x"));
+    CHECK(ops.calls() == b.visited);
+    CHECK(ops.opens == ops.closes);
+    // The counters are per hive, not cumulative: the dispatch total is the sum of three hives.
+    CHECK(b.visited == 20 + 16 + 16);
+}
+
+TEST_CASE("wsl: the per-hive row bound ends that hive alone; later hives are still walked",
+          "[virtualization][wsl][budget]") {
+    FakeOps ops;
+    Node& ha = make_hive(ops, many(1, 8, "hostile"));
+    Node& hb = make_hive(ops, many(2, 2, "bob"));
+    Node& hc = make_hive(ops, many(3, 2, "carol"));
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &ha};
+    acc.cfg[kSidB] = {HiveAccessStatus::ok, &hb, "", false, wsl::kErrorAccessDenied};
+    acc.cfg[kSidC] = {HiveAccessStatus::ok, &hc};
+    wsl::WalkBudget b(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, wsl::kDefaultMaxVisited,
+                      wsl::kDefaultMaxVisitedPerHive, /*max_rows_per_hive=*/3);
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")}, acc,
+                       ops, b);
+
+    CHECK(has_token(r.posture, "hive_row_cap"));
+    CHECK_FALSE(has_token(r.posture, "row_cap"));
+    CHECK_FALSE(has_token(r.posture, "entry_cap"));
+    CHECK_FALSE(has_token(r.posture, "hive_entry_cap"));
+    CHECK(acc.calls[kSidB] == 1);
+    CHECK(acc.calls[kSidC] == 1);
+    CHECK(r.posture.rows[0] == "summary|7|7|3|0|-"); // 3 + 2 + 2
+    CHECK(has_row(r.posture, "distribution|alice|hostile-2|2|installed|no|x"));
+    CHECK_FALSE(has_row(r.posture, "distribution|alice|hostile-3|2|installed|no|x"));
+    // The refused fourth distribution is detected before its values are read:
+    // A = 1 + 3 x 7 + the enum that listed the fourth; B and C = 16 each.
+    CHECK(b.visited == 23 + 16 + 16);
+    CHECK(ops.opens == ops.closes);
 }
 
 TEST_CASE("wsl: the header reserve is a proven maximum", "[virtualization][wsl][budget]") {
@@ -637,6 +735,7 @@ TEST_CASE("wsl: the Lxss key open maps NOT_FOUND to read-ok, denial and failure 
     CHECK(has_token(r.posture, "hive_open_failed"));
     CHECK(r.posture.rows[0] == "summary|0|0|1|0|-"); // only the NOT_FOUND hive counts as read
     CHECK(r.posture.rows.size() == 1);
+    CHECK(ops.opens == ops.closes);
 }
 
 TEST_CASE("wsl: only GUID-shaped children are opened; others are skipped silently",
@@ -670,6 +769,45 @@ TEST_CASE("wsl: an enumeration failure mid-walk keeps the rows so far and is a t
     CHECK(has_token(r.posture, "hive_enum_failed"));
     CHECK(r.posture.status == StatusState::constrained);
     CHECK(r.posture.rows.size() == 2);
+    CHECK(ops.opens == ops.closes);
+}
+
+TEST_CASE("wsl: an enumeration MORE_DATA skips that index and the walk goes on",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}, {kGuid2, "Debian", 2, 1, "debian"}});
+    lxss_of(hive).enum_fail_idx = 0;
+    lxss_of(hive).enum_fail_rc = wsl::kErrorMoreData;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    wsl::WalkBudget b;
+    const auto r = run({profile(kSidA, "alice")}, acc, ops, b);
+    CHECK_FALSE(has_token(r.posture, "hive_enum_failed"));
+    CHECK(r.posture.status == StatusState::supported);
+    CHECK(r.posture.rows.size() == 2);
+    CHECK(r.posture.rows[0] == "summary|1|1|1|0|-");
+    CHECK(has_row(r.posture, "distribution|alice|Debian|2|installed|no|debian"));
+    // The skipped index was charged: DefaultDistribution + 3 enums (skipped, listed, end) + 6 values.
+    CHECK(ops.enums == 3);
+    CHECK(b.visited == 1 + 3 + 6);
+    CHECK(ops.calls() == b.visited);
+    CHECK(ops.opens == ops.closes);
+}
+
+TEST_CASE("wsl: one defect repeated across many children is one token", "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, many(1, 50, "bad"));
+    Node& lx = lxss_of(hive);
+    for (auto& [name, dk] : lx.children)
+        FakeOps::set_dword(*dk, L"DistributionName", 7); // wrong type on every child
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "alice")}, acc, ops);
+    REQUIRE(r.reads.hives.size() == 1);
+    CHECK(r.reads.hives[0].tokens == std::vector<std::string>{"value_malformed"});
+    CHECK(r.reads.hives[0].distros.size() == 50);
+    CHECK(has_token(r.posture, "value_malformed"));
+    CHECK(ops.opens == ops.closes);
 }
 
 TEST_CASE("wsl: a distribution key that fails to open is a typed row", "[virtualization][wsl]") {
@@ -681,6 +819,7 @@ TEST_CASE("wsl: a distribution key that fails to open is a typed row", "[virtual
     const auto r = run({profile(kSidA, "alice")}, acc, ops);
     CHECK(has_token(r.posture, "distro_open_failed"));
     CHECK(has_row(r.posture, "distribution|alice|-|unknown|unknown|yes|-"));
+    CHECK(ops.opens == ops.closes);
 }
 
 TEST_CASE("wsl: RAW value branches classify type, size and race", "[virtualization][wsl]") {
@@ -688,23 +827,37 @@ TEST_CASE("wsl: RAW value branches classify type, size and race", "[virtualizati
         const char* what;
         std::function<void(Node&)> apply;
         const char* token; // nullptr = none
-        const char* row;
-        bool fill_called;
+        std::string row;
+        int fills; // FILL calls across the four reads (a size probe is not a fill)
     };
+    const std::string at_cap(wsl::kMaxValueBytes - 1, 'x'); // + the NUL = exactly kMaxValueBytes
+    const std::string over_cap(wsl::kMaxValueBytes, 'x');   // + the NUL = kMaxValueBytes + 1
     const std::vector<Mutate> cases = {
         {"name typed DWORD", [](Node& d) { FakeOps::set_dword(d, L"DistributionName", 7); },
-         "value_malformed", "distribution|alice|-|2|installed|no|ubuntu", false},
+         "value_malformed", "distribution|alice|-|2|installed|no|ubuntu", 3},
+        {"name typed REG_EXPAND_SZ",
+         [](Node& d) { FakeOps::set_sz(d, L"DistributionName", "Ubuntu", 2); }, "value_malformed",
+         "distribution|alice|-|2|installed|no|ubuntu", 3},
+        {"name typed REG_MULTI_SZ",
+         [](Node& d) { FakeOps::set_sz(d, L"DistributionName", "Ubuntu", 7); }, "value_malformed",
+         "distribution|alice|-|2|installed|no|ubuntu", 3},
         {"name oversized (no fill)",
          [](Node& d) {
              FakeOps::set_sz(d, L"DistributionName", std::string(5000, 'x'));
          },
-         "value_oversized", "distribution|alice|-|2|installed|no|ubuntu", false},
+         "value_oversized", "distribution|alice|-|2|installed|no|ubuntu", 3},
+        {"name at the 4096-byte bound (filled)",
+         [&](Node& d) { FakeOps::set_sz(d, L"DistributionName", at_cap); }, nullptr,
+         "distribution|alice|" + at_cap + "|2|installed|no|ubuntu", 4},
+        {"name one byte past the bound (no fill)",
+         [&](Node& d) { FakeOps::set_sz(d, L"DistributionName", over_cap); }, "value_oversized",
+         "distribution|alice|-|2|installed|no|ubuntu", 3},
         {"name fill MORE_DATA",
          [](Node& d) { d.values[L"DistributionName"].fill_rc = wsl::kErrorMoreData; },
-         "value_unreadable", "distribution|alice|-|2|installed|no|ubuntu", true},
+         "value_unreadable", "distribution|alice|-|2|installed|no|ubuntu", 4},
         {"name query denied",
          [](Node& d) { d.values[L"DistributionName"].fail_rc = wsl::kErrorAccessDenied; },
-         "value_unreadable", "distribution|alice|-|2|installed|no|ubuntu", false},
+         "value_unreadable", "distribution|alice|-|2|installed|no|ubuntu", 3},
         {"version size 8",
          [](Node& d) {
              Val v;
@@ -712,13 +865,13 @@ TEST_CASE("wsl: RAW value branches classify type, size and race", "[virtualizati
              v.data.assign(8, std::byte{1});
              d.values[L"Version"] = v;
          },
-         "value_malformed", "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", true},
+         "value_malformed", "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", 4},
         {"version absent", [](Node& d) { d.values.erase(L"Version"); }, nullptr,
-         "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", true},
+         "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", 3},
         {"state 7", [](Node& d) { FakeOps::set_dword(d, L"State", 7); }, nullptr,
-         "distribution|alice|Ubuntu|2|state_7|no|ubuntu", true},
+         "distribution|alice|Ubuntu|2|state_7|no|ubuntu", 4},
         {"flavor absent", [](Node& d) { d.values.erase(L"Flavor"); }, nullptr,
-         "distribution|alice|Ubuntu|2|installed|no|-", true},
+         "distribution|alice|Ubuntu|2|installed|no|-", 3},
     };
     for (const auto& c : cases) {
         INFO(c.what);
@@ -727,18 +880,73 @@ TEST_CASE("wsl: RAW value branches classify type, size and race", "[virtualizati
         c.apply(*lxss_of(hive).children.front().second);
         FakeAccess acc;
         acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
-        const int fills_before = ops.fills;
         const auto r = run({profile(kSidA, "alice")}, acc, ops);
         CHECK(has_row(r.posture, c.row));
         if (c.token)
             CHECK(has_token(r.posture, c.token));
         else
             CHECK(r.posture.status == StatusState::supported);
-        if (std::string{c.what} == "name oversized (no fill)") {
-            // Only the DWORDs and Flavor are filled: the oversized name never allocates a buffer.
-            CHECK(ops.fills - fills_before == 3);
-        }
+        // A wrong-typed or oversized value never reaches the FILL call, so it never allocates.
+        CHECK(ops.fills == c.fills);
+        CHECK(ops.opens == ops.closes);
     }
+}
+
+TEST_CASE("wsl: a FILL that reports more bytes than the buffer is clamped to the buffer",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+    // The probe said 7 bytes ("Ubuntu" + NUL); the fill then claims 9999 and succeeds.
+    lxss_of(hive).children.front().second->values[L"DistributionName"].fill_size_override = 9999;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "alice")}, acc, ops);
+    // The decoder was handed the buffer (7 bytes) for the name and the flavor, never 9999.
+    CHECK(ops.payload_sizes == std::vector<std::size_t>{7, 7});
+    CHECK(r.posture.status == StatusState::supported);
+    CHECK(has_row(r.posture, "distribution|alice|Ubuntu|2|installed|no|ubuntu"));
+    CHECK(ops.opens == ops.closes);
+}
+
+TEST_CASE("wsl: a value-sized redaction worst case is bounded and emitted as is",
+          "[virtualization][wsl]") {
+    // The densest `@(` run a REG_SZ of kMaxValueBytes can hold: every `@` opens a comment that is
+    // never closed, which is the e-mail scan's quadratic input. The input is bounded BEFORE
+    // redaction, so the test pins the bound (the value is read whole and is not an address), not a time.
+    std::string hostile = "a";
+    while (hostile.size() + 2 <= wsl::kMaxValueBytes - 1)
+        hostile += "@(";
+    REQUIRE(hostile.size() + 1 == wsl::kMaxValueBytes);
+    CHECK_FALSE(yuzu::shared::looks_like_email_address(hostile));
+
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, hostile, 2, 1, "ubuntu"}});
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "alice")}, acc, ops);
+    REQUIRE(r.reads.hives.size() == 1);
+    REQUIRE(r.reads.hives[0].distros.size() == 1);
+    CHECK(r.reads.hives[0].tokens.empty());
+    CHECK(r.reads.hives[0].distros[0].name == hostile);
+    CHECK(r.posture.status == StatusState::supported);
+    CHECK(has_row(r.posture, "distribution|alice|" + hostile + "|2|installed|no|ubuntu"));
+}
+
+TEST_CASE("wsl: an e-mail-shaped profile folder name is redacted on every row that carries it",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    acc.cfg[kSidB] = {HiveAccessStatus::not_found};
+    const auto r = run({profile(kSidA, "jsmith@corp.example"), profile(kSidB, "kjones@corp.example")},
+                       acc, ops);
+    CHECK(has_row(r.posture, "distribution|[redacted-email]|Ubuntu|2|installed|no|ubuntu"));
+    CHECK(has_row(r.posture, "profile|[redacted-email]|not_found|-"));
+    const std::string all = joined(r.posture);
+    CHECK(all.find("corp.example") == std::string::npos);
+    CHECK(all.find("jsmith") == std::string::npos);
+    CHECK(all.find("kjones") == std::string::npos);
 }
 
 TEST_CASE("wsl: nothing on the never-emit list reaches a row", "[virtualization][wsl]") {

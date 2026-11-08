@@ -421,14 +421,26 @@ TEST_CASE("virtualization windows shell: with_user_hive is called with the defau
           "mount name only reaches the log",
           "[virtualization][wsl][lexical]") {
     // A lexical pin on the Windows shell (readable on every host): the one place the offline
-    // arm is entered must stay exactly the shared ladder.
-    const char* root = std::getenv("MESON_SOURCE_ROOT");
-    std::ifstream in(std::string{root ? root : "."} +
-                     "/agents/plugins/virtualization/src/virtualization_win.cpp");
-    if (!in) {
-        WARN("virtualization_win.cpp not found from MESON_SOURCE_ROOT -- skipping the lexical pin");
-        return;
+    // arm is entered must stay exactly the shared ladder. The source is found by its repo-relative
+    // path: the compile-time fixture dir (an absolute path under the source root, defined for
+    // every agent-suite build; `meson test` does not export MESON_SOURCE_ROOT), then
+    // $MESON_SOURCE_ROOT, then the CWD. No candidate FAILS the pin; it is never a soft skip.
+    const std::string rel = "agents/plugins/virtualization/src/virtualization_win.cpp";
+    std::vector<std::string> candidates;
+#ifdef YUZU_TEST_FIXTURE_DIR
+    candidates.push_back(std::string{YUZU_TEST_FIXTURE_DIR} + "/../../../" + rel);
+#endif
+    if (const char* root = std::getenv("MESON_SOURCE_ROOT"))
+        candidates.push_back(std::string{root} + "/" + rel);
+    candidates.push_back(rel);
+    std::ifstream in;
+    for (const auto& c : candidates) {
+        in.open(c);
+        if (in)
+            break;
+        in.clear();
     }
+    REQUIRE(in);
     const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
     const auto call = src.find("with_user_hive(");
@@ -439,6 +451,8 @@ TEST_CASE("virtualization windows shell: with_user_hive is called with the defau
     CHECK(stmt.find("OfflineHiveFileCheck") == std::string::npos);
     CHECK(src.find("kOfflineHiveFileUnguarded") == std::string::npos);
     CHECK(src.find("enumerate_hku_subkeys") == std::string::npos);
+    // The registry is opened without following a link planted in the user-writable Lxss subtree.
+    CHECK(src.find("REG_OPTION_OPEN_LINK") != std::string::npos);
 
     // Every mention of mount_name sits inside a spdlog:: call.
     std::string rest = src;

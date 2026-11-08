@@ -15,13 +15,18 @@
 // BOUNDS (trust boundary: the Lxss subtree is under the owning user's write access). ONE
 // WalkBudget per dispatch, shared across every hive: rows and bytes are charged at COLLECTION,
 // before a row is retained; `max_visited` counts every enum_key/query_value call; a value is
-// never allocated past kMaxValueBytes. These bound the NUMBER of registry calls made under the
-// offline lock, not their duration (there is no wall-clock deadline on this action).
+// never allocated past kMaxValueBytes. Each hive also has its own sub-caps (calls and rows): a
+// hive that trips one ends THAT hive only (`hive_entry_cap` / `hive_row_cap`), so one hostile
+// hive can neither hold the offline lock for the whole dispatch budget nor starve the profiles
+// after it; only the dispatch-wide caps (`entry_cap` / `row_cap`) stop the loop. These bound the
+// NUMBER of registry calls made under the offline lock, not their duration (there is no
+// wall-clock deadline on this action).
 //
 // NEVER EMITTED: BasePath, VhdFileName, ShortcutPath, TerminalProfilePath, PackageFamilyName,
 // DefaultUid, KernelCommandLine, the SID (including the salted mount name, which embeds it),
 // the distribution GUID. None of those values is ever read. DistributionName and Flavor are
-// value-level e-mail redacted; the account is the profile-folder name, `-` when unresolvable.
+// value-level e-mail redacted; the account is the profile-folder name (also e-mail redacted),
+// `-` when unresolvable.
 //
 // TOKENS. Every constraint token is `windows:virtualization:wsl:<suffix>` (class (a) in
 // virtualization_parsers.hpp). The suffix table is closed: see kFixedTokenSuffixes plus the
@@ -67,6 +72,8 @@ inline constexpr std::size_t kMaxPackageVersionBytes = 64;
 inline constexpr std::size_t kDefaultMaxRows = 1024;
 inline constexpr std::size_t kDefaultMaxBytes = 256 * 1024;
 inline constexpr std::size_t kDefaultMaxVisited = 4096;
+inline constexpr std::size_t kDefaultMaxVisitedPerHive = 512;
+inline constexpr std::size_t kDefaultMaxRowsPerHive = 128;
 
 // -- tokens ------------------------------------------------------------------------------------
 
@@ -75,12 +82,13 @@ inline constexpr std::string_view kTokenPrefix = "windows:virtualization:wsl:";
 /// Every fixed token suffix decide_wsl can emit. `package_<cause>` and `profile_list_<cause>`
 /// (cause = `access_denied` or `win32_<n>`) are the only open-ended ones; kHeaderReserveBytes
 /// reserves one of each at its maximum length.
-inline constexpr std::array<std::string_view, 20> kFixedTokenSuffixes = {
+inline constexpr std::array<std::string_view, 22> kFixedTokenSuffixes = {
     "hive_not_found",      "hive_privilege_missing", "hive_mount_failed",
     "hive_access_denied",  "hive_file_refused",      "hive_unload_failed",
     "hive_open_failed",    "hive_enum_failed",       "distro_open_failed",
     "value_unreadable",    "value_malformed",        "value_oversized",
     "package_malformed",   "row_cap",                "entry_cap",
+    "hive_row_cap",        "hive_entry_cap",
     "profile_list_enum_failed", "profile_cap",       "profile_unreadable",
     "profile_backup_skipped",   "profile_sid_invalid",
 };
@@ -122,29 +130,49 @@ inline constexpr std::size_t kHeaderReserveBytes =
 // -- budget ------------------------------------------------------------------------------------
 
 /// One budget per dispatch. Limits are constructor parameters (defaults = production) so a unit
-/// test can prove each bound on its own; production never overrides them.
+/// test can prove each bound on its own; production never overrides them. The per-hive counters
+/// belong to the hive being walked: `begin_hive()` resets them at the start of each hive.
 struct WalkBudget {
     yuzu::shared::RowByteBudget rows;
     std::size_t max_visited;
+    std::size_t max_visited_per_hive;
+    std::size_t max_rows_per_hive;
     std::size_t visited = 0;
+    std::size_t hive_visited = 0;
+    std::size_t hive_rows = 0;
 
     explicit WalkBudget(std::size_t max_rows = kDefaultMaxRows,
                         std::size_t max_bytes = kDefaultMaxBytes,
-                        std::size_t max_visited_calls = kDefaultMaxVisited)
-        : max_visited(max_visited_calls) {
+                        std::size_t max_visited_calls = kDefaultMaxVisited,
+                        std::size_t max_visited_per_hive_calls = kDefaultMaxVisitedPerHive,
+                        std::size_t max_rows_per_hive_rows = kDefaultMaxRowsPerHive)
+        : max_visited(max_visited_calls),
+          max_visited_per_hive(max_visited_per_hive_calls),
+          max_rows_per_hive(max_rows_per_hive_rows) {
         rows.max_rows = max_rows;
         rows.max_bytes = max_bytes;
         rows.add(kHeaderReserveBytes, 2); // the status + summary rows are reserved up front
     }
 
-    /// Counts one enum_key/query_value call. False = the visited-entry cap is reached and the
-    /// call must NOT be made.
+    /// Starts a new hive's accounting: its sub-caps count from zero.
+    void begin_hive() noexcept { hive_visited = hive_rows = 0; }
+
+    /// Counts one enum_key/query_value call against the dispatch-wide cap AND the current hive's
+    /// cap. False = either is reached and the call must NOT be made; `visits_exhausted()` tells
+    /// which (the dispatch-wide cap wins when both are).
     [[nodiscard]] bool visit() noexcept {
-        if (visited >= max_visited)
+        if (visited >= max_visited || hive_visited >= max_visited_per_hive)
             return false;
         ++visited;
+        ++hive_visited;
         return true;
     }
+
+    /// True once the dispatch-wide call cap is spent (every later hive would be refused too).
+    [[nodiscard]] bool visits_exhausted() const noexcept { return visited >= max_visited; }
+
+    /// True once the current hive has retained its per-hive row allowance.
+    [[nodiscard]] bool hive_rows_full() const noexcept { return hive_rows >= max_rows_per_hive; }
 
     /// Charges one row (its bytes + the newline) before it is retained.
     [[nodiscard]] bool charge_row(std::string_view row) noexcept {
@@ -445,9 +473,16 @@ inline const char* value_token(ValueResult r) noexcept {
     return nullptr;
 }
 
+/// Push-if-absent: a hostile hive repeating one defect thousands of times still yields ONE token,
+/// so a HiveRead's token vector can never outgrow the closed suffix table.
+inline void add_token(std::vector<std::string>& tokens, std::string_view t) {
+    if (std::find(tokens.begin(), tokens.end(), t) == tokens.end())
+        tokens.emplace_back(t);
+}
+
 inline void note_value(HiveRead& h, ValueResult r) {
     if (const char* t = value_token(r))
-        h.tokens.emplace_back(t);
+        add_token(h.tokens, t);
 }
 
 inline constexpr const wchar_t* kLxssPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss";
@@ -456,12 +491,25 @@ inline constexpr const wchar_t* kMsiPath =
 
 } // namespace detail
 
-/// Walks one reached hive's Lxss key. `stop` is set when the shared budget refuses anything.
+/// Walks one reached hive's Lxss key. `stop` is set only when a DISPATCH-WIDE cap refuses
+/// something; a per-hive cap ends this hive alone (`hive_entry_cap` / `hive_row_cap`).
 template <class Ops>
 [[nodiscard]] HiveRead read_lxss_hive(Ops& ops, void* root, std::string account,
                                       WalkBudget& budget, bool& stop) {
     HiveRead h;
     h.account = std::move(account);
+    budget.begin_hive();
+
+    // A refused visit() is the dispatch-wide cap (stop the loop) or this hive's own (end this hive
+    // only); the refused call is never made.
+    const auto on_visit_refused = [&] {
+        if (budget.visits_exhausted()) {
+            detail::add_token(h.tokens, "entry_cap");
+            stop = true;
+        } else {
+            detail::add_token(h.tokens, "hive_entry_cap");
+        }
+    };
 
     ScopedKey<Ops> lxss(ops);
     const long open_rc = lxss.open(root, detail::kLxssPath);
@@ -470,8 +518,8 @@ template <class Ops>
         return h;
     }
     if (open_rc != kErrorSuccess) {
-        h.tokens.emplace_back(open_rc == kErrorAccessDenied ? "hive_access_denied"
-                                                            : "hive_open_failed");
+        detail::add_token(h.tokens, open_rc == kErrorAccessDenied ? "hive_access_denied"
+                                                                  : "hive_open_failed");
         return h;
     }
     h.read_ok = true;
@@ -481,8 +529,7 @@ template <class Ops>
     {
         const StringRead d = read_string_value(ops, lxss.get(), L"DefaultDistribution", budget);
         if (d.result == ValueResult::budget) {
-            h.tokens.emplace_back("entry_cap");
-            stop = true;
+            on_visit_refused();
             return h;
         }
         if (d.result == ValueResult::ok)
@@ -494,19 +541,24 @@ template <class Ops>
     std::wstring child;
     for (std::uint32_t idx = 0;; ++idx) {
         if (!budget.visit()) {
-            h.tokens.emplace_back("entry_cap");
-            stop = true;
+            on_visit_refused();
             break;
         }
         const long rc = ops.enum_key(lxss.get(), idx, child);
         if (rc == kErrorNoMoreItems)
             break;
+        if (rc == kErrorMoreData)
+            continue; // a name past the fixed buffer: the visit is charged, the index skipped
         if (rc != kErrorSuccess) {
-            h.tokens.emplace_back("hive_enum_failed");
+            detail::add_token(h.tokens, "hive_enum_failed");
             break;
         }
         if (!is_guid_shaped(child))
             continue; // InstallStatus, AppxInstallerCache, ...: skipped silently
+        if (budget.hive_rows_full()) {
+            detail::add_token(h.tokens, "hive_row_cap"); // a distribution this hive may not keep
+            break;
+        }
 
         DistroValues d;
         d.is_default =
@@ -516,7 +568,7 @@ template <class Ops>
         const long drc = dk.open(lxss.get(), child.c_str());
         if (drc != kErrorSuccess) {
             d.open_failed = true;
-            h.tokens.emplace_back("distro_open_failed");
+            detail::add_token(h.tokens, "distro_open_failed");
         } else {
             const StringRead name = read_string_value(ops, dk.get(), L"DistributionName", budget);
             const DwordRead ver = read_dword_value(ops, dk.get(), L"Version", budget);
@@ -524,8 +576,7 @@ template <class Ops>
             const StringRead flavor = read_string_value(ops, dk.get(), L"Flavor", budget);
             if (name.result == ValueResult::budget || ver.result == ValueResult::budget ||
                 st.result == ValueResult::budget || flavor.result == ValueResult::budget) {
-                h.tokens.emplace_back("entry_cap");
-                stop = true;
+                on_visit_refused();
                 break; // the half-read distribution is discarded, never emitted
             }
             if (name.result == ValueResult::ok)
@@ -541,10 +592,11 @@ template <class Ops>
         }
 
         if (!budget.charge_row(format_distribution_row(h.account, d))) {
-            h.tokens.emplace_back("row_cap");
+            detail::add_token(h.tokens, "row_cap");
             stop = true;
             break;
         }
+        ++budget.hive_rows;
         h.distros.push_back(std::move(d));
     }
     return h;
@@ -646,16 +698,21 @@ inline void add_profile_row(WslReads& out, WalkBudget& budget, bool& stop, std::
 /// The per-profile loop. Skips `.bak` entries and invalid SIDs without ever accessing them,
 /// runs the injected access function for the rest, and maps every outcome. Two INDEPENDENT
 /// mappings: the access status (with the one access_denied precedence rule) and unload_failed
-/// (a mount left behind, whatever else happened). Stops when the shared budget says so.
+/// (a mount left behind, whatever else happened). Stops when the shared budget says so; the
+/// profiles it never reached are counted in `profiles_not_loaded` (no row: the budget is spent).
 template <class Ops>
 void collect_wsl(std::span<const yuzu::profiles::ProfileInfo> profiles, const HiveAccessFn& access,
                  Ops& ops, WalkBudget& budget, WslReads& out) {
     using yuzu::profiles::HiveAccessStatus;
     bool stop = false;
-    for (const auto& profile : profiles) {
-        if (stop)
+    for (std::size_t i = 0; i < profiles.size(); ++i) {
+        if (stop) {
+            out.profiles_not_loaded += profiles.size() - i;
             break;
-        const std::string account = wire_field(profile.profile_name);
+        }
+        const auto& profile = profiles[i];
+        // The account is a free-text folder name: an e-mail shape is redacted like any other field.
+        const std::string account = sanitize_text(profile.profile_name);
 
         if (yuzu::profiles::is_profile_backup_entry(profile.sid)) {
             ++out.profiles_not_loaded;
