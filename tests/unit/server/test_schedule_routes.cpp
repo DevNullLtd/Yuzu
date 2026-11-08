@@ -52,6 +52,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp" // PgConn / PgResult for the drop-table fault seam
 #include "rbac_store.hpp"
 #include "schedule_engine.hpp"
 #include <yuzu/server/auth.hpp>
@@ -488,8 +489,8 @@ TEST_CASE("POST /api/schedules: Schedule:Write + Execution:Execute together crea
     REQUIRE_FALSE(body.is_discarded());
     CHECK(body.value("id", "") == scheds[0].id);
 
-    // AUDIT ASYMMETRY: success is audited; body/param-validation 400s and
-    // store-level failures are not (see schedule_routes.hpp file header).
+    // Success is audited; body/param-validation 400s are not. A store-level failure writes a
+    // `failure` row (pinned by the store-failure case below).
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].action == "schedule.create");
     CHECK(h.audits[0].result == "success");
@@ -780,18 +781,214 @@ TEST_CASE("POST /api/schedules/:id/enable: a non-owner's Schedule:Write grant do
     auto res = h.sink.dispatch("POST", "/api/schedules/" + *created + "/enable",
                                R"({"enabled":true})", "application/json", headers);
     REQUIRE(res);
-    CHECK(res->status == 200); // route itself never 403s here -- set_enabled just no-ops
+    // A schedule the caller does not own answers exactly like an absent one: 404, never the
+    // requested state.
+    CHECK(res->status == 404);
     auto body = json::parse(res->body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
-    // The body unconditionally echoes the REQUESTED value (parse_schedule_enabled's
-    // result), not the actual post-state -- confirm the store itself was untouched
-    // instead of trusting the response body for that.
-    CHECK(body["enabled"] == true);
+    CHECK_FALSE(body.contains("enabled"));
+    CHECK(body["error"]["code"] == 404);
 
     auto scheds = h.schedule_engine->query_schedules();
     REQUIRE(scheds.size() == 1);
     CHECK(scheds[0].enabled == false); // still disabled -- the non-owner's request was a no-op
     CHECK(h.audits.empty()); // no-op enable is unaudited, matching DELETE's M-01 shape
+}
+
+namespace {
+
+/// Seeds one schedule owned by `owner` and returns its id.
+std::string seed_owned_schedule(ScheduleRouteHarness& h, const std::string& owner, bool enabled) {
+    InstructionSchedule sched;
+    sched.name = "nightly-scan";
+    sched.definition_id = "def-1";
+    sched.frequency_type = "daily";
+    sched.enabled = enabled;
+    sched.created_by = owner;
+    auto created = h.schedule_engine->create_schedule(sched);
+    REQUIRE(created.has_value());
+    return *created;
+}
+
+/// Drops the schedules table on a second connection so every later store call fails.
+void drop_schedules_table(ScheduleRouteHarness& h) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(h.rbac_db->dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult d{
+        PQexec(conn.get(), "DROP TABLE schedule_engine.schedules CASCADE")};
+    REQUIRE(d.ok());
+}
+
+} // namespace
+
+TEST_CASE("POST /api/schedules/:id/enable: an unknown id answers 404 in both directions, "
+          "never 200 with the requested state, and writes no audit row",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-owner", "ScheduleEnabler3",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    for (const char* body : {R"({"enabled":true})", R"({"enabled":false})"}) {
+        INFO(body);
+        auto res = h.sink.dispatch("POST", "/api/schedules/no-such-schedule/enable", body,
+                                   "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        auto parsed = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(parsed.is_discarded());
+        CHECK_FALSE(parsed.contains("enabled"));
+        CHECK(parsed["error"]["code"] == 404);
+    }
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("POST /api/schedules/:id/enable: a store failure answers 503 with one failure row "
+          "and no success row, in both directions",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    ScheduleRouteHarness h;
+    const auto id = seed_owned_schedule(h, "sched-owner", /*enabled=*/true);
+    auto headers = h.session_headers_for("sched-owner", "ScheduleEnabler4",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    drop_schedules_table(h);
+
+    const struct {
+        const char* body;
+        const char* action;
+    } cases[] = {{R"({"enabled":false})", "schedule.disable"},
+                 {R"({"enabled":true})", "schedule.enable"}};
+    for (const auto& c : cases) {
+        INFO(c.body);
+        h.audits.clear();
+        auto res = h.sink.dispatch("POST", "/api/schedules/" + id + "/enable", c.body,
+                                   "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        auto parsed = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(parsed.is_discarded());
+        CHECK_FALSE(parsed.contains("enabled"));
+        CHECK(parsed["error"]["code"] == 503);
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == c.action);
+        CHECK(h.audits[0].result == "failure");
+        CHECK(h.audits[0].target_id == id);
+        CHECK(h.audits[0].detail == "store_error");
+    }
+}
+
+TEST_CASE("DELETE /api/schedules/:id: an unknown id keeps its 200 deleted:false answer, "
+          "unaudited, and a store failure answers 503 with one failure row and no success row",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    ScheduleRouteHarness h;
+    const auto id = seed_owned_schedule(h, "sched-owner", /*enabled=*/true);
+    auto headers =
+        h.session_headers_for("sched-owner", "ScheduleDeleter3", {{"Schedule", "Delete"}});
+
+    auto missing = h.sink.dispatch("DELETE", "/api/schedules/no-such-schedule", "",
+                                   "application/json", headers);
+    REQUIRE(missing);
+    CHECK(missing->status == 200);
+    auto missing_body = json::parse(missing->body, nullptr, false);
+    REQUIRE_FALSE(missing_body.is_discarded());
+    CHECK(missing_body["deleted"] == false);
+    CHECK(h.audits.empty());
+
+    drop_schedules_table(h);
+    auto res = h.sink.dispatch("DELETE", "/api/schedules/" + id, "", "application/json", headers);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("deleted"));
+    CHECK(body["error"]["code"] == 503);
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "schedule.delete");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].target_id == id);
+    CHECK(h.audits[0].detail == "store_error");
+}
+
+TEST_CASE("POST /api/schedules: a store failure answers 503 with one failure row and no "
+          "success row; a request-validation failure stays 400",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-op", "ScheduleAndExecute2",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    drop_schedules_table(h);
+
+    auto res = h.sink.dispatch("POST", "/api/schedules",
+                               R"({"name":"nightly-scan","definition_id":"def-1",)"
+                               R"("frequency_type":"daily"})",
+                               "application/json", headers);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("id"));
+    CHECK(body["error"]["code"] == 503);
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "schedule.create");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "store_error");
+
+    // The engine's own validation text still answers 400 and writes no row.
+    h.audits.clear();
+    auto bad = h.sink.dispatch("POST", "/api/schedules",
+                               R"({"definition_id":"def-1","frequency_type":"daily"})",
+                               "application/json", headers);
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("schedule routes: a NUL or control byte in the path id answers 400 with one denied "
+          "row, and nothing changes",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    ScheduleRouteHarness h;
+    const auto id = seed_owned_schedule(h, "sched-owner", /*enabled=*/true);
+    auto headers = h.session_headers_for(
+        "sched-owner", "ScheduleAll",
+        {{"Schedule", "Write"}, {"Schedule", "Delete"}, {"Execution", "Execute"}});
+
+    for (const std::string& bad : {std::string("a\0b", 3), std::string("a\tb"),
+                                  std::string("a\x1b" "b")}) {
+        INFO("id length " << bad.size());
+        const struct {
+            const char* method;
+            std::string path;
+            std::string body;
+            const char* action;
+        } cases[] = {
+            {"POST", "/api/schedules/" + bad + "/enable", R"({"enabled":false})",
+             "schedule.disable"},
+            {"POST", "/api/schedules/" + bad + "/enable", R"({"enabled":true})",
+             "schedule.enable"},
+            {"DELETE", "/api/schedules/" + bad, "", "schedule.delete"},
+        };
+        for (const auto& c : cases) {
+            INFO(c.action);
+            h.audits.clear();
+            auto res = h.sink.dispatch(c.method, c.path, c.body, "application/json", headers);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            auto parsed = json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(parsed.is_discarded());
+            CHECK(parsed["error"]["code"] == 400);
+
+            REQUIRE(h.audits.size() == 1);
+            CHECK(h.audits[0].action == c.action);
+            CHECK(h.audits[0].result == "denied");
+            CHECK(h.audits[0].target_id.empty());
+            CHECK(h.audits[0].detail == "invalid_schedule_id");
+        }
+    }
+
+    // The seeded schedule is untouched.
+    auto scheds = h.schedule_engine->query_schedules();
+    REQUIRE(scheds.size() == 1);
+    CHECK(scheds[0].id == id);
+    CHECK(scheds[0].enabled == true);
 }
 
 // ── Interim service-scoped-token deny (guardian-confinement-2298) ─────────
