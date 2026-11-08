@@ -452,7 +452,7 @@ TEST_CASE("wsl: every failed status x live-root code maps to one outcome, access
 // nowhere to put it proves nothing). That half of the contract is pinned lexically, with a
 // mutation, in tests/test_virtualization_wsl_pin_lexical.py ("mount_name copied into the
 // result"). What this case does prove: unload_failed is processed independently of the access
-// status, and no SID or mount-name prefix reaches any emitted row.
+// status, and no SID reaches any emitted row.
 TEST_CASE("wsl: unload_failed is independent of the access status; no SID reaches a row",
           "[virtualization][wsl]") {
     struct Case {
@@ -487,7 +487,6 @@ TEST_CASE("wsl: unload_failed is independent of the access status; no SID reache
         }
         const std::string all = joined(r.posture);
         CHECK(all.find("S-1-5-") == std::string::npos);
-        CHECK(all.find("YUZU_HIVE") == std::string::npos);
     }
 }
 
@@ -1451,6 +1450,11 @@ TEST_CASE("wsl: RAW value branches classify type, size and race", "[virtualizati
         // malformed, never read as a number.
         {"version typed REG_SZ", [](Node& d) { FakeOps::set_sz(d, L"Version", "2"); },
          "value_malformed", "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", 4},
+        // Exactly 4 bytes (3 chars + NUL in the byte-oriented fake) so only the TYPE clause of the
+        // branch can reject it: dropping `type != REG_DWORD` would read it as a number.
+        {"version typed REG_SZ with a DWORD-sized payload",
+         [](Node& d) { FakeOps::set_sz(d, L"Version", "abc"); }, "value_malformed",
+         "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", 4},
         {"state a 2-byte DWORD",
          [](Node& d) {
              Val v;
