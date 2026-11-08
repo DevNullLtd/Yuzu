@@ -2861,16 +2861,77 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   mutex to a younger errored send released after H, so the errored reaches the wire first.
   UP-14: `enqueued_ns` is `system_clock`; a backward wall-clock step between an older compliant
   and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
-  whatever the wire order (the pair is flagged `order_uncertain` when the errored arrives
-  second; in the other order the compliant applies, and the pair is flagged only if one of the
+  whatever the wire order (the (agent, rule) pair is flagged `order_uncertain` when the errored arrives
+  second; in the other order the compliant applies, and the (agent, rule) pair is flagged only if one of the
   conditions in the Guardian guide's section 'When a verdict is flagged or does not move'
-  holds), and the hold cannot touch it (server side). Note on #5690's
+  holds), and the hold cannot touch it (server side). The agent now also
+  stamps a `(boot_epoch, emit_seq)` pair at the point queue order is decided (legacy executor
+  admission; the Spark outbox stamp). A server that compares the pair orders a retained
+  verdict against a newer one by it, and that order depends on neither the wall clock nor
+  arrival order; a server that does not compare it ignores the pair and keeps ordering by its
+  census ordering key. The census ordering key stays the key for entries that carry no pair:
+  journal-paged replays, DEX observations, and an agent whose boot epoch could not be claimed
+  are sent with the pair unset (0/0). Note on #5690's
   acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14 (the
   server now flags a tied or mis-ordered pair rather than keeping it silently);
   receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
   closes both. The test `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
-- Owner: not assigned in source material.
+- Merge gate for the agent change (UP-14; conditions the UP-14 SERVER change must meet before
+  the agent change merges, in the fixed order census change, server change, agent change).
+  This agent change activates ordering against a server that may already use the pair; it stays
+  blocked until the receiving change satisfies items 1 to 5 and the integrated range is reviewed.
+  Status will be tracked on #5690 and in the agent change's pull request description (one
+  checkbox per item) once that pull request exists:
+  1. The comparator orders per (agent_id, rule_id), compares the pair only when both sides
+     carry a nonzero pair and otherwise uses the census ordering key. Tests: isolation between agents and
+     rules (one agent's pair never affects another agent's rows), ordered to unordered to
+     ordered transitions, and a test that rejects "an unset pair ranks lowest". The pair is
+     agent-asserted and unauthenticated.
+  2. A tested recovery path for a pair regression. A lost, corrupt or restored-older agent row
+     that is below the server's retained epoch recovers without waiting for the clock to catch
+     up; both the ordinary backward-clock case and the previously-fast-clock case are covered.
+     While recovery is incomplete, stale census state is not silently shown as current (an
+     observable uncertain or degraded state, or another tested mechanism). Delayed events
+     carrying the former higher epoch cannot undo the recovery. The operator procedure names
+     the affected agent, leaves other agents' state untouched, and is written in the operator
+     manual.
+  3. The pair is kept out of `stored_event_matches` (pair-independent duplicate equality is
+     retained), so a journal replay (0/0) of an event already delivered is not counted as a
+     collision (otherwise `YuzuGuardianEventsDropped` fires on benign replays), and a test
+     shows a duplicate replay does not reapply an obsolete census transition.
+  4. The rule for gap repairs (they draw a fresh pair at admission today) and for accepted
+     unordered (0/0) events is stated with correctness outcomes and tests: a failed-claim 0/0
+     event against an existing ordered verdict; rollback to a non-stamping binary; the
+     transition from unordered back to ordered; whether an accepted 0/0 clears or retains the
+     stored ordering metadata, and how that metadata stays associated with the verdict it
+     actually describes; and the timeline of a previously undelivered older replay (an error at
+     timestamp 100 replayed as 0/0 after a backward clock step, after a newer live compliant
+     verdict at timestamp 90), in both arrival orders and with subsequent live events; and two
+     live senders sharing one agent_id, a lock holder stamping a pair while a process that
+     was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
+     0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
+     that is in turn ranked above it), the outcome is stated, and a test covers it. Two
+     stamping senders on separate data directories under one fixed agent id (independent
+     epochs) still order totally, but their events rank against each other by epochs that
+     are unrelated across instances, and the count below cannot see them because both send a
+     pair: for that case too the outcome is stated and a test covers it. The server also
+     counts accepted events that carry no pair, per agent, and exposes the count (a metric or
+     an API field), so an agent that runs unordered is visible fleet-wide; the agent's own
+     signal is one error-level log line.
+     For every case above, tests show that stale state is not silently presented as the current
+     verdict. When the available ordering information cannot establish freshness, the server
+     exposes that uncertainty or obtains fresh state; census-ordering-key fallback, metadata retention,
+     or documenting the selected result alone does not satisfy this criterion.
+  5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
+     server change owns the fields); the agent change takes the server change's version of
+     the hunk when it merges origin/dev. That comment must say boot_epoch is not guaranteed
+     monotonic across restarts (lost row, clock-ahead pin, equal epoch, 2^62 ceiling) and
+     must define UP-14. This item is a compatibility and documentation criterion; it does not
+     close items 1 to 4.
+- Owner: Dave Rae (maintainer), for the UP-14 server change that must meet items 1 to 5.
+  Receiving tracking unit: #5690. No server pull request for the pair comparison exists yet;
+  when it does, its description carries one checkbox per item and links back here.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
   `send_order_hold_releases`, `send_stalls` and `send_exceptions` per endpoint on the pilot
@@ -2918,10 +2979,12 @@ was raised (`governance.d/3953-3966-outbox-hardening.T6I4sf.jsonl` line 15).
 **Rollback lever for the hold and the spark path (status note; no new obligation, section 6's
 standing ruling stands).** `prefer_spark_` is `const` and fixed at construction
 (`guardian_engine.hpp`: "IMMUTABLE for object lifetime"), and `agent.cpp` constructs
-`GuardianEngine` with the default (`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(),
-cfg_.agent_id)`, no third argument), so there is no runtime switch for it. The rollback lever is
-the boot-time deploy opt-out `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (`agent.cpp`
-~1232-1248: the SparkEngine is not instantiated and detection stays on the legacy `IGuard` path),
+`GuardianEngine` with the literal `false` (`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(),
+cfg_.agent_id, /*prefer_spark=*/false, boot_epoch_claim.boot_epoch)`), so there is no runtime
+switch for it. The rollback lever is the boot-time deploy opt-out `--spark-disable` /
+`YUZU_AGENT_SPARK_DISABLE` (`agent.cpp`, the `if (cfg_.spark_disable)` branch ahead of the
+SparkEngine construction: the SparkEngine is not instantiated and detection stays on the
+legacy `IGuard` path),
 the sole lever per section 6: restart-required, deploy-time, not server-pushable. It persists
 across restarts only on Linux (`EnvironmentFile=`, #3851); Windows and macOS have no persistence
 mechanism yet (#3973). There is no hold-only lever: the hold's H and N are compile-time defaults.
