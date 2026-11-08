@@ -376,3 +376,78 @@ TEST_CASE("POST /api/policies: policy.create audit records an empty group list a
     INFO("detail = " << a.detail);
     CHECK(a.detail == "scope=ostype____\"linux\" groups=0");
 }
+
+// ── Identifier handling: an id carrying a NUL byte must not act on its prefix ─────────────────
+//
+// The id in these routes is a path capture. A value with an embedded NUL has to be refused as a
+// whole: no policy is deleted, enabled or disabled through its prefix, and no success audit row
+// or event names an id that differs from the row that was acted on.
+
+namespace {
+
+std::string make_policy(PolicyStore& store) {
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag);
+    auto policy = store.create_policy(R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Id Handling Policy
+description: A test policy
+fragment: )" + *frag + R"(
+scope: "tags.env == 'production'"
+)");
+    REQUIRE(policy);
+    return *policy;
+}
+
+} // namespace
+
+TEST_CASE("DELETE /api/policies/:id: an id with an embedded NUL deletes nothing and audits no success",
+          "[compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string pid = make_policy(store);
+
+    PolicyAdminHarness h{&store};
+    auto res = h.sink.Delete("/api/policies/" + pid + std::string("\0junk", 5));
+    REQUIRE(res);
+    CHECK(res->body.find("\"deleted\":true") == std::string::npos);
+    {
+        auto still = store.get_policy(pid);
+        REQUIRE(still.has_value());
+        CHECK(still->has_value());
+    }
+    for (const auto& a : h.audit_calls)
+        CHECK(a.result != "success");
+    CHECK(h.emitted_events.empty());
+}
+
+TEST_CASE("POST /api/policies/:id/disable|enable: an id with an embedded NUL changes nothing",
+          "[compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string pid = make_policy(store);
+    const auto before = store.get_policy(pid);
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+
+    PolicyAdminHarness h{&store};
+    const std::string bad = pid + std::string("\0junk", 5);
+    auto dis = h.sink.Post("/api/policies/" + bad + "/disable", "");
+    REQUIRE(dis);
+    CHECK(dis->status != 200);
+    auto ena = h.sink.Post("/api/policies/" + bad + "/enable", "");
+    REQUIRE(ena);
+    CHECK(ena->status != 200);
+
+    const auto after = store.get_policy(pid);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->enabled == (*before)->enabled);
+    for (const auto& a : h.audit_calls)
+        CHECK(a.result != "success");
+}

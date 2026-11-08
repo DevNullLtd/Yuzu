@@ -876,3 +876,81 @@ TEST_CASE("deployment routes: the deploy results script reveals the empty notice
     CHECK(h.find("e.style.display=vis?'none':'block'") != std::string::npos);
     CHECK(h.find("vis?'none':''") == std::string::npos);
 }
+
+// A run id with an embedded NUL must be refused before the create route reaches either
+// duplicate-deployment guard (find_running_for_run, succeeded_agents_for_run). A running
+// deployment exists for the id's prefix, so a guard that saw the prefix would resume or exclude
+// from it; the route has to answer "not found" and touch nothing instead.
+TEST_CASE("deployment routes: POST run with a run id carrying an embedded NUL is refused before "
+          "either guard, nothing is created, resumed or dispatched",
+          "[pg][deployment][routes][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(predb, preflight_routes_tpl);
+    PgPool dep_pool{{.conninfo = depdb.dsn(), .size = 4}};
+    PgPool pre_pool{{.conninfo = predb.dsn(), .size = 4}};
+    DeploymentRunStore deploy_store(dep_pool);
+    PreflightRunStore preflight_store(pre_pool);
+    REQUIRE(deploy_store.is_open());
+    REQUIRE(preflight_store.is_open());
+
+    const auto t = now_ms();
+    const std::string run_id = "run-nul-guard-1";
+    auto run = make_run(run_id, "alice", t);
+    run.go = 1;
+    REQUIRE(preflight_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+    const std::string dep_id = "dep-nul-guard-1";
+    REQUIRE(deploy_store.create_deployment(make_dep(dep_id, run_id, "alice", t), {tgt("agent-1")}));
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "agent-1";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&,
+                                  const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    auto poll = [](const std::string&) {
+        return std::unordered_map<std::string, deployment::AgentResponse>{};
+    };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+
+    DeploymentRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, devices, dispatch, poll, audit, &preflight_store,
+                           &deploy_store);
+
+    const std::string cfg = "&url=https%3A%2F%2Frepo.lan%2Fpkg.msi&filename=pkg.msi&sha256=" +
+                            std::string(64, 'a');
+    auto res = sink.Post("/fragments/auto/deploy/run?run=" + run_id + "%00junk" + cfg, "",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->body.find("Pre-flight run not found") != std::string::npos);
+    CHECK(dispatched == 0);
+    CHECK(audit_log.empty()); // no create, no resume, nothing
+
+    // The prefix run's deployment is untouched and no second one was minted.
+    auto still_running = deploy_store.find_running_for_run(run_id, "alice");
+    REQUIRE(still_running.has_value());
+    CHECK(*still_running == dep_id);
+    CHECK_FALSE(deploy_store.find_running_for_run(run_id + std::string("\0junk", 5), "alice")
+                    .has_value());
+    CHECK(deploy_store.succeeded_agents_for_run(run_id + std::string("\0junk", 5), "alice").empty());
+}

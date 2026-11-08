@@ -357,6 +357,26 @@ TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audi
     CHECK(h.audit_log.empty());
 }
 
+TEST_CASE("REST DELETE /api/v1/tokens: an id with an embedded NUL revokes nothing and audits no "
+          "success",
+          "[pg][rest][token][validation]") {
+    RestTokensHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    auto res = h.delete_token(token_id + std::string("\0junk", 5));
+    REQUIRE(res);
+    CHECK(res->status != 200);
+
+    // The real token (the prefix of the submitted id) is untouched.
+    auto looked_up = h.token_store()->get_token(token_id).value();
+    REQUIRE(looked_up.has_value());
+    CHECK_FALSE(looked_up->revoked);
+    for (const auto& a : h.audit_log)
+        CHECK(a.result != "success");
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // F-002 (governance Gate 2, security-guardian): CSPRNG failure on token
 // creation paths must emit a `failure` audit row carrying the
