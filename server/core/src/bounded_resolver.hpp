@@ -23,8 +23,8 @@
 /// The lookup function is injectable (`LookupFn`) so a test can block it behind a latch and prove
 /// the timeout, the cap and the not-found paths deterministically, with no DNS.
 ///
-/// POOLS IN USE: CRL source registration uses the default process-wide pool (cap 16), which is
-/// for any consumer that passes none.
+/// POOLS IN USE: CRL source registration uses the default process-wide pool (cap
+/// `kMaxInFlightLookups`), which any consumer that passes no pool also gets.
 ///
 /// CONTRACT FOR CONSUMERS:
 ///  - POOL OWNERSHIP. Every consumer that passes no pool shares the process pool, so a slow

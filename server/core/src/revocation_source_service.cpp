@@ -774,13 +774,15 @@ bool is_wildcard(const std::string& host) { return host.empty() || host == "0.0.
 } // namespace
 
 EgressEnv make_system_egress_env(std::vector<std::string> listen_specs,
-                                 std::vector<eg::Nat64Prefix> nat64_prefixes) {
+                                 std::vector<eg::Nat64Prefix> nat64_prefixes,
+                                 net::LookupFn listen_lookup) {
     EgressEnv env;
     env.resolve = [](const std::string& host, std::chrono::milliseconds budget) {
         return system_resolve(host, budget);
     };
     env.nat64_prefixes = std::move(nat64_prefixes);
-    env.local_addresses = [specs = std::move(listen_specs)](std::chrono::milliseconds budget)
+    env.local_addresses = [specs = std::move(listen_specs), lookup = std::move(listen_lookup)](
+                                  std::chrono::milliseconds budget)
         -> std::optional<std::vector<std::string>> {
         const auto until = std::chrono::steady_clock::now() + budget;
         std::vector<std::string> out;
@@ -806,7 +808,7 @@ EgressEnv make_system_egress_env(std::vector<std::string> listen_specs,
                     until - std::chrono::steady_clock::now());
                 if (left <= std::chrono::milliseconds{0})
                     return std::nullopt;
-                const auto r = net::bounded_resolve(host, std::min(kPerLookupBudget, left));
+                const auto r = net::bounded_resolve(host, std::min(kPerLookupBudget, left), lookup);
                 if (r.status != net::ResolveStatus::kOk)
                     return std::nullopt;
                 out.insert(out.end(), r.addresses.begin(), r.addresses.end());

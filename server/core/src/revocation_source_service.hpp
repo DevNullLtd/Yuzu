@@ -133,10 +133,12 @@ struct EgressEnv {
 
 /// The production environment. `listen_specs` are the configured listener addresses
 /// ("host", "host:port" or "[v6]:port"; an empty spec is a disabled listener and is skipped);
-/// a wildcard host expands to every interface address.
+/// a wildcard host expands to every interface address. `listen_lookup` replaces the system
+/// resolver for a listen host that is a name (tests only; empty = the system resolver).
 [[nodiscard]] EgressEnv make_system_egress_env(
     std::vector<std::string> listen_specs,
-    std::vector<::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes = {});
+    std::vector<::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes = {},
+    net::LookupFn listen_lookup = {});
 
 struct ListResult {
     std::vector<RevocationSourceRecord> sources;

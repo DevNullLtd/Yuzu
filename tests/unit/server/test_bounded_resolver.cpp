@@ -70,7 +70,7 @@ TEST_CASE("bounded resolver: the default cap is exactly 16 and a blocked lookup 
     const auto [status, elapsed] = fut.get();
     CHECK(status == net::ResolveStatus::kTimeout);
     CHECK(elapsed >= 350ms); // not returned early
-    CHECK(elapsed < 5s);     // returned at the bound, not after the blocked lookup (a load-tolerant ceiling)
+    CHECK(elapsed < 2s);     // returned near the bound, not after a doubled wait (load-tolerant ceiling)
     CHECK(pool->in_flight.load() == 1);
 
     // 15 more blocked lookups fill the default cap of 16; the 17th is refused kBusy.

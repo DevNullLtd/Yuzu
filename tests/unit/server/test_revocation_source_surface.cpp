@@ -531,8 +531,8 @@ TEST_CASE("revocation source validation: a wildcard bind expands to every local 
           "[revocation_source][pg]") {
     // The production environment builder: a wildcard listener makes every interface address
     // "own". The interface list is the host's (read live), so this asserts only the properties
-    // that hold on any host: a listener with a LITERAL address names exactly it. No name lookup
-    // runs here; the unresolvable-listen-host branch is not covered by a unit test.
+    // that hold on any host: a listener with a LITERAL address names exactly it. A listen host
+    // that is a name goes through an injected lookup, never the system resolver.
     auto env = rs::make_system_egress_env({"10.9.9.9:50051", "[2001:db8::7]:8080"});
     const auto own_opt = env.local_addresses(std::chrono::seconds(5));
     REQUIRE(own_opt.has_value());
@@ -551,6 +551,21 @@ TEST_CASE("revocation source validation: a wildcard bind expands to every local 
     auto disabled = rs::make_system_egress_env({"", "10.9.9.9:1"});
     REQUIRE(disabled.local_addresses(std::chrono::seconds(5)).has_value());
     CHECK(*disabled.local_addresses(std::chrono::seconds(5)) == std::vector<std::string>{"10.9.9.9"});
+    // A listen host that does not resolve makes the set unknown: nullopt, never "fewer". The
+    // lookup is injected, so no DNS runs.
+    auto unresolvable = rs::make_system_egress_env(
+        {"listener.test:1"}, {}, [](const std::string&) { return net::ResolveResult{}; });
+    CHECK_FALSE(unresolvable.local_addresses(std::chrono::seconds(5)).has_value());
+    // A listen host that resolves contributes exactly the addresses the lookup returned.
+    auto resolvable = rs::make_system_egress_env({"listener.test:1"}, {}, [](const std::string&) {
+        net::ResolveResult r;
+        r.status = net::ResolveStatus::kOk;
+        r.addresses = {"192.0.2.44"};
+        return r;
+    });
+    const auto got = resolvable.local_addresses(std::chrono::seconds(5));
+    REQUIRE(got.has_value());
+    CHECK(*got == std::vector<std::string>{"192.0.2.44"});
 }
 
 TEST_CASE("revocation source validation: address classes are shown, then confirmed",

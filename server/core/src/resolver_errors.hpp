@@ -6,8 +6,8 @@
 /// (CRL source registration is its first consumer), so every later consumer shares ONE classifier
 /// and none can disagree about NXDOMAIN.
 ///
-/// The codes are the platform resolver's return codes; literals are used where a platform's
-/// codes would otherwise need socket includes, so this header needs none.
+/// The codes are the platform resolver's return codes. On the platform whose codes would need
+/// socket includes, literals are used instead, so that branch needs none.
 
 #ifndef _WIN32
 #include <netdb.h>
