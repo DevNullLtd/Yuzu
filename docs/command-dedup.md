@@ -51,7 +51,7 @@ regressible — nothing fails loudly when one is broken.
    `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty or unmovable sidecars are removed, best
    effort), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
    (header-only, unit-tested directly). The claim protects the quarantined EVIDENCE only: two agent daemons on
-   one data dir are unsupported (there is no instance lock), and one can still drop the fresh store the other
+   one data dir are unsupported (no instance lock covers the dedup store; the Guardian boot-epoch lock guards only the epoch claim), and one can still drop the fresh store the other
    just created. What counts is deliberately narrow:
    - `SQLITE_CORRUPT` / `SQLITE_NOTADB` from any open step (open, the `journal_mode`/`synchronous` pragmas,
      creating the two tables). Damage confined to the unused `meta` table is tolerated: the

@@ -90,8 +90,13 @@ struct DeviceCiSectionDef {
 // (a) bump the digest layout version (`kSectionDigestPrefix`, e.g. to `v2:`), so values stored under
 // the old version are a well-formed digest of another layout and read as unverified; or (b) ship a
 // migration that sets `row_count` and `content_digest` to NULL for that kind. Adding a new
-// table-backed kind is safe (it gets a digest automatically); the whole-registry test in
-// test_device_inventory_store.cpp fails if a kind persists none.
+// table-backed kind gets a digest automatically, BUT the registry is not the schema (#7164): migration
+// v2 is a frozen literal in device_inventory_store.cpp, so a new table-backed kind or a changed column
+// list ALSO needs its own migration (a new kind: CREATE TABLE; a column change: ALTER TABLE plus the
+// NULLing in (b)), and new columns are appended to the END of the list. The schema test and the
+// store constructor's projection check fail until that migration exists; the rule is in
+// docs/postgres-store-playbook.md "Registry-backed tables". The whole-registry test in
+// test_device_inventory_store.cpp fails if a kind persists no digest.
 //
 // The last column is row_floor: the width measured from a captured sample for cpu, dimm (once
 // manufacturer, part and serial are filled), disk and volume. partition is measured on Windows
