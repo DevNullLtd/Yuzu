@@ -2359,7 +2359,7 @@ TEST_CASE("ApiTokenStore: validate_token_checked reports a live token as valid",
     auto raw = store.create_token("Stream Token", "alice");
     REQUIRE(raw.has_value());
 
-    auto checked = store.validate_token_checked(*raw);
+    auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kValid);
     REQUIRE(checked.token.has_value());
     CHECK(checked.token->principal_id == "alice");
@@ -2378,7 +2378,7 @@ TEST_CASE("ApiTokenStore: a revoked token is DEFINITIVELY invalid, not indetermi
 
     REQUIRE(store.revoke_token(live->token_id));
 
-    auto checked = store.validate_token_checked(*raw);
+    auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     // kInvalid — NOT kUnavailable. A revocation must cut the stream on the next
     // tick; if it were reported as indeterminate it would instead buy the revoked
     // credential a full grace window of extra life.
@@ -2391,7 +2391,7 @@ TEST_CASE("ApiTokenStore: an unknown token is definitively invalid", "[pg][token
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
     REQUIRE(store.is_open());
-    auto checked = store.validate_token_checked("yuzu_never_issued_0123456789012");
+    auto checked = store.validate_token_checked("yuzu_never_issued_0123456789012", ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kInvalid);
 }
 
@@ -2400,7 +2400,7 @@ TEST_CASE("ApiTokenStore: an empty token is definitively invalid", "[pg][token][
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
     REQUIRE(store.is_open());
-    CHECK(store.validate_token_checked("").status == ApiTokenStore::TokenCheck::kInvalid);
+    CHECK(store.validate_token_checked("", ApiTokenStore::TokenReadMode::kCached).status == ApiTokenStore::TokenCheck::kInvalid);
 }
 
 TEST_CASE("ApiTokenStore: an EXHAUSTED connection pool is kUnavailable, not kInvalid",
@@ -2423,7 +2423,7 @@ TEST_CASE("ApiTokenStore: an EXHAUSTED connection pool is kUnavailable, not kInv
     auto hog = pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(hog); // we now hold the only connection
 
-    const auto checked = store.validate_token_checked(*raw);
+    const auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
     CHECK_FALSE(checked.token.has_value()); // indeterminate NEVER grants access
 }
@@ -2451,7 +2451,7 @@ TEST_CASE("ApiTokenStore: an unreadable store is kUnavailable, NOT kInvalid",
         REQUIRE(r.ok());
     }
 
-    const auto checked = store.validate_token_checked(*raw);
+    const auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
     CHECK_FALSE(checked.token.has_value()); // indeterminate NEVER grants access
 }
@@ -2486,7 +2486,7 @@ TEST_CASE("ApiTokenStore: a CONTENDED store is kUnavailable, not a false revocat
         REQUIRE(r.ok());
     }
 
-    const auto checked = store.validate_token_checked(*raw);
+    const auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
     CHECK_FALSE(checked.token.has_value());
 }
@@ -2504,7 +2504,7 @@ TEST_CASE("ApiTokenStore: re-validation does not write last_used_at",
     auto raw = store.create_token("read-only-check", "alice");
     REQUIRE(raw.has_value());
 
-    const auto before = store.validate_token_checked(*raw);
+    const auto before = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     REQUIRE(before.status == ApiTokenStore::TokenCheck::kValid);
     CHECK(before.token->last_used_at == 0); // create_token leaves it unset
 
@@ -2518,6 +2518,42 @@ TEST_CASE("ApiTokenStore: re-validation does not write last_used_at",
     CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "0"); // a READ — it did not stamp
 }
 
+
+TEST_CASE("ApiTokenStore: validate_token_checked(kAuthoritative) sees a revoke made behind the "
+          "cache and leaves the cache and its counters alone",
+          "[pg][token][authoritative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    auto raw = store.create_token("authoritative-check", "alice");
+    REQUIRE(raw.has_value());
+    const auto live = store.validate_token(*raw); // warms the 60 s cache
+    REQUIRE(live.has_value());
+    REQUIRE(store.cache_size() == 1);
+
+    // A revoke handled by another replica: the row changes, this process is not told.
+    PgConn other{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(other.get()) == CONNECTION_OK);
+    PgResult r{PQexec(other.get(), "UPDATE api_token_store.api_tokens SET revoked = true")};
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+    REQUIRE(std::string(PQcmdTuples(r.get())) == "1");
+
+    const auto hits = store.cache_hits();
+    const auto misses = store.cache_misses();
+    const auto authoritative =
+        store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kAuthoritative);
+    CHECK(authoritative.status == ApiTokenStore::TokenCheck::kInvalid); // definitive
+    CHECK_FALSE(authoritative.token.has_value());
+    CHECK(store.cache_size() == 1);        // no erase
+    CHECK(store.cache_hits() == hits);     // no hit, no miss counted
+    CHECK(store.cache_misses() == misses);
+
+    // The cached read still answers from the entry (this is the lag the authoritative read exists
+    // to step around, kept for the stream pump).
+    CHECK(store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached).status ==
+          ApiTokenStore::TokenCheck::kValid);
+}
 
 // ── Human arm: token-keyed overlap-pair rotation (P2 #11, SOC 2 CC6.3) ─────
 

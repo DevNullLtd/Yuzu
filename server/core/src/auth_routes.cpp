@@ -190,6 +190,34 @@ struct AuditProbeScope {
     AuditProbeScope& operator=(const AuditProbeScope&) = delete;
 };
 
+// The remediation for a supervised-tier token refused on a non-MCP transport. The generic text
+// names the flow; a pair with a named MCP tool also names the tool and what it needs, because
+// the contract (a required idempotency_key, the approval_id on the repeat call) cannot be
+// guessed from "ticket-then-recall". EXTEND this function when a pair gains a tool, never fork.
+std::string approval_gated_remediation(std::string_view securable_type, std::string_view operation) {
+    if (securable_type == "Workflow" && operation == "Execute")
+        return "this operation is approval-gated for the supervised MCP tier; call the MCP "
+               "execute_workflow tool (POST /mcp/v1/) with an idempotency_key: the first call "
+               "returns an approval_id, and once an administrator approves it, repeat the same "
+               "call with that approval_id. A person can also run it from the dashboard";
+    return "this operation is approval-gated for the supervised MCP tier; use the MCP "
+           "ticket-then-recall flow (POST /mcp/v1/) or the dashboard";
+}
+
+// The ONE place a CredentialReadMode is interpreted: true == read the durable row, false == a
+// cache may answer. There is deliberately NO `default:`, so a new enumerator is a -Wswitch
+// diagnostic here instead of a silent fall-through to the weaker (cached) read. A value outside
+// the enumerators (reachable only through a cast) takes the durable read, the stronger one.
+bool reads_durable_row(auth::CredentialReadMode mode) noexcept {
+    switch (mode) {
+    case auth::CredentialReadMode::kCached:
+        return false;
+    case auth::CredentialReadMode::kAuthoritative:
+        return true;
+    }
+    return true;
+}
+
 } // namespace
 
 namespace detail {
@@ -523,7 +551,8 @@ std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::
     return std::nullopt;
 }
 
-auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token) const {
+auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token,
+                                                          auth::CredentialReadMode mode) const {
     using R = auth::CredentialCheck;
 
     // Mirrors the two gates synthesize_token_session applies AFTER the token row
@@ -547,11 +576,35 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
     if (!engine_principal_store_) {
         return R::kRevoked;
     }
-    // The ONE cached-lookup site (#2367). This function is only ever reached
-    // from revalidate_stream — the per-tick liveness re-check of an ALREADY
-    // authenticated stream — never from session synthesis or an on-behalf-of
-    // target check, both of which call get_for_auth and read through to
-    // Postgres every time (which is why this method is private).
+    // The ONE cached-lookup site (#2367). This function is only ever reached from
+    // revalidate_stream, which two kinds of caller ask: the held-open MCP stream's per-tick
+    // liveness re-check (kCached, below) and the workflow run's per-step boundary check
+    // (kAuthoritative, next). Session synthesis and the on-behalf-of target check never come
+    // here: they call get_for_auth and read through to Postgres every time (which is why this
+    // method is private).
+    if (reads_durable_row(mode)) {
+        // A boundary check, not a timer tick: ask Postgres, never the 15 s liveness cache. Same
+        // three-way mapping as below; nothing is reported stale because nothing was cached.
+        // This also bypasses get_for_auth_revalidate's 5-10 s failure backoff (#2367), so under a
+        // pool brownout every check pays for its own lease attempts. The bound (measured): a check makes at
+        // most three reads (two token candidates and this row). A saturated pool makes each
+        // wait at most 0.5 s, so about 4 s per boundary (the run asks twice when the first
+        // answer is indeterminate, one second apart). A database that accepts connections but
+        // does not answer costs the 10 s connect timeout on the first read of each attempt, about
+        // 21 s per boundary. A read on a connection already leased to a database that stopped
+        // answering did not return in 150 s in a test: no pool timeout bounds it and the run
+        // deadline is re-tested only after the retry wait. It fails closed (kIndeterminate)
+        // whenever a read returns.
+        switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
+        case EngineLookupStatus::Active:
+            return R::kValid;
+        case EngineLookupStatus::MissingOrRevoked:
+            return R::kRevoked;
+        case EngineLookupStatus::StoreUnreachable:
+            return R::kIndeterminate;
+        }
+        return R::kRevoked; // unreachable: fail closed on a future enum value
+    }
     const auto engine = engine_principal_store_->get_for_auth_revalidate(token.principal_id);
     switch (engine.status) {
     case EngineLookupStatus::Active:
@@ -576,7 +629,8 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
 }
 
 auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
-                                                    const std::string& expected_principal) {
+                                                    const std::string& expected_principal,
+                                                    auth::CredentialReadMode mode) {
     using R = auth::CredentialCheck;
 
     // The invariant: a stream lives iff a FRESH request carrying these same headers
@@ -587,8 +641,11 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     // to also carry a stale cookie from a browser jar or a cookie-injecting proxy.
     // It failed closed, but it was still wrong.
 
-    // 1. Session cookie. AuthManager's session table is in-memory, so a "no" here is
-    //    always DEFINITIVE — there is no backend that could be unavailable.
+    // 1. Session cookie. `validate_session` answers from the cache of the durable session
+    //    store, whose generation it polls at most once per second (and distrusts past 30 s of
+    //    failed polls, going to the store). A "no" here is treated as DEFINITIVE even when it
+    //    came from a degraded store read: that fails closed (kRevoked), it never grants. The
+    //    mode does not change this arm: there is no per-credential cache to bypass.
     const auto cookie = extract_session_cookie(req);
     if (cookie.size() > auth::kMaxSessionTokenLength) {
         // resolve_session hard-rejects an oversized cookie rather than falling through,
@@ -623,7 +680,9 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     for (const auto& raw : candidates) {
         if (raw.empty() || raw.size() > auth::kMaxApiTokenLength || !api_token_store_)
             continue;
-        const auto checked = api_token_store_->validate_token_checked(raw);
+        const auto checked = api_token_store_->validate_token_checked(
+            raw, reads_durable_row(mode) ? ApiTokenStore::TokenReadMode::kAuthoritative
+                                         : ApiTokenStore::TokenReadMode::kCached);
         switch (checked.status) {
         case ApiTokenStore::TokenCheck::kValid:
             if (checked.token && checked.token->principal_id == expected_principal) {
@@ -636,12 +695,14 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
                 // Returned verbatim, including kValidStale (#2367): the engine
                 // gate is the only staleness this function models today, and
                 // flattening it to kValid here would undo the whole point of
-                // the distinction. NOTE the token half above is NOT modelled —
-                // `validate_token_checked` is served from its own 60 s cache
-                // and reports a hit as plain kValid, so a token-authenticated
-                // stream still carries the additive window this closes for
-                // engine principals. Pre-existing; tracked as #2447.
-                return engine_credential_state(*checked.token);
+                // the distinction. NOTE the token half above is NOT modelled
+                // under kCached: `validate_token_checked` is served from its
+                // own 60 s cache and reports a hit as plain kValid, so a
+                // token-authenticated stream still carries the additive window
+                // this closes for engine principals. Pre-existing; tracked as
+                // #2447. Under kAuthoritative the token row was just read from
+                // Postgres, so there is no cache residency to model.
+                return engine_credential_state(*checked.token, mode);
             }
             break; // a valid token for SOMEONE ELSE is not authority for this stream
         case ApiTokenStore::TokenCheck::kUnavailable:
@@ -1169,13 +1230,12 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
         // false), keep `.remediation` unconditionally (it correctly steers to
         // the ticket-then-recall flow regardless of whether an RBAC grant
         // would separately admit the caller).
+        // Named local: the A4 options hold views, so the text must outlive the a4_denial call.
+        const std::string remediation = approval_gated_remediation(securable_type, operation);
         res.set_content(
             detail::a4_denial(
                 res, 403, "operation requires approval for this MCP tier on this transport",
-                detail::A4ErrorOpts{.remediation = "this operation is approval-gated "
-                                             "for the supervised MCP tier; use the MCP "
-                                             "ticket-then-recall flow (POST /mcp/v1/) or "
-                                             "the dashboard",
+                detail::A4ErrorOpts{.remediation = remediation,
                             .permission = actionable_permission ? std::string_view(perm)
                                                                 : std::string_view{}}),
             "application/json");
@@ -1302,14 +1362,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
                           securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
+            const std::string remediation = approval_gated_remediation(securable_type, operation);
             res.set_content(
                 detail::a4_denial(
                     res, 403,
                     "operation requires approval for this MCP tier on this transport",
-                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
-                                               "supervised MCP tier; use the MCP ticket-then-recall "
-                                               "flow (POST /mcp/v1/) or the dashboard",
-                                .permission = perm}),
+                    detail::A4ErrorOpts{.remediation = remediation, .permission = perm}),
                 "application/json");
             return false;
         }
