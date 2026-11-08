@@ -10,7 +10,8 @@
  * it here together with the schema taken from openapi_spec_json().
  *
  * What is checked, recursively, at every level the schema describes:
- *   - `type` (OpenAPI 3.0 spelling, one name, never an array): string, integer (a JSON integer:
+ *   - `type` (OpenAPI 3.0 spelling, one name: an array `type` throws nlohmann::type_error rather than being
+ *     reported as a violation): string, integer (a JSON integer:
  *     5.0 is a float and fails), number (any), boolean, object, array; `nullable: true` admits
  *     null.
  *   - `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `minItems`, `maxItems`. Lengths are
@@ -76,7 +77,8 @@ inline const json* resolve_local_ref(const json& spec, const std::string& ref) {
     return node;
 }
 
-/// Keywords that carry no constraint on a value.
+/// Keywords accepted without being checked: pure annotations, plus `pattern`, `format` and
+/// `uniqueItems`, which DO constrain a value but are not modelled (see the header).
 inline bool is_annotation_keyword(const std::string& k) {
     static const std::set<std::string> kNames = {
         "description", "default",  "example",  "examples", "title",     "format",

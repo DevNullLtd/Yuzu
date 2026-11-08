@@ -270,7 +270,7 @@ first build. The document is the template literal, not generated, so nothing bel
    more. When a piece nears that, split it at the end of a line after a comma or closing brace:
    close it with `)json"` and open the next piece with `R"json(` on the following line.
 
-One command checks steps 2 to 6 without a build: `python3 -I tests/test_openapi_operation_authoring.py`
+One command checks steps 2, 3, 5 and 6 without a build (step 4, the wording rules, still needs the C++ tests after a build): `python3 -I tests/test_openapi_operation_authoring.py`
 (meson `docs` suite). It reads the served document and the constants out of
 `test_openapi_spec_completeness.cpp`, checks the `operationId` shape and uniqueness, the typed
 success response, the checksum pin and the segment ceiling in one run, and prints the checksum to

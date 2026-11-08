@@ -580,8 +580,9 @@ TEST_CASE("score-policy routes: every 200 body conforms to the served DexScorePo
         const json body = json::parse(res->body);
         const auto violations = oa::body_violations(spec, schema, body);
         INFO(json(violations).dump(2));
-        // REQUIRE, not CHECK: the lines below index the body, and a const operator[] on a missing
-        // member aborts instead of failing.
+        // REQUIRE, not CHECK: the lines below index members the schema requires, and a const
+        // operator[] on a missing member aborts instead of failing. Optional members are read
+        // with .at(), which throws and fails the test.
         REQUIRE(violations.empty());
         // meta is declared as a bare object; its one member is pinned here.
         CHECK(body["meta"] == json{{"api_version", "v1"}});
@@ -619,9 +620,9 @@ TEST_CASE("score-policy routes: every 200 body conforms to the served DexScorePo
     // PUT, real: previous_revision present, document walks every nested part.
     const auto put = conforms("PUT", h.send("PUT", kPath, full_doc, Harness::if_match("default")));
     REQUIRE(put["data"].contains("previous_revision"));
-    CHECK(put["data"]["document"]["overrides"][0].contains("tiers"));
-    CHECK(put["data"]["document"]["overrides"][0].contains("weights"));
-    CHECK(put["data"]["document"]["overrides"][0].contains("model"));
+    CHECK(put.at("data").at("document").at("overrides").at(0).contains("tiers"));
+    CHECK(put.at("data").at("document").at("overrides").at(0).contains("weights"));
+    CHECK(put.at("data").at("document").at("overrides").at(0).contains("model"));
 
     // GET of what was written: custom source.
     const std::string rev = put["data"]["revision"].get<std::string>();
@@ -631,7 +632,7 @@ TEST_CASE("score-policy routes: every 200 body conforms to the served DexScorePo
     const auto dry = conforms("PUT dry run",
                               h.send("PUT", std::string(kPath) + "?dry_run=true", full_doc,
                                      Harness::if_match(rev)));
-    CHECK(dry["data"]["dry_run"] == true);
+    CHECK(dry.at("data").at("dry_run") == true);
 
     // DELETE of the stored policy, then of nothing (idempotent).
     conforms("DELETE, stored policy", h.send("DELETE", kPath, {}, Harness::if_match(rev)));

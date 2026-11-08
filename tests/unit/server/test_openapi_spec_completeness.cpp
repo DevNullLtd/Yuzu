@@ -2887,6 +2887,9 @@ TEST_CASE("openapi body checker: bounds, nullable, oneOf and additionalPropertie
     CHECK_FALSE(bad(one_of, "x"));
     CHECK_FALSE(bad(one_of, 1));
     CHECK(bad(one_of, true));
+    // Known limit: oneOf is checked as at-least-one, so a value matching two alternatives passes.
+    const json overlapping = {{"oneOf", json::array({{{"type", "integer"}}, {{"type", "number"}}})}};
+    CHECK_FALSE(bad(overlapping, 1));
 
     const json closed = {{"type", "object"}, {"properties", {{"a", {{"type", "string"}}}}}};
     CHECK_FALSE(bad(closed, json{{"a", "x"}}));
@@ -2902,7 +2905,7 @@ TEST_CASE("openapi body checker: bounds, nullable, oneOf and additionalPropertie
 
 // The score-policy request-size text is a hand copy of the body-cap row and of the policy limit.
 // Pin it, so changing either without the served document fails here instead of leaving the
-// integrator-facing figure wrong (it was wrong once: 256 KiB where the cap is 320 KiB).
+// integrator-facing figure wrong.
 TEST_CASE("openapi documents: the score-policy request-size text matches the body-cap row and the policy limit",
           "[openapi][structure][responses]") {
     const json spec = json::parse(openapi_spec_json());
@@ -2912,6 +2915,7 @@ TEST_CASE("openapi documents: the score-policy request-size text matches the bod
     // 411 is declared below only while an unmeasurable body is refused.
     REQUIRE(cap.requires_measurable);
     REQUIRE(cap.max_body_bytes % 1024 == 0);
+    REQUIRE(kDexScorePolicyMaxBytes % 1024 == 0);
     const std::string cap_text = std::to_string(cap.max_body_bytes / 1024) + " KiB";
     const std::string limit_text = std::to_string(kDexScorePolicyMaxBytes / 1024) + " KiB";
 
@@ -2930,5 +2934,19 @@ TEST_CASE("openapi documents: the score-policy request-size text matches the bod
         INFO(method);
         CHECK(response_text(method, "413").find(cap_text) != std::string::npos);
         CHECK_FALSE(response_text(method, "411").empty());
+    }
+
+    // Every figure any of the request-size texts states must be one of the two limits, so a stale
+    // figure in the PUT 400 text or in a 413 text fails here whatever its phrasing.
+    const json* put_400 =
+        find_at(spec, {"paths", "/dex/score-policy", "put", "responses", "400", "description"});
+    REQUIRE((put_400 != nullptr && put_400->is_string()));
+    const std::set<std::string> allowed{limit_text, cap_text};
+    const std::regex figure("[0-9]+ KiB");
+    for (const std::string& text : {put, put_400->get<std::string>(), response_text("put", "413"),
+                                    response_text("delete", "413")}) {
+        INFO(text);
+        for (std::sregex_iterator it(text.begin(), text.end(), figure), end; it != end; ++it)
+            CHECK(allowed.contains(it->str()));
     }
 }

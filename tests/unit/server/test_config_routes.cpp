@@ -2096,8 +2096,9 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
         const json b = body(res.body);
         const auto violations = oa::body_violations(spec, schema, b);
         INFO(json(violations).dump(2));
-        // REQUIRE, not CHECK: the lines below index the body, and a const operator[] on a missing
-        // member aborts instead of failing.
+        // REQUIRE, not CHECK: the lines below index members the schema requires, and a const
+        // operator[] on a missing member aborts instead of failing. Optional members are read
+        // with .at(), which throws and fails the test.
         REQUIRE(violations.empty());
         // meta is declared through ApiMeta; its one member is pinned here too.
         CHECK(b["meta"] == json{{"api_version", "v1"}});
@@ -2114,7 +2115,7 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
 
     // The three effects, a numeric JSON value (echoed as its text), a secret (no value member).
     const auto stored_only = put("response_retention_days", R"({"value":120})");
-    CHECK(stored_only["data"]["value"] == "120"); // a string, even for a number sent
+    CHECK(stored_only.at("data").at("value") == "120"); // a string, even for a number sent
     effects.insert(stored_only["data"]["effect"].get<std::string>());
     effects.insert(put("log_level", R"({"value":"debug"})")["data"]["effect"].get<std::string>());
     effects.insert(
@@ -2129,7 +2130,7 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
     h.audits.clear();
     h.audit_fails_at = 1;
     const auto lost = put("response_retention_days", R"({"value":"121"})");
-    CHECK(lost["data"]["audit_persisted"] == false);
+    CHECK(lost.at("data").at("audit_persisted") == false);
     h.audit_fails_at = -1;
     CHECK_FALSE(put("response_retention_days", R"({"value":"122"})")["data"].contains(
         "audit_persisted"));
@@ -2155,8 +2156,8 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
     REQUIRE(admin["data"]["overrides"].size() >= 3);
     for (const auto& [key, ov] : admin["data"]["overrides"].items()) {
         INFO("override " << key);
-        CHECK(ov["updated_by"].is_string());
-        CHECK(ov["updated_at"].is_number_integer()); // an integer timestamp; the schema leaves it untyped
+        CHECK(ov.at("updated_by").is_string());
+        CHECK(ov.at("updated_at").is_number_integer()); // an integer timestamp; the schema leaves it untyped
         // Exactly one of value (a string) and is_set (true, for a secret key).
         CHECK(ov.contains("value") != ov.contains("is_set"));
         if (ov.contains("value"))
@@ -2164,8 +2165,8 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
         if (ov.contains("is_set"))
             CHECK(ov["is_set"] == true);
     }
-    CHECK(admin["data"]["overrides"]["oidc_client_secret"].contains("is_set"));
-    CHECK(admin["data"]["overrides"]["response_retention_days"]["value"] == "122");
+    CHECK(admin.at("data").at("overrides").at("oidc_client_secret").contains("is_set"));
+    CHECK(admin.at("data").at("overrides").at("response_retention_days").at("value") == "122");
 
     // GET as a plain user: the same shape, with withheld_keys non-empty and
     // audit_retention_days out of config.
