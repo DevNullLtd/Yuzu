@@ -35,6 +35,7 @@
 // rule that is never evaluated while hung. The File mechanism is a fake: the real one is Windows-only.
 
 #include <yuzu/agent/guardian_engine.hpp>
+#include <yuzu/agent/guardian_rebuild_tally.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp> // sha256_file
 
@@ -2148,6 +2149,204 @@ TEST_CASE("#4415 PR-A (10b): the preserved tally is bounded and sanitised - ids 
     CHECK(hostile.find('\n') == std::string::npos);
     CHECK(t.ids().size() == 1);
     CHECK(t.ids()[0].find_first_of(" \n=,") == std::string::npos);
+}
+
+// -------------------------------------------------------------------------------------------------
+// #5719 (C1). GuardianRebuildTally: the pure tally behind the `full_sync rebuilt` line. No engine,
+// no runtime; these pin the counting, the shared id budget, the invariant and the golden bytes.
+// -------------------------------------------------------------------------------------------------
+namespace {
+using yuzu::agent::GuardianRebuildReason;
+using yuzu::agent::GuardianRebuildTally;
+
+constexpr std::array<GuardianRebuildReason, 11> kAllRebuildReasons{
+    GuardianRebuildReason::KeyBusy,         GuardianRebuildReason::FirstAttach,
+    GuardianRebuildReason::KeyFaulted,      GuardianRebuildReason::KeyDead,
+    GuardianRebuildReason::HealthUnknown,   GuardianRebuildReason::SubscriptionReplaced,
+    GuardianRebuildReason::UnknownEpisode,  GuardianRebuildReason::ContentChanged,
+    GuardianRebuildReason::BaselineEmpty,   GuardianRebuildReason::BaselineDiffers,
+    GuardianRebuildReason::Other};
+
+bool is_count_only(GuardianRebuildReason r) {
+    return r == GuardianRebuildReason::FirstAttach || r == GuardianRebuildReason::ContentChanged;
+}
+
+GuardianRebuildReason reason_from_token(const std::string& tok) {
+    for (const auto r : kAllRebuildReasons)
+        if (yuzu::agent::guardian_rebuild_reason_token(r) == tok)
+            return r;
+    return GuardianRebuildReason::None;
+}
+
+std::size_t sum_of_buckets(const GuardianRebuildTally& t) {
+    std::size_t n = 0;
+    for (const auto r : kAllRebuildReasons)
+        n += t.count(r);
+    return n;
+}
+} // namespace
+
+// Mutations: make note() bump the wrong bucket (swap two cases in the index), or skip the
+// increment for any one reason; the per-reason count CHECKs go red.
+TEST_CASE("#5719 C1: the rebuild tally counts every reason in its own bucket and lists ids only for "
+          "the id-bearing groups",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    for (const auto r : kAllRebuildReasons) {
+        CAPTURE(std::string(yuzu::agent::guardian_rebuild_reason_token(r)));
+        GuardianRebuildTally t;
+        t.note("rule-a", r);
+        t.note("rule-b", r);
+        CHECK(t.count(r) == 2);
+        CHECK(t.total() == 2);
+        for (const auto other : kAllRebuildReasons)
+            if (other != r)
+                CHECK(t.count(other) == 0);
+        if (is_count_only(r)) {
+            // first_attach and content_changed are count-only: no id is ever kept or printed.
+            CHECK(t.ids(r).empty());
+            const auto line = t.format();
+            CHECK(line.find("rule-a") == std::string::npos);
+            CHECK(line.find("rule-b") == std::string::npos);
+            CHECK(line.find("ids=[") == std::string::npos);
+            CHECK(line.ends_with(" more=0"));
+        } else {
+            CHECK(t.ids(r) == std::vector<std::string>{"rule-a", "rule-b"});
+            const auto token = std::string(yuzu::agent::guardian_rebuild_reason_token(r));
+            CHECK(t.format().find(" " + token + "=2 ids=[rule-a,rule-b]") != std::string::npos);
+            CHECK(t.format().ends_with(" more=0"));
+        }
+    }
+}
+
+// Mutation: let note(None) count (delete the `i == 0` early return); every CHECK here goes red.
+TEST_CASE("#5719 C1: note(None) is a no-op, so a rule without a reason appears in no bucket",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    GuardianRebuildTally t;
+    t.note("a", GuardianRebuildReason::None);
+    CHECK(t.total() == 0);
+    CHECK(sum_of_buckets(t) == 0);
+    CHECK(t.format().find("rebuilt 0 rule(s)") != std::string::npos);
+    CHECK(t.format().find("ids=[") == std::string::npos);
+    t.note("b", GuardianRebuildReason::KeyDead);
+    t.note("c", GuardianRebuildReason::None);
+    CHECK(t.total() == 1);
+    CHECK(t.ids(GuardianRebuildReason::KeyDead) == std::vector<std::string>{"b"});
+}
+
+// Mutation: give each group its own budget (the shared listed_/id_bytes_ become per-group), or
+// compute `more` from one group only; the shared-budget and `more` CHECKs go red.
+TEST_CASE("#5719 C1: the id-bearing groups share ONE id budget and `more` counts every unlisted id",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    GuardianRebuildTally t;
+    // Count-only reasons never consume the budget.
+    for (std::size_t i = 0; i < GuardianRebuildTally::kMaxIds + 10; ++i)
+        t.note("c" + std::to_string(i), GuardianRebuildReason::FirstAttach);
+    CHECK(t.format().ends_with(" more=0"));
+
+    // kMaxIds across TWO id-bearing groups: the first fills the whole list, the second gets none.
+    const std::size_t n = GuardianRebuildTally::kMaxIds;
+    for (std::size_t i = 0; i < n; ++i)
+        t.note("f" + std::to_string(i), GuardianRebuildReason::KeyFaulted);
+    for (std::size_t i = 0; i < 5; ++i)
+        t.note("d" + std::to_string(i), GuardianRebuildReason::KeyDead);
+    CHECK(t.ids(GuardianRebuildReason::KeyFaulted).size() == n);
+    CHECK(t.ids(GuardianRebuildReason::KeyDead).empty());
+    CHECK(t.count(GuardianRebuildReason::KeyDead) == 5);
+    const auto line = t.format();
+    CHECK(line.ends_with(" more=5"));
+    CHECK(line.find(" dead_key=5 ids=[") != std::string::npos); // count > 0 prints an (empty) list
+    CHECK(line.find("d0") == std::string::npos);
+    CHECK(t.total() == GuardianRebuildTally::kMaxIds + 10 + n + 5);
+
+    // The byte budget is shared too: maximum-length ids stop the list well short of kMaxIds.
+    t.reset();
+    const std::string longid(yuzu::kGuardianLogIdMaxBytes, 'x');
+    for (int i = 0; i < 20; ++i)
+        t.note(longid, (i % 2) ? GuardianRebuildReason::HealthUnknown : GuardianRebuildReason::Other);
+    const std::size_t listed = t.ids(GuardianRebuildReason::HealthUnknown).size() +
+                               t.ids(GuardianRebuildReason::Other).size();
+    CHECK(listed < 20);
+    CHECK(listed * yuzu::kGuardianLogIdMaxBytes <= GuardianRebuildTally::kMaxIdBytes);
+    CHECK(t.total() == 20);
+    CHECK(t.format().ends_with(" more=" + std::to_string(20 - listed)));
+
+    // reset() returns the budget.
+    t.reset();
+    CHECK(t.total() == 0);
+    t.note("z", GuardianRebuildReason::KeyBusy);
+    CHECK(t.ids(GuardianRebuildReason::KeyBusy) == std::vector<std::string>{"z"});
+    CHECK(t.format().ends_with(" more=0"));
+}
+
+// Mutation: let ids through unsanitised (drop log_id_token), or print a count-only group's ids.
+TEST_CASE("#5719 C1: a hostile rule id cannot forge a field or a line in the rebuild tally",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    GuardianRebuildTally t;
+    t.note("a b\nGuardian: x=1,y]", GuardianRebuildReason::KeyFaulted);
+    const auto line = t.format();
+    CHECK(line.find('\n') == std::string::npos);
+    REQUIRE(t.ids(GuardianRebuildReason::KeyFaulted).size() == 1);
+    CHECK(t.ids(GuardianRebuildReason::KeyFaulted)[0].find_first_of(" \n=,") == std::string::npos);
+    // log_id_token leaves ']' alone (same as the preserved tally), so it is not asserted here.
+}
+
+// INVARIANT: total() equals the sum of the eleven bucket counts, whatever was noted.
+// Mutation: make total() a separate counter that note() forgets to bump for one reason, or have
+// note(None) bump it.
+TEST_CASE("#5719 C1: INVARIANT - total() equals the sum of the bucket counts",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    GuardianRebuildTally t;
+    CHECK(t.total() == sum_of_buckets(t));
+    std::size_t k = 0;
+    for (int round = 0; round < 3; ++round)
+        for (const auto r : kAllRebuildReasons) {
+            for (std::size_t j = 0; j <= k % 4; ++j)
+                t.note("r" + std::to_string(k) + "-" + std::to_string(j), r);
+            ++k;
+            t.note("none", GuardianRebuildReason::None);
+            CHECK(t.total() == sum_of_buckets(t));
+        }
+    CHECK(t.total() > 0);
+    // The N printed on the line is the same figure.
+    CHECK(t.format().find("rebuilt " + std::to_string(sum_of_buckets(t)) + " rule(s)") !=
+          std::string::npos);
+}
+
+// Mutation: reorder the printed groups, change a literal in the header, or drop the stable
+// zero-count tokens; the byte-for-byte comparison goes red. The fixture is the shared golden.
+TEST_CASE("#5719 C1: format() equals the golden fixture byte for byte",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    const auto path = fs::path{YUZU_TEST_FIXTURE_DIR} / "spark" / "rebuild_line.json";
+    std::ifstream f(path);
+    REQUIRE(f.good());
+    const auto fixture = nlohmann::json::parse(f);
+    REQUIRE(fixture.at("cases").size() >= 2);
+    for (const auto& c : fixture.at("cases")) {
+        CAPTURE(c.at("name").get<std::string>());
+        GuardianRebuildTally t;
+        for (const auto& n : c.at("notes")) {
+            const auto why = reason_from_token(n.at("reason").get<std::string>());
+            REQUIRE(why != GuardianRebuildReason::None);
+            t.note(n.at("rule_id").get<std::string>(), why);
+        }
+        CHECK(t.format() == c.at("expected_line").get<std::string>());
+    }
+}
+
+// Mutation: give two reasons one token, or let a token carry a space, comma or bracket.
+TEST_CASE("#5719 C1: rebuild reason tokens are unique and free of space, comma and bracket",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    std::set<std::string> seen;
+    for (const auto r : kAllRebuildReasons) {
+        const std::string tok{yuzu::agent::guardian_rebuild_reason_token(r)};
+        CAPTURE(tok);
+        CHECK_FALSE(tok.empty());
+        CHECK(tok.find_first_of(" ,[]=\n") == std::string::npos);
+        CHECK(tok != "none");
+        CHECK(seen.insert(tok).second);
+    }
+    CHECK(seen.size() == 11);
+    CHECK(yuzu::agent::guardian_rebuild_reason_token(GuardianRebuildReason::None) == "none");
 }
 
 // -------------------------------------------------------------------------------------------------
