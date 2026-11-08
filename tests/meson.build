@@ -333,6 +333,8 @@ agent_test_exe = executable(
     'unit/test_offline_hive_mutex.cpp',       # ScopedOfflineHiveLock RAII/mutual-exclusion contract
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
+    'unit/test_guardian_emit_seq.cpp',
+    'unit/test_guardian_boot_epoch.cpp',
     'unit/test_guardian_spark_runtime.cpp',
     'unit/test_guardian_state_reader.cpp',
     'unit/test_guardian_convergence_scheduler.cpp',
@@ -4157,6 +4159,23 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
+# stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
+# page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes
+# (executor offer(), outbox set_common), agent.cpp passes the claimed boot epoch as the 4th
+# GuardianEngine argument, and both executor construction paths share the engine's emit source.
+# Carries its own in-memory mutation self-test (one or more per rule, plus comment/string
+# stripping proofs). No build required. Python, one process, ~5 s on Linux and ~7 s on an M1
+# (the mutation self-test re-scans the large agent.cpp once per mutation; the helpers are memoised
+# so a rule scan of an unchanged source is not repeated). The 60 s timeout leaves headroom on a
+# loaded self-hosted runner; the gate took 24-35 s, past the old 30 s limit, before it was memoised.
+test('guardian emit-pair stamp wiring lexical gate (UP-14)',
+  _python3_test,
+  args: [files('test_guardian_emit_stamp_lexical.py')],
+  suite: 'agent',
+  timeout: 60,
+)
+
 # Command-dedup claim wiring (#3668): the claim decision is a pure function with its own unit
 # tests; this pins that agent.cpp's Subscribe loop still CALLS it and acts on every field of the
 # answer (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
@@ -4164,6 +4183,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('agent command-dedup wiring lexical gate (#3668)',
   _python3_test,
   args: [files('test_agent_command_dedup_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Guardian empty-rule_id sender refusal: the helper sits on two private AgentImpl send paths with
+# no gRPC seam (#1492); this pins that both still call it before the Write, return the
+# disposed-by-design outcome, tokenise the logged id and keep T_wire honest. Carries its own
+# in-memory mutation self-test. No build required.
+test('agent guardian sender-refusal wiring lexical gate (#5690)',
+  _python3_test,
+  args: [files('test_agent_guardian_refusal_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
