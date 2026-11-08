@@ -161,6 +161,8 @@ std::unexpected<RevocationSourceStoreError> fail(Kind kind, std::string message)
 // A statement that did not answer as expected. A lost connection after a WRITE was sent is
 // kOutcomeUnknown (Postgres may have committed it before the link dropped); any failure on a
 // live connection is a definite rollback (kQueryError). A read is never ambiguous.
+// A statement issued before the transaction's first write (a lock, a count, the clock) counts as
+// a read here: dropping the link rolls the open transaction back, so its outcome is definite.
 std::unexpected<RevocationSourceStoreError> statement_error(std::string_view op, PGconn* conn,
                                                             const pg::PgResult& res, bool write) {
     const bool lost = PQstatus(conn) == CONNECTION_BAD;
@@ -522,11 +524,11 @@ RevocationSourceStore::create(const NewRevocationSource& src, const std::string&
         conn, "SELECT pg_advisory_xact_lock(hashtext('revocation_source.registration'))",
         std::vector<std::string>{});
     if (lock.status() != PGRES_TUPLES_OK)
-        return statement_error("create lock", conn, lock, true);
+        return statement_error("create lock", conn, lock, false);
     pg::PgResult count = pg::exec_params(
         conn, "SELECT count(*) FROM revocation_source_store.source", std::vector<std::string>{});
     if (count.status() != PGRES_TUPLES_OK || PQntuples(count.get()) != 1)
-        return statement_error("create count", conn, count, true);
+        return statement_error("create count", conn, count, false);
     if (to_i64(count, 0, 0) >= static_cast<std::int64_t>(kMaxSources))
         return fail(Kind::kLimitReached, "the source ceiling is reached");
 
@@ -586,7 +588,7 @@ RevocationSourceStore::replace(std::int64_t id, const NewRevocationSource& src) 
               "FOR UPDATE",
         std::vector<std::string>{std::to_string(id)});
     if (lock.status() != PGRES_TUPLES_OK)
-        return statement_error("replace lock", conn, lock, true);
+        return statement_error("replace lock", conn, lock, false);
     if (PQntuples(lock.get()) != 1)
         return fail(Kind::kNotFound, "no such revocation source");
     if (src.ca_subject_name_sha256 != PQgetvalue(lock.get(), 0, 0))
@@ -762,7 +764,7 @@ RevocationSourceStore::reset_high_water(std::int64_t id, const std::string& rese
               "FOR UPDATE",
         std::vector<std::string>{std::to_string(id)});
     if (lock.status() != PGRES_TUPLES_OK)
-        return statement_error("reset lock", conn, lock, true);
+        return statement_error("reset lock", conn, lock, false);
     if (PQntuples(lock.get()) != 1)
         return fail(Kind::kNotFound, "no such revocation source");
     const std::string ca = PQgetvalue(lock.get(), 0, 0);
@@ -784,7 +786,7 @@ RevocationSourceStore::reset_high_water(std::int64_t id, const std::string& rese
         const std::string_view code = sqlstate(when);
         if (code == "22007" || code == "22008" || code == "22P02")
             return fail(Kind::kInvalidInput, "invalid reset_at");
-        return statement_error("reset time", conn, when, true);
+        return statement_error("reset time", conn, when, false);
     }
     if (std::string_view(PQgetvalue(when.get(), 0, 1)) == "t")
         return fail(Kind::kBadResetTime, "reset_at is later than the server clock");

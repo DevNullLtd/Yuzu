@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -217,18 +218,16 @@ std::expected<ParsedCa, ServiceError> parse_ca_pem(const std::string& pem, std::
         return invalid(param, "is not a parseable PEM certificate");
     }
     // Exactly one certificate: anything left over (a second block, a key) is refused.
+    // The whole remainder is examined (the input is already capped at kMaxPemBytes), so padding
+    // cannot hide a suffix.
     std::string rest(256, '\0');
-    std::string leftover;
     for (;;) {
         const int n = BIO_read(bio.get(), rest.data(), static_cast<int>(rest.size()));
         if (n <= 0)
             break;
-        leftover.append(rest.data(), static_cast<std::size_t>(n));
-        if (leftover.size() > 4096)
-            break;
+        if (!all_space(std::string_view(rest.data(), static_cast<std::size_t>(n))))
+            return invalid(param, "must hold exactly one certificate and nothing else");
     }
-    if (!all_space(leftover))
-        return invalid(param, "must hold exactly one certificate and nothing else");
     ERR_clear_error();
 
     // A CA: basicConstraints cA=TRUE, and cRLSign if a key usage extension is present.
@@ -848,8 +847,8 @@ std::string rfc3339_utc(std::int64_t epoch_seconds) {
 // Validation and the operations.
 
 namespace {
-// At most this many registrations resolve names at once: DNS runs on the request thread of the
-// shared HTTP pool, and DNS on the request thread must not delay /livez and /readyz.
+// At most this many registrations wait on name lookups at once, so registrations cannot take
+// more than this many request workers of the shared HTTP pool.
 constexpr int kMaxConcurrentValidations = 4;
 std::atomic<int>& validations_in_flight() {
     static std::atomic<int>& n = *new std::atomic<int>(0);
