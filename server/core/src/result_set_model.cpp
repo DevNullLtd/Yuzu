@@ -16,6 +16,8 @@ nlohmann::json result_set_json(const ResultSet& r) {
         {"status", to_string(r.status)},
         {"source_execution_id", r.source_execution_id},
         {"device_count", r.device_count},
+        {"agents_failed", r.agents_failed},
+        {"partial", r.agents_failed > 0},
     };
 }
 

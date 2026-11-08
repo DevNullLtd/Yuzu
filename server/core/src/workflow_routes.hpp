@@ -12,6 +12,7 @@
 #include "authz_model.hpp" // yuzu::server::authz::VisibleSet (K-R7-02 / #1788)
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
+#include "event_emit.hpp"       // yuzu::server::EmitEventFn: the 4-argument emitter the v1 execute twin binds
 #include "execution_tracker.hpp"
 #include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
@@ -23,9 +24,12 @@
 #include "tag_store.hpp"
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the v1 workflow reads
 #include "workflow_engine.hpp"
+#include "workflow_execute.hpp"  // WorkflowAuthorizeFn (Deps::authorize_dispatch)
+#include "workflow_run_port.hpp" // WorkflowRunFn (Deps::workflow_run)
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -50,6 +54,13 @@ class WorkflowRoutes {
 public:
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
+    /// Re-validates the credential on `req` against the principal the call was made as
+    /// (`AuthRoutes::revalidate_stream`, the function MCP's held-open streams use, asked here with
+    /// `CredentialReadMode::kAuthoritative`). Asked by a synchronous workflow run before each step
+    /// (`WorkflowExecuteRequest::reauthorize`).
+    using RevalidateFn =
+        std::function<auth::CredentialCheck(const httplib::Request&, const std::string& principal)>;
+
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
@@ -155,6 +166,12 @@ public:
         /// leases from the same counter as every other streaming surface. nullptr = no
         /// admission control (test harnesses only).
         yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+        /// True while the server is draining; the synchronous workflow-run routes refuse new runs
+        /// then (the budget itself does not consult its closing flag). Unset = never draining.
+        std::function<bool()> draining;
+        /// Test seam: the wall-clock bound of one run on the LEGACY `POST /api/workflows/{id}/execute`
+        /// route. Unset = `kWorkflowSyncBudget` (60 s), the production value; nothing wires it.
+        std::optional<std::chrono::milliseconds> workflow_run_budget;
         AuthFn auth_fn;
         PermFn perm_fn;
         /// Side-effect-free permission probe for RENDERING decisions only (never a gate):
@@ -190,6 +207,10 @@ public:
         /// `POST /api/instructions/{id}/execute`. Empty = same-host only.
         std::vector<std::string> csrf_trusted_origins;
         EmitEventFn emit_fn;
+        /// The same emitter in the 4-argument shape `bind_event_emit` takes, for the v1 execute
+        /// twin's `workflow.executed` (the legacy route above publishes it through `emit_fn`).
+        /// Unset = the twin publishes no event.
+        yuzu::server::EmitEventFn emit_event_fn;
         ScopeEstimateFn scope_fn;
         /// Kept for the legacy unversioned GET/mutator routes above (`GET
         /// /api/workflows[/{id}]`, `GET /api/workflow-executions/{id}`,
@@ -218,6 +239,22 @@ public:
         /// is (server.cpp) — see `workflow_api.hpp`'s own doc comment for
         /// the full carve-out list.
         std::shared_ptr<const WorkflowApi> workflow_api;
+        /// The run port behind `POST /api/v1/workflows/{id}/execute` (`workflow_run_port.hpp`),
+        /// built in server.cpp from `workflow_engine_`; the same closure MCP `execute_workflow`
+        /// gets. Unset ⇒ that route answers "workflow engine not available". The legacy
+        /// `POST /api/workflows/{id}/execute` keeps its own `workflow_engine` call.
+        WorkflowRunFn workflow_run;
+        /// The idempotency pre-check beside `workflow_run` (server.cpp wires both from
+        /// `workflow_engine_`); the same function MCP `execute_workflow` gets.
+        WorkflowIdempotencyLookupFn workflow_idempotency_lookup;
+        /// The shared dispatch-chokepoint dry run (server.cpp's `authorize_dispatch`) that the v1
+        /// execute route asks per distinct step pair before anything is sent. Unset ⇒ that
+        /// route answers 503 "workflow dispatch not available" (fail closed, never "no gate").
+        WorkflowAuthorizeFn authorize_dispatch;
+        /// The credential liveness check the v1 execute route hands its run (see
+        /// `WorkflowExecuteRequest::reauthorize`). Unset == the run makes no per-step credential
+        /// check: a test seam only, server.cpp always wires it (a lexical gate pins that).
+        RevalidateFn revalidate;
         /// ADR-0031 WS-A4 (seventh family): the schedule-read seam — replaces
         /// a direct `ScheduleEngine*` reach for `GET /fragments/schedules` /
         /// `GET /api/v1/schedules` (the seamed read triad; the unversioned

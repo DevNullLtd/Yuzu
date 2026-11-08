@@ -24,8 +24,11 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "response_store.hpp"
 #include "rest_api_v1.hpp"
+#include "result_set_members.hpp"
 #include "result_set_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -37,8 +40,10 @@
 
 #include <algorithm>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -396,7 +401,7 @@ TEST_CASE("from-echo-query: 202 pending, dispatch to __all__ when no parent",
     AsyncHarness h(pool);
     int status = 0;
     auto j = h.post("/api/v1/result-sets/from-echo-query",
-                    R"({"sql":"SELECT pid FROM process_live","name":"chrome-procs"})", status);
+                    R"({"sql":"SELECT name FROM $Process_Hourly","name":"chrome-procs"})", status);
     REQUIRE(status == 202);
     auto data = j["data"];
     REQUIRE(data["status"] == "pending");
@@ -413,7 +418,7 @@ TEST_CASE("from-echo-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(h.calls[0].plugin == "echo");
     REQUIRE(h.calls[0].action == "sql");
     REQUIRE(h.calls[0].scope_expr == "__all__");
-    REQUIRE(h.calls[0].params.at("sql") == "SELECT pid FROM process_live");
+    REQUIRE(h.calls[0].params.at("sql") == "SELECT name FROM $Process_Hourly");
     // execution_id was minted BEFORE dispatch (create-before-dispatch).
     REQUIRE(h.calls[0].execution_id == data["source_execution_id"].get<std::string>());
 
@@ -2205,7 +2210,7 @@ TEST_CASE("from-echo-query: an authenticated caller WITHOUT Execution:Execute di
 
     int status = 0;
     h.post("/api/v1/result-sets/from-echo-query",
-           R"({"sql":"SELECT pid FROM process_live","name":"probe"})", status);
+           R"({"sql":"SELECT name FROM $Process_Hourly","name":"probe"})", status);
 
     CHECK(status == 403);
     CHECK(h.calls.empty()); // THE assertion: the fleet was never reached
@@ -2241,7 +2246,7 @@ TEST_CASE("re-eval: an authenticated caller WITHOUT Execution:Execute dispatches
     // inherited from whoever created the original.
     int status = 0;
     auto created = h.post("/api/v1/result-sets/from-echo-query",
-                          R"({"sql":"SELECT pid FROM process_live","name":"orig"})", status);
+                          R"({"sql":"SELECT name FROM $Process_Hourly","name":"orig"})", status);
     REQUIRE(status == 202);
     const auto rs_id = created["data"]["id"].get<std::string>();
     const auto calls_before = h.calls.size();
@@ -4421,6 +4426,498 @@ TEST_CASE("GET /api/v1/result-sets/{id}/lineage: a degraded result_sets read ref
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
+}
+
+// ── Roll-up only: a set stored over a raw capture table is refused, not re-run to nothing ───────
+
+namespace {
+
+// Seed an echo_query set whose stored SQL is `sql`, bypassing the create-time refusal the way a set
+// stored by an earlier release is.
+std::string seed_echo_query(AsyncHarness& h, const std::string& sql) {
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "stored";
+    cr.source_kind = std::string(source_kind::kEchoQuery);
+    cr.source_payload = nlohmann::json{{"sql", sql}, {"include_empty", false}}.dump();
+    cr.matcher = R"({"kind":"echo_rows_ge","n":1})";
+    auto r = h.store->create_materialized(cr, {"dev-1"});
+    REQUIRE(r.has_value());
+    return r->id;
+}
+
+// A stored echo.sql definition: `sql_default` is what the canned query runs when the set carries
+// no `sql` param of its own.
+std::string make_echo_sql_instruction(InstructionStore& s, const std::string& sql_default) {
+    InstructionDefinition def;
+    def.name = "Canned echo query";
+    def.version = "1.0";
+    def.plugin = "echo";
+    def.action = "sql";
+    def.type = "question";
+    def.description = "canned";
+    def.parameter_schema =
+        nlohmann::json{{"type", "object"},
+                       {"properties", {{"sql", {{"type", "string"}, {"default", sql_default}}}}}}
+            .dump();
+    def.enabled = true;
+    auto id = s.create_definition(def);
+    REQUIRE(id.has_value());
+    return *id;
+}
+
+std::string seed_instruction_result(AsyncHarness& h, const std::string& instruction_id,
+                                    const nlohmann::json& params) {
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "stored-instr";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload =
+        nlohmann::json{{"instruction_id", instruction_id}, {"params", params}}.dump();
+    cr.matcher = R"({"kind":"any_response"})";
+    auto r = h.store->create_materialized(cr, {"dev-1"});
+    REQUIRE(r.has_value());
+    return r->id;
+}
+
+} // namespace
+
+TEST_CASE("re-eval: a set stored over a raw capture table is refused with RESULT_SET_REEVAL_STALE_SOURCE",
+          "[pg][result_set][async][reeval][echo][stale_source]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    SECTION("by dollar name and by real table name") {
+        for (const char* sql :
+             {"SELECT pid FROM $Process_Live", "SELECT pid FROM process_live WHERE name='chrome.exe'"}) {
+            INFO(sql);
+            const auto id = seed_echo_query(h, sql);
+            int status = 0;
+            auto re = h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+            REQUIRE(status == 400);
+            CHECK(re["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+                  std::string::npos);
+        }
+        CHECK(h.calls.empty()); // nothing was dispatched
+    }
+    SECTION("a set over the hourly roll-up proceeds") {
+        const auto id = seed_echo_query(h, "SELECT name FROM $Process_Hourly");
+        int status = 0;
+        h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+        CHECK(status == 202);
+        REQUIRE(h.calls.size() == 1);
+        CHECK(h.calls[0].params.at("sql") == "SELECT name FROM $Process_Hourly");
+    }
+}
+
+TEST_CASE("re-eval: an instruction_result set is refused on the SQL its definition will run",
+          "[pg][result_set][async][reeval][echo][stale_source]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    SECTION("the definition's own default reads a raw capture table") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Live");
+        const auto id = seed_instruction_result(h, iid, nlohmann::json::object());
+        int status = 0;
+        auto re = h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+        REQUIRE(status == 400);
+        CHECK(re["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+        CHECK(h.calls.empty());
+    }
+    SECTION("a stored param overrides a clean default") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Hourly");
+        const auto id =
+            seed_instruction_result(h, iid, nlohmann::json{{"sql", "SELECT 1 FROM tcp_live"}});
+        int status = 0;
+        h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+        CHECK(status == 400);
+        CHECK(h.calls.empty());
+    }
+    SECTION("a clean default proceeds") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Hourly");
+        const auto id = seed_instruction_result(h, iid, nlohmann::json::object());
+        int status = 0;
+        h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 1);
+    }
+    SECTION("a definition of another plugin is not read for SQL") {
+        const auto iid = make_instruction(*h.instr); // filehash.check
+        const auto id = seed_instruction_result(h, iid, nlohmann::json{{"sql", "$Process_Live"}});
+        int status = 0;
+        h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+        CHECK(status == 202);
+    }
+}
+
+TEST_CASE("from-echo-query: a query over a raw capture table is refused before dispatch",
+          "[pg][result_set][async][echo][stale_source]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    for (const char* sql : {"SELECT pid FROM $Process_Live", "SELECT pid FROM process_live"}) {
+        INFO(sql);
+        auto j = h.post("/api/v1/result-sets/from-echo-query",
+                        nlohmann::json{{"sql", sql}}.dump(), status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+    }
+    CHECK(h.calls.empty());
+    h.post("/api/v1/result-sets/from-echo-query",
+           nlohmann::json{{"sql", "SELECT name FROM $Process_Hourly"}}.dump(), status);
+    CHECK(status == 202);
+    CHECK(h.calls.size() == 1);
+}
+
+TEST_CASE("from-instruction-result: a definition that reads a raw capture table is refused before dispatch",
+          "[pg][result_set][async][echo][stale_source]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const auto create = [&](const std::string& iid, const nlohmann::json& params, int& status) {
+        nlohmann::json body{{"instruction_id", iid}};
+        if (!params.is_null())
+            body["params"] = params;
+        return h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    };
+
+    SECTION("the definition's own default reads a raw capture table") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Live");
+        int status = 0;
+        auto j = create(iid, nullptr, status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+        CHECK(h.calls.empty());
+    }
+    SECTION("a caller param overrides a clean default") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Hourly");
+        int status = 0;
+        create(iid, nlohmann::json{{"sql", "SELECT 1 FROM tcp_live"}}, status);
+        CHECK(status == 400);
+        CHECK(h.calls.empty());
+    }
+    SECTION("a clean caller param overrides a stale default") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Live");
+        int status = 0;
+        create(iid, nlohmann::json{{"sql", "SELECT 1 FROM $TCP_Hourly"}}, status);
+        CHECK(status == 202);
+        REQUIRE(h.calls.size() == 1);
+        CHECK(h.calls[0].params.at("sql") == "SELECT 1 FROM $TCP_Hourly");
+    }
+    SECTION("a clean default proceeds") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Hourly");
+        int status = 0;
+        create(iid, nullptr, status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 1);
+    }
+    SECTION("a definition of another plugin is not read for SQL") {
+        const auto iid = make_instruction(*h.instr); // filehash.check
+        int status = 0;
+        create(iid, nlohmann::json{{"sql", "$Process_Live"}}, status);
+        CHECK(status == 202);
+    }
+}
+
+// ── A query that failed on an agent is counted, not silently dropped from the set ──────────────
+
+namespace {
+
+void put_exec_row(ResponseStore& store, const std::string& execution_id, const std::string& agent,
+                  int status, const std::string& output, int64_t ts) {
+    StoredResponse r;
+    r.instruction_id = "echo-1";
+    r.execution_id = execution_id;
+    r.agent_id = agent;
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    r.status = status;
+    r.output = output;
+    r.timestamp = ts;
+    store.store(r);
+}
+
+constexpr const char* kOneRow = "__schema__|pid\n1000\n__total__|1";
+constexpr const char* kNoRows = "__schema__|pid\n__total__|0";
+
+// What the server's maintenance tick does for one pending set, then the REST read of the result.
+struct MaterialisedRead {
+    int64_t device_count{0};
+    int64_t agents_failed{0};
+    bool partial{false};
+    std::vector<std::string> members;
+};
+
+MaterialisedRead materialise_and_read(AsyncHarness& h, ResponseStore& responses,
+                                      const std::string& set_id, const std::string& execution_id) {
+    PendingSet pending;
+    pending.id = set_id;
+    pending.owner_principal = "operator-1";
+    pending.source_kind = std::string(source_kind::kEchoQuery);
+    pending.source_execution_id = execution_id;
+    pending.matcher = R"({"kind":"echo_rows_ge","n":1})"; // NOT the default matcher
+    auto found = result_set_members(responses, &yuzu::server::test::forensics_plugin_set(), pending);
+    REQUIRE(found.has_value());
+    std::vector<std::string> members(found->begin(), found->end());
+    REQUIRE(h.store->materialize(set_id, members, found->agents_failed).has_value());
+
+    auto res = h.sink.dispatch("GET", "/api/v1/result-sets/" + set_id, "");
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+    const auto j = nlohmann::json::parse(res->body, nullptr, false);
+    MaterialisedRead out;
+    out.device_count = j["data"]["device_count"].get<int64_t>();
+    out.agents_failed = j["data"]["agents_failed"].get<int64_t>();
+    out.partial = j["data"]["partial"].get<bool>();
+    out.members = std::move(members);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("materialise: one agent that answers error|refused is counted and the set is partial",
+          "[pg][result_set][async][echo][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+
+    int status = 0;
+    auto created = h.post("/api/v1/result-sets/from-echo-query",
+                          R"({"sql":"SELECT pid FROM $Process_Hourly"})", status);
+    REQUIRE(status == 202);
+    const auto set_id = created["data"]["id"].get<std::string>();
+
+    SECTION("a refusing agent is counted (fails without the count)") {
+        const auto exec = get_ok(*h.store, set_id)->source_execution_id;
+        put_exec_row(responses, exec, "agent-ok", 1, kOneRow, 100);
+        put_exec_row(responses, exec, "agent-refused", 1, "error|refused", 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.members == std::vector<std::string>{"agent-ok"});
+        CHECK(read.device_count == 1);
+        CHECK(read.agents_failed == 1);
+        CHECK(read.partial);
+    }
+    SECTION("an agent that errored and then answered with a match is a member and not failed") {
+        const auto exec = get_ok(*h.store, set_id)->source_execution_id;
+        put_exec_row(responses, exec, "agent-flaky", 1, "error|busy", 100);
+        put_exec_row(responses, exec, "agent-flaky", 1, kOneRow, 200);
+        put_exec_row(responses, exec, "agent-ok", 1, kOneRow, 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 2);
+        CHECK(read.agents_failed == 0);
+        CHECK_FALSE(read.partial);
+    }
+    SECTION("a clean no-match is not a failure") {
+        const auto exec = get_ok(*h.store, set_id)->source_execution_id;
+        put_exec_row(responses, exec, "agent-empty", 1, kNoRows, 100);
+        put_exec_row(responses, exec, "agent-ok", 1, kOneRow, 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 1);
+        CHECK(read.agents_failed == 0);
+        CHECK_FALSE(read.partial);
+    }
+    SECTION("a non-success status is a failure, counted once per agent") {
+        const auto exec = get_ok(*h.store, set_id)->source_execution_id;
+        put_exec_row(responses, exec, "agent-crashed", 2, "", 100);
+        put_exec_row(responses, exec, "agent-crashed", 3, "error|again", 150);
+        put_exec_row(responses, exec, "agent-ok", 1, kOneRow, 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 1);
+        CHECK(read.agents_failed == 1);
+        CHECK(read.partial);
+    }
+}
+
+TEST_CASE("materialise: the members read pages past the store's default row limit",
+          "[pg][result_set][async][echo][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+
+    int status = 0;
+    auto created = h.post("/api/v1/result-sets/from-echo-query",
+                          R"({"sql":"SELECT pid FROM $Process_Hourly"})", status);
+    REQUIRE(status == 202);
+    const auto set_id = created["data"]["id"].get<std::string>();
+    const auto exec = get_ok(*h.store, set_id)->source_execution_id;
+
+    SECTION("a failed row at position 101 of a newest-first read is counted") {
+        // 100 newer matching rows, then one older failure: a read capped at the store's default
+        // 100 rows never sees the failure and reports partial=false.
+        for (int i = 0; i < 100; ++i)
+            put_exec_row(responses, exec, "agent-ok-" + std::to_string(i), 1, kOneRow, 200);
+        put_exec_row(responses, exec, "agent-refused", 1, "error|refused", 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 100);
+        CHECK(read.agents_failed == 1);
+        CHECK(read.partial);
+    }
+    SECTION("a member at position 101 is a member") {
+        for (int i = 0; i < 100; ++i)
+            put_exec_row(responses, exec, "agent-ok-" + std::to_string(i), 1, kOneRow, 200);
+        put_exec_row(responses, exec, "agent-last", 1, kOneRow, 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 101);
+        CHECK(read.agents_failed == 0);
+        CHECK_FALSE(read.partial);
+        CHECK(read.members.back() == "agent-last");
+    }
+    SECTION("an agent that never answered is neither a member nor counted") {
+        // The dispatch targeted more agents than answered; the read sees stored rows only, so
+        // partial stays false: the documented non-responder exclusion.
+        put_exec_row(responses, exec, "agent-ok", 1, kOneRow, 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 1);
+        CHECK(read.agents_failed == 0);
+        CHECK_FALSE(read.partial);
+    }
+    SECTION("rows that share one timestamp are each read once across page boundaries") {
+        // Timestamps are epoch seconds, so a fleet's answers tie. Two rows per page over seven
+        // rows at one timestamp: an offset walk over `timestamp DESC` alone has no total order
+        // at the page boundaries; the keyset read has one. Every member and the failed agent
+        // must be seen exactly once.
+        for (int i = 0; i < 6; ++i)
+            put_exec_row(responses, exec, "agent-" + std::to_string(i), 1, kOneRow, 100);
+        put_exec_row(responses, exec, "agent-refused", 1, "error|refused", 100);
+        PendingSet pending;
+        pending.id = set_id;
+        pending.source_execution_id = exec;
+        pending.matcher = R"({"kind":"echo_rows_ge","n":1})";
+        const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+        auto paged = result_set_members(responses, plugins, pending, 2, 100);
+        REQUIRE(paged.has_value());
+        CHECK_FALSE(paged->truncated);
+        CHECK(paged->agents_failed == 1);
+        std::vector<std::string> members(paged->begin(), paged->end());
+        std::sort(members.begin(), members.end());
+        CHECK(members == std::vector<std::string>{"agent-0", "agent-1", "agent-2", "agent-3",
+                                                  "agent-4", "agent-5"});
+    }
+    SECTION("the read reports truncated only when rows lie past its bound") {
+        for (int i = 0; i < 6; ++i)
+            put_exec_row(responses, exec, "agent-" + std::to_string(i), 1, kOneRow, 100 + i);
+        PendingSet pending;
+        pending.id = set_id;
+        pending.source_execution_id = exec;
+        pending.matcher = R"({"kind":"echo_rows_ge","n":1})";
+        const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+        // Two rows per page, four rows allowed, six stored: truncated, with the first four read.
+        auto bounded = result_set_members(responses, plugins, pending, 2, 4);
+        REQUIRE(bounded.has_value());
+        CHECK(bounded->truncated);
+        CHECK(bounded->size() == 4);
+        // Exactly as many rows as allowed: the page past the bound is empty, nothing is lost.
+        auto exact = result_set_members(responses, plugins, pending, 2, 6);
+        REQUIRE(exact.has_value());
+        CHECK_FALSE(exact->truncated);
+        CHECK(exact->size() == 6);
+        auto all = result_set_members(responses, plugins, pending, 2, 7);
+        REQUIRE(all.has_value());
+        CHECK_FALSE(all->truncated);
+        CHECK(all->size() == 6);
+        auto one_page = result_set_members(responses, plugins, pending, 500, 4);
+        REQUIRE(one_page.has_value());
+        CHECK_FALSE(one_page->truncated); // a short page ends the read before the bound is checked
+        CHECK(one_page->size() == 6);
+    }
+}
+
+TEST_CASE("materialise: a success answer whose schema lacks the matcher column is a failed agent",
+          "[pg][result_set][async][echo][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+    // A stored matcher over `pid`, which the roll-up tables do not keep.
+    put_exec_row(responses, "exec-col", "agent-no-column", 1, "__schema__|hour_ts|name\n1|a\n__total__|1", 100);
+    put_exec_row(responses, "exec-col", "agent-empty", 1, "__schema__|pid\n__total__|0", 100);
+    put_exec_row(responses, "exec-col", "agent-hit", 1, kOneRow, 100);
+
+    PendingSet pending;
+    pending.id = "rs-col";
+    pending.source_execution_id = "exec-col";
+    pending.matcher = R"({"column":"pid","op":"exists"})";
+    auto found = result_set_members(responses, &yuzu::server::test::forensics_plugin_set(), pending);
+    REQUIRE(found.has_value());
+    CHECK(std::vector<std::string>(found->begin(), found->end()) ==
+          std::vector<std::string>{"agent-hit"});
+    // agent-no-column answered from a table without `pid`: failed. agent-empty answered from a
+    // table with it and zero rows: a legitimate empty answer, not failed.
+    CHECK(found->agents_failed == 1);
+}
+
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+
+TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
+          "[result_set][async][agents_failed]") {
+    // The tick has no seam a test can drive (it is a lambda on the server's maintenance thread),
+    // so this pins the two lines lexically: the materialize call carries agents_failed, and a
+    // truncated read is marked failed instead of materialized.
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/server.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const auto src = ss.str();
+    CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed)") !=
+          std::string::npos);
+    CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
+    // The truncated branch: between its `if` and the line that adopts the membership, the set
+    // is marked failed and the branch ends in `continue;` with nothing but the closing brace
+    // after it, so a truncated read can never fall through into `materialize`.
+    const auto open = src.find("if (found->truncated) {");
+    REQUIRE(open != std::string::npos);
+    const auto adopt = src.find("agents_failed = found->agents_failed;", open);
+    REQUIRE(adopt != std::string::npos);
+    const std::string branch = src.substr(open, adopt - open);
+    const auto marked = branch.find("result_set_store_->mark_failed(");
+    REQUIRE(marked != std::string::npos);
+    const auto cont = branch.rfind("continue;");
+    REQUIRE(cont != std::string::npos);
+    CHECK(cont > marked);
+    CHECK(branch.substr(cont + std::string("continue;").size()).find_first_not_of(" \t\r\n}") ==
+          std::string::npos);
+    CHECK(marked < 1200);
+}
+
+TEST_CASE("materialise: a success-status error| answer under the default matcher is a member "
+          "because matching decides before failing",
+          "[pg][result_set][async][echo][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+    put_exec_row(responses, "exec-default", "agent-a", 1, "error|refused", 100);
+    put_exec_row(responses, "exec-default", "agent-b", 2, "", 100);
+
+    PendingSet pending;
+    pending.id = "rs-default";
+    pending.source_execution_id = "exec-default";
+    pending.matcher = ""; // default: every SUCCESS responder
+    auto found = result_set_members(responses, &yuzu::server::test::forensics_plugin_set(), pending);
+    REQUIRE(found.has_value());
+    // agent-a is a member (success status matches the default matcher), agent-b failed.
+    CHECK(std::vector<std::string>(found->begin(), found->end()) ==
+          std::vector<std::string>{"agent-a"});
+    CHECK(found->agents_failed == 1);
 }
 
 // A name carrying an embedded NUL cannot be stored faithfully, so it is refused BEFORE dispatch:

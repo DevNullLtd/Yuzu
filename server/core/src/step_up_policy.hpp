@@ -100,6 +100,11 @@ inline constexpr std::string_view kReferenceDataReplace =
     "fleet-wide software reference data (pack replace, curated aliases): not credentials, "
     "identity or authority, but it steers cpe_product and CVE matching and fleet-wide title "
     "resolution; audited before the write; whether it needs MFA step-up awaits an owner ruling";
+inline constexpr std::string_view kCollectionSettings =
+    "per-group software collection settings (interval, window, zone, collector switches): not "
+    "credentials, identity or authority, but a root document can switch collectors off "
+    "fleet-wide; audited ahead of the write; exempt by the project owner's SAM-34 decision while "
+    "the owner ruling on the plugin kill-switch route is pending";
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
@@ -263,6 +268,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/aliases)",                        step_up_detail::kReferenceDataReplace),
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)",  step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/pack)",                           step_up_detail::kReferenceDataReplace),
+    // software_collection_settings_routes.cpp
+    step_up_detail::exempt("PUT",   R"(/api/v1/inventory/software/collection-settings/([a-f0-9]+))",              step_up_detail::kCollectionSettings),
     // instruction_fragment_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/instructions/yaml-preview)",                                    step_up_detail::kReadShaped),
     // instruction_routes.cpp
@@ -425,6 +432,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/workflows)",                                                          step_up_detail::kContentAuthoring),
     step_up_detail::exempt("DELETE",R"(/api/workflows/([^/]+))",                                                  step_up_detail::kContentAuthoring),
     step_up_detail::exempt("POST",  R"(/api/workflows/([^/]+)/execute)",                                          step_up_detail::kExecutionDispatch),
+    step_up_detail::exempt("POST",  R"(/api/v1/workflows/([^/]+)/execute)",                                       step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/instructions/([^/]+)/execute)",                                       step_up_detail::kExecutionDispatch),
     // instruction_execute_routes.cpp (#2146): the v1 twin of the row above, same class.
     step_up_detail::exempt("POST",  R"(/api/v1/instructions/([^/]+)/execute)",                                    step_up_detail::kExecutionDispatch),

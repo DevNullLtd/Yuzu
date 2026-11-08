@@ -1816,6 +1816,7 @@ if build_server
       'unit/server/test_list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
       'unit/server/test_workflow_execution_list_model.cpp', # pure shared REST+MCP list model (parse/rows/cursor)
       'unit/server/test_workflow_execution_list_routes.cpp', # GET /api/v1/workflow-executions via TestRouteSink (no PG)
+      'unit/server/test_workflow_execute_twins.cpp', # #2146 batch B: POST /api/v1/workflows/{id}/execute + the shared sequence (no PG)
       'unit/server/test_guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam (Guardian read)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
@@ -1911,6 +1912,7 @@ if build_server
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',
       'unit/server/test_workflow_engine.cpp',
+      'unit/server/test_workflow_wait.cpp', # #2146: the interruptible retry wait (pure, fake clock)
       'unit/server/test_inventory_eval.cpp',
       'unit/server/test_execution_statistics.cpp',
       'unit/server/test_device_token_store.cpp',
@@ -2037,6 +2039,12 @@ if build_server
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_normalization_pack.cpp',
+      # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
+      'unit/server/test_collection_settings_resolve.cpp',
+      # per-group collection settings store (born-on-PG, [pg][store])
+      'unit/server/test_software_collection_settings_store.cpp',
+      # collection-settings REST routes: null-dep shapes (no PG) + [pg][routes] real AuthRoutes gate over ManagementGroupStorePg/RbacStorePg
+      'unit/server/test_software_collection_settings_routes.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -4274,6 +4282,24 @@ test('section ingest series seed wiring lexical gate',
   timeout: 30,
 )
 
+# #2146: the workflow-run families are seeded by server.cpp, counted by both twins, and the four
+# alert rules name only series and label values the source exports. Source-text only; suite 'docs'.
+test('workflow run metrics wiring lexical gate',
+  _python3_test,
+  args: [files('test_workflow_run_metrics_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #2146: the stand-in and real-engine replay-parity matrices run the scenarios one shared table
+# (tests/unit/server/workflow_parity_scenarios.hpp) names. Source-text only; suite 'docs'.
+test('workflow replay parity scenario table lexical gate',
+  _python3_test,
+  args: [files('test_workflow_parity_scenarios_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
 # audit store read that returns nullopt for a closed store). Source-text only, so Python.
 # Suite 'docs' for the same reason as the Users page gate above.
@@ -4676,9 +4702,26 @@ test('forensics tier wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-34: the collection-settings routes must register ahead of the generic inventory GET, and the
+# step-up, body-cap, OpenAPI and /readyz rows must exist.
+test('collection settings wiring lexical',
+  _python3_test,
+  args: [files('test_collection_settings_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #2146: the workflow-execute zero-reach status list lives in the header, the REST manual and the MCP
+# manual, and an absent command_id is never said to prove a step unsent. Self-checks in memory.
+test('workflow execute docs lexical',
+  _python3_test,
+  args: [files('test_workflow_execute_docs_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
