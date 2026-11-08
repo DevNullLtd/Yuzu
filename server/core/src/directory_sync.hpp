@@ -244,14 +244,28 @@ public:
     /// Get all synced groups.
     std::vector<DirectoryGroup> get_synced_groups() const;
 
-    /// Get sync status for each configured provider.
-    /// Number of directory records (users and groups) skipped because a field carried an
-    /// embedded NUL byte, since this object was constructed. Postgres text cannot hold a NUL,
-    /// so such a record is skipped and counted instead of aborting the whole snapshot.
+    /// Number of directory records skipped since this object was constructed: a user, or a
+    /// group, with an embedded NUL byte in a key field (id, upn, email), plus each group member
+    /// id carrying one. Postgres text cannot hold a NUL, so such a record is skipped and counted
+    /// instead of aborting the whole snapshot.
     [[nodiscard]] std::uint64_t skipped_records() const noexcept {
         return skipped_records_.load(std::memory_order_relaxed);
     }
 
+    /// Number of display-only fields (user display name, group display name, group description)
+    /// whose embedded NUL bytes were replaced with U+FFFD since this object was constructed. The
+    /// record is kept; only the field text changes.
+    [[nodiscard]] std::uint64_t sanitized_fields() const noexcept {
+        return sanitized_fields_.load(std::memory_order_relaxed);
+    }
+
+    /// Records skipped by the most recent snapshot apply alone (same definition as
+    /// `skipped_records()`); 0 when that snapshot skipped nothing.
+    [[nodiscard]] std::uint64_t last_sync_skipped_records() const noexcept {
+        return last_sync_skipped_.load(std::memory_order_relaxed);
+    }
+
+    /// Get sync status for each configured provider.
     SyncStatus get_status() const;
 
     /// Checked variant of `get_synced_groups`.
@@ -292,6 +306,12 @@ private:
     /// See `skipped_records()`.
     std::atomic<std::uint64_t> skipped_records_{0};
 
+    /// See `sanitized_fields()`.
+    std::atomic<std::uint64_t> sanitized_fields_{0};
+
+    /// See `last_sync_skipped_records()`.
+    std::atomic<std::uint64_t> last_sync_skipped_{0};
+
     /// Complete remote snapshot fetched from Microsoft Graph before any
     /// database write — see the file header's transaction-shape note.
     /// `memberships` maps group_id -> the raw member ids Graph returned
@@ -303,17 +323,30 @@ private:
         std::unordered_map<std::string, std::vector<std::string>> memberships;
     };
 
+    /// What `apply_entra_sync` actually stored: the user and group counts left after skipped
+    /// records were removed, and how many records were skipped / display fields sanitized.
+    struct ApplyCounts {
+        int users{0};
+        int groups{0};
+        std::uint64_t skipped{0};
+        std::uint64_t sanitized{0};
+    };
+
     /// Applies a fetched `EntraSyncData` snapshot in one short transaction:
     /// deletes any user/group absent from the snapshot, upserts every
     /// user/group the snapshot names (role mapping is NOT stored here — see
     /// file header), then clears and bulk-repopulates memberships (filtered
     /// to known user ids, so a non-user Graph member can never abort the
-    /// sync via a foreign-key violation). This is where the SQLite-era
+    /// sync via a foreign-key violation). The snapshot is taken by value and
+    /// filtered in place: a record with a NUL in a key field is removed (and
+    /// counted), a NUL in a display-only field is replaced with U+FFFD, and a
+    /// snapshot whose users (or groups) were all skipped is refused before
+    /// any write, leaving the roster untouched. This is where the SQLite-era
     /// self-deadlock lived; it is exposed to the private
     /// `friend struct DirectorySyncTestAccess` test seam so that logic is
     /// unit-testable without a live/stubbed Graph HTTP endpoint (the client
     /// itself stays untouched — see file header).
-    std::expected<void, std::string> apply_entra_sync(const EntraSyncData& data);
+    std::expected<ApplyCounts, std::string> apply_entra_sync(EntraSyncData data);
 
     // Internal: update sync status. Self-contained (acquires its own lease) —
     // called independently of apply_entra_sync at several points in

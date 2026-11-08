@@ -72,7 +72,7 @@ struct DirectorySyncTestAccess {
 
     using EntraSyncData = DirectorySync::EntraSyncData;
 
-    std::expected<void, std::string> apply_entra_sync(const EntraSyncData& data) {
+    auto apply_entra_sync(const EntraSyncData& data) {
         return store.apply_entra_sync(data);
     }
     void update_status(const std::string& provider, const std::string& status,
@@ -1034,16 +1034,18 @@ TEST_CASE("DiscoveryRoutes[pg]: a lost failure row still marks Sec-Audit-Failed 
     CHECK(missing->get_header_value("Sec-Audit-Failed") == "true");
 }
 
-// ── A record with an embedded NUL is skipped and counted, never fatal ───────
+// ── NUL handling: key fields skip the record, display fields are sanitized ──
 //
 // Identity-provider text can carry a NUL (a JSON \u0000 escape decodes to one) and Postgres text
 // cannot hold it. One such record must not abort the whole snapshot: a frozen sync keeps users
-// that were removed upstream in the roster, which delays deprovisioning. The poisoned record is
-// skipped and counted, everything else is applied, and the skipped record's earlier row (if any)
-// goes the way of any user absent from the snapshot.
+// that were removed upstream in the roster, which delays deprovisioning. A NUL in a KEY field
+// (user id/upn/email, group id, member id) skips the record and counts it; a NUL in a
+// display-only field (user display name, group display name, group description) is replaced
+// with U+FFFD and the record is kept. Everything else is applied, and a skipped record's earlier
+// row (if any) goes the way of any user absent from the snapshot.
 
-TEST_CASE("DirectorySync[pg]: a user or group with an embedded NUL is skipped and counted, the "
-          "rest of the snapshot still applies and removals still happen",
+TEST_CASE("DirectorySync[pg]: a key-field NUL skips the record, a display-field NUL is "
+          "sanitized and kept, the rest of the snapshot applies and removals still happen",
           "[directory_sync][pg][validation]") {
     DirectorySyncPg store;
     DirectorySyncTestAccess acc{*store};
@@ -1051,49 +1053,258 @@ TEST_CASE("DirectorySync[pg]: a user or group with an embedded NUL is skipped an
     DirectorySyncTestAccess::EntraSyncData first;
     first.users.push_back(make_user("u1", "Alice"));
     first.users.push_back(make_user("u2", "Bob"));
+    first.users.push_back(make_user("u3", "Carol"));
     first.users.push_back(make_user("u_gone", "Removed Upstream"));
     first.groups.push_back(make_group("g1", "Engineering"));
     first.memberships["g1"] = {"u1", "u2", "u_gone"};
     REQUIRE(acc.apply_entra_sync(first).has_value());
     REQUIRE(store->get_user("u_gone").has_value());
+    REQUIRE(store->get_user("u3").has_value());
     REQUIRE(store->skipped_records() == 0);
+    REQUIRE(store->sanitized_fields() == 0);
 
     const std::string nul("\0", 1);
+    const std::string fffd("\xEF\xBF\xBD");
     DirectorySyncTestAccess::EntraSyncData second;
     second.users.push_back(make_user("u1", "Alice"));
-    second.users.push_back(make_user("u2", "Bob" + nul + "Poisoned")); // display_name
+    second.users.push_back(make_user("u2", "Bob" + nul + "Poisoned"));                 // display
     second.users.push_back(make_user("u3", "Carol", "carol" + nul + "@example.com"));  // email
     second.users.push_back(make_user("u4" + nul + "x", "Dana"));                        // id
     second.users.push_back(make_user("u5", "Erin"));
     auto bad_group = make_group("g_bad", "Poisoned");
-    bad_group.description = "d" + nul + "x";
+    bad_group.description = "d" + nul + "x"; // description
     second.groups.push_back(make_group("g1", "Engineering"));
     second.groups.push_back(bad_group);
-    second.groups.push_back(make_group("g_bad2" + nul, "Poisoned id"));
+    second.groups.push_back(make_group("g_bad2" + nul, "Poisoned id")); // id
     second.memberships["g1"] = {"u1", "u2", "u3", "u5"};
     second.memberships["g_bad"] = {"u1"};
+    second.memberships["g_bad2" + nul] = {"u1"};
 
     auto result = acc.apply_entra_sync(second);
     REQUIRE(result.has_value());
 
-    // Three poisoned users (u2, u3, u4) and two poisoned groups were skipped and counted.
-    CHECK(store->skipped_records() == 5);
+    // Skipped: user u3 (email), user u4 (id), group g_bad2 (id). Sanitized: u2's display name and
+    // g_bad's description.
+    CHECK(store->skipped_records() == 3);
+    CHECK(store->sanitized_fields() == 2);
+    CHECK(store->last_sync_skipped_records() == 3);
+    // The counts returned are what was stored: u1, u2, u5 and g1, g_bad.
+    CHECK(result->users == 3);
+    CHECK(result->groups == 2);
+    CHECK(result->skipped == 3);
+    CHECK(result->sanitized == 2);
+
+    // A display-field NUL is replaced and the record kept, still a member of its group.
+    auto bob = store->get_user("u2");
+    REQUIRE(bob.has_value());
+    CHECK(bob->display_name == "Bob" + fffd + "Poisoned");
+    REQUIRE(bob->groups.size() == 1);
+    CHECK(bob->groups[0] == "Engineering");
 
     // The good records applied, with their memberships.
-    CHECK(store->get_user("u1").has_value());
     CHECK(store->get_user("u5").has_value());
     auto alice = store->get_user("u1");
     REQUIRE(alice.has_value());
-    REQUIRE(alice->groups.size() == 1);
-    CHECK(alice->groups[0] == "Engineering");
+    REQUIRE(alice->groups.size() == 2);
+    CHECK(std::ranges::find(alice->groups, "Engineering") != alice->groups.end());
+    CHECK(std::ranges::find(alice->groups, "Poisoned") != alice->groups.end());
 
     // A user removed upstream is gone: the sync was not frozen by the poisoned records.
     CHECK_FALSE(store->get_user("u_gone").has_value());
-    // A skipped record is not stored; a row it had before goes like any absent user.
-    CHECK_FALSE(store->get_user("u2").has_value());
+    // A key-field skip stores nothing; a row it had before goes like any absent user.
     CHECK_FALSE(store->get_user("u3").has_value());
+
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 2);
+    std::vector<std::string> group_ids;
+    for (const auto& g : groups)
+        group_ids.push_back(g.id);
+    std::ranges::sort(group_ids);
+    CHECK(group_ids == std::vector<std::string>{"g1", "g_bad"});
+    for (const auto& g : groups) {
+        if (g.id == "g_bad")
+            CHECK(g.description == "d" + fffd + "x");
+    }
+}
+
+TEST_CASE("DirectorySync[pg]: a snapshot whose every user was skipped is refused and the roster "
+          "is left untouched",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    DirectorySyncTestAccess::EntraSyncData seed;
+    seed.users.push_back(make_user("u1", "Alice"));
+    seed.users.push_back(make_user("u2", "Bob"));
+    seed.groups.push_back(make_group("g1", "Engineering"));
+    seed.memberships["g1"] = {"u1", "u2"};
+    REQUIRE(acc.apply_entra_sync(seed).has_value());
+
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData poisoned;
+    poisoned.users.push_back(make_user("u1" + nul, "Alice"));
+    poisoned.users.push_back(make_user("u2" + nul, "Bob"));
+    poisoned.groups.push_back(make_group("g1", "Engineering"));
+    poisoned.memberships["g1"] = {"u1" + nul};
+
+    auto result = acc.apply_entra_sync(poisoned);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() ==
+          "refusing to apply a snapshot in which every users record was skipped");
+    // Two users, plus the one member id that carried a NUL.
+    CHECK(store->skipped_records() == 3);
+
+    // Nothing was deleted or rewritten.
+    auto u1 = store->get_user("u1");
+    auto u2 = store->get_user("u2");
+    REQUIRE(u1.has_value());
+    REQUIRE(u2.has_value());
+    CHECK(u1->groups.size() == 1);
+    CHECK(u2->groups.size() == 1);
+    CHECK(store->get_synced_groups().size() == 1);
+    auto count = store->get_synced_user_count_checked();
+    REQUIRE(count.has_value());
+    CHECK(*count == 2);
+}
+
+TEST_CASE("DirectorySync[pg]: a snapshot whose every group was skipped is refused and the groups "
+          "are left untouched",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    DirectorySyncTestAccess::EntraSyncData seed;
+    seed.users.push_back(make_user("u1", "Alice"));
+    seed.groups.push_back(make_group("g1", "Engineering"));
+    seed.memberships["g1"] = {"u1"};
+    REQUIRE(acc.apply_entra_sync(seed).has_value());
+
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData poisoned;
+    poisoned.users.push_back(make_user("u1", "Alice"));
+    poisoned.groups.push_back(make_group("g1" + nul, "Engineering"));
+
+    auto result = acc.apply_entra_sync(poisoned);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() ==
+          "refusing to apply a snapshot in which every groups record was skipped");
 
     auto groups = store->get_synced_groups();
     REQUIRE(groups.size() == 1);
     CHECK(groups[0].id == "g1");
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    CHECK(alice->groups.size() == 1);
+}
+
+TEST_CASE("DirectorySync[pg]: a NUL in a membership member id drops that member and is counted",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2", "Bob"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    data.memberships["g1"] = {"u1", "u2" + nul + "x", "u2"};
+
+    auto result = acc.apply_entra_sync(data);
+    REQUIRE(result.has_value());
+    CHECK(result->users == 2);
+    CHECK(result->groups == 1);
+    // The member id is the only skipped item; no record was removed and no field sanitized.
+    CHECK(result->skipped == 1);
+    CHECK(result->sanitized == 0);
+    CHECK(store->skipped_records() == 1);
+    CHECK(store->sanitized_fields() == 0);
+
+    // The clean members still belong to the group.
+    auto alice = store->get_user("u1");
+    auto bob = store->get_user("u2");
+    REQUIRE(alice.has_value());
+    REQUIRE(bob.has_value());
+    CHECK(alice->groups.size() == 1);
+    CHECK(bob->groups.size() == 1);
+}
+
+TEST_CASE("DirectorySync[pg]: a NUL in a user or group display field keeps the record with U+FFFD "
+          "in place of the NUL",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    const std::string nul("\0", 1);
+    const std::string fffd("\xEF\xBF\xBD");
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", nul + "Alice" + nul));
+    auto group = make_group("g1", "Eng" + nul + "ineering");
+    group.description = "line" + nul + nul + "two";
+    data.groups.push_back(group);
+    data.memberships["g1"] = {"u1"};
+
+    auto result = acc.apply_entra_sync(data);
+    REQUIRE(result.has_value());
+    CHECK(result->skipped == 0);
+    CHECK(result->sanitized == 3); // user display, group display, group description
+    CHECK(store->skipped_records() == 0);
+    CHECK(store->sanitized_fields() == 3);
+
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    CHECK(alice->display_name == fffd + "Alice" + fffd);
+    REQUIRE(alice->groups.size() == 1);
+    CHECK(alice->groups[0] == "Eng" + fffd + "ineering");
+
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].display_name == "Eng" + fffd + "ineering");
+    CHECK(groups[0].description == "line" + fffd + fffd + "two");
+}
+
+TEST_CASE("DirectorySync[pg]: the status row after a sync with skips reports the stored counts "
+          "and a note",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    // sync_entra reports from the apply result; this drives the same update_status call it makes
+    // with the counts apply_entra_sync returned for a snapshot with one skipped user.
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2" + nul, "Bob"));
+    data.users.push_back(make_user("u3", "Car" + nul + "ol"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    auto result = acc.apply_entra_sync(data);
+    REQUIRE(result.has_value());
+    REQUIRE(result->users == 2);
+    REQUIRE(result->groups == 1);
+    REQUIRE(result->skipped == 1);
+    REQUIRE(result->sanitized == 1);
+
+    acc.update_status("entra", "completed", result->users, result->groups,
+                      "1 record(s) skipped, 1 field(s) sanitized (embedded NUL)");
+    auto status = store->get_status();
+    CHECK(status.status == "completed");
+    CHECK(status.user_count == 2); // applied, not the 3 fetched
+    CHECK(status.group_count == 1);
+    CHECK(status.last_error == "1 record(s) skipped, 1 field(s) sanitized (embedded NUL)");
+}
+
+TEST_CASE("DirectorySync[pg]: a status error text with an embedded NUL is still written, with "
+          "U+FFFD in place of the NUL",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    const std::string nul("\0", 1);
+    const std::string fffd("\xEF\xBF\xBD");
+    acc.update_status("entra", "failed", 4, 2,
+                      "fetching members for group Eng" + nul + "ineering failed: boom");
+    auto status = store->get_status();
+    CHECK(status.status == "failed");
+    CHECK(status.user_count == 4);
+    CHECK(status.group_count == 2);
+    CHECK(status.last_error == "fetching members for group Eng" + fffd + "ineering failed: boom");
 }
