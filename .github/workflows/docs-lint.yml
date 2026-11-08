@@ -100,6 +100,11 @@ jobs:
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
 
+      # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
+      # no source or manual claims an absent command_id proves a step was never sent.
+      - name: Workflow execute docs gate (#2146)
+        run: python3 -I tests/test_workflow_execute_docs_lexical.py
+
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
       # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts

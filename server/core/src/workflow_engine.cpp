@@ -7,6 +7,9 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
+#include "workflow_claim_outcome.hpp"
+#include "workflow_model.hpp" // stored_agent_ids_json
+#include "workflow_wait.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -17,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <map>
 #include <random>
 #include <thread>
@@ -32,6 +36,32 @@ constexpr const char* kStoreName = "workflow_engine";
 // "Lease discipline").
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
+// The ONE retry of a run's final status write, when the first attempt could not get a lease: a
+// row left `running` is an orphan nothing sweeps, so the retry is allowed to wait out a busy pool.
+constexpr std::chrono::milliseconds kFinalizeRetryTimeout{10000};
+// The most the final status write's retry may keep waiting once a server stop is seen, checked
+// between tries only: a lease acquire already in flight (a pool connect can run up to its connect
+// timeout, 10 s) and the first non-persist try are not interruptible, so this is best-effort and
+// the process stays bounded by the web server's 15 s shutdown bound, then the hard exit.
+constexpr std::chrono::milliseconds kFinalizeStopBudget{3000};
+
+/// Counts one run in `WorkflowEngine::in_flight_` for exactly the scope it is alive in, so no
+/// path out of `execute()` (a return, a rethrow) can leak the count and hold a shutdown drain.
+class InFlightRun {
+public:
+    explicit InFlightRun(std::atomic<int>& n) noexcept : n_(n) {
+        n_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~InFlightRun() { n_.fetch_sub(1, std::memory_order_acq_rel); }
+    InFlightRun(const InFlightRun&) = delete;
+    InFlightRun& operator=(const InFlightRun&) = delete;
+
+private:
+    std::atomic<int>& n_;
+};
+
+/// Why a run was stopped (`kNone`: it was not). Selects the reason on the steps it skips.
+enum class StopCause { kNone, kBound, kShutdown };
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for the migration txn.
@@ -97,6 +127,33 @@ const std::vector<pg::PgMigration>& migrations() {
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE instruction_id LIKE 'crossplatform.tar.%';"
          "UPDATE workflows SET yaml_source = replace(yaml_source, "
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE yaml_source LIKE '%crossplatform.tar.%';"},
+        // v3 (#2146, idempotent execute): a client key claimed on the run's own row, plus the
+        // run's actor and call. `idempotency_key` and `request_fingerprint` are NULL on every
+        // keyless run (the legacy route and any call that sent no key), so the partial UNIQUE
+        // index holds only keyed rows and a keyless INSERT never touches it. `principal` and
+        // `correlation_id` are stored on EVERY run the execute twins start, keyed or not (NULL
+        // for the legacy route), so an unkeyed run still names its actor and the audit rows that
+        // carry the same `correlation_id=` join to it. The CHECK makes a key without its principal
+        // or fingerprint unstorable (a NULL principal never conflicts under a unique index, so
+        // such a row would silently stop being idempotent) and an empty principal unstorable (it
+        // would be one shared key namespace); it says nothing about the unkeyed row's columns.
+        // Plain (transactional) index build on a table the fresh-database hard cutover guarantees
+        // is empty (docs/postgres-store-playbook.md "Recorded exception"). No backfill: an
+        // existing run has no key. Every statement is re-run safe (a rewound version stamp, or an
+        // index built by hand ahead of the migration): the CHECK is dropped before it is added.
+        {3,
+         "ALTER TABLE workflow_executions "
+         "  ADD COLUMN IF NOT EXISTS principal           TEXT,"
+         "  ADD COLUMN IF NOT EXISTS idempotency_key     TEXT,"
+         "  ADD COLUMN IF NOT EXISTS request_fingerprint TEXT,"
+         "  ADD COLUMN IF NOT EXISTS correlation_id      TEXT;"
+         "ALTER TABLE workflow_executions DROP CONSTRAINT IF EXISTS wf_exec_idem_complete;"
+         "ALTER TABLE workflow_executions ADD CONSTRAINT wf_exec_idem_complete CHECK ("
+         "  idempotency_key IS NULL OR "
+         "  (principal IS NOT NULL AND principal <> '' AND request_fingerprint IS NOT NULL));"
+         "CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_exec_idem "
+         "  ON workflow_executions(principal, idempotency_key) "
+         "  WHERE idempotency_key IS NOT NULL;"},
     };
     return kMigrations;
 }
@@ -112,6 +169,21 @@ std::int64_t to_i64(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0;
     return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+
+/// The fate of the claim transaction `xid` according to Postgres itself (`pg_xact_status`), on a
+/// fresh lease: the original one is gone with the failed transaction. No lease, a failed query or
+/// a NULL answer is `kUnknown`.
+ClaimTxnOutcome claim_txn_outcome(pg::PgPool& pool, const std::string& xid) {
+    auto lease = pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return ClaimTxnOutcome::kUnknown;
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT pg_xact_status($1::xid8)",
+                                       std::vector<std::string>{xid});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0 ||
+        PQgetisnull(res.get(), 0, 0))
+        return ClaimTxnOutcome::kUnknown;
+    return classify_xact_status(std::string_view(PQgetvalue(res.get(), 0, 0)));
 }
 
 int64_t now_epoch() {
@@ -372,7 +444,8 @@ void wf_update_attempt(PGconn* conn, const std::string& execution_id, int step_i
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-WorkflowEngine::WorkflowEngine(pg::PgPool& pool) : pool_(pool) {
+WorkflowEngine::WorkflowEngine(pg::PgPool& pool)
+    : pool_(pool), write_timeout_(kWriteTimeout), finalize_retry_timeout_(kFinalizeRetryTimeout) {
     // Construction-only unbounded acquire (ADR-0012 §2) — every runtime acquire elsewhere in
     // this file is bounded.
     auto lease = pool_.acquire();
@@ -672,12 +745,17 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     const std::string& workflow_id,
     const std::vector<std::string>& agent_ids,
     StepDispatchFn dispatch_fn,
-    ConditionEvalFn condition_fn) {
+    ConditionEvalFn condition_fn,
+    const WorkflowRunControl& control) {
 
     if (!dispatch_fn)
         return std::unexpected("dispatch function is required");
     if (!open_)
         return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+
+    // From here to the end of the final status write (a throw included) this run holds the
+    // shutdown drain: counted in-process, never from the table.
+    const InFlightRun in_flight(in_flight_);
 
     // Load workflow
     auto workflow_result = get_workflow(workflow_id);
@@ -692,7 +770,9 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
 
     auto exec_id = generate_id();
     auto now = std::to_string(now_epoch());
+    // The text every step is dispatched with is the FULL list; the run row stores a bounded copy.
     const std::string agent_str = nlohmann::json(agent_ids).dump();
+    const std::string stored_agent_str = stored_agent_ids_json(agent_ids, control.stored_copy_first);
 
     // New atomicity (ADR-0064): execution-row creation + every step-result pre-creation are one
     // transaction. The execution insert is an INSERT...SELECT...WHERE deleted_at = 0, which
@@ -700,27 +780,90 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // between the get_workflow() read above and this statement (a concurrent delete_workflow()
     // in between now fails admission here instead of silently orphaning a new execution against
     // a since-deleted workflow).
-    bool admitted = false;
-    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        pg::PgResult ires = pg::exec_params(
-            conn,
-            "INSERT INTO workflow_engine.workflow_executions "
-            "(id, workflow_id, status, agent_ids_json, started_at, current_step) "
-            "SELECT $1, w.id, 'running', $3, $4::bigint, 0 "
-            "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
-            "RETURNING id",
-            std::vector<std::string>{exec_id, workflow_id, agent_str, now});
+    //
+    // IDEMPOTENCY (#2146). A keyed call adds `ON CONFLICT (principal, idempotency_key) WHERE
+    // idempotency_key IS NOT NULL DO NOTHING` (the inference clause must name the partial index's
+    // predicate, or Postgres finds no arbiter), so the claim and the admission are ONE statement:
+    // exactly one of two concurrent calls with the same key inserts. ZERO rows is then ambiguous
+    // (the workflow was soft-deleted/removed, or the key is taken), and only a read in this same
+    // transaction can tell which: a row bound to (principal, key) is a REPLAY, none is the
+    // ordinary "workflow not found". READ COMMITTED: a loser that waited on the winner's
+    // uncommitted insert sees the winner's row once it commits.
+    enum class Admission { kAdmitted, kReplay, kNotFound };
+    Admission admission = Admission::kNotFound;
+    WorkflowRunReplay replay;
+    const auto& claim = control.idempotency;
+    // The claim's own transaction id, captured before anything is written, and whether the body
+    // reached its commit-ready end as an admission. Together they let a failed COMMIT be told from
+    // a lost acknowledgement (below): an unknown outcome is asked of Postgres, never guessed.
+    std::string claim_xid;
+    bool admitted_body_done = false;
+    auto claim_lease = pool_.try_acquire_for(kWriteTimeout);
+    bool ok = pool_.with_txn_on(std::move(claim_lease), [&](PGconn* conn) -> bool {
+        {
+            pg::PgResult xid = pg::exec_params(conn, "SELECT pg_current_xact_id()::text",
+                                               std::vector<std::string>{});
+            if (xid.status() != PGRES_TUPLES_OK || PQntuples(xid.get()) == 0)
+                return false;
+            claim_xid = col_str(xid.get(), 0, 0);
+        }
+        // `principal` and `correlation_id` are stored on every row the twins admit (NULL when the
+        // caller supplied none); a KEYED row's principal is the claim's, the key's namespace.
+        pg::PgResult ires = claim
+            ? pg::exec_params(
+                  conn,
+                  "INSERT INTO workflow_engine.workflow_executions "
+                  "(id, workflow_id, status, agent_ids_json, started_at, current_step, "
+                  " principal, idempotency_key, request_fingerprint, correlation_id) "
+                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0, $5, $6, $7, NULLIF($8, '') "
+                  "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
+                  "ON CONFLICT (principal, idempotency_key) WHERE idempotency_key IS NOT NULL "
+                  "DO NOTHING RETURNING id",
+                  std::vector<std::string>{exec_id, workflow_id, stored_agent_str, now, claim->principal,
+                                           claim->key, claim->fingerprint,
+                                           control.correlation_id})
+            : pg::exec_params(
+                  conn,
+                  "INSERT INTO workflow_engine.workflow_executions "
+                  "(id, workflow_id, status, agent_ids_json, started_at, current_step, "
+                  " principal, correlation_id) "
+                  "SELECT $1, w.id, 'running', $3, $4::bigint, 0, NULLIF($5, ''), NULLIF($6, '') "
+                  "FROM workflow_engine.workflows w WHERE w.id = $2 AND w.deleted_at = 0 "
+                  "RETURNING id",
+                  std::vector<std::string>{exec_id, workflow_id, stored_agent_str, now,
+                                           control.principal, control.correlation_id});
         if (ires.status() != PGRES_TUPLES_OK) {
             spdlog::error("WorkflowEngine::execute: execution insert failed: {}",
                           PQresultErrorMessage(ires.get()));
             return false;
         }
         if (PQntuples(ires.get()) == 0) {
-            // Workflow vanished/soft-deleted since get_workflow() above — commit the (no-op)
-            // txn; `admitted` stays false and the caller gets the ordinary not-found error.
+            if (claim) {
+                pg::PgResult bound = pg::exec_params(
+                    conn,
+                    "SELECT id, workflow_id, request_fingerprint, status, started_at "
+                    "FROM workflow_engine.workflow_executions "
+                    "WHERE principal = $1 AND idempotency_key = $2",
+                    std::vector<std::string>{claim->principal, claim->key});
+                if (bound.status() != PGRES_TUPLES_OK) {
+                    spdlog::error("WorkflowEngine::execute: idempotency read failed: {}",
+                                  PQresultErrorMessage(bound.get()));
+                    return false;
+                }
+                if (PQntuples(bound.get()) > 0) {
+                    admission = Admission::kReplay;
+                    replay.execution_id = col_str(bound.get(), 0, 0);
+                    replay.workflow_id = col_str(bound.get(), 0, 1);
+                    replay.fingerprint = col_str(bound.get(), 0, 2);
+                    replay.status = col_str(bound.get(), 0, 3);
+                    replay.started_at = to_i64(col(bound.get(), 0, 4));
+                }
+            }
+            // Replay, or the workflow vanished/soft-deleted since get_workflow() above: commit
+            // the (no-op) txn; the caller gets the replay or the ordinary not-found error.
             return true;
         }
-        admitted = true;
+        admission = Admission::kAdmitted;
 
         for (const auto& step : workflow.steps) {
             pg::PgResult sres = pg::exec_params(
@@ -736,19 +879,55 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                 return false;
             }
         }
+        if (claim_hooks_.in_txn_tail)
+            claim_hooks_.in_txn_tail(conn);
+        admitted_body_done = true;
         return true;
     });
+    if (ok && claim_hooks_.lose_commit_ack)
+        ok = false;
+
+    // A COMMIT that failed after a body that finished as an ADMISSION may still have committed:
+    // the run is then bound (its key, its row) and only the acknowledgement was lost. Failing the
+    // call would leave a running row nothing will ever dispatch, its key burned and, on MCP, its
+    // ticket spent, until the stale rule calls it indeterminate. Ask Postgres for the
+    // transaction's fate (pg_pool.hpp CHAOS-1/CHAOS-1b: never a row-exists read) and, if it
+    // committed, go on with the id this call minted. Rolled back or undeterminable fails as before.
+    if (!ok && admitted_body_done && admission == Admission::kAdmitted && !claim_xid.empty()) {
+        switch (claim_txn_outcome(pool_, claim_xid)) {
+        case ClaimTxnOutcome::kCommitted:
+            spdlog::error("WorkflowEngine::execute: the admission COMMIT of execution {} was "
+                          "reported failed but Postgres confirms transaction {} committed (a "
+                          "lost acknowledgement); proceeding with the run",
+                          exec_id, claim_xid);
+            ok = true;
+            break;
+        case ClaimTxnOutcome::kRolledBack:
+            break;
+        case ClaimTxnOutcome::kUnknown:
+            spdlog::error("WorkflowEngine::execute: the admission COMMIT of execution {} failed "
+                          "and the outcome of transaction {} could not be confirmed; the row may "
+                          "still appear as a running run that was never dispatched",
+                          exec_id, claim_xid);
+            break;
+        }
+    }
 
     if (!ok)
         return std::unexpected(std::string(kDbErrorPrefix) + "failed to admit execution");
-    if (!admitted)
+    if (admission == Admission::kReplay) {
+        if (control.on_replay)
+            control.on_replay(replay);
+        return std::unexpected(std::string(kWorkflowIdempotentReplayError));
+    }
+    if (admission != Admission::kAdmitted)
         return std::unexpected("workflow not found: " + workflow_id);
 
     // Every write from here on is standalone/best-effort (ADR-0064 "Mid-execution write
     // degradation") — a lease timeout mid-execute degrades to unrecorded history for that one
     // write rather than aborting an in-flight, possibly already-dispatched fleet operation.
     auto with_write_lease = [&](auto&& fn) {
-        auto lease = pool_.try_acquire_for(kWriteTimeout);
+        auto lease = pool_.try_acquire_for(write_timeout_);
         if (!lease) {
             spdlog::warn("WorkflowEngine::execute: lease unavailable mid-execution — a write "
                         "for execution {} was dropped (best-effort history, ADR-0064)",
@@ -758,225 +937,420 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
         fn(lease.get());
     };
 
+    // The run's bounds (WorkflowRunControl), asked before EVERY dispatch attempt. When the caller
+    // installed `before_attempt`, it alone decides (the caller owns the reason it said no, and
+    // a clock read here that disagreed with its own by a microsecond would stop a run the caller
+    // never recorded as stopped); `deadline` then only bounds the retry delay. With no hook, a
+    // passed deadline stops the run.
+    //
+    // SHUTDOWN is asked first and is the engine's own: the higher of the run's `should_stop` and
+    // the engine-level default (`set_should_stop`). `kStop` ends the run exactly as a passed
+    // bound does, but with its own cause, so the skipped steps carry `server_shutdown` and the
+    // caller hears `on_interrupted` at the moment the engine acts.
+    const auto stop_level = [&]() {
+        auto level = WorkflowStopLevel::kNone;
+        if (control.should_stop)
+            level = control.should_stop();
+        if (should_stop_)
+            level = std::max(level, should_stop_());
+        return level;
+    };
+    StopCause stop_cause = StopCause::kNone;
+    const auto note_stop = [&](StopCause cause) {
+        if (stop_cause != StopCause::kNone)
+            return;
+        stop_cause = cause;
+        if (cause == StopCause::kShutdown && control.on_interrupted)
+            control.on_interrupted();
+    };
+    const auto stop_before_attempt = [&]() {
+        if (stop_level() == WorkflowStopLevel::kStop) {
+            note_stop(StopCause::kShutdown);
+            return true;
+        }
+        const bool bound = control.before_attempt
+                               ? !control.before_attempt()
+                               : (control.deadline &&
+                                  std::chrono::steady_clock::now() >= *control.deadline);
+        if (bound)
+            note_stop(StopCause::kBound);
+        return bound;
+    };
+    // The two stop tokens a step's stored result carries, under `reason`, whether the step was
+    // skipped or was the one in flight (workflow_run_port.hpp: kStepReason*). A reader of the
+    // stored rows (the idempotent replay) tells a shutdown from a run bound from these alone.
+    const auto stop_reason = [&stop_cause]() {
+        return stop_cause == StopCause::kShutdown ? std::string(kStepReasonServerShutdown)
+                                                  : std::string(kStepReasonRunStopped);
+    };
+    const auto skip_reason_json = [&stop_reason]() {
+        return nlohmann::json({{"reason", stop_reason()}}).dump();
+    };
+    bool run_stopped = false;
+
     // Execute steps sequentially
     std::string prev_result_json = "{}";
     bool execution_failed = false;
+    // A throw out of dispatch_fn / condition_fn / control.on_admitted must not leave the row
+    // `running`: `thrown` carries it past the finalize below, which closes the execution as usual.
+    std::exception_ptr thrown;
+    int current_step_index = -1; // the step in flight (-1: none yet)
+    bool current_step_open = false; // its result row is not yet written
 
-    for (const auto& step : workflow.steps) {
-        // Check if execution was cancelled
-        {
-            auto exec_check = get_execution(exec_id);
-            if (exec_check && *exec_check && (*exec_check)->status == "cancelled") {
+    try {
+        if (control.on_admitted)
+            control.on_admitted(exec_id);
+
+        for (const auto& step : workflow.steps) {
+            // A stop that arrived between steps ends the run before this step begins: this step
+            // and every later one is skipped, nothing is dispatched.
+            if (stop_level() == WorkflowStopLevel::kStop) {
+                note_stop(StopCause::kShutdown);
+                run_stopped = true;
+                spdlog::warn("WorkflowEngine: execution {} stopped before step {} (server "
+                             "shutdown); skipping the remaining steps",
+                             exec_id, step.index);
+                with_write_lease([&](PGconn* c) {
+                    for (const auto& remaining : workflow.steps) {
+                        if (remaining.index >= step.index)
+                            wf_update_step_result(c, exec_id, remaining.index, "skipped",
+                                                  skip_reason_json());
+                    }
+                });
                 execution_failed = true;
                 break;
             }
-        }
-
-        // Update current step — `WHERE status = 'running'` guards this write the same way
-        // finalize's is guarded (governance finding, security-guardian + docs-writer,
-        // independently): without it, a concurrent cancel_execution() landing between the
-        // cancellation check above and this write could flip status back to 'running', making
-        // the loop (and finalize afterwards) forget the cancellation ever happened. `RETURNING id`
-        // makes the CAS observable (governance finding, security-guardian): a CONFIRMED zero-row
-        // result means the guard didn't match — status was no longer 'running', i.e. a cancel landed
-        // in the window between the check above and this write — so the loop stops immediately
-        // instead of dispatching one more step past the cancel. A lease timeout or query failure is
-        // NOT treated as a mismatch (that would break the ADR-0064 degrade-and-continue posture for
-        // an ordinary transient failure) — only a definite, executed CAS that matched zero rows
-        // stops the loop. Currently unreachable in production (cancel_execution has no caller),
-        // closed as the same defense-in-depth as the finalize fix.
-        bool cas_ran = false;
-        bool cas_matched = false;
-        with_write_lease([&](PGconn* c) {
-            pg::PgResult res = pg::exec_params(
-                c,
-                "UPDATE workflow_engine.workflow_executions SET status = 'running', "
-                "current_step = $1::int WHERE id = $2 AND status = 'running' RETURNING id",
-                std::vector<std::string>{std::to_string(step.index), exec_id});
-            if (res.status() != PGRES_TUPLES_OK) {
-                spdlog::warn("WorkflowEngine: current-step update failed for {}: {}", exec_id,
-                            PQresultErrorMessage(res.get()));
-                return;
-            }
-            cas_ran = true;
-            cas_matched = PQntuples(res.get()) > 0;
-        });
-        if (cas_ran && !cas_matched) {
-            execution_failed = true;
-            break;
-        }
-
-        // Evaluate condition if present
-        if (!step.condition.empty() && condition_fn) {
-            // Parse previous result into fields map
-            std::map<std::string, std::string> fields;
-            try {
-                auto prev = nlohmann::json::parse(prev_result_json, nullptr, false);
-                if (!prev.is_discarded() && prev.is_object()) {
-                    for (auto& [k, v] : prev.items()) {
-                        fields["result." + k] = v.is_string() ? v.get<std::string>() : v.dump();
-                    }
-                }
-            } catch (...) {}
-
-            if (!condition_fn(step.condition, fields)) {
-                // Condition not met — skip step
-                with_write_lease([&](PGconn* c) {
-                    wf_update_step_result(c, exec_id, step.index, "skipped",
-                                          R"({"reason":"condition not met"})");
-                });
-                spdlog::info("WorkflowEngine: step {} skipped (condition: {})", step.index,
-                            step.condition);
-                continue;
-            }
-        }
-
-        // Mark step as running
-        with_write_lease([&](PGconn* c) {
-            WorkflowStepResult sr;
-            sr.step_index = step.index;
-            sr.instruction_id = step.instruction_id;
-            sr.status = "running";
-            sr.started_at = now_epoch();
-            wf_create_step_result(c, exec_id, sr);
-        });
-
-        // Determine dispatch items (foreach expansion)
-        std::vector<std::string> dispatch_params;
-        if (!step.foreach_source.empty()) {
-            dispatch_params = expand_foreach(step.foreach_source, prev_result_json);
-        } else {
-            dispatch_params.push_back("{}");
-        }
-
-        // Dispatch with retry logic — no lease/conn held across a dispatch_fn call or
-        // sleep_for (ADR-0064 "Lease discipline").
-        bool step_succeeded = false;
-        std::string step_result;
-
-        for (int attempt = 1; attempt <= (step.retry_count + 1); ++attempt) {
-            // For foreach, aggregate results
-            nlohmann::json foreach_results = nlohmann::json::array();
-            bool foreach_failed = false;
-
-            for (const auto& params : dispatch_params) {
-                auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
-                // #2437-class guard: StepDispatchFn's documented contract (workflow_engine.hpp)
-                // is "returns a JSON result string" with no depth bound. Today's one wired
-                // caller (workflow_routes.cpp's dispatch_fn) only ever returns a small
-                // fixed-shape dispatch acknowledgment, but that closure's own comment notes the
-                // step-dispatch path does not yet correlate a step's real agent-reported
-                // response back through this same return value (tracked as future work) - so
-                // this is the chokepoint that has to hold regardless of which caller is wired
-                // today, not a guard against a live exploit path. Reject on the RAW text BEFORE
-                // the parse below (or anything else) interprets it: nlohmann::json::parse
-                // tolerates very deep input, but .dump() a few lines down, and every downstream
-                // consumer chained off prev_result_json (expand_foreach's array-iteration branch
-                // AND its "treat whole result as single item" fallback, plus the step condition
-                // evaluator) IS unboundedly recursive and SIGSEGVs the whole process well under
-                // 1 MiB of nesting. A depth violation here closes every one of those downstream
-                // traversals at once, since none of them can ever be reached with unchecked
-                // content that didn't pass through this one call first. Fails CLOSED onto the
-                // SAME error path an ordinary dispatch failure already uses just below:
-                // foreach_failed=true, a safe (non-nested) placeholder recorded in
-                // foreach_results, and NO poisoned structure ever enters
-                // foreach_results/step_result/prev_result_json. Never logs the payload, only
-                // identifiers.
-                const bool depth_exceeded =
-                    dispatch_result && yuzu::server::mcp::json_exceeds_depth(
-                                            *dispatch_result, yuzu::server::mcp::kMcpMaxJsonDepth);
-                if (dispatch_result && !depth_exceeded) {
-                    // #4030 Gate 8 fix (Gate 4 unhappy-path finding UP-2):
-                    // an un-guarded parse embeds the nlohmann `<discarded>`
-                    // sentinel as literal text when `*dispatch_result` is
-                    // not valid JSON, producing an invalid JSON document
-                    // once `.dump()`'d downstream (verified via compile+
-                    // run). Matches the read-side guard already applied at
-                    // workflow_model.cpp's `confined_workflow_step_result_json`.
-                    auto parsed = nlohmann::json::parse(*dispatch_result, nullptr, false);
-                    foreach_results.push_back(parsed.is_discarded() ? nlohmann::json(nullptr)
-                                                                    : parsed);
-                } else {
-                    foreach_failed = true;
-                    if (depth_exceeded) {
-                        spdlog::error(
-                            "WorkflowEngine: step {} (execution {}, instruction {}, agents {}) "
-                            "dispatch result nested past the depth guard (max {}); treating as "
-                            "a failed dispatch, cannot be safely parsed",
-                            step.index, exec_id, step.instruction_id, agent_str,
-                            yuzu::server::mcp::kMcpMaxJsonDepth);
-                    }
-                    foreach_results.push_back(nlohmann::json(
-                        {{"error", depth_exceeded
-                                       ? "dispatch result exceeded maximum JSON nesting depth"
-                                       : dispatch_result.error()}}));
+            current_step_index = step.index;
+            current_step_open = true;
+            // Check if execution was cancelled
+            {
+                auto exec_check = get_execution(exec_id);
+                if (exec_check && *exec_check && (*exec_check)->status == "cancelled") {
+                    execution_failed = true;
+                    break;
                 }
             }
 
-            if (!foreach_failed) {
-                step_succeeded = true;
-                step_result = dispatch_params.size() == 1
-                    ? foreach_results[0].dump()
-                    : foreach_results.dump();
-                break;
-            }
-
-            // Retry if attempts remain
-            if (attempt <= step.retry_count) {
-                spdlog::warn("WorkflowEngine: step {} attempt {}/{} failed, retrying in {}s",
-                             step.index, attempt, step.retry_count + 1, step.retry_delay_seconds);
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(step.retry_delay_seconds));
-            } else {
-                step_result = foreach_results.dump();
-            }
-
+            // Update current step - `WHERE status = 'running'` guards this write the same way
+            // finalize's is guarded (governance finding, security-guardian + docs-writer,
+            // independently): without it, a concurrent cancel_execution() landing between the
+            // cancellation check above and this write could flip status back to 'running', making
+            // the loop (and finalize afterwards) forget the cancellation ever happened. `RETURNING id`
+            // makes the CAS observable (governance finding, security-guardian): a CONFIRMED zero-row
+            // result means the guard didn't match - status was no longer 'running', i.e. a cancel landed
+            // in the window between the check above and this write - so the loop stops immediately
+            // instead of dispatching one more step past the cancel. A lease timeout or query failure is
+            // NOT treated as a mismatch (that would break the ADR-0064 degrade-and-continue posture for
+            // an ordinary transient failure) - only a definite, executed CAS that matched zero rows
+            // stops the loop. Currently unreachable in production (cancel_execution has no caller),
+            // closed as the same defense-in-depth as the finalize fix.
+            bool cas_ran = false;
+            bool cas_matched = false;
             with_write_lease([&](PGconn* c) {
-                wf_update_attempt(c, exec_id, step.index, attempt);
+                pg::PgResult res = pg::exec_params(
+                    c,
+                    "UPDATE workflow_engine.workflow_executions SET status = 'running', "
+                    "current_step = $1::int WHERE id = $2 AND status = 'running' RETURNING id",
+                    std::vector<std::string>{std::to_string(step.index), exec_id});
+                if (res.status() != PGRES_TUPLES_OK) {
+                    spdlog::warn("WorkflowEngine: current-step update failed for {}: {}", exec_id,
+                                PQresultErrorMessage(res.get()));
+                    return;
+                }
+                cas_ran = true;
+                cas_matched = PQntuples(res.get()) > 0;
             });
-        }
-
-        // Record step result
-        with_write_lease([&](PGconn* c) {
-            wf_update_step_result(c, exec_id, step.index,
-                                  step_succeeded ? "success" : "failed", step_result);
-        });
-
-        if (step_succeeded) {
-            prev_result_json = step_result;
-        } else {
-            // Handle failure based on on_failure policy
-            if (step.on_failure == "continue") {
-                spdlog::warn("WorkflowEngine: step {} failed, continuing (on_failure=continue)",
-                             step.index);
-                prev_result_json = step_result;
-            } else if (step.on_failure == "skip_remaining") {
-                spdlog::warn("WorkflowEngine: step {} failed, skipping remaining steps",
-                             step.index);
-                with_write_lease([&](PGconn* c) {
-                    for (const auto& remaining : workflow.steps) {
-                        if (remaining.index > step.index) {
-                            wf_update_step_result(c, exec_id, remaining.index, "skipped",
-                                                  R"({"reason":"previous step failed"})");
-                        }
-                    }
-                });
+            if (cas_ran && !cas_matched) {
                 execution_failed = true;
                 break;
+            }
+
+            // Evaluate condition if present
+            if (!step.condition.empty() && condition_fn) {
+                // Parse previous result into fields map
+                std::map<std::string, std::string> fields;
+                try {
+                    auto prev = nlohmann::json::parse(prev_result_json, nullptr, false);
+                    if (!prev.is_discarded() && prev.is_object()) {
+                        for (auto& [k, v] : prev.items()) {
+                            fields["result." + k] = v.is_string() ? v.get<std::string>() : v.dump();
+                        }
+                    }
+                } catch (...) {}
+
+                if (!condition_fn(step.condition, fields)) {
+                    // Condition not met - skip step
+                    with_write_lease([&](PGconn* c) {
+                        wf_update_step_result(
+                            c, exec_id, step.index, "skipped",
+                            nlohmann::json({{"reason", kStepReasonConditionNotMet}}).dump());
+                    });
+                    spdlog::info("WorkflowEngine: step {} skipped (condition: {})", step.index,
+                                step.condition);
+                    current_step_open = false;
+                    continue;
+                }
+            }
+
+            // Mark step as running
+            with_write_lease([&](PGconn* c) {
+                WorkflowStepResult sr;
+                sr.step_index = step.index;
+                sr.instruction_id = step.instruction_id;
+                sr.status = "running";
+                sr.started_at = now_epoch();
+                wf_create_step_result(c, exec_id, sr);
+            });
+
+            // Determine dispatch items (foreach expansion)
+            std::vector<std::string> dispatch_params;
+            if (!step.foreach_source.empty()) {
+                dispatch_params = expand_foreach(step.foreach_source, prev_result_json);
             } else {
-                // "abort" — default
-                spdlog::error("WorkflowEngine: step {} failed, aborting workflow", step.index);
+                dispatch_params.push_back("{}");
+            }
+
+            // Dispatch with retry logic - no lease/conn held across a dispatch_fn call or
+            // sleep_for (ADR-0064 "Lease discipline").
+            bool step_succeeded = false;
+            std::string step_result;
+
+            for (int attempt = 1; attempt <= (step.retry_count + 1); ++attempt) {
+                // For foreach, aggregate results
+                nlohmann::json foreach_results = nlohmann::json::array();
+                bool foreach_failed = false;
+                bool permanent_failure = false; // no retry, no retry sleep
+
+                for (const auto& params : dispatch_params) {
+                    if (control.on_attempt)
+                        control.on_attempt(step.index, attempt);
+                    if (stop_before_attempt()) {
+                        // Not retried, not slept on, and the step's on_failure policy does not
+                        // apply: the whole run ends after this step is recorded.
+                        run_stopped = true;
+                        foreach_failed = true;
+                        permanent_failure = true;
+                        foreach_results.push_back(nlohmann::json(
+                            {{"error", stop_cause == StopCause::kShutdown
+                                           ? "run stopped before this attempt (server shutdown)"
+                                           : "run stopped before this attempt"},
+                             {"reason", stop_reason()}}));
+                        break;
+                    }
+                    auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
+                    // #2437-class guard: StepDispatchFn's documented contract (workflow_engine.hpp)
+                    // is "returns a JSON result string" with no depth bound. Today's one wired
+                    // caller (workflow_routes.cpp's dispatch_fn) only ever returns a small
+                    // fixed-shape dispatch acknowledgment, but that closure's own comment notes the
+                    // step-dispatch path does not yet correlate a step's real agent-reported
+                    // response back through this same return value (tracked as future work) - so
+                    // this is the chokepoint that has to hold regardless of which caller is wired
+                    // today, not a guard against a live exploit path. Reject on the RAW text BEFORE
+                    // the parse below (or anything else) interprets it: nlohmann::json::parse
+                    // tolerates very deep input, but .dump() a few lines down, and every downstream
+                    // consumer chained off prev_result_json (expand_foreach's array-iteration branch
+                    // AND its "treat whole result as single item" fallback, plus the step condition
+                    // evaluator) IS unboundedly recursive and SIGSEGVs the whole process well under
+                    // 1 MiB of nesting. A depth violation here closes every one of those downstream
+                    // traversals at once, since none of them can ever be reached with unchecked
+                    // content that didn't pass through this one call first. Fails CLOSED onto the
+                    // SAME error path an ordinary dispatch failure already uses just below:
+                    // foreach_failed=true, a safe (non-nested) placeholder recorded in
+                    // foreach_results, and NO poisoned structure ever enters
+                    // foreach_results/step_result/prev_result_json. Never logs the payload, only
+                    // identifiers.
+                    const bool depth_exceeded =
+                        dispatch_result && yuzu::server::mcp::json_exceeds_depth(
+                                                *dispatch_result, yuzu::server::mcp::kMcpMaxJsonDepth);
+                    if (dispatch_result && !depth_exceeded) {
+                        // #4030 Gate 8 fix (Gate 4 unhappy-path finding UP-2):
+                        // an un-guarded parse embeds the nlohmann `<discarded>`
+                        // sentinel as literal text when `*dispatch_result` is
+                        // not valid JSON, producing an invalid JSON document
+                        // once `.dump()`'d downstream (verified via compile+
+                        // run). Matches the read-side guard already applied at
+                        // workflow_model.cpp's `confined_workflow_step_result_json`.
+                        auto parsed = nlohmann::json::parse(*dispatch_result, nullptr, false);
+                        foreach_results.push_back(parsed.is_discarded() ? nlohmann::json(nullptr)
+                                                                        : parsed);
+                    } else {
+                        foreach_failed = true;
+                        if (depth_exceeded) {
+                            spdlog::error(
+                                "WorkflowEngine: step {} (execution {}, instruction {}, agents {}) "
+                                "dispatch result nested past the depth guard (max {}); treating as "
+                                "a failed dispatch, cannot be safely parsed",
+                                step.index, exec_id, step.instruction_id, agent_str,
+                                yuzu::server::mcp::kMcpMaxJsonDepth);
+                        }
+                        foreach_results.push_back(nlohmann::json(
+                            {{"error", depth_exceeded
+                                           ? "dispatch result exceeded maximum JSON nesting depth"
+                                           : dispatch_result.error().message}}));
+                        if (!depth_exceeded && dispatch_result.error().permanent)
+                            permanent_failure = true;
+                    }
+                    // A permanent failure repeats for every remaining item, so it ends the
+                    // expansion as well as the retries.
+                    if (permanent_failure)
+                        break;
+                }
+
+                if (!foreach_failed) {
+                    step_succeeded = true;
+                    step_result = dispatch_params.size() == 1
+                        ? foreach_results[0].dump()
+                        : foreach_results.dump();
+                    break;
+                }
+
+                // Retry if attempts remain (never after a permanent failure)
+                if (!permanent_failure && attempt <= step.retry_count) {
+                    // The pending retry ends here, un-made, when the server is stopping (the whole
+                    // run stops) or draining (this step fails under its own on_failure policy and
+                    // the run goes on). Either way no delay is slept for it.
+                    const auto end_retry = [&](WorkflowStopLevel level) {
+                        permanent_failure = true;
+                        if (level == WorkflowStopLevel::kStop) {
+                            note_stop(StopCause::kShutdown);
+                            run_stopped = true;
+                            foreach_results.push_back(nlohmann::json(
+                                {{"error", "run stopped before the retry (server shutdown)"},
+                                 {"reason", stop_reason()}}));
+                        } else {
+                            spdlog::warn("WorkflowEngine: step {} (execution {}) retry abandoned: "
+                                         "the server is draining",
+                                         step.index, exec_id);
+                            foreach_results.push_back(nlohmann::json(
+                                {{"error", "retry abandoned: the server is draining"}}));
+                        }
+                        step_result = foreach_results.dump();
+                    };
+                    if (const auto level = stop_level(); level != WorkflowStopLevel::kNone) {
+                        end_retry(level);
+                    } else {
+                        spdlog::warn("WorkflowEngine: step {} attempt {}/{} failed, retrying in {}s",
+                                     step.index, attempt, step.retry_count + 1,
+                                     step.retry_delay_seconds);
+                        // The delay never runs past the deadline: the next attempt then finds the
+                        // run out of time and stops it, instead of the run sleeping on after the
+                        // bound.
+                        const auto delay = bounded_retry_delay(
+                            step.retry_delay_seconds,
+                            control.deadline
+                                ? std::optional<std::chrono::steady_clock::duration>(
+                                      *control.deadline - std::chrono::steady_clock::now())
+                                : std::nullopt);
+                        if (delay > std::chrono::steady_clock::duration::zero() &&
+                            interruptible_wait(delay, [&] {
+                                return stop_level() != WorkflowStopLevel::kNone;
+                            }) == WaitResult::kWoken) {
+                            if (const auto woke_level = stop_level();
+                                woke_level != WorkflowStopLevel::kNone)
+                                end_retry(woke_level);
+                        }
+                    }
+                } else {
+                    step_result = foreach_results.dump();
+                }
+
+                with_write_lease([&](PGconn* c) {
+                    wf_update_attempt(c, exec_id, step.index, attempt);
+                });
+                if (permanent_failure)
+                    break;
+            }
+
+            // Record step result
+            with_write_lease([&](PGconn* c) {
+                wf_update_step_result(c, exec_id, step.index,
+                                      step_succeeded ? "success" : "failed", step_result);
+            });
+            current_step_open = false;
+
+            if (run_stopped) {
+                spdlog::warn("WorkflowEngine: execution {} stopped at step {} ({}); skipping the "
+                             "remaining steps",
+                             exec_id, step.index,
+                             stop_cause == StopCause::kShutdown ? "server shutdown"
+                                                                : "run bound reached");
                 with_write_lease([&](PGconn* c) {
                     for (const auto& remaining : workflow.steps) {
                         if (remaining.index > step.index) {
                             wf_update_step_result(c, exec_id, remaining.index, "skipped",
-                                                  R"({"reason":"workflow aborted"})");
+                                                  skip_reason_json());
                         }
                     }
                 });
                 execution_failed = true;
                 break;
             }
+
+            if (step_succeeded) {
+                prev_result_json = step_result;
+            } else {
+                // Handle failure based on on_failure policy
+                if (step.on_failure == "continue") {
+                    spdlog::warn("WorkflowEngine: step {} failed, continuing (on_failure=continue)",
+                                 step.index);
+                    prev_result_json = step_result;
+                } else if (step.on_failure == "skip_remaining") {
+                    spdlog::warn("WorkflowEngine: step {} failed, skipping remaining steps",
+                                 step.index);
+                    with_write_lease([&](PGconn* c) {
+                        for (const auto& remaining : workflow.steps) {
+                            if (remaining.index > step.index) {
+                                wf_update_step_result(c, exec_id, remaining.index, "skipped",
+                                                      R"({"reason":"previous step failed"})");
+                            }
+                        }
+                    });
+                    execution_failed = true;
+                    break;
+                } else {
+                    // "abort" - default
+                    spdlog::error("WorkflowEngine: step {} failed, aborting workflow", step.index);
+                    with_write_lease([&](PGconn* c) {
+                        for (const auto& remaining : workflow.steps) {
+                            if (remaining.index > step.index) {
+                                wf_update_step_result(c, exec_id, remaining.index, "skipped",
+                                                      R"({"reason":"workflow aborted"})");
+                            }
+                        }
+                    });
+                    execution_failed = true;
+                    break;
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("WorkflowEngine: execution {} step {} threw: {}", exec_id,
+                      current_step_index, e.what());
+        thrown = std::current_exception();
+    } catch (...) {
+        spdlog::error("WorkflowEngine: execution {} step {} threw a non-standard exception",
+                      exec_id, current_step_index);
+        thrown = std::current_exception();
+    }
+    if (thrown) {
+        // Never retried: the throw left the loop. The in-flight step is failed and every later
+        // step skipped, best effort (a write that cannot happen must not stop the finalize).
+        execution_failed = true;
+        try {
+            with_write_lease([&](PGconn* c) {
+                if (current_step_open)
+                    wf_update_step_result(c, exec_id, current_step_index, "failed",
+                                          nlohmann::json({{"error", "step dispatch threw"},
+                                                          {"reason", kStepReasonDispatchException}})
+                                              .dump());
+                for (const auto& remaining : workflow.steps) {
+                    if (remaining.index > current_step_index) {
+                        wf_update_step_result(c, exec_id, remaining.index, "skipped",
+                                              R"({"reason":"workflow aborted"})");
+                    }
+                }
+            });
+        } catch (...) { // NOLINT(bugprone-empty-catch): the finalize below must still run
         }
     }
 
@@ -997,21 +1371,67 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // either case — as an unconditional metric/log keyed only on `execution_failed` would —
     // would claim a write that didn't happen, or misreport a cancellation as a step failure.
     std::optional<std::string> finalize_status;
-    with_write_lease([&](PGconn* c) {
+    // Landed: our write matched the running row. NoMatch: it executed and matched nothing (a
+    // cancel already moved the row). Dropped: no lease, or the statement failed, so nothing was
+    // written; only that is worth a second try.
+    enum class FinalizeTry { kLanded, kNoMatch, kDropped };
+    // `persist` keeps asking for a lease until `lease_timeout` is spent: one `try_acquire_for`
+    // on a saturated pool gives up after the pool's own fast-fail (500 ms) whatever timeout it
+    // was given, which would make the retry no longer than the first try. An empty answer is
+    // followed by a back-off sleep (a pool whose connect breaker is armed answers empty at once),
+    // and once a stop is seen the wait is cut to `kFinalizeStopBudget`.
+    const auto try_finalize = [&](std::chrono::milliseconds lease_timeout,
+                                  bool persist) -> FinalizeTry {
+        const auto try_lease = [&](std::chrono::milliseconds t) { return pool_.try_acquire_for(t); };
+        auto lease = persist
+            ? acquire_within(
+                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(lease_timeout),
+                  try_lease, [&] { return stop_level() == WorkflowStopLevel::kStop; },
+                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                      kFinalizeStopBudget))
+            : try_lease(lease_timeout);
+        if (!lease) {
+            spdlog::warn("WorkflowEngine::execute: lease unavailable for the final status write "
+                         "of execution {}",
+                         exec_id);
+            return FinalizeTry::kDropped;
+        }
         pg::PgResult res = pg::exec_params(
-            c,
+            lease.get(),
             "UPDATE workflow_engine.workflow_executions SET status = $1, completed_at = $2::bigint "
             "WHERE id = $3 AND status = 'running' RETURNING status",
             std::vector<std::string>{execution_failed ? "failed" : "completed",
                                      std::to_string(now_epoch()), exec_id});
         if (res.status() != PGRES_TUPLES_OK) {
             spdlog::warn("WorkflowEngine: finalize status update failed for {}: {}", exec_id,
-                        PQresultErrorMessage(res.get()));
-            return;
+                         PQresultErrorMessage(res.get()));
+            return FinalizeTry::kDropped;
         }
-        if (PQntuples(res.get()) > 0)
-            finalize_status = col_str(res.get(), 0, 0); // "failed" or "completed" — confirmed written
-    });
+        if (PQntuples(res.get()) == 0)
+            return FinalizeTry::kNoMatch;
+        finalize_status = col_str(res.get(), 0, 0); // "failed" or "completed": confirmed written
+        return FinalizeTry::kLanded;
+    };
+    auto finalize_try = try_finalize(write_timeout_, /*persist=*/false);
+    if (finalize_try == FinalizeTry::kDropped) {
+        // The row would otherwise stay `running` with nothing to close it: one more try, with a
+        // longer lease, before giving up on it.
+        spdlog::warn("WorkflowEngine: final status write for execution {} dropped; retrying once "
+                     "with a longer lease",
+                     exec_id);
+        finalize_try = try_finalize(finalize_retry_timeout_, /*persist=*/true);
+    }
+    if (finalize_try == FinalizeTry::kDropped) {
+        spdlog::error("WorkflowEngine: execution {} was NOT finalized: the final status write "
+                      "failed twice, so the row stays 'running' until something closes it",
+                      exec_id);
+        if (metrics_) {
+            try {
+                metrics_->counter("yuzu_server_workflow_finalize_failed_total", {}).increment();
+            } catch (...) { // NOLINT(bugprone-empty-catch): observability must not fail the run
+            }
+        }
+    }
 
     // Determine the real outcome for the log line (and, via the completed/not-completed split
     // below, the metric). If our own write landed, trust it. If not (lease timeout, or the guard
@@ -1033,10 +1453,38 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
                            {"result", outcome == "completed" ? "success" : "failed"}})
             .increment();
     spdlog::info("WorkflowEngine: execution {} {}", exec_id, outcome);
+    if (thrown)
+        std::rethrow_exception(thrown);
     return exec_id;
 }
 
 // ── Execution queries ───────────────────────────────────────────────────────
+
+std::expected<std::optional<WorkflowIdempotentRun>, std::string> WorkflowEngine::find_execution_by_key(
+    const std::string& principal, const std::string& idempotency_key) const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kDbErrorPrefix) + "pool exhausted");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id, workflow_id, request_fingerprint, status, started_at "
+        "FROM workflow_engine.workflow_executions WHERE principal = $1 AND idempotency_key = $2",
+        std::vector<std::string>{principal, idempotency_key});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::nullopt;
+    WorkflowIdempotentRun run;
+    run.execution_id = col_str(res.get(), 0, 0);
+    run.workflow_id = col_str(res.get(), 0, 1);
+    run.request_fingerprint = col_str(res.get(), 0, 2);
+    run.status = col_str(res.get(), 0, 3);
+    run.started_at = to_i64(col(res.get(), 0, 4));
+    return run;
+}
 
 std::expected<std::optional<WorkflowExecution>, std::string> WorkflowEngine::get_execution(
     const std::string& id) const {
@@ -1153,11 +1601,15 @@ namespace {
 // `pg_input_is_valid` is PostgreSQL 16+ (the documented floor).
 //
 // NOT a byte-for-byte image of that C++ oracle: jsonb and nlohmann accept different JSON. Every
-// document the engine writes (`nlohmann::json(vector<string>).dump()`, execute()) agrees on both
+// document the engine writes (`stored_agent_ids_json()`, execute(): a JSON array of strings, with
+// one trailing marker object on a truncated copy that both sides skip) agrees on both
 // sides; the shapes below can only arrive by a write that bypasses the engine, and each is pinned
 // with its direction in the "SQL visibility predicate" tests:
 //   - jsonb refuses a `\u0000` escape or a UTF-8 byte-order mark; nlohmann takes both. The whole
 //     document is "not an array" here, so a confined caller does NOT see the run (safe direction).
+//     An id holding a NUL byte is how a `\u0000` escape would reach the column, so
+//     `stored_agent_ids_json` skips it (counted in the marker's total, never stored): the engine
+//     itself never writes one. A byte-order mark cannot arrive through an id.
 //   - jsonb takes a number past double range (`["a1",1e400]`); nlohmann rejects the document. A
 //     confined caller whose scope holds "a1" DOES see the run here while the oracle hides it, so a
 //     listed run's detail read can answer not-visible. The run still names an in-scope agent, so
@@ -1167,8 +1619,9 @@ namespace {
 //     levels deep (a document of about 37 KB) hits the stack-depth guard, a hard error
 //     `pg_input_is_valid` does not trap; 18,650 levels is accepted. A stored row that deep fails
 //     the statement, so every confined list answers the typed degrade (503, never rows) until the
-//     row is gone. The engine only ever writes a flat array of strings, so only a bypassing write
-//     can store one.
+//     row is gone. The engine only ever writes a flat array of strings, plus one trailing marker
+//     object on a truncated copy (`stored_agent_ids_json`), so only a bypassing write can store
+//     one.
 constexpr const char* kGuardedAgentIdsJsonb =
     "CASE WHEN pg_input_is_valid(e.agent_ids_json, 'jsonb') "
     "THEN (CASE WHEN jsonb_typeof(e.agent_ids_json::jsonb) = 'array' "
@@ -1332,6 +1785,75 @@ std::expected<void, std::string> WorkflowEngine::cancel_execution(const std::str
     if (PQntuples(check.get()) == 0)
         return std::unexpected("execution not found");
     return std::unexpected("execution is already " + col_str(check.get(), 0, 0));
+}
+
+std::expected<ExecutionTableEstimate, std::string> WorkflowEngine::execution_table_estimate() const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+    // The same bounds as the other maintenance-tick samplers (count_stale_agents): this runs on a
+    // serial thread shared with the revocation sweep, so both the acquire and the statement are
+    // capped.
+    constexpr std::chrono::milliseconds kSampleAcquireTimeout{250};
+    std::optional<ExecutionTableEstimate> out;
+    std::string failure = "pool exhausted";
+    const bool ran = pool_.with_txn_for(kSampleAcquireTimeout, [&](PGconn* c) -> bool {
+        failure = "sample failed";
+        pg::PgResult t = pg::exec_params(c, "SET LOCAL statement_timeout = '250ms'",
+                                         std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK)
+            return false;
+        // One catalog row: reltuples is -1 until the first vacuum/analyze and n_live_tup restarts
+        // from 0 after a crash, so each covers the other's blind spot. Neither scans the table.
+        pg::PgResult res = pg::exec_params(
+            c,
+            "SELECT GREATEST(COALESCE(s.n_live_tup, 0), GREATEST(r.reltuples, 0)::bigint)::bigint, "
+            "pg_total_relation_size(r.oid)::bigint "
+            "FROM pg_class r LEFT JOIN pg_stat_user_tables s ON s.relid = r.oid "
+            "WHERE r.oid = 'workflow_engine.workflow_executions'::regclass",
+            std::vector<std::string>{});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+            return false;
+        out = ExecutionTableEstimate{to_i64(col(res.get(), 0, 0)), to_i64(col(res.get(), 0, 1))};
+        return true;
+    });
+    if (!ran || !out)
+        return std::unexpected(std::string(kDbErrorPrefix) + failure);
+    return *out;
+}
+
+void WorkflowEngine::refresh_table_size_metrics() noexcept {
+    if (!metrics_)
+        return;
+    // A failed sample is counted on every tick; the log line is warn once per interval per cause
+    // (the tick is 15 s, so a persistent failure would otherwise write one line per tick).
+    const auto note_failure = [this](const std::string& cause) noexcept {
+        try {
+            metrics_->counter(kWorkflowExecutionsStatsUnavailableMetric).increment();
+            if (sample_warn_throttle_.should_warn(cause))
+                spdlog::warn("WorkflowEngine: run table size sample failed ({}); the rows and bytes "
+                             "gauges keep their last value",
+                             cause);
+        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the tick
+        }
+    };
+    try {
+        if (auto est = execution_table_estimate()) {
+            metrics_->gauge(kWorkflowExecutionsRowsMetric).set(static_cast<double>(est->rows));
+            metrics_->gauge(kWorkflowExecutionsBytesMetric).set(static_cast<double>(est->bytes));
+        } else {
+            note_failure(est.error());
+        }
+    } catch (const std::exception& e) {
+        // The cause string is built here, outside note_failure's own try, so an allocation failure
+        // while building it must not leave this noexcept function: it falls back to a fixed token.
+        try {
+            note_failure(std::string("exception: ") + e.what());
+        } catch (...) {
+            note_failure("exception");
+        }
+    } catch (...) {
+        note_failure("exception");
+    }
 }
 
 } // namespace yuzu::server
