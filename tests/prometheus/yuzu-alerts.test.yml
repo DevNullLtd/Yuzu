@@ -3461,12 +3461,14 @@ tests:
   # ── YuzuGuardianReadDegraded (#4856) ─────────────────────────────────────
   #
   # `sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason,
-  # source) > 0`, for: 5m, warning. Three sources share the counter:
+  # source) > 0`, for: 5m, warning. Four sources share the counter:
   # "guardian_state" (DEX/observation reads, fail-soft), "guardian_rules"
-  # (authoritative rule/status reads, fail-hard) and "guardian_census" (the
-  # census pending-evidence count read, #5690) - each pages on a
-  # sustained non-zero rate, keyed by both labels (the expr has no source filter; the cases
-  # below exercise guardian_state and guardian_rules).
+  # (authoritative rule/status reads, fail-hard), "guardian_census" (the
+  # census pending-evidence count read, #5690) and "guardian_census_device"
+  # (the two per-device unrepresented-pending reads, #7217, whose reasons add
+  # statement_timeout) - each pages on a sustained non-zero rate, keyed by both
+  # labels (the expr has no source filter; the cases below exercise
+  # guardian_state, guardian_rules and guardian_census_device).
 
   # CASE — a sustained degrade on the DEX/observation family (guardian_state)
   # pages, carrying both its reason and source labels.
@@ -3505,6 +3507,22 @@ tests:
           - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="store_not_open", source="guardian_rules", severity="warning"}'
             value: 1
 
+  # CASE - a sustained statement_timeout on the per-device unrepresented-pending
+  # reads (guardian_census_device, #7217) pages on its OWN source and reason
+  # labels - proof the new source is covered by the unfiltered expr with no
+  # expression change, and that its extra reason is not merged into another.
+  - interval: 1m
+    name: guardian read degraded - a sustained guardian_census_device statement_timeout pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="statement_timeout",source="guardian_census_device"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="statement_timeout", source="guardian_census_device", severity="warning"}'
+            value: 1
+
   # CASE — the boot-time pre-seed alone (the seeded sources x all three reasons
   # present at zero, never incremented) must stay quiet: present-at-zero is
   # the HEALTHY steady state, not a degrade.
@@ -3522,6 +3540,10 @@ tests:
       - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout",source="guardian_rules"}'
         values: "0x30"
       - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_rules"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_census_device"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="statement_timeout",source="guardian_census_device"}'
         values: "0x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'

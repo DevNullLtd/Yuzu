@@ -90,7 +90,7 @@ cadences.
   `msi_packages` entries for the exact per-action wording.
 - **The honest-empty contract:** a field the ecosystem does not store is the
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
-  epoch). Per-ecosystem availability:
+  epoch), except `publisher`, which is never empty: see below. Per-ecosystem availability:
 
   | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java | Chocolatey | winget | Appx package |
   |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -101,10 +101,30 @@ cadences.
   | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) | `Microsoft` | ✓ (the build's self-reported `IMPLEMENTOR`; empty if absent) | — | — | — |
+  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` |
   | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+
+  **`publisher` is never empty.** It is the vendor the source itself declares; when a
+  source declares none, it is the label `via:<ecosystem>` (`via:brew`, `via:snap`,
+  `via:deb` and so on), which names where the row came from, not who made the software.
+  A label is a fixed, lower-case, exact `via:` prefix: Homebrew formulae and casks, Snaps
+  and Flatpaks are read without starting a process, so they carry no vendor and always read
+  `via:brew`, `via:snap` and `via:flatpak`; Chocolatey packages, the Chocolatey and winget
+  presence rows and Appx packages carry none either (`via:chocolatey`, `via:winget`,
+  `via:appx`), and of the `pkg_inventory` sources only the Homebrew presence row, `homebrew`,
+  carries a constant publisher, `Homebrew`; `pacman` and `apk` have no vendor field in their package
+  list; a macOS installer receipt id is an identifier, not a vendor. A row with no
+  ecosystem is labelled `via:unknown`, never the bare `via:`. The catalogue treats a
+  label as no vendor: it does not count towards the publisher total, never wins as a
+  title's representative publisher over a declared one, and does not take part in title
+  matching (a title from `via:snap` matches the same title with no publisher). There is
+  no `publisher` filter parameter; the catalogue search matches the publisher text
+  literally, so searching `via:` lists the titles whose representative publisher is a
+  label. The rpm vendor is read from the
+  package's `VENDOR` tag; the `PACKAGER` tag, which is usually a person or a build-system
+  address, is the fallback when a package has no vendor.
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -113,8 +133,8 @@ cadences.
   packages (they are installed). Machine-scope Homebrew
   is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
   `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
-  one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
-  that records Homebrew itself is present — one row however many prefixes
+  one `kind` `app` row named `homebrew` (`publisher` `Homebrew`) with `source`
+  `pkg_inventory.managers` that records Homebrew itself is present — one row however many prefixes
   exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
   Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
   Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
@@ -172,7 +192,7 @@ cadences.
   not. For these rows `version` carries the DISM feature state verbatim
   (`enabled`, `disabled`, `pending_enable`, `pending_disable`, `superseded`,
   `partially_installed`, `unknown`) because a feature has no version of its own;
-  `publisher` is empty. A host with a disabled feature therefore still lists
+  `publisher` is the constant `Microsoft` (DISM features are Windows components). A host with a disabled feature therefore still lists
   it, so the `/software` catalogue count (grouped by name) counts a host with a
   DISABLED feature as having it — read `version` to tell them apart.
 
@@ -183,7 +203,7 @@ cadences.
   product code exactly as the product registers it (no case normalisation).
   Only the machine install context is enumerated: a product installed for one
   user is never listed by this source. A property the product does not have is
-  empty; a product with no name (for example one that is advertised but not
+  empty, except `publisher`, which becomes `via:msi`; a product with no name (for example one that is advertised but not
   installed) is dropped. A property read that fails for any other reason makes
   the whole roster constrained, so the cycle is skipped rather than a product
   silently disappearing. The same product normally also has an `app`/`windows`
@@ -196,7 +216,10 @@ cadences.
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
   `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
-  `ecosystem` `python`, `version` the interpreter version; publisher and the other
+  `ecosystem` `python`, `version` the interpreter version, `publisher` the `PythonCore`
+  registry tag on Windows (`via:python` when it is absent), and always `via:python` on Linux,
+  where the install tree names no vendor, and on macOS, where the metadata names only a bundle
+  identifier, not a vendor; the other
   package fields are empty. No process is started: each OS answers from install
   metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
   registry views (python.org installs; per-user installs and other PEP 514
@@ -232,7 +255,9 @@ cadences.
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
   or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
   none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
-  Windows) and `publisher` the file's `IMPLEMENTOR`. The publisher is self-reported by the
+  Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with an openable `Contents` and no `release` file
+  under `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a
+  Windows home known only by its registry key). The publisher is self-reported by the
   build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
   the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
   JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu registry keys and then each home's `release` file; Linux
@@ -281,7 +306,7 @@ cadences.
   use `signature_status` as tamper detection or as a Gatekeeper/notarization
   result. (Deep verification — `SecStaticCodeCheckValidity` — is not performed;
   adding it would turn this into a validity verdict and need a third state, an
-  open contract decision.) `publisher` is empty for ad-hoc-signed and unsigned
+  open contract decision.) `publisher` is `via:macos` for ad-hoc-signed and unsigned
   apps. Enrichment covers up to 5000 located apps per collection; that guard is
   a runaway bound rather than a routine limit, and reaching it makes the agent
   report the collection degraded (see below) instead of publishing rows whose
@@ -329,11 +354,9 @@ cadences.
   normal, not degraded. A value-level failure (a non-REG_SZ or over-64 KiB
   DisplayName) is not distinguished from an absent value (plugin README caveat
   1).
-- **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
-  the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
-  only — the release moved to its own `release` column (was fused
-  `VERSION-RELEASE`). Fleet-wide version rollups on Linux change shape
-  accordingly on the first post-upgrade sync.
+- **rpm fields:** `publisher` is the rpm **VENDOR** tag, else the **PACKAGER**
+  tag (a person or a build-system address), else `via:rpm`; `version` is the
+  upstream version only and the release is its own `release` column.
 - **No end-user profiles / personal data in the daily sync.** We do **not** use
   the plugin's per-user enumeration (`list_per_user`), so no logged-in-user
   profiles and no usernames are collected by the sync — no end-user PII. The
@@ -1389,12 +1412,13 @@ The server turns every distinct installed-software title into a stable identity 
 - **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
 - **Settled titles are re-resolved only when something changes.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale. A curated alias (`POST /api/v1/inventory/software/normalization/aliases`) or a replaced pack (`POST .../pack`) marks every title stale in the same transaction, so the next hourly passes pick the fleet up again; rejecting a queue entry does not.
 - **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **Origin labels.** A publisher of the form `via:<ecosystem>` (for example `via:brew`) names where a row came from, not a vendor, so it normalises to no vendor. It is the title's raw key: the queue and `GET .../queue` show it as `raw_publisher`, and a title the pack or a curated alias covers resolves through that alias like a title with no publisher.
 - **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
 - **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
 - **What is kept, and for how long.** The title dimension is permanent: it keeps one row for every distinct title the fleet has ever reported, and is never pruned. Titles that embed a version in their name (many do) therefore add rows over time, so the table grows with the number of distinct titles ever seen, not with the current fleet. `yuzu_software_titles` shows how many titles are in the current fleet; the table's size is visible in Postgres. A future retention policy would be a separate decision. The curation queue is different: its open rows always mirror the current fleet, and an empty title list (see below) empties it; only each row's first-queued time is lost, because the rows are rebuilt as titles return.
 - **Titles that are too long.** A title whose name, publisher and ecosystem together exceed 2,400 bytes is left out of the title list, and so is never normalised or queued; this is far beyond any real software name and exists so that one malformed report cannot stop the whole catalogue refresh. Each catalogue refresh that leaves such titles out writes one warning to the server log with their count.
 - **Where to look.** `GET /api/v1/inventory/software/normalization/status` gives the pack version and the title and queue counts, and `GET .../queue` lists the titles waiting for curation, most-installed first (see [REST API](rest-api.md#software-normalisation-curation)). There is no MCP tool or page for this yet (the MCP twin is a recorded ADR-1005 exception, revisit by 2026-12-31). The Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and the metrics below, remain available.
-- **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no publisher (`git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
+- **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no vendor (a `via:` label: `git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
 - **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
 - **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
 

@@ -2197,6 +2197,69 @@ TEST_CASE("refresh_catalog_rollup rebuilds title_triples with exact distinct tri
     CHECK(count_rows(pool, "title_triples") == 3);
 }
 
+TEST_CASE("catalogue rollup: origin labels are not publishers and never beat a declared vendor",
+          "[pg][software_inventory][vendor]") {
+    SWINV_SHARED(store, pool);
+    // wget: one device with a declared vendor, one with only a label (the label sorts AFTER an
+    // upper-case vendor, so a plain max(publisher) would pick it). curl: label only.
+    put(store, "v1", Rows{ent("wget", "1.24", "GNU Project", "pkg", "deb", kSrcApps)});
+    put(store, "v2", Rows{ent("wget", "1.24", "via:brew", "pkg", "brew", kSrcPkg),
+                          ent("curl", "8.0", "via:brew", "pkg", "brew", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    // total_publishers counts declared vendors only.
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->total_publishers == 1);
+
+    const auto cat = store.software_catalog({});
+    REQUIRE(cat.has_value());
+    std::map<std::string, std::string> pub;
+    for (const auto& r : *cat)
+        pub[r.name] = r.publisher;
+    CHECK(pub["wget"] == "GNU Project"); // the declared vendor wins
+    CHECK(pub["curl"] == "via:brew");    // no vendor anywhere: the label is shown
+}
+
+TEST_CASE("catalogue search matches the displayed representative publisher on the host and fleet paths",
+          "[pg][software_inventory][vendor]") {
+    SWINV_SHARED(store, pool);
+    // One device carries wget through TWO rows: a declared vendor and an origin label. The label
+    // sorts after the capitalised vendor, so a plain max(publisher) would show (and search) the
+    // label; the displayed publisher is the vendor, and a search for the vendor must find it.
+    put(store, "h1",
+        Rows{ent("wget", "1.24", "GNU Project", "pkg", "deb", kSrcApps),
+             ent("wget", "1.24", "via:brew", "pkg", "brew", kSrcPkg)});
+    put(store, "h2", Rows{ent("curl", "8.0", "via:brew", "pkg", "brew", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    const auto names = [&](SoftwareCatalogQuery q) {
+        const auto rows = store.software_catalog(q);
+        REQUIRE(rows.has_value());
+        std::set<std::string> out;
+        for (const auto& r : *rows)
+            out.insert(r.name);
+        return out;
+    };
+    for (const std::string agent : {"h1", ""}) { // host path, then fleet path
+        INFO("agent_id=" << agent);
+        SoftwareCatalogQuery q;
+        q.agent_id = agent;
+        q.q = "GNU";
+        CHECK(names(q) == std::set<std::string>{"wget"}); // the declared vendor is searchable
+        q.q = "via:";
+        // the label is searchable only where it is what the title shows
+        CHECK(names(q) == (agent.empty() ? std::set<std::string>{"curl"} : std::set<std::string>{}));
+    }
+    // ...and the shown publisher is the vendor on the host path too.
+    SoftwareCatalogQuery hq;
+    hq.agent_id = "h1";
+    const auto host = store.software_catalog(hq);
+    REQUIRE(host.has_value());
+    REQUIRE(host->size() == 1);
+    CHECK((*host)[0].publisher == "GNU Project");
+}
+
 TEST_CASE("refresh_catalog_rollup leaves an over-wide triple out of title_triples and still succeeds",
           "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
@@ -4583,6 +4646,39 @@ TEST_CASE("canonical_section_hash is order and duplicate independent, 16 slots a
     SoftwareEntry derived = a;
     SoftwareInventoryStore::derive_install_keys(derived);
     CHECK(SoftwareInventoryStore::canonical_section_hash({derived}) == base);
+}
+
+TEST_CASE("canonical_section_hash pins a row whose publisher is an origin label (via:brew)",
+          "[software_inventory][v3][hash][vendor]") {
+    // The agent writes `via:<ecosystem>` into slot 3 when a source declares no vendor; the server
+    // hashes it like any other publisher (no special case on the hash path). Recipe:
+    //   printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\037\037\037\037pkg_inventory.packages\036' | shasum -a 256
+    SoftwareEntry e;
+    e.name = "wget";
+    e.version = "1.24";
+    e.publisher = "via:brew";
+    e.kind = "pkg";
+    e.ecosystem = "brew";
+    e.source = kV3Pkgs;
+    CHECK(SoftwareInventoryStore::canonical_section_hash({e}) ==
+          "906ce129e4448180dcee1d554df55367a898b40e73551cf9dbfaa73d26d0c69f");
+    // ...and the label is in the hash: the same row with the slot empty hashes differently.
+    SoftwareEntry bare = e;
+    bare.publisher.clear();
+    CHECK(SoftwareInventoryStore::canonical_section_hash({bare}) !=
+          SoftwareInventoryStore::canonical_section_hash({e}));
+    // The v2 report hash (canonical_hash) is the 12-field form with no tail when no source is set;
+    // the agent pins the same two digests in test_inventory_sync.cpp. Recipe:
+    //   printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\036' | shasum -a 256
+    SoftwareEntry v2 = e;
+    v2.source.clear();
+    CHECK(SoftwareInventoryStore::canonical_hash({v2}) ==
+          "3efab992b1c46e477f74297ee3d55e9c1a0cc923aa3d2dd112fe9a074ead29a9");
+    // The identity key ignores the label: a labelled row keys like a vendorless one.
+    SoftwareEntry labelled = e;
+    SoftwareInventoryStore::derive_install_keys(labelled);
+    SoftwareInventoryStore::derive_install_keys(bare);
+    CHECK(labelled.identity_key == bare.identity_key);
 }
 
 TEST_CASE("v3_report_hash sorts by facet in byte order, carries the v3: prefix, pinned",
