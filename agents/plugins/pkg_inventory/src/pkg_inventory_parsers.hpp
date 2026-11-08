@@ -10,17 +10,20 @@
  * SCOPE. MACHINE-SCOPE package-manager state only: per-user package stores
  * (npm/pip/cargo/per-user Homebrew) are out of scope and deferred to the
  * user-session helper (ADR-3003). This release ships the macOS Homebrew
- * legs and the Linux `managers` (tool presence + capture-backed facts) and
- * `store_packages` (snap, flatpak) legs. Linux never reports a distro package
- * roster (installed_apps.list_inventory owns that), so Linux `packages` is
- * UNSUPPORTED by design. The Windows legs are PLANNED.
+ * legs, the Linux `managers` (tool presence + capture-backed facts) and
+ * `store_packages` (snap, flatpak) legs, and the Windows legs (Chocolatey
+ * `packages`, Chocolatey and winget presence in `managers`, the Appx
+ * `store_packages` roster; pkg_inventory_win_parsers.hpp). Linux never reports
+ * a distro package roster (installed_apps.list_inventory owns that), so Linux
+ * `packages` is UNSUPPORTED by design.
  *
  * WIRE GRAMMAR. Every action writes the status row FIRST, then data rows:
  *
  *   status|<action>|<supported|constrained|unsupported>|<tokens or ->
- *   manager|<dpkg|apt|rpm|dnf|pacman|apk|snap|flatpak|homebrew>|<present|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->
+ *   manager|<dpkg|apt|rpm|dnf|pacman|apk|snap|flatpak|homebrew|chocolatey|winget>|<present|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->
  *   package|homebrew|<id>|<version>|<formula|cask>
- *   package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<active|inactive|unknown>
+ *   package|chocolatey|<id>|<version or ->|pkg
+ *   package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<active|inactive|unknown|deprovisioned>
  *
  * The status row is formatted (and read back by the installed-software
  * collector) by the shared yuzu::shared helper in agents/shared/inventory_status_row.hpp;
@@ -108,9 +111,9 @@ struct Limits {
 // ── fixed vocabularies (emitted verbatim, never through safe_output_field) ──
 
 /// The full manager-name vocabulary (a wire contract; the definition lists every
-/// value). `homebrew` is emitted by the macOS leg, the other eight by the Linux
-/// `managers` leg.
-enum class Manager { dpkg, apt, rpm, dnf, pacman, apk, homebrew, snap, flatpak };
+/// value). `homebrew` is emitted by the macOS leg, `chocolatey` and `winget` by
+/// the Windows leg, the other eight by the Linux `managers` leg.
+enum class Manager { dpkg, apt, rpm, dnf, pacman, apk, homebrew, snap, flatpak, chocolatey, winget };
 
 [[nodiscard]] constexpr std::string_view manager_name(Manager m) noexcept {
     switch (m) {
@@ -123,6 +126,8 @@ enum class Manager { dpkg, apt, rpm, dnf, pacman, apk, homebrew, snap, flatpak }
     case Manager::homebrew: return "homebrew";
     case Manager::snap:     return "snap";
     case Manager::flatpak:  return "flatpak";
+    case Manager::chocolatey: return "chocolatey";
+    case Manager::winget:   return "winget";
     }
     return "dpkg";
 }
@@ -141,36 +146,42 @@ enum class Presence { present, unavailable };
     return "unavailable";
 }
 
-enum class PackageKind { formula, cask };
+/// `formula`/`cask` are the Homebrew kinds; `pkg` is the Chocolatey one.
+enum class PackageKind { formula, cask, pkg };
 
 [[nodiscard]] constexpr std::string_view package_kind_token(PackageKind k) noexcept {
     switch (k) {
     case PackageKind::formula: return "formula";
     case PackageKind::cask:    return "cask";
+    case PackageKind::pkg:     return "pkg";
     }
     return "formula";
 }
 
 /// The store ecosystems of the `store_packages` action.
-enum class Store { snap, flatpak };
+enum class Store { snap, flatpak, appx };
 
 [[nodiscard]] constexpr std::string_view store_name(Store s) noexcept {
     switch (s) {
     case Store::snap:    return "snap";
     case Store::flatpak: return "flatpak";
+    case Store::appx:    return "appx";
     }
     return "snap";
 }
 
 /// `active`: the installed revision/commit currently in use. `inactive`: present
 /// on disk but not current. `unknown`: the state could not be determined.
-enum class StoreState { active, inactive, unknown };
+/// `deprovisioned` (Appx only): registered in the Deprovisioned list, i.e. removed
+/// from the set new user profiles receive; never mapped to installed software.
+enum class StoreState { active, inactive, unknown, deprovisioned };
 
 [[nodiscard]] constexpr std::string_view store_state_token(StoreState s) noexcept {
     switch (s) {
     case StoreState::active:   return "active";
     case StoreState::inactive: return "inactive";
     case StoreState::unknown:  return "unknown";
+    case StoreState::deprovisioned: return "deprovisioned";
     }
     return "unknown";
 }
@@ -277,19 +288,24 @@ private:
     return out;
 }
 
-/// package|homebrew|<id>|<version>|<formula|cask>
+/// package|<homebrew|chocolatey>|<id>|<version>|<formula|cask|pkg>. An empty
+/// version is written as "-" (a Chocolatey nuspec that could not be read);
+/// Homebrew always has one.
 [[nodiscard]] inline std::string format_package_row(std::string_view id, std::string_view version,
-                                                    PackageKind kind) {
-    std::string out = "package|homebrew|";
+                                                    PackageKind kind,
+                                                    std::string_view ecosystem = "homebrew") {
+    std::string out = "package|";
+    out += ecosystem;
+    out += '|';
     out += yuzu::util::safe_output_field(id);
     out += '|';
-    out += yuzu::util::safe_output_field(version);
+    out += version.empty() ? std::string{"-"} : yuzu::util::safe_output_field(version);
     out += '|';
     out += package_kind_token(kind);
     return out;
 }
 
-/// package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+/// package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
 /// Nine columns. Empty free fields are written as "-"; every free field goes
 /// through safe_output_field. `kind` is a fixed token chosen by the caller
 /// (snap_kind_token, or app/runtime for flatpak) and is written verbatim.

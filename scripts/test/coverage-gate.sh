@@ -430,8 +430,8 @@ tool_check() {
     local tool_miss_exit=$REFUSE_EXIT
 
     if ! command -v gcovr >/dev/null 2>&1; then
-        echo "coverage-gate: gcovr not on PATH (pip install gcovr)" | tee -a "$GATE_LOG"
-        write_gate WARN 0 "gcovr missing — install with 'pip3 install --user gcovr' and re-run"
+        echo "coverage-gate: gcovr not on PATH (run: bash scripts/test/ensure-gcovr.sh)" | tee -a "$GATE_LOG"
+        write_gate WARN 0 "gcovr missing — run 'bash scripts/test/ensure-gcovr.sh' and re-run"
         exit "$tool_miss_exit"
     fi
     if ! command -v meson >/dev/null 2>&1; then

@@ -59,6 +59,9 @@ ext(Id, Critical, Value) ->
 %%   number   the cRLNumber (default 1); `none' leaves the extension out
 %%   revoked  [Serial | {Serial, [#'Extension'{}]}]  (default none)
 %%   exts     extra CRL extensions, after cRLNumber (default none)
+%%   this     thisUpdate: a utcTime string, or {generalTime, String} (default 261102141448Z,
+%%            2026-11-02T14:14:48Z)
+%%   next     nextUpdate, the same forms (default 261104141948Z: 48 h 5 min wide, 173100 s)
 -spec crl(#{cert := binary(), key := term()}, map()) -> binary().
 crl(#{cert := CaDer, key := Key}, Opts) ->
     #'Certificate'{tbsCertificate = #'TBSCertificate'{subject = Issuer}} =
@@ -84,8 +87,8 @@ crl(#{cert := CaDer, key := Key}, Opts) ->
     Tbs = #'TBSCertList'{version = v2,
                          signature = Algorithm,
                          issuer = Issuer,
-                         thisUpdate = {utcTime, ?THIS_S},
-                         nextUpdate = {utcTime, ?NEXT_S},
+                         thisUpdate = time(maps:get(this, Opts, ?THIS_S)),
+                         nextUpdate = time(maps:get(next, Opts, ?NEXT_S)),
                          revokedCertificates = Revoked,
                          crlExtensions = Extensions},
     Signature = public_key:sign(public_key:der_encode('TBSCertList', Tbs), Digest, Key),
@@ -93,6 +96,9 @@ crl(#{cert := CaDer, key := Key}, Opts) ->
                           #'CertificateList'{tbsCertList = Tbs,
                                              signatureAlgorithm = Algorithm,
                                              signature = Signature}).
+
+time({generalTime, _} = T) -> T;
+time(S) when is_list(S) -> {utcTime, S}.
 
 entry({Serial, Exts}) ->
     #'TBSCertList_revokedCertificates_SEQOF'{userCertificate = Serial,

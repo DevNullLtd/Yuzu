@@ -46,6 +46,7 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/plugin_action_catalogue_virtualization.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "command_capability.hpp"
 #include "forensics_plugin_set.hpp"
@@ -172,6 +173,7 @@ struct LabeledSpan {
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
         {"middleware", capdecls::plugin_action_catalogue_middleware(), false},
+        {"virtualization", capdecls::plugin_action_catalogue_virtualization(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -180,7 +182,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-nine sources exactly as a live composition site would use.
+    // literally, thirty-one sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -211,6 +213,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::plugin_action_catalogue_middleware(),
+        capdecls::plugin_action_catalogue_virtualization(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -422,6 +425,32 @@ TEST_CASE("capability catalogue: shares.list pins its exact classification",
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK(row.system_reserved == false);
     CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `virtualization.host`. A read-only device-facts read (VM or not, which
+/// hypervisor, container membership) under `Inventory`:Read with no execute gate, checked on the
+/// fragment AND as the composed registry classifies it, so neither a fragment edit nor a
+/// composition change can drift a facts-only read into a mutating class or behind a gate.
+TEST_CASE("capability catalogue: virtualization.host pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "host");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "host");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::None);
 }
 
 /// Exact-row pin for `remote_access_audit.list` (Wave 11, Forensics-class): per-account SSH key

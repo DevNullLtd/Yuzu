@@ -6,7 +6,8 @@
 %%%
 %%%   1. A CRL carrying anything that makes it something other than the issuer's full list (a delta,
 %%%      a scoped list, an indirect list, an entry that un-revokes, an extension the CA marked
-%%%      critical that this module does not understand) is refused `malformed'. Accepting one let a
+%%%      critical that this module does not understand) is refused `unsupported' (well formed, refused
+%%%      by policy; `malformed' is kept for input that does not decode). Accepting one let a
 %%%      delta with a higher cRLNumber replace the full list and drop serials only the base listed.
 %%%
 %%%   2. A loaded CRL covers a peer only when the peer certificate verifies under a key that signed
@@ -72,13 +73,13 @@ crl_level_extensions_test_() ->
                end,
     Refused = fun(Exts) -> {Crl, Ca} = with_exts(Exts), parse(Crl, Ca) end,
     [%% a delta CRL is not the issuer's list, critical (as RFC 5280 says it must be) or not
-     ?_assertEqual({error, malformed}, Refused([Delta(true)])),
-     ?_assertEqual({error, malformed}, Refused([Delta(false)])),
+     ?_assertEqual({error, unsupported}, Refused([Delta(true)])),
+     ?_assertEqual({error, unsupported}, Refused([Delta(false)])),
      %% a scoped list covers only some certificates or some reasons
-     ?_assertEqual({error, malformed}, Refused([Idp(true)])),
-     ?_assertEqual({error, malformed}, Refused([Idp(false)])),
+     ?_assertEqual({error, unsupported}, Refused([Idp(true)])),
+     ?_assertEqual({error, unsupported}, Refused([Idp(false)])),
      %% RFC 5280 5.2: a relying party that cannot process a critical extension must not use the CRL
-     ?_assertEqual({error, malformed}, Refused([Unknown(true)])),
+     ?_assertEqual({error, unsupported}, Refused([Unknown(true)])),
      %% ... and an extension it does not understand that is NOT critical is ignorable
      ?_test(Accepted([Unknown(false)])),
      %% authorityKeyIdentifier is understood (and only ever a hint), even marked critical
@@ -91,14 +92,14 @@ entry_extensions_test_() ->
                                            public_key:der_encode('CRLReason', R))
              end,
     [%% an indirect CRL: the serial is in another issuer's namespace
-     ?_assertEqual({error, malformed},
+     ?_assertEqual({error, unsupported},
                    Refused([yuzu_gw_crl_build:ext(?'id-ce-certificateIssuer', true, <<48, 0>>)])),
-     ?_assertEqual({error, malformed},
+     ?_assertEqual({error, unsupported},
                    Refused([yuzu_gw_crl_build:ext(?'id-ce-certificateIssuer', false, <<48, 0>>)])),
      %% removeFromCRL un-revokes: only a delta CRL may say it
-     ?_assertEqual({error, malformed}, Refused([Reason(removeFromCRL)])),
+     ?_assertEqual({error, unsupported}, Refused([Reason(removeFromCRL)])),
      %% an unknown critical entry extension
-     ?_assertEqual({error, malformed},
+     ?_assertEqual({error, unsupported},
                    Refused([yuzu_gw_crl_build:ext(?UNKNOWN_CRITICAL, true, <<5, 0>>)])),
      %% the ones that change nothing about whether the serial is listed
      ?_assertMatch({ok, #{revoked := #{42 := true}}}, Refused([Reason(keyCompromise)])),
@@ -124,7 +125,7 @@ a_delta_cannot_displace_the_full_list_test() ->
                     exts => [yuzu_gw_crl_build:ext(?'id-ce-deltaCRLIndicator', true,
                                                    public_key:der_encode('CRLNumber', 10))]}),
     {ok, Held} = parse(Full, Ca),
-    ?assertEqual({error, malformed}, parse(Delta, Ca)),
+    ?assertEqual({error, unsupported}, parse(Delta, Ca)),
     ?assertEqual({reject, crl_revoked}, yuzu_gw_mgmt_crl:check(Held, Peer, ?NOW, ?GRACE)).
 
 
@@ -135,13 +136,13 @@ understood_and_scope_extensions_test_() ->
     EntryCrit = fun(Exts) -> {Crl, Ca} = with_entry_exts(Exts), parse(Crl, Ca) end,
     [%% freshestCRL points at deltas: a base CRL that names them is still the base list
      ?_assertMatch({ok, _}, Refused([yuzu_gw_crl_build:ext(?'id-ce-freshestCRL', false, <<48, 0>>)])),
-     ?_assertEqual({error, malformed},
+     ?_assertEqual({error, unsupported},
                    Refused([yuzu_gw_crl_build:ext(?'id-ce-freshestCRL', true, <<48, 0>>)])),
      %% cRLStreamIdentifier, cRLScope, statusReferrals, orderedList
-     ?_assertEqual({error, malformed}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 40}, false, <<5, 0>>)])),
-     ?_assertEqual({error, malformed}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 44}, false, <<5, 0>>)])),
-     ?_assertEqual({error, malformed}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 45}, false, <<5, 0>>)])),
-     ?_assertEqual({error, malformed}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 47}, false, <<5, 0>>)])),
+     ?_assertEqual({error, unsupported}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 40}, false, <<5, 0>>)])),
+     ?_assertEqual({error, unsupported}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 44}, false, <<5, 0>>)])),
+     ?_assertEqual({error, unsupported}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 45}, false, <<5, 0>>)])),
+     ?_assertEqual({error, unsupported}, Refused([yuzu_gw_crl_build:ext({2, 5, 29, 47}, false, <<5, 0>>)])),
      %% an understood entry extension is understood even when marked critical
      ?_assertMatch({ok, _},
                    EntryCrit([yuzu_gw_crl_build:ext(?'id-ce-invalidityDate', true,

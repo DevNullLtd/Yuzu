@@ -9,6 +9,15 @@
 // exercises the exact code the plugin runs against per-ecosystem fixture
 // vectors, without needing dpkg/rpm/pacman/apk on the test host (same
 // header-for-testability pattern as installed_apps_registry_utf8.hpp, #1662).
+//
+// Publisher derivation per leg (empty here = the agent core labels the row `via:<ecosystem>`):
+//   rpm      VENDOR, else PACKAGER (a person), else empty      deb   Maintainer (empty -> via:deb)
+//   pacman   empty (no vendor field without a second subprocess) -> via:pacman
+//   apk      empty (same reason)                                 -> via:apk
+//   windows  Uninstall-hive Publisher, else empty               -> via:windows
+//   macos    signing leaf CN, else empty                        -> via:macos
+//   macos_pkgutil  empty always (a reverse-domain id is an identifier, not a vendor)
+//                                                              -> via:macos_pkgutil
 
 #include <algorithm>
 #include <cctype>
@@ -26,7 +35,8 @@ namespace yuzu::installed_apps::inventory {
 struct InvRecord {
     std::string name;
     std::string version;      // upstream version, release/revision stripped
-    std::string publisher;    // rpm PACKAGER / deb Maintainer / Windows Publisher
+    std::string publisher;    // rpm VENDOR>PACKAGER / deb Maintainer / Windows Publisher /
+                              // macOS signer; empty = unlabelled (see the table above)
     std::string install_date; // human-readable per ecosystem, EXCEPT macos_pkgutil,
                               // whose receipts store only a UNIX epoch-seconds
                               // integer -- carried through verbatim rather than
@@ -142,6 +152,14 @@ inline bool rpm_sig_present(std::string_view raw) {
     return !v.empty() && v.rfind("%{", 0) != 0;
 }
 
+// A free-text rpm tag (VENDOR, PACKAGER) as honest-empty: "(none)" and an
+// unexpanded literal "%{...}" echo (an rpm too old to know the tag) both read
+// as empty, so the publisher falls through to the next source instead of
+// carrying the format string. Same guard as rpm_sig_present.
+inline std::string rpm_text_value(std::string_view raw) {
+    return rpm_sig_present(raw) ? std::string{raw} : std::string{};
+}
+
 // deb `${Version}` = [epoch:]upstream[-revision].
 inline EvrParts split_deb_version(std::string_view v) {
     return detail::split_evr(v);
@@ -242,8 +260,10 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     return r;
 }
 
-// One rpm line (9 tab-separated tokens):
-//   NAME EPOCH VERSION RELEASE ARCH PACKAGER INSTALLTIME:date SIGPGP RSAHEADER
+// One rpm line (10 tab-separated tokens):
+//   NAME EPOCH VERSION RELEASE ARCH PACKAGER INSTALLTIME:date SIGPGP RSAHEADER VENDOR
+// The publisher is the declared VENDOR when set, else PACKAGER (a person, kept only as the
+// fallback), else empty (the agent core then labels the row `via:rpm`). `(none)` = unset.
 // SIGPGP is the payload (v3 OpenPGP) signature tag; RSAHEADER is the header
 // signature tag. Both are checked (via rpm_sig_present) because modern
 // RHEL/Fedora packages are frequently header-signed only -- SIGPGP alone
@@ -265,7 +285,7 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
 //      fleet -- now reads "unsigned" where the old scheme read "signed".
 inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
-    if (tok.size() != 9)
+    if (tok.size() != 10)
         return std::nullopt;
     InvRecord r;
     r.name = std::string(tok[0]);
@@ -273,7 +293,9 @@ inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     r.version = std::string(tok[2]);
     r.release = map_rpm_none(tok[3]);
     r.arch = map_rpm_none(tok[4]); // gpg-pubkey pseudo-packages have (none) arch
-    r.publisher = map_rpm_none(tok[5]); // PACKAGER (the v2 spec; `list` keeps VENDOR)
+    r.publisher = rpm_text_value(tok[9]); // VENDOR: the declared vendor
+    if (r.publisher.empty())
+        r.publisher = rpm_text_value(tok[5]); // PACKAGER: a person, fallback only
     r.install_date = map_rpm_none(tok[6]);
     r.signature_status =
         (rpm_sig_present(tok[7]) || rpm_sig_present(tok[8])) ? "signed" : "unsigned";

@@ -73,10 +73,13 @@ constexpr int kFleetQueryRowCap = 100000;
 // survive (the "as of" stamp ages, and yuzu_inventory_catalog_rollup_total{outcome="error"}
 // increments). The first refresh after migration v8 has no last-good (v8 drops the rollup
 // tables), so a failing first refresh leaves the catalogue "building".
-// Scale ceiling (measured on PG 18.6): the GROUPING SETS statement costs about 12.8x the
-// former catalogue GROUP BY (37 s vs 2.9 s at 1.8M rows) and reaches this flat 60 s cap at
-// about 2.7M installed rows (about 6,000 endpoints at about 450 titles each); beyond that
-// the catalogue stays "building" until the rollup is made incremental. The page READS hit
+// Scale ceiling (measured on PG 18.6 for the grouping sets alone): the GROUPING SETS
+// statement costs about 12.8x the former catalogue GROUP BY (37 s vs 2.9 s at 1.8M rows) and
+// reaches this flat 60 s cap at about 2.7M installed rows (about 6,000 endpoints at about 450
+// titles each). The representative-publisher aggregate adds a second max() to each of the 8
+// grouping sets; with it the cap is estimated at about 2.5M rows (unmeasured, tracked in
+// #5545). Beyond the cap the catalogue stays "building"
+// until the rollup is made incremental. The page READS hit
 // the small precomputed tables, no bound.
 constexpr const char* kRollupStatementTimeout = "60s";
 
@@ -710,6 +713,25 @@ std::string distinct_list(std::string_view col) {
     const std::string c(col);
     return "coalesce(string_agg(DISTINCT " + c + ", ',' ORDER BY " + c + ") FILTER (WHERE " + c +
            " <> ''), '')";
+}
+
+// SQL predicate fragment: `col` is an origin label (`via:<ecosystem>`, kOriginLabelPrefix). The
+// prefix carries no LIKE metacharacter, so it needs no escape.
+std::string is_origin_label(std::string_view col) {
+    static_assert(kOriginLabelPrefix.find_first_of("%_\\") == std::string_view::npos);
+    return std::string(col) + " LIKE '" + std::string(kOriginLabelPrefix) + "%'";
+}
+
+// The representative publisher of a group: a declared vendor over an origin label
+// (`via:<ecosystem>`, product_normalize.hpp kOriginLabelPrefix), falling back to the plain max
+// (a label, or '') when no row of the group has a vendor. The CASE excludes labels explicitly,
+// so the result does not depend on the database collation (a plain max() could pick a label
+// over a vendor wherever the label sorts last). The display column AND the
+// catalogue `q` publisher arm both use this expression, so a search finds what is shown.
+std::string representative_publisher(std::string_view col) {
+    const std::string c(col);
+    return "coalesce(nullif(max(CASE WHEN NOT (" + is_origin_label(c) + ") THEN " + c +
+           " END), ''), max(" + c + "))";
 }
 
 // The search term the reads bind: invalid UTF-8 AND embedded NUL are scrubbed to U+FFFD BEFORE
@@ -2019,7 +2041,8 @@ std::string catalogue_predicate(const SoftwareCatalogQuery& q, bool host,
         sql += " AND count(DISTINCT i.version) >= " + bind(std::to_string(versions_min)) +
                "::bigint";
     if (!term.empty())
-        sql += q_arms(bind(std::string(term)), "i.name", "max(i.publisher)", eco_list, src_list);
+        sql += q_arms(bind(std::string(term)), "i.name", representative_publisher("i.publisher"),
+                      eco_list, src_list);
     return sql;
 }
 } // namespace
@@ -2074,8 +2097,9 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
         sql += " ORDER BY (-device_count), name LIMIT " + bind(std::to_string(limit)) + "::bigint";
     } else {
         const std::string eco_list = distinct_list("i.ecosystem");
-        sql = "SELECT i.name, max(i.publisher), 1::bigint, count(DISTINCT i.version), " + eco_list +
-              ", " + distinct_list("i.kind") +
+        sql = "SELECT i.name, " + representative_publisher("i.publisher") +
+              ", 1::bigint, count(DISTINCT i.version), " + eco_list + ", " +
+              distinct_list("i.kind") +
               ", coalesce((SELECT c.newest_version FROM software_inventory_store.catalog_rollup c "
               "WHERE c.name = i.name AND c.grain = " +
               std::to_string(sc::kGrainTitle) +
@@ -2435,7 +2459,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // GROUPING(kind, ecosystem, source); every number is an exact distinct count within
         // its own grouping set — nothing is summed across grains. The comma-joined lists
         // are the distinct non-empty dimension values of THAT set's rows (the q predicate and
-        // the "spans" display read them). max(publisher) picks a representative publisher.
+        // the "spans" display read them). representative_publisher() prefers a declared vendor.
         if (!cmd("DELETE FROM software_inventory_store.catalog_rollup"))
             return false;
         if (!cmd("INSERT INTO software_inventory_store.catalog_rollup (name, grain, kind, "
@@ -2446,7 +2470,8 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                  "g.sources, coalesce(nt.newest_version, '') "
                  "FROM (SELECT name, GROUPING(kind, ecosystem, source)::smallint AS grain, "
                  "coalesce(kind, '') AS kind, coalesce(ecosystem, '') AS ecosystem, "
-                 "coalesce(source, '') AS source, max(publisher) AS publisher, "
+                 "coalesce(source, '') AS source, " + representative_publisher("publisher") +
+                 " AS publisher, "
                  "count(DISTINCT agent_id) AS device_count, "
                  "count(DISTINCT version) AS version_count, "
                  "count(DISTINCT agent_id) FILTER (WHERE signature_status = 'unsigned') "
@@ -2493,16 +2518,16 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
             std::vector<std::string>{});
         if (rpm.status() != PGRES_TUPLES_OK || PQntuples(rpm.get()) != 1)
             return failed("KPI rpm totals", rpm);
-        // (c) distinct non-empty publishers, from the source table (GROUP BY subselect: a hash
-        // aggregate, about 16x faster than count(DISTINCT) at 1.8M rows).
+        // (c) distinct non-empty DECLARED publishers (origin labels `via:<ecosystem>` name a
+        // source, not a vendor, so they are excluded), from the source table (GROUP BY
+        // subselect: a hash aggregate, about 16x faster than count(DISTINCT) at 1.8M rows).
         if (abort_requested())
             return false;
-        pg::PgResult pubs = pg::exec_params(
-            c,
+        const std::string pubs_sql =
             "SELECT count(*) FROM (SELECT publisher FROM "
             "software_inventory_store.installed_software WHERE publisher <> '' "
-            "GROUP BY publisher) p",
-            std::vector<std::string>{});
+            "AND NOT (" + is_origin_label("publisher") + ") GROUP BY publisher) p";
+        pg::PgResult pubs = pg::exec_params(c, pubs_sql.c_str(), std::vector<std::string>{});
         if (pubs.status() != PGRES_TUPLES_OK || PQntuples(pubs.get()) != 1)
             return failed("KPI publisher count", pubs);
 

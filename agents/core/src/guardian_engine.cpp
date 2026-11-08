@@ -36,6 +36,7 @@
 #include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_emit_seq.hpp"    // GuardianEmitSeqSource (UP-14)
 #include "guardian_health_heartbeat.hpp" // GuardianHealthStats, guardian_spark_claim_health_stats (#5404)
 #include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
@@ -946,10 +947,29 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
     return out;
 }
 
-GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
+GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark,
+                               std::uint64_t boot_epoch)
     : kv_{kv}, agent_id_{std::move(agent_id)},
-      legacy_sink_executor_{std::make_unique<GuardianLegacySinkExecutor>()},
-      prefer_spark_{prefer_spark}, ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+      emit_seq_source_{std::make_shared<GuardianEmitSeqSource>(boot_epoch)},
+      legacy_sink_executor_{make_legacy_sink_executor()}, prefer_spark_{prefer_spark},
+      ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+
+std::unique_ptr<GuardianLegacySinkExecutor>
+GuardianEngine::make_legacy_sink_executor(std::optional<std::size_t> max_events) const {
+    GuardianLegacySinkExecutor::Config cfg;
+    if (max_events)
+        cfg.max_events = *max_events;
+    cfg.emit_seq_source = emit_seq_source_;
+    return std::make_unique<GuardianLegacySinkExecutor>(std::move(cfg));
+}
+
+std::uint64_t GuardianEngine::boot_epoch() const noexcept {
+    return emit_seq_source_->boot_epoch;
+}
+
+std::shared_ptr<GuardianEmitSeqSource> GuardianEngine::emit_seq_source_for_test() const {
+    return emit_seq_source_;
+}
 
 GuardianEngine::~GuardianEngine() {
     // Explicit (not = default): join the guard worker threads here via stop().
@@ -2408,11 +2428,13 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // wipe every kBaselinePrefix baseline record, reintroducing exactly the
         // silent-relaunder bug this file's baseline persistence exists to close (a
         // rule's captured "known good" state must survive a full_sync). Scoped to
-        // kRulePrefix keys only — the ONLY other keys ever written under this
-        // namespace are kKeyGen (rewritten unconditionally just below regardless)
-        // and kBaselinePrefix records (deliberately untouched by full_sync — see
-        // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
-        // a baseline either).
+        // kRulePrefix keys only: this sweep is `rule:`-prefixed and must never become a
+        // blanket clear, because other keys live in the same namespace - kKeyGen
+        // (meta:policy_generation, rewritten unconditionally just below regardless),
+        // kBaselinePrefix records (deliberately untouched by full_sync: see
+        // guardian_seed_baseline's doc for why absence-from-a-push must not sweep a
+        // baseline either), and, UP-14, meta:boot_epoch, whose loss would drop the boot
+        // epoch back to the wall clock.
         // #4415: within kRulePrefix the sweep removes only the rows the push OMITS
         // (absent from push_ids). A row the push still carries is left in place and
         // put_rule_locked rewrites it only when the stored bytes differ, so an identical
@@ -3100,12 +3122,26 @@ void GuardianEngine::emit_guard_event(
     // doc comment in guardian_engine.hpp) rather than from `now_ms` above -
     // `event_id` keeps using `now_ms` regardless, so this touches ONLY the
     // event's timestamp, not its identity.
-    const auto timestamp_secs = timestamp_override.has_value()
-                                    ? std::chrono::duration_cast<std::chrono::seconds>(
-                                          timestamp_override->time_since_epoch())
-                                          .count()
-                                    : now_ms / 1000;
-    ev.mutable_timestamp()->set_seconds(timestamp_secs);
+    // Sub-second resolution matters to the server: it orders the Guardian census by this stamp
+    // (#5690), and two verdicts stamped with the same instant can only be ordered by arrival,
+    // which the server flags as `order_uncertain`. Whole-second stamps made every drift followed by
+    // its remediation within one second such a pair. Both sources are FLOORED to milliseconds so a
+    // gap-repair stamp (`timestamp_override`) and a live event are on one scale, and so the
+    // conversion goes from a finer unit to a coarser one and cannot overflow.
+    const std::int64_t stamp_ms = timestamp_override.has_value()
+                                      ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            timestamp_override->time_since_epoch())
+                                            .count()
+                                      : static_cast<std::int64_t>(now_ms);
+    std::int64_t stamp_secs = stamp_ms / 1000;
+    std::int64_t stamp_sub_ms = stamp_ms % 1000;
+    if (stamp_sub_ms <
+        0) { // C++ division truncates toward zero; correct to a floor so nanos is in [0, 1e9)
+        stamp_sub_ms += 1000;
+        --stamp_secs;
+    }
+    ev.mutable_timestamp()->set_seconds(stamp_secs);
+    ev.mutable_timestamp()->set_nanos(static_cast<std::int32_t>(stamp_sub_ms * 1'000'000));
     // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
     // "windows", which would mislabel every drift event once Linux/macOS guards land.
 #if defined(_WIN32)
@@ -3239,9 +3275,9 @@ std::uint64_t GuardianEngine::legacy_sink_dropped_unwired() const {
 void GuardianEngine::set_legacy_sink_max_events_for_test(std::size_t max_events) {
     assert(!started_ &&
            "set_legacy_sink_max_events_for_test: must be called before start_local()");
-    GuardianLegacySinkExecutor::Config cfg;
-    cfg.max_events = max_events;
-    legacy_sink_executor_ = std::make_unique<GuardianLegacySinkExecutor>(cfg);
+    // UP-14: through the shared builder so the rebuilt executor still carries the engine's
+    // emit-order source (a bare Config would silently revert it to a private epoch-0 source).
+    legacy_sink_executor_ = make_legacy_sink_executor(max_events);
 }
 
 // #4783 TEST-ONLY seams (see guardian_engine.hpp's own doc comments). None of these
@@ -3868,6 +3904,11 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         GuardianSparkRuntime::Config spark_runtime_cfg{};
         if (test_spark_backend_op_deadline_)
             spark_runtime_cfg.backend_op_deadline = *test_spark_backend_op_deadline_;
+        // UP-14: the runtime co-owns the engine's emit-order source (shared_ptr, per the
+        // own-everything-borrow-nothing rule below) so Spark lifecycle entries and legacy
+        // events draw from ONE sequence. The source lives in the engine, not here, because
+        // this runtime can be absent (SparkDisabled / SparkFailed).
+        spark_runtime_cfg.emit_seq_source = emit_seq_source_;
         spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_,
                                                                 spark_runtime_cfg);
         // Provider captures a COPY of agent_id_, never `this` (#2237): the runtime is the
@@ -3915,9 +3956,12 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         spark_backend_->bind_consumer(consumer_id);
 
         spark_scheduler_ = std::make_unique<ConvergenceScheduler>(*spark_runtime_);
-        // Wrap the send so that after a PAGED batch's LAST entry is delivered, its best-effort
-        // sent-label is written (item 7 PR-Ag). Live / compliance / health entries carry no
-        // batch key → no-op.
+        // Wrap the send so that after a batch's LAST entry is delivered, its best-effort
+        // sent-label is written (item 7 PR-Ag). That covers PAGED entries AND live lifecycle
+        // entries once their batch is persisted (backfill_batch_provenance stamps the key on
+        // them too); compliance / health entries never carry a batch key → no-op. The key is
+        // therefore NOT a replay marker: whether an entry carries a wire ordering pair is
+        // decided by OutboxEntry::boot_epoch (0 on paged entries), not by this key.
         //
         // Captures the journal HANDLE, not `this` (C0 #2298): re-reading the lifecycle_journal_
         // member from wherever this wrap runs would be an unlocked read of engine state, and
@@ -4064,8 +4108,10 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 // Test-support helper — see guardian_engine.hpp. Friend of GuardianEngine so it
 // can reach the private emit_guard_event(); production drift only ever enters
 // that method from a guard worker's sink lambda (see start_guard_for_rule_locked).
-void guardian_emit_drift_for_test(GuardianEngine& engine, const GuardDrift& drift) {
-    engine.emit_guard_event(drift);
+void guardian_emit_drift_for_test(
+    GuardianEngine& engine, const GuardDrift& drift,
+    std::optional<std::chrono::system_clock::time_point> timestamp_override) {
+    engine.emit_guard_event(drift, /*is_gap_repair=*/false, timestamp_override);
 }
 
 // Test-support helpers — see guardian_engine.hpp (#4021 adversarial-review

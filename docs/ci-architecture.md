@@ -188,8 +188,19 @@ and runs four scenarios (stubbed where they write: those requests are answered i
 so nothing reaches the server). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
-older `Puppeteer` gate is warn-only); a missing `tests/puppeteer/node_modules/puppeteer`
-records SKIP with the `npm ci` hint. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
+older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
+which installs the Node dependencies and Chrome for Testing when absent and proves the browser
+launches headless; if it cannot, the run aborts before the build. A missing
+`tests/puppeteer/node_modules/puppeteer` at Phase 5 records FAIL, never SKIP.
+`/test` Phase 0b also runs `scripts/test/ensure-gcovr.sh` (Linux only). A gcovr you already have at the
+version pinned in `requirements-ci.in` that can produce the gate's reports is used as it is; otherwise it
+installs that version from the hash-pinned `requirements-ci.txt` (the file CI uses) into a private
+virtualenv. If neither works, default mode records WARN and Phase 7b measures nothing; `--full` stops in
+Phase 0b.
+Phase 7b re-checks gcovr before it measures (another worktree may have rebuilt the shared virtualenv since):
+if it is no longer usable the Coverage gate is not run and is recorded as WARN in default mode and as FAIL
+in `--full`.
+Shared browser mechanics are in `tests/puppeteer/lib/harness.mjs`;
 `tests/puppeteer/README.md` covers running it by hand.
 
 ### Release re-publish guard (`release-guard`, #5282)
@@ -2005,7 +2016,7 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
   that matter: agent shard C 480 s (shards A and B 240 s), `blocked log sink
-  SIGTERM harness` 300 s, echo 180 s, `gateway eunit` and `gateway ct` 600 s. (Shard
+  SIGTERM harness` 300 s, echo 180 s (`echo unit tests`; `echo fold sizing` and `echo v10 migration` are 300 s), `gateway eunit` and `gateway ct` 600 s. (Shard
   C was 240 s until #7135, a deliberate, temporary raise: see the sizing comment in
   `tests/meson.build`, and #7177 for the split that brings C back down. Echo was 90 s
   and is now 180 s, which keeps its measured passing runs under 50% of the limit.

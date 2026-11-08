@@ -31,6 +31,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
+#include <yuzu/log_token.hpp> // log_id_token (CWE-117) for the refusal log line
 
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
@@ -60,6 +61,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
+#include "guardian_drift_event.hpp" // guardian_event_refused_by_server
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "guardian_spark_timing.hpp" // #4606 criterion-10 T_wire: SendTimingRecord/format_send_timing_line
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
@@ -68,6 +70,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
 #include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
+#include "guardian_boot_epoch.hpp"         // claim_guardian_boot_epoch (UP-14)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
@@ -863,9 +866,12 @@ public:
         // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
         // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
         // descriptors and opens no database). This is the ONLY adopter - the plugins never
-        // rename - so nothing can have the database open while it moves, and
+        // rename - so within this process nothing has the database open while it moves, and
         // EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db.
-        // Neither step is fatal: a failed adoption leaves the echo plugin refusing to open.
+        // This step runs BEFORE the Guardian instance lock below, so it does not exclude a
+        // predecessor still shutting down during a service restart: on Windows its open handle
+        // can fail the rename. Neither step is fatal: a failed adoption leaves the echo plugin
+        // refusing to open for this run, and the next start resumes it (sidecars move first).
         //
         // Deferred while the plugin dir still holds only the retired tar plugin: OTA replaces the
         // agent binary alone, so the renamed plugin may not be installed yet. Adopting now would
@@ -886,8 +892,8 @@ public:
                 spdlog::error("Legacy tar.db adoption failed: {}", adopted.error());
             }
             if (kv_store_ && !kv_store_->rename_plugin("tar", "echo")) {
-                spdlog::warn(
-                    "KV namespace re-key tar -> echo failed; Echo health history restarts");
+                spdlog::warn("KV namespace re-key tar -> echo failed; Echo health history "
+                             "restarts until the next start retries it");
             }
         }
 
@@ -925,7 +931,30 @@ public:
         // The engine persists rules into the KV store and answers __guard__
         // dispatches once the Subscribe stream is open. Construction is
         // safe even when KV failed to open (it degrades to in-memory only).
-        guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id);
+        //
+        // UP-14: claim this boot's event-order epoch HERE, after the KvStore is open and before
+        // the engine exists, and pass it as the 4th constructor argument so the constructor
+        // stays I/O-free (the epoch must already be known when the engine builds the emit
+        // source its executor and Spark runtime share). It is NOT read in start_local(),
+        // which is deferred past the network. A null kv_store_ is handled by the claim
+        // (epoch 0 = unordered: the wire pair is 0/0, which a pair-comparing server treats
+        // as unordered and orders by the census ordering key). The literal `false` stays visible on
+        // purpose: prefer_spark_ is never passed true in production.
+        // UP-9: exclusive per-data-dir lock held for the life of the process (a member, so it
+        // outlives guardian_). The wait covers a service restart overlapping the old process's
+        // shutdown. A loser (or an unsupported file system) claims epoch 0 and emits 0/0.
+        guardian_instance_lock_ = GuardianInstanceLock::acquire(
+            cfg_.data_dir / "guardian_boot_epoch.lock", std::chrono::seconds{5});
+        // Read AFTER the wait: the clock term of the epoch is the time of the claim, and a wait of
+        // up to 5 s would otherwise make it stale.
+        const auto now_unix_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+        const auto boot_epoch_claim =
+            claim_guardian_boot_epoch(kv_store_.get(), now_unix_s, guardian_instance_lock_);
+        guardian_ =
+            std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id,
+                                             /*prefer_spark=*/false, boot_epoch_claim.boot_epoch);
         // Spread this endpoint's journal maintenance and its forced (boot / reconnect) replay
         // pages over their intervals - the ONLY place jitter is turned on, so every test keeps
         // a deterministic cadence. Must precede wire_spark_engine(), which builds the worker.
@@ -2295,7 +2324,10 @@ public:
                     // running, exactly like send_guardian_outbox_entry's own capture below.
                     guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
                         const auto outcome = emit_guardian_event(ev);
-                        const bool sent = (outcome == LegacySendOutcome::Sent);
+                        // A refused event is reported Sent (disposed by design, no Write); the
+                        // T_wire line must not claim a local write happened.
+                        const bool sent = (outcome == LegacySendOutcome::Sent) &&
+                                          !guardian_event_refused_by_server(ev);
                         // #4606 criterion-10 T_wire (legacy non-Spark drift-sink path only — the
                         // DEX observer's call to this same method stays uninstrumented, see
                         // emit_guardian_event's own comment).
@@ -4085,7 +4117,9 @@ private:
     // sink and the (ruleless) DEX signal observer. Drops the event if the link is
     // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
     // Returns the delivery outcome (LegacySendOutcome, #4783: LinkDown when the
-    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise)
+    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise, which
+    // includes an event refused locally as unsendable: that returns Sent WITHOUT a Write, see
+    // refuse_unsendable_guardian_event)
     // so a caller can distinguish those two failure shapes and log it (#4606
     // criterion-10 T_wire) — deliberately instrumented ONLY at the drift-sink call
     // site (set_event_sink's lambda), never here and never at the DEX observer's
@@ -4095,6 +4129,8 @@ private:
     // should make the same choice deliberately rather than copy whichever pattern it
     // happens to see first.
     LegacySendOutcome emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+        if (refuse_unsendable_guardian_event(ev, "legacy"))
+            return LegacySendOutcome::Sent; // dropped by design; a retry could never succeed
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
@@ -4107,11 +4143,42 @@ private:
                                                                         : LegacySendOutcome::WriteFailed;
     }
 
+    // True (and logged) when `ev` is one the server drops at ingest for want of a rule id
+    // (guardian_event_refused_by_server). The server answers an ingest refusal with nothing, so
+    // this is the only place the agent can see it. Callers then skip the Write and report the
+    // event as Sent, meaning "disposed by design", not "delivered": a retry could never succeed,
+    // and Retain/WriteFailed would respectively wedge the outbox head or record a gap against an
+    // empty rule id. No producer reaches this today: a pushed rule set with an empty rule id is
+    // rejected whole by apply_rules' is_valid_rule_id scan, json_to_rule rejects one on boot
+    // re-arm, and DEX observations carry the `__observation__` sentinel. On the Spark path the
+    // journal mint gate only keeps such a record out of the journal (the live entry is still
+    // enqueued), so this refusal is what stops it reaching the wire; it is the last line. Logged
+    // on the first occurrence and then every 1024th, so a bad producer cannot flood; the counter
+    // exists only to set that cadence and is not exported.
+    // The legacy drift-sink lambda logs sent=0 in its T_wire line for a refused event, so the
+    // line never claims a write that did not happen.
+    bool refuse_unsendable_guardian_event(const gpb::GuaranteedStateEvent& ev,
+                                          std::string_view path) {
+        if (!guardian_event_refused_by_server(ev))
+            return false;
+        const auto n = guardian_unsendable_events_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n % 1024 == 0) {
+            try {
+                spdlog::warn("Guardian {} path: not sending event {}: its rule_id is empty and the "
+                             "server would drop it (refused so far: {})",
+                             path, ::yuzu::log_id_token(ev.event_id()), n);
+            } catch (...) { // best-effort diagnostic; never propagate onto a send worker
+            }
+        }
+        return true;
+    }
+
     // The send callback the Guardian spark outbox drain worker uses (rung 7.7a). It
     // maps one buffered OutboxEntry to the wire event and writes it over the current
     // Subscribe stream, mirroring emit_guardian_event but returning a SendResult so
     // the drain can retain-and-retry: Retain when the stream is down (pre-network arm
-    // or a reconnect gap) or the Write fails, Sent on a successful Write. Capturing
+    // or a reconnect gap) or the Write fails, Sent on a successful Write or when the event is
+    // refused locally as unsendable (no Write, see refuse_unsendable_guardian_event). Capturing
     // `this` is lifetime-safe, but NOT via a synchronous join (#2233 item 4, revised):
     // this callback runs on GuardianOutboxSendExecutor's DETACHED worker
     // (guardian_outbox_send_executor.hpp), which guardian_->stop() does NOT join. Safety
@@ -4132,11 +4199,14 @@ private:
 #else
             "linux";
 #endif
+        const auto wire_ev = guardian_outbox_entry_to_event(e, kHostPlatform);
+        if (refuse_unsendable_guardian_event(wire_ev, "spark"))
+            return SendResult::Sent; // Retain would wedge the outbox head on a row that can never send
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
         resp.set_status(pb::CommandResponse::SUCCESS);
-        resp.set_payload(guardian_outbox_entry_to_event(e, kHostPlatform).SerializeAsString());
+        resp.set_payload(wire_ev.SerializeAsString());
         bool ok;
         {
             std::lock_guard lock(stream_write_mu_);
@@ -4392,7 +4462,9 @@ private:
                 // undeduplicated (claim had failed — fail-open) or this is a
                 // duplicate terminal write. NOT the same as the eviction-driven
                 // double-execute, which produces a fresh claim and is not
-                // separately detectable here (bounded by kMaxDedupRows).
+                // separately detectable here (limited, as an ESTIMATE, by kMaxDedupRows
+                // exceeding the server's outbox redelivery horizon, #3678; see
+                // common/include/yuzu/command_replay_horizon.hpp for what it misses).
                 metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total").increment();
                 break;
             case RecordOutcome::Error:
@@ -4540,6 +4612,9 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
+    // UP-9: single-writer guard for the Guardian boot epoch. Declared before guardian_, so it
+    // is destroyed after it and held until the engine is gone.
+    GuardianInstanceLock guardian_instance_lock_;
     // Drives interval / file-change / service-status triggers that plugins
     // register during init(). Owned here; a non-owning pointer is handed to
     // every per-plugin context so yuzu_register_trigger can reach it.
@@ -4697,6 +4772,8 @@ private:
     // bursts within one millisecond; agent_id (folded into the id) disambiguates
     // ACROSS agents so a fleet-wide signal wave doesn't collide on the global PK.
     std::atomic<std::uint64_t> dex_seq_{0};
+    /// Guardian events refused by refuse_unsendable_guardian_event (empty rule_id).
+    std::atomic<std::uint64_t> guardian_unsendable_events_{0};
     // Runtime arm/health of the DEX observer — flipped to false by the observer's
     // error callback on a runtime subscription failure on any channel (UP-1). A
     // shared_ptr<atomic> (not `this`) so a late OS-threadpool error callback stays

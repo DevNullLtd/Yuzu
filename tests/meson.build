@@ -333,6 +333,8 @@ agent_test_exe = executable(
     'unit/test_offline_hive_mutex.cpp',       # ScopedOfflineHiveLock RAII/mutual-exclusion contract
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
+    'unit/test_guardian_emit_seq.cpp',
+    'unit/test_guardian_boot_epoch.cpp',
     'unit/test_guardian_spark_runtime.cpp',
     'unit/test_guardian_state_reader.cpp',
     'unit/test_guardian_convergence_scheduler.cpp',
@@ -617,6 +619,8 @@ agent_test_exe = executable(
     'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux/list_windows/list_macos decision seams over injected fakes; portable
     'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_virtualization_parsers.cpp',         # virtualization: pure classifier/vendor tables/CPUID fact builder/row formatters over labelled fixtures; portable
+    'unit/test_virtualization_local_dispatcher.cpp',  # virtualization: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
     'unit/test_remote_access_audit_keys_parsers.cpp',    # remote_access_audit: pure authorized_keys/options/blob decoder/fingerprint over REAL ssh-keygen captures; portable
     'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
@@ -646,9 +650,12 @@ agent_test_exe = executable(
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
     'unit/test_runtimes_win_walk.cpp',           # runtimes python: PythonCore dual-view walk, FakeOps + salted scratch key (Windows-only; no-op TU elsewhere)
+    'unit/test_runtimes_macos_dotnet_jvm.cpp',   # runtimes macOS dotnet/jvm legs: materialized fixture trees (walk bodies POSIX-only)
+    'unit/test_hardware_drivers_inventory.cpp',  # hardware.drivers_inventory: pure builders + dispatcher grammar, every host
     'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
     'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
     'unit/test_pkg_inventory_linux_parsers.cpp',    # pkg_inventory Linux legs: injected-root Linux snap/flatpak/managers walk over a REAL CAPTURE tree manifest (body POSIX-only)
+    'unit/test_pkg_inventory_win_parsers.cpp',      # pkg_inventory Windows legs: nuspec tag scanner, Appx PackageFullName parser, rows and the three legs over a FakeOps seam (REAL CAPTURE names/versions plus labelled synthetic cases; runs on every OS, RealOps cases Windows-only)
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
@@ -675,6 +682,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/virtualization/src'),  # virtualization_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/registry/src'),  # registry_parsers.hpp / registry_core.hpp (pure layer)
     include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
@@ -866,6 +874,7 @@ agent_test_exe = executable(
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
                 shares_plugin_lib,  # shares
+                virtualization_plugin_lib,  # virtualization
                 registry_plugin_lib,  # test_registry_write_local_dispatcher.cpp loads the real plugin by path
                 remote_access_audit_plugin_lib,  # remote_access_audit
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
@@ -979,6 +988,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     include_directories: [include_directories('../agents/plugins/browser_policy/src'),
                           include_directories('../agents/plugins/mgmt_posture/src'),
                           include_directories('../agents/plugins/shares/src'),
+                          include_directories('../agents/plugins/virtualization/src'),
                           include_directories('../agents/plugins/remote_access_audit/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
@@ -1383,6 +1393,7 @@ echo_test_exe = executable(
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
+    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, shim views
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1396,6 +1407,7 @@ echo_test_exe = executable(
     '../agents/plugins/echo/src/echo_schema_registry.cpp',
     '../agents/plugins/echo/src/echo_fold_schema.cpp',
     '../agents/plugins/echo/src/echo_fold.cpp',
+    '../agents/plugins/echo/src/echo_db_v10_migration.cpp',  # schema v10: the one-transaction roll-up flip (test_echo_v10_migration.cpp drives it)
     '../agents/plugins/echo/src/echo_aggregator.cpp',
     '../agents/plugins/echo/src/echo_usage.cpp',
     '../agents/plugins/echo/src/echo_perf.cpp',
@@ -1442,8 +1454,13 @@ echo_test_exe = executable(
 # deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
 # live-registry case adds its own 15s waits on top. Revisit the value once #7173/#7135 settle; there
 # is no commitment to lower it, because the 50% rule is met at 180s.
-test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 180)
+# The schema-v10 migration cases ([v10]: a seeded v9 database folded over all 17 sources, chunked
+# folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
+# run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
+# third test() too. Together the three filters cover every case exactly once.
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
+test('echo v10 migration', echo_test_exe, args: ['[v10]~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -1472,6 +1489,7 @@ if build_server
       'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
       'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired as the post-read stage (registry + HttplibRouteSink wrapper), over a real httplib::Server (no PG)
       'unit/server/test_post_read_stage.cpp', # PostReadStageRegistry + HttplibRouteSink handler wrapper: order, short-circuit, install guards, unwrapped servers (no PG)
+      'unit/server/test_model_param_to_params.cpp', # model_detail::to_params: key-sorted copy of httplib params for the pure parsers (no PG)
       'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
       'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
       'unit/server/test_mfa_qr.cpp',
@@ -1601,6 +1619,7 @@ if build_server
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
+      'unit/server/test_command_replay_horizon.cpp', # #3678: outbox redelivery horizon < agent dedup ring (compile-time cross-component pin)
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
@@ -1620,6 +1639,8 @@ if build_server
       'unit/server/test_rbac_admin_hint.cpp', # #6034: rbac_admin_hint == the real POST assign / PUT enforcement answer, per persona
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
+      'unit/server/test_rbac_enforcement_read.cpp', # #6033: GET /api/v1/rbac/enforcement (REST twin of the enforcement fragment)
+      'unit/server/test_rbac_enforcement_read_mcp.cpp', # #6033: MCP get_rbac_enforcement
       'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
       'unit/server/test_list_read_confinement.cpp',
@@ -1719,6 +1740,7 @@ if build_server
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_census_ordering_store.cpp', # #5690 PR2a-1: census ordering key, durable pending evidence, schema v4
       'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
@@ -1763,6 +1785,7 @@ if build_server
       # (see the include-path constraint below) - the test includes the header by
       # relative path.
       '../agents/plugins/echo/src/echo_schema_registry.cpp',
+      '../agents/plugins/echo/src/echo_fold_schema.cpp', # the registry's roll-up tiers are declared there
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
@@ -3644,6 +3667,18 @@ test('instructions runner hardening',
   timeout: 300,
 )
 
+# scripts/test/ensure-puppeteer.sh and ensure-gcovr.sh, the /test Phase 0b installers, run against
+# stub node/npm/npx/python3 executables in a temp HOME (never the real HOME or repo tree): every
+# ready / NOT READY branch, the hash-verified pip install, the interrupted-install repairs and the
+# refuse-to-delete guards. Bash only; the gcovr cases skip off Linux (the script is Linux-only) and
+# the whole file skips on Windows. Suite docs, which CI runs on the Linux leg and /test runs natively.
+test('ensure install helpers',
+  _python3_test,
+  args: [files('test_ensure_install_helpers.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
@@ -3734,6 +3769,16 @@ test('mgmt_posture definition columns',
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# virtualization's definition-column contract (content/definitions/virtualization.yaml): row_kind
+# first, then the generic field_1..field_6 sequence pinned to the wire rows virtualization_parsers.hpp
+# emits (the test holds the expected literals; it does not read the C++).
+test('virtualization definition columns',
+  _python3_test,
+  args: [files('test_virtualization_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4120,6 +4165,23 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
+# stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
+# page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes
+# (executor offer(), outbox set_common), agent.cpp passes the claimed boot epoch as the 4th
+# GuardianEngine argument, and both executor construction paths share the engine's emit source.
+# Carries its own in-memory mutation self-test (one or more per rule, plus comment/string
+# stripping proofs). No build required. Python, one process, ~5 s on Linux and ~7 s on an M1
+# (the mutation self-test re-scans the large agent.cpp once per mutation; the helpers are memoised
+# so a rule scan of an unchanged source is not repeated). The 60 s timeout leaves headroom on a
+# loaded self-hosted runner; the gate took 24-35 s, past the old 30 s limit, before it was memoised.
+test('guardian emit-pair stamp wiring lexical gate (UP-14)',
+  _python3_test,
+  args: [files('test_guardian_emit_stamp_lexical.py')],
+  suite: 'agent',
+  timeout: 60,
+)
+
 # Command-dedup claim wiring (#3668): the claim decision is a pure function with its own unit
 # tests; this pins that agent.cpp's Subscribe loop still CALLS it and acts on every field of the
 # answer (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
@@ -4127,6 +4189,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('agent command-dedup wiring lexical gate (#3668)',
   _python3_test,
   args: [files('test_agent_command_dedup_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Guardian empty-rule_id sender refusal: the helper sits on two private AgentImpl send paths with
+# no gRPC seam (#1492); this pins that both still call it before the Write, return the
+# disposed-by-design outcome, tokenise the logged id and keep T_wire honest. Carries its own
+# in-memory mutation self-test. No build required.
+test('agent guardian sender-refusal wiring lexical gate (#5690)',
+  _python3_test,
+  args: [files('test_agent_guardian_refusal_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
@@ -4504,6 +4577,15 @@ test('assert-suite-cover selftest',
 test('issue lifecycle docs',
   _python3_test,
   args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# The Windows package-sources upgrade note states the fresh-deployment contract (routed
+# Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
+test('upgrade notes contract',
+  _python3_test,
+  args: [files('test_upgrade_notes_contract.py')],
   suite: 'docs',
   timeout: 10,
 )

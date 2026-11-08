@@ -79,11 +79,25 @@ struct OutboxEntry {
     /// outbox_mu_ immediately before each enqueue; the logs below only carry it, and a
     /// coalesce (whole-struct replace) carries the NEW entry's seq, so "enqueue order" for a
     /// coalesced entry is its latest observation. A journal-replayed lifecycle entry is
-    /// stamped when it is paged into the window, not when it was first produced. NOT a wire
-    /// field and NOT journalled: guardian_outbox_entry_to_event and the journal format ignore
-    /// it. 0 means the cross-lane order hold never holds that entry and never treats it as a
-    /// blocker (GuardianOutboxDrainWorker::wrapped_send()).
+    /// stamped when it is paged into the window, not when it was first produced. NOT journalled
+    /// (the journal format ignores it). UP-14: drawn from the engine-shared
+    /// GuardianEmitSeqSource, so it is also the wire `emit_seq` (see `boot_epoch` below for
+    /// when it reaches the wire). 0 means the cross-lane order hold never holds that entry
+    /// and never treats it as a blocker (GuardianOutboxDrainWorker::wrapped_send()), so every
+    /// production enqueue draws a value even when nothing will go on the wire.
     std::uint64_t seq{0};
+
+    /// UP-14: the boot epoch to put on the wire beside `seq`, or 0 for "send no ordering
+    /// pair". Set in the same place as `seq` (stamp_seq_locked) and immutable from then on,
+    /// so a coalesce carries the newer entry's seq with the same epoch and a Retain resend
+    /// re-copies the head with its pair intact. 0 on a source with no claimed epoch AND on
+    /// every journal-paged entry (try_page_batch): the production-time seq of a replayed
+    /// record is not journalled, so the page-time seq would label a prior-boot event with a
+    /// current-boot position. Not a wire field itself and NOT journalled;
+    /// guardian_outbox_entry_to_event stamps the pair iff BOTH `boot_epoch` and `seq` are
+    /// nonzero. The replay discriminator is this page-time stamp, never `journal_batch_key`
+    /// (see below: that is also set on LIVE entries).
+    std::uint64_t boot_epoch{0};
 
     GuardDrift drift{};          ///< Compliance payload
 
@@ -98,11 +112,14 @@ struct OutboxEntry {
     std::string guard_type;      ///< Health/Lifecycle: "file" | "registry" | "service"
     std::string rule_name;       ///< Health/Lifecycle: human-readable rule name
 
-    // Journal-replay provenance (item 7 PR-Ag): set ONLY on Lifecycle entries PAGED back
-    // from the durable journal, so the send path can write the batch's sent-label after its
-    // LAST entry sends. Empty/false on live + compliance/health entries. NOT wire fields -
-    // guardian_outbox_entry_to_event ignores them, so they never change the server compare.
-    std::string journal_batch_key;     ///< the durable batch this replayed entry came from ("" if live)
+    // Journal provenance (item 7 PR-Ag): set on Lifecycle entries PAGED back from the durable
+    // journal AND on LIVE window entries once their batch is persisted
+    // (GuardianLifecycleLog::stamp_provenance, via backfill_batch_provenance), so the send path
+    // can write the batch's sent-label after its LAST entry sends. Empty/false on compliance
+    // and health entries. So it is NOT a "was replayed" discriminator (use `boot_epoch`, which
+    // is 0 on paged entries). NOT wire fields - guardian_outbox_entry_to_event ignores them, so
+    // they never change the server compare.
+    std::string journal_batch_key; ///< the durable batch this entry belongs to ("" until persisted)
     bool journal_last_in_batch{false}; ///< this is that batch's LAST entry - write sent:<key> on send
 
     static OutboxEntry compliance(std::string rule_id, std::uint64_t generation,
@@ -150,7 +167,7 @@ struct OutboxEntry {
 /// What a send attempt reported. Retain and Failed are equivalent to the drain
 /// (both stop it and keep the entry); they read differently at the call site.
 enum class SendResult {
-    Sent,   ///< delivered; remove the entry
+    Sent,   ///< delivered, or disposed by design as unsendable (no Write); remove the entry
     Retain, ///< stream down / Write()==false; keep the entry and stop draining
 };
 
