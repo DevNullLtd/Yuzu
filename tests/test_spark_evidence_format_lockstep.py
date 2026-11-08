@@ -28,6 +28,14 @@ import: env-var reads only, no I/O, no network). Pointed at a throwaway tempfile
 here so importing the driver never touches a real scratch path or collides with a concurrent
 CI job on the same shared runner box (#1871).
 
+#5719 adds a negative check: the two `expected_line` strings in
+tests/unit/fixtures/spark/rebuild_line.json (the golden for GuardianRebuildTally::format(),
+agents/core/include/yuzu/agent/guardian_rebuild_tally.hpp) must match NONE of the driver's
+PRESERVED_RE, T0_RE, T0D_RE, T1_RE, T2_RE and ARM_LEGACY_RE, using the driver's own compiled
+objects. The rebuild line sits beside the `full_sync preserved` line in the agent log, so a
+rewording of either that made the driver read one as the other would corrupt the blackout
+evidence silently.
+
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml (merge ref),
 alongside tests/test_no_connless_pq_escape.py.
 
@@ -52,6 +60,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = REPO_ROOT / "tests" / "unit" / "fixtures" / "spark" / "arm_committed_line.json"
 DRIVER_PATH = REPO_ROOT / "docs" / "spark-rebuild-baselines" / "fullsync_blackout_diag.py"
+REBUILD_FIXTURE_PATH = REPO_ROOT / "tests" / "unit" / "fixtures" / "spark" / "rebuild_line.json"
+# The driver regexes the #5719 rebuild line must never match (names as in the driver module).
+DRIVER_REGEX_NAMES = ("PRESERVED_RE", "T0_RE", "T0D_RE", "T1_RE", "T2_RE", "ARM_LEGACY_RE")
 
 
 def _load_driver() -> types.ModuleType:
@@ -93,6 +104,32 @@ def _selfcheck(driver: types.ModuleType) -> None:
         raise SystemExit("selfcheck: T1_RE.match() wrongly forged (#4665 regression)")
 
 
+def _check_rebuild_line_matches_no_driver_regex(driver: types.ModuleType) -> int:
+    """#5719: neither golden rebuild line may be read as any other evidence line."""
+    cases = json.loads(REBUILD_FIXTURE_PATH.read_text(encoding="utf-8"))["cases"]
+    if len(cases) < 2:
+        print(f"FAIL: {REBUILD_FIXTURE_PATH} lists {len(cases)} case(s); the check expects at "
+              "least the all-zero and the populated one")
+        return 1
+    for name in DRIVER_REGEX_NAMES:
+        if not hasattr(driver, name):
+            print(f"FAIL: the driver no longer defines {name}; update DRIVER_REGEX_NAMES in this "
+                  "file together with the driver so the rebuild-line check keeps its full set")
+            return 1
+    for case in cases:
+        line = case["expected_line"]
+        for name in DRIVER_REGEX_NAMES:
+            pattern = getattr(driver, name)
+            # Both .match() and .search(): the driver uses each form in different places and the
+            # rebuild line must be invisible to either.
+            if pattern.match(line) or pattern.search(line):
+                print(f"FAIL: the driver's {name} matches the #5719 rebuild line "
+                      f"(fixture case {case['name']!r}):")
+                print(f"  {line!r}")
+                return 1
+    return 0
+
+
 def main() -> int:
     driver = _load_driver()
     _selfcheck(driver)
@@ -105,6 +142,9 @@ def main() -> int:
     if driver.cmd_selftest() != 0:
         print("FAIL: the driver's own F1-F28 cmd_selftest() reported a failure (see "
               "[selftest] lines above) -- see the driver's cmd_selftest for which fixture")
+        return 1
+
+    if _check_rebuild_line_matches_no_driver_regex(driver) != 0:
         return 1
 
     fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -133,7 +173,8 @@ def main() -> int:
         return 1
 
     print("OK: driver T2_RE parses tests/unit/fixtures/spark/arm_committed_line.json's "
-          "expected_line into the pinned field tuple; #4665 forgery regression still refused")
+          "expected_line into the pinned field tuple; #4665 forgery regression still refused; "
+          "no driver regex matches either #5719 rebuild-line golden")
     return 0
 
 
