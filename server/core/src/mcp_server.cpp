@@ -60,6 +60,7 @@
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "rbac_text.hpp"                  // rbac_text_is_clean — identifier check shared with the owner
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
 // The SAME pure validation grammar the REST route
@@ -27088,6 +27089,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // `role` is deliberately free text (see below), so it is validated here, BEFORE
+                // any guard or write looks at it: a value with a NUL or other control byte is
+                // refused as invalid params and the refusal is audited. The role is then resolved
+                // once to the stored role id, and that one id is what both guards, the delete and
+                // the audit row use; an unknown but well-formed name stays an idempotent no-op.
+                if (!rbac_text_is_clean(role_name)) {
+                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                   audit_token(principal_id), "invalid_role_name");
+                    res.set_content(error_response(id, kInvalidParams, "invalid role format"),
+                                    "application/json");
+                    return;
+                }
+                const std::string role_id = [&] {
+                    auto stored = rbac_store->get_role(role_name);
+                    return stored ? stored->name : role_name;
+                }();
                 // Governance BLOCKING #2 (audit-log-injection, CWE-117):
                 // principal_id is charset-safe past is_valid_username above,
                 // but role_name is DELIBERATELY unrestricted here (schema:
@@ -27100,13 +27117,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // unless neutralized here. Matches this file's established
                 // `audit_token`/`log_token` convention (web_utils.hpp).
                 const std::string audit_target_id = audit_token(principal_id);
-                const std::string audit_role = audit_token(role_name);
+                const std::string audit_role = audit_token(role_id);
 
                 // Self-target guard (#397/#403 — third call site; shared via
                 // rbac_admin_predicate.hpp's is_self_target). Scoped to
                 // role_name=="Administrator" ONLY — see the REST route's own
                 // comment for why.
-                if (role_name == "Administrator" && is_self_target(*session, principal_id)) {
+                if (role_id == "Administrator" && is_self_target(*session, principal_id)) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
                                    "self_admin_unassign_blocked");
                     res.set_content(
@@ -27122,7 +27139,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // zero administrators (a business-rule conflict, not a store
                 // fault) — is_rbac_last_admin_refusal distinguishes them so
                 // only the genuine fault carries a retry hint.
-                auto result = rbac_store->unassign_role("user", principal_id, role_name);
+                auto result = rbac_store->unassign_role("user", principal_id, role_id);
                 if (!result) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
                                    result.error());
@@ -27167,7 +27184,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 nlohmann::json payload = {
-                    {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
+                    {"unassigned", true}, {"principal_id", principal_id}, {"role", role_id}};
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
