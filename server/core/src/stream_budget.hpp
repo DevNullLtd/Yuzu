@@ -33,7 +33,8 @@ namespace yuzu::server::detail {
 ///
 /// This is a real reserve, not an aspiration: EVERY surface that holds a response open
 /// leases from the one budget below — MCP's GET channel, MCP streamed POST, `GET
-/// /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream.
+/// /api/v1/events`, the dashboard executions drawer, the legacy `/events` stream, and a
+/// synchronous workflow run (which pins its worker for the run, not for an SSE stream).
 /// A surface that held a worker without a lease would make the arithmetic here a
 /// fiction.
 inline constexpr std::size_t kPlainRestReserveDefault = 8;
@@ -131,6 +132,14 @@ inline constexpr std::size_t kPerPrincipalAnonymous = 4;
 /// side of the one-way include edge).
 inline constexpr std::size_t kPerPrincipalMcpPost = 4;
 
+/// Max concurrent synchronous workflow runs one principal may hold (`POST
+/// /api/v1/workflows/{id}/execute`, MCP `execute_workflow`, the legacy execute route). A run
+/// holds its worker for up to the 60 s run budget (`kWorkflowSyncBudget`, workflow_execute.hpp),
+/// so the per-principal share is deliberately far below the stream surfaces': two keeps a
+/// client able to pipeline one run behind another while one noisy principal cannot take a
+/// meaningful share of the 128 held-open workers (owner ruling D3, 2026-11-04).
+inline constexpr std::size_t kPerPrincipalWorkflowRun = 2;
+
 /// The surfaces that hold a response open. A CLOSED set — it is the metric label, and it is
 /// the list ADR-0034 says must be exhaustive. Adding a new streaming route means adding a
 /// value here and taking a lease; there is no third option.
@@ -140,6 +149,8 @@ enum class SseSurface {
     kApiEvents,       ///< GET /api/v1/events    — token, Execution:Read
     kDashboardExec,   ///< GET /sse/executions/{id} — cookie, the executions drawer
     kLegacyEvents,    ///< GET /events           — the legacy dashboard stream
+    kWorkflowRun,     ///< a SYNCHRONOUS workflow run (REST v1 execute, MCP execute_workflow): not an
+                      ///< SSE stream, but the response is held open and a worker pinned for the run
 };
 
 inline const char* to_string(SseSurface s) {
@@ -154,6 +165,8 @@ inline const char* to_string(SseSurface s) {
         return "dashboard_exec";
     case SseSurface::kLegacyEvents:
         return "legacy_events";
+    case SseSurface::kWorkflowRun:
+        return "workflow_run";
     }
     return "unknown";
 }
@@ -325,6 +338,21 @@ public:
     }
 
     std::size_t capacity() const { return cfg_.global_cap; }
+
+    /// Held-open responses right now on ONE surface, across every principal. The per-surface
+    /// share of `active()`, for a per-surface gauge (`yuzu_server_workflow_runs_in_flight`).
+    /// Summed from the per-principal map rather than kept as a second counter set, so a new
+    /// `SseSurface` value can never be missed by a parallel array; the map holds at most
+    /// `global_cap` entries (one per live lease), so the walk is bounded and cheap.
+    std::size_t active_for_surface(SseSurface surface) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::size_t n = 0;
+        for (const auto& [key, held] : per_principal_) {
+            if (key.surface == surface)
+                n += held;
+        }
+        return n;
+    }
 
     std::size_t active_for(SseSurface surface, const std::string& principal) const {
         std::lock_guard<std::mutex> lk(mu_);

@@ -212,6 +212,8 @@ Session ID returned on registration. `WatchEvents` tracks connect/disconnect eve
 
 `ExecutionTracker` supports parent/child execution hierarchy via `parent_execution_id`. Query children by parent. Follow-up instructions use parent response data as scope input.
 
+Multi-step workflows (`WorkflowEngine`) can be started over REST v1 (`POST /api/v1/workflows/{id}/execute`) and MCP (`execute_workflow`, #2146), which run one shared sequence: every step is checked against the caller before anything is sent, a `supervised`-tier MCP token needs an approval ticket, an idempotency key makes a lost answer safe to repeat (required on MCP), and a run is synchronous, limited to 2 concurrent runs per principal per server process and stopped at 60 seconds. **Gaps:** no asynchronous run (a run holds an HTTP worker until its steps are sent), no sweep of runs left `running` by a crash, and a revoked API token can outlive a revoke on another replica for up to 60 seconds during a run. See ADR-1005, 2026-11-05 entry, "Known residuals".
+
 ### 2.9 Instruction Scheduling :white_check_mark: `T2`
 
 `ScheduleEngine` (ADR-0065: migrated to PostgreSQL, schema `schedule_engine`) with frequency types (daily, weekly, monthly, sub-day), scope expressions evaluated dynamically at dispatch, enable/disable toggle, execution history tracking. REST CRUD via `/api/schedules`.

@@ -1334,6 +1334,169 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        hold for all five. Wire reference: `docs/user-manual/rest-api.md`,
        "Software normalisation curation".
      - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-05 - the `Workflow:Execute` residual of the 2026-10-30 entry is
+     closed.** That entry accepted that no MCP tool mapped to the pair, so a
+     supervised token had no ticket path to run a workflow. The MCP tool
+     `execute_workflow` and its REST twin `POST /api/v1/workflows/{id}/execute` now
+     exist, sharing one sequence in `server/core/src/workflow_execute.{hpp,cpp}`. A
+     supervised token calls the tool, receives an approval ticket (`-32006`), and
+     repeats the same call with the `approval_id` after an administrator approves;
+     the ticket binds the workflow id, the agent ids and the ordered step effects.
+     The tool requires an `idempotency_key` (the REST twin accepts an optional
+     `Idempotency-Key` header), because the call is synchronous and a lost response
+     must not become a second full send. The operator tier stays denied by
+     `tier_allows()`, and the legacy `POST /api/workflows/{id}/execute` still refuses
+     a supervised token with `403`. A run holds one HTTP worker, so it leases the
+     shared held-open budget (`StreamBudget`, at most 2 per principal) and has a 60
+     second deadline. The 2026-10-30 entry is left as written; this entry supersedes
+     its residual sentence only.
+     - **Known residuals of this change (recorded by the change author; ADR-owner
+       acceptance pending, except the confined-reader visibility consequence of the
+       stored agent id cap in residual 13, which the owner accepted on 2026-11-06).**
+       Each was checked against the code at the commit that wrote this paragraph.
+       The per-step credential check no longer carries the token-cache lag it once did (it
+       reads the token and engine rows from Postgres, see residual 3); #4766 (token
+       revocation and expiry without the durable-generation discipline sessions have) stays
+       open for the other callers of the token cache and for expiry on the replica's clock,
+       and `AuthRoutes::revalidate_stream` cites #2447, the separate stream grace-clock
+       point. No issue is filed for the rest yet (file each and update its line with the
+       number). The date is the latest the residual is re-read, not a promise it is fixed
+       by then.
+       1. *Write-ahead command id (revisit by 2026-12-15).* A step's command id is
+          stored after the send, by a write that can be dropped, so a step recorded
+          `pending` or `skipped` may still have been sent. The docs tell the reader
+          to check the audit and response stores. Closing it means recording the
+          intended command id before the send.
+       2. *Orphan runs (revisit by 2026-12-15).* Nothing sweeps a run left
+          `running` (a crashed process, a final write that failed twice, an
+          unconfirmed claim COMMIT); its idempotency key stays bound. The runbook is
+          `docs/user-manual/server-admin.md` "A workflow run left `running`". A sweep
+          must close the row and decide the key's fate on purpose.
+       3. *Caller authority is a snapshot (revisit by 2026-12-15).* The run
+          re-checks that the credential is live before each step but does not
+          re-derive the `DispatchCaller` (D2b): an administrator elevation that
+          expires, or a device-group narrowing, during the run is bounded only by the
+          60 s deadline. The liveness check for an API-token caller (and an engine
+          token's backing principal) reads the durable row at every step boundary, so a
+          revoke committed by any replica is seen at the next boundary; the step already
+          sent is not recalled, a cookie session is decided by the durable session
+          generation (polled at most once per second while the session store answers; a
+          replica whose poll is failing keeps trusting its cached sessions for up to
+          30 s, then fails closed), and token expiry is judged on the replica's clock.
+       4. *No per-surface ceiling (revisit by 2026-12-15).* The workflow run leases
+          from the one shared budget, 2 per principal, so 64 principals can hold all
+          128 default slots for up to 60 s and every new stream or run is refused
+          meanwhile. The caps and the `yuzu_server_workflow_runs_in_flight` gauge are
+          per server process. ADR-0034 Decision 3 prefers utilisation to per-surface
+          counters; the gauge is a diagnostic share of that utilisation, and
+          `YuzuHeldOpenUtilisationHigh` alerts on the total.
+       5. *Zero-reach is final for the key (revisit by 2027-01-15).* A run that
+          reaches no device (for example every target is quarantined) answers with
+          no retry hint, and with a key the key is bound to that failed run, so
+          running again after the cause clears needs a new key (on MCP, a new
+          approval).
+       6. *`foreach` (revisit by 2027-01-15).* A step expands over the previous
+          step's result, which is the dispatch acknowledgement (command id, agents
+          reached) and not device output, so it sends one item today.
+       7. *Unkeyed calls (revisit by 2027-01-15).* The key is required only on MCP.
+          The REST route takes it as an optional header and the legacy route takes
+          none, so a lost response retried blind sends every step again; the cap and
+          the 60 s bound still apply.
+       8. *The legacy route has fewer controls (revisit by 2027-01-15).* No approval
+          ticket or step-effect binding, no per-step credential re-check, no refusal
+          of a workflow whose retry sleeps exceed 60 s, no `requested` audit row, and
+          a run stopped at the deadline is recorded `result=success` with the stop in
+          the detail only. It answers `202` `status: running` after such a stop.
+       9. *Audit coverage (revisit by 2027-01-15).* A cap or drain refusal writes no
+          audit row (the counter is its record). Each terminal idempotent replay
+          writes one `success` row and replays are not capped, because they take no
+          slot. An unwired audit sink fails closed on REST (503 `audit_unavailable`)
+          but not on MCP, where the call proceeds and writes no row; on MCP, an
+          unknown argument and a missing or empty `workflow_id` also write no row.
+       10. *Stored attempt number (revisit by 2027-01-15).* The engine writes a
+           step's `attempt` after a failed attempt only, so a step retried to
+           success shows its last failed attempt's number.
+       11. *Shutdown (revisit by 2026-12-15).* The drain waits at most 30 s for
+           runs; a run still going then is stopped between attempts and closed
+           `failed` (the caller is told `interrupted`), and a send already in flight
+           is not interrupted. A run whose final write cannot be made before the
+           process exits stays `running` (residual 2).
+       12. *Unconfirmed claim COMMIT (revisit by 2026-12-15).* When a claim COMMIT
+           fails and Postgres cannot say whether it committed, the call fails but a
+           `running` row for a run that was never dispatched may exist, with its key
+           bound (and, on MCP, its ticket spent), until residual 2's runbook or a
+           sweep clears it.
+       13. *Run records are kept without limit (revisit by 2027-01-15).* No prune
+           exists for `workflow_executions` (see `docs/clock-guarded-retention.md`),
+           so the account name, the key and the agent list (the distinct ids, at most
+           1,000 of them and at most 131,072 bytes of JSON text per run, each id at most
+           256 bytes: a list that does not fit stores the ids that fit and a marker with
+           the count of distinct ids and a digest, `stored_agent_ids_json`) stay for the
+           life of the database, and a deleted-and-recreated username inherits the old
+           account's keys. The table now has a size gauge
+           (`yuzu_server_workflow_executions_rows`, `_bytes`) and a growth alert
+           (`YuzuWorkflowExecutionsTableLarge`, above 100,000 rows for 30 minutes); the
+           rows are still never pruned.
+
+           *Owner-accepted: confined-reader visibility (owner decision 2026-11-06,
+           "accept and record").* For a run naming more than 1,000 distinct agent ids
+           (or whose ids exceed the 131,072-byte stored budget), a CONFINED reader's
+           scoped visibility of the run depends on the stored ids. The ids in the
+           creator's own dispatch scope (`Execution:Execute` visibility) are stored first,
+           then the rest in the order named. The creator keeps seeing its run exactly
+           while at least one stored id lies in the scope its reads are checked against
+           (`Workflow:Read`). That is guaranteed when the run names at least one device
+           inside its `Execution:Execute` scope and that scope lies WITHIN its
+           `Workflow:Read` scope: the first stored id is then inside both. Overlap is not
+           enough. When the `Execution:Execute` scope reaches devices the `Workflow:Read`
+           scope does not, the creator can lose sight of its own run: a global
+           `Execution:Execute` grant with a group-scoped `Workflow:Read` makes every
+           named id "first", so the ids are stored in request order, and the creator
+           loses the run when none of its group's devices is among those stored (the two
+           scopes overlap here, and the run is still lost). Starting a run
+           needs a global `Workflow:Execute`, which of the seeded roles only
+           `Administrator` holds, so a confined creator is a custom role with that grant
+           plus a scoped one (for example an `Operator` assignment on a group). Another confined reader whose devices fall past the cap
+           does not see the run in its scoped list or detail reads. Unconfined readers
+           and the audit log still see it, and the check fails closed (a malformed or
+           empty column is invisible to a confined reader). The trigger is distinct ids
+           beyond the cap: duplicates do not consume it, and an id that names no device
+           does; an id over 256 bytes or holding a NUL byte is counted in the total and
+           never stored, so it consumes nothing. The run is still dispatched to every id
+           it named.
+       14. *Dedupe memory on the legacy execute route (revisit by 2027-01-15).*
+           `stored_agent_ids_json` holds a set of the distinct ids while it works. The
+           legacy `POST /api/workflows/{id}/execute` checks no id count, so a request
+           near its 16 MiB body cap (the reachable ceiling is about 2.5 million distinct
+           ids of at most 4 bytes) costs about 154 MiB of transient memory in that set
+           and the distinct list (the set is freed before the digest is built, the list
+           when the helper returns). The digest's JSON copy of the list, which already
+           existed, coexists with the list, so the helper's peak is about 250 MiB
+           (measured on a release build with glibc: 247 MiB above the input list at
+           2,510,443 distinct ids of 1 to 4 bytes; a list of duplicates peaks at 33 MiB
+           or less). The handler's own parse of the body peaks higher before the helper
+           runs (about 290 MiB for that list and about 450 MiB for 4.19 million one-byte
+           duplicates, measured on a copy of the parse lines). The v1 route and MCP are capped at 10,000 ids and
+           are not affected. The body cap bounds it; an id-count cap on the legacy route
+           would remove it.
+       15. *Pool brownout wait at a step boundary (revisit by 2026-12-15).* The credential
+           check reads the token and engine rows from the primary, and (unlike the
+           held-open stream's cached read) is not covered by the engine liveness cache's
+           failure backoff. The wait depends on how the database fails (measured, a test
+           harness calling the production store functions). When every pooled connection
+           is in use, a read waits at most 0.5 s (the pool's saturated fast-fail), so one
+           boundary is about 4 s (up to three reads per attempt, two attempts, 1 s
+           between). When the database accepts connections but never answers and no
+           connection is idle, the first read of each attempt waits the 10 s connect
+           timeout and the rest of that attempt fails fast, so one boundary is about 21 s.
+           A read on a connection already leased to a database that stopped answering
+           while its host still acknowledges packets (a paused or frozen server) did not
+           return within 150 s in the test: no pool timeout bounds it, and the 60 s run
+           deadline is tested only between attempts, so such a run is not stopped at
+           60 s. The run still fails closed whenever a read returns
+           (`credential_indeterminate`), and is capped at 2 per principal. A packet-drop
+           failure (no acknowledgement) was not measured; the 10 s TCP user timeout
+           should end it (inferred).
 
 ## Interim rules (until the named follow-ups ship)
 
