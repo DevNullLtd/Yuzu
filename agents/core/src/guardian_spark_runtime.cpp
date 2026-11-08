@@ -3634,9 +3634,10 @@ void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
         outbox_waker();
 }
 
-void GuardianSparkRuntime::detach_all() { detach_rules_except({}); }
+void GuardianSparkRuntime::detach_all() { (void)detach_rules_except({}); }
 
-void GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<>>& keep) {
+std::vector<GuardianSparkRuntime::ForcedRebuild>
+GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<>>& keep) {
     std::function<void()> outbox_waker;
     std::vector<std::shared_ptr<KeyClaim>> works;
     // #4415: the faulted bit below decides which kept rules are torn down with their key, and a
@@ -3743,6 +3744,7 @@ void GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::
         submit_disarm_off_lock(work);
     if (outbox_waker)
         outbox_waker();
+    return {}; // #5719 C2: no forced-rebuild record yet (C3 fills it)
 }
 
 std::shared_ptr<GuardianSparkRuntime::KeyClaim>

@@ -32,12 +32,15 @@
 #include "guardian_rule_eval.hpp" // read_unknown
 #include "guardian_spark_runtime.hpp"
 
+#include <yuzu/agent/guardian_rebuild_tally.hpp>
 #include <yuzu/agent/spark.hpp>
 
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -1322,4 +1325,643 @@ TEST_CASE("#4415 PR-A a rule in an Unknown evaluation episode is rebuilt by an i
     REQUIRE(again.has_value());
     CHECK(!again->skipped);
     REQUIRE(yuzu::test::spin_until([&] { return rig.rt->claim_queue_depth_for_test(key) == 0; }, 10s));
+}
+
+// =======================================================================================
+// #5719 PR-A, commit C2a: RED-FIRST runtime tests for the rebuild reason, the forced-rebuild
+// return of detach_rules_except and the three silent-catch counters.
+//
+// STATE AT THIS COMMIT: the API surface exists (ArmOutcome::rebuild_reason,
+// detach_rules_except's std::vector<ForcedRebuild>, the three counters,
+// fail_next_sweep_snapshot_for_test) but nothing sets or counts anything, so every test below
+// that asserts a reason, a returned entry or a counter value is RED on an ASSERTION. C3 (the
+// reason, its precedence, PerKey::unhealthy_why and the forced return) and C4 (the counters)
+// turn them green. The few cases that already pass (marked "GREEN at C2") pin the value None
+// that the default legitimately has, and go red only under the mutation they name.
+//
+// Reasons are compared as their log tokens so a failure prints "'none' == 'key_busy'" rather
+// than two integers. Every wait is event-driven (spin_until on claim_queue_depth_for_test or
+// an observable rule count); nothing sleeps. A wait is placed only on a condition that holds
+// in BOTH the red and the green world, so a red test fails on its assertion, not on a timeout.
+// =======================================================================================
+namespace {
+using Why = GuardianRebuildReason;
+
+std::string why_tok(Why r) { return std::string{guardian_rebuild_reason_token(r)}; }
+
+SparkSpec startup_spec() { return SparkSpec{SparkType::Startup, StartupSparkParams{}}; }
+
+/// attach_rule(NonWaiting) that must succeed; the claim, if any, is NOT awaited here.
+RT::ArmOutcome attach_nw(Rig& rig, const std::string& rid, const SparkSpec& spec,
+                         RuleAssertion a) {
+    auto out = rig.rt->attach_rule(RT::NonWaiting{}, rid, spec, std::move(a), true);
+    INFO("attach_rule(NonWaiting, " << rid << "): " << (out ? "ok" : out.error().message));
+    REQUIRE(out.has_value());
+    return *out;
+}
+
+/// Waits until `spec`'s key has no claim left (a rebuild's disarm + arm have both finished).
+void settle(Rig& rig, const SparkSpec& spec) {
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0; }, 10s));
+}
+
+/// The id of the subscription the backend holds for the most recently armed key.
+std::uint64_t last_sub(Rig& rig) {
+    const auto ids = rig.backend->armed_ids();
+    REQUIRE_FALSE(ids.empty());
+    return ids.back();
+}
+
+/// Delivers a Faulted event for `spec`'s current subscription (the recorded-bit path).
+void deliver_faulted(Rig& rig, const SparkSpec& spec, std::uint64_t sub) {
+    rig.rt->on_event(SparkEvent{.key = spark_key(spec), .kind = SparkEventKind::Faulted,
+                                .subscription_id = sub, .detail = "deaf"});
+}
+
+/// Collapses a returned vector to "rule_id:token" strings in a stable order.
+std::vector<std::string> forced_summary(const std::vector<RT::ForcedRebuild>& v) {
+    std::vector<std::string> out;
+    for (const auto& f : v)
+        out.push_back(f.rule_id + ":" + why_tok(f.why));
+    std::sort(out.begin(), out.end());
+    return out;
+}
+} // namespace
+
+// ---------------------------------------------------------------------------------------
+// R1. A skip carries NO reason, and a re-observation of a live in-flight arm is a skip.
+// GREEN at C2 (the default is None). Mutation: set a reason on the skip return in attach_core
+// (or on reuse_existing_locked's success results) and this goes red.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R1: a healthy identical attach is skipped and carries no reason",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    SECTION("committed rule: Armed, skipped") {
+        REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+        CHECK(out.kind == RT::ArmOutcomeKind::Armed);
+        CHECK(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "none");
+    }
+    SECTION("identical live in-flight arm: Reobserved, skipped") {
+        auto parked = attach_parked(rig, "r1", spec, file_exists_rule("r1"));
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+        CHECK(out.kind == RT::ArmOutcomeKind::Accepted);
+        CHECK(out.receipt.claim == parked.receipt.claim);
+        CHECK(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "none");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// R2. FirstAttach, on each success return that must carry a reason.
+// Mutation: leave `.rebuild_reason` off the Pending return (the io-class SECTION), off the
+// inline Armed return (the Startup SECTION) or off the join return (the shared-key SECTION)
+// in attach_core, or in attach_rule(NonWaiting)'s four ArmOutcome constructions.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R2: a first attach reports first_attach on every success return",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    SECTION("io-class key, arm parked: the Pending return (Accepted)") {
+        const auto spec = file_spec("/a");
+        auto gate = rig.backend->park_next_arm_for_key(spark_key(spec));
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+        REQUIRE(gate->wait_entered(10s));
+        CHECK(out.kind == RT::ArmOutcomeKind::Accepted);
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+    }
+    SECTION("io-class key, not parked: whichever post-check return attach_rule takes") {
+        // The claim may already be terminal when attach_rule re-checks it (Armed) or still
+        // unresolved (Accepted); both ArmOutcome constructions must carry the reason. Which one
+        // is taken is a race this test deliberately does not force.
+        const auto spec = file_spec("/a");
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+        settle(rig, spec);
+    }
+    SECTION("inline type (Startup): the Armed return built under the lock") {
+        const auto spec = startup_spec();
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+        CHECK(out.kind == RT::ArmOutcomeKind::Armed);
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+    }
+    SECTION("a second rule joining a committed shared key: Armed, still a first attach") {
+        const auto spec = file_spec("/a");
+        REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+        const auto out = attach_nw(rig, "r2", spec, file_exists_rule("r2"));
+        CHECK(out.kind == RT::ArmOutcomeKind::Armed);
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// R3. KeyBusy: the key is held by ANOTHER rule's in-flight claim.
+// Mutation: return FirstAttach (or None) from the claims branch of reuse_existing_locked when
+// the claim belongs to a different rule.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R3: a key held by another rule's in-flight claim reports key_busy",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    auto head = attach_parked(rig, "r2", spec, file_exists_rule("r2")); // in flight, other rule
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+    CHECK(out.kind == RT::ArmOutcomeKind::Accepted); // queued behind r2's arm
+    CHECK_FALSE(out.skipped);
+    CHECK(why_tok(out.rebuild_reason) == "key_busy");
+    head.gate->release();
+    settle(rig, spec);
+}
+
+// ---------------------------------------------------------------------------------------
+// R4. ContentChanged: on a committed rule, on an in-flight arm of the same rule (a changed
+// content id, then a changed expected_hash), and on an inline-type committed rule (the Armed
+// return).
+// Mutation: report KeyBusy (or Other) from the claims branch's "same rule, different content"
+// return, or drop the content term's reason from the committed path.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R4: a changed push reports content_changed",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    SECTION("committed rule, changed content id") {
+        const auto spec = file_spec("/a");
+        REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1", true), true).has_value());
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1", false));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "content_changed");
+        settle(rig, spec);
+    }
+    SECTION("in-flight arm of the same rule, changed content id") {
+        const auto spec = file_spec("/a");
+        auto parked = attach_parked(rig, "r1", spec, file_exists_rule("r1", true));
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1", false));
+        CHECK_FALSE(out.skipped);
+        CHECK(out.receipt.claim != parked.receipt.claim); // replaced, not re-observed
+        CHECK(why_tok(out.rebuild_reason) == "content_changed");
+        parked.gate->release();
+        settle(rig, spec);
+    }
+    SECTION("in-flight arm of the same rule, changed expected_hash only") {
+        const auto spec = file_spec("/a");
+        auto parked = attach_parked(rig, "r1", spec, file_hash_rule("r1", "h"));
+        const auto out = attach_nw(rig, "r1", spec, file_hash_rule("r1", "other"));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "content_changed");
+        parked.gate->release();
+        settle(rig, spec);
+    }
+    SECTION("inline-type committed rule, changed content id: the Armed return") {
+        const auto spec = startup_spec();
+        REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1", true), true).has_value());
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1", false));
+        CHECK(out.kind == RT::ArmOutcomeKind::Armed);
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "content_changed");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// R5. UnknownEpisode, and its precedence over changed content.
+// Mutation: drop `live.eval.in_unknown` from reuse_existing_locked (the skip decision changes),
+// or evaluate the content term before the Unknown term (the second SECTION reports
+// content_changed).
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R5: an Unknown-evaluation episode reports unknown_episode, ahead of "
+          "changed content",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    const auto key = spark_key(spec);
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1", true), true).has_value());
+    rig.reader->file = read_unknown<FileSnapshot>("io");
+    rig.rt->evaluate_key(key, EvalReason::Initial);
+    const auto st = rig.rt->status_for_rule("r1");
+    REQUIRE(st.has_value());
+    REQUIRE(st->in_unknown);
+    SECTION("identical push") {
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1", true));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "unknown_episode");
+    }
+    SECTION("two terms true: in_unknown AND a changed content id") {
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1", false));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "unknown_episode");
+    }
+    settle(rig, spec);
+}
+
+// ---------------------------------------------------------------------------------------
+// R6. KeyFaulted: the recorded bit (a delivered event, the backend still saying Healthy) and a
+// Faulted probe (no event delivered). Both also the "two terms true" precedence: faulted AND a
+// changed content id reports the broken key, not the content.
+// Mutation: test content_id before the health terms in reuse_existing_locked (the "changed
+// content" SECTIONs report content_changed); or fall back to Other for the recorded bit.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R6: a faulted key reports faulted_key, ahead of changed content",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1", true), true).has_value());
+    const auto sub = last_sub(rig);
+    const bool by_event = GENERATE(true, false);
+    const bool changed = GENERATE(false, true);
+    INFO("by_event=" << by_event << " changed=" << changed);
+    if (by_event)
+        deliver_faulted(rig, spec, sub); // recorded bit set, the backend still reports Healthy
+    else
+        rig.backend->set_health(sub, SubscriptionHealth::Faulted); // no event is ever delivered
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1", !changed));
+    CHECK_FALSE(out.skipped);
+    CHECK(why_tok(out.rebuild_reason) == "faulted_key");
+    settle(rig, spec);
+}
+
+// ---------------------------------------------------------------------------------------
+// R7. KeyDead (the backend says Dead, no Lost event), also ahead of changed content.
+// Mutation: map a Dead probe to KeyFaulted or None, or test content first.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R7: a dead key reports dead_key, ahead of changed content",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1", true), true).has_value());
+    rig.backend->set_health(last_sub(rig), SubscriptionHealth::Dead);
+    const bool changed = GENERATE(false, true);
+    INFO("changed=" << changed);
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1", !changed));
+    CHECK_FALSE(out.skipped);
+    CHECK(why_tok(out.rebuild_reason) == "dead_key");
+    settle(rig, spec);
+}
+
+// ---------------------------------------------------------------------------------------
+// R8. HealthUnknown: the backend's health query throws, so the probe is absent for a committed
+// rule. Mutation: report FirstAttach (a nullopt probe looks like "nothing committed") or None
+// for an absent probe on the committed path.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R8: a throwing health query reports health_unknown",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    HookReset hook_reset{rig};
+    rig.backend->set_health_hook([](std::uint64_t) { throw std::runtime_error("health"); });
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+    CHECK_FALSE(out.skipped);
+    CHECK(why_tok(out.rebuild_reason) == "health_unknown");
+    settle(rig, spec);
+}
+
+// ---------------------------------------------------------------------------------------
+// R9. SubscriptionReplaced: the probe was taken against subscription 1, which is replaced by 2
+// while the probe is parked in the backend (the F1j recipe).
+// Mutation: drop `probe->subscription != kit->second->subscription` from the locked decision
+// (the attach then skips, reason None), or report HealthUnknown for the mismatch.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R9: a subscription replaced between the probe and the relock reports "
+          "subscription_replaced",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    std::mutex mu;
+    std::condition_variable cv;
+    bool entered = false, released = false;
+    std::atomic<bool> first{true};
+    rig.backend->set_health_hook([&](std::uint64_t) {
+        if (!first.exchange(false))
+            return;
+        std::unique_lock<std::mutex> lk{mu};
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return released; });
+    });
+    const auto release = [&] {
+        std::lock_guard<std::mutex> lk{mu};
+        released = true;
+        cv.notify_all();
+    };
+    std::optional<std::string> reason;
+    std::optional<bool> skipped;
+    Joiner joiner;
+    struct Releaser {
+        std::function<void()> fn;
+        ~Releaser() { fn(); }
+    } releaser{release}; // runs before the joiner on every exit path
+    HookReset hook_reset{rig}; // declared last: resets the hook before the captured locals die
+    joiner.add(std::thread([&] {
+        auto out = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
+        if (out.has_value()) {
+            skipped = out->skipped;
+            reason = why_tok(out->rebuild_reason);
+        }
+    }));
+    {
+        std::unique_lock<std::mutex> lk{mu};
+        REQUIRE(cv.wait_for(lk, 10s, [&] { return entered; }));
+    }
+    rig.rt->detach_rule("r1");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    REQUIRE(rig.backend->armed_ids().size() == 2); // the replacement subscription
+    release();
+    joiner.threads.front().join();
+    REQUIRE(skipped.has_value());
+    REQUIRE(reason.has_value());
+    CHECK(!*skipped);
+    CHECK(*reason == "subscription_replaced");
+    settle(rig, spec);
+}
+
+// ---------------------------------------------------------------------------------------
+// R10. BaselineEmpty and BaselineDiffers: a FileHashEquals rule whose live hash is authored
+// ("h"); an empty pushed hash is "empty", a differing one is "differs". The content id leaves
+// expected_hash out, so only the baseline term can rebuild these.
+// Mutation: swap the two reasons, or return None for either.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R10: an empty or differing pushed baseline is named",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_hash_rule("r1", "h"), true).has_value());
+    SECTION("empty pushed hash") {
+        const auto out = attach_nw(rig, "r1", spec, file_hash_rule("r1", ""));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "baseline_empty");
+    }
+    SECTION("differing pushed hash") {
+        const auto out = attach_nw(rig, "r1", spec, file_hash_rule("r1", "other"));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "baseline_differs");
+    }
+    settle(rig, spec);
+}
+
+// ---------------------------------------------------------------------------------------
+// R11. A wedge re-observation carries no reason and is not a skip: it is in NEITHER the
+// preserved nor the rebuild line (contract (f) of guardian_rebuild_tally.hpp).
+// GREEN at C2 (the default is None). Mutation: set a reason on the retained-wedge PRE-CHECK
+// Reobserved return in attach_core (the one that runs before reuse_existing_locked).
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R11: a wedge re-observation returns no reason and skipped=false",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    auto wedge = attach_wedged(rig, "r1", spec, file_exists_rule("r1"));
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+    CHECK(out.kind == RT::ArmOutcomeKind::Accepted);
+    CHECK(out.receipt.claim == wedge.receipt.claim); // the existing claim, nothing new
+    CHECK_FALSE(out.skipped);
+    CHECK(why_tok(out.rebuild_reason) == "none");
+}
+
+// ---------------------------------------------------------------------------------------
+// F1. detach_rules_except returns each KEPT rule it detaches because its key is unhealthy, with
+// the key's cause. Mutation: return an empty vector (today's stub), return the omitted rules
+// too, or pick the cause from the sweep's answer instead of the recorded first cause.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 forced F1: a kept rule on a faulted key (by event) is returned as faulted_key",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec_a = file_spec("/a");
+    const auto spec_b = file_spec("/b");
+    const auto spec_c = file_spec("/c");
+    REQUIRE(rig.rt->attach_rule("r1", spec_a, file_exists_rule("r1"), true).has_value());
+    const auto sub_a = last_sub(rig);
+    REQUIRE(rig.rt->attach_rule("r2", spec_b, file_exists_rule("r2"), true).has_value());
+    REQUIRE(rig.rt->attach_rule("r3", spec_c, file_exists_rule("r3"), true).has_value());
+    const auto sub_c = last_sub(rig);
+    deliver_faulted(rig, spec_a, sub_a); // kept, faulted
+    deliver_faulted(rig, spec_c, sub_c); // OMITTED and faulted: must not be returned
+    const auto forced = rig.rt->detach_rules_except({"r1", "r2"});
+    CHECK(forced_summary(forced) == std::vector<std::string>{"r1:faulted_key"});
+    CHECK(rig.rt->rule_count() == 1); // r1 and r3 detached, r2 (healthy, kept) stays
+    CHECK(rig.rt->status_for_rule("r2").has_value());
+}
+
+TEST_CASE("#5719 forced F1: a kept rule on a Dead key (backend only) is returned as dead_key",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
+    rig.backend->set_health(last_sub(rig), SubscriptionHealth::Dead); // no Lost event
+    const auto forced = rig.rt->detach_rules_except({"r1"});
+    CHECK(forced_summary(forced) == std::vector<std::string>{"r1:dead_key"});
+    CHECK(rig.rt->rule_count() == 0);
+}
+
+TEST_CASE("#5719 forced F1: a kept rule whose health query throws is returned as "
+          "health_unknown",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
+    HookReset hook_reset{rig};
+    rig.backend->set_health_hook([](std::uint64_t) { throw std::runtime_error("health"); });
+    const auto forced = rig.rt->detach_rules_except({"r1"});
+    CHECK(forced_summary(forced) == std::vector<std::string>{"r1:health_unknown"});
+    CHECK(rig.rt->rule_count() == 0);
+}
+
+TEST_CASE("#5719 forced F1: a key shared by two kept rules yields one entry per sibling",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    REQUIRE(rig.rt->attach_rule("r2", spec, file_exists_rule("r2"), true).has_value());
+    REQUIRE(rig.backend->armed_ids() == std::vector<std::uint64_t>{1}); // one shared watcher
+    deliver_faulted(rig, spec, 1);
+    const auto forced = rig.rt->detach_rules_except({"r1", "r2"});
+    CHECK(forced_summary(forced) ==
+          std::vector<std::string>{"r1:faulted_key", "r2:faulted_key"});
+    CHECK(rig.rt->rule_count() == 0);
+}
+
+// GREEN at C2 (the stub returns empty). Mutation: return every kept rule, or every rule the call
+// detaches, instead of only the kept ones torn down for an unhealthy key.
+TEST_CASE("#5719 forced F1: an identical healthy scoped detach returns nothing, and an omitted "
+          "rule is never returned",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
+    REQUIRE(rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true).has_value());
+    SECTION("everything kept and healthy") {
+        CHECK(rig.rt->detach_rules_except({"r1", "r2"}).empty());
+        CHECK(rig.rt->rule_count() == 2);
+    }
+    SECTION("one rule omitted, the kept one healthy") {
+        CHECK(rig.rt->detach_rules_except({"r1"}).empty());
+        CHECK(rig.rt->rule_count() == 1);
+        CHECK(rig.rt->status_for_rule("r1").has_value());
+    }
+    SECTION("detach_all discards the record and detaches everything") {
+        rig.rt->detach_all();
+        CHECK(rig.rt->rule_count() == 0);
+    }
+}
+
+// First cause wins: an event-edge KeyFaulted is authoritative, so a sweep that would record
+// HealthUnknown (throwing query) or KeyDead (Dead answer) for the same key does not overwrite it.
+// Mutation: write unhealthy_why unconditionally in sweep_key_health (instead of only when None).
+TEST_CASE("#5719 forced F1: the sweep does not overwrite an event-edge faulted_key cause",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    const auto sub = last_sub(rig);
+    deliver_faulted(rig, spec, sub);
+    HookReset hook_reset{rig};
+    SECTION("the sweep's own answer would be health_unknown") {
+        rig.backend->set_health_hook([](std::uint64_t) { throw std::runtime_error("health"); });
+    }
+    SECTION("the sweep's own answer would be dead_key") {
+        rig.backend->set_health(sub, SubscriptionHealth::Dead);
+    }
+    const auto forced = rig.rt->detach_rules_except({"r1"});
+    CHECK(forced_summary(forced) == std::vector<std::string>{"r1:faulted_key"});
+}
+
+// Why the engine needs the forced reason: on an INLINE key the scoped detach's disarm is
+// synchronous, so the kept rule's own later attach finds no committed entry and no claim and
+// would say first_attach. The return value is the only place the cause survives.
+// Mutation: drop the forced return (the first CHECK) or let the later attach report the key's
+// cause (the second CHECK); either changes what the engine reports.
+TEST_CASE("#5719 forced F1: on an inline key the later attach sees first_attach while the return "
+          "carries the cause",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = startup_spec();
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    deliver_faulted(rig, spec, last_sub(rig));
+    const auto forced = rig.rt->detach_rules_except({"r1"});
+    CHECK(forced_summary(forced) == std::vector<std::string>{"r1:faulted_key"});
+    CHECK(rig.rt->rule_count() == 0);
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+    CHECK(out.kind == RT::ArmOutcomeKind::Armed);
+    CHECK(why_tok(out.rebuild_reason) == "first_attach");
+}
+
+// ---------------------------------------------------------------------------------------
+// K1. health_probe_failures(): the probe's catch counts once and the attach still rebuilds
+// (the F1g recipe, with the counter read before and after).
+// Mutation: drop the fetch_add in probe_key_health's catch, or count on the non-throwing path.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 counters K1: a throwing health query is counted once by the probe and the "
+          "attach still rebuilds",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    CHECK(rig.rt->health_probe_failures() == 0);
+    CHECK(rig.rt->sweep_snapshot_failures() == 0);
+    CHECK(rig.rt->sweep_health_query_failures() == 0);
+    HookReset hook_reset{rig};
+    rig.backend->set_health_hook([](std::uint64_t) { throw std::runtime_error("health"); });
+    CHECK(identical_push_rebuilds(rig, spec, "r1"));
+    CHECK(rig.rt->health_probe_failures() == 1);
+    CHECK(rig.rt->sweep_snapshot_failures() == 0);
+    CHECK(rig.rt->sweep_health_query_failures() == 0);
+}
+
+// ---------------------------------------------------------------------------------------
+// K2. sweep_health_query_failures(): one count per throwing key query, and the sweep still
+// reaches the other keys. Scoped detach (the F1h recipe) and the poll backstop (the F1k recipe).
+// Mutation: drop the fetch_add in the per-key catch, count once per sweep instead of once per
+// throw, or `break` out of the loop on the first throw (the call count is then 1, not 2).
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 counters K2: every throwing key query is counted and the sweep reaches the "
+          "other keys",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
+    REQUIRE(rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true).has_value());
+    std::atomic<int> calls{0}, thrown{0};
+    std::atomic<bool> first{true};
+    HookReset hook_reset{rig}; // after the captured locals: resets the hook before they die
+    SECTION("scoped detach, every query throws (F1h): one count per key") {
+        rig.backend->set_health_hook([&](std::uint64_t) {
+            calls.fetch_add(1);
+            thrown.fetch_add(1);
+            throw std::runtime_error("health");
+        });
+        rig.rt->detach_rules_except({"r1"});
+        CHECK(calls.load() == 2); // both keys were asked
+        CHECK(rig.rt->sweep_health_query_failures() == 2);
+        CHECK(rig.rt->health_probe_failures() == 0);
+        CHECK_FALSE(rig.rt->status_for_rule("r2").has_value());
+        CHECK_FALSE(rig.rt->status_for_rule("r1").has_value()); // unknown health: rebuilt
+    }
+    SECTION("scoped detach, only the first query throws: the second key is still reached") {
+        rig.backend->set_health_hook([&](std::uint64_t) {
+            calls.fetch_add(1);
+            if (first.exchange(false)) {
+                thrown.fetch_add(1);
+                throw std::runtime_error("health");
+            }
+        });
+        rig.rt->detach_rules_except({"r1", "r2"});
+        CHECK(calls.load() == 2);
+        CHECK(thrown.load() == 1);
+        CHECK(rig.rt->sweep_health_query_failures() == 1);
+        CHECK(rig.rt->rule_count() == 1); // the unknown-health key's rule went, the other stayed
+    }
+    SECTION("poll backstop, only the first query throws (F1k)") {
+        for (const auto id : rig.backend->armed_ids())
+            rig.backend->set_health(id, SubscriptionHealth::Dead);
+        rig.backend->set_health_hook([&](std::uint64_t) {
+            calls.fetch_add(1);
+            if (first.exchange(false)) {
+                thrown.fetch_add(1);
+                throw std::runtime_error("health");
+            }
+        });
+        CHECK_NOTHROW(rig.rt->revalidate_subscriptions());
+        CHECK(calls.load() == 2);
+        CHECK(thrown.load() == 1);
+        CHECK(rig.rt->sweep_health_query_failures() == 1);
+        CHECK(rig.rt->rule_count() == 1); // unknown is not dead: that key stays attached
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// K3. sweep_snapshot_failures(): the snapshot throws (test seam), the failure is counted once,
+// the dead-key repair is skipped for THAT call only, and the scoped detach still detaches the
+// omitted rule.
+// Mutation: drop the fetch_add in the snapshot catch, consume the seam outside the try, leave the
+// seam armed after one use (the second call is then skipped too), or let the throw escape.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 counters K3: a failed sweep snapshot is counted once, skips the repair for one "
+          "call, and the detach still runs",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec_a = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec_a, file_exists_rule("r1"), true).has_value());
+    const auto sub_a = last_sub(rig);
+    REQUIRE(rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true).has_value());
+    CHECK(rig.rt->sweep_snapshot_failures() == 0);
+    SECTION("scoped detach: the kept rule's faulted bit is not refreshed for that push") {
+        rig.backend->set_health(sub_a, SubscriptionHealth::Faulted); // no event delivered
+        rig.rt->fail_next_sweep_snapshot_for_test();
+        CHECK_NOTHROW(rig.rt->detach_rules_except({"r1"}));
+        CHECK(rig.rt->sweep_snapshot_failures() == 1);
+        CHECK_FALSE(rig.rt->status_for_rule("r2").has_value()); // the detach still ran
+        CHECK(rig.rt->status_for_rule("r1").has_value());       // repair skipped: r1 not torn down
+        // The seam is consumed: the next push's sweep succeeds, finds the key Faulted and repairs it.
+        CHECK_NOTHROW(rig.rt->detach_rules_except({"r1"}));
+        CHECK(rig.rt->sweep_snapshot_failures() == 1);
+        CHECK_FALSE(rig.rt->status_for_rule("r1").has_value());
+    }
+    SECTION("poll backstop: a Dead key is not reported lost on that call, and is on the next") {
+        rig.backend->set_health(sub_a, SubscriptionHealth::Dead);
+        rig.rt->fail_next_sweep_snapshot_for_test();
+        CHECK_NOTHROW(rig.rt->revalidate_subscriptions());
+        CHECK(rig.rt->sweep_snapshot_failures() == 1);
+        CHECK(rig.rt->status_for_rule("r1").has_value());
+        CHECK_NOTHROW(rig.rt->revalidate_subscriptions());
+        CHECK(rig.rt->sweep_snapshot_failures() == 1);
+        CHECK_FALSE(rig.rt->status_for_rule("r1").has_value());
+    }
 }

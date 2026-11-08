@@ -81,6 +81,7 @@
 
 #include <yuzu/plugin.h>        // YUZU_EXPORT
 #include <yuzu/agent/spark.hpp> // SparkSpec, SparkEvent, SparkType, ServiceRunState
+#include <yuzu/agent/guardian_rebuild_tally.hpp> // GuardianRebuildReason (#5719)
 
 #include "guardian_emit_seq.hpp"    // GuardianEmitSeqSource (UP-14)
 #include "guardian_io_executor.hpp" // GuardianIoExecutor, IoClass (#2233 item 3)
@@ -435,7 +436,13 @@ public:
     /// when attach_rule re-observes it. A kept rule whose key is faulted (reported, or found so
     /// by the backend health check) or dead is detached as well, so a key shared by several rules
     /// is torn down and re-armed rather than rejoined by each of them.
-    void detach_rules_except(const std::set<std::string, std::less<>>& keep);
+    /// #5719 C2 (API surface only, no behaviour yet): the kept rules this call detaches because
+    /// their key was faulted or dead, each with the key's cause. Always empty until C3.
+    struct ForcedRebuild {
+        std::string rule_id;
+        GuardianRebuildReason why{GuardianRebuildReason::None};
+    };
+    std::vector<ForcedRebuild> detach_rules_except(const std::set<std::string, std::less<>>& keep);
 
     /// The queued-handler body: resolve `ev.key` to its rules and run one
     /// evaluate_key(Event) pass. Safe to call on a detached thread post-shutdown
@@ -844,6 +851,28 @@ public:
     /// Lock-free.
     [[nodiscard]] std::uint64_t claim_drain_failures() const noexcept {
         return claim_drain_failures_.load(std::memory_order_relaxed);
+    }
+    /// #5719 item 4 (C2: declared, never incremented yet): probe_key_health's backend-health
+    /// query threw, so the attach rebuilt the rule instead of skipping it. Lock-free.
+    [[nodiscard]] std::uint64_t health_probe_failures() const noexcept {
+        return health_probe_failures_.load(std::memory_order_relaxed);
+    }
+    /// #5719 item 4 (C2: declared, never incremented yet): sweep_key_health's snapshot of the
+    /// armed keys threw, so the dead-key repair was skipped for that one call. Lock-free.
+    [[nodiscard]] std::uint64_t sweep_snapshot_failures() const noexcept {
+        return sweep_snapshot_failures_.load(std::memory_order_relaxed);
+    }
+    /// #5719 item 4 (C2: declared, never incremented yet): sweep_key_health's per-key health
+    /// query threw for one key (treated as unhealthy by the scoped detach, ignored by the poll
+    /// backstop, for that sweep). Lock-free.
+    [[nodiscard]] std::uint64_t sweep_health_query_failures() const noexcept {
+        return sweep_health_query_failures_.load(std::memory_order_relaxed);
+    }
+    /// TEST-ONLY (#5719): make the next sweep_key_health snapshot throw bad_alloc inside its try
+    /// (consumed once; wired in C4). Distinct from fail_next_snapshot_for_test (baseline
+    /// staging). No production caller.
+    void fail_next_sweep_snapshot_for_test() noexcept {
+        fail_next_sweep_snapshot_.store(true, std::memory_order_relaxed);
     }
     /// Test seam: claims currently queued on `key` (0 when the key has no entry).
     [[nodiscard]] std::size_t claim_queue_depth_for_test(const std::string& key) const;
@@ -1293,6 +1322,9 @@ private:
         /// reuse_existing_locked and detach_rules_except. A key torn down and re-armed gets a
         /// fresh PerKey that starts clear: the skip decision does not rely on the bit alone.
         bool faulted{false};
+        /// #5719: why `faulted` (or the backend's Dead/unknown answer) was recorded; None while
+        /// the key is healthy. C2: declared, never written yet.
+        GuardianRebuildReason unhealthy_why{GuardianRebuildReason::None};
     };
 
     /// rung 9c R5.2: the per-key claim/queue state machine (replaces #2233 item 3's
@@ -1533,6 +1565,8 @@ private:
         /// #4415: set only by the reuse_existing_locked() skip (state Armed or Reobserved);
         /// the retained-wedge re-observation paths leave it false.
         bool skipped{false};
+        /// #5719: why attach_core did NOT skip (None on a skip). C2: declared, never set yet.
+        GuardianRebuildReason rebuild_reason{GuardianRebuildReason::None};
     };
 
 public:
@@ -1744,6 +1778,8 @@ public:
         /// #4415: true iff reuse_existing_locked() skipped this push (a healthy, unchanged
         /// committed rule, or an identical live arm already in flight); no teardown, no new claim.
         bool skipped{false};
+        /// #5719: why this attach was not skipped (None on a skip). C2: declared, never set yet.
+        GuardianRebuildReason rebuild_reason{GuardianRebuildReason::None};
     };
 
     /// rung 9c PR-5c round 2 (#4221, UP-1 residual): the non-waiting attach_rule()
@@ -2729,6 +2765,7 @@ private:
     std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
     std::atomic<bool> fail_next_unstaged_sweep_{false}; ///< TEST-ONLY sweep-throw seam
+    std::atomic<bool> fail_next_sweep_snapshot_{false}; ///< TEST-ONLY, see fail_next_sweep_snapshot_for_test()
     std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
     /// TEST-ONLY: see unstaged_sweep_stopping_for_test().
     std::atomic<int> unstaged_sweep_stopping_for_test_{-1};
@@ -2978,6 +3015,9 @@ private:
     std::atomic<std::uint64_t> disarm_retained_{0};       ///< R5.2: disarm claims retained after an admission refusal
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
+    std::atomic<std::uint64_t> health_probe_failures_{0};        ///< #5719: probe_key_health catch
+    std::atomic<std::uint64_t> sweep_snapshot_failures_{0};      ///< #5719: sweep_key_health snapshot catch
+    std::atomic<std::uint64_t> sweep_health_query_failures_{0};  ///< #5719: sweep_key_health per-key catch
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
     std::atomic<std::uint64_t> dead_subscription_disarms_skipped_{0}; ///< cs-1: Disarm claims completed for an id already reported dead
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
