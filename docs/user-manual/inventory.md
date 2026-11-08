@@ -513,8 +513,9 @@ whole source name.
   spread. An endpoint with no time zone configured (a container, a VDI image, a
   service with `TZ` unset) uses UTC, and 01:00 to 05:00 UTC can be working hours
   where its users are. A laptop that is off during its window syncs when it next
-  wakes (see Gentle catch-up) and then returns to the next window. The window is
-  built into the agent: it has no setting yet, and the server cannot push one.
+  wakes (see Gentle catch-up) and then returns to the next window. The window
+  is a collection setting (see Collection settings below); the agent's own
+  moment between 01:00 and 05:00 applies until the settings push lands.
 - **Gentle catch-up.** An agent that was switched off, or a laptop that slept
   through its sync, does not report the moment it wakes. A sync more than 15
   minutes overdue is spread over the next 30 minutes by a stable per-agent
@@ -537,6 +538,32 @@ whole source name.
   a spring-forward clock change).
 - **Resilient.** Sync state is kept on the agent and survives reconnects and
   reboots; a failed sync simply retries on the next cycle.
+
+## Collection settings
+
+How often installed software is collected, in which local-time window, in which
+time zone, and which collectors run is set per management group. Each group
+holds one document (an interval of 1 hour to 7 days, an optional window, a zone,
+a switch per collector and a priority), written through
+`PUT /api/v1/inventory/software/collection-settings/{group_id}`
+([REST API](rest-api.md#software-collection-settings)). Settings are managed by
+fleet administrators (the global `ManagementGroup:Write` grant, or the
+administrator role while RBAC enforcement is off); group-scoped delegation is
+not part of this build.
+
+A device belongs to many groups, so the server resolves one document for it:
+each group the device belongs to is a branch (a group that is an ancestor of
+another of its groups gives way to the nearer one), the nearest group with a
+document wins inside a branch, priority decides between branches, and the root
+group's document is the fleet-wide default layer. The plugin kill switches
+always win over a document, and registered apps collection cannot be turned off
+by a document. A window needs a whole-day interval because the agent fires a
+window once per local day.
+
+Settings take effect on agents only when the settings push lands. Until then the
+server stores and resolves them, shows the effective result for a device
+(`GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`), and
+saving a document never starts a collection.
 
 ## Reading the inventory
 
