@@ -6017,6 +6017,132 @@ TEST_CASE("diff_changes: pairing, upgrades, churn and leftovers (pure)",
     }
 }
 
+TEST_CASE("diff_changes: Windows package rows (appx, chocolatey) (pure)",
+          "[software_inventory][v3][ledger]") {
+    // The row shapes the Windows pkg_inventory legs emit: the collector declares no vendor for
+    // them, so the publisher is the origin label `via:<ecosystem>` (which the pairing key reads as
+    // no vendor); no release, no install location; an Appx row is named by the part of its
+    // PackageFullName before the first '_' and carries the architecture; a Chocolatey package
+    // whose nuspec is unreadable has version ''.
+    // One call diffs one collector's rows, so a call never mixes the two ecosystems.
+    const auto row = [](const std::string& name, const std::string& version,
+                        const std::string& ecosystem, const std::string& arch = "") {
+        SoftwareEntry e;
+        e.name = name;
+        e.version = version;
+        e.ecosystem = ecosystem;
+        e.publisher = "via:" + ecosystem;
+        e.arch = arch;
+        const bool choco = ecosystem == "chocolatey";
+        e.kind = choco ? "pkg" : "app";
+        e.source = choco ? "pkg_inventory.packages" : "pkg_inventory.store_packages";
+        return keyed(std::move(e));
+    };
+    using Kind = SoftwareChangeKind;
+    const auto by_name = [](const std::vector<SoftwareChange>& ch) {
+        std::map<std::string, SoftwareChange> out;
+        for (const auto& c : ch)
+            out.emplace(c.name, c);
+        REQUIRE(out.size() == ch.size()); // a repeated name would otherwise be dropped silently
+        return out;
+    };
+
+    SECTION("one Appx name in two architectures is two installs, each upgraded on its own") {
+        // x64 goes 1.0 -> 4.0 and x86 goes 3.0 -> 3.5. Without the architecture in the pairing
+        // stem the removed {1.0, 3.0} would pair with the added {3.5, 4.0} in tuple order and
+        // record 1.0 -> 3.5 and 3.0 -> 4.0.
+        const auto ch = SoftwareInventoryStore::diff_changes(
+            {row("Contoso.Calc", "1.0", "appx", "x64"), row("Contoso.Calc", "3.0", "appx", "x86")},
+            {row("Contoso.Calc", "4.0", "appx", "x64"), row("Contoso.Calc", "3.5", "appx", "x86")});
+        REQUIRE(ch.size() == 2);
+        std::map<std::string, SoftwareChange> by_to;
+        for (const auto& c : ch) {
+            CHECK(c.kind == Kind::kUpgrade);
+            CHECK(c.name == "Contoso.Calc");
+            by_to.emplace(c.to_version, c);
+        }
+        REQUIRE(by_to.size() == 2);
+        CHECK(by_to.at("4.0").from_version == "1.0");
+        CHECK(by_to.at("4.0").instance_key ==
+              row("Contoso.Calc", "4.0", "appx", "x64").instance_key);
+        CHECK(by_to.at("3.5").from_version == "3.0");
+        CHECK(by_to.at("3.5").instance_key ==
+              row("Contoso.Calc", "3.5", "appx", "x86").instance_key);
+    }
+    SECTION("the same Appx version in two architectures is two rows: dropping one is a remove") {
+        // The two rows differ only in the architecture. If the architecture were left out of
+        // the instance key they would be one row and dropping the x86 one would be no event.
+        const auto ch = SoftwareInventoryStore::diff_changes(
+            {row("Contoso.Calc", "1.0", "appx", "x64"), row("Contoso.Calc", "1.0", "appx", "x86")},
+            {row("Contoso.Calc", "1.0", "appx", "x64")});
+        REQUIRE(ch.size() == 1);
+        CHECK(ch[0].kind == Kind::kRemove);
+        CHECK(ch[0].from_version == "1.0");
+        CHECK(ch[0].instance_key == row("Contoso.Calc", "1.0", "appx", "x86").instance_key);
+    }
+    SECTION("an origin label reads as no vendor: label for label is no event, a vendor is new") {
+        // The publisher is hashed verbatim (so the instance key changes with it) but the pairing
+        // stem reads an origin label `via:<ecosystem>` as no vendor. A label for a label pairs at
+        // an equal version and writes nothing; a label becoming a real vendor changes the stem,
+        // so the same version is a removal and an install, not an update.
+        const auto with = [&](const std::string& publisher, const std::string& version = "2.45") {
+            auto e = row("git", version, "chocolatey");
+            e.publisher = publisher;
+            return keyed(std::move(e));
+        };
+        CHECK(SoftwareInventoryStore::diff_changes({with("via:chocolatey")}, {with("via:other")})
+                  .empty());
+        // A ledger row keeps the raw publisher of the row it represents: an upgrade the new row's.
+        const auto bumped = SoftwareInventoryStore::diff_changes({with("via:chocolatey")},
+                                                                 {with("via:other", "2.46")});
+        REQUIRE(bumped.size() == 1);
+        CHECK(bumped[0].kind == Kind::kUpgrade);
+        CHECK(bumped[0].publisher == "via:other");
+        CHECK(bumped[0].from_version == "2.45");
+        CHECK(bumped[0].to_version == "2.46");
+        const auto ch = SoftwareInventoryStore::diff_changes({with("via:chocolatey")},
+                                                             {with("Acme Tools")});
+        REQUIRE(ch.size() == 2);
+        for (const auto& c : ch) {
+            if (c.kind == Kind::kRemove) {
+                CHECK(c.publisher == "via:chocolatey");
+                CHECK(c.from_version == "2.45");
+            } else {
+                CHECK(c.kind == Kind::kInstall);
+                CHECK(c.publisher == "Acme Tools");
+                CHECK(c.to_version == "2.45");
+            }
+        }
+    }
+    SECTION("an unreadable Chocolatey version is a version like any other") {
+        // The collector writes version '' for a package whose nuspec it cannot read (a junction
+        // lib directory does that to every package at once). The pairing rule as it stands does
+        // not treat '' as unknown: the flip is one upgrade per package with an empty side, in
+        // both directions, and a package that appears beside it is an install. This pins that
+        // rule; whether '' should mean unknown is a design question this test does not settle.
+        const auto lost = by_name(SoftwareInventoryStore::diff_changes(
+            {row("git", "2.45", "chocolatey"), row("nodejs", "20.1", "chocolatey")},
+            {row("git", "", "chocolatey"), row("nodejs", "", "chocolatey"),
+             row("7zip", "", "chocolatey")}));
+        REQUIRE(lost.size() == 3);
+        CHECK(lost.at("git").kind == Kind::kUpgrade);
+        CHECK(lost.at("git").from_version == "2.45");
+        CHECK(lost.at("git").to_version.empty());
+        CHECK(lost.at("nodejs").kind == Kind::kUpgrade);
+        CHECK(lost.at("nodejs").from_version == "20.1");
+        CHECK(lost.at("nodejs").to_version.empty());
+        CHECK(lost.at("7zip").kind == Kind::kInstall);
+        CHECK(lost.at("7zip").from_version.empty());
+        CHECK(lost.at("7zip").to_version.empty());
+        const auto back = SoftwareInventoryStore::diff_changes({row("git", "", "chocolatey")},
+                                                               {row("git", "2.45", "chocolatey")});
+        REQUIRE(back.size() == 1);
+        CHECK(back[0].kind == Kind::kUpgrade);
+        CHECK(back[0].from_version.empty());
+        CHECK(back[0].to_version == "2.45");
+    }
+}
+
 TEST_CASE("component row hash and component section hash are pinned",
           "[software_inventory][v3][hash][components]") {
     // The agent writer must reproduce these bytes. Recipe (8 fields, 0x1F between, 0x1E ends the

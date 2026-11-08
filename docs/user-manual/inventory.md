@@ -437,7 +437,8 @@ shows the same software from two report formats.
 A `delta` section lists only what changed (rows removed by hash, rows added) and carries the hash
 the device holds once it has applied it. The server applies it to the rows it holds and checks
 its own result against that hash. If the device's starting point is not the one the server holds,
-a removal names a row the server does not hold, an added row has the key of a held row, the result
+the section is asked for again in full and nothing is written. If a removal names a row the
+server does not hold, an added row has the key of a held row, the result
 does not match, or the facet would hold more than the per-call record cap (20,000), the section is
 undone on its own (the other sections of the report apply) and asked for again in full, which
 repairs a delta that went out of step. The
@@ -458,9 +459,10 @@ of that collector, and a full section for a collector whose stored rows do not m
 section hash (an out-of-band change to the table) set the starting point and produce no history;
 the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
 software is simply deleted from the device's list; the history entry is the record that it was
-there. History older than 400 days is pruned. Nothing in
+there. History older than 400 days is pruned, and decommissioning a device deletes its history
+and its components with it. Nothing in
 the dashboard or the API shows the change history or the components yet. No shipped agent sends v3
-yet; the agent side arrives in a later release. Operators can see the outcome of each section in
+yet. Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
 `need_full`, `mismatch`, `rejected` or `error`, and `facet` is the collector source
 (`unknown` for a name the server does not recognise), and the number of history entries in

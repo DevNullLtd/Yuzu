@@ -1008,7 +1008,8 @@ store's `derive_install_keys`) on both insert paths:
   serialisation of that one row). Rows are sorted and de-duplicated before insert, so it is
   unique per agent by construction. It is the value a `-` record names. A partial unique index on
   `(agent_id, instance_key) WHERE instance_key <> ''` enforces it.
-- `identity_key` is `norm_key(name, publisher)`, `0x1F`, `version`, `0x1F`, `arch`, `0x1F`, the
+- `identity_key` is `norm_key(name, publisher)` (an origin label `via:<ecosystem>` in `publisher` reads
+  as no vendor), `0x1F`, `version`, `0x1F`, `arch`, `0x1F`, the
   install location lower-cased with trailing path separators stripped (empty on v2 rows). It is
   stored and **not** unique and not indexed; it is the key a later consolidation step will use.
 
@@ -1187,12 +1188,22 @@ diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`. A r
 the (`epoch`, `version`, `release`) tuple, so a release-only or epoch-only change (a distribution
 backport, a Flatpak commit) is an update. Within one identity stem (`identity_key` with its
 version segment blanked) both sides are sorted by (tuple, `instance_key`): a removed and an added
-row with an EQUAL tuple pair first and write no row (install_date, signature, or a location
-spelling that normalises equal); the rest pair k-th to k-th in tuple order as one
+row with an EQUAL tuple pair first and write no row (install_date, signature, a location
+spelling that normalises equal, or a publisher that normalises equal, which includes one origin
+label for another); the rest pair k-th to k-th in tuple order as one
 `upgrade(from, to)` each; leftovers are `remove` and `install`. `from_version` and `to_version`
 hold `[epoch:]version[-release]`, non-empty parts only (the `:` follows a non-empty epoch, the
 `-` joins a release to a non-empty version, so a Flatpak row reads as its commit), in the
-existing text columns. **There are no tombstones on `installed_software`**: a removal is a hard
+existing text columns. A version is compared as written, so a row whose version could not be read
+(an empty version, which the collector reports when a Chocolatey package's nuspec cannot be read,
+for example when the `lib` directory is a junction) moves to or from a real version as an
+`upgrade` with an empty side, provided the row has no epoch or release either. The writer must
+also keep the spelling of `arch`, the install location and the vendor stable from one sync to the
+next: a row whose `arch`, or whose location beyond ASCII case and trailing separators, or whose
+vendor beyond what the vendor normaliser reads as equal, changes is a removal and an install, not
+an update. An origin label (`via:<ecosystem>`) reads as no vendor, so one label for another is no
+event, while a source that starts or stops declaring a vendor changes the vendor.
+**There are no tombstones on `installed_software`**: a removal is a hard
 delete plus a `remove` row carrying name, publisher and that version text, so no read needs a
 `removed_at` filter.
 
@@ -1229,6 +1240,10 @@ deletes the rows. A repeated `(kind, path)` inside one section is a producer def
 That includes two components of one kind with an empty path, and it holds for a `full` section
 too: the resend repeats the pair, so the facet is answered `mismatch` on every cycle and none of
 it is stored until the writer sends each path once. It does not repair itself.
+
+The component writer is held to the same precondition as slot 13: `path` and `anchor_app` are
+stored as sent, the server does not enforce it, so the writer must not send per-user paths.
+
 The facet now carries a real section hash and enters the report hash. A row a delta removes is
 hard-deleted with no history row: component change history is out of scope. Components are
 current-state, bounded to the per-call cap per device by the post-apply check above, and die with
