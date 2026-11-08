@@ -2,12 +2,13 @@
  * virtualization_legs.hpp -- shared seam between the virtualization plugin TU and its three
  * per-OS leg TUs (mgmt_posture_legs.hpp shape).
  *
- * Holds (a) the per-OS entry-point declarations, (b) report_host, the SINGLE owner of the
- * `status|host|...` row (no leg and no parser writes one), pairing each status with its result
- * status/completeness, (c) execute_host, the plugin's whole execute() body (dispatch + ABI
- * containment), and (d) `decide`, the OS-free pairing of the pure classifiers with the status
- * decision. The leg TUs keep only the OS shell: they read, fill a Facts and call
- * report_host(ctx, decide(facts)).
+ * Holds (a) the per-OS entry-point declarations, (b) report, the SINGLE owner of every
+ * `status|<action>|...` row (no leg and no parser writes one), pairing each status with its result
+ * status/completeness (report_host is its `host` form), (c) execute_action, the plugin's whole
+ * execute() body (dispatch over the Legs table + ABI containment), and (d) `decide`, the OS-free
+ * pairing of the pure classifiers with the status decision for `host`. The leg TUs keep only the
+ * OS shell: they read, fill a Facts and call report_host(ctx, decide(facts)). The `wsl` action's
+ * decision lives in virtualization_wsl_parsers.hpp (decide_wsl).
  *
  * Reason propagation, one rule: every failed-read token (and the permanent `cpuid:unavailable`
  * limitation, when it is why the kind is unknown) goes into one ConstraintAccumulator; the
@@ -33,6 +34,9 @@ namespace yuzu::virtualization {
 int run_windows(yuzu::CommandContext& ctx);
 int run_linux(yuzu::CommandContext& ctx);
 int run_macos(yuzu::CommandContext& ctx);
+int run_windows_wsl(yuzu::CommandContext& ctx);
+int run_linux_wsl(yuzu::CommandContext& ctx);
+int run_macos_wsl(yuzu::CommandContext& ctx);
 
 enum class StatusState { supported, constrained, unsupported };
 
@@ -48,8 +52,11 @@ inline std::string_view status_token(StatusState s) {
     return "unsupported";
 }
 
-inline std::string format_status_row(StatusState s, std::string_view reason) {
-    std::string r = "status|host|";
+inline std::string format_status_row(std::string_view action, StatusState s,
+                                     std::string_view reason) {
+    std::string r = "status|";
+    r += action;
+    r += '|';
     r += status_token(s);
     r += '|';
     r += reason.empty() ? std::string{"-"} : yuzu::util::safe_output_field(reason);
@@ -65,8 +72,8 @@ struct Posture {
 
 /// Writes the status row FIRST, then the data rows, then the paired result status.
 /// `unsupported` (a leg that read nothing) pairs with UNAVAILABLE/UNKNOWN.
-inline void report_host(yuzu::CommandContext& ctx, const Posture& p) {
-    ctx.write_output(format_status_row(p.status, p.reason));
+inline void report(yuzu::CommandContext& ctx, std::string_view action, const Posture& p) {
+    ctx.write_output(format_status_row(action, p.status, p.reason));
     for (const auto& r : p.rows)
         ctx.write_output(r);
     switch (p.status) {
@@ -84,10 +91,13 @@ inline void report_host(yuzu::CommandContext& ctx, const Posture& p) {
     }
 }
 
+inline void report_host(yuzu::CommandContext& ctx, const Posture& p) { report(ctx, "host", p); }
+
 /// A leg that read nothing: ONE `unsupported` status row carrying the token.
-/// Caller: execute_host's catch arm (`<os>:leg:exception`).
-inline void report_unavailable(yuzu::CommandContext& ctx, std::string_view token) {
-    report_host(ctx, Posture{StatusState::unsupported, std::string{token}, {}});
+/// Callers: execute_action's catch arm (`<os>:leg:exception`) and the non-Windows `wsl` legs.
+inline void report_unavailable(yuzu::CommandContext& ctx, std::string_view action,
+                               std::string_view token) {
+    report(ctx, action, Posture{StatusState::unsupported, std::string{token}, {}});
 }
 
 /// The OS-free decision: classify the host and the container, accumulate every constraint token.
@@ -114,17 +124,31 @@ inline Posture decide(const Facts& f) {
 
 using LegFn = int (*)(yuzu::CommandContext&);
 
+/// The per-OS leg of each action.
+struct Legs {
+    LegFn host;
+    LegFn wsl;
+};
+
 /// The WHOLE body of the plugin's execute(): dispatch and the single ABI containment.
 /// Status-row contract: one status row per dispatch, with three exceptions. (1) An unknown
 /// action writes ONE non-status line (`unknown action: <name>`, invalid UTF-8 replaced and the
-/// rest escaped) and returns 1: no status row. (2) A leg that throws AFTER report_host already
-/// wrote its row gets the catch arm's `unsupported` row appended, so there are TWO and the LAST
-/// status row wins. (3) The recovery itself allocates, so it is guarded too: if it throws as
-/// well, the dispatch returns 1 rather than unwinding across the plugin ABI.
-inline int execute_host(yuzu::CommandContext& ctx, std::string_view action, LegFn leg,
-                        std::string_view leg_exception_token) {
+/// rest escaped) and returns 1: no status row. (2) A leg that throws AFTER report already
+/// wrote its row gets the catch arm's `unsupported` row (named for the action) appended, so
+/// there are TWO and the LAST status row wins. (3) The recovery itself allocates, so it is
+/// guarded too: if it throws as well, the dispatch returns 1 rather than unwinding across the
+/// plugin ABI.
+inline int execute_action(yuzu::CommandContext& ctx, std::string_view action, const Legs& legs,
+                          std::string_view leg_exception_token) {
+    std::string_view known = "host";
     try {
-        if (action != "host") {
+        LegFn leg = nullptr;
+        if (action == "host") {
+            leg = legs.host;
+        } else if (action == "wsl") {
+            leg = legs.wsl;
+            known = "wsl";
+        } else {
             ctx.write_output(std::string{"unknown action: "} +
                              yuzu::util::safe_output_field(
                                  yuzu::util::sanitize_utf8(std::string{action})));
@@ -133,7 +157,7 @@ inline int execute_host(yuzu::CommandContext& ctx, std::string_view action, LegF
         return leg(ctx);
     } catch (...) {
         try {
-            report_unavailable(ctx, leg_exception_token);
+            report_unavailable(ctx, known, leg_exception_token);
         } catch (...) {
             return 1;
         }

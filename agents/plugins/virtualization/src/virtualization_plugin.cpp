@@ -7,6 +7,11 @@
  *                       /run/.containerenv, /run/systemd/container, /proc/self/cgroup;
  *               macOS   sysctl kern.hv_vmm_present and hw.model;
  *               Windows CPUID (x86), the SMBIOS System Information table (RSMB).
+ *   "wsl"  -- Windows only: the WSL distributions of every local profile (account, name,
+ *               version 1|2, state, default, flavor), read from each profile's
+ *               Software/Microsoft/Windows/CurrentVersion/Lxss key through the shared
+ *               with_user_hive ladder (loaded hive first, else the guarded offline mount).
+ *               Linux and macOS answer one `unsupported` status row.
  *
  * FACTS ONLY and read-only, no subprocess. A Windows machine running Hyper-V, VBS or WSL2 sets
  * the CPUID hypervisor bit but is the HOST, not a guest: the Hyper-V root-partition bit
@@ -53,6 +58,25 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "build ships, and the x64 agent on a Windows-on-ARM device reads whatever CPUID the "
          "emulation presents (not measured)"},
     },
+    {
+        /* .action      = */ "wsl",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows-only: WSL distributions are a Windows feature"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows-only: WSL distributions are a Windows feature"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "Reg*W reads of HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\\MSI and each "
+         "local profile's Software\\Microsoft\\Windows\\CurrentVersion\\Lxss key through the shared "
+         "with_user_hive ladder (loaded HKU hive first, else a guarded offline NTUSER.DAT mount "
+         "under SeBackup/SeRestore and the process-wide offline-hive lock); no subprocess",
+         "a profile whose hive was reached by neither arm is counted and reported on its own "
+         "profile row, never read as having no distributions; wsl2 counts version-2 "
+         "distributions and is not a VM count (the utility VM's running state is not read); "
+         "base, VHD and shortcut paths, SIDs, uids and hive mount names are never emitted; "
+         "package version - means unavailable; the offline mount calls have no deadline (the "
+         "walk is bounded in work, not in time)"},
+    },
 };
 
 #if defined(_WIN32)
@@ -68,13 +92,13 @@ constexpr const char* kLegExceptionToken = "macos:leg:exception";
 class VirtualizationPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "virtualization"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
-        return "Virtualization facts: VM or not, which hypervisor, container membership";
+        return "Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"host", nullptr};
+        static const char* acts[] = {"host", "wsl", nullptr};
         return acts;
     }
 
@@ -92,16 +116,19 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
         // Every failure-token literal matches ^(windows|macos|linux):virtualization:[a-z0-9_]+
-        // (:[a-z0-9_]+)*$ (or the seam's `<os>:leg:exception`); the body is execute_host.
+        // (:[a-z0-9_]+)*$ (or the seam's `<os>:leg:exception`); the body is execute_action.
 #if defined(_WIN32)
-        return yuzu::virtualization::execute_host(ctx, action, &yuzu::virtualization::run_windows,
-                                                  kLegExceptionToken);
+        static constexpr yuzu::virtualization::Legs kLegs{&yuzu::virtualization::run_windows,
+                                                          &yuzu::virtualization::run_windows_wsl};
 #elif defined(__linux__)
-        return yuzu::virtualization::execute_host(ctx, action, &yuzu::virtualization::run_linux,
-                                                  kLegExceptionToken);
+        static constexpr yuzu::virtualization::Legs kLegs{&yuzu::virtualization::run_linux,
+                                                          &yuzu::virtualization::run_linux_wsl};
 #elif defined(__APPLE__)
-        return yuzu::virtualization::execute_host(ctx, action, &yuzu::virtualization::run_macos,
-                                                  kLegExceptionToken);
+        static constexpr yuzu::virtualization::Legs kLegs{&yuzu::virtualization::run_macos,
+                                                          &yuzu::virtualization::run_macos_wsl};
+#endif
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+        return yuzu::virtualization::execute_action(ctx, action, kLegs, kLegExceptionToken);
 #endif
         return 1; // unreachable on a supported build
     }

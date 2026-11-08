@@ -10,7 +10,7 @@
  * The live-host cases assert SHAPE (status row first, fixed row order, closed vocabularies),
  * never host-specific values: whether a shared CI runner is a VM, which hypervisor, or whether
  * it sits in a container is unknown. Every classification case lives in
- * test_virtualization_parsers.cpp; the [seam] cases here only pin execute_host and the
+ * test_virtualization_parsers.cpp; the [seam] cases here only pin execute_action and the
  * report_host status pairing, without loading the plugin.
  */
 #include <catch2/catch_test_macros.hpp>
@@ -21,10 +21,11 @@
 
 #include "local_dispatcher.hpp"
 
-#include "virtualization_legs.hpp" // execute_host / report_host
+#include "virtualization_legs.hpp" // execute_action / report_host
 
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <filesystem>
 #include <initializer_list>
 #include <optional>
@@ -120,7 +121,7 @@ std::optional<LoadedPlugin> load_plugin() {
     return LoadedPlugin{std::move(*loaded), d};
 }
 
-/// Seam probes: execute_host over legs that throw / report a constrained read.
+/// Seam probes: execute_action over legs that throw / report a constrained read.
 int throwing_leg(yuzu::CommandContext&) { throw std::runtime_error("probe: the leg threw"); }
 
 /// Throws AFTER report_host already wrote its rows: the catch arm appends a second status row.
@@ -146,11 +147,13 @@ int supported_leg(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-template <yuzu::virtualization::LegFn Leg>
+template <yuzu::virtualization::LegFn Leg, yuzu::virtualization::LegFn WslLeg = Leg>
 int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
                  std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
-    return yuzu::virtualization::execute_host(ctx, action, Leg, "linux:leg:exception");
+    return yuzu::virtualization::execute_action(ctx, action,
+                                                yuzu::virtualization::Legs{Leg, WslLeg},
+                                                "linux:leg:exception");
 }
 
 std::size_t field_count(const std::string& row) {
@@ -333,4 +336,114 @@ TEST_CASE("virtualization execute seam: a leg that throws after reporting keeps 
     CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE); // the recovery's status, not the leg's OK
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     CHECK(r.result_provenance == "linux:leg:exception");
+}
+
+// ---------------------------------------------------------------------------------------------
+// wsl
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("virtualization plugin: wsl answers per OS (one unsupported row off Windows)",
+          "[virtualization][dispatcher][wsl]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "wsl");
+    CHECK(result.rc == 0); // a degraded read is never a failed command
+    CHECK_FALSE(result.truncated);
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+#if defined(_WIN32)
+    INFO("status row: " << rows[0]);
+    REQUIRE(starts_with(rows[0], "status|wsl|"));
+    CHECK((starts_with(rows[0], "status|wsl|supported|") ||
+           starts_with(rows[0], "status|wsl|constrained|")));
+    REQUIRE(rows.size() >= 2);
+    REQUIRE(starts_with(rows[1], "summary|"));
+    CHECK(field_count(rows[1]) == 6);
+    for (std::size_t i = 1; i <= 4; ++i)
+        CHECK(field(rows[1], i).find_first_not_of("0123456789") == std::string::npos);
+    for (std::size_t i = 2; i < rows.size(); ++i) {
+        INFO("row: " << rows[i]);
+        if (starts_with(rows[i], "profile|")) {
+            CHECK(field_count(rows[i]) == 4);
+            CHECK(one_of(field(rows[i], 2), {"not_found", "privilege_missing", "mount_failed",
+                                             "access_denied", "file_refused", "unload_failed",
+                                             "backup_skipped", "sid_invalid"}));
+        } else {
+            REQUIRE(starts_with(rows[i], "distribution|"));
+            CHECK(field_count(rows[i]) == 7);
+            CHECK(one_of(field(rows[i], 3), {"1", "2", "unknown"}));
+            CHECK(one_of(field(rows[i], 5), {"yes", "no"}));
+        }
+    }
+    for (const auto& r : rows) {
+        CHECK(r.find("S-1-5-") == std::string::npos);
+        CHECK(r.find("YUZU_HIVE") == std::string::npos);
+        CHECK(r.find("\\AppData\\") == std::string::npos);
+        CHECK(r.find("NTUSER") == std::string::npos);
+    }
+#else
+    REQUIRE(rows.size() == 1);
+#if defined(__APPLE__)
+    CHECK(rows[0] == "status|wsl|unsupported|macos:virtualization:wsl:unsupported");
+#else
+    CHECK(rows[0] == "status|wsl|unsupported|linux:virtualization:wsl:unsupported");
+#endif
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+#endif
+}
+
+TEST_CASE("virtualization execute seam: a throwing wsl leg is contained under its own action name",
+          "[virtualization][dispatcher][seam][wsl]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &seam_execute<&supported_leg, &throwing_leg>;
+
+    const auto w = dispatcher.run(&d, "wsl");
+    CHECK(w.rc == 0);
+    const auto wrows = captured_rows(w.captured);
+    REQUIRE(wrows.size() == 1);
+    CHECK(wrows[0] == "status|wsl|unsupported|linux:leg:exception");
+    CHECK(w.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+
+    // The host leg of the same table is untouched and keeps its own status name.
+    const auto h = dispatcher.run(&d, "host");
+    const auto hrows = captured_rows(h.captured);
+    REQUIRE(hrows.size() == 1);
+    CHECK(hrows[0] == "status|host|supported|-");
+}
+
+TEST_CASE("virtualization windows shell: with_user_hive is called with the default-on guard and the "
+          "mount name only reaches the log",
+          "[virtualization][wsl][lexical]") {
+    // A lexical pin on the Windows shell (readable on every host): the one place the offline
+    // arm is entered must stay exactly the shared ladder.
+    const char* root = std::getenv("MESON_SOURCE_ROOT");
+    std::ifstream in(std::string{root ? root : "."} +
+                     "/agents/plugins/virtualization/src/virtualization_win.cpp");
+    if (!in) {
+        WARN("virtualization_win.cpp not found from MESON_SOURCE_ROOT -- skipping the lexical pin");
+        return;
+    }
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    const auto call = src.find("with_user_hive(");
+    REQUIRE(call != std::string::npos);
+    CHECK(src.find("with_user_hive(", call + 1) == std::string::npos); // exactly one call
+    const std::string stmt = src.substr(call, 300); // the call, lambda body included
+    CHECK(stmt.find("&report)") != std::string::npos);        // four arguments, ending in the report
+    CHECK(stmt.find("OfflineHiveFileCheck") == std::string::npos);
+    CHECK(src.find("kOfflineHiveFileUnguarded") == std::string::npos);
+    CHECK(src.find("enumerate_hku_subkeys") == std::string::npos);
+
+    // Every mention of mount_name sits inside a spdlog:: call.
+    std::string rest = src;
+    for (std::size_t p; (p = rest.find("spdlog::error(")) != std::string::npos;)
+        rest.erase(p, rest.find(';', p) - p);
+    CHECK(rest.find("mount_name") == std::string::npos);
+    CHECK(src.find("mount_name") != std::string::npos);
 }

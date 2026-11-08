@@ -1,0 +1,906 @@
+/**
+ * test_virtualization_wsl_parsers.cpp -- the pure core of the virtualization `wsl` action:
+ * the Ops-templated Lxss walk, the injected per-profile hive-access seam (live and offline
+ * outcomes), the shared WalkBudget, decide_wsl and the row formatters. A fake registry and a
+ * fake HiveAccessFn stand in for Reg*W and with_user_hive, so every branch runs on every host
+ * with no real registry, file, process or clock.
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#include "virtualization_wsl_parsers.hpp"
+
+#include <deque>
+#include <map>
+#include <regex>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace wsl = yuzu::virtualization::wsl;
+using yuzu::profiles::HiveAccessStatus;
+using yuzu::profiles::ProfileInfo;
+using yuzu::virtualization::Posture;
+using yuzu::virtualization::StatusState;
+
+namespace {
+
+constexpr const char* kSidA = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+constexpr const char* kSidB = "S-1-5-21-1111111111-2222222222-3333333333-1002";
+constexpr const char* kSidC = "S-1-5-21-1111111111-2222222222-3333333333-1003";
+constexpr const char* kMountName =
+    "YUZU_HIVE_S-1-5-21-1111111111-2222222222-3333333333-1001_0123456789abcdef_7";
+
+constexpr const char* kGuid1 = "{11111111-2222-3333-4444-555555555555}";
+constexpr const char* kGuid2 = "{AAAAAAAA-bbbb-CCCC-dddd-EEEEEEEEEEEE}";
+
+std::wstring w(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+
+// -- fake registry ---------------------------------------------------------------------------
+
+struct Val {
+    std::uint32_t type = wsl::kRegSz;
+    std::vector<std::byte> data;
+    long fail_rc = 0;      // returned for any query when non-zero
+    long fill_rc = 0;      // returned by the FILL call only
+};
+
+struct Node {
+    std::vector<std::pair<std::wstring, Node*>> children;
+    std::map<std::wstring, Val> values;
+    long open_rc = 0;
+    long enum_fail_rc = 0; // returned at enum_fail_idx
+    std::size_t enum_fail_idx = static_cast<std::size_t>(-1);
+};
+
+struct FakeOps {
+    std::deque<Node> arena;
+    int opens = 0, closes = 0, enums = 0, probes = 0, fills = 0;
+    bool throw_on_enum = false;
+
+    Node& node() { return arena.emplace_back(); }
+    Node& child(Node& parent, const std::wstring& name) {
+        Node& c = node();
+        parent.children.emplace_back(name, &c);
+        return c;
+    }
+
+    static void set_sz(Node& n, const wchar_t* name, const std::string& v, std::uint32_t type = wsl::kRegSz) {
+        Val val;
+        val.type = type;
+        for (char c : v)
+            val.data.push_back(static_cast<std::byte>(c));
+        val.data.push_back(std::byte{0});
+        n.values[name] = std::move(val);
+    }
+    static void set_dword(Node& n, const wchar_t* name, std::uint32_t v) {
+        Val val;
+        val.type = wsl::kRegDword;
+        for (int i = 0; i < 4; ++i)
+            val.data.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xff));
+        n.values[name] = std::move(val);
+    }
+
+    long open_key(void* parent, const wchar_t* name, void*& out) {
+        auto* p = static_cast<Node*>(parent);
+        for (auto& [n, c] : p->children) {
+            if (n == name) {
+                if (c->open_rc != 0)
+                    return c->open_rc;
+                out = c;
+                ++opens;
+                return wsl::kErrorSuccess;
+            }
+        }
+        return wsl::kErrorFileNotFound;
+    }
+    void close_key(void*) { ++closes; }
+    long enum_key(void* parent, std::uint32_t idx, std::wstring& name) {
+        if (throw_on_enum)
+            throw std::runtime_error("probe: enum threw");
+        ++enums;
+        auto* p = static_cast<Node*>(parent);
+        if (idx == p->enum_fail_idx)
+            return p->enum_fail_rc;
+        if (idx >= p->children.size())
+            return wsl::kErrorNoMoreItems;
+        name = p->children[idx].first;
+        return wsl::kErrorSuccess;
+    }
+    long query_value(void* key, const wchar_t* name, std::uint32_t& type, std::span<std::byte> buf,
+                     std::uint32_t& size) {
+        auto* n = static_cast<Node*>(key);
+        auto it = n->values.find(name);
+        if (it == n->values.end())
+            return wsl::kErrorFileNotFound;
+        const Val& v = it->second;
+        if (v.fail_rc != 0)
+            return v.fail_rc;
+        type = v.type;
+        const auto need = static_cast<std::uint32_t>(v.data.size());
+        if (buf.empty()) {
+            ++probes;
+            size = need;
+            return wsl::kErrorSuccess;
+        }
+        ++fills;
+        if (v.fill_rc != 0)
+            return v.fill_rc;
+        if (buf.size() < v.data.size()) {
+            size = need;
+            return wsl::kErrorMoreData;
+        }
+        std::copy(v.data.begin(), v.data.end(), buf.begin());
+        size = need;
+        return wsl::kErrorSuccess;
+    }
+    std::string utf8(std::wstring_view s) const { return std::string(s.begin(), s.end()); }
+    std::string reg_sz_utf8(std::span<const std::byte> p) const {
+        std::string out;
+        for (auto b : p) {
+            if (b == std::byte{0})
+                break;
+            out += static_cast<char>(b);
+        }
+        return out;
+    }
+};
+
+struct Distro {
+    std::string guid, name;
+    std::uint32_t version = 2, state = 1;
+    std::string flavor = "ubuntu";
+};
+
+/// A hive root holding Lxss with the given distributions; `default_guid` empty = none set.
+Node& make_hive(FakeOps& ops, const std::vector<Distro>& distros, const std::string& default_guid = {}) {
+    Node& root = ops.node();
+    Node& lx = ops.child(root, wsl::detail::kLxssPath);
+    if (!default_guid.empty())
+        FakeOps::set_sz(lx, L"DefaultDistribution", default_guid);
+    for (const auto& d : distros) {
+        Node& dk = ops.child(lx, w(d.guid));
+        FakeOps::set_sz(dk, L"DistributionName", d.name);
+        FakeOps::set_dword(dk, L"Version", d.version);
+        FakeOps::set_dword(dk, L"State", d.state);
+        FakeOps::set_sz(dk, L"Flavor", d.flavor);
+        // Values that must never be read or emitted.
+        FakeOps::set_sz(dk, L"BasePath", "C:\\Users\\SECRETPATH\\AppData\\Local\\Packages");
+        FakeOps::set_sz(dk, L"VhdFileName", "ext4.SECRETVHD");
+        FakeOps::set_dword(dk, L"DefaultUid", 424242);
+    }
+    return root;
+}
+
+Node& lxss_of(Node& root) { return *root.children.front().second; }
+
+// -- fake access seam ------------------------------------------------------------------------
+
+struct Cfg {
+    HiveAccessStatus status = HiveAccessStatus::ok;
+    Node* root = nullptr; // walked when status == ok
+    std::string refusal;
+    bool unload_failed = false;
+    long live_rc = wsl::kErrorSuccess;
+};
+
+struct FakeAccess {
+    std::map<std::string, Cfg> cfg;
+    std::map<std::string, int> calls;
+
+    wsl::HiveAccessFn fn() {
+        return [this](const ProfileInfo& p, const std::function<void(void*)>& walk) {
+            ++calls[p.sid];
+            const Cfg& c = cfg.at(p.sid);
+            if (c.status == HiveAccessStatus::ok && c.root)
+                walk(c.root);
+            wsl::HiveAccess a;
+            a.status = c.status;
+            a.refusal = c.refusal;
+            a.unload_failed = c.unload_failed;
+            a.live_open_rc = c.live_rc;
+            return a;
+        };
+    }
+    int total_calls() const {
+        int n = 0;
+        for (auto& [k, v] : calls)
+            n += v;
+        return n;
+    }
+};
+
+ProfileInfo profile(const std::string& sid, const std::string& name) {
+    ProfileInfo p;
+    p.sid = sid;
+    p.profile_name = name;
+    p.profile_path = "C:\\Users\\" + name;
+    return p;
+}
+
+struct Run {
+    wsl::WslReads reads;
+    Posture posture;
+};
+
+Run run(std::vector<ProfileInfo> profiles, FakeAccess& acc, FakeOps& ops, wsl::WalkBudget& budget) {
+    Run r;
+    wsl::collect_wsl(std::span<const ProfileInfo>{profiles}, acc.fn(), ops, budget, r.reads);
+    r.posture = wsl::decide_wsl(r.reads);
+    return r;
+}
+
+Run run(std::vector<ProfileInfo> profiles, FakeAccess& acc, FakeOps& ops) {
+    wsl::WalkBudget budget;
+    return run(std::move(profiles), acc, ops, budget);
+}
+
+bool has_row(const Posture& p, const std::string& row) {
+    return std::find(p.rows.begin(), p.rows.end(), row) != p.rows.end();
+}
+
+std::string joined(const Posture& p) {
+    std::string s = p.reason;
+    for (const auto& r : p.rows)
+        s += "\n" + r;
+    return s;
+}
+
+bool has_token(const Posture& p, const std::string& suffix) {
+    return p.reason.find(std::string{wsl::kTokenPrefix} + suffix) != std::string::npos;
+}
+
+std::size_t fields(const std::string& row) {
+    std::size_t n = 1;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size())
+            ++i;
+        else if (row[i] == '|')
+            ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("wsl: a loaded hive lists its distributions with default, version and state",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu-26.04", 2, 1, "ubuntu"},
+                                 {kGuid2, "Legacy", 1, 3, "-"}},
+                           kGuid1);
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "alice")}, acc, ops);
+
+    CHECK(r.posture.status == StatusState::supported);
+    CHECK(r.posture.reason.empty());
+    REQUIRE(r.posture.rows.size() == 3);
+    CHECK(r.posture.rows[0] == "summary|2|1|1|0|-");
+    CHECK(r.posture.rows[1] == "distribution|alice|Legacy|1|installing|no|-");
+    CHECK(r.posture.rows[2] == "distribution|alice|Ubuntu-26.04|2|installed|yes|ubuntu");
+    CHECK(ops.opens == ops.closes);
+}
+
+TEST_CASE("wsl: the offline arm is indistinguishable on the wire; ok ignores a refused live root",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Debian", 2, 1, "debian"}});
+    FakeAccess live, offline;
+    live.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    offline.cfg[kSidA] = {HiveAccessStatus::ok, &hive, "", false, wsl::kErrorAccessDenied};
+    const auto a = run({profile(kSidA, "alice")}, live, ops);
+    const auto b = run({profile(kSidA, "alice")}, offline, ops);
+    CHECK(a.posture.rows == b.posture.rows);
+    CHECK(b.posture.status == StatusState::supported);
+    CHECK_FALSE(has_token(b.posture, "hive_access_denied"));
+}
+
+TEST_CASE("wsl: a guard refusal skips the walk, is carried verbatim and spares other profiles",
+          "[virtualization][wsl]") {
+    for (const char* lit : {"hive_path_unc", "hive_stat_failed:win32_5"}) {
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+        acc.cfg[kSidB] = {HiveAccessStatus::file_refused, nullptr, lit};
+        const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob")}, acc, ops);
+        CHECK(r.posture.status == StatusState::constrained);
+        CHECK(has_token(r.posture, "hive_file_refused"));
+        const std::string row = std::string{"profile|bob|file_refused|"} + lit;
+        CHECK(has_row(r.posture, row));
+        CHECK(fields(row) == 4);
+        CHECK(r.posture.rows[0] == "summary|1|1|1|1|-");
+        CHECK(has_row(r.posture, "distribution|alice|Ubuntu|2|installed|no|ubuntu"));
+    }
+}
+
+TEST_CASE("wsl: every failed status x live-root code maps to one outcome, access_denied first",
+          "[virtualization][wsl]") {
+    struct Case {
+        HiveAccessStatus st;
+        const char* outcome;
+        const char* token;
+    };
+    const Case cases[] = {
+        {HiveAccessStatus::not_found, "not_found", "hive_not_found"},
+        {HiveAccessStatus::privilege_missing, "privilege_missing", "hive_privilege_missing"},
+        {HiveAccessStatus::mount_failed, "mount_failed", "hive_mount_failed"},
+        {HiveAccessStatus::file_refused, "file_refused", "hive_file_refused"},
+    };
+    for (const auto& c : cases) {
+        for (const long live : {wsl::kErrorFileNotFound, wsl::kErrorAccessDenied}) {
+            FakeOps ops;
+            Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+            FakeAccess acc;
+            acc.cfg[kSidA] = {c.st, nullptr, c.st == HiveAccessStatus::file_refused ? "hive_hardlinked" : "",
+                              false, live};
+            acc.cfg[kSidB] = {HiveAccessStatus::ok, &hive};
+            const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob")}, acc, ops);
+            INFO(c.outcome << " live=" << live);
+            const bool denied = (live == wsl::kErrorAccessDenied);
+            const std::string outcome = denied ? "access_denied" : c.outcome;
+            const std::string token = denied ? "hive_access_denied" : c.token;
+            const std::string detail =
+                c.st == HiveAccessStatus::file_refused ? "hive_hardlinked" : "-";
+            CHECK(has_row(r.posture, "profile|alice|" + outcome + "|" + detail));
+            CHECK(has_token(r.posture, token));
+            CHECK(acc.calls[kSidB] == 1); // the next profile is still accessed and listed
+            CHECK(r.posture.rows[0] == "summary|1|1|1|1|-");
+        }
+    }
+}
+
+TEST_CASE("wsl: unload_failed is independent of the access status and never carries the mount name",
+          "[virtualization][wsl]") {
+    struct Case {
+        HiveAccessStatus st;
+        std::string refusal;
+        bool expect_failure_row;
+        std::string failure_row;
+    };
+    const Case cases[] = {
+        {HiveAccessStatus::ok, "", false, ""},
+        {HiveAccessStatus::file_refused, "hive_identity_changed", true,
+         "profile|alice|file_refused|hive_identity_changed"},
+        {HiveAccessStatus::mount_failed, "", true, "profile|alice|mount_failed|-"},
+    };
+    for (const auto& c : cases) {
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+        FakeAccess acc;
+        acc.cfg[kSidA] = {c.st, &hive, c.refusal, true};
+        const auto r = run({profile(kSidA, "alice")}, acc, ops);
+        CHECK(has_row(r.posture, "profile|alice|unload_failed|-"));
+        CHECK(has_token(r.posture, "hive_unload_failed"));
+        CHECK(r.posture.status == StatusState::constrained);
+        if (c.expect_failure_row) {
+            CHECK(has_row(r.posture, c.failure_row));
+            CHECK(r.posture.rows[0].starts_with("summary|0|0|0|1|"));
+        } else {
+            // The hive was read: the distribution stays, profiles_read counts it, not_loaded does not.
+            CHECK(r.posture.rows[0] == "summary|1|1|1|0|-");
+            CHECK(has_row(r.posture, "distribution|alice|Ubuntu|2|installed|no|ubuntu"));
+        }
+        const std::string all = joined(r.posture);
+        CHECK(all.find("S-1-5-") == std::string::npos);
+        CHECK(all.find("YUZU_HIVE") == std::string::npos);
+        CHECK(all.find(kMountName) == std::string::npos);
+    }
+}
+
+TEST_CASE("wsl: a .bak entry and an invalid SID are named and never accessed", "[virtualization][wsl]") {
+    FakeOps ops;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::not_found};
+    const std::string bak = std::string{kSidA} + ".bak";
+    const auto r = run({profile(bak, "oldalice"), profile("not-a-sid", "mallory"),
+                        profile("S-1-5-21-1-2-", "trailing"), profile(kSidA, "alice")},
+                       acc, ops);
+    CHECK(acc.calls[bak] == 0);
+    CHECK(acc.calls["not-a-sid"] == 0);
+    CHECK(acc.calls["S-1-5-21-1-2-"] == 0);
+    CHECK(acc.calls[kSidA] == 1);
+    CHECK(has_row(r.posture, "profile|oldalice|backup_skipped|-"));
+    CHECK(has_row(r.posture, "profile|mallory|sid_invalid|-"));
+    CHECK(has_row(r.posture, "profile|trailing|sid_invalid|-"));
+    CHECK(has_token(r.posture, "profile_backup_skipped"));
+    CHECK(has_token(r.posture, "profile_sid_invalid"));
+    CHECK(r.posture.rows[0] == "summary|0|0|0|4|-");
+}
+
+TEST_CASE("wsl: the SID validator accepts only S-1-<n>(-<n>)*", "[virtualization][wsl]") {
+    CHECK(wsl::is_valid_sid_string(kSidA));
+    CHECK(wsl::is_valid_sid_string("S-1-5-18"));
+    CHECK_FALSE(wsl::is_valid_sid_string(""));
+    CHECK_FALSE(wsl::is_valid_sid_string("S-1-"));
+    CHECK_FALSE(wsl::is_valid_sid_string("S-1-5--1"));
+    CHECK_FALSE(wsl::is_valid_sid_string("S-1-5-1a"));
+    CHECK_FALSE(wsl::is_valid_sid_string(std::string{"S-1-"} + std::string(300, '1')));
+}
+
+// -- budget ----------------------------------------------------------------------------------
+
+namespace {
+
+struct Fleet {
+    FakeOps ops;
+    FakeAccess acc;
+    std::vector<ProfileInfo> profiles;
+
+    explicit Fleet(int per_hive = 2) {
+        const char* sids[] = {kSidA, kSidB, kSidC};
+        const char* names[] = {"alice", "bob", "carol"};
+        for (int i = 0; i < 3; ++i) {
+            std::vector<Distro> ds;
+            for (int k = 0; k < per_hive; ++k) {
+                char g[64];
+                std::snprintf(g, sizeof g, "{0000000%d-0000-0000-0000-00000000000%d}", i + 1, k);
+                ds.push_back({g, std::string{names[i]} + "-d" + std::to_string(k), 2, 1, "x"});
+            }
+            Node& hive = make_hive(ops, ds);
+            // A and C are loaded hives, B arrives through the offline arm.
+            acc.cfg[sids[i]] = {HiveAccessStatus::ok, &hive, "", false,
+                                i == 1 ? wsl::kErrorAccessDenied : wsl::kErrorSuccess};
+            profiles.push_back(profile(sids[i], names[i]));
+        }
+    }
+};
+
+} // namespace
+
+TEST_CASE("wsl: the row bound trips alone, inside the second hive, and the third is never accessed",
+          "[virtualization][wsl][budget]") {
+    Fleet f(8);
+    wsl::WalkBudget big;
+    const auto full = run(f.profiles, f.acc, f.ops, big);
+    REQUIRE(full.posture.rows.size() == 1 + 24);
+    CHECK(full.posture.status == StatusState::supported);
+
+    Fleet g(8);
+    wsl::WalkBudget capped(/*max_rows=*/12, wsl::kDefaultMaxBytes, wsl::kDefaultMaxVisited);
+    const auto r = run(g.profiles, g.acc, g.ops, capped);
+    CHECK(has_token(r.posture, "row_cap"));
+    CHECK_FALSE(has_token(r.posture, "entry_cap"));
+    CHECK(g.acc.calls[kSidB] == 1); // the cap tripped inside B ...
+    CHECK(g.acc.calls[kSidC] == 0); // ... and C was never reached
+    // 12 rows - 2 reserved = 10 retained distributions; the summary counts exactly those.
+    CHECK(r.posture.rows.size() == 1 + 10);
+    CHECK(r.posture.rows[0].starts_with("summary|10|"));
+    CHECK(g.ops.opens == g.ops.closes);
+}
+
+TEST_CASE("wsl: the byte bound trips alone, at the exact byte", "[virtualization][wsl][budget]") {
+    Fleet f(3);
+    wsl::WalkBudget big;
+    (void)run(f.profiles, f.acc, f.ops, big);
+    const std::size_t exact = big.rows.bytes;
+
+    Fleet fit(3);
+    wsl::WalkBudget at(wsl::kDefaultMaxRows, exact, wsl::kDefaultMaxVisited);
+    const auto ok = run(fit.profiles, fit.acc, fit.ops, at);
+    CHECK_FALSE(has_token(ok.posture, "row_cap"));
+
+    Fleet tight(3);
+    wsl::WalkBudget under(wsl::kDefaultMaxRows, exact - 1, wsl::kDefaultMaxVisited);
+    const auto r = run(tight.profiles, tight.acc, tight.ops, under);
+    CHECK(has_token(r.posture, "row_cap"));
+    CHECK(under.rows.bytes <= exact - 1);
+    CHECK(r.posture.rows.size() == 1 + 8);
+}
+
+TEST_CASE("wsl: the visited-entry bound trips alone and stops the loop", "[virtualization][wsl][budget]") {
+    Fleet f(2);
+    wsl::WalkBudget big;
+    (void)run(f.profiles, f.acc, f.ops, big);
+    const std::size_t exact = big.visited;
+    REQUIRE(exact > 10);
+
+    Fleet fit(2);
+    wsl::WalkBudget at(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, exact);
+    CHECK_FALSE(has_token(run(fit.profiles, fit.acc, fit.ops, at).posture, "entry_cap"));
+
+    Fleet cut(2);
+    wsl::WalkBudget under(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, exact - 1);
+    const auto r = run(cut.profiles, cut.acc, cut.ops, under);
+    CHECK(has_token(r.posture, "entry_cap"));
+    CHECK_FALSE(has_token(r.posture, "row_cap"));
+    CHECK(cut.acc.calls[kSidC] == 1); // the last call of the last hive was the one refused
+    CHECK(cut.ops.opens == cut.ops.closes);
+
+    Fleet early(2);
+    wsl::WalkBudget tiny(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, 3);
+    const auto e = run(early.profiles, early.acc, early.ops, tiny);
+    CHECK(has_token(e.posture, "entry_cap"));
+    CHECK(early.acc.calls[kSidB] == 0); // stopped in A: later profiles never accessed
+    CHECK(early.acc.calls[kSidC] == 0);
+
+    // Production limits are the documented ones.
+    wsl::WalkBudget prod;
+    CHECK(prod.rows.max_rows == 1024);
+    CHECK(prod.rows.max_bytes == 262144);
+    CHECK(prod.max_visited == 4096);
+}
+
+TEST_CASE("wsl: the header reserve is a proven maximum", "[virtualization][wsl][budget]") {
+    std::string reason;
+    for (const auto s : wsl::kFixedTokenSuffixes) {
+        if (!reason.empty())
+            reason += ',';
+        reason += std::string{wsl::kTokenPrefix} + std::string{s};
+    }
+    reason += std::string{","} + std::string{wsl::kTokenPrefix} + "package_win32_-2147483648";
+    reason += std::string{","} + std::string{wsl::kTokenPrefix} + "profile_list_win32_-2147483648";
+    const std::string status =
+        yuzu::virtualization::format_status_row("wsl", StatusState::constrained, reason);
+
+    // Worst-case escaping: every version byte is a pipe, doubled by safe_output_field.
+    wsl::WslReads reads;
+    reads.package_version = yuzu::virtualization::wire_field(std::string(64, '|'));
+    reads.profiles_not_loaded = 18446744073709551615ULL;
+    const auto p = wsl::decide_wsl(reads);
+    std::string summary = p.rows.at(0);
+    // decide_wsl's counts are small here; widen the numeric fields to the 20-digit worst case.
+    summary = "summary|18446744073709551615|18446744073709551615|18446744073709551615|"
+              "18446744073709551615|" + *reads.package_version;
+    CHECK(status.size() + 1 + summary.size() + 1 <= wsl::kHeaderReserveBytes);
+    CHECK(reads.package_version->size() == 128);
+}
+
+TEST_CASE("wsl: a profile row that would cross the row budget is itself row_cap",
+          "[virtualization][wsl][budget]") {
+    FakeOps ops;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::not_found};
+    acc.cfg[kSidB] = {HiveAccessStatus::not_found};
+    wsl::WalkBudget b(/*max_rows=*/3, wsl::kDefaultMaxBytes, wsl::kDefaultMaxVisited);
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob")}, acc, ops, b);
+    CHECK(has_row(r.posture, "profile|alice|not_found|-"));
+    CHECK_FALSE(has_row(r.posture, "profile|bob|not_found|-"));
+    CHECK(has_token(r.posture, "row_cap"));
+    CHECK(r.posture.rows[0] == "summary|0|0|0|2|-"); // counts stay truthful
+}
+
+TEST_CASE("wsl: retained values are the sanitized, charged ones; e-mail shapes are redacted",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    const std::string big_email = std::string(3000, 'a') + "@example.com";
+    Node& hive = make_hive(ops, {{kGuid1, big_email, 2, 1, "me@example.org"}});
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    wsl::WalkBudget b;
+    const auto r = run({profile(kSidA, "alice")}, acc, ops, b);
+    REQUIRE(r.reads.hives.size() == 1);
+    REQUIRE(r.reads.hives[0].distros.size() == 1);
+    const auto& d = r.reads.hives[0].distros[0];
+    CHECK(*d.name == "[redacted-email]");
+    CHECK(*d.flavor == "[redacted-email]");
+    CHECK(has_row(r.posture, "distribution|alice|[redacted-email]|2|installed|no|[redacted-email]"));
+    // charged == formatted row + newline, on top of the reserved header
+    const std::string row = wsl::format_distribution_row("alice", d);
+    CHECK(b.rows.bytes == wsl::kHeaderReserveBytes + row.size() + 1);
+}
+
+// -- walk branches ---------------------------------------------------------------------------
+
+TEST_CASE("wsl: an exception inside a mounted hive propagates and every key is closed",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+    ops.throw_on_enum = true;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    wsl::WslReads reads;
+    wsl::WalkBudget b;
+    std::vector<ProfileInfo> ps{profile(kSidA, "alice")};
+    CHECK_THROWS(wsl::collect_wsl(std::span<const ProfileInfo>{ps}, acc.fn(), ops, b, reads));
+    CHECK(ops.opens == ops.closes);
+}
+
+TEST_CASE("wsl: DefaultDistribution matches case-insensitively; absent means every row no",
+          "[virtualization][wsl]") {
+    {
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid2, "Ubuntu", 2, 1, "ubuntu"}},
+                               "{aaaaaaaa-BBBB-cccc-DDDD-eeeeeeeeeeee}");
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+        CHECK(has_row(run({profile(kSidA, "alice")}, acc, ops).posture,
+                      "distribution|alice|Ubuntu|2|installed|yes|ubuntu"));
+    }
+    {
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid2, "Ubuntu", 2, 1, "ubuntu"}});
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+        CHECK(has_row(run({profile(kSidA, "alice")}, acc, ops).posture,
+                      "distribution|alice|Ubuntu|2|installed|no|ubuntu"));
+    }
+}
+
+TEST_CASE("wsl: the Lxss key open maps NOT_FOUND to read-ok, denial and failure to tokens",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& none = ops.node(); // a hive with no Lxss key
+    Node& denied = make_hive(ops, {});
+    lxss_of(denied).open_rc = wsl::kErrorAccessDenied;
+    Node& broken = make_hive(ops, {});
+    lxss_of(broken).open_rc = 1450;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &none};
+    acc.cfg[kSidB] = {HiveAccessStatus::ok, &denied};
+    acc.cfg[kSidC] = {HiveAccessStatus::ok, &broken};
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")}, acc, ops);
+    CHECK(has_token(r.posture, "hive_access_denied"));
+    CHECK(has_token(r.posture, "hive_open_failed"));
+    CHECK(r.posture.rows[0] == "summary|0|0|1|0|-"); // only the NOT_FOUND hive counts as read
+    CHECK(r.posture.rows.size() == 1);
+}
+
+TEST_CASE("wsl: only GUID-shaped children are opened; others are skipped silently",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+    Node& lx = lxss_of(hive);
+    for (const wchar_t* junk : {L"InstallStatus", L"AppxInstallerCache", L"{not-a-guid}",
+                                L"{11111111-22223333-4444-555555555555}", L""})
+        ops.child(lx, junk);
+    ops.child(lx, std::wstring(L"{11111111-2222-3333-4444-55555555555") + std::wstring(1, L'\0') + L"}");
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "alice")}, acc, ops);
+    CHECK(r.posture.status == StatusState::supported);
+    CHECK(r.posture.rows.size() == 2);
+    CHECK(ops.opens == 2); // the Lxss key and the one distribution
+    CHECK(wsl::is_guid_shaped(L"{AAAAAAAA-bbbb-CCCC-dddd-EEEEEEEEEEEE}"));
+    CHECK_FALSE(wsl::is_guid_shaped(L"{AAAAAAAA-bbbb-CCCC-dddd-EEEEEEEEEEEG}"));
+}
+
+TEST_CASE("wsl: an enumeration failure mid-walk keeps the rows so far and is a token",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}, {kGuid2, "Debian", 2, 1, "debian"}});
+    lxss_of(hive).enum_fail_idx = 1;
+    lxss_of(hive).enum_fail_rc = wsl::kErrorAccessDenied;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "alice")}, acc, ops);
+    CHECK(has_token(r.posture, "hive_enum_failed"));
+    CHECK(r.posture.status == StatusState::constrained);
+    CHECK(r.posture.rows.size() == 2);
+}
+
+TEST_CASE("wsl: a distribution key that fails to open is a typed row", "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}}, kGuid1);
+    lxss_of(hive).children.front().second->open_rc = wsl::kErrorAccessDenied;
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "alice")}, acc, ops);
+    CHECK(has_token(r.posture, "distro_open_failed"));
+    CHECK(has_row(r.posture, "distribution|alice|-|unknown|unknown|yes|-"));
+}
+
+TEST_CASE("wsl: RAW value branches classify type, size and race", "[virtualization][wsl]") {
+    struct Mutate {
+        const char* what;
+        std::function<void(Node&)> apply;
+        const char* token; // nullptr = none
+        const char* row;
+        bool fill_called;
+    };
+    const std::vector<Mutate> cases = {
+        {"name typed DWORD", [](Node& d) { FakeOps::set_dword(d, L"DistributionName", 7); },
+         "value_malformed", "distribution|alice|-|2|installed|no|ubuntu", false},
+        {"name oversized (no fill)",
+         [](Node& d) {
+             FakeOps::set_sz(d, L"DistributionName", std::string(5000, 'x'));
+         },
+         "value_oversized", "distribution|alice|-|2|installed|no|ubuntu", false},
+        {"name fill MORE_DATA",
+         [](Node& d) { d.values[L"DistributionName"].fill_rc = wsl::kErrorMoreData; },
+         "value_unreadable", "distribution|alice|-|2|installed|no|ubuntu", true},
+        {"name query denied",
+         [](Node& d) { d.values[L"DistributionName"].fail_rc = wsl::kErrorAccessDenied; },
+         "value_unreadable", "distribution|alice|-|2|installed|no|ubuntu", false},
+        {"version size 8",
+         [](Node& d) {
+             Val v;
+             v.type = wsl::kRegDword;
+             v.data.assign(8, std::byte{1});
+             d.values[L"Version"] = v;
+         },
+         "value_malformed", "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", true},
+        {"version absent", [](Node& d) { d.values.erase(L"Version"); }, nullptr,
+         "distribution|alice|Ubuntu|unknown|installed|no|ubuntu", true},
+        {"state 7", [](Node& d) { FakeOps::set_dword(d, L"State", 7); }, nullptr,
+         "distribution|alice|Ubuntu|2|state_7|no|ubuntu", true},
+        {"flavor absent", [](Node& d) { d.values.erase(L"Flavor"); }, nullptr,
+         "distribution|alice|Ubuntu|2|installed|no|-", true},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+        c.apply(*lxss_of(hive).children.front().second);
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+        const int fills_before = ops.fills;
+        const auto r = run({profile(kSidA, "alice")}, acc, ops);
+        CHECK(has_row(r.posture, c.row));
+        if (c.token)
+            CHECK(has_token(r.posture, c.token));
+        else
+            CHECK(r.posture.status == StatusState::supported);
+        if (std::string{c.what} == "name oversized (no fill)") {
+            // Only the DWORDs and Flavor are filled: the oversized name never allocates a buffer.
+            CHECK(ops.fills - fills_before == 3);
+        }
+    }
+}
+
+TEST_CASE("wsl: nothing on the never-emit list reaches a row", "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}}, kGuid1);
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive, "", true};
+    acc.cfg[kSidB] = {HiveAccessStatus::not_found};
+    const auto r = run({profile(kSidA, ""), profile(kSidB, "bob")}, acc, ops);
+    const std::string all = joined(r.posture);
+    for (const char* secret : {"SECRETPATH", "SECRETVHD", "424242", "S-1-5-", "YUZU_HIVE", kGuid1})
+        CHECK(all.find(secret) == std::string::npos);
+    CHECK(has_row(r.posture, "distribution|-|Ubuntu|2|installed|yes|ubuntu")); // empty folder name -> "-"
+}
+
+TEST_CASE("wsl: hostile names stay seven fields", "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& hive = make_hive(ops, {{kGuid1, std::string("a|b\\c\nd\xff") + "e", 2, 1, "x|y"}});
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+    const auto r = run({profile(kSidA, "ali|ce")}, acc, ops);
+    for (const auto& row : r.posture.rows)
+        if (row.starts_with("distribution|")) {
+            CHECK(fields(row) == 7);
+            CHECK(row.find('\n') == std::string::npos);
+        }
+}
+
+// -- package version and ProfileList ---------------------------------------------------------
+
+TEST_CASE("wsl: the package version is read, bounded and tokenised", "[virtualization][wsl]") {
+    const auto read = [](const std::function<void(FakeOps&, Node&)>& setup) {
+        FakeOps ops;
+        Node& hklm = ops.node();
+        setup(ops, hklm);
+        wsl::WalkBudget b;
+        wsl::WslReads reads;
+        wsl::read_package_version(ops, &hklm, b, reads);
+        CHECK(ops.opens == ops.closes);
+        return reads;
+    };
+    auto ok = read([](FakeOps& o, Node& h) {
+        FakeOps::set_sz(o.child(h, wsl::detail::kMsiPath), L"Version", "3.0.3.0");
+    });
+    CHECK(ok.package_version == "3.0.3.0");
+    CHECK(ok.tokens.empty());
+
+    CHECK_FALSE(read([](FakeOps&, Node&) {}).package_version); // no key: no token
+    CHECK(read([](FakeOps&, Node&) {}).tokens.empty());
+
+    auto longv = read([](FakeOps& o, Node& h) {
+        FakeOps::set_sz(o.child(h, wsl::detail::kMsiPath), L"Version", std::string(65, '1'));
+    });
+    CHECK_FALSE(longv.package_version);
+    CHECK(longv.tokens == std::vector<std::string>{"package_malformed"});
+
+    auto keyfail = read([](FakeOps& o, Node& h) { o.child(h, wsl::detail::kMsiPath).open_rc = wsl::kErrorAccessDenied; });
+    CHECK(keyfail.tokens == std::vector<std::string>{"package_access_denied"});
+
+    auto valfail = read([](FakeOps& o, Node& h) {
+        Node& k = o.child(h, wsl::detail::kMsiPath);
+        FakeOps::set_sz(k, L"Version", "3.0");
+        k.values[L"Version"].fail_rc = 1450;
+    });
+    CHECK(valfail.tokens == std::vector<std::string>{"package_win32_1450"});
+
+    auto wrongtype = read([](FakeOps& o, Node& h) {
+        FakeOps::set_dword(o.child(h, wsl::detail::kMsiPath), L"Version", 3);
+    });
+    CHECK(wrongtype.tokens == std::vector<std::string>{"package_malformed"});
+}
+
+TEST_CASE("wsl: ProfileList discovery is classified, never a prefix read as complete",
+          "[virtualization][wsl]") {
+    using E = wsl::ProfileListEnd;
+    CHECK(wsl::classify_profile_list_end(wsl::kErrorNoMoreItems, wsl::kErrorSuccess) == E::complete);
+    CHECK(wsl::classify_profile_list_end(wsl::kErrorAccessDenied, wsl::kErrorNoMoreItems) == E::enum_failed);
+    CHECK(wsl::classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorNoMoreItems) == E::complete);
+    CHECK(wsl::classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorSuccess) == E::cap);
+    CHECK(wsl::classify_profile_list_end(wsl::kErrorSuccess, wsl::kErrorAccessDenied) == E::enum_failed);
+
+    CHECK_FALSE(wsl::profile_list_token(0, wsl::kErrorNoMoreItems, 0));
+    CHECK(wsl::profile_list_token(wsl::kErrorAccessDenied, 0, 0) == "profile_list_access_denied");
+    CHECK(wsl::profile_list_token(2, 0, 0) == "profile_list_win32_2");
+    CHECK(wsl::profile_list_token(0, wsl::kErrorSuccess, wsl::kErrorSuccess) == "profile_cap");
+    CHECK(wsl::profile_list_token(0, wsl::kErrorSuccess, wsl::kErrorAccessDenied) ==
+          "profile_list_enum_failed");
+}
+
+// -- formatters, decide, grammar -------------------------------------------------------------
+
+TEST_CASE("wsl: state and version tokens", "[virtualization][wsl]") {
+    CHECK(wsl::state_token(1) == "installed");
+    CHECK(wsl::state_token(3) == "installing");
+    CHECK(wsl::state_token(4) == "uninstalling");
+    CHECK(wsl::state_token(5) == "converting");
+    CHECK(wsl::state_token(6) == "exporting");
+    CHECK(wsl::state_token(2) == "state_2");
+    CHECK(wsl::state_token(std::nullopt) == "unknown");
+    CHECK(wsl::version_token(1) == "1");
+    CHECK(wsl::version_token(2) == "2");
+    CHECK(wsl::version_token(3) == "unknown");
+    CHECK(wsl::version_token(std::nullopt) == "unknown");
+}
+
+TEST_CASE("wsl: rows sort by account then name; profile rows by account then outcome",
+          "[virtualization][wsl]") {
+    FakeOps ops;
+    Node& ha = make_hive(ops, {{kGuid2, "Zeta", 2, 1, "z"}, {kGuid1, "Alpha", 2, 1, "a"}});
+    Node& hb = make_hive(ops, {{kGuid1, "Mid", 1, 1, "m"}});
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &hb};
+    acc.cfg[kSidB] = {HiveAccessStatus::ok, &ha, "", true};
+    const auto r = run({profile(kSidA, "zed"), profile(kSidB, "amy")}, acc, ops);
+    std::vector<std::string> d;
+    for (const auto& row : r.posture.rows)
+        d.push_back(row.substr(0, row.find('|', row.find('|') + 1)));
+    CHECK(d == std::vector<std::string>{"summary|3", "profile|amy", "distribution|amy",
+                                        "distribution|amy", "distribution|zed"});
+    CHECK(r.posture.rows[2].find("Alpha") != std::string::npos);
+}
+
+TEST_CASE("wsl: every emitted token matches the class (a) grammar", "[virtualization][wsl]") {
+    const std::regex re{"^windows:virtualization:wsl:[a-z0-9_]+$"};
+    for (const auto s : wsl::kFixedTokenSuffixes)
+        CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + std::string{s}, re));
+    CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + "package_" + wsl::win32_cause(1450), re));
+    CHECK(std::regex_match(std::string{wsl::kTokenPrefix} + "profile_list_" + wsl::win32_cause(5), re));
+    CHECK(wsl::kProfileOutcomes.size() == 8);
+
+    // Every profile-row outcome decide can produce is one of the eight literals.
+    FakeOps ops;
+    FakeAccess acc;
+    const HiveAccessStatus all[] = {HiveAccessStatus::not_found, HiveAccessStatus::privilege_missing,
+                                    HiveAccessStatus::mount_failed, HiveAccessStatus::file_refused};
+    const char* sids[] = {kSidA, kSidB, kSidC, "S-1-5-21-9-9-9-1004"};
+    std::vector<ProfileInfo> ps;
+    for (int i = 0; i < 4; ++i) {
+        acc.cfg[sids[i]] = {all[i], nullptr, "hive_path_unc", i == 0, 0};
+        ps.push_back(profile(sids[i], "u" + std::to_string(i)));
+    }
+    acc.cfg["S-1-5-21-9-9-9-1005"] = {HiveAccessStatus::not_found, nullptr, "", false,
+                                      wsl::kErrorAccessDenied};
+    ps.push_back(profile("S-1-5-21-9-9-9-1005", "denied"));
+    ps.push_back(profile("bad", "b"));
+    ps.push_back(profile(std::string{kSidA} + ".bak", "k"));
+    const auto r = run(ps, acc, ops);
+    std::set<std::string> outcomes;
+    for (const auto& row : r.posture.rows)
+        if (row.starts_with("profile|")) {
+            const auto a = row.find('|', 8);
+            outcomes.insert(row.substr(a + 1, row.find('|', a + 1) - a - 1));
+        }
+    for (const auto& o : outcomes)
+        CHECK(std::find(wsl::kProfileOutcomes.begin(), wsl::kProfileOutcomes.end(), o) !=
+              wsl::kProfileOutcomes.end());
+    CHECK(outcomes.size() == 8);
+    for (const char* tok : {"windows:virtualization:wsl:hive_not_found",
+                            "windows:virtualization:wsl:hive_access_denied"})
+        CHECK(r.posture.reason.find(tok) != std::string::npos);
+    for (std::size_t pos = 0; (pos = r.posture.reason.find("windows:", pos)) != std::string::npos; ++pos) {
+        const auto end = r.posture.reason.find(',', pos);
+        CHECK(std::regex_match(r.posture.reason.substr(pos, end == std::string::npos ? end : end - pos), re));
+    }
+}

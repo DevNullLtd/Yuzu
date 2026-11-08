@@ -2,7 +2,8 @@
 """test_virtualization_definition.py -- ties the C++ row-format contract (the status row plus
 `host|<is_virtual>|<kind>|<vendor>|<product>|<source>|<confidence>` and
 `container|<yes|no|unknown>|<evidence>`, formatted by virtualization_parsers.hpp and
-virtualization_legs.hpp) to the definition YAML that actually ships it, so a reordered or renamed
+virtualization_legs.hpp; and the `wsl` action's status, summary, profile and distribution rows,
+formatted by virtualization_wsl_parsers.hpp) to the definition YAML that actually ships it, so a reordered or renamed
 result column fails here rather than only in a dashboard.
 
 Runnable standalone: `python3 tests/test_virtualization_definition.py` (how meson runs it; a bare
@@ -21,6 +22,7 @@ DEFINITION = REPO_ROOT / "content" / "definitions" / "virtualization.yaml"
 # host row is the widest (six fields after the discriminator).
 EXPECTED_COLUMNS = ["row_kind", "field_1", "field_2", "field_3", "field_4", "field_5", "field_6"]
 ROW_KINDS = ["status", "host", "container"]
+WSL_ROW_KINDS = ["status", "summary", "profile", "distribution"]
 
 
 def _documents() -> list:
@@ -32,15 +34,29 @@ def _definitions() -> dict:
 
 
 class VirtualizationDefinitionColumns(unittest.TestCase):
-    def test_one_definition_for_the_host_action(self):
-        # Counted before keying by action, which would collapse a duplicate `host` document.
-        self.assertEqual(len(_documents()), 1)
+    def test_one_definition_per_action(self):
+        # Counted before keying by action, which would collapse a duplicate document.
+        self.assertEqual(len(_documents()), 2)
         defs = _definitions()
-        self.assertEqual(sorted(defs), ["host"])
+        self.assertEqual(sorted(defs), ["host", "wsl"])
         d = defs["host"]
         self.assertEqual(d["spec"]["execution"]["plugin"], "virtualization")
         self.assertEqual(d["metadata"]["id"], "crossplatform.virtualization.host")
         self.assertEqual(d["spec"]["platforms"], ["windows", "linux", "darwin"])
+
+    def test_wsl_definition_is_windows_only_and_role_gated(self):
+        d = _definitions()["wsl"]
+        self.assertEqual(d["metadata"]["id"], "windows.virtualization.wsl")
+        self.assertEqual(d["spec"]["execution"]["plugin"], "virtualization")
+        self.assertEqual(d["spec"]["platforms"], ["windows"])
+        # Per-user data: the strictest gate the catalogue row pins (AdminOrApproval).
+        self.assertEqual(d["spec"]["approval"]["mode"], "role-gated")
+        self.assertEqual(d["spec"]["gather"]["ttlSeconds"], 3600)
+        self.assertEqual(d["spec"]["permissions"]["executeRoles"], ["endpoint-admin", "endpoint-operator"])
+        self.assertEqual(d["spec"]["compatibility"]["requiredPlugins"], ["virtualization"])
+        cols = d["spec"]["result"]["columns"]
+        self.assertEqual([c["name"] for c in cols], EXPECTED_COLUMNS)
+        self.assertEqual(cols[0]["values"], WSL_ROW_KINDS)
 
     def test_row_kind_leads_and_the_columns_match_the_wire_rows(self):
         names = [c["name"] for c in _definitions()["host"]["spec"]["result"]["columns"]]

@@ -1,7 +1,7 @@
 ## Virtualization Definitions
 ## Reports whether the device is a virtual machine, which hypervisor, and whether the agent
 ## itself runs in a container, as facts only: nothing is enforced, changed or fetched.
-## Plugin: virtualization | Actions: host
+## Plugin: virtualization | Actions: host, wsl
 ##
 ## Sources by platform (no subprocess on any):
 ##   Linux:   CPUID (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type,
@@ -109,6 +109,121 @@ spec:
 
   approval:
     mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [virtualization]
+
+status:
+  phase: active
+
+---
+## windows.virtualization.wsl: the WSL distributions of every local profile (Windows only).
+##
+## For each real local profile the agent reads Software\Microsoft\Windows\CurrentVersion\Lxss
+## through the shared with_user_hive ladder: the loaded HKU hive first, else a guarded offline
+## NTUSER.DAT mount under SeBackupPrivilege and SeRestorePrivilege (already held by the agent
+## account, enabled only inside the offline arm, under the process-wide offline-hive lock and the
+## default-on hive-file guard). No subprocess. The work per dispatch is bounded in rows, bytes and
+## registry calls; the mount calls have no wall-clock deadline (bounded work, not bounded time).
+## A hive that could not be reached is reported on its own profile row and counted, never read as
+## having no distributions. gather.ttlSeconds is the response window of the definition, not a
+## schedule.
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.virtualization.wsl
+  displayName: WSL Distributions
+  version: 1.0.0
+  description: >
+    Lists the Windows Subsystem for Linux distributions installed for each local user profile:
+    the account (the profile folder name), the distribution name, its WSL version (1 or 2), its
+    install state, whether it is that user's default and its flavor. A profile that is not logged
+    on is read through the same guarded offline hive mount the per-user software inventory uses.
+    A summary row counts the distributions, how many are WSL 2 (not a VM count: every WSL 2
+    distribution shares one utility VM whose running state is not read), the profiles read, the
+    profiles whose hive could not be reached and the WSL package version. A profile whose hive
+    was not reached, or whose mount could not be released, is reported on its own profile row;
+    the status row is constrained whenever anything was not read in full. Install paths, disk
+    image paths, SIDs, user ids and mount names are never reported.
+  tags: [inventory, virtualization, wsl, per-user]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: virtualization
+    action: wsl
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
+    # comes first, then one summary row.
+    #
+    #   status|wsl|<supported|constrained|unsupported>|<reason or ->
+    #   summary|<distributions>|<wsl2>|<profiles_read>|<profiles_not_loaded>|<package_version or ->
+    #   profile|<account or ->|<outcome>|<detail or ->
+    #   distribution|<account or ->|<name>|<1|2|unknown>|<state>|<yes|no>|<flavor or ->
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, summary, profile, distribution]
+        description: 'Row shape discriminator (field 0). Values: status, summary, profile, distribution.'
+        example: distribution
+        platforms: [windows]
+      - name: field_1
+        type: string
+        description: 'status: the literal "wsl". summary: the number of distributions listed. profile and distribution: the account, the profile folder name ("-" when it cannot be resolved), never the SID.'
+        example: alice
+        platforms: [windows]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (a leg that threw). summary: the number of WSL 2 distributions (not a VM count). profile: the outcome, not_found, privilege_missing, mount_failed, access_denied, file_refused, unload_failed, backup_skipped or sid_invalid. distribution: the distribution name as WSL records it (an e-mail-shaped name is replaced by [redacted-email]).'
+        example: Ubuntu-26.04
+        platforms: [windows]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was read. profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown.'
+        example: '2'
+        platforms: [windows]
+      - name: field_4
+        type: string
+        description: 'summary: the number of profiles whose hive was reached by neither the loaded hive nor the offline mount (a .bak entry or an invalid SID counts). distribution: the install state, installed, installing, uninstalling, converting, exporting, state_<n> for an unrecognised value or unknown.'
+        example: installed
+        platforms: [windows]
+      - name: field_5
+        type: string
+        description: 'summary: the WSL package version, "-" when unavailable. distribution: whether this is the account''s default distribution, yes or no.'
+        example: 'yes'
+        values: ['yes', 'no']
+        platforms: [windows]
+      - name: field_6
+        type: string
+        description: 'distribution: the flavor WSL records (for example ubuntu), "-" when absent; an e-mail-shaped value is replaced by [redacted-email]. Not used by the other kinds.'
+        example: ubuntu
+        platforms: [windows]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List WSL distributions per user profile"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]
