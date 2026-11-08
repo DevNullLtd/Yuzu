@@ -374,6 +374,44 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   single `dev`-sync cycle should re-sync frequently: a smaller delta is easier to triage for
   which changed test file touches the store's old constructor.
 
+## Registry-backed tables (a migration must not be generated from a live table)
+
+Some stores drive their tables from a compile-time registry (the device-CI section registry
+`kDeviceCiSections` in `device_ci_kinds.hpp`, one child table per kind). The registry is the
+right source for the RUNTIME (ingest and read both iterate it). It is the wrong source for a
+MIGRATION, because the runner skips a version it has already recorded: a migration generated
+from the registry changes what a FRESH database gets and nothing about a deployed one (#7164).
+
+- **A migration is a literal.** `kMigrationV2Sql` in `device_inventory_store.cpp` is the checked-in
+  text of what v2 creates, marked FROZEN. Never edit it, and never rebuild it from the registry.
+  (A migration that has not shipped in a release tag may be frozen as it stands; one that has
+  shipped may not be edited at all.)
+- **A new table-backed kind ships its own migration** (the next free version) that creates its
+  table, in the same change that adds the registry entry.
+- **A column change ships a migration that ALTERs the table AND sets `row_count` and
+  `content_digest` to NULL for that kind** (or bumps `kSectionDigestPrefix`), because the stored
+  digest binds `n_fields`, the section name and the cell order. Append new columns to the END of
+  the registry list and ADD them by migration: a migration appends the column at the end of the
+  table, and the schema test compares column order.
+- **Two guards enforce it**, and both fail when the registry moves without a migration: the
+  schema test in `test_device_inventory_store.cpp` ("schema created by the frozen migrations
+  matches the section registry"), and the post-migration projection check in the store's
+  constructor (a `LIMIT 0` SELECT of every table and column the runtime reads, which refuses to
+  open the store and names the table, so a registry ahead of its database fails at boot and not
+  as `42P01`/`42703` on the first sections read).
+- **This is not the runner's drift detection** (#7158, a version recorded with different text).
+  That is a different question (same version, different SQL) and does not replace the projection
+  check: do not consolidate the two. The projection is column PRESENCE only (an extra column is
+  tolerated, in line with the ahead-database stance of #3894); names, types, nullability, order and
+  the key shape (primary key, cascading foreign key) are pinned for the shipped literals by the
+  schema test, and column defaults are pinned by nothing. A third test pins each registry kind's
+  column list to the stored digest layout, so a column change cannot land without this rule.
+- **The refusal is a boot failure.** The store's `is_open()` is checked in `server.cpp` and a
+  closed store stops the server from starting, so a registry ahead of its database never runs
+  degraded. The log message distinguishes SQLSTATE 42P01/42703 (a schema defect) from any other
+  failure (a restart is the retry) and names no destructive step; the reset recipe for a dev/UAT
+  database lives in `docs/user-manual/upgrading.md`.
+
 ## Anti-patterns reviewers reject
 
 - An **authoritative** store that returns an empty result on a DB error (fail-open). Surface it.

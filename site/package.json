@@ -16,11 +16,11 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@astrojs/markdown-remark": "^7.3.4",
-    "astro": "^7.4.2"
+    "@astrojs/markdown-remark": "^7.3.5",
+    "astro": "^7.4.4"
   },
   "devDependencies": {
     "pagefind": "^1.1.1",
-    "unist-util-visit": "^5.0.0"
+    "unist-util-visit": "^5.2.0"
   }
 }

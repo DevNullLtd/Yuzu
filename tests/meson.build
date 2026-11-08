@@ -619,6 +619,8 @@ agent_test_exe = executable(
     'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux/list_windows/list_macos decision seams over injected fakes; portable
     'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_virtualization_parsers.cpp',         # virtualization: pure classifier/vendor tables/CPUID fact builder/row formatters over labelled fixtures; portable
+    'unit/test_virtualization_local_dispatcher.cpp',  # virtualization: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
     'unit/test_remote_access_audit_keys_parsers.cpp',    # remote_access_audit: pure authorized_keys/options/blob decoder/fingerprint over REAL ssh-keygen captures; portable
     'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
@@ -648,9 +650,12 @@ agent_test_exe = executable(
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
     'unit/test_runtimes_win_walk.cpp',           # runtimes python: PythonCore dual-view walk, FakeOps + salted scratch key (Windows-only; no-op TU elsewhere)
+    'unit/test_runtimes_macos_dotnet_jvm.cpp',   # runtimes macOS dotnet/jvm legs: materialized fixture trees (walk bodies POSIX-only)
+    'unit/test_hardware_drivers_inventory.cpp',  # hardware.drivers_inventory: pure builders + dispatcher grammar, every host
     'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
     'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
     'unit/test_pkg_inventory_linux_parsers.cpp',    # pkg_inventory Linux legs: injected-root Linux snap/flatpak/managers walk over a REAL CAPTURE tree manifest (body POSIX-only)
+    'unit/test_pkg_inventory_win_parsers.cpp',      # pkg_inventory Windows legs: nuspec tag scanner, Appx PackageFullName parser, rows and the three legs over a FakeOps seam (REAL CAPTURE names/versions plus labelled synthetic cases; runs on every OS, RealOps cases Windows-only)
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
@@ -677,6 +682,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/virtualization/src'),  # virtualization_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/registry/src'),  # registry_parsers.hpp / registry_core.hpp (pure layer)
     include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
@@ -868,6 +874,7 @@ agent_test_exe = executable(
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
                 shares_plugin_lib,  # shares
+                virtualization_plugin_lib,  # virtualization
                 registry_plugin_lib,  # test_registry_write_local_dispatcher.cpp loads the real plugin by path
                 remote_access_audit_plugin_lib,  # remote_access_audit
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
@@ -981,6 +988,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     include_directories: [include_directories('../agents/plugins/browser_policy/src'),
                           include_directories('../agents/plugins/mgmt_posture/src'),
                           include_directories('../agents/plugins/shares/src'),
+                          include_directories('../agents/plugins/virtualization/src'),
                           include_directories('../agents/plugins/remote_access_audit/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
@@ -3653,6 +3661,18 @@ test('instructions runner hardening',
   timeout: 300,
 )
 
+# scripts/test/ensure-puppeteer.sh and ensure-gcovr.sh, the /test Phase 0b installers, run against
+# stub node/npm/npx/python3 executables in a temp HOME (never the real HOME or repo tree): every
+# ready / NOT READY branch, the hash-verified pip install, the interrupted-install repairs and the
+# refuse-to-delete guards. Bash only; the gcovr cases skip off Linux (the script is Linux-only) and
+# the whole file skips on Windows. Suite docs, which CI runs on the Linux leg and /test runs natively.
+test('ensure install helpers',
+  _python3_test,
+  args: [files('test_ensure_install_helpers.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
@@ -3743,6 +3763,16 @@ test('mgmt_posture definition columns',
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# virtualization's definition-column contract (content/definitions/virtualization.yaml): row_kind
+# first, then the generic field_1..field_6 sequence pinned to the wire rows virtualization_parsers.hpp
+# emits (the test holds the expected literals; it does not read the C++).
+test('virtualization definition columns',
+  _python3_test,
+  args: [files('test_virtualization_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4541,6 +4571,15 @@ test('assert-suite-cover selftest',
 test('issue lifecycle docs',
   _python3_test,
   args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# The Windows package-sources upgrade note states the fresh-deployment contract (routed
+# Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
+test('upgrade notes contract',
+  _python3_test,
+  args: [files('test_upgrade_notes_contract.py')],
   suite: 'docs',
   timeout: 10,
 )

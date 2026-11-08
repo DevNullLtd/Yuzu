@@ -951,11 +951,15 @@ metric_specs() ->
             {name, yuzu_gw_mgmt_crl_rejected_total},
             {labels, [reason]},
             {help, "CA revocation lists (mgmt_crl_source) that were not obtained or not "
-                   "loaded, by reason (closed set: malformed | too_large | unverified | "
-                   "issuer_mismatch | future_dated | replay | fetch_timeout | fetch_connect | "
-                   "fetch_tls | fetch_status | fetch_error | file_unreadable). The CRL loaded "
-                   "earlier, if any, stays in force. A sustained rate means no fresh CRL is "
-                   "arriving; see yuzu_gw_mgmt_crl_next_update_timestamp_seconds"}]},
+                   "loaded, by reason (closed set: malformed | unsupported | too_large | "
+                   "unverified | issuer_mismatch | validity_too_long | future_dated | replay | "
+                   "fetch_timeout | fetch_connect | fetch_tls | fetch_status | fetch_error | "
+                   "file_unreadable). The CRL loaded earlier, if any, stays in force. The same "
+                   "refused bytes are counted once in a row and again once an hour while "
+                   "they persist, not once per refresh, except for future_dated, replay, "
+                   "too_large as reported by the fetch, and the fetch reasons, which count "
+                   "every attempt. Alert on the state gauges, not on this rate; see "
+                   "yuzu_gw_mgmt_crl_next_update_timestamp_seconds"}]},
         {counter, [
             {name, yuzu_gw_heartbeat_rejected_total},
             {labels, [reason]},
