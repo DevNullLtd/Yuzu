@@ -261,6 +261,9 @@ struct LiveCaptureSource {
     std::string name, dollar, category;
     bool enabled = false;
     long long live_rows = -1; ///< -1 = unknown (no count reported)
+    /// The agent reported `<src>_live_rows` only: it has not moved to the roll-up store, so its
+    /// count is raw capture rows and is not presented as the hourly count.
+    bool pre_rollup_agent = false;
 };
 
 /// PURE renderers — one `.ls-tbl`/tree per card body, dark-theme, CSP-safe.

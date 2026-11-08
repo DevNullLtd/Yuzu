@@ -1459,7 +1459,8 @@ auto-revoke a row this leaves stranded.
 Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
 access reviews") shipped with zero metrics; the hardening round added four
 bounded-label series wired at the REST handlers (`rest_api_v1.cpp`) only —
-the MCP twins are not double-counted.
+the MCP twins are not double-counted. A fifth series,
+`yuzu_access_review_attestation_refused_total`, covers both surfaces (see below).
 
 ```
 # HELP yuzu_access_review_export_total Access review evidence exports (GET /api/v1/access-reviews/export), by format
@@ -1502,6 +1503,37 @@ yuzu_access_review_attestations_total{decision="flagged_revoke"} 0
   itself revokes anything (flag ≠ revoke, see `docs/auth-architecture.md`);
   a rising `flagged_revoke` count is a worklist size for whoever acts on
   the flags, not an automatic remediation trigger.
+
+```
+# HELP yuzu_access_review_attestation_refused_total Access review attestations refused because the reviewer is the subject of the grant, by surface (rest|mcp) and reason (self_subject|engine_owner|group_member|check_unavailable)
+# TYPE yuzu_access_review_attestation_refused_total counter
+yuzu_access_review_attestation_refused_total{surface="rest",reason="self_subject"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="engine_owner"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="group_member"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="check_unavailable"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="self_subject"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="engine_owner"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="group_member"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="check_unavailable"} 0
+```
+
+`yuzu_access_review_attestation_refused_total{surface,reason}` counts attestations
+refused by the rule that the reviewer must differ from the subject of the grant.
+Unlike the four series above it is counted for both the REST route and the MCP
+`record_attestation` tool (`surface` is `rest` or `mcp`). `reason` is
+`self_subject` (a `user` grant naming the reviewer), `engine_owner` (an engine
+principal the reviewer owns now or owned when the campaign opened; the series counts both the
+live-owner refusal and the frozen-owner refusal and cannot tell them apart), `group_member` (a group the reviewer belongs to) or
+`check_unavailable` (the engine or group lookup behind the check could not be
+answered, so nothing was recorded; this one is a degraded store, not a reviewer
+doing something wrong, and no dedicated alert ships for it: the group path also
+feeds the existing `yuzu_server_rbac_read_degrade_total` (a pool timeout, an open
+breaker or a query error), while the engine path emits no other metric, so an
+engine lookup outage is visible only here and in the `failure` audit rows). All eight series are pre-seeded to `0`. The counter moves
+whether or not the refusal's audit row could be saved. It is operational, not
+`event="security"`, and has no alert rule; the refusal's own audit row
+(`access_review.attested` / `access_review.flagged` with `result=denied`, or
+`result=failure` for `check_unavailable`) is the evidence.
 
 None of the four carries `event="security"` — a review export or an
 attestation decision is expected, privileged, self-audited operator

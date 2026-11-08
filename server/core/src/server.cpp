@@ -237,6 +237,8 @@
 #include "device_containment_routes.hpp"
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
+#include "software_collection_settings_routes.hpp"
+#include "software_collection_settings_store.hpp"
 #include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
 #include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
@@ -952,6 +954,23 @@ public:
                           "counter");
         for (auto decision : {"attested", "flagged_revoke"}) {
             metrics_.counter("yuzu_access_review_attestations_total", {{"decision", decision}});
+        }
+        // Attestations refused by the reviewer-differs-from-the-subject rule, on BOTH surfaces
+        // (counted inside the shared gate in access_review_attest_gate.hpp, so the MCP twin is
+        // counted here, unlike the four counters above). `surface` and `reason` are closed sets,
+        // never derived from caller input. Operational, not a security event: the refusal's
+        // audit row is the evidence.
+        metrics_.describe("yuzu_access_review_attestation_refused_total",
+                          "Access review attestations refused because the reviewer is the subject "
+                          "of the grant, by surface (rest|mcp) and reason (self_subject|"
+                          "engine_owner|group_member|check_unavailable)",
+                          "counter");
+        for (auto surface : {"rest", "mcp"}) {
+            for (auto reason :
+                 {"self_subject", "engine_owner", "group_member", "check_unavailable"}) {
+                metrics_.counter("yuzu_access_review_attestation_refused_total",
+                                 {{"surface", surface}, {"reason", reason}});
+            }
         }
         // MCP Streamable HTTP transport (ADR-1005 Decision 15(k) — the family was
         // NAMED in the decision, not left to implementer discretion, so alerts can
@@ -8429,6 +8448,22 @@ public:
             }
         }
 
+        // SoftwareCollectionSettingsStore - per-management-group software collection settings
+        // (SAM-34). Authoritative configuration, so construction is fail-closed like the
+        // product registry (ADR-0012 s1): a database that cannot create or open the schema
+        // refuses the boot rather than serving settings routes that answer 503 forever.
+        if (pg_pool_ && !startup_failed_) {
+            software_collection_settings_store_ =
+                std::make_unique<SoftwareCollectionSettingsStore>(*pg_pool_);
+            if (!software_collection_settings_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software collection settings store "
+                              "migration/open failed (database reachable but the "
+                              "software_collection_settings_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
         // Fleet-aggregate app-perf projection (B2) + its roll-up query owner — the
         // long-retention trend substrate, built from B1 by a daily background job.
         // AppPerfFleetStore owns the schema (fail-closed like every PG store);
@@ -11561,6 +11596,9 @@ public:
         // destruct-before-pool). Nothing borrows it long-lived (its writer is the UCE
         // module's evaluator, out-of-server), so no unwire step precedes the reset.
         product_registry_store_.reset();
+        // SAM-34 collection settings store: its routes capture it and are served only until
+        // web_server_->stop(); drop it ahead of the pool with the other born-on-PG stores.
+        software_collection_settings_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -17206,7 +17244,9 @@ private:
                     -> std::expected<CampaignView, std::string> {
                     if (!access_review_store_ || !access_review_store_->is_open())
                         return std::unexpected(std::string("access review store not open"));
-                    return access_review_store_->get_campaign(id);
+                    // The Access page shows the decision history, so it opts in; the
+                    // Settings fragment reads the latest decision only.
+                    return access_review_store_->get_campaign(id, /*include_history=*/true);
                 },
                 .grants_fn = [this]()
                     -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {
@@ -17396,6 +17436,8 @@ private:
                              .app_usage_store = app_usage_store_.get(),
                              .certificate_inventory_store = certificate_inventory_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
+                             .software_collection_settings_store =
+                                 software_collection_settings_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
@@ -18883,14 +18925,39 @@ private:
                             // tick rather than risk a false-empty membership (ADR-0039) - it
                             // retries on the next 2s tick.
                             std::vector<std::string> members;
+                            int64_t agents_failed = 0;
                             if (response_store_) {
                                 auto found =
                                     result_set_members(*response_store_, forensics_plugins(), p);
                                 if (!found)
                                     continue;
+                                if (found->truncated) {
+                                    // The read hit its row bound before the stored rows ran
+                                    // out: a membership that is incomplete in a way
+                                    // agents_failed cannot express. Fail the set closed rather
+                                    // than publish it as partial.
+                                    spdlog::warn("result set {} not materialized: more than {} "
+                                                 "response rows for execution {}",
+                                                 p.id, ResultSetStore::kMaxMembersPerSet,
+                                                 p.source_execution_id);
+                                    result_set_store_->mark_failed(
+                                        p.id, "response rows exceed the members read bound");
+                                    metrics_
+                                        .counter("yuzu_result_sets_total",
+                                                 {{"source_kind", p.source_kind},
+                                                  {"result", "materialize_failed"}})
+                                        .increment();
+                                    continue;
+                                }
+                                agents_failed = found->agents_failed;
                                 members = std::move(*found);
                             }
-                            if (result_set_store_->materialize(p.id, members)) {
+                            if (agents_failed > 0)
+                                spdlog::warn("result set {} materialized partial: {} agent(s) "
+                                             "answered execution {} with a failure and never "
+                                             "matched",
+                                             p.id, agents_failed, p.source_execution_id);
+                            if (result_set_store_->materialize(p.id, members, agents_failed)) {
                                 metrics_
                                     .counter("yuzu_result_sets_total",
                                              {{"source_kind", p.source_kind},
@@ -20407,6 +20474,34 @@ private:
                                    .audit_fn = audit_fn,
                                    .registry = product_registry_store_.get(),
                                });
+        }
+
+        // Per-group software collection settings REST (SAM-34). Registered here, ahead of
+        // rest_api_v1_->register_routes: httplib dispatches in registration order, and the bare
+        // GET /api/v1/inventory/software/collection-settings would otherwise be taken by the
+        // generic GET /api/v1/inventory/{a}/{b}. The routes borrow three stores (settings,
+        // management groups, plugin config) and, through the probe lambda's `this`, auth_routes_;
+        // stop() joins the web thread ahead of resetting any of them, and the class holds no
+        // state of its own.
+        {
+            HttplibRouteSink collection_settings_sink{*web_server_};
+            SoftwareCollectionSettingsRoutes{}.register_routes(
+                collection_settings_sink,
+                SoftwareCollectionSettingsRoutes::Deps{
+                    .auth_fn = auth_fn,
+                    .perm_fn = perm_fn,
+                    .probe_perm_fn =
+                        [this](const httplib::Request& req, httplib::Response& res,
+                               const std::string& type, const std::string& op) {
+                            return auth_routes_->probe_permission_unavailable_aware(req, res, type,
+                                                                                    op);
+                        },
+                    .scoped_perm_fn = scoped_perm_fn,
+                    .audit_fn = audit_fn,
+                    .store = software_collection_settings_store_.get(),
+                    .mgmt_store = mgmt_group_store_.get(),
+                    .plugin_config_store = plugin_config_store_.get(),
+                });
         }
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
@@ -24610,6 +24705,7 @@ private:
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
+    std::unique_ptr<SoftwareCollectionSettingsStore> software_collection_settings_store_;
     // SAM.4: declared AFTER the stores they borrow so they destruct first; stop() also
     // resets them explicitly before the stores and pool.
     std::unique_ptr<SoftwareTitleDimension> software_title_dimension_;
