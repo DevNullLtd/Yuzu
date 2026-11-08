@@ -24,9 +24,18 @@
 //
 // NEVER EMITTED: BasePath, VhdFileName, ShortcutPath, TerminalProfilePath, PackageFamilyName,
 // DefaultUid, KernelCommandLine, the SID (including the salted mount name, which embeds it),
-// the distribution GUID. None of those values is ever read. DistributionName and Flavor are
-// value-level e-mail redacted; the account is the profile-folder name (also e-mail redacted),
-// `-` when unresolvable.
+// the distribution GUID. The first seven are never read; the SID (it keys the hive that is
+// opened) and the GUID (the child name that is enumerated and compared with DefaultDistribution)
+// are used but never put on a row, so none of the ten is ever emitted. DistributionName and
+// Flavor are value-level e-mail redacted; the account is the profile-folder name (also e-mail
+// redacted), `-` when unresolvable.
+//
+// REGISTRY LINKS. The shell opens every key with REG_OPTION_OPEN_LINK, so a planted registry
+// link opens as the link object itself and is never followed; it carries none of the value names
+// this walk reads. `is_link_key` DETECTS one (a `SymbolicLinkValue` value) on the Lxss key and on
+// each distribution key: a link at Lxss is `lxss_link` and the profile is not counted as read, a
+// link at a distribution key is `lxss_link` plus an `unknown` row. A decoy REG_SZ value of that
+// name on a plain key reads the same way (constrained, never fail-open).
 //
 // TOKENS. Every constraint token is `windows:virtualization:wsl:<suffix>` (class (a) in
 // virtualization_parsers.hpp). The suffix table is closed: see kFixedTokenSuffixes plus the
@@ -84,13 +93,13 @@ inline constexpr std::string_view kTokenPrefix = "windows:virtualization:wsl:";
 /// Every fixed token suffix decide_wsl can emit. `package_<cause>` and `profile_list_<cause>`
 /// (cause = `access_denied` or `win32_<n>`) are the only open-ended ones; kHeaderReserveBytes
 /// reserves one of each at its maximum length.
-inline constexpr std::array<std::string_view, 22> kFixedTokenSuffixes = {
+inline constexpr std::array<std::string_view, 23> kFixedTokenSuffixes = {
     "hive_not_found",      "hive_privilege_missing", "hive_mount_failed",
     "hive_access_denied",  "hive_file_refused",      "hive_unload_failed",
     "hive_open_failed",    "hive_enum_failed",       "distro_open_failed",
-    "value_unreadable",    "value_malformed",        "value_oversized",
-    "package_malformed",   "row_cap",                "entry_cap",
-    "hive_row_cap",        "hive_entry_cap",
+    "lxss_link",           "value_unreadable",       "value_malformed",
+    "value_oversized",     "package_malformed",      "row_cap",
+    "entry_cap",           "hive_row_cap",           "hive_entry_cap",
     "profile_list_enum_failed", "profile_cap",       "profile_unreadable",
     "profile_backup_skipped",   "profile_sid_invalid",
 };
@@ -287,6 +296,13 @@ using HiveAccessFn = std::function<HiveAccess(const yuzu::profiles::ProfileInfo&
     return "unknown";
 }
 
+/// The persisted `State` DWORD, labelled from the public WSL source (microsoft/WSL,
+/// src/windows/service/inc/wslservice.idl, `_LxssDistributionState`): Invalid = 0, Installed = 1,
+/// Running = 2, Installing = 3, Uninstalling = 4, Converting = 5, Exporting = 6, Compacting = 7.
+/// DistributionRegistration.h reads the DWORD with that enum as its type. 0 (Invalid) and 2
+/// (Running, a session state; whether it is ever persisted is unverified) are deliberately not
+/// labelled and fall to `state_<n>`, as does any value past the enum. Only `installed` (1) has
+/// been seen on a measured host.
 [[nodiscard]] inline std::string state_token(std::optional<std::uint32_t> s) {
     if (!s)
         return "unknown";
@@ -301,6 +317,8 @@ using HiveAccessFn = std::function<HiveAccess(const yuzu::profiles::ProfileInfo&
         return "converting";
     case 6:
         return "exporting";
+    case 7:
+        return "compacting";
     default:
         return "state_" + std::to_string(*s);
     }
@@ -336,13 +354,16 @@ using HiveAccessFn = std::function<HiveAccess(const yuzu::profiles::ProfileInfo&
 // -- registry walk (Ops-templated, RAW: type/size/race checks live here, not in the shell) -----
 //
 // Ops supplies:
-//   long open_key(void* parent, const wchar_t* name, void*& out)   RegOpenKeyExW(KEY_READ)
+//   long open_key(void* parent, const wchar_t* name, void*& out)
+//       RegOpenKeyExW with REG_OPTION_OPEN_LINK and KEY_READ: a registry link opens as the link
+//       object itself and is never followed (is_link_key then detects it).
 //   void close_key(void* key)
 //   long enum_key(void* parent, std::uint32_t idx, std::wstring& name)
 //   long query_value(void* key, const wchar_t* name, std::uint32_t& type,
 //                    std::span<std::byte> buf, std::uint32_t& size)   empty buf = size probe
 //   std::string utf8(std::wstring_view)
 //   std::string reg_sz_utf8(std::span<const std::byte> payload)
+//       payload.data() is wchar_t-aligned (read_string_value hands it a heap vector).
 
 template <class Ops>
 class ScopedKey {
@@ -461,6 +482,26 @@ template <class Ops>
     return r;
 }
 
+/// What one registry-link probe found.
+enum class LinkProbe { plain, link, unreadable, refused };
+
+/// Is `key` a registry link? One charged size-probe of the `SymbolicLinkValue` value (the marker
+/// the registry plugin's own link probe reads): present with any type = a link (or a decoy value
+/// of that name, which is treated the same way: constrained, never fail-open), absent = a plain
+/// key, any other failure = `unreadable` (reported, and the key is then read as a plain one).
+/// `refused` = the call budget would not allow the probe, which was not made. The key was opened
+/// with REG_OPTION_OPEN_LINK, so a link here is the link object itself, never its target.
+template <class Ops>
+[[nodiscard]] LinkProbe is_link_key(Ops& ops, void* key, WalkBudget& budget) {
+    if (!budget.visit())
+        return LinkProbe::refused;
+    std::uint32_t type = 0, size = 0;
+    const long rc = ops.query_value(key, L"SymbolicLinkValue", type, {}, size);
+    if (rc == kErrorSuccess)
+        return LinkProbe::link;
+    return rc == kErrorFileNotFound ? LinkProbe::plain : LinkProbe::unreadable;
+}
+
 namespace detail {
 
 inline const char* value_token(ValueResult r) noexcept {
@@ -528,6 +569,23 @@ template <class Ops>
                                                                   : "hive_open_failed");
         return h;
     }
+
+    // A link planted at Lxss opens as the link object: no values, no children, so an unprobed walk
+    // would report it as a clean profile with no WSL. Detect it, never read through it.
+    switch (is_link_key(ops, lxss.get(), budget)) {
+    case LinkProbe::link:
+        detail::add_token(h.tokens, "lxss_link");
+        return h; // not read: in neither summary count, like a denied Lxss open
+    case LinkProbe::refused:
+        h.read_ok = true; // opened but not examined: counted, and the cap token says why
+        on_visit_refused();
+        return h;
+    case LinkProbe::unreadable:
+        detail::add_token(h.tokens, "value_unreadable");
+        break;
+    case LinkProbe::plain:
+        break;
+    }
     h.read_ok = true;
 
     // DefaultDistribution first, so every row carries its final default flag at collection.
@@ -572,10 +630,22 @@ template <class Ops>
 
         ScopedKey<Ops> dk(ops);
         const long drc = dk.open(lxss.get(), child.c_str());
+        const LinkProbe lp = drc == kErrorSuccess ? is_link_key(ops, dk.get(), budget)
+                                                  : LinkProbe::plain;
+        if (lp == LinkProbe::refused) {
+            on_visit_refused();
+            break; // the unexamined distribution is discarded, never emitted
+        }
         if (drc != kErrorSuccess) {
             d.open_failed = true;
             detail::add_token(h.tokens, "distro_open_failed");
+        } else if (lp == LinkProbe::link) {
+            // A link at a distribution key: the same `unknown` row as an open failure, no reads.
+            d.open_failed = true;
+            detail::add_token(h.tokens, "lxss_link");
         } else {
+            if (lp == LinkProbe::unreadable)
+                detail::add_token(h.tokens, "value_unreadable");
             const StringRead name = read_string_value(ops, dk.get(), L"DistributionName", budget);
             const DwordRead ver = read_dword_value(ops, dk.get(), L"Version", budget);
             const DwordRead st = read_dword_value(ops, dk.get(), L"State", budget);

@@ -134,8 +134,9 @@ struct Legs {
 /// Status-row contract: one status row per dispatch, with three exceptions. (1) An unknown
 /// action writes ONE non-status line (`unknown action: <name>`, invalid UTF-8 replaced and the
 /// rest escaped) and returns 1: no status row. (2) A leg that throws AFTER report already
-/// wrote its row gets the catch arm's `unsupported` row (named for the action) appended, so
-/// there are TWO and the LAST status row wins. (3) The recovery itself allocates, so it is
+/// wrote its row gets the catch arm's `unsupported` row appended, so there are TWO and the LAST
+/// status row wins; it is named for the leg's action, or `host` when the throw came before the
+/// action was recognised. (3) The recovery itself allocates, so it is
 /// guarded too: if it throws as well, the dispatch returns 1 rather than unwinding across the
 /// plugin ABI.
 inline int execute_action(yuzu::CommandContext& ctx, std::string_view action, const Legs& legs,

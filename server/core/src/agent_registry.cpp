@@ -937,6 +937,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "and whether the agent itself runs in a container. CPUID, DMI/SMBIOS, sysctl, cgroup and "
          "container-marker reads only; a host-decision source (SMBIOS, CPUID, OS hint) that cannot "
          "be read reads unknown with a reason, never bare_metal; read-only, no subprocess"},
+        {"virtualization.wsl",
+         "WSL distributions for each local user profile (Windows only): account, distribution "
+         "name, WSL version, state, default and flavor; per-user data, so it needs an "
+         "administrator or an approval. Reads the loaded user hive, else mounts the profile's "
+         "NTUSER.DAT offline (changes that hive's sequence number and hash); wsl2 is not a VM "
+         "count; install paths, SIDs and user ids are never reported; read-only, no subprocess"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "

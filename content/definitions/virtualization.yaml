@@ -9,6 +9,9 @@
 ##            /proc/self/cgroup.
 ##   macOS:   sysctl kern.hv_vmm_present and hw.model.
 ##   Windows: CPUID (x86) and the SMBIOS System Information table (GetSystemFirmwareTable RSMB).
+##   Windows (`wsl`): the HKLM ProfileList and Lxss\MSI keys, and each local profile's Lxss key
+##            through the shared with_user_hive ladder (loaded hive first, else a guarded offline
+##            NTUSER.DAT mount); see the second document below.
 ##
 ## A Windows machine running Hyper-V, VBS or WSL2 sets the CPUID hypervisor bit but is the HOST:
 ## the Hyper-V root-partition bit separates it from a guest (kind host_with_hypervisor,
@@ -132,7 +135,12 @@ status:
 ## registry calls; the mount calls have no wall-clock deadline (bounded work, not bounded time).
 ## A hive that could not be reached is reported on its own profile row and counted, never read as
 ## having no distributions. gather.ttlSeconds is the response window of the definition, not a
-## schedule.
+## schedule. A registry link planted at an Lxss or distribution key is detected and reported
+## (windows:virtualization:wsl:lxss_link), never followed.
+##
+## Roles: executeRoles follows the `host` document and is advisory (docs/yaml-dsl-spec.md); the
+## enforced control is the server's ExecuteGate, AdminOrApproval, which mirrors
+## installed_apps.list_per_user (approval.mode role-gated).
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 metadata:
@@ -143,13 +151,16 @@ metadata:
     Lists the Windows Subsystem for Linux distributions installed for each local user profile:
     the account (the profile folder name), the distribution name, its WSL version (1 or 2), its
     install state, whether it is that user's default and its flavor. A profile that is not logged
-    on is read through the same guarded offline hive mount the per-user software inventory uses.
-    A summary row counts the distributions, how many are WSL 2 (not a VM count: every WSL 2
+    on is read through the same guarded offline hive mount the per-user software inventory uses
+    (SeBackupPrivilege and SeRestorePrivilege, already held by the agent; the mount changes that
+    hive's sequence number and hash, #4977). This is per-user data (account and distribution names), so
+    it requires an administrator or an approval. A summary row counts the distributions, how many are WSL 2 (not a VM count: every WSL 2
     distribution shares one utility VM whose running state is not read), the profiles read, the
     profiles whose hive could not be reached and the WSL package version. A profile whose hive
     was not reached, or whose mount could not be released, is reported on its own profile row;
-    the status row is constrained whenever anything was not read in full. Install paths, disk
-    image paths, SIDs, user ids and mount names are never reported.
+    the status row is constrained whenever anything was not read in full, and a registry link
+    planted at a distribution key is reported rather than followed. Install paths, disk image
+    paths, SIDs, user ids and mount names are never reported.
   tags: [inventory, virtualization, wsl, per-user]
 
 spec:
@@ -192,12 +203,12 @@ spec:
         platforms: [windows]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was read. profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown.'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:lxss_link, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was opened or found absent (it need not add up with field 4 to the profile count: a reached hive whose Lxss key could not be opened, or is a registry link, appears only as a status token). profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown.'
         example: '2'
         platforms: [windows]
       - name: field_4
         type: string
-        description: 'summary: the number of profiles whose hive was reached by neither the loaded hive nor the offline mount (a .bak entry or an invalid SID counts). distribution: the install state, installed, installing, uninstalling, converting, exporting, state_<n> for an unrecognised value or unknown.'
+        description: 'summary: the number of profiles whose hive was reached by neither the loaded hive nor the offline mount (a .bak entry or an invalid SID counts, and so does a profile never reached because a dispatch-wide limit stopped the walk). distribution: the install state, installed, installing, uninstalling, converting, exporting, compacting, state_<n> for an unrecognised value or unknown.'
         example: installed
         platforms: [windows]
       - name: field_5

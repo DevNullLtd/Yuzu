@@ -30,6 +30,8 @@
 /// the process-wide offline-hive lock and the default-on hive-file guard). It therefore mirrors
 /// `installed_apps.list_per_user`: `Inventory`:Read, default-on, `ExecuteGate::AdminOrApproval`,
 /// no Forensics securable and no kill-switch seed. Linux and macOS answer one `unsupported` row.
+/// The enforced control is this gate; the definition's `executeRoles` are advisory and follow the
+/// `host` document (`content/definitions/virtualization.yaml`), not `list_per_user`'s narrower list.
 namespace yuzu::server::capdecls {
 
 namespace detail {

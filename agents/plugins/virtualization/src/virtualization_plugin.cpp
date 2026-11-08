@@ -68,17 +68,19 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "Windows-only: WSL distributions are a Windows feature"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "Reg*W reads of HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\\MSI and each "
-         "local profile's Software\\Microsoft\\Windows\\CurrentVersion\\Lxss key through the "
-         "shared with_user_hive ladder (loaded HKU hive first, else a guarded offline "
-         "NTUSER.DAT mount under SeBackup/SeRestore and the process-wide offline-hive lock); "
-         "no subprocess",
+         "Reg*W reads of HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\\MSI, the HKLM "
+         "ProfileList (profile SIDs and folder paths; no privilege) and each local profile's "
+         "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss key through the shared "
+         "with_user_hive ladder (loaded HKU hive first, else a guarded offline NTUSER.DAT mount "
+         "under SeBackup/SeRestore and the process-wide offline-hive lock); no subprocess",
          "a profile whose hive was reached by neither arm is counted and reported on its own "
-         "profile row, never read as having no distributions; wsl2 counts version-2 "
+         "profile row, never read as having no distributions; a registry link planted at the "
+         "Lxss key or at a distribution key is detected and reported "
+         "(windows:virtualization:wsl:lxss_link), never followed; wsl2 counts version-2 "
          "distributions and is not a VM count (the utility VM's running state is not read); "
          "base, VHD and shortcut paths, SIDs, uids and hive mount names are never emitted; "
          "package version - means unavailable; the offline mount calls have no deadline (the "
-         "walk is bounded in work, not in time)"},
+         "walk is bounded in work, not in time: at most 512 profiles are mounted per dispatch)"},
     },
 };
 

@@ -34,10 +34,22 @@ mount path of its own.
 ## Deadlines (disclosed residual)
 
 The lock wait, `RegLoadKeyW`, `RegUnLoadKeyW` and the individual registry reads have **no deadline**,
-identical to `installed_apps.list_per_user`. The visited-entry cap (4096 per dispatch, 512 per hive), the per-value bound and the row/byte
+identical to `installed_apps.list_per_user`. The visited-entry cap (4096 `RegEnumKeyExW` / `RegQueryValueExW`
+calls per dispatch, the link probes included, and 512 per hive), the per-value bound and the row/byte
 budget (1024 rows / 256 KiB per dispatch, 128 rows / 32 KiB per hive) bound how many registry calls run under the lock, not how long each takes. A dead profile volume
 or another plugin holding the lock can hold the instruction worker. A cooperative deadline would need a
-custom `OfflineHiveFileCheck`, which the default-on guard rule forbids for this action.
+custom `OfflineHiveFileCheck`; this action deliberately uses the deadline-less default instead (the
+binding decision is a default-on guard with no custom check).
+
+The number of mounts is bounded by the profile cap alone, not by the visited-entry cap: opening the Lxss key
+is not counted, so a hive with no Lxss key costs no counted call. The worst case is therefore
+`kMaxProfiles` (512) serial `RegLoadKeyW` / `RegUnLoadKeyW` cycles per dispatch, each altering that hive's
+sequence number and hash (#4977). Residual after an unload failure, all disclosed in the README: the
+`YUZU_HIVE_<SID>_...` mount stays under `HKU` and keeps that `NTUSER.DAT` locked until `reg unload
+HKU\<mount>` (found with `reg query HKU`); the user's next logon gets a temporary profile; a repeat
+dispatch reports the profile as `mount_failed`; the only automatic cleanup is Echo's start-up sweep of
+`YUZU_HIVE_*` mounts (`echo_registry_source.cpp`), which runs only when the Echo plugin is loaded. Retry,
+caller-tag and read-audit changes belong to the shared helper and are out of scope for this diff.
 
 ## Table 3 — pre-existing resources this diff touches without changing ownership
 
@@ -57,7 +69,17 @@ SID-bearing mount name only in the agent log), since that body cannot run in the
 ## Registry links (hostile hive content)
 
 Every key is opened with `REG_OPTION_OPEN_LINK`, so a link planted as the user's `Lxss` or as a `{GUID}`
-child is opened as the link object (which holds none of the five value names read) and reads as no WSL or
-an empty row. The flag covers the last component of each open only; a link planted at an ancestor of
-`Lxss` is a disclosed residual (README caveat 4). No crafted-hive probe was run on a Windows host: the
-remedy is applied unconditionally rather than gated on a measurement.
+child is opened as the link object, which holds none of the five value names read. That alone would read
+as "no WSL" or a clean empty row, so each opened key (the Lxss key and every distribution key) is also
+probed once for the `SymbolicLinkValue` value, one charged size-probe inside the existing budget (the
+registry plugin's own link-probe marker). A hit is the token `lxss_link`: a link at Lxss leaves the profile
+unread (in neither summary count), a link at a distribution key is a row with `-` / `unknown` fields and no
+value is read. A plain key holding a decoy value of that name reads the same way, so the result is
+constrained and never fail-open. A probe that itself fails is `value_unreadable` and the key is then read as
+a plain one. The flag and the probe cover the last component of each open only; a link planted at an
+ancestor of `Lxss` is a disclosed residual (README caveat 4). The unit tests drive the detection through a
+fake registry (the fake cannot prove the real `REG_OPTION_OPEN_LINK` semantics).
+
+Real-host check (planted link on a disposable local account: `REG_OPTION_CREATE_LINK` at `Lxss` and at one
+child, a normal key listed alongside): pending the Gate 4 capture on the Windows host; the result is
+recorded here and in the PR body. No probe source is committed.
