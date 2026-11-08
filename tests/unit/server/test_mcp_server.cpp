@@ -51640,3 +51640,251 @@ TEST_CASE("MCP result-sets: create_result_set refuses a name with an embedded NU
     CHECK(body["error"]["code"] == kInvalidParams);
     CHECK(sends == 0);
 }
+
+namespace {
+
+/// A tools/call body whose arguments are built as JSON, so a NUL byte inside a string value is
+/// carried as the \u0000 escape and reaches the handler as a real NUL after parsing.
+std::string rs_tool_call_body(const std::string& tool, const nlohmann::json& arguments, int id = 1) {
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"id", id},
+                          {"method", "tools/call"},
+                          {"params", {{"name", tool}, {"arguments", arguments}}}}
+        .dump();
+}
+
+} // namespace
+
+// A NUL byte in the dispatched parameters (the echo `sql`, an instruction parameter key or
+// value) or in `parent_id` is refused as invalid params before the execution row and before any
+// dispatch, and each refusal writes one denied `result_set.create` row with a fixed detail.
+TEST_CASE("MCP result-sets: a NUL in sql, an instruction parameter or parent_id is refused "
+          "before any dispatch and audited as denied",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-3"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const std::string with_nul("a\0b", 3);
+
+    // Runs one call that must be refused: invalid params naming the field, nothing dispatched,
+    // exactly one denied row with the fixed detail, and no success row.
+    auto expect_refused = [&](const std::string& tool, const nlohmann::json& arguments,
+                              const std::string& field, const std::string& kind) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body(tool, arguments));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: " + field + " must not contain a NUL byte");
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=" + kind);
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    };
+
+    SECTION("control: a clean echo query reaches the dispatch mock, so a zero count below is "
+            "not vacuous") {
+        auto res = ts.call(rs_tool_call_body("create_result_set_from_echo_query",
+                                             {{"sql", "SELECT 1"}, {"name", "clean-name"}}));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(sends == 1);
+    }
+
+    SECTION("create_result_set_from_echo_query: NUL in sql") {
+        expect_refused("create_result_set_from_echo_query", {{"sql", "SELECT 1" + with_nul}},
+                       "parameters", "echo_query");
+    }
+
+    SECTION("create_result_set_from_echo_query: NUL in parent_id") {
+        expect_refused("create_result_set_from_echo_query",
+                       {{"sql", "SELECT 1"}, {"parent_id", "rs_" + with_nul}}, "parent_id",
+                       "echo_query");
+    }
+
+    SECTION("create_result_set_from_echo_query: NUL in name writes the denied row too") {
+        expect_refused("create_result_set_from_echo_query",
+                       {{"sql", "SELECT 1"}, {"name", with_nul}}, "name", "echo_query");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in a parameter value") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"params", {{"k", with_nul}}}}, "parameters",
+                       "instruction_result");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in a parameter key") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"params", {{"k" + with_nul, "v"}}}},
+                       "parameters", "instruction_result");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in parent_id") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"parent_id", "rs_" + with_nul}}, "parent_id",
+                       "instruction_result");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in name writes the denied row too") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"name", with_nul}}, "name",
+                       "instruction_result");
+    }
+}
+
+// The direct create is Infrastructure:Write (supervised tier, as the sibling NUL-name test).
+// A NUL in `name` or `parent_id` is refused as invalid params and audited as denied with the
+// caller's source_kind; no row is stored.
+TEST_CASE("MCP result-sets: create_result_set audits a NUL name or parent_id as denied",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 1, .command_id = "cmd-nul-4"};
+        },
+        "supervised");
+
+    const std::string with_nul("a\0b", 3);
+
+    auto expect_refused = [&](const nlohmann::json& arguments, const std::string& field) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("create_result_set", arguments));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: " + field + " must not contain a NUL byte");
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=manual_curate");
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    };
+
+    SECTION("NUL in name") {
+        expect_refused({{"name", with_nul}}, "name");
+    }
+
+    SECTION("NUL in parent_id") {
+        expect_refused({{"name", "ok"}, {"parent_id", "rs_" + with_nul}}, "parent_id");
+    }
+}
+
+// Re-evaluation reads the stored source payload; a NUL that JSON decoding produces from a
+// \u0000 escape in the stored sql or an instruction parameter is refused before the execution
+// row and the dispatch, and audited as denied.
+TEST_CASE("MCP reevaluate_result_set: a NUL in the stored sql or parameters is refused before "
+          "any dispatch and audited as denied",
+          "[pg][mcp][integration][result-sets][validation]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    std::string instruction_id;
+    {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Get OS Version";
+        def.version = "1.0";
+        def.plugin = "os_info";
+        def.action = "version";
+        def.type = "question";
+        def.description = "test";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        instruction_id = *created;
+    }
+
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-5"};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const std::string with_nul("a\0b", 3);
+
+    auto seed = [&](const std::string& kind, const nlohmann::json& payload) {
+        CreateRequest cr;
+        cr.owner_principal = "test-user"; // McpTestServer's default session principal
+        cr.name = "seed";
+        cr.source_kind = kind;
+        cr.source_payload = payload.dump(); // dump() carries the NUL as a \u0000 escape
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+        return seeded->id;
+    };
+
+    auto expect_refused = [&](const std::string& rs_id, const std::string& kind) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("reevaluate_result_set", {{"id", rs_id}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: parameters must not contain a NUL byte");
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=" + kind);
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    };
+
+    SECTION("control: a stored clean echo query is re-run, so a zero count below is not "
+            "vacuous") {
+        const auto rs_id = seed(std::string(source_kind::kEchoQuery),
+                                {{"sql", "SELECT 1"}, {"include_empty", false}});
+        auto res = ts.call(rs_tool_call_body("reevaluate_result_set", {{"id", rs_id}}));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(sends == 1);
+    }
+
+    SECTION("stored echo sql with a NUL") {
+        const auto rs_id = seed(std::string(source_kind::kEchoQuery),
+                                {{"sql", "SELECT 1" + with_nul}, {"include_empty", false}});
+        expect_refused(rs_id, "echo_query");
+    }
+
+    SECTION("stored instruction parameter value with a NUL") {
+        const auto rs_id = seed(std::string(source_kind::kInstructionResult),
+                                {{"instruction_id", instruction_id}, {"params", {{"k", with_nul}}}});
+        expect_refused(rs_id, "instruction_result");
+    }
+}

@@ -24,9 +24,11 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "../test_helpers.hpp"
 
@@ -100,7 +102,8 @@ struct McpEngineRolesHarness {
     std::string mock_username{"admin"};
     auth::Role mock_role{auth::Role::admin};
 
-    std::vector<std::string> audit_log; // "action|result"
+    std::vector<std::string> audit_log;     // "action|result"
+    std::vector<std::string> audit_details; // the detail of each row, same order as audit_log
 
     McpServer mcp;
     McpServer::HandlerFn handler;
@@ -119,8 +122,9 @@ struct McpEngineRolesHarness {
                           const std::string&) -> bool { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&, const std::string&,
-                               const std::string&) -> bool {
+                               const std::string& detail) -> bool {
             audit_log.push_back(action + "|" + result);
+            audit_details.push_back(detail);
             return audit_succeeds;
         };
         auto agents_fn = []() -> nlohmann::json { return nlohmann::json::array(); };
@@ -362,4 +366,100 @@ TEST_CASE("MCP: assign_engine_role / unassign_engine_role / list_engine_roles ar
     CHECK(res->body.find("\"assign_engine_role\"") != std::string::npos);
     CHECK(res->body.find("\"unassign_engine_role\"") != std::string::npos);
     CHECK(res->body.find("\"list_engine_roles\"") != std::string::npos);
+}
+
+namespace {
+
+/// Role names the clean-text rule refuses: tab, ESC-led sequence, NUL, DEL.
+std::vector<std::string> control_byte_role_names() {
+    return {std::string("Eng\tReader"), std::string("Eng\x1b[0mReader"),
+            std::string("Eng\0Reader", 10), std::string("Eng\x7f" "Reader")};
+}
+
+std::size_t count_rows(const McpEngineRolesHarness& h, const std::string& action_result) {
+    return static_cast<std::size_t>(
+        std::count(h.audit_log.begin(), h.audit_log.end(), action_result));
+}
+
+} // namespace
+
+TEST_CASE("MCP assign_engine_role: a role name with a control byte is refused as invalid params",
+          "[pg][mcp][engine_principal][rbac][validation]") {
+    McpEngineRolesHarness h;
+    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        h.rbac_store.set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
+    REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
+               .has_value());
+
+    for (const auto& bad : control_byte_role_names()) {
+        INFO("role size " << bad.size());
+        h.audit_log.clear();
+        h.audit_details.clear();
+        auto res = h.call_tool("assign_engine_role", {{"principal_id", "vuln"}, {"role", bad}});
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == -32602);
+        CHECK(body["error"]["message"].get<std::string>().find("invalid role format") !=
+              std::string::npos);
+        // The refusal is audited once, with a fixed detail that never echoes the value.
+        REQUIRE(count_rows(h, "engine_principal.role.assigned|denied") == 1);
+        REQUIRE(h.audit_details.size() == h.audit_log.size());
+        CHECK(h.audit_details.front() == "invalid_role_name");
+        CHECK(count_rows(h, "engine_principal.role.assigned|success") == 0);
+        // No grant was created.
+        CHECK(h.rbac_store.get_principal_roles("engine", "engine:vuln").empty());
+    }
+
+    SECTION("control: a clean role name is still assigned") {
+        h.audit_log.clear();
+        auto res = h.call_tool("assign_engine_role",
+                               {{"principal_id", "vuln"}, {"role", "EngineReader"}});
+        REQUIRE(res);
+        CHECK(res->body.find("\"error\"") == std::string::npos);
+        CHECK(count_rows(h, "engine_principal.role.assigned|success") == 1);
+        CHECK(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+    }
+}
+
+TEST_CASE("MCP unassign_engine_role: a role name with a control byte is refused as invalid "
+          "params and no grant is removed",
+          "[pg][mcp][engine_principal][rbac][validation]") {
+    McpEngineRolesHarness h;
+    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        h.rbac_store.set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
+    REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
+               .has_value());
+    REQUIRE(h.rbac_store.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
+    REQUIRE(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+
+    for (const auto& bad : control_byte_role_names()) {
+        INFO("role size " << bad.size());
+        h.audit_log.clear();
+        h.audit_details.clear();
+        auto res = h.call_tool("unassign_engine_role", {{"principal_id", "vuln"}, {"role", bad}});
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        // Invalid params (-32602), not an internal/store-fault error (-32603).
+        CHECK(body["error"]["code"] == -32602);
+        REQUIRE(count_rows(h, "engine_principal.role.unassigned|denied") == 1);
+        REQUIRE(h.audit_details.size() == h.audit_log.size());
+        CHECK(h.audit_details.front() == "invalid_role_name");
+        CHECK(count_rows(h, "engine_principal.role.unassigned|success") == 0);
+        // The existing grant is untouched.
+        CHECK(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+    }
+
+    SECTION("control: a clean role name is still removed") {
+        h.audit_log.clear();
+        auto res = h.call_tool("unassign_engine_role",
+                               {{"principal_id", "vuln"}, {"role", "EngineReader"}});
+        REQUIRE(res);
+        CHECK(res->body.find("\"unassigned\":true") != std::string::npos);
+        CHECK(count_rows(h, "engine_principal.role.unassigned|success") == 1);
+        CHECK_FALSE(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+    }
 }

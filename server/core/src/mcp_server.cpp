@@ -3557,7 +3557,7 @@ static const ToolDef kTools[] = {
      // AFTER the ticket is minted/consumed today — same handler-side pattern
      // as the engine:<slug> form above, just without the prefix.
      R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
-     R"j("role":{"type":"string","minLength":1,"description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
+     R"j("role":{"type":"string","minLength":1,"description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected; a name containing a NUL, other control byte (0x01-0x1F) or DEL is refused as invalid params"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -3572,7 +3572,7 @@ static const ToolDef kTools[] = {
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
-     R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke"})j"
+     R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke; a name containing a NUL, other control byte (0x01-0x1F) or DEL is refused as invalid params"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -3644,7 +3644,7 @@ static const ToolDef kTools[] = {
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","description":"Target username"},)j"
-     R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke — deliberately NOT restricted to the 7 assignable names (unlike assign_rbac_role): unassign is a pure idempotent DELETE with no privilege granted, so it must stay able to clean up an out-of-band grant (e.g. ITServiceOwner or a custom role assigned by direct SQL) that assign_rbac_role itself could never have created"})j"
+     R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke. Any role name is accepted, including one granted out of band (e.g. ITServiceOwner or a custom role assigned by direct SQL), not only the 7 assignable names; the one exception is a name containing a NUL, another control byte (0x01-0x1F) or DEL, which is refused as invalid params"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"})j"
      // audit_persisted deliberately NOT documented here — see
@@ -14685,6 +14685,30 @@ McpServer::HandlerFn McpServer::build_handler(
                 return rs_id;
             };
 
+            // A NUL byte in a result-set producer input (name, parameters, parent_id) is
+            // refused as invalid params before anything is stored or dispatched. The refusal
+            // writes a denied `result_set.create` row whose detail is fixed (never the value).
+            const auto rs_has_nul = [](std::string_view rs_text) {
+                return rs_text.find('\0') != std::string_view::npos;
+            };
+            const auto rs_params_have_nul =
+                [&rs_has_nul](const std::unordered_map<std::string, std::string>& rs_map) {
+                    for (const auto& [rs_key, rs_val] : rs_map)
+                        if (rs_has_nul(rs_key) || rs_has_nul(rs_val))
+                            return true;
+                    return false;
+                };
+            auto rs_refuse_nul = [&](std::string_view rs_what, std::string_view rs_kind) {
+                (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                               "reason=field_contains_nul source_kind=" + audit_token(rs_kind));
+                // retry-hint-exempt: caller-input rejection (a NUL byte), not a transient fault.
+                res.set_content(
+                    error_response(id, kInvalidParams,
+                                   "RESULT_SET_BAD_REQUEST: " + std::string(rs_what) +
+                                       " must not contain a NUL byte"),
+                    "application/json");
+            };
+
             // `rs_run_async`: MCP twin of rest_api_v1.cpp's `run_async` — the
             // shared dispatch engine for the 3 async result-set producers
             // (create_result_set_from_echo_query, create_result_set_from_
@@ -14703,6 +14727,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                     const std::string& matcher,
                                     const nlohmann::json& args_for_parent,
                                     const std::string& name) {
+                // A NUL byte in the name, a dispatched parameter (key or value) or the
+                // parent_id is refused before anything else runs: no wiring check, alias
+                // lookup, execution row or dispatch. The tool blocks check the caller's
+                // own arguments earlier; this also covers reevaluate_result_set, whose
+                // parameters come from a stored payload that can carry a NUL after JSON
+                // decoding.
+                if (rs_has_nul(name)) {
+                    rs_refuse_nul("name", src_kind);
+                    return;
+                }
+                if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
+                    rs_has_nul(args_for_parent["parent_id"].get_ref<const std::string&>())) {
+                    rs_refuse_nul("parent_id", src_kind);
+                    return;
+                }
+                if (rs_params_have_nul(params)) {
+                    rs_refuse_nul("parameters", src_kind);
+                    return;
+                }
                 if (!result_set_store_ || !execution_tracker) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -15287,11 +15330,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         kResultSetNameMaxLen, kResultSetSourceKindMaxLen));
                     return;
                 }
-                if (cr.name.find('\0') != std::string::npos) {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "RESULT_SET_BAD_REQUEST: name must not contain a NUL byte"),
-                        "application/json");
+                if (rs_has_nul(cr.name)) {
+                    rs_refuse_nul("name", cr.source_kind);
+                    return;
+                }
+                if (pid && rs_has_nul(*pid)) {
+                    rs_refuse_nul("parent_id", cr.source_kind);
                     return;
                 }
                 if (!result_set_store_) {
@@ -15839,6 +15883,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The sql is the dispatched parameter: a NUL byte is refused here, before the
+                // execution row and the dispatch.
+                if (rs_has_nul(sql)) {
+                    rs_refuse_nul("parameters", source_kind::kEchoQuery);
+                    return;
+                }
                 // Roll-up is the only Echo store: a query over a raw capture table answers
                 // with no rows, so the set would silently be empty (REST twin refuses too).
                 if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
@@ -15862,12 +15912,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             std::format("name must be at most {} bytes", kResultSetNameMaxLen));
                         return;
                     }
-                    if (name_arg.find('\0') != std::string::npos) {
-                        res.set_content(
-                            error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: name must not contain a NUL "
-                                           "byte"),
-                            "application/json");
+                    if (rs_has_nul(name_arg)) {
+                        rs_refuse_nul("name", source_kind::kEchoQuery);
                         return;
                     }
                     if (args.contains("parent_id") && args["parent_id"].is_string() &&
@@ -15875,6 +15921,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             kResultSetParentIdMaxLen) {
                         reject_field_too_large(std::format(
                             "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
+                    if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                        rs_has_nul(args["parent_id"].get_ref<const std::string&>())) {
+                        rs_refuse_nul("parent_id", source_kind::kEchoQuery);
                         return;
                     }
                 }
@@ -15934,12 +15985,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             std::format("name must be at most {} bytes", kResultSetNameMaxLen));
                         return;
                     }
-                    if (name_arg.find('\0') != std::string::npos) {
-                        res.set_content(
-                            error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: name must not contain a NUL "
-                                           "byte"),
-                            "application/json");
+                    if (rs_has_nul(name_arg)) {
+                        rs_refuse_nul("name", source_kind::kInstructionResult);
                         return;
                     }
                     if (args.contains("parent_id") && args["parent_id"].is_string() &&
@@ -15947,6 +15994,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             kResultSetParentIdMaxLen) {
                         reject_field_too_large(std::format(
                             "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
+                    if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                        rs_has_nul(args["parent_id"].get_ref<const std::string&>())) {
+                        rs_refuse_nul("parent_id", source_kind::kInstructionResult);
                         return;
                     }
                     if (args.contains("matcher") && args["matcher"].is_object()) {
@@ -16004,6 +16056,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                         for (const auto& [k, v] : p.items()) {
+                            if (rs_has_nul(k) ||
+                                (v.is_string() && rs_has_nul(v.get_ref<const std::string&>()))) {
+                                rs_refuse_nul("parameters", source_kind::kInstructionResult);
+                                return;
+                            }
                             if (k.size() > kExecInstrParamKeyMaxLen) {
                                 reject_field_too_large(std::format(
                                     "a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
@@ -27354,6 +27411,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string principal_id = "engine:" + slug;
+                // `role` is free text within the clean-text rule (no NUL, no C0
+                // control byte, no DEL): refuse anything else before the role
+                // lookup or the store sees it, so assign and unassign agree on
+                // which names are valid. The refusal is audited with a fixed
+                // detail; the raw value is never echoed.
+                if (!rbac_text_is_clean(role_name)) {
+                    (void)audit_fn(req, "engine_principal.role.assigned", "denied",
+                                   "EnginePrincipal", principal_id, "invalid_role_name");
+                    res.set_content(error_response(id, kInvalidParams, "invalid role format"),
+                                    "application/json");
+                    return;
+                }
 
                 // Target must name a live (non-revoked) engine principal —
                 // MissingOrRevoked/StoreUnreachable per the store's
@@ -27468,6 +27537,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string principal_id = "engine:" + slug;
+                // `role` is free text within the clean-text rule (no NUL, no C0
+                // control byte, no DEL): refuse anything else before the role
+                // lookup or the store sees it, so assign and unassign agree on
+                // which names are valid. The refusal is audited with a fixed
+                // detail; the raw value is never echoed.
+                if (!rbac_text_is_clean(role_name)) {
+                    (void)audit_fn(req, "engine_principal.role.unassigned", "denied",
+                                   "EnginePrincipal", principal_id, "invalid_role_name");
+                    res.set_content(error_response(id, kInvalidParams, "invalid role format"),
+                                    "application/json");
+                    return;
+                }
                 // Idempotent DELETE (success even if the role was not held).
                 // With the store confirmed open, a !result is a runtime query
                 // failure, not a client error → kInternalError, not kInvalidParams.
@@ -27918,11 +27999,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // `role` is deliberately free text (see below), so it is validated here, BEFORE
-                // any guard or write looks at it: a value with a NUL or other control byte is
-                // refused as invalid params and the refusal is audited. The role is then resolved
-                // once to the stored role id, and that one id is what both guards, the delete and
-                // the audit row use; an unknown but well-formed name stays an idempotent no-op.
+                // `role` is free text within the clean-text rule (see below), so it is validated
+                // here, BEFORE any guard or write looks at it: a value with a NUL or other control
+                // byte is refused as invalid params and the refusal is audited. The role is then
+                // resolved once to the stored role name, and that one name is what both guards, the
+                // delete and the audit row use; an unknown but well-formed name stays an
+                // idempotent no-op.
                 if (!rbac_text_is_clean(role_name)) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
                                    audit_token(principal_id), "invalid_role_name");
@@ -27935,15 +28017,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return stored ? stored->name : role_name;
                 }();
                 // Governance BLOCKING #2 (audit-log-injection, CWE-117):
-                // principal_id is charset-safe past is_valid_username above,
-                // but role_name is DELIBERATELY unrestricted here (schema:
-                // maxLength:64 only, no enum/charset — unlike
-                // assign_rbac_role's closed enum) so this tool can still
-                // clean up an out-of-band grant (a custom role, or
-                // ITServiceOwner, assigned by direct SQL — see this tool's
-                // own schema comment). That means role_name can reach a
-                // SUCCESSFUL Administrator-revoke audit row completely raw
-                // unless neutralized here. Matches this file's established
+                // principal_id is charset-safe past is_valid_username above.
+                // role_name is free text within the clean-text rule (no NUL,
+                // no C0 control byte, no DEL: rbac_text_is_clean above; schema:
+                // maxLength:64, no enum/charset, unlike assign_rbac_role's
+                // closed enum) so this tool can still clean up an out-of-band
+                // grant (a custom role, or ITServiceOwner, assigned by direct
+                // SQL; see this tool's own schema comment). The value is
+                // still neutralised with `audit_token` before it reaches an
+                // audit row. Matches this file's established
                 // `audit_token`/`log_token` convention (web_utils.hpp).
                 const std::string audit_target_id = audit_token(principal_id);
                 const std::string audit_role = audit_token(role_id);

@@ -4,6 +4,10 @@
 /// Shared check for free-text RBAC identifiers (a role name, a principal id) that reach a
 /// comparison and a SQL bind. The rule is one function so the places that decide on a value and
 /// the place that acts on it cannot disagree about what the value is.
+///
+/// EXTEND this, never fork it: this is the single clean-text predicate for RBAC identifiers.
+/// Near-duplicates exist in outbound_url_policy.hpp and instruction_execute.hpp for other
+/// fields; do not add another copy for an RBAC identifier.
 
 #include <string_view>
 
@@ -20,5 +24,13 @@ namespace yuzu::server {
     }
     return true;
 }
+
+// Boundary pins: the accepted range is exactly 0x20-0x7E plus every byte at or above 0x80.
+static_assert(!rbac_text_is_clean(std::string_view("\x01", 1)));
+static_assert(!rbac_text_is_clean(std::string_view("\x1f", 1)));
+static_assert(rbac_text_is_clean(std::string_view(" ", 1)));
+static_assert(rbac_text_is_clean(std::string_view("~", 1)));
+static_assert(!rbac_text_is_clean(std::string_view("\x7f", 1)));
+static_assert(rbac_text_is_clean(std::string_view("\x80", 1)));
 
 } // namespace yuzu::server

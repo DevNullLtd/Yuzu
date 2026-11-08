@@ -4964,3 +4964,104 @@ TEST_CASE("result-set producers: a name with an embedded NUL is refused with 400
         CHECK(h.calls.empty()); // the dispatch mock recorded zero sends
     }
 }
+
+// The refusal covers every value that is dispatched or persisted, not only the name: the echo sql,
+// each instruction parameter key and value, and parent_id. Each refusal answers 400 with the same
+// message, dispatches nothing, and writes one result_set.create row with outcome denied and a
+// fixed detail that does not echo the input.
+TEST_CASE("result-set producers: a NUL in the name, sql, a parameter or parent_id is refused with "
+          "400 and one denied audit row, nothing dispatched",
+          "[pg][result_set][async][security][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    const auto expect_refused = [&h](int status, const nlohmann::json& j,
+                                     const std::string& kind) {
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: name, parameters, parent_id and matcher must not contain a "
+              "NUL byte");
+        CHECK(h.calls.empty()); // the dispatch mock recorded zero sends
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "result_set.create");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == "reason=field_contains_nul source_kind=" + kind);
+    };
+
+    SECTION("from-echo-query: a NUL in the name") {
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["name"] = std::string("a\0b", 3);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
+        expect_refused(status, j, "echo_query");
+    }
+
+    SECTION("from-echo-query: a NUL in sql") {
+        nlohmann::json body;
+        body["sql"] = std::string("SELECT 1\0--", 11);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
+        expect_refused(status, j, "echo_query");
+    }
+
+    SECTION("from-echo-query: a NUL in parent_id") {
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["parent_id"] = std::string("rs_a\0b", 6);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
+        expect_refused(status, j, "echo_query");
+    }
+
+    SECTION("from-instruction-result: a NUL in a parameter value") {
+        auto iid = make_instruction(*h.instr);
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["params"] = {{"path", std::string("/x\0y", 4)}};
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        expect_refused(status, j, "instruction_result");
+    }
+
+    SECTION("from-instruction-result: a NUL in a parameter key") {
+        auto iid = make_instruction(*h.instr);
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["params"] = nlohmann::json::object();
+        body["params"][std::string("pa\0th", 5)] = "/x";
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        expect_refused(status, j, "instruction_result");
+    }
+
+    SECTION("from-instruction-result: a NUL in parent_id") {
+        auto iid = make_instruction(*h.instr);
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["parent_id"] = std::string("rs_a\0b", 6);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        expect_refused(status, j, "instruction_result");
+    }
+
+    SECTION("control: the same requests without a NUL reach the dispatch mock and write no "
+            "denied row") {
+        auto iid = make_instruction(*h.instr);
+        int status = 0;
+        nlohmann::json echo;
+        echo["sql"] = "SELECT 1";
+        h.post("/api/v1/result-sets/from-echo-query", echo.dump(), status);
+        CHECK(status == 202);
+        nlohmann::json instr;
+        instr["instruction_id"] = iid;
+        instr["params"] = {{"path", "/x"}};
+        h.post("/api/v1/result-sets/from-instruction-result", instr.dump(), status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 2);
+        for (const auto& a : h.audits)
+            CHECK(a.result != "denied");
+    }
+}
