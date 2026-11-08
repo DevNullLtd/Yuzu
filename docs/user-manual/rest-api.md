@@ -490,16 +490,43 @@ List every device visible to the caller.
         "hostname": "web-01",
         "os": "linux",
         "arch": "x86_64",
-        "agent_version": "0.13.1"
+        "agent_version": "0.13.1",
+        "guardian_backend": "legacy"
+      },
+      {
+        "agent_id": "f6e5d4c3b2a1",
+        "hostname": "db-01",
+        "os": "windows",
+        "arch": "x86_64",
+        "agent_version": "0.13.1",
+        "guardian_backend": null
       }
     ],
-    "count": 1,
+    "count": 2,
     "devices_omitted": 0
   },
-  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "pagination": { "total": 2, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
+
+`guardian_backend` is the Guardian detection backend the device reports on its heartbeat (the
+`yuzu.guardian_backend` tag), one of `legacy`, `spark`, `spark_failed` or `unwired`, from a closed
+server-side table. The key is always present. `null` means the device has not reported one: an agent
+older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a
+forged or unrecognised value, no heartbeat in the last 90 seconds, or no heartbeat yet. `null` is
+never `legacy`, and one device cannot show whether it is a forged value or an old agent;
+`yuzu_fleet_guardian_backend_tag_rejected` is the fleet signal for rejected values. Until `prefer_spark` is
+enabled every device that reports reads `legacy`. The value is the device's own report, not independent verification, and `null` on a connected device is routine (for example before its first heartbeat), not evidence that it is unprotected. The set is closed: adding a value is a
+breaking change under the API versioning policy. During a rolling upgrade a response from a replica
+older than this change omits the key. The field covers only connected devices and is read live, while the
+`yuzu_fleet_guardian_backend{os,backend}` gauge is republished every 15 seconds and also counts an
+agent that disconnected within the last 90 seconds, so after a disconnect the two can differ for up
+to about 105 seconds. It is machine metadata in the same class as `os` and `agent_version`, so the
+unaudited posture above is unchanged. It is served only here and on the MCP twins, never on the
+unauthenticated legacy `GET /api/agents`. A degraded tag store on `GET /api/v1/devices/{id}` returns
+`503` with `retry_after_ms: 5000` and a `remediation` in the error body; no `Retry-After` header is
+set.
 
 `devices_omitted` counts agents dropped by the caller's management-group/service-scope
 confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not
@@ -523,6 +550,7 @@ Fetch one device's identity.
     "os": "linux",
     "arch": "x86_64",
     "agent_version": "0.13.1",
+    "guardian_backend": "legacy",
     "tags": [
       { "key": "environment", "value": "production", "source": "server" }
     ]
@@ -531,8 +559,9 @@ Fetch one device's identity.
 }
 ```
 
+`guardian_backend` is as described under the list route (always present, `null` when not reported).
 `tags` is always present (`[]` when the device has no tags, or in the never-hit-in-production case
-of an unwired TagStore). A device outside the caller's fleet-read scope returns the SAME 404 as a
+of an unwired TagStore). A degraded tag store returns 503 with `retry_after_ms` 5000. A device outside the caller's fleet-read scope returns the SAME 404 as a
 genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
 exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
 existence-oracle closure exactly).

@@ -99,6 +99,7 @@
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
+#include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet gauge names + HELP (#2240)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
@@ -3100,6 +3101,15 @@ public:
                           detail::kGuardianIoCeilingReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianIoCeilingTagRejectedGauge,
                           detail::kGuardianIoCeilingTagRejectedHelp, "gauge");
+        // #2240: yuzu.guardian_backend. A categorical {os,backend} partition count plus the two
+        // unlabelled meta gauges, all registered from the SAME constants
+        // AgentHealthStore::recompute_metrics clears and publishes with
+        // (guardian_backend_fleet_tags.hpp), so a name or HELP cannot drift between the two.
+        metrics_.describe(detail::kGuardianBackendGauge, detail::kGuardianBackendHelp, "gauge");
+        metrics_.describe(detail::kGuardianBackendReportingGauge,
+                          detail::kGuardianBackendReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianBackendTagRejectedGauge,
+                          detail::kGuardianBackendTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -9692,7 +9702,7 @@ public:
                 // delays revoked-agent teardown by the same amount. Make it
                 // visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
-                health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                health_store_.recompute_metrics(metrics_, detail::kAgentHealthStaleness);
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
@@ -19432,7 +19442,7 @@ private:
             // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
             // copies ONLY the perf tags (G3 performance S1 — the copy runs under
             // the heartbeat-upsert mutex).
-            const auto health = health_store_.perf_snapshot(std::chrono::seconds{90});
+            const auto health = health_store_.perf_snapshot(detail::kAgentHealthStaleness);
             std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
             by_id.reserve(health.size());
             for (const auto& h : health)
@@ -19804,7 +19814,7 @@ private:
         // by this rewire — they are shared infrastructure with other live consumers
         // (PreflightRoutes, DeploymentRoutes, EchoTreeRoutes, and McpServer's/
         // EchoTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
-        auto device_api = make_local_device_api(registry_, tag_store_.get());
+        auto device_api = make_local_device_api(registry_, tag_store_.get(), health_store_);
         // The customer score policy is one stored document read through a
         // bounded-refresh provider, so every instance converges within
         // kDexPolicyRefreshMs. It depends only on the runtime config store, so it exists
@@ -20244,12 +20254,12 @@ private:
                         software_catalogue::kStaleWindowSecs;
                     return software_inventory_store_->count_stale_agents(cutoff);
                 },
-                // ponytail: O(fleet) registry walk per full-page render (the REST twin does the
-                // same); an O(1) connected-count when the 2M-endpoint target bites.
+                // O(1) count of connected devices (DeviceApi::connected_count): no per-device
+                // rows are built for a number the page shows.
                 .connected_fn = [device_api]() -> std::optional<std::int64_t> {
                     if (!device_api)
                         return std::nullopt;
-                    return static_cast<std::int64_t>(device_api->list_devices().size());
+                    return static_cast<std::int64_t>(device_api->connected_count());
                 },
                 // agent_id -> hostname for the host type-ahead / devices tables. One bulk read
                 // per render; endpoint_state's hostname is written on every heartbeat whether
@@ -24018,6 +24028,17 @@ private:
     std::unique_ptr<pg::PgPool> pg_pool_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
+    /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device
+    /// guardian_backend read). DECLARED HERE, beside `registry_` and BEFORE every borrower: the
+    /// holders of the device API (`rest_api_v1_`, `mcp_server_`, `device_routes_`,
+    /// `crypto_device_api_`) and the direct borrowers (`agent_service_`, `gateway_service_`,
+    /// `network_routes_`, `heartbeat_ingestion_`; tests/test_guardian_backend_wiring_lexical.py
+    /// pins the order), on purpose (#2240): `LocalDeviceApi` holds a `const AgentHealthStore&`, and members destruct
+    /// in reverse declaration order, so this store must outlive all of them by construction
+    /// instead of relying only on stop() having quiesced their callers. `heartbeat_ingestion_`
+    /// (declared far below) borrows it and must stay below this line. It has no constructor
+    /// arguments, so moving it earlier changes no initialisation dependency.
+    detail::AgentHealthStore health_store_;
     /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
     /// direct Subscribe path via agent_service_ and the gateway path via
     /// gateway_service_). Its on_incident sink fans out to notification +
@@ -24729,8 +24750,8 @@ private:
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
 
-    // Fleet health aggregation
-    detail::AgentHealthStore health_store_;
+    // Fleet health aggregation: `health_store_` is declared right after `registry_` (above), not
+    // here (#2240). See the comment there.
     /// #881: the containment-read concurrency bound, spelled ONCE. It appears
     /// in the member's type, at both acquire sites and in the guard, and three
     /// literal 4s would drift the moment one of them was tuned.
