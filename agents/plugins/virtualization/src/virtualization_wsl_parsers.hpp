@@ -15,12 +15,12 @@
 // BOUNDS (trust boundary: the Lxss subtree is under the owning user's write access). ONE
 // WalkBudget per dispatch, shared across every hive: rows and bytes are charged at COLLECTION,
 // before a row is retained; `max_visited` counts every enum_key/query_value call; a value is
-// never allocated past kMaxValueBytes. Each hive also has its own sub-caps (calls and rows): a
-// hive that trips one ends THAT hive only (`hive_entry_cap` / `hive_row_cap`), so one hostile
-// hive can neither hold the offline lock for the whole dispatch budget nor starve the profiles
-// after it; only the dispatch-wide caps (`entry_cap` / `row_cap`) stop the loop. These bound the
-// NUMBER of registry calls made under the offline lock, not their duration (there is no
-// wall-clock deadline on this action).
+// never allocated past kMaxValueBytes. Each hive also has its own sub-caps (calls, rows and
+// bytes): a hive that trips one ends THAT hive only (`hive_entry_cap` / `hive_row_cap`; the row
+// and byte sub-caps share the one token), so one hostile hive can neither hold the offline lock
+// for the whole dispatch budget nor starve the profiles after it; only the dispatch-wide caps
+// (`entry_cap` / `row_cap`) stop the loop. These bound the NUMBER of registry calls made under
+// the offline lock, not their duration (there is no wall-clock deadline on this action).
 //
 // NEVER EMITTED: BasePath, VhdFileName, ShortcutPath, TerminalProfilePath, PackageFamilyName,
 // DefaultUid, KernelCommandLine, the SID (including the salted mount name, which embeds it),
@@ -74,6 +74,8 @@ inline constexpr std::size_t kDefaultMaxBytes = 256 * 1024;
 inline constexpr std::size_t kDefaultMaxVisited = 4096;
 inline constexpr std::size_t kDefaultMaxVisitedPerHive = 512;
 inline constexpr std::size_t kDefaultMaxRowsPerHive = 128;
+/// An eighth of the dispatch byte budget; a real hive's rows are well under 10 KiB.
+inline constexpr std::size_t kDefaultMaxBytesPerHive = 32 * 1024;
 
 // -- tokens ------------------------------------------------------------------------------------
 
@@ -131,25 +133,29 @@ struct WalkBudget {
     std::size_t max_visited;
     std::size_t max_visited_per_hive;
     std::size_t max_rows_per_hive;
+    std::size_t max_bytes_per_hive;
     std::size_t visited = 0;
     std::size_t hive_visited = 0;
     std::size_t hive_rows = 0;
+    std::size_t hive_bytes = 0;
 
     explicit WalkBudget(std::size_t max_rows = kDefaultMaxRows,
                         std::size_t max_bytes = kDefaultMaxBytes,
                         std::size_t max_visited_calls = kDefaultMaxVisited,
                         std::size_t max_visited_per_hive_calls = kDefaultMaxVisitedPerHive,
-                        std::size_t max_rows_per_hive_rows = kDefaultMaxRowsPerHive)
+                        std::size_t max_rows_per_hive_rows = kDefaultMaxRowsPerHive,
+                        std::size_t max_bytes_per_hive_bytes = kDefaultMaxBytesPerHive)
         : max_visited(max_visited_calls),
           max_visited_per_hive(max_visited_per_hive_calls),
-          max_rows_per_hive(max_rows_per_hive_rows) {
+          max_rows_per_hive(max_rows_per_hive_rows),
+          max_bytes_per_hive(max_bytes_per_hive_bytes) {
         rows.max_rows = max_rows;
         rows.max_bytes = max_bytes;
         rows.add(kHeaderReserveBytes, 2); // the status + summary rows are reserved up front
     }
 
     /// Starts a new hive's accounting: its sub-caps count from zero.
-    void begin_hive() noexcept { hive_visited = hive_rows = 0; }
+    void begin_hive() noexcept { hive_visited = hive_rows = hive_bytes = 0; }
 
     /// Counts one enum_key/query_value call against the dispatch-wide cap AND the current hive's
     /// cap. False = either is reached and the call must NOT be made; `visits_exhausted()` tells
@@ -167,6 +173,12 @@ struct WalkBudget {
 
     /// True once the current hive has retained its per-hive row allowance.
     [[nodiscard]] bool hive_rows_full() const noexcept { return hive_rows >= max_rows_per_hive; }
+
+    /// True when the current hive may not retain `row` (its bytes + the newline) without
+    /// crossing its own byte allowance.
+    [[nodiscard]] bool hive_bytes_exceeded_by(std::string_view row) const noexcept {
+        return hive_bytes + row.size() + 1 > max_bytes_per_hive;
+    }
 
     /// Charges one row (its bytes + the newline) before it is retained.
     [[nodiscard]] bool charge_row(std::string_view row) noexcept {
@@ -585,12 +597,18 @@ template <class Ops>
                 detail::note_value(h, r);
         }
 
-        if (!budget.charge_row(format_distribution_row(h.account, d))) {
+        const std::string row = format_distribution_row(h.account, d);
+        if (budget.hive_bytes_exceeded_by(row)) {
+            detail::add_token(h.tokens, "hive_row_cap"); // this hive's byte allowance: end it alone
+            break;
+        }
+        if (!budget.charge_row(row)) {
             detail::add_token(h.tokens, "row_cap");
             stop = true;
             break;
         }
         ++budget.hive_rows;
+        budget.hive_bytes += row.size() + 1;
         h.distros.push_back(std::move(d));
     }
     return h;
@@ -707,6 +725,12 @@ void collect_wsl(std::span<const yuzu::profiles::ProfileInfo> profiles, const Hi
         const auto& profile = profiles[i];
         // The account is a free-text folder name: an e-mail shape is redacted like any other field.
         const std::string account = sanitize_text(profile.profile_name);
+
+        // A ProfileImagePath that is present but unusable (zero-length, wrong type, over the cap
+        // or changed under the read) sets only this flag, not a record failure: report it whatever
+        // the hive access then does. The profile is still accessed, under account `-`.
+        if (profile.profile_path_unreadable)
+            detail::add_token(out.tokens, "profile_unreadable");
 
         if (yuzu::profiles::is_profile_backup_entry(profile.sid)) {
             ++out.profiles_not_loaded;

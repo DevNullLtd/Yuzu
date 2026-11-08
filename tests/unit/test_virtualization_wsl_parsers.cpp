@@ -471,6 +471,66 @@ TEST_CASE("wsl: a .bak entry and an invalid SID are named and never accessed",
     CHECK(r.posture.rows[0] == "summary|0|0|0|4|-");
 }
 
+TEST_CASE("wsl: an unreadable ProfileImagePath is reported whatever the hive access does",
+          "[virtualization][wsl]") {
+    // The producer sets only the flag (no record failure) for a zero-length, over-cap or
+    // wrong-typed value, so this is the one place the token can come from for such a profile.
+    const auto unreadable = [](const std::string& sid) {
+        ProfileInfo p;
+        p.sid = sid;
+        p.profile_path_unreadable = true; // no folder name, no path
+        return p;
+    };
+
+    SECTION("a reachable live hive keeps its rows under account `-` and is still constrained") {
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+        const auto r = run({unreadable(kSidA)}, acc, ops);
+        CHECK(acc.calls[kSidA] == 1); // still accessed
+        CHECK(has_row(r.posture, "distribution|-|Ubuntu|2|installed|no|ubuntu"));
+        CHECK(has_token(r.posture, "profile_unreadable"));
+        CHECK_FALSE(has_token(r.posture, "hive_not_found"));
+        CHECK(r.posture.status == StatusState::constrained);
+        CHECK(r.posture.rows[0] == "summary|1|1|1|0|-");
+    }
+    SECTION("an unreachable hive carries both tokens") {
+        FakeOps ops;
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::not_found};
+        const auto r = run({unreadable(kSidA)}, acc, ops);
+        CHECK(has_token(r.posture, "hive_not_found"));
+        CHECK(has_token(r.posture, "profile_unreadable"));
+        CHECK(has_row(r.posture, "profile|-|not_found|-"));
+        CHECK(r.posture.status == StatusState::constrained);
+    }
+    SECTION("several such profiles are one token") {
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+        acc.cfg[kSidB] = {HiveAccessStatus::not_found};
+        const auto r = run({unreadable(kSidA), unreadable(kSidB)}, acc, ops);
+        const std::string needle = std::string{wsl::kTokenPrefix} + "profile_unreadable";
+        std::size_t hits = 0;
+        for (auto at = r.posture.reason.find(needle); at != std::string::npos;
+             at = r.posture.reason.find(needle, at + needle.size()))
+            ++hits;
+        CHECK(hits == 1);
+        CHECK(std::count(r.reads.tokens.begin(), r.reads.tokens.end(), "profile_unreadable") == 1);
+    }
+    SECTION("a readable profile record adds no token") {
+        FakeOps ops;
+        Node& hive = make_hive(ops, {{kGuid1, "Ubuntu", 2, 1, "ubuntu"}});
+        FakeAccess acc;
+        acc.cfg[kSidA] = {HiveAccessStatus::ok, &hive};
+        const auto r = run({profile(kSidA, "alice")}, acc, ops);
+        CHECK_FALSE(has_token(r.posture, "profile_unreadable"));
+        CHECK(r.posture.status == StatusState::supported);
+    }
+}
+
 TEST_CASE("wsl: the SID validator accepts only S-1-<n>(-<n>)*", "[virtualization][wsl]") {
     CHECK(wsl::is_valid_sid_string(kSidA));
     CHECK(wsl::is_valid_sid_string("S-1-5-18"));
@@ -596,6 +656,7 @@ TEST_CASE("wsl: the visited-entry bound trips alone and stops the loop",
     CHECK(prod.max_visited == 4096);
     CHECK(prod.max_visited_per_hive == 512);
     CHECK(prod.max_rows_per_hive == 128);
+    CHECK(prod.max_bytes_per_hive == 32768);
 }
 
 TEST_CASE("wsl: the per-hive call bound ends that hive alone; later hives are still walked",
@@ -659,6 +720,94 @@ TEST_CASE("wsl: the per-hive row bound ends that hive alone; later hives are sti
     // The refused fourth distribution is detected before its values are read:
     // A = 1 + 3 x 7 + the enum that listed the fourth; B and C = 16 each.
     CHECK(b.visited == 23 + 16 + 16);
+    CHECK(ops.opens == ops.closes);
+}
+
+TEST_CASE("wsl: the per-hive byte bound ends that hive alone; later hives are still walked",
+          "[virtualization][wsl][budget]") {
+    FakeOps ops;
+    Node& ha = make_hive(ops, many(1, 8, "hostile"));
+    Node& hb = make_hive(ops, many(2, 2, "bob"));
+    Node& hc = make_hive(ops, many(3, 2, "carol"));
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &ha};
+    acc.cfg[kSidB] = {HiveAccessStatus::ok, &hb, "", false, wsl::kErrorAccessDenied};
+    acc.cfg[kSidC] = {HiveAccessStatus::ok, &hc};
+    // Room for exactly three of alice's rows (every one is the same length, + the newline); bob's
+    // and carol's two rows each are shorter, so only alice's hive reaches the allowance.
+    const std::size_t alice_row =
+        std::string{"distribution|alice|hostile-0|2|installed|no|x"}.size() + 1;
+    wsl::WalkBudget b(wsl::kDefaultMaxRows, wsl::kDefaultMaxBytes, wsl::kDefaultMaxVisited,
+                      wsl::kDefaultMaxVisitedPerHive, wsl::kDefaultMaxRowsPerHive,
+                      /*max_bytes_per_hive=*/3 * alice_row);
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob"), profile(kSidC, "carol")},
+                       acc, ops, b);
+
+    CHECK(has_token(r.posture, "hive_row_cap"));
+    CHECK_FALSE(has_token(r.posture, "row_cap"));
+    CHECK_FALSE(has_token(r.posture, "entry_cap"));
+    CHECK_FALSE(has_token(r.posture, "hive_entry_cap"));
+    CHECK(r.posture.status == StatusState::constrained);
+    CHECK(acc.calls[kSidB] == 1); // the trip was NOT a dispatch stop
+    CHECK(acc.calls[kSidC] == 1);
+    CHECK(r.posture.rows[0] == "summary|7|7|3|0|-"); // 3 + 2 + 2
+    CHECK(has_row(r.posture, "distribution|alice|hostile-2|2|installed|no|x"));
+    CHECK_FALSE(has_row(r.posture, "distribution|alice|hostile-3|2|installed|no|x"));
+    CHECK(has_row(r.posture, "distribution|carol|carol-1|2|installed|no|x"));
+    // The byte counter is per hive: A = 1 + 4 x 7 (the fourth is read whole, then refused), B and
+    // C = 16 each; the refused row was never charged to the dispatch budget.
+    CHECK(b.visited == 29 + 16 + 16);
+    CHECK(b.rows.bytes == wsl::kHeaderReserveBytes + 3 * alice_row + 2 * 40 + 2 * 44);
+    CHECK(ops.opens == ops.closes);
+}
+
+TEST_CASE("wsl: with production limits one hive of worst-case rows cannot starve the next profile",
+          "[virtualization][wsl][budget]") {
+    // Names and flavours at the largest escaped size a 4 KiB REG_SZ can produce: 2047 pipes, each
+    // emitted as two bytes. Before the per-hive byte allowance, ~31 such rows spent the whole
+    // 256 KiB dispatch budget and the second profile was never accessed.
+    const std::string pipes(2047, '|');
+    FakeOps ops;
+    std::vector<Distro> hostile = many(1, 40, "x");
+    for (auto& d : hostile) {
+        d.name = pipes;
+        d.flavor = pipes;
+    }
+    Node& ha = make_hive(ops, hostile);
+    Node& hb = make_hive(ops, many(2, 2, "bob"));
+    FakeAccess acc;
+    acc.cfg[kSidA] = {HiveAccessStatus::ok, &ha};
+    acc.cfg[kSidB] = {HiveAccessStatus::ok, &hb};
+    wsl::WalkBudget b; // production limits, nothing overridden
+    const auto r = run({profile(kSidA, "alice"), profile(kSidB, "bob")}, acc, ops, b);
+
+    CHECK(acc.calls[kSidB] == 1);
+    CHECK(has_token(r.posture, "hive_row_cap"));
+    CHECK_FALSE(has_token(r.posture, "row_cap"));
+    CHECK_FALSE(has_token(r.posture, "entry_cap"));
+    CHECK(r.posture.status == StatusState::constrained);
+    CHECK(has_row(r.posture, "distribution|bob|bob-0|2|installed|no|x"));
+    CHECK(has_row(r.posture, "distribution|bob|bob-1|2|installed|no|x"));
+
+    REQUIRE(r.reads.hives.size() == 2);
+    const auto& alice = r.reads.hives[0];
+    REQUIRE_FALSE(alice.distros.empty());
+    CHECK(alice.distros.size() < 40);
+    std::size_t alice_bytes = 0;
+    for (const auto& d : alice.distros)
+        alice_bytes += wsl::format_distribution_row(alice.account, d).size() + 1;
+    CHECK(alice_bytes <= b.max_bytes_per_hive);
+    // One more such row would have crossed it: the cap fired on the byte allowance, not by chance.
+    CHECK(alice_bytes + wsl::format_distribution_row(alice.account, alice.distros.front()).size() +
+              1 >
+          b.max_bytes_per_hive);
+
+    // The summary counts are the rows that exist.
+    const auto n_rows = static_cast<std::size_t>(
+        std::count_if(r.posture.rows.begin(), r.posture.rows.end(),
+                      [](const std::string& row) { return row.rfind("distribution|", 0) == 0; }));
+    CHECK(n_rows == alice.distros.size() + 2);
+    CHECK(r.posture.rows[0].rfind("summary|" + std::to_string(n_rows) + "|", 0) == 0);
     CHECK(ops.opens == ops.closes);
 }
 
