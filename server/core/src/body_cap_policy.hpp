@@ -595,6 +595,13 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // ANY method; no sibling verb carries a body on this path.
     {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/pack", 1u * 1024 * 1024,
      false, "software_alias_pack"},
+    // /api/v1/inventory/software/collection-settings — the per-group collection settings REST
+    // v1 routes (software_collection_settings_routes.cpp). The only body-bearing route is PUT
+    // .../{group_id}: one small JSON object (an interval, a window, a zone name, six boolean
+    // switches, a priority and a version), well under 16 KiB. ANY method: the GET siblings
+    // share the prefix.
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/collection-settings", 16u * 1024, false,
+     "software_collection_settings"},
     // /api/v1/commands -- POST: the REST v1 twin of MCP execute_instruction (command_v1_routes.cpp).
     // The same 4 MiB as the `/mcp/` row because the same worst case rides it: a maximal request
     // (10000 agent ids, 32 parameters of 64 KiB, an 8 KiB scope) is `kExecInstrWorstCaseBody`,

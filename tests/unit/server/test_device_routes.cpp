@@ -657,27 +657,58 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
 TEST_CASE("device live capture_sources: echo status -> read-only source table", "[device][routes]") {
     LiveHarness h;
     h.fake_rows = {{"a-1", 1,
-                    "config|process_enabled|true\nconfig|process_live_rows|1234\n"
-                    "config|arp_enabled|false\nconfig|arp_live_rows|0",
+                    "config|process_enabled|true\nconfig|process_rows|1234\n"
+                    "config|arp_enabled|false\nconfig|arp_rows|0",
                     ""}};
     auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
                         "&agent_id=a-1&kind=capture_sources&n=1");
     REQUIRE(r);
-    CHECK(r->body.find("$Process_Live") != std::string::npos);
-    CHECK(r->body.find("1234") != std::string::npos);                  // live-row count
+    CHECK(r->body.find("$Process_Hourly") != std::string::npos);
+    CHECK(r->body.find("1234") != std::string::npos);                  // row count
     CHECK(r->body.find("id=\"ls-cnt-capture_sources\"") != std::string::npos); // OOB "X of N on"
     CHECK(r->body.find("/echo") != std::string::npos);                  // configure-on-Echo link
+}
+
+TEST_CASE("device live capture_sources: row count reads <src>_rows then <src>_live_rows",
+          "[device][routes]") {
+    const auto count_cell = [](const std::string& status) {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, status, ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
+                            "&agent_id=a-1&kind=capture_sources&n=1");
+        REQUIRE(r);
+        return r->body;
+    };
+    // Only the new key: fails if the <src>_rows lookup is removed.
+    CHECK(count_cell("config|process_enabled|true\nconfig|process_rows|4321")
+              .find("<td class=\"ls-num\">4321</td>") != std::string::npos);
+    // Only the one-release alias: the agent has not moved to the roll-up store, so its raw-row
+    // figure is not shown under the hourly label: a dash with the reason, never the number.
+    const auto alias_only = count_cell("config|process_enabled|true\nconfig|process_live_rows|8765");
+    CHECK(alias_only.find("8765") == std::string::npos);
+    CHECK(alias_only.find("title=\"This device runs an agent without the roll-up tables; upgrade "
+                          "the agent\">&mdash;") != std::string::npos);
+    // Both present: the new key wins and the agent is not flagged.
+    const auto both = count_cell(
+        "config|process_enabled|true\nconfig|process_live_rows|1\nconfig|process_rows|2");
+    CHECK(both.find("<td class=\"ls-num\">2</td>") != std::string::npos);
+    CHECK(both.find("<td class=\"ls-num\">1</td>") == std::string::npos);
+    CHECK(both.find("without the roll-up tables") == std::string::npos);
+    // Neither: a dash, not a zero, and no agent note.
+    const auto neither = count_cell("config|process_enabled|true");
+    CHECK(neither.find("&mdash;") != std::string::npos);
+    CHECK(neither.find("without the roll-up tables") == std::string::npos);
 }
 
 TEST_CASE("device live capture_sources: registry row renders with the System category",
           "[device][routes]") {
     LiveHarness h;
-    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_live_rows|7", ""}};
+    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_rows|7", ""}};
     auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
                         "&agent_id=a-1&kind=capture_sources&n=1");
     REQUIRE(r);
     CHECK(r->body.find("<span class=\"src-on\">registry</span>") != std::string::npos);
-    CHECK(r->body.find("<code>$Registry_Live</code></td><td class=\"ls-num\">7</td>"
+    CHECK(r->body.find("<code>$Registry_Hourly</code></td><td class=\"ls-num\">7</td>"
                        "<td><span class=\"ls-pill\">System</span>") != std::string::npos);
     CHECK(r->body.find("1 of 1 on") != std::string::npos);
 }

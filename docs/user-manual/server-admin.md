@@ -93,7 +93,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
 | `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | on | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships ON** — the transport machinery is complete and reviewed, and the four defects that previously gated the on-by-default flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one progress drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Pass `--no-mcp-streamed-post` to opt out. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
 | `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
-| `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
+| `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** - `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, the legacy `/events` stream, and synchronous workflow runs (`POST /api/v1/workflows/{id}/execute`, the legacy `POST /api/workflows/{id}/execute`, MCP `execute_workflow`; at most 2 per principal, each held for up to 60 seconds). The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
 | `--mcp-max-streams-per-principal` | `4` | Max concurrent MCP SSE streams for one principal. An **anti-monopoly policy, not a capacity limit** — capacity is `--max-sse-streams`. Stops a single agentic token taking the channel; does not ration the fleet. Env: `YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL`. |
 | `--http-worker-threads` | `0` (derive) | Pin the shared HTTP worker pool by hand. `0` derives it from `--max-sse-streams`, which is what you want. If you set it, the stream target is clamped to what your pool can actually carry (the startup log reports the effective figure). Env: `YUZU_HTTP_WORKER_THREADS`. |
 | `--response-max-rows-per-agent` | `256` | Most response rows the server stores for one command on one device (range 1-65536; `0` is rejected). A row is one streamed output frame (the agent sends a frame once its buffer reaches about 64 KiB, and a frame can be larger) or the final status frame, so 256 rows is roughly 16 MiB of streamed output: an illustration, not a byte guarantee. Past the cap the **newest** frames are dropped at the store (the row just before them ends with a `...[rows past per-agent cap dropped]` marker), counted on `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}` and logged with a rate-limited warning; one terminal-status frame is still recorded when none exists yet, so the command's outcome still shows. A command whose output on one device exceeds about 16 MiB therefore keeps its first part and loses the tail: raise this value for such commands. Concurrent writers for one device can overshoot the cap slightly. Env: `YUZU_RESPONSE_MAX_ROWS_PER_AGENT` (an out-of-range env value is ignored and the default applies; only the flag form refuses to start). |
@@ -263,7 +263,7 @@ The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg`
 | `upload-blobs/` | Blob root for completed agent file uploads (ADR-3004). The records (`upload_grant_store.completed_uploads`) are in PostgreSQL; the blobs live here. Always under `--data-dir`; no flag overrides it. |
 | `enablement-anchor` | Plugin-enablement continuity anchor (ADR-3006): three lines, the enablement store's id, epoch and counter. It is this host's witness that the store has not gone backwards. Written on a boot that finds none, from the store's current highest; never lowered. Copy it with the data directory and with every backup: it is **not** in the `pg_dump`. What unwitnessed, regressed and unreadable mean, and how to recover, are in [Enablement continuity anchor](#enablement-continuity-anchor). |
 
-> **Backup recommendation:** A complete backup is a `pg_dump --format=custom` of the Yuzu database **plus the entire CA/cert directory `--ca-dir`**, captured at the same point in time and restored as a pair — `--ca-dir` holds `default-ca.key` (the per-install CA private key) and the secrets KEK files `secrets-kek-v<N>.key`, without which the secret columns in the dump (TOTP secrets, webhook and plugin-config secrets, runtime-config and offload-target secrets) cannot be decrypted. See [Backup — the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) and [PostgreSQL Substrate](#postgresql-substrate) for the procedure. Retain old KEK versions for as long as the backups that need them. Also back up the `--data-dir` `.cfg` files above, `nvd_cves.db` (use `sqlite3 nvd_cves.db ".backup ..."`, NEVER `cp` against a live DB), and the two blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` — the dump holds only the package and upload records that point into them, so restoring the dump without these directories leaves records with no files behind them. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing the Postgres `auth` schema AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing authentication state alone is a Postgres restore — see `docs/ops-runbooks/auth-db-recovery.md`. Also keep `enablement-anchor` (it is a witness of the plugin-enablement store, not part of the dump; `scripts/yuzu-backup.sh` and `scripts/yuzu-restore.sh` copy it): restoring the dump without it is reported as unwitnessed, and restoring a dump older than the anchor starts with enablement regressed by design (see [Enablement continuity anchor](#enablement-continuity-anchor)). **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
+> **Backup recommendation:** A complete backup is a `pg_dump --format=custom` of the Yuzu database **plus the entire CA/cert directory `--ca-dir`**, captured at the same point in time and restored as a pair — `--ca-dir` holds `default-ca.key` (the per-install CA private key) and the secrets KEK files `secrets-kek-v<N>.key`, without which the secret columns in the dump (TOTP secrets, webhook and plugin-config secrets, runtime-config and offload-target secrets) cannot be decrypted. See [Backup — the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) and [PostgreSQL Substrate](#postgresql-substrate) for the procedure. Retain old KEK versions for as long as the backups that need them. Also back up the `--data-dir` `.cfg` files above, `nvd_cves.db` (use `sqlite3 nvd_cves.db ".backup ..."`, NEVER `cp` against a live DB), and the two blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` — the dump holds only the package and upload records that point into them, so restoring the dump without these directories leaves records with no files behind them. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing the Postgres `auth` schema AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing authentication state alone is a Postgres restore — see `docs/ops-runbooks/auth-db-recovery.md`. Also keep `enablement-anchor` (it is a witness of the plugin-enablement store, not part of the dump; `scripts/yuzu-backup.sh` and `scripts/yuzu-restore.sh` copy it): restoring the dump without it is reported as unwitnessed, and restoring a dump older than the anchor starts with enablement regressed by design (see [Enablement continuity anchor](#enablement-continuity-anchor)). **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file. **Access-review caveat:** a data-only restore (`--data-only` or `--section=data`) into a schema that already has the access-review guard triggers (`access_review_store`, schema v3 and later) is refused, because the guard accepts an attestation row only as `pending` at sequence 0; restore schema and data together.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
 > - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `yuzu-tls` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry, one at a time with rising urgency: `YuzuCertificateExpiringSoon` (warning, 30 to 7 days left: schedule the renewal), `YuzuCertificateExpiryImminent` (critical, 7 days to 24 hours: renew today), `YuzuCertificateExpiryCritical` (critical, under 24 hours: renew now). The gateway reports its own certificate files the same way (`yuzu_gw_cert_expiry_timestamp_seconds`, alerts `YuzuGatewayCertificateExpir*`; see [Certificate rotation and expiry](gateway.md#certificate-rotation-and-expiry)). **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, follow the clean re-root in [PKI architecture](../pki-architecture.md) "Operator runbook", which removes the `default-*` files and `default-marker.json` and also clears the CA inventory in Postgres (`ca_store`). Never clear the whole `--ca-dir`: it also holds the secrets key-encryption key (`secrets-kek-*.key`), and the server refuses to start without it (`kek_unresolvable`, #5370).
@@ -3376,7 +3376,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with a "Test SSO" button (checks the issuer's discovery document and signing keys). Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
-| Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A decision is final, and a reviewer cannot decide their own grant (or an engine principal they own): the panel shows the refusal, and another reviewer must decide it, so a one-Administrator deployment needs a second person holding `Reviewer`. Gated on `AccessReview:Read` (the write controls appear for a caller who also holds `AccessReview:Attest`), and, like every `/api/v1/access-reviews` route, refused with `403` to an engine principal session whatever role it holds (audited as a denied `access_review.list` or `access_review.get` row with detail `engine_session_denied`). The panel is a view over the same `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. Unlike the **Audit and reviews** page (`/access/audit`), a person's successful view of this panel writes no `access_review.list`, `access_review.get` or `access_review.exported` audit row; the changes made from it are audited by the REST routes it calls. See `docs/auth-architecture.md` "Periodic access reviews". |
+| Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). Gated on `AccessReview:Read` (the write controls appear for a caller who also holds `AccessReview:Attest`), and, like every `/api/v1/access-reviews` route, refused with `403` to an engine principal session whatever role it holds (audited as a denied `access_review.list` or `access_review.get` row with detail `engine_session_denied`). The panel is a view over the same `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path, so a decision recorded from it follows the same rules as the REST route (the reviewer must differ from the subject of the grant; every decision is kept) while the panel itself shows only the latest decision, with no marker for earlier ones. The panel offers Attest and Flag only on a grant that is still pending on an open campaign, and shows "Another reviewer must decide" instead on a user grant that names the signed-in reviewer (as the Access page does); both buttons are disabled while the request is in flight. To change a decision already recorded, call `POST /api/v1/access-reviews/{id}/attestations` or the MCP `record_attestation`: the new decision becomes current and the earlier one stays in the history. When a decision replaces an earlier one (another reviewer decided since the page was drawn), the panel's feedback line names the superseded decision. On an RBAC-off install the sole Administrator's own and group grants stay pending, because nobody else can decide them. Unlike the **Audit and reviews** page (`/access/audit`), a person's successful view of this panel writes no `access_review.list`, `access_review.get` or `access_review.exported` audit row; the changes made from it are audited by the REST routes it calls. See `docs/auth-architecture.md` "Periodic access reviews". |
 
 ### Plugins and updates (System page)
 
@@ -4945,7 +4945,7 @@ sudo bash install-server-postgres.sh --dsn 'postgresql://yuzu:...@db.example.com
 sudo bash install-server-postgres.sh
 ```
 
-The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008).
+The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008). The database should be UTF8-encoded: the access-review history read cuts a superseded justification by characters, which assumes UTF8. The HA image sets UTF8 explicitly, and the single-node image, measured on 2026-11-04 with the image built from `Dockerfile.postgres` (the published `yuzu-postgres` image is built from the same Dockerfile; the CI image `postgres:18.4-bookworm` and `postgres:18` were measured as well), created a UTF8 database. The helper creates a database in an existing cluster (`CREATE DATABASE`, which inherits the encoding of `template1`) and sets no encoding of its own, so a native cluster follows its `initdb` locale and a host in the `C` locale yields `SQL_ASCII`. Check with `SHOW server_encoding;` in the Yuzu database, which must answer `UTF8`. An existing database cannot be converted in place: back up first, create a NEW database under a different name (for example `CREATE DATABASE yuzu_utf8 OWNER yuzu ENCODING 'UTF8' TEMPLATE template0;`, verified on a `postgres:18` cluster initialised with the `C` locale; the same command against the existing name fails with "already exists"), move the data across (a dump taken from a single-byte database can contain bytes that are not valid UTF8 and may need cleaning; not verified in detail), and repoint the DSN at the new database. On a database with a single-byte encoding a cut counts bytes and can fall inside a multibyte sequence; the effect on the validity of the JSON response was not verified. Sizing: one read of a campaign of 1000 frozen grants with 100 decisions each needed a server peak of about 331 MB to 779 MB on 2026-11-04 (see `docs/auth-architecture.md`, "The decision history"), the cost grows linearly with the number of frozen grants (no cap), and each concurrent read holds its own copies, so set a server memory limit above that peak for the number of such reads you expect at once. No shipped deployment file sets a limit. Alert on `yuzu_server_memory_bytes{type="rss"}` (exposed on `/metrics`) and on restarts; one out-of-memory kill is one reset of `yuzu_server_uptime_seconds`, below the `YuzuServerRestartLoop` threshold (more than 3 resets in 3 hours), so that alert does not fire on a single kill.
 
 ### Backing up PostgreSQL state
 
@@ -4972,7 +4972,7 @@ docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
   > "yuzu-pg-$(date +%F).dump"
 ```
 
-Restore only a dump taken from this 0.15.0 deployment. The server does not check where a dump came from: a dump written by an earlier build is unsupported and is migrated forward without notice. Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot). On a **fresh disaster-recovery target**, the app role and database must exist before `pg_restore` — run `install-server-postgres.sh` (or your managed-DB provisioning) first:
+Restore only a dump taken from this 0.15.0 deployment. The server does not check where a dump came from: a dump written by an earlier build is unsupported and is migrated forward without notice, except that the access-review store's schema v3 migration refuses a database holding a decision on a `user` grant recorded by the account it names (see the Behaviour change section on access-review attestations in `upgrading.md`). Restore schema and data together, as the recipe below does: a data-only restore (`pg_restore --data-only` or `--section=data`) into a schema the server has already migrated fails for the access-review attestation tables, because their guard triggers admit only rows that arrive with their history: when the dump holds any decided grant, `pg_restore` reports a guard error for the attestation table (its whole `COPY` is refused, so the decided and the pending rows are absent) and a foreign-key error for the history table, ends with errors ignored and exits non-zero, and the restored campaigns have no attestation or history rows. A dump whose grants are all still pending restores its attestation rows without an error. A superuser run with `--disable-triggers` skips the guards, which is the owner-level limit described in the access-review sections. Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot). On a **fresh disaster-recovery target**, the app role and database must exist before `pg_restore` — run `install-server-postgres.sh` (or your managed-DB provisioning) first:
 
 ```bash
 # Native — same env-file + PGPASSWORD/DSN_NOPASS preamble as the backup recipe
@@ -5665,6 +5665,156 @@ was shown, frozen at submission. It is stored in the `request_json` column as cl
 No feature creates a bound request in this release, so no `request_json` is stored yet; this is
 the contract for the change that does.
 
+### Workflow run records are not pruned (#2146)
+
+None of the settings above applies to workflow runs. The `workflow_executions` and
+`workflow_step_results` tables (schema `workflow_engine`) have no retention pass today and nothing
+deletes a row; a run's history survives its workflow being deleted. Any future prune is a bulk
+delete on a wall-clock cutoff and falls under the clock-guarded retention rules
+([`docs/clock-guarded-retention.md`](../clock-guarded-retention.md)), which also say that deleting a
+run row releases its idempotency key, so a prune has to decide the key's fate on purpose.
+
+What a run row holds, and how to treat it:
+
+- **Who ran it.** `principal` is the calling account's name (a person's username for a dashboard or
+  API session, the token owner for an API token). The v1 execute route and MCP `execute_workflow`
+  set it on every run they start, keyed or not; a run started through the legacy
+  `POST /api/workflows/{id}/execute` leaves it empty. `correlation_id` is the call's correlation id
+  (the same value the call's audit rows carry). `idempotency_key` is the caller's own string,
+  `request_fingerprint` a SHA-256 of the request.
+- **Where it ran.** `agent_ids_json` holds the device ids the caller named, as a JSON array of
+  strings, each distinct id once in the order it was first named (a repeated id is stored once).
+  The column is bounded three ways on every route that starts a run (the v1 route, MCP and the
+  legacy execute route share the same insert): at most 1,000 ids, at most 131,072 bytes of JSON
+  text in all (the marker included), and an id longer than 256 bytes (the longest id any agent can
+  have) or holding a NUL byte is never stored. A run still sends to every id it names, as the caller sent them; only the
+  stored copy is bounded. When the distinct ids do not all fit, the column holds the ones that fit,
+  followed by one marker object
+  `{"truncated":true,"total":<distinct ids named>,"sha256":"<hash>"}`: `total` counts every distinct
+  id including any that were not stored, and `sha256` is the digest of the JSON text of the
+  distinct list in the order it was first named (null if the digest could not be computed). The
+  column is still a JSON array, so the true count and a digest of the list stay in the row. For a
+  caller confined to a device scope, the ids in that caller's own dispatch scope (its
+  `Execution:Execute` visibility) are stored first, then the rest in the order named. The run's detail reads then show `agent_ids_truncated: true` and, to a caller
+  with no device scope, `agent_ids_total`. A list with no repeated id, no skipped id and
+  within the bounds is stored unchanged.
+
+  **Accepted residual (owner decision, 2026-11-06).** A confined reader sees a run only if one
+  of the stored ids is in its scope. For a run that names more than 1,000 distinct ids, or whose
+  ids do not fit the 131,072-byte budget, that depends on which ids were stored: the confined
+  creator keeps seeing its own run exactly while at least one stored id lies in the scope its reads
+  are checked against (`Workflow:Read`). The ids in its `Execution:Execute` dispatch scope are
+  stored first, so this is guaranteed when the run names at least one device inside that scope and
+  that scope lies within its `Workflow:Read` scope. Overlap alone is not enough: with a global
+  `Execution:Execute` grant and a group-scoped `Workflow:Read` (the scopes overlap) every named id
+  counts as first, the ids are stored in the order named, and the creator loses sight of its own
+  run when none of its group's devices is among those stored. Starting a run needs a global
+  `Workflow:Execute`, which of the seeded roles only `Administrator` holds, so a confined creator
+  is a custom role that holds `Workflow:Execute` globally plus a scoped grant such as an
+  `Operator` assignment on a group. Another confined reader whose devices fall past the cap does not see the run in its list or
+  its detail read. Unconfined readers and the audit log still see it, and a malformed or empty column is
+  invisible to a confined reader, never visible. The trigger is distinct ids beyond the cap
+  (an id that names no device counts; a repeated id does not; an id over 256 bytes or holding a NUL
+  byte is skipped and consumes nothing).
+
+  Rows are
+  still never trimmed, so size the Postgres volume for the run rate you expect: the bound caps
+  each row, not the number of rows. The server watches the row count for you:
+  `yuzu_server_workflow_executions_rows` (an estimate, sampled about every 15 seconds without a
+  table scan) and `yuzu_server_workflow_executions_bytes` (heap, TOAST and indexes, step results
+  excluded) are exported, and the `YuzuWorkflowExecutionsTableLarge` alert warns when the estimate
+  stays above 100,000 rows for 30 minutes. That is about 130 MB if a typical run names 10 devices
+  and up to about 13 GB if every run fills the 131,072-byte column. When it fires, read the bytes gauge,
+  then find the caller (a looping client appears as many rows in
+  `GET /api/v1/workflow-executions` and as `workflow.execute` audit rows from one principal) and
+  stop it. Nothing deletes rows for you and no route does, so reclaiming space is a DBA decision
+  that must account for the idempotency keys below.
+- **Classification.** The pairing of an operator's account name with a set of devices and a time is
+  personal data about that operator (usage-class, like the audit log). Include `workflow_executions`
+  in your data inventory and in any works-council or subject-access process. There is no per-row
+  delete route, and deactivating or deleting an account does not touch its rows. Audit rows for the
+  same calls follow `--audit-retention-days` (365 by default); the run rows outlive them.
+- **Who can read it.** No REST or MCP read of the run returns the row's `principal`,
+  `idempotency_key`, `request_fingerprint` or `correlation_id` columns; the columns are readable in
+  the database. Some of the values are not confined to the database: the call's `workflow.execute`
+  audit rows carry the `idempotency_key` (neutralised and clipped) and the `correlation_id`, and
+  each audit row names the calling principal, so every `AuditLog:Read` holder can read them for as
+  long as the audit log keeps them (365 days by default). A key is a string the client chooses, so
+  tell your clients not to put a secret or personal data in one. The run detail returns
+  `agent_ids` (narrowed to the caller's visible devices for a confined caller) and the step
+  results. A repeat of a key with a different request returns the bound run's `execution_id` to the
+  same principal.
+- **A recreated account inherits its keys.** A key belongs to the principal NAME. If an account is
+  deleted and a new one is created with the same username, the new account owns the old account's
+  keys: a repeat of one of those keys by the new account replays the old run instead of starting
+  one, and a different request under it is refused `422` with the old run's `execution_id`.
+  Deleting an account therefore does not free its keys; only deleting the run rows does, and no
+  supported route does that.
+
+### A workflow run left `running`
+
+A workflow run can be left in status `running` with nothing still working on it. This section
+covers runs of `POST /api/v1/workflows/{id}/execute`, the legacy `POST /api/workflows/{id}/execute`
+and MCP `execute_workflow`. It does not cover instruction executions in the execution tracker.
+
+**How a row gets stuck.** Nothing sweeps these rows. Three causes are known: the final status
+write failed twice (the server log says `execution <id> was NOT finalized` at `error` and
+`yuzu_server_workflow_finalize_failed_total` moves; `YuzuWorkflowFinalizeFailed` fires); the
+process died mid-run (SIGKILL, power loss, out of memory), which moves no counter; and an admission
+COMMIT whose outcome Postgres could not confirm (the log says `the outcome of transaction ... could
+not be confirmed`), which can leave a `running` row for a run that was never dispatched.
+
+**Find them.** List runs that are `running` and started more than 180 seconds ago:
+
+```
+GET /api/v1/workflow-executions?status=running&until=<now minus 180, epoch seconds>
+```
+
+MCP: `list_workflow_executions` with `status` `running` and `until`. `until` is exclusive and
+matches `started_at`. 180 seconds is the age at which the server itself calls a repeat of that
+row's key `indeterminate`; a live run normally is not older, because a run is bounded to 60 seconds
+and a shutdown waits at most 30 seconds for runs (a send already in flight is not interrupted, so a
+hung send can in principle outlast the bound). Search the server log for the execution id first:
+`execution <id> was NOT finalized` at `error` confirms the first cause above. Use an account that
+is not confined to a management
+group: a confined caller sees only runs with a device in its scope, so the list can be short.
+Then read each with `GET /api/v1/workflow-executions/{id}`.
+
+**Decide what was sent.** The row cannot say. A step recorded `pending` or `skipped` may still have
+been sent, because the command id is stored by a write that can be dropped. Check the audit log for
+`workflow.execute` rows for that workflow around `started_at` (the closing row names the execution
+id; a `requested` row with no closing row is the orphan's own trail) and the response store by
+plugin and time, before running anything again.
+
+**Clearing it.** No REST or MCP call closes a workflow run. `cancel_execution` closes an
+instruction execution in the execution tracker and does not apply to a workflow run. Leaving the
+row alone is safe: it holds no slot, nothing waits for it at shutdown, and the only visible effect
+is that a repeat of its idempotency key answers `indeterminate` (or `running` while it is younger
+than 180 seconds). If you must close it, a database administrator can run the engine's own guarded
+statement, which only touches a row that is still `pending` or `running`:
+
+```
+UPDATE workflow_engine.workflow_executions
+   SET status = 'cancelled', completed_at = <epoch seconds>
+ WHERE id = '<execution id>' AND status IN ('pending', 'running');
+```
+
+That changes the row's status and nothing else: it recalls nothing that was sent and does not
+touch the step rows. If a run is somehow still driving the row, the engine stops dispatching its
+remaining steps once it finds the row no longer `running`.
+
+**The key stays bound.** Closing the row does not release its idempotency key, and a repeat of the
+key still sends nothing. The replay is then a terminal answer from the stored step rows, never
+`completed` for a row closed this way. To run the workflow again, use a NEW key (on MCP, a new
+approval as well), after you have decided from the audit evidence that another run is wanted.
+
+**After a restore.** A key lives only on its run row. Restoring this build's own backup taken
+BEFORE a run was admitted removes that run and with it the key's binding: a repeat of the same key
+then starts the workflow again in full, even if the lost run had already sent its steps. Restoring
+a backup taken after the claim brings back the row as it was, possibly `running`, and this section
+applies to it. After any restore, check the audit log before repeating a key whose original call
+ran after the backup point.
+
 ---
 
 ## Settings API Reference
@@ -5803,6 +5953,8 @@ Assigning a role to an engine principal offers custom roles only: built-in roles
 A request the page cannot honour (an unknown range, an `offset` past 10000, a NUL byte in a filter, a bad sample size) is answered with status 200 and a short note, because htmx discards 4xx and 5xx bodies; nothing is read from the store.
 
 Which refusals leave a denied-access audit row differs by panel, because some panels load themselves and some wait for a click. The campaign list loads on every page view, so a refused browser session writes no denied-access row for it (opening the page must not fill the audit log). Opening a campaign, including by the `?campaign=<id>` link (which loads that campaign when the page opens), and reading the current grants are deliberate requests: a refused caller writes the ordinary permission-denied row. A refused API or MCP token that reaches any of the three fragment URLs writes one every time. An engine-class session is refused with `403` on all three fragments and leaves an `access_review.list`, `access_review.get` or `access_review.exported` row with `result=denied` and `detail=engine_session_denied`, as the REST twins do.
+
+**Triage: an attest or close that returns `503`.** An attest returns the fixed store-failure message (`the decision store is unavailable or the decision may not have been committed; read the campaign and compare decision_seq before retrying`, `retry_after_ms` 5000). A close returns the store string unchanged: `close_campaign lock_timeout failed`, `close_campaign write failed` or `database unavailable — try again` (an internal error with `retry_after_ms` 5000 on MCP). Search the server log for `AccessReviewStore::record_attestation` or `AccessReviewStore::close_campaign` lines (each carries `campaign=` and `sqlstate=`); the line `access review attestation store failure: surface=` is written for an attest only, a close fault has only the `AccessReviewStore::close_campaign: failed (campaign=..., sqlstate=...)` line. `sqlstate=55P03` means the 3-second row-lock wait expired because another decision or a close held the row; nothing was committed on that path, so a retry is safe. The 3-second bound is set inside each of those two transactions (`SET LOCAL lock_timeout`) and replaces any `lock_timeout` in the DSN, so a stricter DSN value (for example `options=-c lock_timeout=1000`) is loosened to 3 seconds for them. An attest can wait on its grant row and then on the campaign row, so its lock waits can total about 6 seconds. A close whose COMMIT acknowledgement was lost may have closed the campaign already; the retry then answers `404`, so read the campaign first. An attest that fails with audit `result=failure` and `sod_check_unavailable store=engine|rbac` (metric `yuzu_access_review_attestation_refused_total` reason `check_unavailable`) means the engine-principal or RBAC store read behind the separation-of-duties check was degraded, so nothing was recorded. For either, check the database pool: `yuzu_pg_pool_in_use` at the pool size, or a rising `yuzu_pg_acquire_timeout_total`.
 
 ### OTA Updates
 
@@ -6136,7 +6288,7 @@ Notes:
 
 ### Load balancers and shutdown drain
 
-On `SIGTERM` the server sets `/readyz` to `503 {"status":"draining"}` and then keeps serving every other route for at least **`--shutdown-drain-seconds`** (env `YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, range 0–60) before it closes its listener, and for as long as executions are still running (up to 30 s). It logs a countdown every 10 s. The two background roll-ups (app-perf and the software catalogue) do not start new work once draining begins. With the default of 0 and nothing running, the listener closes straight away — fine for a single server, but a load balancer in front of several replicas would then find out from refused connections.
+On `SIGTERM` the server sets `/readyz` to `503 {"status":"draining"}` and then keeps serving every other route for at least **`--shutdown-drain-seconds`** (env `YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, range 0–60) before it closes its listener, and for as long as executions are still running (up to 30 s). Workflow runs started by `POST /api/v1/workflows/{id}/execute`, MCP `execute_workflow` or the legacy `POST /api/workflows/{id}/execute` count too: the server counts them inside its own process, from the moment the run is admitted (so a run that has not yet started sending steps is waited for too; a run left `running` by a crash, or owned by another replica, never holds a shutdown), so graceful shutdown waits for each in-flight run up to the same 30 s cap. While draining, a run gives up any retry it had not yet made and keeps sending its remaining steps; when the wait ends, a run still going is stopped (its unstarted steps are marked `skipped` with reason `server_shutdown`, its execution is closed `failed`, and the caller is told `interrupted`). It logs a countdown every 10 s. The two background roll-ups (app-perf and the software catalogue) do not start new work once draining begins. With the default of 0 and nothing running, the listener closes straight away, which is fine for a single server, but a load balancer in front of several replicas would then find out from refused connections.
 
 For any deployment behind a load balancer:
 

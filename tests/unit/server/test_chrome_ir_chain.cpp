@@ -251,7 +251,7 @@ TEST_CASE("chrome-ir: composable-scope chain — lineage, audit, pin-prevents-GC
     //            (two agents returned ≥1 row). Dispatch must be scoped to the parent set. ──
     const std::string b2 =
         std::string(
-            R"({"name":"windows-chrome-vulnerable","sql":"SELECT pid FROM process_live WHERE name='chrome.exe'","parent_id":")") +
+            R"({"name":"windows-chrome-vulnerable","sql":"SELECT name FROM $Process_Hourly WHERE name='chrome.exe'","parent_id":")") +
         rs1 + R"("})";
     auto j2 = h.post("/api/v1/result-sets/from-echo-query", b2, st);
     REQUIRE(st == 202);

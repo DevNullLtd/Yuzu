@@ -74,6 +74,12 @@ Every event contains:
 | `instruction.deleted` | DELETE /api/instructions/{id} | instruction_id |
 | `instruction.executed` | An instruction execute call reached at least one agent: `POST /api/instructions/{id}/execute`, `POST /api/v1/instructions/{id}/execute` or MCP `execute_instruction_definition` | none |
 
+### Workflow
+
+| Type | When | Key attributes/payload |
+|------|------|----------------------|
+| `workflow.executed` | The engine admitted and ran a workflow: `POST /api/workflows/{id}/execute`, `POST /api/v1/workflows/{id}/execute` or MCP `execute_workflow`. Published once, whatever the run's outcome; not for a refusal, an idempotent replay or a run that threw | none |
+
 ### Auth
 
 | Type | When | Key attributes/payload |

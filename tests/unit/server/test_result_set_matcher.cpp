@@ -588,3 +588,195 @@ TEST_CASE("matcher: a two-column definition over a key/value plugin is unchanged
     CHECK(response_matches(m.dump(), kOk, "status|ok"));
     CHECK_FALSE(response_matches(m.dump(), kOk, "status|no"));
 }
+
+// ── references_raw_capture_table: persisted SQL that still reads a raw capture table ───────────
+
+TEST_CASE("raw capture table predicate: dollar names and real names", "[result_set][matcher]") {
+    CHECK(references_raw_capture_table("SELECT pid FROM $Process_Live"));
+    CHECK(references_raw_capture_table("select * from $process_live where pid = 1"));
+    // The shape of the chained sets in test_chrome_ir_chain.cpp.
+    CHECK(references_raw_capture_table("SELECT pid FROM process_live WHERE name='chrome.exe'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM main.PROCESS_LIVE"));
+    CHECK(references_raw_capture_table("SELECT a FROM t JOIN $TCP_Live ON 1"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM \"registry_live\""));
+}
+
+TEST_CASE("raw capture table predicate: every one of the sixteen real tables", "[result_set][matcher]") {
+    for (const char* t : {"process", "tcp", "service", "user", "perf", "procperf", "netqual",
+                          "module", "software", "arp", "dns", "netconn", "mapdrive", "power",
+                          "removable", "registry"}) {
+        INFO(t);
+        CHECK(references_raw_capture_table(std::string("SELECT 1 FROM ") + t + "_live"));
+    }
+}
+
+TEST_CASE("raw capture table predicate: roll-up tiers and look-alikes pass", "[result_set][matcher]") {
+    CHECK_FALSE(references_raw_capture_table("SELECT name FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT name FROM $Process_Daily"));
+    CHECK_FALSE(references_raw_capture_table("SELECT name FROM process_hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM process_lived"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM my_process_live"));
+    // usage_live is the open-runs table, not a raw capture table.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM usage_live"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Usage_Live"));
+    // An unknown shim is the agent's error path (counted by agents_failed), not a server refusal.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Foo_Live"));
+    CHECK_FALSE(references_raw_capture_table(""));
+}
+
+TEST_CASE("raw capture table predicate: literals and comments are not table references",
+          "[result_set][matcher]") {
+    CHECK_FALSE(references_raw_capture_table("SELECT 'label $Process_Live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 'it''s process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly -- was $Process_Live\n"));
+    CHECK_FALSE(references_raw_capture_table("SELECT /* process_live */ 1 FROM $Process_Hourly"));
+    // A literal that ends before the reference does not hide it.
+    CHECK(references_raw_capture_table("SELECT 'x' FROM process_live"));
+    // An unterminated literal hides the rest, never the part before it.
+    CHECK(references_raw_capture_table("SELECT 1 FROM process_live WHERE a = 'unterminated"));
+}
+
+TEST_CASE("raw capture table predicate: quoted identifiers are tokens and never hide the code "
+          "after them",
+          "[result_set][matcher]") {
+    // A quote, comment opener or bracket INSIDE a quoted identifier is part of the name.
+    CHECK(references_raw_capture_table("SELECT 1 AS \"a'\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS \"--\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS \"/*\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS [--] FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS [a'] FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS `a'` FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS `--` FROM $Process_Live"));
+    // A doubled delimiter is an escape inside "..." and `...`, not a close.
+    CHECK(references_raw_capture_table("SELECT 1 AS \"a\"\"'\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS `a``'` FROM tcp_live"));
+    // The identifier's own content is read like code.
+    CHECK(references_raw_capture_table("SELECT 1 FROM \"Process_Live\""));
+    CHECK(references_raw_capture_table("SELECT 1 FROM [process_live]"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM `PROCESS_LIVE`"));
+    // A literal after a quoted identifier is still a literal (its content is not a bare raw
+    // table name, so the comma before it does not make it a table reference).
+    CHECK_FALSE(references_raw_capture_table("SELECT \"x'\" , 'see process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT [x'] , 'see process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT `x'` , 'see $Process_Live' FROM $Process_Hourly"));
+    // An unterminated quoted identifier runs to the end, as SQLite reads it; its content is
+    // still read like code (fails closed), and it never hides a reference before it.
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a = \"process_live"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a = \"x"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM process_live WHERE a = \"unterminated"));
+    // Schema-qualified, tab and newline separated.
+    CHECK(references_raw_capture_table("SELECT 1\nFROM\tmain.process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM main.\"process_live\""));
+    // The accepted false positive: a name inside a double-quoted string literal is read as an
+    // identifier and refused (the predicate fails closed).
+    CHECK(references_raw_capture_table("SELECT \"$Process_Live\" FROM $Process_Hourly"));
+}
+
+TEST_CASE("raw capture table predicate: a single-quoted raw table name is a reference wherever "
+          "it stands",
+          "[result_set][matcher]") {
+    // SQLite reads a single-quoted token where a table name is expected as an identifier
+    // (verified against sqlite3: each of these returns the raw table's rows).
+    CHECK(references_raw_capture_table("SELECT * FROM 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM 'PROCESS_LIVE'"));
+    CHECK(references_raw_capture_table("SELECT * FROM '$Process_Live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM main.'process_live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM 'main'.'process_live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM main . 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $TCP_Hourly JOIN 'tcp_live' ON 1"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $TCP_Hourly LEFT JOIN 'tcp_live' ON 1"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $TCP_Hourly, 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM ('process_live')"));
+    CHECK(references_raw_capture_table("SELECT 1\nFROM\t'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM/* c */'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM -- c\n'process_live'"));
+    // The IN forms SQLite also reads as the table (`select 42 in 'process_live'` scans it); a
+    // rule keyed on the preceding keyword missed every one of these.
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a NOT IN 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN/**/'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN -- c\n'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE (a, b) IN 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN main.'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN '$Process_Live'"));
+    // The documented over-refusal: a string literal that is exactly a raw table name is refused
+    // wherever it stands, the position-free rule's price for closing every IN form.
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 'process_live' AS label FROM $Process_Hourly"));
+    CHECK(references_raw_capture_table("SELECT '$Process_Live' AS label FROM $Process_Hourly"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name LIKE 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name IS NOT 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT a, 'process_live' FROM $Process_Hourly"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name IN ('process_live')"));
+    // Content that is not a bare raw table name is never a reference, wherever it stands.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly, 'process_lives'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM 'it''s process_live'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'see process_live'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN 'see tcp_live'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'process_live '"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = '$$process_live'"));
+    // An unterminated single-quoted name is refused (fail closed); SQLite would reject the
+    // statement as unterminated, so nothing is lost.
+    CHECK(references_raw_capture_table("SELECT 1 FROM 'process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a = 'process_live"));
+}
+
+TEST_CASE("raw capture table predicate: a 100000-byte run of literals is decided correctly",
+          "[result_set][matcher]") {
+    // The request cap is 100000 bytes. Every literal is blanked in the one pass that finds it
+    // (no look-behind over the earlier blanks), so a run of thousands of literals costs one
+    // scan; the assertions pin the verdicts at that size, with no wall-clock bound.
+    std::string sql = "SELECT 1 FROM $Process_Hourly WHERE a = ";
+    while (sql.size() < 100000 - 20)
+        sql += "'x' || ";
+    CHECK_FALSE(references_raw_capture_table(sql + "'x'"));
+    CHECK(references_raw_capture_table(sql + "'process_live'"));
+    std::string words = "SELECT 1 FROM $Process_Hourly WHERE a = ";
+    words += std::string(50000, 'w');
+    while (words.size() < 100000 - 20)
+        words += " || 'x'";
+    CHECK_FALSE(references_raw_capture_table(words + " || ''"));
+    CHECK(references_raw_capture_table(words + " || '$TCP_Live'"));
+}
+
+TEST_CASE("answer_lacks_matcher_column: a success answer from a table without the column",
+          "[result_set][matcher]") {
+    const std::string pid_exists = R"({"column":"pid","op":"exists"})";
+    // Schema present, column absent: the agent answered from a table without it.
+    CHECK(answer_lacks_matcher_column(pid_exists, "__schema__|hour_ts|name\n1|a\n__total__|1"));
+    CHECK(answer_lacks_matcher_column(pid_exists, "__schema__|hour_ts|name\n__total__|0"));
+    // Schema present and the column named, zero rows: a legitimate empty answer.
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, "__schema__|pid\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, "__schema__|name|pid\n__total__|0"));
+    // No schema line at all (JSON or plain rows): nothing to decide.
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, R"([{"name":"a"}])"));
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, ""));
+    // Not a column matcher: never.
+    CHECK_FALSE(answer_lacks_matcher_column("", "__schema__|name\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column(R"({"kind":"echo_rows_ge","n":1})",
+                                            "__schema__|name\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column(R"({"column":5,"op":"exists"})",
+                                            "__schema__|name\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column("not json", "__schema__|name\n__total__|0"));
+}
+
+TEST_CASE("instruction raw capture predicate: stored param first then schema default",
+          "[result_set][matcher]") {
+    const std::string schema =
+        R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $TCP_Live"}}})";
+    const std::string hourly_schema =
+        R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $TCP_Hourly"}}})";
+    // A stored param decides, whatever the default is.
+    CHECK(instruction_reads_raw_capture_table(nlohmann::json{{"sql", "SELECT 1 FROM process_live"}},
+                                              hourly_schema));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json{{"sql", "SELECT 1 FROM $TCP_Hourly"}},
+                                                    schema));
+    // No stored param: the definition's own default runs.
+    CHECK(instruction_reads_raw_capture_table(nlohmann::json::object(), schema));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), hourly_schema));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json(), hourly_schema));
+    // Nothing to read: not a refusal.
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), ""));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), "not json"));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), R"({"properties":{}})"));
+}
