@@ -1467,6 +1467,40 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
            failure (no acknowledgement) was not measured; the 10 s TCP user timeout
            should end it (inferred).
 
+   - **2026-11-05 - per-group software collection settings (REST only; the MCP
+     twin is a recorded exception).** The four routes
+     `GET /api/v1/inventory/software/collection-settings`,
+     `GET`/`PUT /api/v1/inventory/software/collection-settings/{group_id}` and
+     `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings` have
+     no MCP tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as roadmap row **3.7a-mcp** in the software estate roadmap; **revisit by
+       2026-12-31**. The MCP twin and the dashboard Collection tab (roadmap row
+       **3.7c**) are separate rows, each its own change. The twin takes the same
+       store and the same pure validator and resolver
+       (`collection_settings_resolve.hpp`), so there is no second validator. This
+       entry retires when the twin merges. No parity-ledger row is added: v1
+       routes are held to the OpenAPI check (`docs/api-parity-ledger.md`).
+     - **What an MCP-only caller can and cannot reach.** The documents and the
+       per-device effective settings are not reachable over MCP; the OpenAPI
+       document is readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Settings are managed by fleet
+       administrators: writes need the global `ManagementGroup:Write` grant
+       (the administrator role while RBAC enforcement is off, the default),
+       checked again immediately ahead of the write; reads take the same
+       `ManagementGroup:Read` gate as the other management-group routes,
+       which admits any signed-in session while RBAC enforcement is off; the
+       device route needs `Inventory:Read` scoped to the device. This build
+       has no group-scoped delegation. Each write is audited with a
+       `requested` row stored ahead of the write (an audit row that cannot be
+       stored is a `503` and nothing is written) and an outcome row. A degraded
+       store read answers `503`, never an empty `200`; an RBAC read that cannot
+       be completed is a `503` on the per-group read and the write, and the
+       shared deny-on-degrade `403` on the list and the device route. The A4 envelope and the OpenAPI
+       entries hold for all four. Wire reference: `docs/user-manual/rest-api.md`,
+       "Software collection settings".
+     - Recorded by the change author; ADR-owner acceptance pending.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
