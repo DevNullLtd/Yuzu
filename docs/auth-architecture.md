@@ -696,7 +696,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 242 REST rows: 37 `kRequired`, 3 `kOwnGate`, 129 `kExempt` and 73
+  table has 244 REST rows: 37 `kRequired`, 3 `kOwnGate`, 131 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
   body of the post-read stage `server.cpp` installs through
@@ -4301,9 +4301,11 @@ only where the gate itself writes one, such as an engine principal with the stor
 read that fails (breaker open, pool timeout, a failed role or permission query) is a `403` here and
 cannot be told apart from a refusal), `probe_permission_unavailable_aware` (`probe_permission`
 with one difference: such a failed RBAC read is answered with a retryable `503`, `retry_after_ms`
-5000 and no `permission` field. It exists for the one consumer whose correctness depends on telling
-"could not determine" from "definitively denied", the Forensics-tier resolver, where a collapsed
-answer would serve a `200` with the Forensics rows silently missing; a new caller needs the same
+5000 and no `permission` field. It exists for the two consumers whose correctness depends on telling
+"could not determine" from "definitively denied": the Forensics-tier resolver, where a collapsed
+answer would serve a `200` with the Forensics rows silently missing, and the software collection
+settings per-group read and write (`software_collection_settings_routes.cpp`), where a collapsed
+answer would record an RBAC outage as a refused or withdrawn grant; a new caller needs the same
 justification, and `require_permission` itself stays a `403` on a degrade, ADR-0041), `probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
 scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
 confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin

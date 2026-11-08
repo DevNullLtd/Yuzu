@@ -34,6 +34,7 @@
 #include "pg/secret_codec.hpp"
 #include "test_route_sink.hpp"
 
+#include <yuzu/echo_retention_tick.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
@@ -326,10 +327,14 @@ TEST_CASE("GET /api/v1/settings/data-retention carries the Echo tier defaults an
     CHECK(data.at("echo").at("tick_seconds").get<int>() == 900);
     const auto& tiers = data.at("echo").at("tiers");
     REQUIRE(tiers.is_array());
+    // Roll-up only: a source's daily tier is published, and the byte budget is the agent's default.
+    CHECK(data.at("echo").at("db_budget_bytes").get<long long>() == yuzu::kEchoDbBudgetBytesDefault);
     bool found = false;
-    for (const auto& t : tiers)
+    for (const auto& t : tiers) {
         found = found || (t.at("source") == "process" && t.at("tier") == "hourly" &&
                           t.at("limit").get<long long>() == 7776000);
+        CHECK(t.contains("budget_dependent"));
+    }
     CHECK(found);
 
     auto frag = h.sink.Get("/fragments/settings/data-retention");

@@ -379,6 +379,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/commands` | 4 MiB | `commands` | The fifth `requires_measurable=true` class. The REST v1 twin of MCP `execute_instruction` (`POST /api/v1/commands`). The same 4 MiB as the `/mcp/` class, because the same worst case rides it: 10000 agent ids, 32 parameters of 64 KiB and an 8 KiB scope come to about 3.3 MiB. `requires_measurable=true`, like `/mcp/`: a chunked (unmeasurable) body is refused here rather than read unbounded. Any method, so a sibling under the prefix is capped too. |
 | any | `/api/v1/inventory/software/normalization/` | 64 KiB | `software_curation` | The software-title curation subtree. The body-bearing routes are `POST .../aliases` (one JSON object of at most eight strings, each at most 256 bytes) and `POST .../queue/{key}/reject` (bodyless); the status and queue GETs are bodyless siblings sharing the prefix, so any method. |
 | any | `/api/v1/inventory/software/normalization/pack` | 1 MiB | `software_alias_pack` | The alias-pack CSV upload. The raw body is the CSV, which `parse_normalization_pack` refuses over 1 MiB, so the cap mirrors that bound exactly. A longer prefix than the row above, so it wins for this path. |
+| any | `/api/v1/inventory/software/collection-settings` | 16 KiB | `software_collection_settings` | The per-group collection settings routes. The only body-bearing route is `PUT .../{group_id}`: one small JSON object (an interval, a window, a zone name, six boolean switches, a priority and a version). The GET siblings share the prefix. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
@@ -6096,36 +6097,39 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
 
-`echo` publishes the Echo warehouse retention tiers: `tick_seconds` (the agent's prune
-tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
-`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
-roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
-case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
-a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
-guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
-fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
-where it sits: a record is still in its finer tier until the coarser roll-up closes. It holds while
-the device is within its `db_budget_bytes` (default 250 MiB): a device over its byte budget removes
-hourly rows older than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is
-back under (daily and monthly rows, the `usage` tables and paused sources are never taken);
-`echo.status` reports it as `budget_evicted_hourly_rows_total` (`budget_evicted_raw_rows_total` is
-retired: there is no raw tier) (see the Echo manual, The database byte budget). It is a floor on
-rows that exist, not on coverage: every event folds into every tier as it arrives, so an agent that
-is offline records nothing for that span in any tier, and there is no later aggregation pass or
-catch-up window that could fill it. The
-`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
-set (20,000 runs) before this limit can apply.
+`echo` publishes the Echo warehouse retention tiers: `tick_seconds` (the cadence of the agent's
+retention and byte-budget pass, 900), `db_budget_bytes` (the default byte budget, 262144000) and
+`tiers`, one row per source and tier (`hourly`, `daily`, `monthly`, `boot`). Echo keeps roll-up
+tiers only, so `hourly` is the finest tier: there is no raw tier and no setting that brings one
+back. Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the roll-up
+bucket: 0 for `boot`, 3600, 86400, or 2678400 for a month, the 31-day worst case),
+`guaranteed_depth_seconds` and `budget_dependent`. Roll-up rows age from the start of their
+bucket, so a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
+guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how fast a
+device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not where it
+sits: a record is still in its finer tier until the coarser roll-up closes. `budget_dependent` is
+`true` for the `hourly` tier only: it holds while the device is within its `db_budget_bytes`
+(default 250 MiB). A device over its byte budget removes hourly rows older than 48 h (5 days for
+`procperf`) inside their depth, oldest first, until it is back under, so an hourly row's depth holds
+only while the device is within its budget (daily and monthly rows, the `usage` tables and paused
+sources are never taken). `echo.status` reports it as `budget_evicted_hourly_rows_total` (see the
+Echo manual, The database byte budget). It is a floor on rows that exist, not on coverage: every
+event folds into every tier as it arrives, so an agent that is offline records nothing for that
+span in any tier, and there is no later aggregation pass or catch-up window that could fill it.
 
-These are the registry **defaults** an agent of this server's release applies (agents on other
-releases may differ), not per-device readings: Echo prunes on the agent, so the server has no
-live value. Every source's tiers are declared on every OS; where a source does not run on the
-agent's OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty
-table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)); while the agent is running, rows may
-outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
-nothing), longer when the retention clock guard declines a prune, shorter by any plausible
-forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
-the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
-(5,000 rows per table per tick). `echo` is `null` only if the server's embedded table cannot be read. A server older than this release omits `echo`; treat absent like `null`.
+These are the registry **defaults** the current release applies (agents on other releases may
+differ), not per-device readings: Echo prunes on the agent, so the server holds no per-device
+value. Every source's tiers are declared on every OS; where a source does not run on the agent's
+OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty table. A
+paused or errored source is never pruned (per-device paused sources:
+[`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)) and becomes eligible again
+when it is re-enabled. `tick_seconds` is the cadence of the retention pass, not a bound: while the
+agent is running a row can outlive its limit by that tick and by ordinary scheduling lag (an offline
+agent or a disabled plugin prunes nothing), longer when the retention clock guard declines a prune,
+shorter by any plausible forward skew of the endpoint clock, which the guard does not decline (the
+depth is measured on the agent's own clock), and longer still while a backlog drains through the
+per-pass delete cap (5,000 rows per table per tick). `echo` is `null` only if the server's embedded
+table cannot be read. A server older than this release omits `echo`; treat absent like `null`.
 
 The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
 unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
@@ -6144,11 +6148,12 @@ server-enforced reading, if one ever ships, lands under a new key, never by rede
     },
     "echo": {
       "tick_seconds": 900,
+      "db_budget_bytes": 262144000,
       "tiers": [
-        { "source": "usage", "tier": "live", "limit_kind": "rows", "limit": 200000,
-          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "hourly", "limit_kind": "seconds", "limit": 7776000,
+          "bucket_seconds": 3600, "guaranteed_depth_seconds": 7772400, "budget_dependent": true },
         { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 15552000,
-          "bucket_seconds": 86400, "guaranteed_depth_seconds": 15465600 }
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 15465600, "budget_dependent": false }
       ]
     }
   },
@@ -8484,8 +8489,9 @@ re-eval, unchanged.
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `RESULT_SET_REEVAL_STALE_SOURCE` — on `from-echo-query`, the `sql` reads a raw capture table (a `$<Source>_Live` name or a `<source>_live` table); on `from-instruction-result`, an `echo.sql` definition's SQL does (the `params.sql` value, else the definition's declared default: the text the dashboard submits for a canned query; a default is never injected at dispatch, so a dispatch without `sql` is answered with an error by the agent and counted in `agents_failed`); on `re-eval`, the stored SQL does (for an `instruction_result` set, the stored `sql` param, else that same declared default). Echo keeps roll-up tiers only, so such a query answers with no rows and the set would be silently empty. Nothing is dispatched; query the hourly roll-up instead (for example `$Process_Hourly`). A match inside a comment, or inside a longer string literal (`'see process_live'`), is not a reference; a single-quoted token that is exactly a raw table name (`'process_live'`, `'$Process_Live'`) is one wherever it stands, because SQLite reads such a token as the table after `FROM`, `JOIN`, `IN` and in other positions, so `FROM 'process_live'` and `x IN 'process_live'` are refused, and so is a string literal equal to a raw table name (`WHERE name = 'process_live'`), the price of a rule that does not depend on position. This is a behaviour change for a stale client that stored a set over a `$<Source>_Live` name |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"echo_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"echo_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). `n` counts the rows the agent returned, which on the roll-up tiers are hour-bucket rows (one per key per hour), not events. A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only Echo or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-echo-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
@@ -8833,6 +8839,58 @@ Marks one open queue entry `rejected` (`200 {"data": {"rejected": true}}`). `key
 
 Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row (and at least 50-row) and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400` (a NUL byte or invalid UTF-8 included). A body over 1 MiB never reaches the parser: the pre-auth body cap answers `413`. A replace keeps products a curator owns (`origin` curated) at their category, and at their `cpe_product` once it is non-empty. A replace also leaves curated aliases active. An alias curated with the category omitted still marks its product curated, which freezes that product's category against later packs. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
 
+#### Software collection settings
+
+Per-management-group settings for the daily installed-software collection: how often it runs, in which local-time window, in which time zone, and which collectors run (see [Collection settings](inventory.md#collection-settings)). The server stores one document per group and resolves the single document that applies to a device. REST only: there is no MCP tool or page for these routes yet. This build sends no settings to agents: they take effect only when the settings push lands, and storing or changing a document never starts a collection and never contacts an agent.
+
+**A document** is the group's whole setting, replaced as a unit:
+
+| Field | Type | Rule |
+|---|---|---|
+| `interval_s` | integer | Required. 3600 to 604800 (1 hour to 7 days) |
+| `window` | object or `null` | Optional; omitted or `null` is no window. `{"start_min": 60, "end_min": 300}`, minutes past local midnight, `0 <= start_min < end_min <= 1440`; allowed only with a whole-day interval (86400, 172800, ...) |
+| `timezone` | string | Optional; omitted or empty is the machine's own zone, else an IANA zone name known to the database (`Europe/London`); at most 64 bytes. Names under `posix/`, `right/` or `SystemV/` and the placeholder `Factory` are a `400` (an agent cannot resolve them); link names such as `US/Pacific` are accepted |
+| `plugins` | object | Required. Every collector as a boolean: `installed_apps`, `middleware`, `msi_packages`, `pkg_inventory`, `runtimes`, `windows_optional_features`. `installed_apps` cannot be `false`. An unknown or missing key is a `400` |
+| `priority` | integer | Optional; omitted is 0. 0 to 1000; decides only between branches (below). The root group's document takes no priority (any other value is a `400`) |
+| `expected_version` | string | Optional, write only: the `version` last read, or `none` (also the default) to create only |
+
+Any other top-level key is a `400`. `version` is the SHA-256 of the stored document including its priority, so a concurrent priority-only edit is caught by `expected_version`.
+
+**Authority.** Settings are managed by fleet administrators. A write needs the global `ManagementGroup:Write` grant while RBAC enforcement is on, and the administrator role while it is off (the default). The list and a group's document follow the same `ManagementGroup:Read` gate as the other management-group routes: the global grant while RBAC enforcement is on, and any signed-in user session or API token while it is off. A service-scoped token is refused with `403` in both modes, an engine principal needs an explicit RBAC grant, and an MCP-tier token is also held to its tier. Group-scoped delegation (a group owner managing its own branch) is not part of this build: a management-group role assignment admits nothing on these routes. The device route is gated differently: `Inventory:Read` scoped to the device (below). For the per-group `GET` and the `PUT`, an authority read that cannot be completed (the RBAC store) is a `503` with `retry_after_ms`, never a `403` and never an admit; the list and the device route use the shared deny-on-degrade gate (ADR-0041), so the same outage answers `403` there.
+
+**Stored copies.** Each save also adds a row to the store's own change history (the newest 200 rows per group, readable with SQL only). That history is a capped, secondary copy: the audit log is the record of who changed what and when. The document's `updated_by` and each history row carry the writer's user name; they are kept with the document, which no route deletes, including once its group is deleted.
+
+#### `GET /api/v1/inventory/software/collection-settings`
+
+Every stored document and the built-in fleet default. The answer is `data.fleet_default` (24 hours, 01:00 to 05:00, machine-local zone, every collector on, `priority` 0, and a `version`) and `data.documents[]` (one object per stored document, in the shape the per-group `GET` returns). `fleet_default.version` is an effective-settings version (the hash a device's effective settings carry, below), not a document version. Gated by `ManagementGroup:Read` (see Authority above). A document whose group has been deleted is neither listed nor used by the resolver; it counts toward the cap below. More than 20,000 documents, or a stored row that fails the read rule (a `version` that is not 64 lowercase hex included), is a `503` with no `retry_after_ms` and a remediation saying operator action is required, never a truncated list. The read fails closed on purpose: documents are written only through the validating `PUT`, so a row that fails the read rule means the table has been damaged out of band, and one such row makes this list and every device's effective-settings read answer `503` until the row is repaired or removed. The server log names the group (`found a corrupt row for group <id>`).
+
+#### `GET /api/v1/inventory/software/collection-settings/{group_id}`
+
+The group's own stored document (`group_id`, `interval_s`, `window`, `timezone`, `plugins`, `priority`, `version`, `updated_at`, `updated_by`), not the resolved result for any device. `404` when the group does not exist or has no document. A refused read (`403`) is audited as `software_estate.collection_settings.read` with `result=denied`; a served read is not audited (see [audit-log.md](audit-log.md)).
+
+#### `PUT /api/v1/inventory/software/collection-settings/{group_id}`
+
+Replaces the group's document and answers `200` with the stored document and `previous_version` (`null` on create). Authority is decided first, ahead of reading the body: a caller the write gate refuses gets `403` whatever the body holds, and only an authorised caller sees a `400` for an invalid body. A group that does not exist is a `404`. The write gate is checked again immediately ahead of the write, once the `requested` audit row is stored: authority withdrawn in between answers `403`, a session that ended in between answers `401`, and nothing is written (a withdrawal landing during the store call itself is ordered behind the write). A stale `expected_version` answers `409` with the stored document in `error.current`, including when a concurrent create won. A versioned write on a group with no document answers `409` with `error.current` `null` and a remediation to send `expected_version` `none`. A retry of a write that landed (a lost response, say) answers `409` with the caller's own document in `error.current`: compare it with the body sent. A zone the database does not know is a `400`. The request is audited as `software_estate.collection_settings.update` with a `requested` row stored ahead of the write and an outcome row (see [audit-log.md](audit-log.md)). A `503` reading `outcome unknown` means the commit did not confirm and the write may be live: `GET` the document to verify. Creating a document when 20,000 documents exist (a deleted group's document counts) is a `503` with no retry hint: operator action is required, because no route deletes a document. A write identical to the stored document keeps its `version` and counts as a save: it adds a history row and its audit rows. The route is exempt from MFA step-up (no proof required) by the project owner's decision for this change; the owner ruling on the plugin kill-switch route, which can also switch collectors off fleet-wide, is pending.
+
+#### `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`
+
+The settings that apply to one device, resolved across every management group it belongs to:
+
+```json
+{"data": {"agent_id": "agent-1",
+          "effective": {"interval_s": 7200, "window": null, "timezone": "", "plugins": {"installed_apps": true, "middleware": true, "msi_packages": true, "pkg_inventory": true, "runtimes": false, "windows_optional_features": true}},
+          "source_group_id": "a1b2c3d4e5f6", "version": "<64 hex>", "kill_switched": ["runtimes"]},
+ "meta": {"api_version": "v1"}}
+```
+
+- Each group the device belongs to is a branch, except a group that is an ancestor of another group the device belongs to: the nearer group stands for that branch, so a device in a group and in its descendant resolves through the descendant whatever the priorities. In each branch the nearest group (itself, then its ancestors) with a document is the branch winner; an ancestor's document therefore competes for a sibling branch that has none of its own. Priority decides only between branch winners. The winner is chosen by priority (higher wins), then depth (deeper wins), then group creation time (older wins), then group id.
+- The root group's document is the fleet default layer: it applies to a device with no other candidate and never competes with a group's document.
+- The plugin kill switches always win: a killed collector is `false` in `effective.plugins` and listed in `kill_switched`. Registered apps collection (`installed_apps`) is on unless it is itself kill-switched. Only plugin-level, all-OS kill-switch rows are read: a switch on one action of a plugin, or on one OS, is not reflected here.
+- `version` is the SHA-256 of the effective fields only (interval, window, zone, sorted switches): no priority, source group or timestamps. It is a different hash from a stored document's `version`, which includes `priority`: a priority-only edit changes the document's `version` and leaves this one unchanged.
+- `source_group_id` is the winning group, the root group id (`000000000000`) when the root document applies, or empty for the built-in default. It is an opaque id and can name a group outside a scoped caller's branch when the device is also a member there.
+- A device in no group, or one the server has no record of, answers `200` with the root document and `source_group_id` `000000000000` when a root document exists, else the built-in default with an empty `source_group_id`; no device lookup is made.
+- Requires `Inventory:Read` on the device. A membership, settings or kill-switch read that cannot be completed is a `503`, never a document with collectors off.
+
 ---
 
 ### Crypto
@@ -9168,11 +9226,13 @@ The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-wal
   "source_kind": "manual_curate",
   "status": "materialized",
   "source_execution_id": "",
-  "device_count": 42
+  "device_count": 42,
+  "agents_failed": 0,
+  "partial": false
 }
 ```
 
-`parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
+`agents_failed` counts the agents that answered an asynchronous producer's dispatch with a failure (a non-success status, output starting `error|`, or a success answer whose `__schema__` header lacks the column a column matcher names) and never produced a matching row. They are absent from the set because their query failed, not because they do not match, so `partial` is `true` whenever `agents_failed` is above zero and the set may be missing devices. An agent that failed once and later matched is a member and is not counted. `partial` means at least one *answering* agent failed: an agent that never answered is neither a member nor counted, so a set filled at the five-minute fill timeout reflects the answers stored by then and says nothing about the agents still missing. The execution's `agents_targeted` (`GET /api/v1/executions/{id}`) shows how many were sent the query, but under confinement it counts only agents with a response row, so a confined caller cannot see the non-responders that way. The fill reads every stored answer of the execution, 500 rows at a time, up to 100,000 rows; past that bound the set is marked `failed` rather than filled as partial: it reads `device_count` `0`, `agents_failed` `0` and `partial` `false`, and the reason (`response rows exceed the members read bound`) is in the server log only, not in the set. Both are `0` / `false` for a set that is not filled from agent answers, and while a set is still `pending`. On a database carried forward from an earlier build (not a supported deployment; see Upgrading), a set filled before this release, or by a server replica from before it, also reads `0` / `false` without information. `parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
 
 #### `GET /api/v1/result-sets`
 
@@ -14060,7 +14120,7 @@ Execute an Echo warehouse SQL query against targeted agents. Returns HTMX HTML f
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `sql` | string | Yes | A SELECT query using `$`-prefixed table names (e.g., `$Process_Live`, `$TCP_Hourly`). |
+| `sql` | string | Yes | A SELECT query using `$`-prefixed table names (e.g., `$Process_Hourly`, `$TCP_Hourly`). |
 | `scope` | string | No | Target scope. An agent ID, `group:<expression>`, or `__all__` for all agents. Defaults to all connected agents. |
 
 **Example (curl):**
@@ -14069,7 +14129,7 @@ Execute an Echo warehouse SQL query against targeted agents. Returns HTMX HTML f
 curl -X POST https://yuzu.example.com/api/dashboard/echo-execute \
   -H "Cookie: yuzu_session=abc123" \
   -H "Origin: https://yuzu.example.com" \
-  -d "sql=SELECT name, pid FROM \$Process_Live LIMIT 10" \
+  -d "sql=SELECT hour_ts, name, start_count FROM \$Process_Hourly LIMIT 10" \
   -d "scope=__all__"
 ```
 
