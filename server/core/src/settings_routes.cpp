@@ -1317,7 +1317,7 @@ function arFeedback(msg, isError) {
   fb.textContent = msg;
   fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
-function arPost(url, body, onSuccess, onRefused) {
+function arPost(url, body, onSuccess, onFailure) {
   fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -1328,12 +1328,13 @@ function arPost(url, body, onSuccess, onRefused) {
       var data = {};
       try { data = JSON.parse(t); } catch (e) {}
       if (!r.ok) {
-        // The A4 error body is {error:{code,message,...}}: read the message, never print the object.
+        // The error envelope is {error: {message, ...}}: read the message, not the object (a
+        // plain string `error` and a top-level `message` stay accepted).
         var e = data && data.error;
-        var msg = (e && typeof e === 'object' ? e.message : e) || (data && data.message) ||
+        var msg = (e && (typeof e === 'string' ? e : e.message)) || (data && data.message) ||
                   ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
-        if (onRefused) onRefused(r.status);
+        if (onFailure) onFailure();
         return;
       }
       arFeedback('Done.', false);
@@ -1341,6 +1342,7 @@ function arPost(url, body, onSuccess, onRefused) {
     });
   }).catch(function () {
     arFeedback('Network error — the action may not have applied', true);
+    if (onFailure) onFailure();
   });
 }
 function arLoadCampaign(id) {
@@ -1351,7 +1353,9 @@ function arOpenCampaign(form) {
   var title = (form.elements['title'].value || '').trim();
   if (!title) return false;
   arPost('/api/v1/access-reviews', {title: title}, function (data) {
-    if (data && data.campaign_id) arLoadCampaign(data.campaign_id);
+    // The success body is the A4 envelope {data: {campaign_id, grant_count}, meta}.
+    var d = data && data.data;
+    if (d && d.campaign_id) arLoadCampaign(d.campaign_id);
   });
   return false;
 }
@@ -1364,15 +1368,27 @@ function arAttest(btn) {
   }
   var row = btn.closest('tr');
   var justEl = row ? row.querySelector('[data-ar-justification]') : null;
+  // Every extra click would be a valid request that appends another decision, so every
+  // decision button in the campaign stays disabled until the answer arrives (re-enabled only on
+  // failure; on success the campaign is re-drawn).
+  var btns = document.querySelectorAll('#ar-campaign button');
+  function arSetBusy(busy) { for (var i = 0; i < btns.length; i++) btns[i].disabled = busy; }
+  arSetBusy(true);
   arPost('/api/v1/access-reviews/' + encodeURIComponent(d.campaignId) + '/attestations', {
     principal_type: d.principalType,
     principal_id: d.principalId,
     role_name: d.roleName,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
-  }, function () { arLoadCampaign(d.campaignId); },
-  // 409: another reviewer decided this grant first (decisions are final) - show the row as decided.
-  function (status) { if (status === 409) arLoadCampaign(d.campaignId); });
+  }, function (data) {
+    // The success body is the A4 envelope {data: {recorded, decision_seq, previous_decision}}.
+    // Another reviewer may have decided this grant since the page was drawn: say so.
+    var r = data && data.data;
+    if (r && typeof r.previous_decision === 'string' && r.previous_decision !== 'pending')
+      arFeedback('Done. This replaced an earlier "' + r.previous_decision + '" decision; the ' +
+                 'earlier decision stays in the history.', false);
+    arLoadCampaign(d.campaignId);
+  }, function () { arSetBusy(false); });
 }
 function arCloseCampaign(btn) {
   var id = btn.dataset.campaignId;
@@ -1502,7 +1518,7 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
                 "<div class=\"mini-field\" style=\"flex:1\">"
                 "<label>Campaign title</label>"
                 "<input type=\"text\" name=\"title\" placeholder=\"e.g. Q3 2026 access review\" "
-                "required>"
+                "maxlength=\"256\" required>"
                 "</div>"
                 "<button class=\"btn btn-primary\" type=\"submit\">Open review campaign</button>"
                 "</form>";
@@ -1529,12 +1545,26 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
         return html;
     }
 
+    // A malformed id never reaches the store; the shared validator is the one REST, MCP and the
+    // Access page use.
+    if (!valid_campaign_id(campaign_id)) {
+        html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+        return html;
+    }
+
     auto view_res = access_review_store_->get_campaign(campaign_id);
     if (!view_res.has_value()) {
-        // Covers both the store's machine-checkable "not_found: ..." (unknown
-        // campaign id) and a genuine read failure — either way, an honest
-        // notice rather than a blank panel.
-        html += "<div class=\"feedback-error\">" + html_escape(view_res.error()) + "</div></div>";
+        // The store's machine-checkable "not_found: " prefix separates an unknown campaign id
+        // (it answered) from a genuine read failure. Neither shows the store's own text, which
+        // carries its classification prefix. A genuine read failure is logged.
+        if (view_res.error().starts_with("not_found:")) {
+            html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+            return html;
+        }
+        spdlog::warn("settings access-review campaign: read failed: {}",
+                     ::yuzu::log_key_token(view_res.error()));
+        html += "<div class=\"feedback-error\">Access review campaign could not be read. "
+                "Please retry.</div></div>";
         return html;
     }
     const auto& view = *view_res;
@@ -1542,6 +1572,14 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     httplib::Response probe;
     bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
     bool is_open_campaign = view.campaign.status == "open";
+    // The signed-in reviewer: the server refuses a reviewer who is the subject of a user grant,
+    // so that row shows no Attest or Flag (a courtesy, not the control), like the Access page.
+    std::string viewer;
+    if (can_attest && auth_fn_) {
+        httplib::Response who_probe;
+        if (auto who = auth_fn_(req, who_probe))
+            viewer = who->username;
+    }
 
     html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
             " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
@@ -1574,6 +1612,9 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     } else {
         for (const auto& a : view.attestations) {
             bool pending = a.decision == "pending";
+            const bool own =
+                !viewer.empty() && a.principal_type == "user" && a.principal_id == viewer;
+            const bool editable = pending && is_open_campaign && !own;
             std::string decision_cls = pending                         ? "role-user"
                                        : a.decision == "flagged_revoke" ? "role-warn"
                                                                         : "role-ok";
@@ -1593,14 +1634,16 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                     ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
             if (can_attest) {
                 html += "<td>";
-                if (pending && is_open_campaign) {
+                if (editable) {
                     html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
                             "style=\"width:140px\">";
                 } else {
                     html += a.justification.empty() ? "—" : html_escape(a.justification);
                 }
                 html += "</td><td>";
-                if (pending && is_open_campaign) {
+                if (pending && is_open_campaign && own) {
+                    html += "<span class=\"hint\">Another reviewer must decide</span>";
+                } else if (editable) {
                     html += "<button class=\"btn btn-primary\" "
                             "data-campaign-id=\"" +
                             html_escape(campaign_id) + "\" data-principal-type=\"" +

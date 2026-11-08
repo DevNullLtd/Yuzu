@@ -229,6 +229,11 @@ constexpr ExpectedResolution kExpected[] = {
     {"GET",    "/api/v1/inventory/software/normalization/status",                 64u * 1024, false, "software_curation"},
     {"POST",   "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
     {"PUT",    "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
+    // body_cap_policy.hpp software_collection_settings row: the per-group collection settings
+    // routes (one prefix, any method; a sibling path outside the segment boundary is the default).
+    {"PUT",    "/api/v1/inventory/software/collection-settings/abc123",           16u * 1024, false, "software_collection_settings"},
+    {"GET",    "/api/v1/inventory/software/collection-settings",                  16u * 1024, false, "software_collection_settings"},
+    {"PUT",    "/api/v1/inventory/software/collection-settingsevil/abc",          4u * 1024 * 1024, false, "default"},
     {"POST",   "/api/v1/inventory/software/normalization/packevil",               64u * 1024, false, "software_curation"},
     {"POST",   "/api/v1/inventory/software/normalizationevil/aliases",            4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp commands row - POST /api/v1/commands (the REST v1 twin of MCP
@@ -278,6 +283,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "config",
     "software_curation",
     "software_alias_pack",
+    "software_collection_settings",
     "default",
 };
 
@@ -413,7 +419,7 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 39 = mcp(1) +
+    // check while still silently growing the table. 40 = mcp(1) +
     // commands(1: POST /api/v1/commands, the REST v1 twin of execute_instruction) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
@@ -436,8 +442,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
-    // default(1).
-    CHECK(std::size(kBodyCapTable) == 39);
+    // software_collection_settings(1: the collection settings subtree) + default(1).
+    CHECK(std::size(kBodyCapTable) == 40);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

@@ -3265,10 +3265,29 @@ groups:
             check the named helper, not AuditStore, for that case. phase=dispatch
             counts the dispatch call ITSELF throwing, on route=command_v1
             (POST /api/v1/commands), route=instruction_execute
-            (POST /api/v1/instructions/{id}/execute) and route=mcp
-            (execute_instruction_definition). The execution row was left running,
-            NOT cancelled, because some agents may already hold the command.
-            Runbook for phase=dispatch: find the dispatch_exception failure audit
+            (POST /api/v1/instructions/{id}/execute), route=mcp
+            (execute_instruction_definition) and route=workflow
+            (POST /api/v1/workflows/{id}/execute and MCP execute_workflow). For
+            route=workflow, read the paragraph beginning "Runbook for route=workflow"
+            below INSTEAD of the runbook after it: a workflow run is not an
+            executions-ledger row. On the other routes the execution row was left
+            running, NOT cancelled, because some agents may already hold the command.
+            Runbook for route=workflow: a workflow run threw after its `requested`
+            audit row, so steps may already have been sent. Its id is a WORKFLOW
+            execution id, and cancel_execution does not apply to it. Find the closing
+            workflow.execute failure audit row (reason=dispatch_exception; it names
+            execution_id when the engine had admitted the run, and agents_sent, a lower
+            bound) and the server log line naming the exception. Read the run with
+            GET /api/v1/workflow-executions/{id} (MCP get_workflow_execution): a step
+            recorded pending or skipped may still have been sent, so check the audit
+            and response stores by plugin and time before re-running. A run still
+            `running` well past its 60 second budget is an orphan (see
+            YuzuWorkflowFinalizeFailed). A repeat of the call with the same
+            idempotency key replays the run's answer and sends nothing; do NOT start
+            another run with a new key until you have read this one. The count of such
+            runs is yuzu_server_workflow_run_outcome_total{outcome="failed",
+            reason="dispatch_exception"}.
+            Runbook for the other routes, phase=dispatch: find the dispatch_exception failure audit
             row (it names the execution_id and, when known, agents_sent, a lower
             bound) and the server log line naming the exception; check that
             execution's per-agent results (the error body carries it as
@@ -3302,6 +3321,155 @@ groups:
             after a single increment, so one throw still pages, two minutes
             later. The delay exists so a self-resolving blip clears before
             anyone is woken, not so a single throw is ignored.
+
+      # Workflow-run saturation and integrity (#2146). Series each rule reads, and where the code
+      # emits them: yuzu_http_held_open_responses / yuzu_http_held_open_capacity (gauges set in
+      # server.cpp; the budget every streaming surface and every synchronous workflow run leases
+      # from), yuzu_server_workflow_finalize_failed_total (workflow_engine.cpp, pre-seeded),
+      # yuzu_server_workflow_run_refused_total{reason} and
+      # yuzu_server_workflow_run_idempotent_total{outcome} (workflow_execute.hpp's closed sets,
+      # pre-seeded by seed_workflow_run_metrics). tests/test_workflow_run_metrics_wiring_lexical.py
+      # checks every metric name and label value below against that source.
+      #
+      # Deliberately NOT alerted: a per_principal_stream_cap refusal (one caller already holds its
+      # 2 runs: a client pacing itself, not a server fault) and a draining refusal (a shutdown is
+      # not an incident). yuzu_server_workflow_run_outcome_total is a dashboard series, not an
+      # alert: an aborted or failed run is the control working as often as a defect.
+      - alert: YuzuHeldOpenUtilisationHigh
+        expr: |
+          yuzu_http_held_open_responses / yuzu_http_held_open_capacity > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Held-open responses are above 80% of the capacity the HTTP worker pool is sized for"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#server-cli-flags"
+          description: >-
+            yuzu_http_held_open_responses is above 80% of yuzu_http_held_open_capacity
+            on {{ $labels.instance }} for 5 minutes. Every streaming surface and every
+            synchronous workflow run leases from this ONE budget (MCP GET and streamed
+            POST, /api/v1/events, the dashboard executions drawer, the legacy /events
+            stream, and POST /api/v1/workflows/{id}/execute, MCP execute_workflow and the
+            legacy POST /api/workflows/{id}/execute), and each lease pins one HTTP worker
+            thread. At 100% the next stream or workflow run is refused with a 429
+            (yuzu_server_workflow_run_refused_total{reason="global_stream_cap"} for a
+            workflow run). Read yuzu_server_workflow_runs_in_flight for the workflow
+            share (a run holds its slot for up to 60 seconds, at most 2 per caller), and
+            yuzu_mcp_streams_active / yuzu_mcp_post_streams_active for the MCP share.
+            Both gauges are sampled on the server's maintenance tick (about every 15
+            seconds), so a burst shorter than that can be missed; the 5 minute window is
+            a level, not a count. The remedy is a higher --max-sse-streams (the worker
+            pool follows it; see docs/adr/0034) or fewer concurrent clients, not a
+            restart.
+
+      - alert: YuzuWorkflowFinalizeFailed
+        expr: |
+          sum by (instance) (increase(yuzu_server_workflow_finalize_failed_total[1h])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A workflow run's final status write failed twice and left its execution row running"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#a-workflow-run-left-running"
+          description: >-
+            yuzu_server_workflow_finalize_failed_total moved on {{ $labels.instance }}:
+            a workflow run finished its steps but the final status write failed twice (a
+            lease timeout or a failed statement, then one retry), so its execution row
+            stays running and nothing closes it. The server log names the execution id at
+            error. Read the run with GET /api/v1/workflow-executions/{id} (MCP
+            get_workflow_execution): a step recorded pending or skipped may still have
+            been sent, so check the audit and response stores by plugin and time before
+            re-running. A call with an idempotency key already bound to that run answers
+            indeterminate once the row is older than 180 seconds (see
+            YuzuWorkflowIndeterminateReplays). A healthy server never increments this, so
+            the rule is increase()[1h] > 0 with for: 2m: one orphan pages two minutes
+            after it happens and stays visible for an hour. A server killed mid-run
+            (SIGKILL, power loss) leaves the same orphan WITHOUT moving this counter; the
+            signal for those is a replay of the run's key answering indeterminate.
+
+      - alert: YuzuWorkflowRunGlobalCapRefused
+        expr: |
+          sum by (instance) (rate(yuzu_server_workflow_run_refused_total{reason="global_stream_cap"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workflow runs are being refused because the server's held-open budget is full"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#server-cli-flags"
+          description: >-
+            Workflow runs on {{ $labels.instance }} have been refused with reason
+            global_stream_cap, a refusal rate above zero over the last 5 minutes, for 10
+            minutes running: the shared held-open budget is full, so a caller got a 429
+            (MCP -32012) with Retry-After 5, no workflow or instruction was read, and nothing was sent or audited. A
+            single refusal does not fire it (the 5 minute rate window cannot stay true for
+            10 minutes on one event); a sustained one means the saturation
+            YuzuHeldOpenUtilisationHigh warns about has arrived. Check
+            yuzu_http_held_open_responses against yuzu_http_held_open_capacity, then
+            yuzu_server_workflow_runs_in_flight for the workflow share. The reasons
+            per_principal_stream_cap and draining are deliberately excluded: one caller
+            holding its 2 runs is a client pacing itself, and a draining server is
+            shutting down. Callers retry after 5 seconds; a call that was refused sent
+            nothing, so repeating it is safe.
+
+      - alert: YuzuWorkflowIndeterminateReplays
+        expr: |
+          sum by (instance) (increase(yuzu_server_workflow_run_idempotent_total{outcome="indeterminate"}[15m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A workflow-run idempotency key was repeated and the run it is bound to cannot be proven"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#a-workflow-run-left-running"
+          description: >-
+            yuzu_server_workflow_run_idempotent_total{outcome="indeterminate"} moved on
+            {{ $labels.instance }}: a client repeated an idempotency key and the run it is
+            bound to answered indeterminate, which means the stored rows cannot prove how
+            it ended (a step row still pending or running under a completed run, an
+            unknown status, or no rows) or the run has been running for more than 180
+            seconds, past its 60 second budget. Either way the caller cannot know whether
+            the steps were sent, and the answer tells it not to retry. The usual causes
+            are a server that died mid-run (SIGKILL, power loss: nothing counts that one
+            except this series) or a final status write that failed twice
+            (YuzuWorkflowFinalizeFailed). Find the execution id in the workflow.execute
+            audit rows (idempotent_replay=true run_status=indeterminate carries it), read
+            the run with GET /api/v1/workflow-executions/{id}, and check the audit and
+            response stores by plugin and time before re-running with a new key. The
+            counter moves once per repeat, so a looping client raises it quickly: the
+            rule is increase()[15m] > 0 with for: 2m, not a rate.
+
+      # Workflow run table growth (#2146, ADR-1005 residual 13). Run rows are never pruned, and a
+      # run row is bounded but not small: agent_ids_json stores at most 1,000 distinct ids and at
+      # most 131,072 bytes of JSON text (1,000 ids of 128 bytes, quoted and comma-separated, is
+      # 131,001 bytes), on every route, before TOAST compression. 100,000 rows is therefore up to
+      # about 13 GB if every row were at that worst case and about 130 MB at a typical 10-device
+      # run (about 1.3 KB). The series is yuzu_server_workflow_executions_rows
+      # (WorkflowEngine::refresh_table_size_metrics, planner estimate, sampled about every 15 s);
+      # every replica reads the same table, so the rule collapses the replicas with max by (job).
+      - alert: YuzuWorkflowExecutionsTableLarge
+        expr: |
+          max by (job) (yuzu_server_workflow_executions_rows) > 100000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The workflow run table has passed 100,000 rows and nothing prunes it"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#workflow-run-records-are-not-pruned-2146"
+          description: >-
+            workflow_engine.workflow_executions holds an estimated {{ $value | humanize }}
+            rows (yuzu_server_workflow_executions_rows, job {{ $labels.job }}) and has been
+            above 100,000 for 30 minutes. Run rows are never deleted, so the table only
+            grows, on the same Postgres that holds the audit, auth and session tables. A
+            row stores at most 1,000 distinct device ids and 131,072 bytes of them
+            (before compression), so 100,000 rows is about 130 MB if a typical run names 10
+            devices and up to about 13 GB if every run filled that column. Read
+            yuzu_server_workflow_executions_bytes for the real size (heap, TOAST and
+            indexes), then find the caller: a looping client shows up as many rows in
+            GET /api/v1/workflow-executions and as workflow.execute audit rows from one
+            principal. Stop the loop, and size or grow the Postgres volume; there is no
+            supported delete route, so reclaiming space is a DBA decision (see the
+            runbook). The count is a planner estimate (the larger of reltuples and
+            n_live_tup), and the step results table is not included. The
+            threshold is a sizing claim, not tuned against fleet data.
 
   - name: yuzu-tls
     rules:

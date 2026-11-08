@@ -101,8 +101,11 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
       // silently deleted at retention. That loss channel is SIZE-BIASED: the largest batches
       // are mass arm/disarm bursts, i.e. the most security-relevant audit records, so it is
       // strictly worse than a random one (#2345 Gate 5 CH-4 / Gate 4 UP-5+UP-15).
-      lifecycle_log_(std::max({kMinOutboxCapacity, cfg.outbox_capacity,
-                               kMaxJournalEntriesPerBatch})) {
+      lifecycle_log_(
+          std::max({kMinOutboxCapacity, cfg.outbox_capacity, kMaxJournalEntriesPerBatch})),
+      // UP-14: always non-null, so stamp_seq_locked never branches; an uninjected runtime
+      // (every pre-existing fixture) draws from a private epoch-0 source and sends no pair.
+      src_(cfg.emit_seq_source ? cfg.emit_seq_source : std::make_shared<GuardianEmitSeqSource>(0)) {
     if (cfg.outbox_capacity > 0 && cfg.outbox_capacity < kMaxJournalEntriesPerBatch)
         spdlog::info("Guardian: lifecycle audit window raised from the configured {} to {} - a "
                      "window smaller than one maximum-size journal batch makes large batches "
@@ -4740,7 +4743,8 @@ std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
     case JournalReject::SkewedClock:
         journal_clock_rejected_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
-    default: // EmbeddedNul / Oversized / InvalidUtf8 - a field the journal cannot carry byte-exact
+    default: // EmbeddedNul / Oversized / InvalidUtf8 / EmptyRuleId - a field the journal cannot carry
+             // byte-exact, or one the server would refuse at ingest
         journal_field_rejected_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -4985,7 +4989,10 @@ GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
     for (auto& e : entries) {
         if (want.erase(e.event_id) == 0) // already windowed, or an intra-batch duplicate
             continue;
-        stamp_seq_locked(e); // page-time stamp: a prior-boot entry sorts after live enqueues so far
+        // Page-time stamp: a prior-boot entry sorts after live enqueues so far. The seq is the
+        // hold key only (wire_ordered=false => boot_epoch 0 => no wire pair, see
+        // stamp_seq_locked): this record was produced earlier and its original position is gone.
+        stamp_seq_locked(e, /*wire_ordered=*/false);
         if (lifecycle_log_.enqueue(std::move(e)))
             ++out.added;
     }
@@ -5167,9 +5174,17 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     //  - enqueued_ns is system_clock (stamped at the enqueue sites, wall = system_clock::now();
     //    replayed lifecycle entries keep the original persisted ns):
     //    a backward wall-clock step between an older compliant and a newer errored makes the
-    //    errored timestamp earlier, so the server keeps compliant regardless of wire order; the
-    //    hold cannot affect this (server-side, #5690);
-    //  - replayed journal entries vs live compliance (seq is stamped at page time);
+    //    errored timestamp earlier, so the server's census ordering key keeps compliant and
+    //    flags the pair `order_uncertain` when the errored event arrives second (after the
+    //    one-hour stale-mark recovery it follows arrival order, still flagged); the cross-lane
+    //    hold cannot affect this. UP-14 puts the (boot_epoch,
+    //    emit_seq) pair on every live entry; a server that compares the pair orders by it
+    //    AHEAD of the census ordering key, one that does not ignores it and keeps ordering by the
+    //    census ordering key (the comparator is the server's, not this function's), so this bullet
+    //    applies in full to entries sent without a pair (an unclaimed epoch, or a replayed
+    //    entry) and to any server that does not compare it;
+    //  - replayed journal entries vs live compliance (seq is stamped at page time, and carries
+    //    no wire pair: OutboxEntry::boot_epoch stays 0);
     //  - seq == 0 entries: an unstamped head is never held and never blocks (fail-open);
     //  - entries behind a head: only each lane's HEAD (front_seq) and the one running send are
     //    compared, so with a coalesced head (higher seq, same position) an older entry behind

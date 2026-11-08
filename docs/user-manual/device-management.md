@@ -282,7 +282,7 @@ Each card has its own audit verb so a usage-class read (what a person is running
 | **Listening ports** | `network_diag/listening` | `device.live.listening` | all |
 | **Active connections** | `network_diag/connections` | `device.live.connections` | all |
 | **Logged-in users** | `users/logged_on` | `device.live.users` | all |
-| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state + `$`-table + live row count); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
+| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state, the `$<Source>_Hourly` table and its row count; a dash with "This device runs an agent without the roll-up tables; upgrade the agent" for an agent that has not moved to the roll-up store); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
 | **Disk space** — free/used for the root volume with a colour-coded usage bar (>=90% used or <5 GiB free = red) | `disk_space/free` | `device.live.disk` | all |
 
 Every card requires **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the card shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. The process tree, connections, logged-in-user, and **DNS-cache** reads are **usage-class behavioral telemetry** (a person's running software, active connections, sessions, and resolved names) and are individually audit-logged; the remaining kinds (uptime, services, adapters/IP, listening ports, ARP, capture sources, disk space) are machine-health reads.

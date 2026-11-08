@@ -23,7 +23,7 @@ struct GuardianJournalStats {
     // Staging loss channels (runtime).
     std::uint64_t stage_dropped{0};   ///< pending reserve overflow under sustained write failure
     std::uint64_t stage_failures{0};  ///< a disarm record could not be built post-teardown
-    std::uint64_t field_rejected{0};  ///< NUL / oversized / non-UTF-8 field kept a record out
+    std::uint64_t field_rejected{0};  ///< NUL/oversized/non-UTF-8 field or empty rule_id
     std::uint64_t clock_rejected{0};  ///< skewed clock (secs<=0) kept a record out
     std::uint64_t pending_depth{0};   ///< records staged but not yet persisted (gauge)
     // Persist (component).

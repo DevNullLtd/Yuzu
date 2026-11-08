@@ -976,6 +976,79 @@ message GuaranteedStateRuleStatus {
 }
 ```
 
+The block above is the original sketch; the proto file is the source of truth for the
+fields. `GuaranteedStateEvent` fields 24 and 25, `boot_epoch` and `emit_seq`, carry the
+agent-asserted order of an event as the pair `(boot_epoch, emit_seq)`, compared
+lexicographically. They are ordinals, not timestamps: 0 means unset, and the agent sets
+both or neither. `boot_epoch` is claimed once at agent boot as the larger of the persisted
+counter plus one and the boot time in unix seconds, stored in the agent KV store under
+namespace `__guardian__`, key `meta:boot_epoch`; a stored value that cannot be parsed, or is
+at or above 2^62 - 1, is re-claimed from the clock and overwritten (the agent emits nonzero
+pairs again, which does not by itself restore order relative to epochs issued before the loss),
+and a KV failure leaves the epoch 0, so the pair is sent as 0/0. The agent logs one
+`Guardian boot_epoch claim` line per boot, which also prints `synchronous=` (expected 2, FULL;
+a lower level fails the claim). `emit_seq` is drawn from one
+source owned by the engine and shared by both emit paths: the legacy sink executor draws it
+at admission, under the executor lock, and the Spark runtime draws it when it enqueues an
+outbox entry. Entries re-sent from the lifecycle journal carry 0/0, because their original
+position is not journalled; DEX observations also carry 0/0. 0/0 means unordered, not oldest.
+A receiver should compare the pair only when both sides carry a nonzero pair, and otherwise
+order by the census ordering key. A server that compares the pair orders by it; one that does not
+ignores it and keeps ordering by the census ordering key. The server change owns the comparator and the
+recovery path for a pinned or lost epoch. Acceptance list for the server change: see the UP-14
+entry in `docs/spark-flip-gate.md` and issue #5690.
+
+Known limits of the boot epoch:
+
+- If the KV row is wiped and the agent restarts within the same second as the previous boot,
+  the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted by the UP-14
+  residual-acceptance ruling; the equal epoch is pinned by a test).
+- A single writer is enforced for processes that run this code (UP-9): the agent holds an
+  exclusive lock on `<data-dir>/guardian_boot_epoch.lock` (advisory `flock` on POSIX, an open
+  with share mode 0 on Windows) for the life of the process, waiting up to 5 s for a previous
+  process to exit. A process that cannot take it claims no epoch (`instance_lock_not_held`,
+  with `instance_lock=contended` or `failed`) and emits unordered 0/0 events instead of
+  colliding with the holder. The lock guards only the epoch claim, not the rest of the data
+  directory. Limits:
+  - an agent build that predates the lock does not take it, and it is a same-host guard;
+  - the 5 s wait is shorter than the agent's worst-case shutdown, so a restart that overlaps a
+    slow teardown runs unordered until its next restart;
+  - on Linux and macOS a lock file removed or replaced after the claim is not detected (it
+    needs write access to the data directory; a file replaced before the lock is detected and
+    re-locked); on Windows share mode 0 forbids removing the held file;
+  - on Windows any other program holding the file open (a backup or security product) is
+    reported as `contended` with `native_error=32`;
+  - a local principal that can open the file before the agent starts can hold it (POSIX: lock
+    it; Windows: keep it open) and leave the agent at 0/0 for that process lifetime (accepted:
+    the result is ordering by the census ordering key alone, as before the feature, and the agent logs `contended`; on POSIX
+    the requested mode 0600 limits this to the agent's account and root unless the mode was
+    changed or the file already existed with a looser one; on Windows it depends on the data
+    directory ACL, which was not measured);
+  - a file system that does not support the lock, or a lock file the agent's account cannot
+    open, is `failed`.
+
+  The recovery is a restart with the cause fixed; the process does not retry.
+- A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
+  claim tracks the persisted value rather than the clock. A burst of restarts or a crash loop
+  within the same second also pushes the epoch ahead of a correct clock until the clock catches
+  up (n boots in one second give clock + n - 1). A lost or corrupt row after such a pin
+  re-claims from the clock and can land below epochs already issued. A deleted or
+  restored-from-backup `kv_store.db` likewise loses the ordering history; restoring an older
+  copy is normally safe because the clock term wins, unless the agent restarted repeatedly
+  within a few seconds before the restore or the epoch had been pinned ahead of the clock. A VM
+  memory-snapshot revert continues with the same epoch and a lower `emit_seq` and involves no
+  boot, so no claim runs.
+- An agent whose epoch claim fails (no store, a read or write failure, a store that reports a
+  `PRAGMA synchronous` level below FULL (outcome `durability_below_full`, not expected for the
+  agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), a clock reading at or above the 2^62 ceiling, or the data-directory lock not held (`instance_lock_not_held`)) sends the pair as 0/0 for the whole process lifetime, ordered by
+  the census ordering key. Today this is visible only as an error-level `Guardian boot_epoch claim` log
+  line.
+- Events replayed from the lifecycle journal carry 0/0, so a replayed event is not
+  byte-identical to its live original in fields 24 and 25.
+- The pair is agent-asserted and not authenticated: a local administrator or a compromised
+  agent can set any epoch, for that agent's own events only, provided the server keys
+  ordering per agent.
+
 ### 7.2 Wire integration
 
 Uses existing `CommandRequest` with reserved plugin name `__guard__`:
@@ -3022,7 +3095,7 @@ heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 |---|---|---|---|
 | stage-drop | `pending_journal_` reserve exhausted under sustained write failure | `stage_dropped` | integrity gap, alert |
 | stage-failure | a disarm record could not be built after the rule was already torn down | `stage_failures` | integrity gap, alert |
-| field rejection | NUL / oversized / non-UTF-8 field kept a record out of the journal | `field_rejected` | integrity gap, alert |
+| field rejection | NUL / oversized / non-UTF-8 field or empty rule_id kept a record out of the journal | `field_rejected` | integrity gap, alert |
 | skewed-clock reject | normalized event timestamp floors to `seconds <= 0` (would replay as server-receipt-now and false-conflict) | `clock_rejected` | integrity gap, alert |
 | write failure | a `set()` failed; per-push circuit-broken, retried by the maintenance tick | `write_failures` | integrity gap, alert |
 | write-capacity reject | a new batch refused because the journal is at its byte/count cap | `write_capacity_rejected` | integrity gap, alert (UP-1) |

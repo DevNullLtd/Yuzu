@@ -56,6 +56,10 @@ metadata:
     none; or deferred once a one-off conversion was wanted and could not run,
     for too little free disk space or a failed VACUUM, which stays until a
     conversion succeeds).
+    Per capture source it reports config|<src>_rows|<n>, the rows held for that
+    source (an agent from before the roll-up-only release reports
+    config|<src>_live_rows|<n> instead; the server shows a dash for it rather
+    than reading that figure as the hourly count).
     module_dedup_overflow_total and tcp_closing_dedup_overflow_total count how
     often the hourly de-duplication sets filled and were cleared.
     An exception inside any action ends the reply with a fixed error|internal
@@ -132,16 +136,19 @@ metadata:
   displayName: Query Echo Events
   version: 1.0.0
   description: >
-    Queries the Echo event database for system activity records within a
-    time range. Events include process starts/stops, network connections
-    opened/closed, service state changes, and user logins/logouts. Results
-    are pipe-delimited: timestamp|event_type|event_action|snapshot_id|detail_json.
-    The detail_json field contains a JSON object with type-specific fields:
-
-    Process events: {"pid":N, "ppid":N, "name":"...", "cmdline":"...", "user":"..."}
-    Network events: {"proto":"tcp", "local_addr":"...", "local_port":N, "remote_addr":"...", "remote_host":"...", "remote_port":N, "state":"...", "pid":N}
-    Service events: {"name":"...", "display_name":"...", "status":"...", "startup_type":"..."}
-    User events: {"user":"...", "domain":"...", "logon_type":"...", "session_id":"..."}
+    Queries the Echo hourly roll-up for system activity within a time range.
+    Echo keeps hourly, daily and monthly roll-up tiers only, so each row is one
+    hour bucket of one capture source: process starts/stops, network
+    connections opened/closed, service state changes, and user logins/logouts
+    are counted per hour, not listed one by one. Results are pipe-delimited:
+    timestamp|event_type|event_action|snapshot_id|detail_json, where timestamp
+    is the bucket start, event_action is always bucket and snapshot_id is 0.
+    The detail_json field contains a JSON object holding that bucket's key
+    fields and counts, named as the columns of the source's hourly table are
+    (for example name, user, start_count and stop_count for a process).
+    For anything finer than that, or for daily and monthly figures, use
+    echo.sql over the $<Source>_Hourly, $<Source>_Daily and $<Source>_Monthly
+    tables.
   tags: [echo, timeline, query, forensics, compliance]
 
 spec:
@@ -193,7 +200,7 @@ spec:
     columns:
       - name: timestamp
         type: int64
-        description: Unix epoch seconds the event was recorded.
+        description: Unix epoch seconds of the start of the hour bucket the row summarises.
         example: "-"
         platforms: [windows, linux, darwin]
       - name: event_type
@@ -203,18 +210,18 @@ spec:
         platforms: [windows, linux, darwin]
       - name: event_action
         type: string
-        description: 'The lifecycle verb for this event (e.g. started/stopped, appeared/removed, opened/closed); the vocabulary is source-specific. Values: free text, source-dependent verb.'
+        description: 'Always bucket: each row is an hourly roll-up of the source, not a single event. Values: bucket.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: snapshot_id
         type: int64
-        description: 'Internal id of the collection cycle that produced this row, used to correlate rows from the same tick. Values: integer.'
+        description: 'Always 0: roll-up rows do not belong to a single collection cycle. Values: 0.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: detail_json
         type: clob
         description: >-
-          JSON object with type-specific fields (see metadata.description for the per-type shape); empty string on the default (no type filter) union branches, which project only ts/event_type/action/snapshot_id. Values: JSON object, or empty string.
+          JSON object with the bucket's key fields and counts, named as the source's hourly table columns are (see metadata.description); empty string on the default (no type filter) union branches, which project only ts/event_type/action/snapshot_id. Values: JSON object, or empty string.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -526,14 +533,14 @@ spec:
         displayName: Network-Quality Collector Enabled
         description: >
           Enable or disable the per-connection TCP-quality sampler (netqual
-          source → $NetQual_Live, plus the per-boot retrospective baseline
+          source → $NetQual_Hourly, plus the per-boot retrospective baseline
           $NetQual_Boot). **On by default**; only a coarse destination class
           (loopback/private/public) is stored, raw remote addresses are
           dropped at the edge. Linux (netlink INET_DIAG) and
           Windows (TCP ESTATS — ADR-0020); **Windows requires an elevated
           agent** (non-elevated records nothing and echo.status reports
           netqual_capture_method=none). macOS is planned. Independent of
-          tcp_enabled. Queried via echo.sql only ($NetQual_Live / $NetQual_Boot);
+          tcp_enabled. Queried via echo.sql only ($NetQual_Hourly / $NetQual_Boot);
           the legacy echo.query / echo.export actions do not surface netqual. Set
           to "false" to opt out. Requires agent v0.12.0+; older agents silently
           ignore. Valid: "true" | "false".
@@ -544,14 +551,14 @@ spec:
         displayName: Connectivity-Transition Collector Enabled
         description: >
           Enable or disable the connectivity-transition source (netconn →
-          $NetConn_Live, ADR-0020). **On by default**. Windows reads the OS-retained NetworkProfile / NCSI /
+          $NetConn_Hourly, ADR-0020). **On by default**. Windows reads the OS-retained NetworkProfile / NCSI /
           WLAN-AutoConfig event logs, so the FIRST read backfills connectivity
           history from BEFORE the source was enabled (bounded by
           netconn_lookback_seconds; set that to 0 for forward-only). Only closed
           enum tokens + numeric reason codes are stored — NO SSID, BSSID, profile
           name, interface GUID, or MAC. Windows-only collector today (Linux
           journald / macOS oslog planned; the table is queryable-empty there).
-          Queried via echo.sql only ($NetConn_Live); the legacy echo.query /
+          Queried via echo.sql only ($NetConn_Hourly); the legacy echo.query /
           echo.export actions do not surface netconn. Requires agent v0.12.0+;
           older agents silently ignore. Valid: "true" | "false".
         validation:
@@ -646,12 +653,6 @@ spec:
           signal). **On by default** — rows expose usernames and remote share
           paths. Windows + Linux (macOS planned); inbound
           needs local-admin / Server-Operator on Windows and Samba on Linux and
-          degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all
-          PREVIOUSLY mapped drives, from the registry / fstab / event logs) is
-          seeded at agent init, so it materializes on the first agent restart
-          AFTER you enable this (or after upgrade, where it is now on by
-          default). See software_enabled for disable semantics (disabling leaves
-          existing rows queryable).
           degrades to empty otherwise. NOTE: the HISTORICAL backfill (all
           PREVIOUSLY mapped drives, from the registry / fstab / event logs) runs
           its first pass at agent init, so it materializes on the first agent
@@ -744,7 +745,7 @@ spec:
         displayName: Registry Change Capture Enabled
         description: >
           Enable or disable the Windows registry change source (registry →
-          $Registry_Hourly and $Registry_Daily; $Registry_Live is an empty view;
+          $Registry_Hourly and $Registry_Daily;
           cursor-model seam). **ON by default ("true")**, like
           every other capture source. Windows only; on Linux and macOS the source
           is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
@@ -760,8 +761,7 @@ spec:
           VALUES ARE STORED UNMASKED: the newest value of every value added or
           changed under a watched key is readable through echo.sql as last_data
           in $Registry_Hourly and $Registry_Daily, for the tier's retention (for
-          example a Winlogon autologon DefaultPassword when it changes); $Registry_Live
-          answers no rows. A value that has not changed is not: the per-key baseline
+          example a Winlogon autologon DefaultPassword when it changes). A value that has not changed is not: the per-key baseline
           in echo_state holds only its type, size and an unsalted hash. The
           source's cursor row (echo_cursor) holds the new value of a change still
           waiting for its writer. A baseline written by an older build also holds
@@ -799,8 +799,7 @@ spec:
           that first read is not a row; a user's baseline carries across logoff
           and logon, so a change made while they were logged off is reported by
           the next read.
-          Rows live in $Registry_Hourly and $Registry_Daily ($Registry_Live
-          is an empty view): the newest value of each changed value is
+          Rows live in $Registry_Hourly and $Registry_Daily: the newest value of each changed value is
           readable there as last_data, unmasked, for the tier's retention
           (90 days hourly, 180 days daily by default; time-based, not a row
           count). Setting "false" pauses capture
@@ -813,13 +812,12 @@ spec:
         type: string
         displayName: Application Usage Capture Enabled
         description: >
-          Enable or disable the `usage` derived fold (usage → $Usage_Live /
-          $Usage_Daily), a checked_transaction-based pairing of the process
+          Enable or disable the `usage` derived fold (usage → the open-run table
+          usage_live and $Usage_Daily), a checked_transaction-based pairing of the process
           source's started/stopped events into per-executable run/duration
           aggregates plus a per-day distinct-user count. **ON by default
           ("true")**, like every other capture source.
-          The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as
-          usage-class / behavioral-adjacent: $Usage_Live persists the owning
+          usage_live persists the owning
           pid and user for each open run, and the per-day username
           membership (queryable via echo.sql) reveals which applications run
           on a device, when, and by whom. Treat as co-determination-relevant,

@@ -333,6 +333,8 @@ agent_test_exe = executable(
     'unit/test_offline_hive_mutex.cpp',       # ScopedOfflineHiveLock RAII/mutual-exclusion contract
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
+    'unit/test_guardian_emit_seq.cpp',
+    'unit/test_guardian_boot_epoch.cpp',
     'unit/test_guardian_spark_runtime.cpp',
     'unit/test_guardian_state_reader.cpp',
     'unit/test_guardian_convergence_scheduler.cpp',
@@ -617,6 +619,8 @@ agent_test_exe = executable(
     'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux/list_windows/list_macos decision seams over injected fakes; portable
     'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_virtualization_parsers.cpp',         # virtualization: pure classifier/vendor tables/CPUID fact builder/row formatters over labelled fixtures; portable
+    'unit/test_virtualization_local_dispatcher.cpp',  # virtualization: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
     'unit/test_remote_access_audit_keys_parsers.cpp',    # remote_access_audit: pure authorized_keys/options/blob decoder/fingerprint over REAL ssh-keygen captures; portable
     'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
@@ -678,6 +682,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/virtualization/src'),  # virtualization_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/registry/src'),  # registry_parsers.hpp / registry_core.hpp (pure layer)
     include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
@@ -869,6 +874,7 @@ agent_test_exe = executable(
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
                 shares_plugin_lib,  # shares
+                virtualization_plugin_lib,  # virtualization
                 registry_plugin_lib,  # test_registry_write_local_dispatcher.cpp loads the real plugin by path
                 remote_access_audit_plugin_lib,  # remote_access_audit
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
@@ -982,6 +988,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     include_directories: [include_directories('../agents/plugins/browser_policy/src'),
                           include_directories('../agents/plugins/mgmt_posture/src'),
                           include_directories('../agents/plugins/shares/src'),
+                          include_directories('../agents/plugins/virtualization/src'),
                           include_directories('../agents/plugins/remote_access_audit/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
@@ -1809,6 +1816,7 @@ if build_server
       'unit/server/test_list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
       'unit/server/test_workflow_execution_list_model.cpp', # pure shared REST+MCP list model (parse/rows/cursor)
       'unit/server/test_workflow_execution_list_routes.cpp', # GET /api/v1/workflow-executions via TestRouteSink (no PG)
+      'unit/server/test_workflow_execute_twins.cpp', # #2146 batch B: POST /api/v1/workflows/{id}/execute + the shared sequence (no PG)
       'unit/server/test_guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam (Guardian read)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
@@ -1904,6 +1912,7 @@ if build_server
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',
       'unit/server/test_workflow_engine.cpp',
+      'unit/server/test_workflow_wait.cpp', # #2146: the interruptible retry wait (pure, fake clock)
       'unit/server/test_inventory_eval.cpp',
       'unit/server/test_execution_statistics.cpp',
       'unit/server/test_device_token_store.cpp',
@@ -2029,6 +2038,12 @@ if build_server
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_normalization_pack.cpp',
+      # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
+      'unit/server/test_collection_settings_resolve.cpp',
+      # per-group collection settings store (born-on-PG, [pg][store])
+      'unit/server/test_software_collection_settings_store.cpp',
+      # collection-settings REST routes: null-dep shapes (no PG) + [pg][routes] real AuthRoutes gate over ManagementGroupStorePg/RbacStorePg
+      'unit/server/test_software_collection_settings_routes.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -3760,6 +3775,16 @@ test('shares definition columns',
   timeout: 30,
 )
 
+# virtualization's definition-column contract (content/definitions/virtualization.yaml): row_kind
+# first, then the generic field_1..field_6 sequence pinned to the wire rows virtualization_parsers.hpp
+# emits (the test holds the expected literals; it does not read the C++).
+test('virtualization definition columns',
+  _python3_test,
+  args: [files('test_virtualization_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # hardware's planned-action definition contract (content/definitions/hardware.yaml): the four
 # on-demand definitions (no gather block, row_kind first, the final column schema) and the
 # columns appended to processors and memory (the test holds the expected literals; it does not
@@ -4142,6 +4167,23 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
+# stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
+# page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes
+# (executor offer(), outbox set_common), agent.cpp passes the claimed boot epoch as the 4th
+# GuardianEngine argument, and both executor construction paths share the engine's emit source.
+# Carries its own in-memory mutation self-test (one or more per rule, plus comment/string
+# stripping proofs). No build required. Python, one process, ~5 s on Linux and ~7 s on an M1
+# (the mutation self-test re-scans the large agent.cpp once per mutation; the helpers are memoised
+# so a rule scan of an unchanged source is not repeated). The 60 s timeout leaves headroom on a
+# loaded self-hosted runner; the gate took 24-35 s, past the old 30 s limit, before it was memoised.
+test('guardian emit-pair stamp wiring lexical gate (UP-14)',
+  _python3_test,
+  args: [files('test_guardian_emit_stamp_lexical.py')],
+  suite: 'agent',
+  timeout: 60,
+)
+
 # Command-dedup claim wiring (#3668): the claim decision is a pure function with its own unit
 # tests; this pins that agent.cpp's Subscribe loop still CALLS it and acts on every field of the
 # answer (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
@@ -4149,6 +4191,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('agent command-dedup wiring lexical gate (#3668)',
   _python3_test,
   args: [files('test_agent_command_dedup_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Guardian empty-rule_id sender refusal: the helper sits on two private AgentImpl send paths with
+# no gRPC seam (#1492); this pins that both still call it before the Write, return the
+# disposed-by-design outcome, tokenise the logged id and keep T_wire honest. Carries its own
+# in-memory mutation self-test. No build required.
+test('agent guardian sender-refusal wiring lexical gate (#5690)',
+  _python3_test,
+  args: [files('test_agent_guardian_refusal_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
@@ -4224,6 +4277,24 @@ test('typed-source purge wiring lexical gate (2a-1b)',
 test('section ingest series seed wiring lexical gate',
   _python3_test,
   args: [files('test_section_ingest_seed_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #2146: the workflow-run families are seeded by server.cpp, counted by both twins, and the four
+# alert rules name only series and label values the source exports. Source-text only; suite 'docs'.
+test('workflow run metrics wiring lexical gate',
+  _python3_test,
+  args: [files('test_workflow_run_metrics_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #2146: the stand-in and real-engine replay-parity matrices run the scenarios one shared table
+# (tests/unit/server/workflow_parity_scenarios.hpp) names. Source-text only; suite 'docs'.
+test('workflow replay parity scenario table lexical gate',
+  _python3_test,
+  args: [files('test_workflow_parity_scenarios_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4630,9 +4701,26 @@ test('forensics tier wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-34: the collection-settings routes must register ahead of the generic inventory GET, and the
+# step-up, body-cap, OpenAPI and /readyz rows must exist.
+test('collection settings wiring lexical',
+  _python3_test,
+  args: [files('test_collection_settings_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #2146: the workflow-execute zero-reach status list lives in the header, the REST manual and the MCP
+# manual, and an absent command_id is never said to prove a step unsent. Self-checks in memory.
+test('workflow execute docs lexical',
+  _python3_test,
+  args: [files('test_workflow_execute_docs_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

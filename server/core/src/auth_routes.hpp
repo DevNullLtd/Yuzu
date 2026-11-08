@@ -256,8 +256,18 @@ public:
     /// terminates it. MCP clients authenticate with API tokens in practice; if the
     /// inactivity semantics matter for a future browser-side MCP client, the fix is
     /// a non-touching `peek_session` on AuthManager.
+    ///
+    /// `mode` has no default. `kCached` is the stream pump's question (the token and engine
+    /// liveness caches may answer). `kAuthoritative` is the workflow run's per-step question:
+    /// the API-token row (a human, MCP or engine token alike) and an engine token's backing
+    /// principal are read from Postgres, so a revoke committed on any replica before the read is
+    /// seen. It costs one indexed `api_tokens` read per call, plus one `engine_principals` read
+    /// for an engine token. A cookie session is adjudicated the same way in both modes
+    /// (`AuthManager::validate_session`: the durable generation, polled at most once per second,
+    /// and trusted for up to 30 s while that poll is failing).
     auth::CredentialCheck revalidate_stream(const httplib::Request& req,
-                                            const std::string& expected_principal);
+                                            const std::string& expected_principal,
+                                            auth::CredentialReadMode mode);
 
     /// Calls require_auth, then checks session.role == admin.
     /// Returns true if admin; sets 403 and returns false otherwise.
@@ -304,12 +314,15 @@ public:
     /// answered with a retryable 503 (`retry_after_ms`, no `permission` field) instead of the
     /// fail-closed 403 that `require_permission` gives every route (ADR-0041). Same decision path
     /// otherwise (elevation, engine principals, MCP tier, service scope, RBAC, legacy floor), same
-    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the one consumer
-    /// whose correctness depends on telling "could not determine" from "definitively denied", the
+    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the consumers
+    /// whose correctness depends on telling "could not determine" from "definitively denied": the
     /// Forensics-tier resolver (`resolve_forensics_visible`), where a collapsed answer would
-    /// silently serve a 200 with the Forensics rows missing. A new caller needs the same
-    /// justification; do not switch `require_permission` itself (about a hundred routes document
-    /// the 403).
+    /// silently serve a 200 with the Forensics rows missing, and the collection settings authority
+    /// (`global_authority` in `software_collection_settings_routes.cpp`), which writes its own
+    /// audited refusal and re-checks the write grant behind its `requested` audit row, where a
+    /// collapsed answer would record an RBAC outage as a refused or withdrawn grant instead of
+    /// answering 503. A new caller needs the same justification;
+    /// do not switch `require_permission` itself (about a hundred routes document the 403).
     [[nodiscard]] bool probe_permission_unavailable_aware(const httplib::Request& req,
                                                           httplib::Response& res,
                                                           const std::string& securable_type,
@@ -948,7 +961,11 @@ private:
     /// answer to a question that must be asked of Postgres every time. If you
     /// need the engine-principal gate somewhere new, call
     /// `EnginePrincipalStore::get_for_auth` directly — do not make this public.
-    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token) const;
+    ///
+    /// Under `kAuthoritative` it does exactly that: `get_for_auth`, the uncached chokepoint, so
+    /// the 15 s cache is bypassed and the answer is never `kValidStale`.
+    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token,
+                                                                auth::CredentialReadMode mode) const;
 
     Config& cfg_;
     auth::AuthManager& auth_mgr_;

@@ -29,6 +29,16 @@ GuardDrift base_drift() {
 
 } // namespace
 
+TEST_CASE("guardian_event_refused_by_server: only an empty rule_id is refused",
+          "[guardian][drift_event]") {
+    gpb::GuaranteedStateEvent ev;
+    CHECK(guardian_event_refused_by_server(ev));
+    ev.set_rule_id("r-1");
+    CHECK_FALSE(guardian_event_refused_by_server(ev));
+    ev.set_rule_id("__observation__"); // the ruleless DEX sentinel is a real, non-empty id
+    CHECK_FALSE(guardian_event_refused_by_server(ev));
+}
+
 TEST_CASE("drift-map: plain drift -> drift.detected, fields copied", "[guardian][driftmap]") {
     gpb::GuaranteedStateEvent ev;
     apply_drift_to_event(base_drift(), ev);

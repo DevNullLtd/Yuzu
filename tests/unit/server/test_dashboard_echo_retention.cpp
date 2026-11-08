@@ -299,6 +299,59 @@ TEST_CASE("gather_echo_retention_paused: extra_scope_is_authoritative bypasses "
     }
 }
 
+TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows then <src>_live_rows",
+          "[pg][server][echo][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-new", "agent-old", "agent-both", "agent-none"});
+
+    // Only the new key: fails if the <src>_rows lookup is removed.
+    rs.store(mk_resp("agent-new", 10, "config|process_enabled|false\nconfig|process_rows|111\n"));
+    // Only the one-release alias: the agent has not moved to the roll-up store; its raw-row figure
+    // is read to flag it, never presented as the hourly count.
+    rs.store(mk_resp("agent-old", 10, "config|process_enabled|false\nconfig|process_live_rows|222\n"));
+    // Both present: the new key wins and the agent is not flagged.
+    rs.store(mk_resp("agent-both", 10,
+                     "config|process_enabled|false\nconfig|process_live_rows|1\nconfig|process_rows|333\n"));
+    // Neither key: unknown, not flagged.
+    rs.store(mk_resp("agent-none", 10, "config|process_enabled|false\n"));
+
+    DashboardEchoRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 4, 1);
+
+    const auto scan = acc.routes.gather_echo_retention_paused(kUser);
+    const auto row_of = [&](const char* agent) -> const EchoPausedSourceRow* {
+        for (const auto& r : scan.rows)
+            if (r.agent_id == agent)
+                return &r;
+        return nullptr;
+    };
+    REQUIRE(row_of("agent-new"));
+    CHECK(row_of("agent-new")->live_rows == 111);
+    CHECK_FALSE(row_of("agent-new")->pre_rollup_agent);
+    REQUIRE(row_of("agent-old"));
+    CHECK(row_of("agent-old")->live_rows == -1);
+    CHECK(row_of("agent-old")->pre_rollup_agent);
+    REQUIRE(row_of("agent-both"));
+    CHECK(row_of("agent-both")->live_rows == 333);
+    CHECK_FALSE(row_of("agent-both")->pre_rollup_agent);
+    REQUIRE(row_of("agent-none"));
+    CHECK(row_of("agent-none")->live_rows == -1);
+    CHECK_FALSE(row_of("agent-none")->pre_rollup_agent);
+
+    // The rendered table shows the flagged agent a dash with the reason, and never its figure.
+    const auto html = acc.render(kUser);
+    CHECK(html.find("222") == std::string::npos);
+    CHECK(html.find("title=\"This device runs an agent without the roll-up tables; upgrade the "
+                    "agent\">") != std::string::npos);
+    CHECK(html.find(">111<") != std::string::npos);
+    CHECK(html.find(">333<") != std::string::npos);
+}
+
 TEST_CASE("render_echo_retention_paused: paused_at==0 sorts oldest with schema badge (#558)",
           "[pg][server][echo][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

@@ -94,7 +94,7 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (49 passes). Verified against the source sweep
+/// The exhaustive inventory (50 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
@@ -102,7 +102,8 @@ struct BackgroundJobDecl {
 /// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12, and the #5513
 /// addition of `guardian_reconcile_gate.sweep`, the 2a-1b addition of
 /// `inventory_store.purge_typed_sources`, and the SAM.4 addition of
-/// `software_normalization_job.run_tick`); keep the count
+/// `software_normalization_job.run_tick`, and the #2146 addition of
+/// `workflow_engine.refresh_table_size_metrics`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -244,6 +245,11 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "gauges)"},
     {"software_inventory_store.count_stale_agents", "health_recompute_thread_",
      BackgroundJobClass::ReplicaSafe, "read-only inventory-freshness gauge"},
+    {"workflow_engine.refresh_table_size_metrics", "health_recompute_thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "read-only run-table size gauges: one catalog row, per-replica, 250 ms acquire and "
+     "statement bounds (plus connect_timeout_s when the pool must open a connection); a failed "
+     "sample only counts and logs"},
     {"registry.reap_stale_sessions", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory Subscribe-stream reap (local presence)"},
     {"ca.publish_crl", "health_recompute_thread_", BackgroundJobClass::FencedLeaderOnly,

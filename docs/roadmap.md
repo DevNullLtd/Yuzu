@@ -1005,7 +1005,7 @@ Implement Ed25519-based signing, 3-level key hierarchy (org root → signing key
 **Scope:** Server
 **Depends on:** 2.5, 2.12
 
-Server-side orchestration: `workflow.if` (branch on expression), `workflow.foreach` (iterate result rows, dispatch child per row), `workflow.retry` (retry with backoff). Compose existing InstructionDefinitions — no new execution semantics. Uses `Execution.parent_id` for linking. Design: `docs/Instruction-Engine.md` Section 7.9.
+Server-side orchestration: `workflow.if` (branch on expression), `workflow.foreach` (iterate result rows, dispatch child per row), `workflow.retry` (retry with backoff). Compose existing InstructionDefinitions - no new execution semantics. Uses `Execution.parent_id` for linking. Design: `docs/Instruction-Engine.md` Section 7.9. Running a workflow is also exposed over REST v1 and MCP (`execute_workflow`, #2146 batch B); the residuals of that surface are listed in the ADR-1005 2026-11-05 entry.
 
 **Files:** New `server/core/src/workflow_engine.cpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/instruction_store.cpp`
 
