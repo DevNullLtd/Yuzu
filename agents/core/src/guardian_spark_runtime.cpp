@@ -3066,6 +3066,9 @@ GuardianSparkRuntime::probe_key_health(const std::string& key, const std::string
         return KeyHealthProbe{.subscription = subscription,
                               .health = backend_->subscription_health(subscription)};
     } catch (...) {
+        // #5719 item 4: counted, no longer silent. registry_mu_ is not held here (the lock above
+        // is scoped to its own block), and a relaxed fetch_add takes no lock and allocates nothing.
+        health_probe_failures_.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt; // unknown health is not healthy: the rule is rebuilt
     }
 }
@@ -3076,10 +3079,18 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (stopping_)
             return;
+        // TEST-ONLY seam (#5719): consumed inside the try, after the lock_guard and before the
+        // allocation it stands in for, so the catch below sees exactly what a real bad_alloc from
+        // the reserve or an emplace_back would give it.
+        if (fail_next_sweep_snapshot_.exchange(false, std::memory_order_relaxed))
+            throw std::bad_alloc{};
         snapshot.reserve(keys_.size());
         for (const auto& [key, pk] : keys_)
             snapshot.emplace_back(key, pk->subscription);
     } catch (...) {
+        // #5719 item 4: counted, no longer silent. The lock_guard above was destroyed during the
+        // unwind, so registry_mu_ is released here; the counter is a relaxed atomic add.
+        sweep_snapshot_failures_.fetch_add(1, std::memory_order_relaxed);
         return; // best-effort: the caller's teardown must still run (same posture as the probe)
     }
     for (const auto& [key, subscription_id] : snapshot) {
@@ -3087,7 +3098,9 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
         try {
             health = backend_->subscription_health(subscription_id);
         } catch (...) {
-            // unknown health is not healthy; the loop goes on to the other keys
+            // unknown health is not healthy; the loop goes on to the other keys. #5719 item 4:
+            // counted once per throwing key (registry_mu_ is not held in this loop body).
+            sweep_health_query_failures_.fetch_add(1, std::memory_order_relaxed);
         }
         if (report_dead && health == SubscriptionHealth::Dead) {
             on_subscription_lost(key, subscription_id,

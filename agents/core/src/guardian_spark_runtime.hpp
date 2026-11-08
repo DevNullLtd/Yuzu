@@ -861,24 +861,37 @@ public:
     [[nodiscard]] std::uint64_t claim_drain_failures() const noexcept {
         return claim_drain_failures_.load(std::memory_order_relaxed);
     }
-    /// #5719 item 4 (C2: declared, never incremented yet): probe_key_health's backend-health
-    /// query threw, so the attach rebuilt the rule instead of skipping it. Lock-free.
+    /// #5719 item 4: times probe_key_health's backend-health query threw. Operator meaning: that
+    /// attach found the key's health unknown, so it did NOT skip: the rule was rebuilt (torn down
+    /// and re-armed) although it may have been healthy and unchanged, and it is reported as
+    /// health_unknown on the full_sync rebuild line. A steady rise means the backend's health
+    /// query itself is failing, not that rules are unhealthy. In-process only (no export), zero
+    /// until Spark enforcement is enabled (prefer_spark_), since the attach path is not reached
+    /// before. Lock-free relaxed read.
     [[nodiscard]] std::uint64_t health_probe_failures() const noexcept {
         return health_probe_failures_.load(std::memory_order_relaxed);
     }
-    /// #5719 item 4 (C2: declared, never incremented yet): sweep_key_health's snapshot of the
-    /// armed keys threw, so the dead-key repair was skipped for that one call. Lock-free.
+    /// #5719 item 4: times sweep_key_health could not take its snapshot of the armed keys (an
+    /// allocation failure). Operator meaning: the dead-key repair was skipped for that ONE call
+    /// and nothing else changed. On the heartbeat tick the poll backstop (revalidate_subscriptions)
+    /// did not run once; on a scoped detach (a full_sync) the kept rules' faulted bits were not
+    /// refreshed from the backend for that push, so a key that was already deaf was not torn down
+    /// by it. The next full_sync or heartbeat tick repairs it. In-process only, zero until Spark
+    /// enforcement is enabled. Lock-free relaxed read.
     [[nodiscard]] std::uint64_t sweep_snapshot_failures() const noexcept {
         return sweep_snapshot_failures_.load(std::memory_order_relaxed);
     }
-    /// #5719 item 4 (C2: declared, never incremented yet): sweep_key_health's per-key health
-    /// query threw for one key (treated as unhealthy by the scoped detach, ignored by the poll
-    /// backstop, for that sweep). Lock-free.
+    /// #5719 item 4: times sweep_key_health's backend-health query threw for one key, counted once
+    /// per throwing key per sweep (the sweep still visits the other keys). Operator meaning: that
+    /// key was treated as unhealthy by the scoped detach (so its rules were torn down and
+    /// re-armed for that push) or ignored by the poll backstop (it was not reported dead on that
+    /// tick), for that one sweep. In-process only, zero until Spark enforcement is enabled.
+    /// Lock-free relaxed read.
     [[nodiscard]] std::uint64_t sweep_health_query_failures() const noexcept {
         return sweep_health_query_failures_.load(std::memory_order_relaxed);
     }
     /// TEST-ONLY (#5719): make the next sweep_key_health snapshot throw bad_alloc inside its try
-    /// (consumed once; wired in C4). Distinct from fail_next_snapshot_for_test (baseline
+    /// (consumed once, after the registry_mu_ lock_guard and before the reserve). Distinct from fail_next_snapshot_for_test (baseline
     /// staging). No production caller.
     void fail_next_sweep_snapshot_for_test() noexcept {
         fail_next_sweep_snapshot_.store(true, std::memory_order_relaxed);
