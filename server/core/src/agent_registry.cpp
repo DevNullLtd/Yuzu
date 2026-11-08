@@ -931,6 +931,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "through NetShareEnum (name, path, kind and flags only), macOS reads the share points "
          "recorded by sharing -l -f json plus /etc/exports as written (not live smbd/nfsd "
          "state); read-only"},
+        {"virtualization.host",
+         "Virtualization facts: whether this device is a VM (guest), a Windows host running "
+         "Hyper-V/VBS/WSL2 (host_with_hypervisor, not a guest), or bare metal; which hypervisor; "
+         "and whether the agent itself runs in a container. CPUID, DMI/SMBIOS, sysctl, cgroup and "
+         "container-marker reads only; a host-decision source (SMBIOS, CPUID, OS hint) that cannot "
+         "be read reads unknown with a reason, never bare_metal; read-only, no subprocess"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
@@ -1139,13 +1145,15 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
          "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
-         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
+         "with apt/snap/flatpak counts; Windows Chocolatey lib presence and winget presence "
+         "from the Appx roster; read-only, no subprocess)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
-         "Linux unsupported by design; installed_apps owns the roster)"},
+         "List macOS Homebrew formulae and casks and Windows Chocolatey packages by name, "
+         "version and kind (Linux unsupported by design; installed_apps owns the roster)"},
         {"pkg_inventory.store_packages",
-         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
-         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux) and "
+         "the Windows Appx/MSIX all-user roster (read-only, no subprocess; macOS unsupported "
+         "by design)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture

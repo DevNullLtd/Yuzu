@@ -82,6 +82,7 @@
 #include <yuzu/plugin.h>        // YUZU_EXPORT
 #include <yuzu/agent/spark.hpp> // SparkSpec, SparkEvent, SparkType, ServiceRunState
 
+#include "guardian_emit_seq.hpp"    // GuardianEmitSeqSource (UP-14)
 #include "guardian_io_executor.hpp" // GuardianIoExecutor, IoClass (#2233 item 3)
 #include "guardian_journal_format.hpp" // JournalRecord + caps (item 7 PR-Ag)
 #include "guardian_outbox.hpp"
@@ -344,6 +345,13 @@ public:
         /// Checked on every Unknown pass regardless of reason or enqueue outcome
         /// (#2992). 0 disables the elapsed-time demotion arm.
         std::uint64_t pending_demote_ms{120'000};
+        /// UP-14: the engine-owned emit ordinal this runtime stamps OutboxEntry::seq /
+        /// boot_epoch from, shared with the legacy sink executor so one sequence covers both
+        /// emit paths. Null means a private epoch-0 source: seq is still drawn (the cross-lane
+        /// hold needs it nonzero) but no ordering pair reaches the wire. A shared_ptr, not a
+        /// pointer to an engine member: the runtime outlives the engine's stack frame via
+        /// the detached SparkEngine handler.
+        std::shared_ptr<GuardianEmitSeqSource> emit_seq_source;
     };
 
     /// The runtime OWNS the reader and backend (shared_ptr): a queued handler that
@@ -3012,16 +3020,30 @@ private:
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;
     GuardianLifecycleLog lifecycle_log_; ///< capacity set in the ctor init list (see the .cpp)
-    /// #3972: last OutboxEntry::seq handed out; ONE counter for both logs so seq orders
-    /// entries across lanes. outbox_mu_-guarded (stamped at the same instant as the enqueue).
-    std::uint64_t outbox_seq_{0};
-    /// Stamp `e.seq = ++outbox_seq_`. Called (outbox_mu_ held) immediately before EVERY
-    /// production enqueue into outbox_ / lifecycle_log_: enqueue_lifecycle_locked (armed +
-    /// disarm), evaluate_key and on_subscription_faulted (enqueue_all, each element, in vector
-    /// order), try_page_batch (each element actually enqueued). A new enqueue site MUST call
-    /// it, or its entries are seq 0 = exempt from the ordering guarantee (the tripwire test
-    /// in test_guardian_spark_runtime.cpp covers the five existing sites).
-    void stamp_seq_locked(OutboxEntry& e) noexcept { e.seq = ++outbox_seq_; }
+    /// #3972 / UP-14: the emit-order source; ONE sequence for both logs (and, when the engine
+    /// injects its own, for the legacy sink executor too) so seq orders entries across lanes
+    /// and across emit paths. Never null: the ctor substitutes a private epoch-0 source when
+    /// Config carries none. draw() is atomic, but every call here is made under outbox_mu_ at
+    /// the same instant as the enqueue, so seq order IS queue order.
+    std::shared_ptr<GuardianEmitSeqSource> src_;
+    /// Stamp `e.seq = src_->draw()` and `e.boot_epoch`. Called (outbox_mu_ held) immediately
+    /// before EVERY production enqueue into outbox_ / lifecycle_log_: enqueue_lifecycle_locked
+    /// (armed + disarm), evaluate_key and on_subscription_faulted (enqueue_all, each element,
+    /// in vector order), try_page_batch (each element actually enqueued). A new enqueue site
+    /// MUST call it, or its entries are seq 0 = exempt from the ordering guarantee (the
+    /// tripwire test in test_guardian_spark_runtime.cpp covers the five existing sites).
+    ///
+    /// `wire_ordered` is false ONLY for the journal-replay page-time stamp: a replayed record
+    /// was produced in an earlier boot (or earlier in this one), and its production-time seq
+    /// is not journalled, so the freshly drawn seq is a hold key and nothing more. It keeps
+    /// the entry's seq nonzero (the cross-lane hold fails open on 0) but leaves boot_epoch 0
+    /// so guardian_outbox_entry_to_event puts NO pair on the wire. The discriminator is this
+    /// argument, never OutboxEntry::journal_batch_key: backfill_batch_provenance sets that on
+    /// LIVE window entries too.
+    void stamp_seq_locked(OutboxEntry& e, bool wire_ordered = true) noexcept {
+        e.seq = src_->draw();
+        e.boot_epoch = wire_ordered ? src_->boot_epoch : 0;
+    }
     /// Durable-journal staging: built + validated records awaiting persist. Bounded
     /// (kMaxPendingJournalRecords), reserved ONCE in the ctor, drop-oldest on overflow.
     /// outbox_mu_-guarded (co-located with lifecycle_log_). Mutated by the engine's
@@ -3031,7 +3053,7 @@ private:
     std::vector<std::shared_ptr<JournalRecord>> pending_journal_;
     std::atomic<std::uint64_t> journal_stage_dropped_{0};  ///< overflow drop-oldest (disk-full backpressure)
     std::atomic<std::uint64_t> journal_stage_failures_{0}; ///< disarm record un-buildable post-teardown
-    std::atomic<std::uint64_t> journal_field_rejected_{0}; ///< NUL/oversized/non-UTF-8 field kept out
+    std::atomic<std::uint64_t> journal_field_rejected_{0}; ///< NUL/oversized/non-UTF-8/empty rule_id
     std::atomic<std::uint64_t> journal_clock_rejected_{0}; ///< skewed clock (secs<=0) kept out (rev-4.1 #2)
     /// #2233 item 7: incremented each time enqueue_lifecycle_locked's log-once branch
     /// actually calls spdlog::warn (see lifecycle_backpressure_log_fires_for_test()).

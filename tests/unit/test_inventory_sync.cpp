@@ -4,6 +4,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "installed_apps_inventory.hpp" // the plugin's own row parsers/builder feed the publisher cases
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
@@ -1862,7 +1863,7 @@ TEST_CASE("windows_optional_features adapter: real capture keeps every feature w
     for (const auto& e : r.entries) {
         CHECK(e.kind == "feat");
         CHECK(e.ecosystem == "optional_feature");
-        CHECK(e.publisher.empty());
+        CHECK(e.publisher == "Microsoft"); // constant vendor: DISM features are Windows components
         state[e.name] = e.version;
         enabled += e.version == "enabled";
         disabled += e.version == "disabled";
@@ -2833,7 +2834,7 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     Grammar g{"managers",
               bind_managers,
               "manager|homebrew|present|-|/opt/homebrew|-|-",
-              entry_of("homebrew", "", "", "app", "brew"),
+              entry_of("homebrew", "", "Homebrew", "app", "brew"),
               "manager|snap|present|2.60|/|-|-",
               "manager|homebrew|present|-|/opt/homebrew|-",
               true};
@@ -2845,11 +2846,11 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     const std::string sup = st("managers", "supported", "-");
     const std::string hb = "manager|homebrew|present|4.1|/opt/homebrew|-|-";
     SECTION("presence row fields") {
-        CHECK(run({sup, hb}) == res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+        CHECK(run({sup, hb}) == res("ok", "", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
         CHECK(run({sup, hb, "manager|homebrew|present|-|/usr/local|-|-"}) ==
               res("ok", "",
-                  {entry_of("homebrew", "4.1", "", "app", "brew"),
-                   entry_of("homebrew", "", "", "app", "brew")}));
+                  {entry_of("homebrew", "4.1", "Homebrew", "app", "brew"),
+                   entry_of("homebrew", "", "Homebrew", "app", "brew")}));
     }
     SECTION("a present non-homebrew manager is seen and dropped") {
         for (const char* m :
@@ -2861,7 +2862,7 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
         }
         // a dropped manager next to a mapped one: only the mapped one is an entry
         CHECK(run({st("managers", "constrained", "tok"), "manager|snap|present|1|/|-|-", hb}) ==
-              res("ok", "tok", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+              res("ok", "tok", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
     }
     SECTION("an unavailable manager is neither seen nor mapped") {
         const std::string un =
@@ -2879,7 +2880,7 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     }
     SECTION("supported keeps no reason, whatever field 4 holds") {
         CHECK(run({st("managers", "supported", "tok|more"), hb}) ==
-              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+              res("ok", "", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
     }
     SECTION("unknown level fails even with a present row") {
         CHECK(run({st("managers", "bogus", "tok"), hb}) == res("failed", "bad status"));
@@ -2924,13 +2925,18 @@ TEST_CASE("characterisation: msi list_inventory",
 // Collector level: the whole blob, pinned. The blob is hashed byte-identically on agent and
 // server (ADR-0016), so any movement here is a one-sided change. Re-measure ONLY on a sample
 // recapture, the same rule as the record counts above.
+//
+// Every row carries a non-empty publisher (a declared vendor, else `via:<ecosystem>`), so the
+// digests below include it. The SwEntry fixture cross-pins (kCrossPinHash and the extended /
+// tail-order / mixed-blob pins) are independent of the fallback, which is applied in the
+// collector, not in installed_software_canonical_blob.
 TEST_CASE("characterisation: collector blob digests are byte-pinned",
           "[sync][characterisation][collector]") {
-    constexpr const char* kMac = "db0a9878010b71264fced3df9cb00e4703093e50cb59314d171a3227b929f2bf";
+    constexpr const char* kMac = "64e09c0cdc2fb0011487b2d423db2301c3488c59068cbb16c2ab63bb153da631";
     constexpr const char* kWindows =
-        "fe9619361232be03c99ea7e0dc4059c988344734d91d18cb24dc30ec0b1e61e5";
+        "d9d4a2681b82bd7513fb57068d327be30db77a09677da1e11aa8daeaf2776ee5";
     constexpr const char* kLinuxManagers =
-        "522b8d64c16e2f503bdff8f68d2ba21989e534234da2c7174b7f11b38b955561";
+        "fe4b1ba29b6c0e31d42ed519ece8ac674818a6b1ab423acf6f4854735f667d17";
     const auto digest = [](const char* what) {
         const auto got = collect_with(all_plugins());
         INFO(what);
@@ -3059,7 +3065,7 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
               res("ok", "", {entry_of("wget", "1.24", "", "pkg", "brew")}));
         CHECK(show(bind_managers(nl({st("managers", "supported", "-"),
                                      "manager|homebrew|present|4.1|/opt/homebrew|-|-"}))) ==
-              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+              res("ok", "", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
     }
     SECTION("snap -> snap and flatpak -> flatpak, through store_packages") {
         CHECK(show(bind_store(nl({st("store_packages", "supported", "-"),
@@ -3182,22 +3188,46 @@ TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / pyth
     using Status = AdaptedRows::Status;
     // Rows as the plugin emits them over the committed captures: the debian:bookworm listing
     // (major.minor only on Linux), the python.org 3.13.1 framework plist (macOS) and a Windows
-    // PythonCore tag (flavour/path/vendor are dropped: no installed_software slot).
+    // PythonCore tag (flavour/path are dropped: no installed_software slot; the vendor column
+    // is the publisher, and `-` stays empty for the collector's via:python label).
     const auto r = parse_runtimes_python_output(
         nl({"status|python|supported|-",
             "python|unmodelled|3.11|/usr/bin/python3.11|-",
             "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
             "python|cpython|3.14.6|C:/Python314/|PythonCore"}),
-        kFailPolicy);
+        kFailPolicy, /*vendor_column_is_vendor=*/true);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 3);
     const char* versions[] = {"3.11", "3.13.1", "3.14.6"};
+    const char* publishers[] = {"", "org.python.python", "PythonCore"};
     for (std::size_t i = 0; i < 3; ++i) {
         CHECK(r.entries[i].name == "Python");
         CHECK(r.entries[i].version == versions[i]);
         CHECK(r.entries[i].kind == "app");
         CHECK(r.entries[i].ecosystem == "python");
-        CHECK(r.entries[i].publisher.empty());
+        CHECK(r.entries[i].publisher == publishers[i]);
+    }
+}
+
+TEST_CASE("runtimes python adapter: macOS ignores the vendor column (a bundle id, not a vendor)",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    const auto out = nl({"status|python|supported|-",
+                         "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
+                         "python|cpython|3.12.4|/opt/py|Some Vendor"});
+    SECTION("vendor column is an identifier: publisher stays empty for the via:python label") {
+        const auto r = parse_runtimes_python_output(out, kFailPolicy, /*vendor_column_is_vendor=*/false);
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].version == "3.13.1");
+        CHECK(r.entries[0].publisher.empty());
+        CHECK(r.entries[1].publisher.empty());
+    }
+    SECTION("vendor column is a vendor (Windows, Linux): read as the publisher") {
+        const auto r = parse_runtimes_python_output(out, kFailPolicy, /*vendor_column_is_vendor=*/true);
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].publisher == "org.python.python");
+        CHECK(r.entries[1].publisher == "Some Vendor");
     }
 }
 
@@ -3213,19 +3243,23 @@ TEST_CASE("runtimes python adapter: rows built by the producer round-trip throug
     // Pin the wire form the adapter has to read, so a producer change shows up here.
     REQUIRE(row == "python|cpython|3.13.1|C:/Python\\|313/|org.python\\|custom");
     SECTION("one piped vendor and path: one entry, version unchanged") {
-        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}), kFailPolicy);
+        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}), kFailPolicy,
+                                                    /*vendor_column_is_vendor=*/true);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version == "3.13.1");
         CHECK(r.entries[0].ecosystem == "python");
+        CHECK(r.entries[0].publisher == "org.python|custom"); // the escape is undone
     }
     SECTION("more escaped pipes than the split width still read as five logical fields") {
         rec.vendor = "a|b|c|d|e|f|g|h|i|j|k|l";
         const auto r = parse_runtimes_python_output(
-            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}), kFailPolicy);
+            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}), kFailPolicy,
+            /*vendor_column_is_vendor=*/true);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version == "3.13.1");
+        CHECK(r.entries[0].publisher == "a|b|c|d|e|f|g|h|i|j|k|l");
     }
 }
 
@@ -3235,36 +3269,40 @@ TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dro
     const auto r = parse_runtimes_python_output(
         nl({"status|python|supported|-", "python|unmodelled|-|/usr/bin/python3.x|-",
             "python|cpython|3.1|/p", "jvm|jdk|17|/x|-", "python|cpython|3.2|/p|v|extra"}),
-        kFailPolicy);
+        kFailPolicy, /*vendor_column_is_vendor=*/true);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].version.empty());
     CHECK(r.entries[0].ecosystem == "python");
+    CHECK(r.entries[0].publisher.empty()); // vendor `-` = unknown: the collector labels it
 }
 
 TEST_CASE("runtimes python adapter: status grammar decides the answer", "[sync][parse][adapter][runtimes]") {
     using Status = AdaptedRows::Status;
     // No status row, or one for another action: bad status.
-    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}), kFailPolicy).status ==
-          Status::failed);
-    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy).status ==
-          Status::failed);
+    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}), kFailPolicy,
+                                       /*vendor_column_is_vendor=*/true)
+              .status == Status::failed);
+    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy,
+                                       /*vendor_column_is_vendor=*/true)
+              .status == Status::failed);
     // constrained under the table row's drop_source policy: status withheld, zero entries even
     // though a row was present, reason = the status tokens (what the collector logs).
     const auto w = parse_runtimes_python_output(
         nl({"status|python|constrained|linux:runtimes:permission_denied",
             "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
-        ConstrainedPolicy::drop_source);
+        ConstrainedPolicy::drop_source, /*vendor_column_is_vendor=*/true);
     CHECK(show(w) == res("withheld", "linux:runtimes:permission_denied"));
     // the adapter still honours an explicit fail policy
     const auto c = parse_runtimes_python_output(
         nl({"status|python|constrained|linux:runtimes:permission_denied",
             "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
-        ConstrainedPolicy::fail);
+        ConstrainedPolicy::fail, /*vendor_column_is_vendor=*/true);
     CHECK(c.status == Status::failed);
     CHECK(c.reason == "linux:runtimes:permission_denied");
     // unsupported is skipped with no entries.
-    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}), kFailPolicy);
+    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}), kFailPolicy,
+                                                /*vendor_column_is_vendor=*/true);
     CHECK(u.status == Status::unsupported);
     CHECK(u.entries.empty());
 }
@@ -3821,6 +3859,189 @@ TEST_CASE("runtimes dotnet and jvm adapters: producer rows round-trip; bad shape
     CHECK(u.entries.empty());
 }
 
+// ============================================================================
+// pkg_inventory Windows legs: chocolatey / winget / appx adapter arms
+// ============================================================================
+
+namespace {
+std::string constrained_status(std::string_view action, std::string_view token) {
+    return yuzu::shared::format_status_row(action, yuzu::shared::StatusLevel::constrained, token);
+}
+// The shapes the Windows leg emits (pkg_inventory_win_parsers.hpp), via the real row emitters.
+std::string appx_row(std::string_view full_name, std::string_view version, std::string_view arch,
+                     pkg::StoreState state = pkg::StoreState::active) {
+    return pkg::format_store_row(pkg::Store::appx, full_name, version, "app", "", arch, "", state);
+}
+} // namespace
+
+TEST_CASE("pkg_inventory store_packages adapter: appx rows map to {appx, app, name, version, arch}",
+          "[sync][parse][adapter][windows]") {
+    const auto r = parse_pkg_inventory_store_packages_output(
+        nl({supported_status("store_packages"),
+            appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
+                     "neutral"),
+            appx_row("Microsoft.DesktopAppInstaller_1.29.379.0_x64__8wekyb3d8bbwe", "1.29.379.0",
+                     "x64"),
+            // Removed from the set new profiles receive: seen, never collected.
+            appx_row("Microsoft.Gone_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64",
+                     pkg::StoreState::deprovisioned),
+            // An unparsable key name: the row degrades to `-`, the entry keeps the whole key.
+            appx_row("not-a-package-name", "", ""),
+            // A snap row beside it still maps through its own arm.
+            snap_store_row("btop", "1.4.7", "app", "1073")}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 4);
+    CHECK(r.entries[0].name == "Microsoft.BingNews");
+    CHECK(r.entries[0].ecosystem == "appx");
+    CHECK(r.entries[0].kind == "app");
+    CHECK(r.entries[0].version == "4.1.24002.0");
+    CHECK(r.entries[0].arch == "neutral");
+    CHECK(r.entries[0].release.empty());
+    CHECK(r.entries[0].publisher.empty());
+    CHECK(r.entries[1].name == "Microsoft.DesktopAppInstaller");
+    CHECK(r.entries[1].arch == "x64");
+    CHECK(r.entries[2].name == "not-a-package-name");
+    CHECK(r.entries[2].version.empty());
+    CHECK(r.entries[2].arch.empty());
+    CHECK(r.entries[3].ecosystem == "snap");
+    // A partial Appx roster would delete stored rows: a constrained answer fails the cycle.
+    CHECK(parse_pkg_inventory_store_packages_output(
+              nl({constrained_status("store_packages",
+                                     "windows:pkg_inventory:appx_applications:access_denied"),
+                  appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
+                           "neutral")}),
+              kFailPolicy)
+              .status == Status::failed);
+    // Width guard (`!= 9`): this adapter splits on a bare `|` and never unescapes, so a key name
+    // carrying pipes (each written `\|`) and a short row are dropped, never shifted. MUTATION:
+    // without the guard the hostile name below (six pipes, the last segment `active`) puts
+    // `active` at the state column and maps a bogus appx entry named `a\`; a short row would
+    // read past its tokens. The well-formed sibling after them still maps.
+    {
+        const auto w = parse_pkg_inventory_store_packages_output(
+            nl({supported_status("store_packages"),
+                appx_row("We|ird_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64"),
+                appx_row("a|b|c|d|e|f|active", "", ""),
+                "package|appx|Short_1.0.0.0_x64__8wekyb3d8bbwe|1.0.0.0|app",
+                appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
+                         "neutral")}),
+            kFailPolicy);
+        REQUIRE(w.status == Status::ok);
+        REQUIRE(w.entries.size() == 1);
+        CHECK(w.entries[0].name == "Microsoft.BingNews");
+    }
+}
+
+TEST_CASE("pkg_inventory packages adapter: chocolatey pkg rows map to {chocolatey, pkg}",
+          "[sync][parse][adapter][windows]") {
+    const auto r = parse_pkg_inventory_packages_output(
+        nl({supported_status("packages"), "package|chocolatey|7zip|26.5.0|pkg",
+            // nuspec unreadable: the version column is `-`, the entry's version stays empty
+            "package|chocolatey|jq|-|pkg",
+            pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
+            // an appx row has no business in `packages`: not counted, not mapped
+            appx_row("X.Y_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64")}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 3);
+    CHECK(r.entries[0].name == "7zip");
+    CHECK(r.entries[0].ecosystem == "chocolatey");
+    CHECK(r.entries[0].kind == "pkg");
+    CHECK(r.entries[0].version == "26.5.0");
+    CHECK(r.entries[1].name == "jq");
+    CHECK(r.entries[1].version.empty());
+    CHECK(r.entries[2].ecosystem == "brew");       // Homebrew is unchanged
+    CHECK(r.entries[2].version == "1.24");
+    // constrained packages answers still fail the cycle (policy unchanged)
+    CHECK(parse_pkg_inventory_packages_output(
+              nl({constrained_status("packages", "windows:pkg_inventory:chocolatey_lib:entry_cap"),
+                  "package|chocolatey|7zip|26.5.0|pkg"}),
+              kFailPolicy)
+              .status == Status::failed);
+    // Width guard (`!= 5`): an id carrying pipes (each written `\|`) and a short row (four tokens)
+    // are dropped, never shifted. MUTATION: without the guard the second id below puts `pkg` at
+    // the kind column and maps a shifted entry named `a\` with version `b\`; a short row would
+    // read past its tokens. The well-formed sibling after them still maps.
+    {
+        const auto w = parse_pkg_inventory_packages_output(
+            nl({supported_status("packages"),
+                pkg::format_package_row("we|ird", "1.0", pkg::PackageKind::pkg, "chocolatey"),
+                pkg::format_package_row("a|b|pkg", "1.0", pkg::PackageKind::pkg, "chocolatey"),
+                "package|chocolatey|short|1.0", "package|chocolatey|7zip|26.5.0|pkg"}),
+            kFailPolicy);
+        REQUIRE(w.status == Status::ok);
+        REQUIRE(w.entries.size() == 1);
+        CHECK(w.entries[0].name == "7zip");
+    }
+}
+
+TEST_CASE("pkg_inventory managers adapter: chocolatey and winget presence rows map",
+          "[sync][parse][adapter][windows]") {
+    const std::string choco =
+        pkg::format_manager_row(pkg::Manager::chocolatey, pkg::Presence::present, "",
+                                "C:\\ProgramData\\chocolatey", "lib_dirs=19", "");
+    const std::string winget = pkg::format_manager_row(
+        pkg::Manager::winget, pkg::Presence::present, "1.29.379.0",
+        "C:\\Program Files\\WindowsApps\\Microsoft.DesktopAppInstaller_1.29.379.0_x64__8wekyb3d8bbwe",
+        "", "");
+    const std::string unavailable = pkg::format_manager_row(
+        pkg::Manager::chocolatey, pkg::Presence::unavailable, "", "C:\\ProgramData\\chocolatey", "",
+        "windows:pkg_inventory:chocolatey_lib:access_denied");
+    const auto r = parse_pkg_inventory_managers_output(
+        nl({supported_status("managers"), choco, winget, unavailable}), kKeepPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 2); // an unavailable row is not a presence row
+    CHECK(r.entries[0].name == "chocolatey");
+    CHECK(r.entries[0].ecosystem == "chocolatey");
+    CHECK(r.entries[0].kind == "app");
+    CHECK(r.entries[0].version.empty());
+    CHECK(r.entries[1].name == "winget");
+    CHECK(r.entries[1].ecosystem == "winget");
+    CHECK(r.entries[1].version == "1.29.379.0");
+    // Constrained with a present row seen: the rows are kept (managers policy unchanged).
+    const auto c = parse_pkg_inventory_managers_output(
+        nl({constrained_status("managers", "windows:pkg_inventory:appx_applications:access_denied"),
+            choco}),
+        kKeepPolicy);
+    CHECK(c.status == Status::ok);
+    CHECK_FALSE(c.reason.empty());
+    CHECK(c.entries.size() == 1);
+}
+
+TEST_CASE("pkg_inventory adapters: the committed windows.txt sample round-trips through all three",
+          "[sync][parse][adapter][windows]") {
+    const auto m = parse_pkg_inventory_managers_output(
+        capture_section("pkg_inventory", "windows.txt", "managers"), kKeepPolicy);
+    REQUIRE(m.status == Status::ok);
+    REQUIRE(m.entries.size() == 2);
+    CHECK(m.entries[0].ecosystem == "chocolatey");
+    CHECK(m.entries[1].ecosystem == "winget");
+    CHECK(m.entries[1].version == "2026.917.151.0");
+
+    const auto p = parse_pkg_inventory_packages_output(
+        capture_section("pkg_inventory", "windows.txt", "packages"), kFailPolicy);
+    REQUIRE(p.status == Status::ok);
+    CHECK(p.entries.size() == 18); // 19 lib directories, `chocolatey` has no loose nuspec
+    for (const auto& e : p.entries) {
+        CHECK(e.ecosystem == "chocolatey");
+        CHECK(e.kind == "pkg");
+        CHECK_FALSE(e.version.empty());
+    }
+
+    const auto s = parse_pkg_inventory_store_packages_output(
+        capture_section("pkg_inventory", "windows.txt", "store_packages"), kFailPolicy);
+    REQUIRE(s.status == Status::ok);
+    // 119 captured Appx rows; the adapter keeps the 118 active ones and drops the 1 deprovisioned.
+    CHECK(s.entries.size() == 118);
+    for (const auto& e : s.entries) {
+        CHECK(e.ecosystem == "appx");
+        CHECK(e.kind == "app");
+        CHECK_FALSE(e.version.empty());
+        CHECK(e.name.find('_') == std::string::npos);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SAM-19: delay_max on request_now, source lists, maintenance windows, catch-up.
 // ---------------------------------------------------------------------------
@@ -4213,5 +4434,224 @@ TEST_CASE("SAM-19: a repeated delayed request never pushes an earlier armed fire
         CHECK(r.next_fire("a") == t0 + offset);
         CHECK(r.kv.at("sync.a.force_full") == "1");
         CHECK(r.calls == 0);
+    }
+}
+
+// --- SAM-41: a non-empty publisher on every row of every source ---
+
+TEST_CASE("vendor_or_origin: a declared vendor stays, an empty one becomes via:<ecosystem>",
+          "[sync][vendor]") {
+    SwEntry declared;
+    declared.publisher = "Acme";
+    declared.ecosystem = "brew";
+    vendor_or_origin(declared);
+    CHECK(declared.publisher == "Acme");
+
+    // The prefix is the wire form the server recognises (product_normalize.hpp kOriginLabelPrefix,
+    // pinned to the same literal in test_product_normalize.cpp).
+    CHECK(yuzu::agent::kOriginLabelPrefix == "via:");
+
+    for (const char* eco : {"deb", "pacman", "apk", "rpm", "windows", "macos", "macos_pkgutil",
+                            "brew", "snap", "flatpak", "optional_feature", "msi", "python",
+                            "jvm"}) {
+        INFO(eco);
+        SwEntry e;
+        e.ecosystem = eco;
+        vendor_or_origin(e);
+        CHECK(e.publisher == std::string("via:") + eco);
+    }
+
+    // An empty ecosystem is labelled `via:unknown`, never the bare `via:`.
+    SwEntry no_eco;
+    vendor_or_origin(no_eco);
+    CHECK(no_eco.publisher == "via:unknown");
+
+    // The fallback lives in the collector, not in the blob builder: a fixture entry with an empty
+    // publisher hashes an empty slot 3, so the cross-pins above are independent of the fallback.
+    SwEntry bare;
+    bare.name = "n";
+    bare.ecosystem = "brew";
+    const auto blob = installed_software_canonical_blob({bare});
+    CHECK(fields_of(records_of(blob)[0])[2].empty());
+}
+
+TEST_CASE("a row whose publisher is an origin label hashes to the server's pinned digests",
+          "[sync][hash][vendor]") {
+    // The same row and the same digests as the server test "canonical_section_hash pins a row
+    // whose publisher is an origin label (via:brew)" in test_software_inventory_store.cpp. Recipes:
+    //   16-field form (source set):
+    //     printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\037\037\037\037pkg_inventory.packages\036' | shasum -a 256
+    //   12-field v2 form (no source):
+    //     printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\036' | shasum -a 256
+    SwEntry e;
+    e.name = "wget";
+    e.version = "1.24";
+    e.publisher = "via:brew";
+    e.kind = "pkg";
+    e.ecosystem = "brew";
+    CHECK(sha256_hex(installed_software_canonical_blob({e})) ==
+          "3efab992b1c46e477f74297ee3d55e9c1a0cc923aa3d2dd112fe9a074ead29a9");
+    e.source = "pkg_inventory.packages";
+    CHECK(sha256_hex(installed_software_canonical_blob({e})) ==
+          "906ce129e4448180dcee1d554df55367a898b40e73551cf9dbfaa73d26d0c69f");
+    // ...and the label is in the hash: the same row with the slot empty hashes differently.
+    SwEntry bare = e;
+    bare.publisher.clear();
+    CHECK(sha256_hex(installed_software_canonical_blob({bare})) !=
+          sha256_hex(installed_software_canonical_blob({e})));
+}
+
+namespace {
+namespace ia_inv = yuzu::installed_apps::inventory;
+
+std::string inv_row_of(const std::optional<ia_inv::InvRecord>& r) {
+    REQUIRE(r.has_value());
+    return ia_inv::format_inv_row(*r);
+}
+
+// A row for the sources whose publisher the plugin takes from the OS rather than from a line this
+// test can feed the parser (the Windows Uninstall hive, the macOS signing certificate, a receipt).
+std::string inv_row(std::string name, std::string publisher, std::string kind, std::string eco) {
+    ia_inv::InvRecord r;
+    r.name = std::move(name);
+    r.version = "1";
+    r.publisher = std::move(publisher);
+    r.kind = std::move(kind);
+    r.ecosystem = std::move(eco);
+    return ia_inv::format_inv_row(r);
+}
+
+// "<source>|<ecosystem>" -> the distinct publishers of that pair across one collector run.
+std::map<std::string, std::set<std::string>> publishers_by_source_and_ecosystem(
+    const std::string& blob) {
+    std::map<std::string, std::set<std::string>> out;
+    for (const auto& rec : records_of(blob)) {
+        const auto f = fields_of(rec);
+        REQUIRE(f.size() == 16);
+        out[f[15] + "|" + f[5]].insert(f[2]);
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("collector: every inventory action's rows carry exactly the publisher of their source",
+          "[sync][vendor][collector]") {
+    fake_mac();
+    // installed_apps: one declared-vendor row and one vendorless row per ecosystem that has a
+    // vendor, built through the plugin's own parsers (deb, rpm, pacman, apk) or its row builder.
+    g_fake[0].out["list_inventory"] = nl({
+        inv_row_of(ia_inv::parse_dpkg_inv_line(
+            "bash\tii \t5.2.37-2\tarm64\tMatthias Klose <doko@debian.org>")),
+        inv_row_of(ia_inv::parse_dpkg_inv_line("nomaint\tii \t1.0\tall\t")),
+        // rpm: a Rocky Linux 9 row (PACKAGER is the build system, VENDOR the org) -> VENDOR; a row
+        // with only PACKAGER -> PACKAGER; a row with neither -> no publisher (labelled by the core)
+        inv_row_of(ia_inv::parse_rpm_inv_line(
+            "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tRocky Linux Build System (Peridot) "
+            "<releng@rockylinux.org>\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
+            "Rocky Enterprise Software Foundation")),
+        inv_row_of(ia_inv::parse_rpm_inv_line(
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\tFedora (43) Signing\td\t(none)\t(none)\t(none)")),
+        inv_row_of(ia_inv::parse_rpm_inv_line("bare\t0\t1\t1\tnoarch\t(none)\td\t(none)\t(none)\t(none)")),
+        inv_row_of(ia_inv::parse_pacman_inv_line("zlib 1:1.3.1-2")),
+        inv_row_of(ia_inv::parse_apk_inv_line("musl-1.2.5-r0")),
+        inv_row("Contoso Tool", "Contoso Ltd", "app", "windows"),
+        inv_row("No Publisher Tool", "", "app", "windows"),
+        inv_row("Acme App", "Developer ID Application: Acme Inc (ABCDE12345)", "app", "macos"),
+        inv_row("Ad Hoc App", "", "app", "macos"),
+        inv_row("com.example.pkg", "", "pkg", "macos_pkgutil"),
+        inv_row("No Ecosystem", "", "package", ""),
+    });
+    // pkg_inventory: only Homebrew's presence row declares a vendor (the constant `Homebrew`); the
+    // Chocolatey and winget presence rows, Chocolatey packages and the Appx roster carry none, so
+    // the core labels them by origin.
+    g_fake[1].out["managers"] = nl({
+        supported_status("managers"),
+        pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::present, "4.1",
+                                "/opt/homebrew", "-", ""),
+        pkg::format_manager_row(pkg::Manager::chocolatey, pkg::Presence::present, "",
+                                "C:\\ProgramData\\chocolatey", "lib_dirs=19", ""),
+        pkg::format_manager_row(pkg::Manager::winget, pkg::Presence::present, "1.29.379.0",
+                                "C:\\Program Files\\WindowsApps\\DesktopAppInstaller", "", "")});
+    g_fake[1].out["packages"] =
+        nl({supported_status("packages"),
+            pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
+            "package|chocolatey|7zip|26.5.0|pkg"});
+    g_fake[1].out["store_packages"] =
+        nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
+            flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit),
+            appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
+                     "neutral")});
+    g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
+    {
+        msi::Inventory inv;
+        inv.products.push_back({"{A}", "Contoso Msi", "1.0", "Contoso Ltd"});
+        inv.products.push_back({"{B}", "Vendorless Msi", "1.0", ""});
+        std::string out;
+        for (const auto& row : msi::render(inv))
+            out += row + '\n';
+        g_fake[3].out["list_inventory"] = out;
+    }
+    // runtimes.python: the vendor column is read as a vendor on Windows and Linux (the Linux
+    // producer always emits `-`) and ignored on macOS, where it is a bundle identifier; `-` is
+    // no vendor on any OS.
+    g_fake[4].out["python"] = nl({supported_status("python"),
+                                  "python|cpython|3.14.6|C:/Python314/|PythonCore",
+                                  "python|unmodelled|3.11|/usr/bin/python3.11|-"});
+    // runtimes.dotnet: the publisher is the constant Microsoft whatever the vendor column says: the
+    // `-` the Linux and native macOS legs emit and a foreign vendor both become Microsoft.
+    // runtimes.jvm: the release file's IMPLEMENTOR, and a home with none (`-`) is labelled via:jvm.
+    g_fake[4].out["dotnet"] = nl({supported_status("dotnet"),
+                                  "dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft",
+                                  "dotnet|sdk|8.0.400|C:/Program Files/dotnet/sdk/8.0.400|Contoso",
+                                  "dotnet|core|8.0.31|/usr/share/dotnet/shared/"
+                                  "Microsoft.NETCore.App/8.0.31|-"});
+    g_fake[4].out["jvm"] = nl({supported_status("jvm"),
+                               "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
+                               "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"});
+    g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+
+    const auto got = collect_with(with_middleware());
+    REQUIRE(got.has_value());
+    const auto by = publishers_by_source_and_ecosystem(got->first);
+
+    using Set = std::set<std::string>;
+    const std::map<std::string, Set> expected = {
+        {"installed_apps.list_inventory|deb", {"Matthias Klose <doko@debian.org>", "via:deb"}},
+        {"installed_apps.list_inventory|rpm",
+         {"Rocky Enterprise Software Foundation", "Fedora (43) Signing", "via:rpm"}},
+        {"installed_apps.list_inventory|pacman", {"via:pacman"}},
+        {"installed_apps.list_inventory|apk", {"via:apk"}},
+        {"installed_apps.list_inventory|windows", {"Contoso Ltd", "via:windows"}},
+        {"installed_apps.list_inventory|macos",
+         {"Developer ID Application: Acme Inc (ABCDE12345)", "via:macos"}},
+        {"installed_apps.list_inventory|macos_pkgutil", {"via:macos_pkgutil"}},
+        {"installed_apps.list_inventory|", {"via:unknown"}},
+        {"pkg_inventory.managers|brew", {"Homebrew"}},
+        {"pkg_inventory.managers|chocolatey", {"via:chocolatey"}},
+        {"pkg_inventory.managers|winget", {"via:winget"}},
+        {"pkg_inventory.packages|brew", {"via:brew"}},
+        {"pkg_inventory.packages|chocolatey", {"via:chocolatey"}},
+        {"pkg_inventory.store_packages|snap", {"via:snap"}},
+        {"pkg_inventory.store_packages|flatpak", {"via:flatpak"}},
+        {"pkg_inventory.store_packages|appx", {"via:appx"}},
+        {"windows_optional_features.list|optional_feature", {"Microsoft"}},
+        {"msi_packages.list_inventory|msi", {"Contoso Ltd", "via:msi"}},
+        {"runtimes.python|python",
+         yuzu::agent::kPythonVendorColumnIsVendor ? Set{"PythonCore", "via:python"}
+                                                  : Set{"via:python"}},
+        {"middleware.ibm_mq|ibm_mq", {"IBM"}},
+        {"runtimes.dotnet|dotnet", {"Microsoft"}},
+        {"runtimes.jvm|jvm", {"Eclipse Adoptium", "via:jvm"}},
+    };
+    CHECK(by == expected);
+
+    // Every action of the table is exercised: a new inventory action without a case here fails.
+    for (const auto& [plugin, action] : yuzu::agent::installed_software_actions()) {
+        const std::string source = std::string(plugin) + "." + std::string(action);
+        INFO(source);
+        const bool seen = std::any_of(by.begin(), by.end(), [&](const auto& kv) {
+            return kv.first.starts_with(source + "|");
+        });
+        CHECK(seen);
     }
 }
