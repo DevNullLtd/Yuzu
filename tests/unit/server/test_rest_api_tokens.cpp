@@ -367,14 +367,19 @@ TEST_CASE("REST DELETE /api/v1/tokens: an id with an embedded NUL revokes nothin
 
     auto res = h.delete_token(token_id + std::string("\0junk", 5));
     REQUIRE(res);
-    CHECK(res->status != 200);
+    // The ownership read is refused by the store, so the route reports a retryable store
+    // fault: 503 with a retry hint, never 200 and never the not-found answer.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("token store unavailable") != std::string::npos);
+    CHECK(res->body.find("\"revoked\"") == std::string::npos);
 
     // The real token (the prefix of the submitted id) is untouched.
     auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK_FALSE(looked_up->revoked);
-    for (const auto& a : h.audit_log)
-        CHECK(a.result != "success");
+    // No audit row at all: the refusal happens before any revoke is attempted.
+    CHECK(h.audit_log.empty());
 }
 
 // ──────────────────────────────────────────────────────────────────────────

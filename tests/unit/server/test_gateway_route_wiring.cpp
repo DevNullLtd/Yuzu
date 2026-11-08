@@ -4313,4 +4313,62 @@ TEST_CASE("NotifyStreamStatus: an identifier with an embedded NUL is refused and
     CHECK((*row)->session_id == session_id);
     CHECK_FALSE((*row)->cluster_id.has_value());
     CHECK_FALSE((*row)->home_cluster_id.has_value());
+
+    // The agent's in-memory session was not given a placement either.
+    auto sess = registry.get_session("agent-nul-1");
+    REQUIRE(sess);
+    {
+        std::lock_guard lk(sess->stream_mu);
+        CHECK(sess->cluster_id.empty());
+        CHECK(sess->gateway_node.empty());
+    }
+}
+
+TEST_CASE("NotifyStreamStatus: the same CONNECTED without an embedded NUL is accepted and "
+          "records the placement",
+          "[pg][gateway_route_wiring][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-nul-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-nul-1");
+    notif.set_session_id(session_id);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-x");
+    notif.set_gateway_node("node-a");
+    notif.set_stream_home_id("home-a");
+    gw::StreamStatusAck ack;
+    const auto status = gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack);
+    CHECK(status.ok());
+    CHECK(ack.acknowledged());
+
+    auto row = store.lookup_route("agent-nul-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_id);
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "cluster-x");
+
+    auto sess = registry.get_session("agent-nul-1");
+    REQUIRE(sess);
+    {
+        std::lock_guard lk(sess->stream_mu);
+        CHECK(sess->cluster_id == "cluster-x");
+        CHECK(sess->gateway_node == "node-a");
+    }
 }

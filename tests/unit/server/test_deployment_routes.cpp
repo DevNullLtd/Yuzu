@@ -950,7 +950,18 @@ TEST_CASE("deployment routes: POST run with a run id carrying an embedded NUL is
     auto still_running = deploy_store.find_running_for_run(run_id, "alice");
     REQUIRE(still_running.has_value());
     CHECK(*still_running == dep_id);
-    CHECK_FALSE(deploy_store.find_running_for_run(run_id + std::string("\0junk", 5), "alice")
-                    .has_value());
-    CHECK(deploy_store.succeeded_agents_for_run(run_id + std::string("\0junk", 5), "alice").empty());
+
+    auto dep_after = deploy_store.get_deployment(dep_id, "alice");
+    REQUIRE(dep_after.has_value());
+    CHECK(dep_after->status == "running");
+    CHECK(dep_after->source_run_id == run_id);
+
+    auto devices_after = deploy_store.get_devices(dep_id);
+    REQUIRE(devices_after.size() == 1);
+    CHECK(devices_after[0].agent_id == "agent-1");
+    CHECK(devices_after[0].step == "pending");
+
+    auto listing = deploy_store.list_deployments_checked("alice", /*is_admin=*/false, 10);
+    REQUIRE(listing.has_value());
+    CHECK(listing->rows.size() == 1);
 }
