@@ -38,6 +38,7 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "body_cap_policy.hpp" // the request-size row the score-policy text restates
 #include "content_etag.hpp"
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
@@ -2805,4 +2806,129 @@ TEST_CASE("openapi body checker: a conforming body passes and each kind of disag
     // A schema keyword the checker does not model is reported, never skipped.
     CHECK(mentions(oa::body_violations(spec, json{{"not", json::object()}}, json::object()),
                    "not modelled"));
+}
+
+// The other direction of the check: a member every real body carries but the schema does not list
+// as `required`. It is the only guard on a `required` entry dropped from the served text, so it is
+// proven here to find a gap, to stay quiet when there is none, and to ignore a member some body
+// lacks.
+TEST_CASE("openapi body checker: always_present_not_required finds a required entry dropped from the schema",
+          "[openapi][value]") {
+    namespace oa = yuzu::test::openapi;
+    const json spec = json::parse(openapi_spec_json());
+
+    // Hand-made schema: `a` required, `b` declared but not.
+    const json schema = {{"type", "object"},
+                         {"required", json::array({"a"})},
+                         {"properties", {{"a", {{"type", "string"}}}, {"b", {{"type", "string"}}}}}};
+    const json both = {{"a", "x"}, {"b", "y"}};
+    CHECK(oa::always_present_not_required(spec, schema, {both, both}, "$") ==
+          std::set<std::string>{"b"});
+    // A body without `b` shows it is optional: no gap.
+    CHECK(oa::always_present_not_required(spec, schema, {both, json{{"a", "x"}}}, "$").empty());
+    // Declaring it required closes the gap.
+    json tightened = schema;
+    tightened["required"] = json::array({"a", "b"});
+    CHECK(oa::always_present_not_required(spec, tightened, {both}, "$").empty());
+    // A path the schema does not declare is reported, not skipped.
+    CHECK(oa::always_present_not_required(spec, schema, {both}, "$.nope") ==
+          std::set<std::string>{"<path not declared: $.nope>"});
+
+    // The real case the route tests rely on: dropping `required: [data, meta]` from the served
+    // DexScorePolicyData is invisible to a conforming body and is found only here.
+    const json policy_schema = oa::ok_response_schema(spec, "/dex/score-policy", "get");
+    REQUIRE(policy_schema.is_object());
+    const json real = {{"data", {{"document", json::object()}, {"revision", "default"},
+                                 {"source", "default"}}},
+                       {"meta", {{"api_version", "v1"}}}};
+    CHECK(oa::always_present_not_required(spec, policy_schema, {real}, "$").empty());
+    json dropped = spec;
+    REQUIRE(dropped["components"]["schemas"]["DexScorePolicyData"].contains("required"));
+    dropped["components"]["schemas"]["DexScorePolicyData"].erase("required");
+    CHECK(oa::always_present_not_required(dropped, policy_schema, {real}, "$") ==
+          std::set<std::string>{"data", "meta"});
+}
+
+// The other kinds of disagreement the value checker is trusted to catch, each on a hand-made
+// schema so the test does not depend on what the served document happens to declare today.
+TEST_CASE("openapi body checker: bounds, nullable, oneOf and additionalProperties are enforced",
+          "[openapi][value]") {
+    namespace oa = yuzu::test::openapi;
+    const json spec = json::object();
+    const auto bad = [&](const json& schema, const json& body) {
+        return !oa::body_violations(spec, schema, body).empty();
+    };
+
+    const json bounded = {{"type", "integer"}, {"minimum", 1}, {"maximum", 3}};
+    CHECK_FALSE(bad(bounded, 2));
+    CHECK(bad(bounded, 0));
+    CHECK(bad(bounded, 4));
+    CHECK(bad(bounded, 2.5)); // a fraction is not an integer
+
+    const json lengths = {{"type", "string"}, {"minLength", 2}, {"maxLength", 3}};
+    CHECK_FALSE(bad(lengths, "ab"));
+    CHECK(bad(lengths, "a"));
+    CHECK(bad(lengths, "abcd"));
+
+    const json items = {{"type", "array"}, {"minItems", 1}, {"maxItems", 2},
+                        {"items", {{"type", "string"}}}};
+    CHECK_FALSE(bad(items, json::array({"a"})));
+    CHECK(bad(items, json::array()));
+    CHECK(bad(items, json::array({"a", "b", "c"})));
+    CHECK(bad(items, json::array({"a", 1}))); // an element of the wrong type
+
+    const json plain = {{"type", "string"}};
+    json nullable = plain;
+    nullable["nullable"] = true;
+    CHECK_FALSE(bad(nullable, json()));
+    CHECK(bad(plain, json()));
+
+    const json one_of = {{"oneOf", json::array({{{"type", "string"}}, {{"type", "integer"}}})}};
+    CHECK_FALSE(bad(one_of, "x"));
+    CHECK_FALSE(bad(one_of, 1));
+    CHECK(bad(one_of, true));
+
+    const json closed = {{"type", "object"}, {"properties", {{"a", {{"type", "string"}}}}}};
+    CHECK_FALSE(bad(closed, json{{"a", "x"}}));
+    CHECK(bad(closed, json{{"a", "x"}, {"b", 1}}));
+    json open = closed;
+    open["additionalProperties"] = true;
+    CHECK_FALSE(bad(open, json{{"a", "x"}, {"b", 1}}));
+    json typed_extra = closed;
+    typed_extra["additionalProperties"] = {{"type", "integer"}};
+    CHECK_FALSE(bad(typed_extra, json{{"a", "x"}, {"b", 1}}));
+    CHECK(bad(typed_extra, json{{"a", "x"}, {"b", "no"}}));
+}
+
+// The score-policy request-size text is a hand copy of the body-cap row and of the policy limit.
+// Pin it, so changing either without the served document fails here instead of leaving the
+// integrator-facing figure wrong (it was wrong once: 256 KiB where the cap is 320 KiB).
+TEST_CASE("openapi documents: the score-policy request-size text matches the body-cap row and the policy limit",
+          "[openapi][structure][responses]") {
+    const json spec = json::parse(openapi_spec_json());
+    const auto cap = resolve_body_cap("PUT", "/api/v1/dex/score-policy");
+    CHECK(resolve_body_cap("DELETE", "/api/v1/dex/score-policy").max_body_bytes ==
+          cap.max_body_bytes);
+    // 411 is declared below only while an unmeasurable body is refused.
+    REQUIRE(cap.requires_measurable);
+    REQUIRE(cap.max_body_bytes % 1024 == 0);
+    const std::string cap_text = std::to_string(cap.max_body_bytes / 1024) + " KiB";
+    const std::string limit_text = std::to_string(kDexScorePolicyMaxBytes / 1024) + " KiB";
+
+    const auto response_text = [&](const char* method, const char* status) -> std::string {
+        const json* node = find_at(spec, {"paths", "/dex/score-policy", method, "responses",
+                                          status, "description"});
+        return node != nullptr && node->is_string() ? node->get<std::string>() : std::string{};
+    };
+
+    const json* put_description = find_at(spec, {"paths", "/dex/score-policy", "put", "description"});
+    REQUIRE((put_description != nullptr && put_description->is_string()));
+    const std::string put = put_description->get<std::string>();
+    CHECK(put.find("at most " + limit_text) != std::string::npos);
+    CHECK(put.find("up to " + cap_text) != std::string::npos);
+    for (const char* method : {"put", "delete"}) {
+        INFO(method);
+        CHECK(response_text(method, "413").find(cap_text) != std::string::npos);
+        CHECK_FALSE(response_text(method, "411").empty());
+    }
 }

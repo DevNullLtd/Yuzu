@@ -10,9 +10,11 @@
  * it here together with the schema taken from openapi_spec_json().
  *
  * What is checked, recursively, at every level the schema describes:
- *   - `type` (OpenAPI 3.0 spelling): string, integer (a whole JSON number), number (any), boolean,
- *     object, array; `nullable: true` admits null.
- *   - `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `minItems`, `maxItems`.
+ *   - `type` (OpenAPI 3.0 spelling, one name, never an array): string, integer (a JSON integer:
+ *     5.0 is a float and fails), number (any), boolean, object, array; `nullable: true` admits
+ *     null.
+ *   - `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `minItems`, `maxItems`. Lengths are
+ *     counted in bytes, not code points.
  *   - every `required` member is present.
  *   - no undeclared member: an object schema that declares `properties` is CLOSED unless it says
  *     `additionalProperties: true` (or gives a schema, which each extra member must satisfy).
@@ -22,7 +24,16 @@
  *   - `items` for every array element.
  * Any schema keyword it does not model and that could constrain a value (`not`, `if`,
  * `patternProperties`, ...) is itself a violation, so a schema edit that outgrows this checker
- * fails loudly instead of being silently skipped.
+ * fails loudly instead of being silently skipped. The exception is a closed list of annotation
+ * keywords (`description`, `default`, `example(s)`, `title`, `readOnly`, `writeOnly`,
+ * `deprecated`, `externalDocs`, `x-*`) plus three that DO constrain a value but are accepted
+ * without being checked: `pattern`, `format` and `uniqueItems`. None of the schemas the route
+ * tests check uses them; one that starts to needs modelling here first.
+ *
+ * A second, simpler subset validator lives in test_json_schema_subset.hpp (`schema_violation`,
+ * used by the MCP output-schema tests). It is a different checker with different semantics: it
+ * returns the first violation only, accepts a `type` array, and models neither `$ref`, `allOf`,
+ * `oneOf` nor the bounds. Do not assume a schema that passes one passes the other.
  *
  * It returns the list of violations (empty = the body conforms) rather than asserting, so a
  * test can both require an empty list and prove, on a hand-made bad body, that each kind of

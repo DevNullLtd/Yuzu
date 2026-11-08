@@ -580,7 +580,9 @@ TEST_CASE("score-policy routes: every 200 body conforms to the served DexScorePo
         const json body = json::parse(res->body);
         const auto violations = oa::body_violations(spec, schema, body);
         INFO(json(violations).dump(2));
-        CHECK(violations.empty());
+        // REQUIRE, not CHECK: the lines below index the body, and a const operator[] on a missing
+        // member aborts instead of failing.
+        REQUIRE(violations.empty());
         // meta is declared as a bare object; its one member is pinned here.
         CHECK(body["meta"] == json{{"api_version", "v1"}});
         const auto paths = oa::seen_member_paths(body);

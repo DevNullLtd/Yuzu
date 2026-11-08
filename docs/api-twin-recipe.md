@@ -270,6 +270,12 @@ first build. The document is the template literal, not generated, so nothing bel
    more. When a piece nears that, split it at the end of a line after a comma or closing brace:
    close it with `)json"` and open the next piece with `R"json(` on the following line.
 
+One command checks steps 2 to 6 without a build: `python3 -I tests/test_openapi_operation_authoring.py`
+(meson `docs` suite). It reads the served document and the constants out of
+`test_openapi_spec_completeness.cpp`, checks the `operationId` shape and uniqueness, the typed
+success response, the checksum pin and the segment ceiling in one run, and prints the checksum to
+paste into `kOperationIdChecksum`. It does not replace the C++ tests after the build.
+
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
 `"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes where a present-empty value selects rows with no

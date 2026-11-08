@@ -18,19 +18,19 @@ literal text (the R"json(...)json" chain that tests/test_openapi_literal_segment
 the same constants out of the C++ test, applies the same rules, and prints every violation in one
 run, with the checksum the pin must be changed to. It does not build anything.
 
-Rules, each mirroring tests/unit/server/test_openapi_spec_completeness.cpp (line numbers as of
-this writing):
+Rules, each mirroring tests/unit/server/test_openapi_spec_completeness.cpp (named, not
+line-numbered, because the lines move):
   A. every operation (a path item member named get/put/post/delete/options/head/patch/trace,
-     all_operations() at :1160) has a string operationId (:1891-1892);
-  B. operationIds match kShape (:1882, ^[a-z][A-Za-z0-9]*$ today, read from the C++ test) and
-     are unique across the document (:1895-1900);
-  C. an operation with no 2xx response carrying content.<media>.schema (has_typed_success(),
-     :1845) is listed in kUntyped (:2052, read from the C++ test), and a kUntyped entry names an
-     operation that exists and is untyped (:2063 compares the two sets for equality);
-  D. kOperationIdChecksum (:1881, read from the C++ test) equals content_etag() of the sorted
-     "<id> <method> <path>\\n" lines (:1902-1911), content_etag() being FNV-1a 64 with the offset
-     constant in server/core/src/content_etag.hpp:31-36. Skipped, and said so, while A or B fail,
-     because the C++ test REQUIREs those first;
+     as all_operations() lists them) has a string operationId;
+  B. operationIds match kShape (^[a-z][A-Za-z0-9]*$ today, read from the C++ test) and are
+     unique across the document;
+  C. an operation with no 2xx response carrying content.<media>.schema (has_typed_success() in
+     the C++ test) is listed in kUntyped (read from the C++ test), and a kUntyped entry names an
+     operation that exists and is untyped (the C++ test compares the two sets for equality);
+  D. kOperationIdChecksum (read from the C++ test) equals content_etag() of the sorted
+     "<id> <method> <path>\\n" lines, content_etag() being FNV-1a 64 with the offset constant in
+     server/core/src/content_etag.hpp. Skipped, and said so, while A or B fail, because the C++
+     test REQUIREs those first;
   E. every raw-string segment stays under the 15,000-byte ceiling, by calling
      test_openapi_literal_segments.py's own function (one lexer, one ceiling).
 

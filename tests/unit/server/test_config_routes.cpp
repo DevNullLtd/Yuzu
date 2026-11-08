@@ -2096,7 +2096,9 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
         const json b = body(res.body);
         const auto violations = oa::body_violations(spec, schema, b);
         INFO(json(violations).dump(2));
-        CHECK(violations.empty());
+        // REQUIRE, not CHECK: the lines below index the body, and a const operator[] on a missing
+        // member aborts instead of failing.
+        REQUIRE(violations.empty());
         // meta is declared through ApiMeta; its one member is pinned here too.
         CHECK(b["meta"] == json{{"api_version", "v1"}});
         const auto paths = oa::seen_member_paths(b);
