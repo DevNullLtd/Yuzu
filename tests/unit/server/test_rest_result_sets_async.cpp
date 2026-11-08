@@ -4422,3 +4422,48 @@ TEST_CASE("GET /api/v1/result-sets/{id}/lineage: a degraded result_sets read ref
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
 }
+
+// A name carrying an embedded NUL cannot be stored faithfully, so it is refused BEFORE dispatch:
+// nothing is sent to an agent and then reported as failed because the row could not be written.
+TEST_CASE("result-set producers: a name with an embedded NUL is refused with 400 before any "
+          "dispatch, on both async producers",
+          "[pg][result_set][async][security][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    SECTION("from-echo-query") {
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["name"] = std::string("a\0b", 3);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
+        CHECK(status == 400);
+        INFO("dispatches recorded: " << h.calls.size());
+        CHECK(h.calls.empty()); // the dispatch mock recorded zero sends
+    }
+
+    SECTION("control: a clean name does reach the dispatch mock, so the zero counts are not "
+            "vacuous") {
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["name"] = "clean-name";
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 1);
+    }
+
+    SECTION("from-instruction-result") {
+        auto iid = make_instruction(*h.instr);
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["name"] = std::string("a\0b", 3);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        CHECK(status == 400);
+        INFO("dispatches recorded: " << h.calls.size());
+        CHECK(h.calls.empty()); // the dispatch mock recorded zero sends
+    }
+}

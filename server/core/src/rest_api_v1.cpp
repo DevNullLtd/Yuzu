@@ -14194,6 +14194,22 @@ void RestApiV1::register_routes(
                 rs_err(res, 503, "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired");
                 return;
             }
+            // A value with an embedded NUL cannot be stored in the result-set row, and the row is
+            // written AFTER the command has been dispatched. Refuse it here, before anything is
+            // sent, so a command is never run and then reported as failed.
+            if (name.find('\0') != std::string::npos ||
+                matcher.find('\0') != std::string::npos ||
+                source_payload.find('\0') != std::string::npos) {
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                        std::string("reason=field_contains_nul source_kind=") +
+                                            std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 400, "RESULT_SET_BAD_REQUEST: name must not contain a NUL byte");
+                return;
+            }
             // #1788: these three producers are OPERATOR dispatch surfaces that
             // admit on a bare GLOBAL Execution:Execute gate and then reach the
             // fleet by scope or `__all__` broadcast. The derived VisibleSet is

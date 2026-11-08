@@ -14606,6 +14606,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         kResultSetNameMaxLen, kResultSetSourceKindMaxLen));
                     return;
                 }
+                if (cr.name.find('\0') != std::string::npos) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_REQUEST: name must not contain a NUL byte"),
+                        "application/json");
+                    return;
+                }
                 if (!result_set_store_) {
                     res.set_content(a4_error(kInternalError, "result-set store unavailable"),
                                     "application/json");
@@ -15165,6 +15172,14 @@ McpServer::HandlerFn McpServer::build_handler(
                             std::format("name must be at most {} bytes", kResultSetNameMaxLen));
                         return;
                     }
+                    if (name_arg.find('\0') != std::string::npos) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: name must not contain a NUL "
+                                           "byte"),
+                            "application/json");
+                        return;
+                    }
                     if (args.contains("parent_id") && args["parent_id"].is_string() &&
                         args["parent_id"].get_ref<const std::string&>().size() >
                             kResultSetParentIdMaxLen) {
@@ -15227,6 +15242,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (name_arg.size() > kResultSetNameMaxLen) {
                         reject_field_too_large(
                             std::format("name must be at most {} bytes", kResultSetNameMaxLen));
+                        return;
+                    }
+                    if (name_arg.find('\0') != std::string::npos) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: name must not contain a NUL "
+                                           "byte"),
+                            "application/json");
                         return;
                     }
                     if (args.contains("parent_id") && args["parent_id"].is_string() &&

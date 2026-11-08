@@ -48842,3 +48842,91 @@ TEST_CASE("MCP Guardian: tool descriptions carry the never-render-clean rule and
     }
     CHECK(seen == 3);
 }
+
+// A name with an embedded NUL is refused as invalid params BEFORE any dispatch, on the two async
+// producers and the direct create. The dispatch mock counts sends: nothing may run on an agent and
+// then be reported as failed because the result-set row could not be written.
+TEST_CASE("MCP result-sets: a name with an embedded NUL is rejected before any dispatch",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-1"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const std::string nul_name = R"("name":"a\u0000b")";
+
+    SECTION("control: a clean name reaches the dispatch mock, so a zero count below is not "
+            "vacuous") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1","name":"clean-name"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK_FALSE(body.contains("error"));
+        CHECK(sends == 1);
+    }
+
+    SECTION("create_result_set_from_echo_query") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1",)" +
+            nul_name + R"(}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+    }
+
+    SECTION("create_result_set_from_instruction_result") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x",)" +
+            nul_name + R"(}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+    }
+
+}
+
+// The direct create is Infrastructure:Write, which the operator tier does not allow; it is exercised
+// at the supervised tier, as the sibling oversized-name test is. Same rule: refused as invalid
+// params, and nothing is dispatched.
+TEST_CASE("MCP result-sets: create_result_set refuses a name with an embedded NUL as invalid params",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-2"};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set","arguments":{"name":"a\u0000b"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(sends == 0);
+}
