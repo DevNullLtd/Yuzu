@@ -220,6 +220,7 @@ class EnablementStore;
 class AppUsageStore;
 class CertificateInventoryStore;
 class ProductRegistryStore;
+class SoftwareCollectionSettingsStore;
 class ProductPackStore;
 class ScimStore;
 class AnalyticsEventStore;
@@ -465,6 +466,7 @@ struct Deps {
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
     CertificateInventoryStore* certificate_inventory_store{nullptr}; // slice-2 PR 2a-2a
     ProductRegistryStore* product_registry_store{nullptr};
+    SoftwareCollectionSettingsStore* software_collection_settings_store{nullptr}; // SAM-34
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};
     AnalyticsEventStore* analytics_store{nullptr};

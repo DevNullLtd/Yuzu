@@ -8,12 +8,17 @@
 /// drift test keeps it in lock-step with `capture_sources()`.
 ///
 /// Honesty rules the API promises:
-///  - These are the registry DEFAULTS every agent applies, not per-device
-///    readings. Echo tiers prune on the agent; the server has no live value.
+///  - These are the registry DEFAULTS of the current release, not per-device
+///    readings. Echo tiers prune on the agent; the server holds no per-device
+///    value.
 ///  - A paused or errored source is never pruned (echo_aggregator.cpp
-///    `source_enabled` gate), so its rows do not age.
-///  - Rows may outlive their limit by up to kEchoRetentionTickSeconds, and
-///    longer when the retention clock guard declines a prune.
+///    `source_enabled` gate), so its rows do not age; they become eligible
+///    again when the source is re-enabled.
+///  - kEchoRetentionTickSeconds is the cadence of the agent's retention pass,
+///    not a bound: a row can outlive its limit by scheduling lag, and by more
+///    when the retention clock guard declines a prune or an agent is offline.
+///  - Roll-up is the only mode: hourly is the finest tier, and it is the one
+///    the agent's byte budget may evict (see budget_dependent).
 
 #include <algorithm>
 #include <charconv>
@@ -36,13 +41,15 @@ inline constexpr std::int64_t kEchoRetentionTickSeconds = yuzu::kEchoRollupTickS
 
 struct EchoRetentionTier {
     std::string source;
-    std::string tier; // live | hourly | daily | monthly | boot
+    std::string tier; // hourly | daily | monthly | boot
     bool row_count{false}; // true: `limit` is rows; false: seconds
     std::int64_t limit{0};
 };
 
 /// Strict parser for the 4-column TSV (`source tier limit_kind limit`).
-/// Errors name the 1-based offending line.
+/// Errors name the 1-based offending line. A `live` row is skipped, not an
+/// error: the embedded table still carries them until the agent drops the raw
+/// tier. The tolerance goes with that removal.
 [[nodiscard]] inline std::expected<std::vector<EchoRetentionTier>, std::string>
 parse_echo_retention_tiers(std::string_view tsv) {
     constexpr std::string_view kHeader = "source\ttier\tlimit_kind\tlimit";
@@ -83,8 +90,9 @@ parse_echo_retention_tiers(std::string_view tsv) {
             return err("expected 4 non-empty tab-separated cells");
         if (cells[2] != "rows" && cells[2] != "seconds")
             return err("limit_kind must be rows or seconds");
-        if (cells[1] != "live" && cells[1] != "hourly" && cells[1] != "daily" &&
-            cells[1] != "monthly" && cells[1] != "boot")
+        const bool live = cells[1] == "live";
+        if (!live && cells[1] != "hourly" && cells[1] != "daily" && cells[1] != "monthly" &&
+            cells[1] != "boot")
             return err("unknown tier");
         std::int64_t limit = 0;
         const auto [p, ec] = std::from_chars(cells[3].data(), cells[3].data() + cells[3].size(), limit);
@@ -92,6 +100,8 @@ parse_echo_retention_tiers(std::string_view tsv) {
             return err("limit must be a positive integer");
         if (!seen.emplace(std::string(cells[0]), std::string(cells[1])).second)
             return err("duplicate source/tier");
+        if (live)
+            continue;
         out.push_back({std::string(cells[0]), std::string(cells[1]), cells[2] == "rows", limit});
     }
     if (!header_seen)
@@ -102,7 +112,7 @@ parse_echo_retention_tiers(std::string_view tsv) {
 }
 
 /// Roll-up bucket width. Monthly is a calendar month (`start of month` in the
-/// registry's roll-up SQL), so the worst case 31 days is used. live/boot: 0.
+/// registry's roll-up SQL), so the worst case 31 days is used. boot: 0.
 [[nodiscard]] inline std::int64_t bucket_seconds(std::string_view tier) noexcept {
     if (tier == "hourly")
         return 3600;
@@ -111,6 +121,12 @@ parse_echo_retention_tiers(std::string_view tsv) {
     if (tier == "monthly")
         return 31 * 86400;
     return 0;
+}
+
+/// True for the tier the agent's byte budget may evict (hourly, oldest first
+/// beyond the newest 48 hours). Daily, monthly and boot rows are never evicted.
+[[nodiscard]] inline bool budget_dependent(std::string_view tier) noexcept {
+    return tier == "hourly";
 }
 
 /// Age a record is guaranteed to still be held at. Roll-up rows age from their

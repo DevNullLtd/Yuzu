@@ -52,14 +52,14 @@ using yuzu::server::pg::PgPool;
 namespace yuzu::server {
 
 // #2703 Gate 7 item 3 — friend seam (rbac_store.hpp) for exercising
-// user_rbac_group_names/role_effects_for directly; same shape as
+// user_rbac_group_names_checked/role_effects_for directly; same shape as
 // PreflightRoutesTestAccess (test_preflight_routes.cpp) /
 // DashboardResultsColumnsTestAccess. See the friend declaration's comment for
 // why authorize_list_read() alone can't reach role_effects_for's own sites.
 struct RbacStoreTestAccess {
     RbacStore& store;
-    auto user_rbac_group_names(const std::string& username) {
-        return store.user_rbac_group_names(username);
+    auto user_rbac_group_names_checked(const std::string& username) {
+        return store.user_rbac_group_names_checked(username);
     }
     auto role_effects_for(const std::string& securable_type, const std::string& operation) {
         return store.role_effects_for(securable_type, operation);
@@ -3506,7 +3506,7 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
 }
 
 // #2703 Gate 7 item 3 (BLOCKING, consistency-auditor Gate 4 + compliance-officer
-// Gate 6): user_rbac_group_names and role_effects_for share check_permission's
+// Gate 6): user_rbac_group_names_checked and role_effects_for share check_permission's
 // 3 degrade exits (breaker-denied, pool-acquire-timeout, query-error) but,
 // before this fix, never called note_read_degrade() on any of them — a
 // degrade on the ADR-0017 admit-then-filter chokepoint (authorize_list_read,
@@ -3515,13 +3515,13 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
 // (first two calls, one per sibling) and the breaker-denied fast path (calls
 // 3 and 4, once the first two have tripped the breaker) ON EACH sibling's OWN
 // code site — quality-engineer (Gate 8) found an earlier version of this
-// test exercised user_rbac_group_names' breaker-denied branch but not
+// test exercised user_rbac_group_names_checked' breaker-denied branch but not
 // role_effects_for's own (structurally identical, but a distinct site);
 // call 4 closes that. Query-error is intentionally NOT covered here (a
 // pre-existing, file-wide gap — check_permission's own query-error path has
 // never had a counter-asserting test either); asserts the counter directly,
 // not merely that the calls return an error.
-TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
+TEST_CASE("RbacStore: user_rbac_group_names_checked and role_effects_for record "
           "read-degrade on pool-acquire-timeout and breaker-denied "
           "(#2703 Gate 7 item 3)",
           "[rbac_store][pg]") {
@@ -3543,10 +3543,10 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
     auto held = pool_b.acquire();
     REQUIRE(held);
 
-    // Call 1 (user_rbac_group_names): breaker still closed (streak 0) ->
+    // Call 1 (user_rbac_group_names_checked): breaker still closed (streak 0) ->
     // genuine pool-acquire attempt -> times out -> streak 0->1, denying,
     // reason=pool_acquire_timeout.
-    auto r1 = acc.user_rbac_group_names("bob");
+    auto r1 = acc.user_rbac_group_names_checked("bob");
     REQUIRE_FALSE(r1.has_value());
     // The error text is the shared constant: authz::ceiling_degrade_reason matches on it, so a
     // hand-typed variant would be labelled query_error instead of pool_acquire_timeout.
@@ -3566,13 +3566,13 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
               .value() == 2.0);
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
-    // Call 3 (user_rbac_group_names again): breaker now OPEN and within its
+    // Call 3 (user_rbac_group_names_checked again): breaker now OPEN and within its
     // cooldown -> denies WITHOUT a pool touch, via each sibling's own
     // breaker-denied branch (the other half of this fix — that branch was
     // ALSO silent pre-fix). Reason is still pool_acquire_timeout (breaker-
     // denied is recorded under the same label as check_permission's own
     // breaker-denied branch, not a distinct reason — see the HELP text).
-    auto r3 = acc.user_rbac_group_names("bob");
+    auto r3 = acc.user_rbac_group_names_checked("bob");
     REQUIRE_FALSE(r3.has_value());
     CHECK(std::string_view{r3.error()} == kRbacErrCircuitBreakerOpen);
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
@@ -3580,7 +3580,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
               .value() == 3.0);
 
     // Call 4 (role_effects_for, breaker-denied): quality-engineer (Gate 8) —
-    // call 3 above only exercised user_rbac_group_names' OWN breaker-denied
+    // call 3 above only exercised user_rbac_group_names_checked' OWN breaker-denied
     // branch; role_effects_for's own breaker-denied early return
     // (structurally identical, but a distinct code site) was never directly
     // hit. Still within the cooldown from call 2/3, so this denies WITHOUT a
@@ -3596,7 +3596,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
 // The error text of the degraded-read producers is a shared constant because
 // authz::ceiling_degrade_reason keys the `yuzu_server_rbac_read_degrade_total{reason}` label on it:
 // a hand-typed variant at any one producer would be counted as query_error. Three producers are
-// pinned above (user_rbac_group_names, role_effects_for) and in test_authz_gates.cpp
+// pinned above (user_rbac_group_names_checked, role_effects_for) and in test_authz_gates.cpp
 // (role_permission_effect_authz_checked, through role_permission_allowed_checked); the two cases
 // below pin the rest through the real accessors: every "store not open" producer here, and the
 // pool-acquire-timeout producers of the unbreakered reads.
@@ -3630,7 +3630,7 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     const auto r6 = broken.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
     REQUIRE_FALSE(r6.has_value());
     CHECK(std::string_view{r6.error()} == kRbacErrStoreNotOpen);
-    const auto r7 = acc.user_rbac_group_names("bob");
+    const auto r7 = acc.user_rbac_group_names_checked("bob");
     REQUIRE_FALSE(r7.has_value());
     CHECK(std::string_view{r7.error()} == kRbacErrStoreNotOpen);
     const auto r8 = acc.role_effects_for("Infrastructure", "Read");
@@ -5509,5 +5509,41 @@ TEST_CASE("RbacStore: a starved pool, an open breaker and a store that is not op
         REQUIRE_FALSE(r.has_value());
         CHECK(std::string_view{r.error()} == kRbacErrStoreNotOpen);
         CHECK_FALSE(broken.check_permission("bob", "Forensics", "Read"));
+    }
+}
+
+// user_rbac_group_names_checked is public (the attestation separation-of-duties gate reads it): an
+// authoritative membership read, never the fail-open `get_group_members` shape. A member's groups
+// come back, a non-member gets an empty SUCCESS, and a read that cannot be answered is an error.
+TEST_CASE("RbacStore::user_rbac_group_names_checked: groups for a member, empty for a non-member, "
+          "an error when the read cannot be answered",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.create_group({"eng", "Engineering", "local", "", 0}).has_value());
+    REQUIRE(store.create_group({"ops", "Operations", "local", "", 0}).has_value());
+    REQUIRE(store.add_group_member("eng", "bob").has_value());
+    REQUIRE(store.add_group_member("ops", "bob").has_value());
+    REQUIRE(store.add_group_member("ops", "carol").has_value());
+
+    auto bob = store.user_rbac_group_names_checked("bob");
+    REQUIRE(bob.has_value());
+    std::ranges::sort(*bob);
+    CHECK(*bob == std::vector<std::string>{"eng", "ops"});
+
+    auto carol = store.user_rbac_group_names_checked("carol");
+    REQUIRE(carol.has_value());
+    CHECK(*carol == std::vector<std::string>{"ops"});
+
+    auto nobody = store.user_rbac_group_names_checked("nobody");
+    REQUIRE(nobody.has_value()); // a genuine non-member is a success, not an error
+    CHECK(nobody->empty());
+
+    SECTION("a dropped membership table is an error, never an empty set") {
+        exec_on_test_db(rbac_db_fx_.dsn(), "DROP TABLE rbac_store.group_members CASCADE");
+        const auto r = store.user_rbac_group_names_checked("bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("query failed:"));
+        // The fail-open sibling cannot tell the two apart; this is why the gate must not use it.
+        CHECK(store.get_group_members("eng").empty());
     }
 }

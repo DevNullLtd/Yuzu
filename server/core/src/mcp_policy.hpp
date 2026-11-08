@@ -173,16 +173,15 @@ inline bool requires_approval(std::string_view mcp_tier,
         if (securable_type == "Security" && operation == "Execute") return true;
         if (securable_type == "UserManagement" && operation == "Write") return true;
         if (securable_type == "ManagementGroup" && operation == "Write") return true;
-        // Workflow:Execute (POST /api/workflows/{id}/execute): a workflow fans several steps out
-        // to the fleet in one call with no per-step human look. Owner ruling 2026-10-30: a
-        // supervised token needs an approval ticket for it, like every other fleet execution at
-        // this tier. Before this line a supervised token passed Workflow:Execute with NO
-        // ticket. AuthRoutes::require_permission mirrors this rule on every non-MCP transport,
-        // so a supervised-tier token is refused (403) on the REST execute route. No MCP tool
-        // maps to Workflow:Execute yet (the execute_workflow tool is not implemented), so
-        // until that tool ships a supervised token has no ticket path to run a workflow. The operator
-        // tier stays DENIED by tier_allows() above, which admits only Execution:Execute among
-        // execute operations.
+        // Workflow:Execute (execute_workflow / POST /api/v1/workflows/{id}/execute and the legacy
+        // POST /api/workflows/{id}/execute): a workflow fans several steps out to the fleet in
+        // one call, with no per-step human look. Owner ruling 2026-10-30: a supervised token
+        // needs an approval ticket for it, like every other fleet execution at this tier.
+        // Before this line a supervised token passed Workflow:Execute with NO ticket. Because
+        // AuthRoutes::require_permission mirrors this rule on every non-MCP transport, a
+        // supervised-tier token is now also refused (403; use the MCP ticket flow, i.e. the
+        // execute_workflow tool) on both REST execute routes (#520). The operator tier stays DENIED by tier_allows()
+        // above, which admits only Execution:Execute among execute operations.
         if (securable_type == "Workflow" && operation == "Execute") return true;
 
         // RevocationSource:Write (ADR-0070 R1, slice 2b-1a): register, replace, remove and reset

@@ -164,6 +164,57 @@ TEST_CASE("StreamBudget: kMcpPost is an independent surface — its per-principa
     CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 1);
 }
 
+TEST_CASE("StreamBudget: kWorkflowRun is a surface of the ONE budget: 2 per principal, counted in "
+          "the global cap, released with the lease (#2146 D3)",
+          "[mcp][stream][ch5][workflow][twin]") {
+    CHECK(std::string(detail::to_string(detail::SseSurface::kWorkflowRun)) == "workflow_run");
+    CHECK(detail::kPerPrincipalWorkflowRun == 2);
+
+    detail::StreamBudget budget{{.global_cap = 3}};
+    std::vector<detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < detail::kPerPrincipalWorkflowRun; ++i) {
+        auto r = budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                    detail::kPerPrincipalWorkflowRun);
+        REQUIRE(r.lease);
+        held.push_back(std::move(r.lease));
+    }
+    // The third run for the same principal is refused on the PER-PRINCIPAL cap...
+    auto over = budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                   detail::kPerPrincipalWorkflowRun);
+    CHECK_FALSE(over.lease);
+    CHECK(std::string(over.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
+    // ...her other surfaces are separate keys and still admit.
+    auto get = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", 4);
+    REQUIRE(get.lease);
+
+    // The per-surface count is the workflow share only; active() is everything.
+    CHECK(budget.active_for_surface(detail::SseSurface::kWorkflowRun) == 2);
+    CHECK(budget.active_for_surface(detail::SseSurface::kMcpGet) == 1);
+    CHECK(budget.active_for_surface(detail::SseSurface::kApiEvents) == 0);
+    CHECK(budget.active() == 3);
+
+    // ONE budget: the workflow runs spend the global cap that the streaming surfaces share, so a
+    // stream is refused on the global cap while two runs and a GET hold it, and a different
+    // principal's run is refused the same way.
+    auto stream = budget.try_acquire(detail::SseSurface::kApiEvents, "bob", detail::kPerPrincipalApiEvents);
+    CHECK_FALSE(stream.lease);
+    CHECK(std::string(stream.reject_reason) == detail::StreamBudget::kRejectGlobal);
+    auto bob_run = budget.try_acquire(detail::SseSurface::kWorkflowRun, "bob",
+                                      detail::kPerPrincipalWorkflowRun);
+    CHECK_FALSE(bob_run.lease);
+    CHECK(std::string(bob_run.reject_reason) == detail::StreamBudget::kRejectGlobal);
+
+    // Destroying a lease returns the slot: the count falls and the next run admits.
+    held.pop_back();
+    CHECK(budget.active_for_surface(detail::SseSurface::kWorkflowRun) == 1);
+    auto again = budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                    detail::kPerPrincipalWorkflowRun);
+    CHECK(again.lease);
+    held.clear();
+    again.lease.release();
+    CHECK(budget.active_for_surface(detail::SseSurface::kWorkflowRun) == 0);
+}
+
 TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can spare",
           "[mcp][stream][ch6]") {
     // Each permitted stream must be able to pin kMaxProvidersPerStream (2) workers —

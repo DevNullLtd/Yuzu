@@ -880,6 +880,8 @@ yuzu_server_core_lib = static_library(
     'src/workflow_model.cpp',
     'src/workflow_execution_list_model.cpp', # shared REST+MCP parser/row builder for the run list
     'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
+    'src/workflow_execute.cpp', # #2146 batch B: the shared workflow-execute sequence (REST v1 + MCP)
+    'src/workflow_execute_routes.cpp', # #2146 batch B: POST /api/v1/workflows/{id}/execute
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',
@@ -896,6 +898,7 @@ yuzu_server_core_lib = static_library(
     'src/vuln_finding_store.cpp',
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
+    'src/software_collection_settings_store.cpp',
     'src/software_normalization_pack.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
@@ -1022,6 +1025,7 @@ yuzu_server_routes_lib = static_library(
     'src/device_ui.cpp',
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
+    'src/software_collection_settings_routes.cpp',
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',

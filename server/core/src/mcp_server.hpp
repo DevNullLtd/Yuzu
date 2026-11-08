@@ -75,6 +75,7 @@
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
+#include "workflow_run_port.hpp" // WorkflowRunFn: the run port set_workflow_run_fn takes
 // #4027: DeviceRow (via device_routes.hpp) + EchoRetentionPausedScan/
 // EchoPausedSourceRow + the echo_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
@@ -856,6 +857,62 @@ public:
     /// `!workflow_engine` guard's behaviour exactly.
     void set_workflow_api(std::shared_ptr<const WorkflowApi> a) { workflow_api_ = std::move(a); }
 
+    /// ADR-1007 per-device concurrency variant of `DispatchFn` (REST's `WorkflowRoutes::
+    /// ConcurrencyDispatchFn`, same shape), used ONLY by `execute_workflow` so a workflow step
+    /// honours its instruction's `concurrency_mode` exactly as the REST twin does. Unset (the
+    /// default, and every harness that does not wire it) means `execute_workflow` dispatches each
+    /// step through the plain `DispatchFn` with no concurrency claim: the pre-ADR-1007 behaviour
+    /// `execute_instruction` still has. server.cpp wires the identical closure the REST route gets.
+    using ConcurrencyDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+        const std::string& definition_id, const std::string& concurrency_mode)>;
+    void set_workflow_concurrency_dispatch_fn(ConcurrencyDispatchFn fn) {
+        workflow_concurrency_dispatch_fn_ = std::move(fn);
+    }
+
+    /// The run port `execute_workflow` starts a run through (`workflow_run_port.hpp`); server.cpp
+    /// wires the identical closure the REST route gets. Unset (the default) means
+    /// `execute_workflow` answers "workflow engine not available" and dispatches nothing.
+    void set_workflow_run_fn(WorkflowRunFn fn) { workflow_run_fn_ = std::move(fn); }
+
+    /// The idempotency pre-check `execute_workflow` asks beside the run port; server.cpp wires the
+    /// identical function the REST route gets. Unset means a keyed call (every MCP call is keyed)
+    /// answers "workflow engine not available".
+    void set_workflow_idempotency_lookup_fn(WorkflowIdempotencyLookupFn fn) {
+        workflow_idempotency_lookup_fn_ = std::move(fn);
+    }
+
+    /// True while the server is draining. `execute_workflow` refuses a new run then
+    /// (`StreamBudget::try_acquire` does not consult its own closing flag). Unset (the default)
+    /// is never draining: a harness that does not wire it. server.cpp wires `draining_`.
+    void set_draining_fn(std::function<bool()> fn) { draining_fn_ = std::move(fn); }
+
+    /// The wait before the single retry of an indeterminate per-step credential check in an
+    /// `execute_workflow` run. Unset (the production default) is `kReauthorizeRetryDelay`; set
+    /// only by a test that drives the indeterminate path.
+    void set_workflow_reauthorize_retry_delay(std::chrono::milliseconds d) {
+        workflow_reauthorize_retry_delay_ = d;
+    }
+
+    /// The per-step credential check of an `execute_workflow` run, asked against the principal
+    /// and the request of THAT call. Separate from the `StreamRevalidateFn` that `build_handler`
+    /// takes for the GET stream pump, which may answer from the token and engine caches: a run
+    /// asks at a step boundary, so server.cpp wires the authoritative question here. Unset is
+    /// "no per-step check" (a harness that does not wire it); there is no fallback to the
+    /// stream function, so a missing wire cannot quietly turn into the cached question.
+    void set_workflow_revalidate_fn(StreamRevalidateFn fn) {
+        workflow_revalidate_fn_ = std::move(fn);
+    }
+
+    /// The digest `execute_workflow` binds a ticket's step effects with. Unset (the production
+    /// default) is `sha256_hex`; set only by a test that drives the fail-closed refusal.
+    void set_workflow_digest_fn(std::function<std::optional<std::string>(std::string_view)> fn) {
+        workflow_digest_fn_ = std::move(fn);
+    }
+
     /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
     /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
     /// server.cpp wires the IDENTICAL instance so the eight Guardian read
@@ -1403,6 +1460,13 @@ private:
     std::shared_ptr<const ScheduleApi> schedule_api_;
     // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
     std::shared_ptr<const WorkflowApi> workflow_api_;
+    ConcurrencyDispatchFn workflow_concurrency_dispatch_fn_; // see set_workflow_concurrency_dispatch_fn
+    WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
+    WorkflowIdempotencyLookupFn workflow_idempotency_lookup_fn_; // see set_workflow_idempotency_lookup_fn
+    std::function<bool()> draining_fn_;                      // see set_draining_fn
+    std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
+    std::optional<std::chrono::milliseconds> workflow_reauthorize_retry_delay_; // see set_workflow_reauthorize_retry_delay
+    StreamRevalidateFn workflow_revalidate_fn_;              // see set_workflow_revalidate_fn
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.

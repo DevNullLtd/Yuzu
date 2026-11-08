@@ -73,13 +73,14 @@ TEST_CASE("step-up policy: the gated set is exactly the 41 routes with an in-han
 
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (246 mutating REST routes: 41 required, 3 own-gate,
-    // 129 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
-    // commands row and the v1 instruction-definition execute row, and the software-title
-    // curation routes added the aliases, reject and pack rows, and ADR-0070 R1 four revocation-source rows). A row added or reclassified
-    // without these numbers moving together fails here.
-    CHECK(kStepUpPolicyCount == 246);
-    CHECK(count_class(StepUpClass::kExempt) == 129);
+    // Executable pins for the table counts (248 mutating REST routes: 41 required, 3 own-gate,
+    // 131 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
+    // commands row, the v1 instruction-definition execute row and the v1 workflow execute row,
+    // the software-title curation routes added the aliases, reject and pack rows, the per-group
+    // collection settings added its PUT row, and ADR-0070 R1 added four revocation-source
+    // rows). A row added or reclassified without these numbers moving together fails here.
+    CHECK(kStepUpPolicyCount == 248);
+    CHECK(count_class(StepUpClass::kExempt) == 131);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
     CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
               count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
@@ -303,7 +304,7 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
         kSyncTrigger,          kAgentUploadProtocol,    kScimBearer,      kMcpTransport,
         kContentAuthoring,     kPolicyLifecycle,        kEvidenceCapture, kCancelsRecord,
         kCreatesRerunRecord,   kAlertingConfig,         kMfaEnrolment,    kSchedulingGatedWork,
-        kSelfNotificationState, kReferenceDataReplace};
+        kSelfNotificationState, kReferenceDataReplace,  kCollectionSettings};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

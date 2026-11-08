@@ -15,6 +15,13 @@ constexpr std::size_t kConditionChars = 80;
 constexpr std::size_t kScopeChars = 120;
 constexpr std::size_t kErrorChars = 160;
 
+// The disabled Run control's reason. A supervised-tier MCP token holds the grant but is
+// approval-gated here: the way to run a workflow is the MCP execute_workflow ticket flow.
+constexpr std::string_view kRunRequiresGrantAttr = " disabled title=\"Requires Workflow:Execute\"";
+constexpr std::string_view kRunApprovalGatedAttr =
+    " disabled title=\"Approval-gated for this MCP token tier: use the MCP execute_workflow "
+    "tool and its approval ticket\"";
+
 std::string pill(std::string_view cls, std::string_view label) {
     return "<span class=\"pill " + std::string(cls) + "\">" + html_escape(std::string(label)) +
            "</span>";
@@ -93,7 +100,8 @@ std::string render_workflows_list(const WorkflowListView& v) {
            "\" data-count=\"" + std::to_string(v.rows.size()) + "\" data-truncated=\"" +
            (v.truncated ? "1" : "0") + "\" data-can-run=\"" + (v.can_run ? "1" : "0") +
            "\" data-can-write=\"" + (v.can_write ? "1" : "0") + "\" data-can-delete=\"" +
-           (v.can_delete ? "1" : "0") + "\">";
+           (v.can_delete ? "1" : "0") + "\"" +
+           (v.run_approval_gated ? " data-run-gate=\"approval\"" : "") + ">";
     if (v.rows.empty()) {
         out += "<div class=\"empty-state\">" + esc(kWorkflowsEmptyNote) + "<br>" +
                esc(kWorkflowsEmptyHint) + "</div></div>";
@@ -112,7 +120,9 @@ std::string render_workflows_list(const WorkflowListView& v) {
         out += "</td><td>" + std::to_string(w.steps.size()) +
                "</td><td class=\"tm\" data-c=\"started\">-</td><td data-c=\"status\">-</td>"
                "<td class=\"act\"><button type=\"button\" class=\"btn btn-sm\" data-act=\"run\"" +
-               std::string(v.can_run ? "" : " disabled title=\"Requires Workflow:Execute\"") +
+               std::string(v.can_run ? std::string_view{}
+                           : v.run_approval_gated ? kRunApprovalGatedAttr
+                                                  : kRunRequiresGrantAttr) +
                ">Run now</button></td></tr>";
     }
     out += "</tbody></table></div><div class=\"ops-steps-store\" hidden>";

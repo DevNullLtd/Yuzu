@@ -92,12 +92,14 @@
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
+#include "workflow_execute.hpp" // #2146 batch B: execute_workflow shares this sequence with POST /api/v1/workflows/{id}/execute
 #include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
+#include "access_review_attest_gate.hpp" // reviewer != subject of the grant, shared with REST
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
 #include "enrollment_directory_model.hpp" // #4031: shared row builders — REST/MCP parity (Rule 1)
@@ -702,13 +704,27 @@ std::string lower_copy(std::string v) {
 // constant).
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview tool text, the OpenAPI text and the docs");
+// The ResultSet row's `properties` / `required` fragments are spelled once here and spliced into the
+// nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
+// array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
+// #undef'd right after it.
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
-     "List the connected agents the caller may read, with hostname, OS, architecture, and "
-     "version. Read-only. Requires Infrastructure:Read. A live snapshot of the agents connected "
+     "List the connected agents the caller may read, with hostname, OS, architecture, "
+     "version and guardian_backend. Read-only. Requires Infrastructure:Read. A live snapshot of "
+     "the agents connected "
      "to this server: an enrolled device that is offline is not listed, so use list_hardware_ci "
      "for enrolled devices. Use get_agent_details for one device's tags and detail; each row's "
-     "agent_id feeds the per-agent tools. Confined: when the read is scoped to the devices the "
+     "agent_id feeds the per-agent tools. guardian_backend is the detection backend the device "
+     "reports on its latest heartbeat: legacy, spark, spark_failed or unwired, or null when it "
+     "has not reported one (an older agent, no Guardian, a faulted heartbeat tag group, a "
+     "forged value, or no heartbeat in the last 90 seconds); null is never legacy, and until "
+     "prefer_spark is enabled every device that reports reads legacy. The value is the "
+     "device's own report, not independent verification, and null on a connected device is "
+     "routine (for example before its first heartbeat), not evidence that it is unprotected. "
+     "Confined: when the read is scoped to the devices the "
      "caller may read, the result carries scope_basis authority_scoped, and the text content is "
      "the object {agents, scope_basis} instead of the bare array of an unscoped read. It is a "
      "status, set whether or not anything was hidden; the number of hidden devices is never "
@@ -718,7 +734,7 @@ static const ToolDef kTools[] = {
      "permission denial is terminal; an authorization-store failure is a retryable 503 with "
      "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Until prefer_spark is enabled every device that reports reads legacy. The value is the device's own report, not independent verification, and null is routine (for example before the first heartbeat) and is not evidence that the device is unprotected. The set is closed: adding a value is a breaking change under docs/api-versioning-policy.md. During a rolling upgrade a response from a replica older than this change omits the key."}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
@@ -766,17 +782,37 @@ static const ToolDef kTools[] = {
      "result_truncated_by_cap=true means the scan's response read reached its "
      "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
      "response reads as an agent that never answered); store_degraded is then "
-     "also true, and result_truncated_by_cap tells a cut apart from a failed read.",
+     "also true, and result_truncated_by_cap tells a cut apart from a failed read. "
+     "Each row's live_rows is the count of raw capture rows held for the source (the "
+     "name is kept for compatibility; -1 when unknown).",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"result_truncated_by_cap":{"type":"boolean","description":"true when the scan's response read hit the 10,000-row or 50 MiB payload cap: rows and counts are partial"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows"]})j"},
 
     {"get_agent_details",
-     "Get detailed info for a single agent including tags and inventory. "
-     "An \"Agent not found\" error means either the agent does not exist or "
-     "it exists outside your management-group scope -- deliberately "
-     "indistinguishable to prevent scope-probing.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","tags"]})j"},
+     "Get one connected agent's identity (hostname, OS, architecture, agent version), its "
+     "guardian_backend and its tags (key, value, source). Read-only. Requires "
+     "Infrastructure:Read. Use list_agents first: each row's agent_id is the input here, and "
+     "list_agents is the right tool to enumerate or find devices. This is not an inventory "
+     "read; installed software and hardware are separate tools. The identity fields are a live "
+     "snapshot of the agent's session on this server, so a device that is not currently "
+     "connected is not found; the tags are read live from the tag store. guardian_backend is "
+     "the detection backend the device reports on its latest heartbeat: legacy, spark, "
+     "spark_failed or unwired, or null when it has not reported one (an older agent, no "
+     "Guardian, a faulted heartbeat tag group, a forged value, or no heartbeat in the last 90 "
+     "seconds); null is never legacy, and until prefer_spark is enabled every device that "
+     "reports reads legacy. The value is the device's own report, not independent "
+     "verification, and null on a connected device is routine (for example before its first "
+     "heartbeat), not evidence that it is unprotected. The tags array is always present, empty "
+     "when the device has none. An \"Agent "
+     "not found\" error means the agent is not connected, does not exist, or exists outside "
+     "your management-group scope, deliberately indistinguishable to prevent scope-probing, "
+     "so an unreadable id is not proof the device is absent from the fleet. Not found and "
+     "permission denial are terminal; a tag-store failure (\"Tag store unavailable\") is "
+     "retryable with retry_after_ms 5000, never a device with empty tags; an authorization-store "
+     "failure is also a retryable 503 with retry_after_ms; an unwired server or device registry "
+     "is a non-retryable internal error.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent ID"}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Until prefer_spark is enabled every device that reports reads legacy. The value is the device's own report, not independent verification, and null is routine (for example before the first heartbeat) and is not evidence that the device is unprotected. The set is closed: adding a value is a breaking change under docs/api-versioning-policy.md. During a rolling upgrade a response from a replica older than this change omits the key."},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend","tags"]})j"},
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries (newest first, rows with "
@@ -1291,11 +1327,17 @@ static const ToolDef kTools[] = {
      "Record-level confined (#4030 Gate 8 fix): a caller with no agent visible in the "
      "execution's agent_ids gets the same not-found error as a nonexistent id, not a "
      "narrower-but-still-present record; an admitted confined caller's agent_ids is narrowed "
-     "to their visible agents and each step's result.agents_reached is stripped. Audited as "
+     "to their visible agents and each step's result.agents_reached is stripped. A run row "
+     "stores each distinct id once, at most 1000 of them and at most 131072 bytes: when they do not "
+     "all fit agent_ids_truncated is true, plus agent_ids_total for a caller with no device "
+     "scope, and a confined reader may not see the run if none of its devices were stored, the "
+     "creator included unless the run names a device inside its Execution:Execute scope and that "
+     "scope lies within its Workflow:Read scope (overlap alone is not enough) (an owner-accepted "
+     "residual). Audited as "
      "workflow_execution.detail.fetch (set-and-proceed, audit_persisted:false on an admitted "
      "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed — the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"agent_ids_truncated":{"type":"boolean","description":"Present and true only when the run named more distinct agent ids than the row stores; agent_ids then holds only stored ids. The run itself sent to every id it named."},"agent_ids_total":{"type":"integer","description":"Present only when agent_ids_truncated is true and the caller has no device scope: the number of distinct agent ids the run named."},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed: the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
 
     {"list_workflow_executions", "List workflow executions (runs) — WorkflowEngine's own multi-step "
      "run records, a DIFFERENT data model from list_executions's single-instruction fan-out "
@@ -1337,6 +1379,155 @@ static const ToolDef kTools[] = {
      R"j("result_truncated_by_cap":{"type":"boolean","description":"Present (true) only under latest_per_workflow when more workflows matched than limit"})j"
      R"j(},"required":["executions","next_cursor"]})j"},
 
+    // Workflow execute twin (#2146 batch B). Shares workflow_execute.hpp's sequence with
+    // POST /api/v1/workflows/{id}/execute.
+    {"execute_workflow",
+     "Run a multi-step workflow (see list_workflows / get_workflow) against the named devices. "
+     "SEND AN idempotency_key (REQUIRED): a fresh unique string per intended run, 8 to 128 "
+     "characters from A-Z a-z 0-9 . _ : -, scoped to you. A repeat of the SAME key and the same "
+     "request is SAFE: it sends nothing and answers with the run the key is bound to (status "
+     "completed, partial, failed, aborted, interrupted, running or indeterminate, "
+     "idempotent_replay true; a replay says the class the first answer said, judged from the "
+     "run's stored steps, and is completed ONLY for a run that succeeded), needs no new approval "
+     "and no approval_id, and is answered even while the server is shutting down or at the run "
+     "cap. NEVER re-send this call without the key you first used. A deliberate second run needs "
+     "a NEW key; the key stays bound to its run for the life of the run record. The same key with "
+     "a different workflow_id or agent_ids is refused -32602 reason idempotency_key_conflict "
+     "(terminal). A workflow_id that holds a control byte (NUL included), is not valid UTF-8 or "
+     "is over 128 bytes is refused -32602 reason invalid_workflow_id (never retryable) before "
+     "anything is read or minted; an empty or non-string id is refused -32602 earlier with no "
+     "reason token, and so is an id over 128 characters (by the input schema). A replay's status running (retry_after_ms 2000) means POLL get_workflow_execution, "
+     "never re-send; once a run has been running for 180 seconds the server answers "
+     "indeterminate (retryable false) and you should treat it the same way: "
+     "read get_workflow_execution and inspect the step results before deciding on a new key: a "
+     "step recorded pending or skipped may still have been sent; check the audit and response "
+     "stores by plugin and time before re-running. "
+     "SYNCHRONOUS DISPATCH, ASYNC DEVICE WORK: the call returns once every step's command has "
+     "been SENT (it can take as long as the workflow's step retries and delays, up to a 60 second "
+     "run budget that is checked before each send, so a send already in flight is not cut "
+     "short), not when devices "
+     "finish; read the outcome with get_workflow_execution on the returned execution_id, and the "
+     "devices' own results with query_responses by each step's command_id. A call without a "
+     "key must never be re-sent to 'retry' (it is refused here): a second run sends every step "
+     "to the devices a second time. "
+     "agent_ids is REQUIRED (1 to 10000 ids): a workflow run names its devices; there is no scope "
+     "and no fleet-wide default. Each step is sent only to the agents you can see; ids outside "
+     "your visibility are silently dropped, and a step that then reaches nobody is reported in "
+     "steps with its reason. "
+     "AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Before anything is sent every step is "
+     "checked against YOU: its instruction must exist and have approval_mode auto (a role-gated "
+     "step runs only for an administrator; an always-approval step, or an unknown mode, refuses "
+     "the whole call with a permission error (-32003) and a message naming the step - run that instruction through its "
+     "own approval instead), and you must be allowed to dispatch its plugin.action (RBAC, the "
+     "action's admin-or-approval gate, the action's kill switch): if not, the whole call is "
+     "refused with a permission error (-32003), reason dispatch_denied, naming the step, permanently for you (retrying "
+     "will not help) and nothing is sent. An approval ticket for this call does NOT lift either "
+     "check. A Destructive-classified step needs the explicit agent_ids (always true here) and "
+     "at least one of them visible to you, else the call is refused; a Forensics step needs "
+     "exactly one agent id. A step whose plugin.action is not in the capability catalogue "
+     "refuses the call. If the instruction store, the approval gate or the dispatcher is not "
+     "available the call is refused with an internal error (-32603) and NOTHING is sent. Which DEVICES a step reaches "
+     "is decided per step at send time and is NOT checked up front: an earlier step may already "
+     "have been sent when a later one reaches nobody. "
+     "TIER AND TICKET: the operator tier is denied. At the supervised tier the first call returns "
+     "kApprovalRequired with an approval_id; repeat the SAME arguments plus that approval_id "
+     "after an administrator approves. The ticket binds workflow_id, agent_ids and the ORDERED "
+     "step effects (each step's instruction id, plugin.action, approval mode and concurrency "
+     "mode; the approver is shown the step count and the first plugin.actions, then a digest "
+     "of all of them). If any step's instruction is repointed before the repeat call it is "
+     "refused -32003 with error.data.reason definition_changed (ticket unspent; repointing back "
+     "restores it, or request a fresh approval); a repoint landing after that check sends "
+     "nothing for that step and answers -32602 definition_changed with the ticket SPENT. An "
+     "edit to anything else in a definition runs as edited, with every precheck re-run at send "
+     "time. "
+     "RUN BUDGET AND ADMISSION: the call holds a server worker for the whole run, so at most 2 "
+     "runs per principal (and a server-wide limit shared with the streams) are admitted; a "
+     "refusal is HTTP 429 / -32012 with error.data.reason per_principal_stream_cap or "
+     "global_stream_cap, or 503 / -32015 reason draining while the server shuts down, with "
+     "retry_after_ms 5000: no workflow or instruction was read (your key was looked up first), "
+     "nothing was sent or audited and NO approval ticket was spent, so re-call with the same "
+     "approval_id. A workflow whose worst-case retry sleep (the sum over its "
+     "steps of retryCount x retryDelay) exceeds 60 seconds is refused -32602 reason "
+     "workflow_exceeds_sync_budget before a ticket is minted. The run has 60 seconds from the call: "
+     "no send starts after the deadline (a credential check already waiting on a database that has "
+     "stopped answering is not interrupted by it), the remaining steps are skipped and the run is closed "
+     "failed: status aborted with reason deadline_exceeded if something had been sent, or, if no "
+     "step had reached an agent, status deadline_exceeded (not retryable either way). "
+     "CREDENTIAL CHECK: before each step's first send, before each foreach item, and after waking from each retry delay, the "
+     "run re-validates the credential this call was made with. A revoked or expired credential "
+     "(or an engine principal that is no longer active) stops the run with status aborted, reason "
+     "credential_revoked; a check that cannot be answered is asked once more and then stops it "
+     "with reason credential_indeterminate. Either way the remaining steps are skipped, steps "
+     "already sent are not recalled, retryable is false, and this holds even when nothing was "
+     "sent. A role grant removed mid-run is caught per step at the dispatch chokepoint; an "
+     "administrator elevation that expires, or a device-group narrowing, during the run is only "
+     "bounded by the 60 second deadline. "
+     "AUDIT: a 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
+     "it cannot be saved the call fails with an internal error (-32603, retry_after_ms 5000) and "
+     "nothing was sent, but the approval ticket is already spent: a retry needs a NEW approval, "
+     "and a store fault after the ticket was consumed is the same. A step "
+     "refused at send time because its definition changed is audited at that moment and is not "
+     "retried. A closing row records the outcome (audit_persisted:false if that one was lost). "
+     "A run that THROWS after that row is answered -32603 with error.data.reason "
+     "dispatch_exception, error.data.execution_id and error.data.agents_sent (a lower bound, "
+     "present when known) and retry_after_ms null: steps may already have been sent, so do NOT "
+     "re-send; read get_workflow_execution. A throw before that row is -32603 with "
+     "retry_after_ms 5000 because nothing was sent, but a ticket already consumed stays spent "
+     "and the retry needs a new approval. "
+     "RESULT: a success envelope with execution_id, workflow_id, status and steps (one entry per "
+     "send attempt: instruction_id, attempt (1-based; a retry has the next number and a new step "
+     "starts at 1), command_id, agents_reached; when 0, a reason). status is "
+     "\"completed\" ONLY if the engine recorded the run completed, no step was refused at send "
+     "time and every step's FINAL attempt reached at least one agent (a step that failed and was "
+     "retried to success counts; it means sent, not finished). "
+     "Otherwise, when something was sent, status is \"partial\" (some step's final attempt reached "
+     "nobody, or the engine did not complete after a send) or \"aborted\" (a step was refused at send time "
+     "because its definition changed (later steps still run when it was an onFailure continue "
+     "step), or the run reached its 60 second deadline, reason deadline_exceeded, or the "
+     "credential check stopped it, reason credential_revoked or credential_indeterminate; the "
+     "rest did not run for those two) or \"interrupted\" (the server began stopping: "
+     "reason server_shutdown, the unstarted steps are skipped, and this holds even when nothing "
+     "was sent), with run_status (the engine's own "
+     "status), message, retryable false and retry_after_ms null: the run is NOT a success and "
+     "must not be re-sent; read get_workflow_execution and each step's reason. A server that is "
+     "only draining lets a run finish its steps (it gives up retries it had not made). The closing "
+     "audit row is result failure with run_outcome=failed|partial|interrupted|aborted. If "
+     "NO step reached any agent the envelope instead carries status set to the cause with "
+     "agents_reached 0 on every step, one of: \"containment_unreadable\", \"route_unreadable\", "
+     "\"os_gate_unreadable\", \"no_agents_reached\" (offline devices, or a concurrency claim), "
+     "\"quarantined\", \"plugin_not_found\", \"kill_switched_os\", \"late_denied\", "
+     "\"definition_changed\", \"deadline_exceeded\" (the 60 second budget ended the run before "
+     "any step reached an agent) or \"run_failed\" (the engine closed the run without a single "
+     "dispatch attempt). This call always carries an idempotency_key and the key is bound to the "
+     "run, so EVERY one of them has retryable false, retry_after_ms null and remediation \"use a "
+     "new idempotency key (MCP: a new approval)\": repeating the call replays this run (status failed, or "
+     "aborted when the stored steps show a deadline stop, a send-time refusal or a definition "
+     "change) and never runs again, so read the run first and decide on a new key and a new approval. The "
+     "execution still exists and is readable. "
+     "Mirrors REST POST /api/v1/workflows/{id}/execute. Requires Workflow:Execute; a "
+     "service-scoped token is denied.",
+     R"j({"type":"object","properties":{)j"
+     R"j("workflow_id":{"type":"string","minLength":1,"maxLength":128,"description":"Workflow id from list_workflows"},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128},"description":"Agent ids to run the workflow against. Required: there is no scope and no fleet-wide default"},)j"
+     R"j("idempotency_key":{"type":"string","minLength":8,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$","description":"REQUIRED. A unique string per intended run, scoped to you and bound to the run for the life of its record; repeat the same key (with the same workflow_id and agent_ids) to learn what happened to a call whose answer was lost, never to run again"},)j"
+     R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"})j"
+     R"j(},"required":["workflow_id","agent_ids","idempotency_key"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("execution_id":{"type":"string","description":"Read the run with get_workflow_execution"},)j"
+     R"j("idempotent_replay":{"type":"boolean","description":"Present (true) only when the idempotency_key was already bound to a run and this call sent nothing: the other fields then describe that run, thinly (status, started_at, message), and steps and late_denied are absent"},)j"
+     R"j("started_at":{"type":"integer","description":"Present only on an idempotent replay: when the run started, epoch seconds"},)j"
+     R"j("workflow_id":{"type":"string"},)j"
+     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent (one of containment_unreadable, route_unreadable, os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, kill_switched_os, late_denied, definition_changed, deadline_exceeded, run_failed). On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
+     R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
+     R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"attempt":{"type":"integer","minimum":1,"description":"The 1-based send attempt of this step this entry records: a retry has the next number and the next step starts again at 1. A step is judged by its last attempt"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
+     R"j("remediation":{"type":"string","description":"Present on an idempotent replay of every status but completed and running, and when no step reached any agent (use a new idempotency key (MCP: a new approval) for another run). A replay's text says a step recorded pending or skipped may still have been sent"},)j"
+     R"j("message":{"type":"string","description":"Present when no step reached any agent, and on an idempotent replay"},)j"
+     R"j("reason":{"type":"string","enum":["deadline_exceeded","server_shutdown","credential_revoked","credential_indeterminate"],"description":"Present only when the run was stopped: the 60 second run budget (deadline_exceeded), the server stopping (server_shutdown, status interrupted), or the caller's credential check before a step (credential_revoked, or credential_indeterminate when it could not be confirmed after one retry; status aborted)"},)j"
+     R"j("retryable":{"type":"boolean","description":"Present when no step reached any agent, for partial, aborted and interrupted, and on every idempotent replay but completed and running: always false here, because the idempotency_key is bound to the run and a repeat of the call replays it"},)j"
+     R"j("retry_after_ms":{"type":["integer","null"],"description":"Present when no step reached any agent, and null on every such answer from this tool (the key is bound to the run: a retry replays it); also 2000 on a running idempotent replay"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row failed to persist after the run had started"})j"
+     R"j(},"required":["execution_id","workflow_id","status"]})j"},
+
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression to validate"}},"required":["expression"]})",
@@ -1369,7 +1560,7 @@ static const ToolDef kTools[] = {
     // v1 had a full 12-operation API with zero MCP tools before this batch.
     // Every tool below shares the SAME `ResultSet` row shape (id/name/
     // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
-    // source_kind/status/source_execution_id/device_count) as its REST v1
+    // source_kind/status/source_execution_id/device_count/agents_failed/partial) as its REST v1
     // twin — both surfaces call the SAME result_set_json() builder
     // (result_set_model.hpp), so the shape cannot drift.
 
@@ -1381,8 +1572,8 @@ static const ToolDef kTools[] = {
      "share.",
      R"j({"type":"object","properties":{"cursor":{"type":"string","maxLength":2048,"description":"Opaque pagination cursor from a prior response's next_cursor"},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50}}})j",
      R"j({"type":"object","properties":{"result_sets":{"type":"array","items":{"type":"object","properties":{)j"
-     R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
+     YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
 
     {"create_result_set",
      "Create a result set directly from pre-computed device ids. Synchronous — lands "
@@ -1393,8 +1584,8 @@ static const ToolDef kTools[] = {
      "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_inventory_query",
      "Create an owner-scoped result set from a SYNCHRONOUS inventory query — evaluates "
@@ -1412,8 +1603,8 @@ static const ToolDef kTools[] = {
      "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_echo_query",
      "Create a result set by DISPATCHING a read-only Echo SQL query to the fleet. ASYNC: "
@@ -1423,7 +1614,14 @@ static const ToolDef kTools[] = {
      "derived visible device set — the ONLY per-device authorization on this dispatch "
      "surface (not defense-in-depth). SQL is sandboxed AGENT-side by a read-only authorizer; "
      "the server only length-checks (max 100000 bytes). Membership is every agent that "
-     "returned >=1 row (include_empty=true widens to every responder). Dispatches to "
+     "returned >=1 row (include_empty=true widens to every responder); an agent whose "
+     "query failed is not a member, and the filled set reports how many in agents_failed "
+     "with partial=true (an execution with more than 100000 stored answers marks the set "
+     "failed instead, with agents_failed 0 and the reason in the server log). SQL that "
+     "reads a raw capture table ($<Source>_Live or a "
+     "<source>_live table, which Echo no longer keeps) is refused with "
+     "RESULT_SET_REEVAL_STALE_SOURCE: query the hourly roll-up instead, for example "
+     "$Process_Hourly. Dispatches to "
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
@@ -1436,8 +1634,8 @@ static const ToolDef kTools[] = {
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_instruction_result",
      "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
@@ -1449,7 +1647,11 @@ static const ToolDef kTools[] = {
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
      "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
-     "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
+     "or discover_instructions — do not guess. An echo.sql definition whose SQL (params.sql, "
+     "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
+     "<source>_live table, which Echo no longer keeps) is refused with "
+     "RESULT_SET_REEVAL_STALE_SOURCE and nothing is dispatched, the same as "
+     "create_result_set_from_echo_query. If the definition runs a Forensics-tier "
      "plugin (an action on the Forensics securable) the set materializes with no members "
      "for every creator, because the materializer never reads Forensics-tier output; an "
      "empty set from such a definition says nothing about the fleet. A definition whose "
@@ -1478,8 +1680,8 @@ static const ToolDef kTools[] = {
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"reevaluate_result_set",
      "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
@@ -1510,6 +1712,9 @@ static const ToolDef kTools[] = {
      "retry_after_ms 5000; effect_unresolvable_store_unwired null). A missing instruction, or "
      "an absent or not-owned set, still mints a ticket bound to effect=unresolved, which the "
      "approved recall then refuses and spends. "
+     "A set whose stored SQL reads a raw capture table ($<Source>_Live or a <source>_live "
+     "table, which Echo no longer keeps) is refused with RESULT_SET_REEVAL_STALE_SOURCE and "
+     "nothing is dispatched: create a new set over the hourly roll-up instead. "
      "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
@@ -1520,16 +1725,16 @@ static const ToolDef kTools[] = {
      "faulted after a real command already reached the fleet) carries no retry_after_ms "
      "and must NEVER be retried - poll executions for the outcome instead.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"get_result_set",
      "Get one result set's metadata by id. Owner-scoped — a non-owner gets the same "
      "not-found error as a nonexistent id (existence-oracle-safe). REST v1 twin: GET "
      "/api/v1/result-sets/{id}.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"get_result_set_members",
      "List a result set's member device ids. Owner-scoped. REST v1 twin: GET "
@@ -1550,15 +1755,15 @@ static const ToolDef kTools[] = {
      "set is a no-op success, same end state. Owner-scoped; capped at 50 pinned sets per "
      "owner. REST v1 twin: POST /api/v1/result-sets/{id}/pin.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"unpin_result_set",
      "Unpin a result set, restoring its normal TTL. Idempotent — unpinning an already-unpinned "
      "set is a no-op success. Owner-scoped. REST v1 twin: POST /api/v1/result-sets/{id}/unpin.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"delete_result_set",
      "Delete a result set. Owner-scoped. A pinned set must be unpinned first. REST v1 twin: "
@@ -3698,9 +3903,10 @@ static const ToolDef kTools[] = {
      "(enabled|disabled|degraded) stamps whether RBAC actually governs this grant population "
      "right now — degraded means the read could not confirm state, so gates deny "
      "defensively, NOT that an admin turned RBAC off. Self-audited as "
-     "access_review.exported. Requires AccessReview:Read.",
+     "access_review.exported; if that audit write fails the export still stands and the "
+     "result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]}},"required":["count","rows","rbac_enforcement"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","rows","rbac_enforcement"]})j"},
 
     {"open_access_review",
      "Open a review campaign — freeze the CURRENT cross-principal grant population "
@@ -3710,78 +3916,116 @@ static const ToolDef kTools[] = {
      "stays reviewable (frozen, not re-derived from live state). The fleet's current RBAC "
      "enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same "
      "moment — see get_access_review. Mirrors POST "
-     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
+     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. If the audit "
+     "row cannot be saved the campaign is still open and the result carries "
+     "audit_persisted:false. This records "
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j("title":{"type":"string","minLength":1,"maxLength":256,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'. At most 256 bytes and no NUL (a longer one is refused with invalid-params)"})j"
      R"j(},"required":["title"]})j",
-     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
+     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["campaign_id","grant_count"]})j"},
 
+    // campaign_id on the three id tools below carries maxLength/pattern as DISCOVERY METADATA
+    // only: the schema validator runs just for approval-gated calls, so each handler's own
+    // valid_campaign_id check is the enforcement.
     {"record_attestation",
      "Record one reviewer decision against a grant frozen into an open campaign — "
      "'attested' (the reviewer confirms this grant is still appropriate) or "
      "'flagged_revoke' (the reviewer believes it should be revoked). flag != revoke: this "
      "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
      "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
-     "engine-principal-revoke call an operator makes after reading this evidence. This is "
-     "FINAL and irreversible, so destructiveHint:true: the first decision on a "
-     "(campaign_id, principal_type, principal_id, role_name) grant sticks and cannot be "
-     "changed while the campaign is open (a second call is refused as already_decided; open "
-     "a new campaign to re-review). Separation of duties: the reviewer may NOT decide their "
-     "own grant (principal_type 'user' whose principal_id is the caller) nor an engine "
-     "principal they own — refused as self_attestation, and another reviewer must decide it. "
-     "Group grants are not covered by the owner check. Both refusals are audited with "
-     "result=denied. An identifier with a NUL byte or over 512 bytes, or a justification with "
-     "a NUL byte or over 8192 bytes, is refused as invalid-params (nothing is truncated). "
-     "Mirrors POST /api/v1/access-reviews/{id}/attestations. Self-audited as "
-     "access_review.attested or access_review.flagged (by decision). Requires "
-     "AccessReview:Attest.",
+     "engine-principal-revoke call an operator makes after reading this evidence. Calling it "
+     "again for the same (campaign_id, principal_type, principal_id, role_name) makes the new "
+     "decision the CURRENT one and it can never return the grant to pending, so "
+     "destructiveHint:true; the earlier decision is NOT lost, every decision is kept in the "
+     "grant's history (get_access_review returns the latest 100 entries per grant, with an "
+     "earlier justification cut to its first 64 characters, and a decision_seq). The "
+     "reviewer must differ from the subject of the grant: a user grant naming the caller, an "
+     "engine principal the caller owns now or owned when the campaign opened, or a group the caller "
+     "belongs to is refused with a "
+     "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
+     "another reviewer to record this decision', and records nothing. principal_id and "
+     "role_name are at most 1024 bytes each and justification at most 4096 bytes (a "
+     "justification that is present and not a string is refused with invalid params). Each grant "
+     "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
+     "invalid params and records nothing, and the way to review that grant again is to open a "
+     "new campaign. A successful call returns decision_seq (this "
+     "decision's position in the grant's history, 1 for the first) and previous_decision "
+     "(the decision it superseded, 'pending' for the first), so you can see when you replaced "
+     "another reviewer's decision. "
+     "An internal error that carries retry_after_ms can mean the decision was recorded anyway "
+     "(a lost commit acknowledgement): before retrying, call get_access_review, compare "
+     "decision_seq with the value you last saw and look for your own entry (match reviewer, "
+     "justification and decided_at_ms; an earlier entry shows at most its first 64 "
+     "characters), because a blind retry appends another identical "
+     "decision, which is kept and visible, not an error, until the grant reaches its limit of "
+     "100 decisions, after which the request is refused. Mirrors POST "
+     "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
+     "access_review.flagged (by decision). If the audit row cannot be saved the decision "
+     "still stands and the result carries audit_persisted:false. Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("role_name":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
-     R"j("justification":{"type":"string","maxLength":8192})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"},)j"
+     R"j("principal_type":{"type":"string","enum":["user","group","engine"],"description":"Type of the principal that holds the grant"},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024,"description":"Id of the principal that holds the grant, as listed in get_access_review (at most 1024 bytes)"},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":1024,"description":"Role of the grant being decided (at most 1024 bytes)"},)j"
+     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested records that the grant is still appropriate; flagged_revoke records evidence that it should be revoked. Neither changes any grant"},)j"
+     R"j("justification":{"type":"string","maxLength":4096,"description":"Reviewer's reason (at most 4096 bytes). Only the latest entry of a grant's history is returned whole"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
-     R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
+     R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["recorded","decision_seq","previous_decision"]})j"},
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
-     "attestation row (pending/attested/flagged_revoke) plus pending_count. "
+     "attestation row (pending/attested/flagged_revoke) plus pending_count. Each attestation "
+     "carries its current decision, a decision_seq (0 while pending) and history, the latest "
+     "decisions recorded for that grant (at most 100) oldest first as {seq, decision, "
+     "previous_decision, reviewer, justification, justification_truncated, decided_at_ms}; "
+     "previous_decision \"\" means not recorded (the decision predates the history), never "
+     "pending. The response grows with every re-recorded decision, up to 100 decisions per "
+     "grant; a history lists at most the latest 100, so decision_seq greater than the number "
+     "of history entries means earlier ones are not shown. Only the latest history entry "
+     "carries its whole justification; an earlier entry carries at most its first 64 "
+     "characters, with justification_truncated true when text was cut (the full text stays "
+     "in the database). "
      "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
      "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
-     "for those), newest-first, capped at the most recent 500. The surface an auditor "
-     "needs to prove reviews ran on cadence. Each campaign's rbac_enforcement "
+     "for those), newest-first, capped at the most recent 500. Metadata only, with no "
+     "decided or pending counts: use get_access_review (pending_count and the attestation rows) "
+     "to see how complete a campaign is. Each campaign's rbac_enforcement "
      "(enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN (empty string for "
      "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
-     "Self-audited as access_review.list. Requires AccessReview:Read.",
+     "Self-audited as access_review.list; if that audit write fails the list still stands and "
+     "the result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
      "first — a campaign closed with pending rows still outstanding is itself evidence, "
      "not something this tool silently forces to completion. Mirrors POST "
-     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Closing is a "
+     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. If the audit "
+     "row cannot be saved the campaign is still closed and the result carries "
+     "audit_persisted:false. Closing is a "
      "one-way lifecycle transition (no reopen path) that permanently freezes every still-pending "
      "attestation, so destructiveHint:true; it deletes no evidence (attestation rows are "
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
+     R"j({"type":"object","properties":{"closed":{"type":"boolean"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["closed"]})j"},
 
     // ── KEK (key-encryption-key) rotation tools (#2395 track C) — MCP twins
     // of POST/GET /api/v1/secrets/kek/* (kek_routes.hpp/.cpp), sharing the
@@ -4724,6 +4968,8 @@ static const ToolDef kTools[] = {
      R"j(},"required":["id"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned"]})j"},
 };
+#undef YUZU_MCP_RESULT_SET_ROW_PROPS
+#undef YUZU_MCP_RESULT_SET_ROW_REQUIRED
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
@@ -4743,6 +4989,7 @@ static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
 static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
     "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
+    "execute_workflow",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
@@ -4964,6 +5211,13 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // get_definition above, not a per-agent read.
     {"list_workflows", {"Workflow", "Read"}},
     {"get_workflow", {"Workflow", "Read"}},
+    // #2146 batch B. ServiceScopeClass is the `denied` default: the REST twin's perm_fn refuses a
+    // service-scoped token (Workflow:Execute is not on kServiceScopeGlobalSafe, which is empty),
+    // and the only confinement the steps have is the caller's exec_visible at the dispatch
+    // chokepoint, a management-group mechanism, not a service-scope one. `confined` would claim
+    // a downstream service-scope mechanism that does not exist. Approval: requires_approval()
+    // gates the supervised tier on this pair (mcp_policy.hpp); the operator tier is denied.
+    {"execute_workflow", {"Workflow", "Execute"}},
     // get_workflow_execution DOES carry per-agent data (agent_ids) and is
     // gated on fleet_read_fn — a real confinement mechanism, so it earns the
     // `confined` tag (same precedent as query_responses/get_agent_details).
@@ -5940,6 +6194,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"execute_instruction", {ToolEffect::Destructive, false, "Execute instruction"}},
     {"execute_instruction_definition", {ToolEffect::Destructive, false, "Execute stored instruction definition"}},
     {"execute_bundle", {ToolEffect::Destructive, false, "Execute live-query bundle"}},
+    // A workflow's steps are caller-chosen instructions, so the worst case is whatever those
+    // instructions can do (Destructive); each call sends every step again (not idempotent).
+    {"execute_workflow", {ToolEffect::Destructive, false, "Execute workflow"}},
     // approve/reject: one-way pending→decided transition (approve also arms a live
     // one-time execution ticket) → destructive + non-idempotent.
     {"approve_request", {ToolEffect::Destructive, false, "Approve request"}},
@@ -6044,9 +6301,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"raise_guardian_policy_generation",
      {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
-    // record_attestation: writes a FINAL, irreversible reviewer decision (#4752 — once-only,
-    // no overwrite) → stays Destructive. Do NOT lower it: that would loosen tier gating, a
-    // security decision rather than a side effect of making the write once-only.
+    // record_attestation: the current decision is replaced and a grant can never return to
+    // pending → Destructive. The earlier decision is kept in the grant's history (the read
+    // returns the latest 100 per grant, earlier justifications cut), so this is not a loss of
+    // evidence; the hint stays true because the current state is replaced.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
@@ -6632,40 +6890,28 @@ int mcp_error_for_store_msg(const std::string& msg) {
 
 // AccessReviewStore error → JSON-RPC code (mirrors rest_api_v1.cpp's
 // access_review_error_status(), translated into the JSON-RPC vocabulary).
-// The store's documented "not_found: " prefix (access_review_store.hpp —
+// The store's documented "not_found: " prefix (access_review_store.hpp,
 // machine-checkable) means a bad campaign_id, a grant never in the frozen
 // population, or an already-closed campaign: client input, not a server
-// fault, so it maps to kInvalidParams like the REST twin's 404. Any other
-// message is a genuine read/write failure → kInternalError (retryable).
+// fault, so it maps to kInvalidParams like the REST twin's 404. The
+// "bad_request: " prefix (campaign_id shape, an embedded NUL, an oversized
+// justification) is client input the store refused before touching the pool,
+// so it is kInvalidParams too, like the REST twin's 400. The "forbidden: "
+// prefix (the reviewer is the subject of the grant) is kPermissionDenied, like
+// the REST twin's 403. Any other message is a genuine read/write failure ->
+// kInternalError (retryable).
 //
-// Contract pin: same classes as rest_api_v1.cpp's access_review_error_status —
-// self_attestation: -> kPermissionDenied, already_decided: and bad_request: ->
-// kInvalidParams (#4752), not_found: -> kInvalidParams, else kInternalError.
-// Every tool handler above also pre-validates its own required fields
-// (title/decision/campaign_id/principal_type/principal_id/role_name) BEFORE
-// calling into AccessReviewStore, so the store's remaining bare validation
-// strings never actually reach this function today; they would otherwise land
-// in the `else -> kInternalError` arm, which is wrong (client error, not
-// retryable). Callers MUST keep pre-validating; a store error a handler cannot
-// pre-validate gets a `bad_request:` prefix (see
-// AccessReviewStore::record_attestation) and is mapped here and in the matching
-// 400 arm in rest_api_v1.cpp rather than falling through to kInternalError.
+// Contract pin: every tool handler above pre-validates its own required
+// fields (title/decision/campaign_id/principal_type/principal_id/role_name)
+// BEFORE calling into AccessReviewStore, so the store's other
+// input-validation strings never actually reach this function today; an
+// unprefixed one would land in the `else -> kInternalError` arm, which is
+// wrong (client error, not retryable). Callers MUST keep pre-validating, and
+// any new store-side validation error gets the `bad_request:` prefix (the
+// arm below and the matching 400 arm in rest_api_v1.cpp's
+// access_review_error_status already map it).
 int mcp_error_for_access_review_msg(const std::string& msg) {
-    // #4752: a deliberate refusal of an attestation. self_attestation is a
-    // permission problem (the reviewer may not decide their own grant);
-    // already_decided is bad input against the row's current state. Neither is
-    // retryable, so neither may fall into kInternalError.
-    switch (classify_attestation_refusal(msg)) {
-    case AttestationRefusal::SelfAttestation:
-        return kPermissionDenied;
-    case AttestationRefusal::AlreadyDecided:
-        return kInvalidParams;
-    case AttestationRefusal::None:
-        break;
-    }
-    if (is_bad_request_error(msg))
-        return kInvalidParams;
-    return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
+    return access_review_sod::store_error_jsonrpc_code(access_review_sod::classify_store_error(msg));
 }
 
 // B4 (#2146 API-parity) — ManagementGroupStore error → JSON-RPC code + retry
@@ -8031,6 +8277,16 @@ McpServer::HandlerFn McpServer::build_handler(
             // the dispatch stage so the definition that RUNS is the one the human approved.
             // Unset on the operator tier (no ticket, nothing to hold the lookup to).
             std::optional<std::string> ticket_bound_effect;
+            // The same binding for execute_workflow (#2146 sec-1): the per-step tuples the ticket's
+            // effect line was computed over, set by the C8 probe on the mint AND the recall and
+            // handed to the run as `expected_step_effects`. Unset when no ticket is in play.
+            std::optional<WorkflowStepEffects> workflow_bound_effects;
+            // The held-open lease of an execute_workflow run (SseSurface::kWorkflowRun, #2146 D3).
+            // Acquired by the C8 recall arm immediately BEFORE the approval ticket is consumed (so
+            // a refusal spends no ticket) or, for a caller that never reaches that arm, by the
+            // handler; carried to the handler and released with this request, on any return or
+            // throw. Declared here so both sites see the one object.
+            std::optional<yuzu::server::detail::StreamBudget::Lease> workflow_run_lease;
 
             // Audit helper. Returns true when the audit row persisted, false when it was
             // dropped, so SOC 2 read/write surfaces can
@@ -8638,6 +8894,398 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── execute_workflow, the parts the C8 pre-mint probe and the handler share ──
+            // (#2146 batch B). One copy of argument parsing, port wiring and refusal rendering,
+            // so the probe a supervised caller hits BEFORE a ticket is minted refuses exactly as
+            // the handler would after one is consumed. All three are inert unless called.
+            struct WorkflowMcpCall {
+                std::string workflow_id;
+                WorkflowExecuteRequest wreq;
+            };
+            // The call's ONE correlation id: the response header, every error body this tool
+            // answers, the run's own row and the `correlation_id=` token of every row this call
+            // writes (the `workflow.execute` rows through the request, the `mcp.execute_workflow`
+            // rows through `mcp_workflow_audit`). `ensure_correlation_id` reuses the header, so the
+            // probe and the handler agree.
+            const auto wf_cid = [&]() { return yuzu::server::detail::ensure_correlation_id(res); };
+            // The approval ticket the call presented, bounded and cleaned for a row; empty when it
+            // presented none. On a recall it is the id the `approved ... consumed approval_id=`
+            // row names, which is how an audit reader joins the run to the human approval.
+            const auto wf_approval_id = [&]() -> std::string {
+                if (const auto it = args.find("approval_id");
+                    it != args.end() && it->is_string())
+                    return it->get<std::string>();
+                return {};
+            };
+            const auto mcp_workflow_audit = [&](const std::string& result_status,
+                                                const std::string& detail_text) {
+                std::string d = detail_text;
+                if (!d.empty())
+                    d += ' ';
+                d += "correlation_id=" + ::yuzu::log_token(wf_cid());
+                if (const auto ap = wf_approval_id(); !ap.empty())
+                    d += " approval_id=" + audit_caller_id(ap);
+                return mcp_audit(result_status, d);
+            };
+            // Writes the refusal into `res` and returns nullopt.
+            const auto parse_workflow_call = [&]() -> std::optional<WorkflowMcpCall> {
+                // Strict arguments: the C8 schema check only runs for approval-gated callers.
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "workflow_id" && it.key() != "agent_ids" &&
+                        it.key() != "idempotency_key" && it.key() != "approval_id") {
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "unknown argument '" + it.key().substr(0, 64) +
+                                         "'; execute_workflow takes workflow_id, agent_ids, "
+                                         "idempotency_key and approval_id",
+                                     {}, -1, wf_cid()),
+                            "application/json");
+                        return std::nullopt;
+                    }
+                }
+                const auto wf_id = param_string_strict(args, "workflow_id");
+                if (!wf_id || wf_id->empty()) {
+                    res.set_content(a4_error(kInvalidParams,
+                                             "workflow_id must be a non-empty string of at "
+                                             "most 128 bytes",
+                                             {}, -1, wf_cid()),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                // Length, control bytes (NUL included) and UTF-8 validity, before the targeting
+                // parse, the key, the replay lookup, the lease or any ticket. The audit detail
+                // carries the id only bounded and cleaned, never raw.
+                if (const auto bad_id = check_workflow_id(*wf_id)) {
+                    const bool audit_ok = mcp_workflow_audit(
+                        "denied", "reason=" + bad_id->reason + " workflow=" +
+                                      ::yuzu::log_token(
+                                          instruction_execute::bounded_definition_id(*wf_id)));
+                    res.set_content(a4_error(kInvalidParams, bad_id->message,
+                                             "fix the workflow id; this input can never succeed "
+                                             "as sent",
+                                             -1, wf_cid(), audit_ok, bad_id->reason),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                auto agent_ids = parse_workflow_execute_body(args);
+                if (!agent_ids) {
+                    if (metrics) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_target_rejected_total",
+                                          {{"route", "workflow"},
+                                           {"reason", agent_ids.error().reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                        }
+                    }
+                    const bool audit_ok =
+                        mcp_workflow_audit("denied", "reason=" + agent_ids.error().reason);
+                    res.set_content(a4_error(kInvalidParams, agent_ids.error().message, {}, -1, // retry-hint-exempt: input-parse failure, not a store fault
+                                             wf_cid(), audit_ok),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                // The idempotency key is REQUIRED here (the blind-retry surface: every MCP caller
+                // is supervised, so a keyless retry is a fresh mint plus a second human approval
+                // plus a full re-send). Bound-checked before anything is minted, leased or read.
+                const auto key = param_string_strict(args, "idempotency_key");
+                const auto key_error =
+                    !key ? std::optional<WorkflowExecuteBodyError>{WorkflowExecuteBodyError{
+                               "idempotency_key_required",
+                               "idempotency_key is required: send a unique string of 8 to 128 "
+                               "characters from A-Z a-z 0-9 . _ : - and repeat the SAME key to "
+                               "learn the outcome of a call whose answer was lost, never to run "
+                               "again"}}
+                         : check_workflow_idempotency_key(*key);
+                if (key_error) {
+                    const bool audit_ok =
+                        mcp_workflow_audit("denied", "reason=" + key_error->reason);
+                    res.set_content(a4_error(kInvalidParams, key_error->message, {}, -1, // retry-hint-exempt: input-parse failure, not a store fault
+                                             wf_cid(), audit_ok),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                WorkflowMcpCall call;
+                call.workflow_id = *wf_id;
+                call.wreq.idempotency_key = *key;
+                call.wreq.workflow_id = *wf_id;
+                call.wreq.agent_ids = std::move(*agent_ids);
+                // The caller's REAL DispatchCaller; an unwired derivation fails CLOSED on
+                // visibility (present-EMPTY set, never nullopt - ADR-0033 section 1).
+                // approval_provenance stays None whether or not a ticket was consumed.
+                call.wreq.caller =
+                    caller_fn ? caller_fn(*session)
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                call.wreq.audit_context = "surface=mcp";
+                call.wreq.correlation_id = wf_cid();
+                call.wreq.approval_id = wf_approval_id();
+                // The run's clock starts when the call is taken, so prepare counts against it.
+                call.wreq.deadline = std::chrono::steady_clock::now() + kWorkflowSyncBudget;
+                return call;
+            };
+            const auto make_workflow_ports = [&]() {
+                WorkflowExecutePorts ports;
+                ports.api = workflow_api_.get();
+                ports.run = workflow_run_fn_;
+                ports.idempotency_lookup = workflow_idempotency_lookup_fn_;
+                ports.digest = workflow_digest_fn_;
+                ports.instruction_store_open = instruction_store && instruction_store->is_open();
+                ports.approval_gate_available = approval_manager != nullptr;
+                ports.lookup = make_instruction_lookup(instruction_store);
+                ports.classify = classify_fn_;
+                ports.authorize = authorize_dispatch_fn_;
+                if (dispatch_fn) {
+                    ports.dispatch = [&](const WorkflowStepInstruction& def,
+                                         const std::vector<std::string>& ids,
+                                         const std::unordered_map<std::string, std::string>& params,
+                                         const DispatchCaller& c) {
+                        return workflow_concurrency_dispatch_fn_
+                                   ? workflow_concurrency_dispatch_fn_(
+                                         def.plugin, def.action, ids, "", params,
+                                         /*execution_id=*/"", c, def.id, def.concurrency_mode)
+                                   : dispatch_fn(def.plugin, def.action, ids, "", params,
+                                                 /*execution_id=*/"", c);
+                    };
+                }
+                ports.audit = [&](const std::string& action, const std::string& result_status,
+                                  const std::string& target_id, const std::string& detail_text) {
+                    return yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, action, result_status, "workflow", target_id, detail_text);
+                };
+                // The legacy route's workflow.executed, published by the run itself.
+                ports.emit = bind_event_emit(emit_event_fn_, req, metrics);
+                ports.count_target_rejected = [&](std::string_view reason) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "workflow"}, {"reason", std::string(reason)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                    }
+                };
+                ports.count_dispatch_denied = [&](std::string_view reason) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_denied_total",
+                                      {{"reason", std::string(reason)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                    }
+                };
+                ports.count_run_threw = [&] {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_fanout_throw_total",
+                                      {{"route", "workflow"}, {"phase", "dispatch"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail the answer
+                    }
+                };
+                ports.count_run_outcome = make_workflow_run_outcome_counter(metrics);
+                ports.count_idempotent = [&](std::string_view outcome) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter(kWorkflowRunIdempotentMetric,
+                                      {{"outcome", std::string(outcome)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail an answer
+                    }
+                };
+                return ports;
+            };
+            // Reached only for a throw BEFORE the sequence's `requested` row (the prepare half):
+            // nothing was sent, so the retry hint is honest. A throw after that row is answered
+            // by the sequence itself as kRunFailed (no retry hint, see render_workflow_refusal).
+            const auto respond_workflow_threw = [&](const char* what) {
+                spdlog::error("MCP execute_workflow: threw: {}", what);
+                const bool audit_ok = mcp_workflow_audit("failure", "exception");
+                res.set_content(
+                    a4_error(kInternalError, "workflow execution failed",
+                             approval_ticket_just_consumed
+                                 ? "nothing was sent, but the approval ticket is spent; request a "
+                                   "new approval for the same call and re-call with the same "
+                                   "idempotency_key"
+                                 : std::string{},
+                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, wf_cid(), audit_ok),
+                    "application/json");
+            };
+            // An execute_workflow run refused at ADMISSION (cap or draining): the same HTTP 429 /
+            // 503 + Retry-After and honest retry_after_ms the streamed-POST cap answers, with the
+            // budget's own reason token. No workflow or instruction was read, nothing was sent or
+            // audited (the counter is the record; a keyed call has had only its key looked up)
+            // and no approval ticket was spent. The code is the existing stream-cap code
+            // (-32012) for a cap and the existing shutdown code (-32015) while draining.
+            const auto respond_workflow_admission_refused = [&](const WorkflowExecuteOutcome& out) {
+                const bool draining = out.status == WorkflowExecuteStatus::kDraining;
+                res.status = draining ? 503 : 429;
+                res.set_header("Retry-After",
+                               std::to_string((kWorkflowRunCapRetryAfterMs + 999) / 1000));
+                res.set_content(a4_error(draining ? kMcpShuttingDown : kMcpStreamCap, out.message,
+                                         out.remediation,
+                                         static_cast<long>(kWorkflowRunCapRetryAfterMs), wf_cid(),
+                                         true, out.reason),
+                                "application/json");
+            };
+            // Leases the run's slot from the ONE shared budget, or answers the refusal. True ==
+            // the lease is held in `workflow_run_lease` for the rest of the request.
+            const auto admit_workflow_run_mcp = [&]() -> bool {
+                auto admission = admit_workflow_run(stream_budget, draining_fn_, session->username,
+                                                    metrics);
+                if (admission.refusal) {
+                    respond_workflow_admission_refused(*admission.refusal);
+                    return false;
+                }
+                if (admission.lease)
+                    workflow_run_lease.emplace(std::move(admission.lease));
+                return true;
+            };
+            // Renders any status the sequence refuses with (everything but kOk, kRunIncomplete and
+            // kNoAgentsReached, which are success envelopes).
+            const auto render_workflow_refusal = [&](const WorkflowExecuteOutcome& out) {
+                using WES = WorkflowExecuteStatus;
+                const bool audit_ok = mcp_workflow_audit(
+                    out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
+                            out.status == WES::kUnavailable ||
+                            out.status == WES::kEffectDigestFailed || out.status == WES::kRunFailed
+                        ? "error"
+                        : "denied",
+                    "reason=" + out.reason);
+                const std::string cid = wf_cid();
+                switch (out.status) {
+                case WES::kRunFailed: {
+                    // The run THREW after steps may have been sent: -32603 with NO retry hint
+                    // (retry_after_ms null on purpose; a blind re-send could dispatch twice) and
+                    // the typed handles a worker reads the run with, as execute_instruction_definition's
+                    // dispatch_exception carries them.
+                    nlohmann::json data{{"correlation_id", cid},
+                                        {"retry_after_ms", nullptr},
+                                        {"remediation", out.remediation},
+                                        {"reason", out.reason},
+                                        {"execution_id", out.execution_id}};
+                    if (out.agents_sent > 0)
+                        data["agents_sent"] = out.agents_sent;
+                    if (!out.audit_persisted)
+                        data["audit_persisted"] = false;
+                    res.set_content(error_response(id, kInternalError, out.message, data.dump()),
+                                    "application/json");
+                    return;
+                }
+                case WES::kStoreFailed:
+                case WES::kAuditFailed:
+                    // Nothing was sent. Once the ticket was consumed (every call that reaches the
+                    // handler at the supervised tier) it is spent, so the retry the hint offers
+                    // needs a NEW approval; a refusal from the probe, before any mint or consume,
+                    // spent nothing.
+                    res.set_content(
+                        a4_error(kInternalError, out.message,
+                                 approval_ticket_just_consumed
+                                     ? "nothing was sent, but the approval ticket is spent; "
+                                       "request a new approval for the same call and re-call "
+                                       "with the same idempotency_key"
+                                     : std::string{},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, cid, audit_ok),
+                        "application/json");
+                    return;
+                case WES::kUnavailable:
+                case WES::kNoPrincipal:
+                case WES::kEffectDigestFailed:
+                    res.set_content(a4_error(kInternalError, out.message, {}, -1, cid, audit_ok), // retry-hint-exempt: a missing dependency or an unusable request, not a transient fault
+                                    "application/json");
+                    return;
+                case WES::kDefinitionChanged:
+                    // Reached only after the ticket was consumed (a repoint before that is the
+                    // generic -32003 ticket-match refusal): the ticket is spent.
+                    res.set_content(a4_error(kInvalidParams, out.message,
+                                             "the approval ticket is spent; re-request approval "
+                                             "for the workflow as it is now and re-call",
+                                             -1, cid, audit_ok, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kApprovalRequired:
+                    res.set_content(
+                        a4_error(kPermissionDenied, out.message,
+                                 "run each instruction through its own approval; a workflow only "
+                                 "runs steps this caller may run without one. An approval ticket "
+                                 "for this call does not lift a step's own approval mode",
+                                 -1, cid, audit_ok),
+                        "application/json");
+                    return;
+                case WES::kDispatchDenied:
+                    // Permanent for this caller: retry_after_ms stays null, and `reason` is the
+                    // stable token a worker branches on.
+                    res.set_content(a4_error(kPermissionDenied, out.message, out.remediation, -1,
+                                             cid, audit_ok, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kRunCapReached:
+                case WES::kDraining:
+                    respond_workflow_admission_refused(out);
+                    return;
+                case WES::kExceedsSyncBudget:
+                    // A property of the stored workflow, permanent until it is replaced: no hint.
+                    res.set_content(a4_error(kInvalidParams, out.message, out.remediation, -1, cid,
+                                             audit_ok, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kIdempotencyConflict: {
+                    // The key is bound to a DIFFERENT request: terminal, no retry hint. The run it
+                    // is bound to is the caller's own, so its id is handed back.
+                    nlohmann::json data{{"correlation_id", cid},
+                                        {"retry_after_ms", nullptr},
+                                        {"remediation", out.remediation},
+                                        {"reason", out.reason},
+                                        {"execution_id", out.execution_id}};
+                    res.set_content(error_response(id, kInvalidParams, out.message, data.dump()),
+                                    "application/json");
+                    return;
+                }
+                case WES::kIdempotentReplay: // answered by respond_workflow_idempotency, never here
+                case WES::kOk:
+                case WES::kRunIncomplete:
+                case WES::kNoAgentsReached:
+                case WES::kInvalidWorkflow:
+                case WES::kWorkflowNotFound:
+                case WES::kUnknownInstruction:
+                case WES::kUnclassifiedStep:
+                case WES::kDestructiveUntargeted:
+                case WES::kDestructiveNoVisibleTarget:
+                case WES::kExecuteFailed:
+                    break;
+                }
+                res.set_content(a4_error(kInvalidParams, out.message, {}, -1, cid, audit_ok), // retry-hint-exempt: a permanent refusal of this input, not a store fault
+                                "application/json");
+            };
+
+            // The answer to the idempotency pre-check (`check_workflow_idempotency`): a replay is a
+            // SUCCESS envelope carrying the thin body (nothing was sent), anything else is the
+            // refusal the shared sequence rendered. A terminal replay is audited here as well as by
+            // the sequence (workflow.execute); a running replay writes no row (polling must not).
+            const auto respond_workflow_idempotency = [&](const WorkflowExecuteOutcome& out,
+                                                          const std::string& workflow_id) {
+                if (out.status != WorkflowExecuteStatus::kIdempotentReplay) {
+                    render_workflow_refusal(out);
+                    return;
+                }
+                if (out.replay_status != kReplayRunning)
+                    mcp_workflow_audit("success", "execution_id=" + audit_caller_id(out.execution_id) +
+                                                      " idempotent_replay=true run_status=" +
+                                                      out.replay_status);
+                res.set_content(
+                    success_response(id, tool_result(workflow_idempotent_replay_json(out, workflow_id)
+                                                         .dump(),
+                                                     kObjectOutputSchema)),
+                    "application/json");
+            };
+
             // ── C8: Generic tier + approval checks via catalogue().security ──
             // Look up the tool's (securable_type, operation) pair and run
             // tier_allows() / requires_approval() generically.  This fires
@@ -9014,6 +9662,57 @@ McpServer::HandlerFn McpServer::build_handler(
                                     : std::string(yuzu::server::instruction_execute::
                                                       kUnresolvedEffect);
                         canon = *ticket_bound_effect + args_canon;
+                    }
+                    // #2146 execute_workflow: the caller-level half of the sequence (prepare:
+                    // wiring, the workflow and every step's instruction, the chokepoint dry run
+                    // per distinct step pair, approval mode, targeting) runs HERE, before a
+                    // ticket is minted or consumed, so a call that is going to be refused mints
+                    // no ticket and burns none. Order is tier -> RBAC -> probe -> mint (sg-b1,
+                    // as execute_instruction_definition above). The probe is ADVISORY: the
+                    // handler runs the whole sequence again after the ticket is consumed against
+                    // fresh reads, and that run is authoritative. It dispatches nothing and
+                    // writes no `requested` row.
+                    if (tool_name == "execute_workflow") {
+                        if (!perm_fn(req, res, "Workflow", "Execute"))
+                            return;
+                        const auto call = parse_workflow_call();
+                        if (!call)
+                            return;
+                        try {
+                            const auto ports = make_workflow_ports();
+                            // A repeat of the idempotency key is answered HERE, after the tier and
+                            // Workflow:Execute gates above and before the probe, the ticket mint
+                            // and the lease: a retry whose ticket is spent, or that carries none,
+                            // gets the run the key is bound to with no -32006 and no new approval
+                            // (it sends nothing and discloses only the caller's own row). Allowed
+                            // while draining and at the run cap: it is a short read.
+                            if (auto early = check_workflow_idempotency(ports, call->wreq)) {
+                                respond_workflow_idempotency(*early, call->workflow_id);
+                                return;
+                            }
+                            const auto plan = prepare_workflow_execute(ports, call->wreq);
+                            if (!plan) {
+                                render_workflow_refusal(plan.error());
+                                return;
+                            }
+                            // Bind the ORDERED step effects into the ticket's subject, exactly as
+                            // execute_instruction_definition binds its resolved pair: the approver
+                            // sees the step count and the first plugin.actions, and a repoint of
+                            // any step between approval and recall fails the ordinary match below
+                            // (no consume, nothing sent). A digest failure refuses here, before
+                            // any ticket exists.
+                            const auto effect = workflow_effect_binding(ports, *plan);
+                            if (!effect) {
+                                render_workflow_refusal(effect.error());
+                                return;
+                            }
+                            ticket_bound_effect = *effect;
+                            canon = *ticket_bound_effect + args_canon;
+                            workflow_bound_effects = workflow_step_effects(*plan);
+                        } catch (const std::exception& e) {
+                            respond_workflow_threw(e.what());
+                            return;
+                        }
                     }
                     if (tool_name == "execute_instruction") {
                         if (auto bv = check_exec_instruction_shape(args)) {
@@ -9834,6 +10533,13 @@ McpServer::HandlerFn McpServer::build_handler(
                             return rotation_precondition(row);
                         return {};
                     };
+                    // #2146 execute_workflow: the run's held-open slot is taken BEFORE the
+                    // one-time ticket is spent, so a cap or draining refusal burns nothing and
+                    // the client re-calls with the same approval_id. Every check that can still
+                    // refuse WITHOUT consuming has run above; the consume is the first thing
+                    // that spends. (The handler acquires for a caller that never gets here.)
+                    if (tool_name == "execute_workflow" && !admit_workflow_run_mcp())
+                        return;
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
                     if (auto consumed = approval_manager->consume_ticket(
@@ -10145,12 +10851,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 for (const auto& d : device_api->list_devices()) {
                     if (!authz::in_scope(gate.scope, d.agent_id))
                         continue;
-                    arr.add(JObj()
-                                .add("agent_id", d.agent_id)
-                                .add("hostname", d.hostname)
-                                .add("os", d.os)
-                                .add("arch", d.arch)
-                                .add("agent_version", d.agent_version));
+                    JObj row;
+                    row.add("agent_id", d.agent_id)
+                        .add("hostname", d.hostname)
+                        .add("os", d.os)
+                        .add("arch", d.arch)
+                        .add("agent_version", d.agent_version);
+                    // #2240: always present; null = not reported, never "legacy".
+                    if (d.guardian_backend)
+                        row.add("guardian_backend", *d.guardian_backend);
+                    else
+                        row.raw("guardian_backend", "null");
+                    arr.add(row);
                 }
                 // Confinement is reported as a STATUS, never a count of hidden devices
                 // (mcp_tools_hardware.cpp), in both channels so a client reading only
@@ -10368,7 +11080,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                                 // (in-scope only reaches here)
                     mcp_audit("failure", audit_caller_id(agent_id));
-                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                    // A genuine retryable store fault: carry the hint (A5 item 5) rather
+                    // than an inline exemption. The REST twin carries the same 5 s hint.
+                    res.set_content(a4_error(kInternalError, "Tag store unavailable",
+                                             "retry once the tag store recovers",
+                                             mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10388,6 +11104,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("os", detail.row.os)
                     .add("arch", detail.row.arch)
                     .add("agent_version", detail.row.agent_version);
+                // #2240: always present; null = not reported, never "legacy".
+                if (detail.row.guardian_backend)
+                    agent_obj.add("guardian_backend", *detail.row.guardian_backend);
+                else
+                    agent_obj.raw("guardian_backend", "null");
                 // ADR-0031 WS-A4 wave 2: DeviceApi always returns a (possibly
                 // empty) tags vector — a null/unwired TagStore at the seam
                 // degrades to empty, not an omitted key (device_api_local.hpp's
@@ -15731,6 +16452,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Roll-up is the only Echo store: a query over a raw capture table answers
+                // with no rows, so the set would silently be empty (REST twin refuses too).
+                if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                        "application/json");
+                    return;
+                }
                 // #4353 follow-up (Gate 2 finding on #4364): this tool IS
                 // approval-gated at supervised tier (Execution:Execute is in
                 // requires_approval()'s list), but an operator-tier call
@@ -15919,6 +16649,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& def = **def_result;
+                // Same refusal as create_result_set_from_echo_query, on the caller's params.sql,
+                // else the definition's declared default (the text the dashboard submits for a
+                // canned query; a default is never injected at dispatch, so a dispatch without
+                // sql is answered with an error by the agent and counted in agents_failed): a
+                // set that reevaluate_result_set would refuse is not created either.
+                if (def.plugin == "echo" && def.action == "sql" &&
+                    yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
+                        args.value("params", nlohmann::json::object()), def.parameter_schema)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                        "application/json");
+                    return;
+                }
                 std::unordered_map<std::string, std::string> params;
                 if (args.contains("params") && args["params"].is_object())
                     for (auto& [k, v] : args["params"].items())
@@ -16124,6 +16868,16 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
+                    // A set stored over a raw capture table would re-run to an empty
+                    // membership with no error: refuse it, nothing is dispatched.
+                    if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                        res.set_content(
+                            error_response(
+                                id, kInvalidParams,
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                            "application/json");
+                        return;
+                    }
                     std::unordered_map<std::string, std::string> params{{"sql", sql}};
                     rs_run_async("echo", "sql", params, source_kind::kEchoQuery, orig->source_payload,
                                 orig->matcher, synth, reeval_name);
@@ -16212,6 +16966,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(id, kInvalidParams,
                                            "RESULT_SET_BAD_REQUEST: original instruction unavailable"),
+                            "application/json");
+                        return;
+                    }
+                    // Same refusal as the echo_query branch, on the stored params.sql, else the
+                    // definition's declared default (never injected at dispatch; see the
+                    // create tool).
+                    if (def->plugin == "echo" && def->action == "sql" &&
+                        yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
+                            sp.value("params", nlohmann::json::object()),
+                            def->parameter_schema)) {
+                        res.set_content(
+                            error_response(
+                                id, kInvalidParams,
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
                             "application/json");
                         return;
                     }
@@ -22709,6 +23477,108 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload.add("audit_persisted", false);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            // ── execute_workflow (#2146 batch B) ──────────────────────────
+            // REST v1 twin: POST /api/v1/workflows/{id}/execute (workflow_execute_routes.cpp).
+            // Both run workflow_execute.hpp's apply_workflow_execute, so the precheck, the
+            // fail-closed wiring, the requested-before-effect audit and the per-step confinement
+            // are one copy. The tier and ticket are decided BEFORE this branch by the generic C8
+            // gate (tier_allows denies operator; requires_approval gates supervised on
+            // Workflow:Execute). A consumed ticket does NOT change what the steps may do:
+            // approval_provenance is left None, so an AdminOrApproval step still needs an
+            // administrator, exactly as on REST.
+            if (tool_name == "execute_workflow") {
+                if (!perm_fn(req, res, "Workflow", "Execute"))
+                    return;
+                const auto call = parse_workflow_call();
+                if (!call)
+                    return;
+                const auto ports = make_workflow_ports();
+                WorkflowExecuteRequest wreq = call->wreq;
+                // Admission: the recall arm normally holds the lease already (it took it before
+                // the ticket was spent, and ran the idempotency pre-check before that); a caller
+                // that did not go through it checks the key, then takes the lease here, before any
+                // read of the workflow. A repeat of the key precedes the lease: it is a short read.
+                if (!workflow_run_lease) {
+                    try {
+                        if (auto early = check_workflow_idempotency(ports, wreq)) {
+                            respond_workflow_idempotency(*early, call->workflow_id);
+                            return;
+                        }
+                    } catch (const std::exception& e) {
+                        respond_workflow_threw(e.what());
+                        return;
+                    }
+                    if (!admit_workflow_run_mcp())
+                        return;
+                }
+                wreq.idempotency_prechecked = true;
+                // The effects the consumed ticket was bound to: the run holds every fresh read to
+                // them, and sends nothing for a step that moved (definition_changed).
+                wreq.expected_step_effects = workflow_bound_effects;
+                // The credential liveness check before each step: the authoritative question
+                // (`set_workflow_revalidate_fn`, NOT the cached `revalidate_fn` the held-open
+                // streams tick on), asked against the principal and request of THIS call. The
+                // run is synchronous on this thread, so `req` outlives the closure. An unwired
+                // seam (test harnesses) is no check.
+                wreq.reauthorize_retry_delay =
+                    workflow_reauthorize_retry_delay_.value_or(kReauthorizeRetryDelay);
+                if (workflow_revalidate_fn_) {
+                    wreq.reauthorize = [&] {
+                        return workflow_revalidate_fn_(req, session->username);
+                    };
+                }
+
+                WorkflowExecuteOutcome out;
+                try {
+                    // The real sequence, authoritative after any C8 probe: the whole of prepare
+                    // runs again here against fresh reads, then the run.
+                    out = apply_workflow_execute(ports, wreq);
+                } catch (const std::exception& e) {
+                    respond_workflow_threw(e.what());
+                    return;
+                }
+                using WES = WorkflowExecuteStatus;
+                if (out.status == WES::kIdempotentReplay) {
+                    // The race: this call lost the engine's atomic claim to one with the same key.
+                    respond_workflow_idempotency(out, call->workflow_id);
+                    return;
+                }
+                if (out.status == WES::kOk || out.status == WES::kRunIncomplete ||
+                    out.status == WES::kNoAgentsReached) {
+                    auto payload = workflow_execute_result_json(out, call->workflow_id);
+                    if (out.status == WES::kRunIncomplete) {
+                        // Same typed status as REST's 202 (`partial` / `aborted`): a success
+                        // envelope that says the run did not succeed, never a retry hint.
+                        payload["retry_after_ms"] = nullptr;
+                    }
+                    if (out.status == WES::kNoAgentsReached) {
+                        // Same envelope shape as execute_instruction's zero-agents branch: a
+                        // success result carrying the cause, never a bare "reached 0".
+                        payload["status"] = out.reason;
+                        payload["message"] = out.message;
+                        payload["retryable"] = out.retryable;
+                        payload["retry_after_ms"] =
+                            out.retryable ? nlohmann::json(mcp::kMcpStoreFaultRetryMs)
+                                          : nlohmann::json(nullptr);
+                        if (!out.remediation.empty())
+                            payload["remediation"] = out.remediation;
+                    }
+                    mcp_workflow_audit(
+                        out.status == WES::kOk ? "success" : "failure",
+                        "execution_id=" + audit_caller_id(out.execution_id) +
+                            (out.status == WES::kOk
+                                 ? std::string{}
+                                 : " run_outcome=" +
+                                       std::string(workflow_run_outcome_token(out.run_outcome))));
+                    res.set_content(
+                        success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                        "application/json");
+                    return;
+                }
+                render_workflow_refusal(out);
                 return;
             }
 
@@ -30047,6 +30917,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Enforced here, not by the input schema: its maxLength is discovery metadata only
+                // (the schema validator runs just for approval-gated tools).
+                if (title.size() > kCampaignTitleMaxLen) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleTooLongMessage),
+                                    "application/json");
+                    return;
+                }
+                if (title.find('\0') != std::string::npos) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleNulMessage),
+                                    "application/json");
+                    return;
+                }
                 auto rows_res = build_access_review(auth_db, rbac_store, engine_principal_store_,
                                                     engine_credential_store_, directory_sync);
                 if (!rows_res) {
@@ -30076,7 +30958,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::string snapshot =
                         JObj()
                             .add("display_name", r.display_name)
-                            .add("owner_or_email", r.owner_or_email)
+                            .add(kSnapshotOwnerKey, r.owner_or_email)
                             .add("effective_permission_count", r.effective_permission_count)
                             .add("last_activity_ms", r.last_activity_ms)
                             .add("last_activity_kind", r.last_activity_kind)
@@ -30152,44 +31034,114 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
+                                    "application/json");
+                    return;
+                }
                 if (decision != "attested" && decision != "flagged_revoke") {
                     res.set_content(
                         a4_error(kInvalidParams, "decision must be attested or flagged_revoke"),
                         "application/json");
                     return;
                 }
+                // A present justification that is not a string is refused, not read as "" (the
+                // REST twin does the same): the entry is append-only. Absent and null both mean
+                // no justification.
+                if (args.is_object() && args.contains("justification") &&
+                    !args["justification"].is_null() && !args["justification"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, kJustificationTypeMessage),
+                                    "application/json");
+                    return;
+                }
+                // Bound the grant tuple BEFORE the gate (the REST twin does the same): the gate's
+                // refusal rows and the failure row embed it, so an unbounded or NUL-bearing id
+                // would write a forged, oversized audit row per call. The schema's maxLength is
+                // discovery metadata only; this is the enforcement.
+                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name)) {
+                    res.set_content(a4_error(kInvalidParams, kGrantFieldInvalidMessage),
+                                    "application/json");
+                    return;
+                }
+                // decision selects the audit verb so the two outcomes are
+                // separately countable evidence, matching the REST twin exactly. Every
+                // row of this verb has one shape: target_id = the campaign alone, the
+                // grant tuple in the detail (access_review_attest_gate.hpp).
+                const std::string audit_action =
+                    access_review_sod::attest_audit_action(decision);
+                const std::string tuple_detail =
+                    access_review_sod::attest_tuple_detail(principal_type, principal_id,
+                                                           role_name);
+                // One refusal path for the gate's verdict and for the store's in-write
+                // `forbidden:` backstop. The domain row is written first, then the
+                // `mcp.<tool>` wrapper row; either failing to persist is surfaced as
+                // audit_persisted:false (MCP has no response-header channel) and the
+                // refusal stands.
+                auto refuse = [&](const access_review_sod::SodVerdict& verdict) {
+                    const auto refusal = access_review_sod::sod_refusal_for(verdict.outcome);
+                    const bool domain_ok = access_review_sod::audit_and_count_refusal(
+                        audit_fn, req, metrics, access_review_sod::AttestSurface::kMcp, verdict,
+                        audit_action, campaign_id, tuple_detail);
+                    const bool wrapper_ok = mcp_audit(
+                        std::string(refusal.audit_result),
+                        access_review_sod::sod_refusal_detail(verdict, refusal, {}));
+                    res.set_content(
+                        a4_error(refusal.jsonrpc_code, refusal.message, refusal.remediation,
+                                 static_cast<long>(refusal.retry_after_ms.value_or(-1)), {},
+                                 domain_ok && wrapper_ok),
+                        "application/json");
+                };
+                // The LAST call before the store (see the REST twin): the reviewer must
+                // differ from the subject of the grant; engine-owner and group-member are a
+                // pre-read outside the store's transaction (documented window).
+                const auto verdict = access_review_sod::evaluate_attestation_sod(
+                    session->username, principal_type, principal_id, engine_principal_store_,
+                    rbac_store);
+                if (verdict.outcome != access_review_sod::SodOutcome::kPass) {
+                    refuse(verdict);
+                    return;
+                }
                 auto rec_res = access_review_store->record_attestation(
                     campaign_id, principal_type, principal_id, role_name, decision,
                     session->username, justification);
-                // decision selects the audit verb so the two outcomes are
-                // separately countable evidence, matching the REST twin exactly.
-                const std::string audit_action = decision == "flagged_revoke"
-                                                     ? "access_review.flagged"
-                                                     : "access_review.attested";
                 if (!rec_res) {
-                    // #4752: a deliberate refusal is audited `denied` with a
-                    // stable token (matches the REST twin); other errors keep
-                    // `failure`.
-                    const auto refusal = classify_attestation_refusal(rec_res.error());
-                    const bool refused = refusal != AttestationRefusal::None;
-                    const bool denied_audit_ok =
-                        refused ? audit_fn(req, audit_action, "denied", "AccessReview",
-                                           campaign_id + ":" + principal_type + ":" +
-                                               principal_id + ":" + role_name,
-                                           attestation_refusal_token(refusal))
-                                : audit_fn(req, audit_action, "failure", "AccessReview",
-                                           // bad_request: an identifier (possibly this very
-                                           // campaign_id) was NUL-bearing or over-long, so the
-                                           // row carries a fixed empty target, not the bytes.
-                                           is_bad_request_error(rec_res.error()) ? std::string{}
-                                                                                 : campaign_id,
-                                           rec_res.error());
-                    mcp_audit(refused ? "denied" : "failure",
-                              refused ? std::string(attestation_refusal_token(refusal))
-                                      : rec_res.error());
+                    if (const auto sod =
+                            access_review_sod::sod_from_store_error(rec_res.error())) {
+                        refuse({*sod, {}});
+                        return;
+                    }
+                    if (access_review_sod::classify_store_error(rec_res.error()) ==
+                        access_review_sod::StoreErrorClass::kTransient) {
+                        // A fault that is not the caller's (see the REST twin): the raw text goes
+                        // to the log, the caller gets a fixed message and a retry hint, and both
+                        // audit rows carry the fixed message, never the raw error.
+                        access_review_sod::log_store_failure(campaign_id, "mcp", rec_res.error());
+                        const bool failure_audit_ok = yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                            access_review_sod::store_failure_audit_detail(tuple_detail));
+                        const bool wrapper_ok = mcp_audit(
+                            "failure", std::string(access_review_sod::kStoreFailureMessage));
+                        res.set_content(
+                            a4_error(kInternalError, access_review_sod::kStoreFailureMessage,
+                                     access_review_sod::kStoreFailureRemediation,
+                                     static_cast<long>(access_review_sod::kStoreFailureRetryMs),
+                                     {}, failure_audit_ok && wrapper_ok),
+                            "application/json");
+                        return;
+                    }
+                    const bool denied_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                        flatten_audit_text(rec_res.error()) + tuple_detail);
+                    mcp_audit("failure", rec_res.error());
+                    // The cap refusal goes out without the store's `bad_request: ` classification
+                    // prefix; every other store refusal keeps the text it has always had.
+                    const std::string wire_text{
+                        decision_cap_wire_message(rec_res.error()).value_or(rec_res.error())};
                     res.set_content(
                         error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
-                                       rec_res.error(),
+                                       wire_text,
                                        denied_audit_ok
                                            ? std::string_view{}
                                            : std::string_view{R"({"audit_persisted":false})"}),
@@ -30202,12 +31154,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 // on this path (flag != revoke). Acting on the flag is a separate,
                 // explicit RBAC/EnginePrincipal write an operator performs after
                 // reading this evidence.
-                const bool audit_ok = audit_fn(
-                    req, audit_action, "success", "AccessReview",
-                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
-                    "decision=" + decision);
+                //
+                // Set-and-proceed: the decision and its history row are already
+                // committed, so the audit row is secondary evidence and never a gate. A
+                // throwing audit callback is caught inside try_persist_audit.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, audit_action, "success", "AccessReview", campaign_id,
+                    access_review_sod::attest_success_detail(decision, rec_res->previous_decision,
+                                                             rec_res->seq, tuple_detail));
                 JObj payload;
-                payload.add("recorded", true);
+                payload.add("recorded", true)
+                    .add("decision_seq", static_cast<int64_t>(rec_res->seq))
+                    .add("previous_decision", rec_res->previous_decision);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", campaign_id);
@@ -30240,7 +31198,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto view_res = access_review_store->get_campaign(campaign_id);
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
+                                    "application/json");
+                    return;
+                }
+                // Same read as GET /api/v1/access-reviews/{id}: the grant's history.
+                auto view_res = access_review_store->get_campaign(campaign_id, /*include_history=*/true);
                 if (!view_res) {
                     mcp_audit("failure", view_res.error());
                     const int code = mcp_error_for_access_review_msg(view_res.error());
@@ -30267,6 +31233,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // grant_snapshot is raw-embedded, not escaped: this store's only
                     // writer (open_access_review/POST /api/v1/access-reviews) always
                     // freezes it as a JObj().str() JSON object.
+                    // Oldest first; previous_decision "" is "not recorded", never "pending".
+                    JArr history;
+                    for (const auto& h : a.history)
+                        history.add(JObj()
+                                        .add("seq", h.seq)
+                                        .add("decision", h.decision)
+                                        .add("previous_decision", h.previous_decision)
+                                        .add("reviewer", h.reviewer)
+                                        .add("justification", h.justification)
+                                        .add("justification_truncated", h.justification_truncated)
+                                        .add("decided_at_ms", h.decided_at_ms));
                     attestations.add(
                         JObj()
                             .add("principal_type", a.principal_type)
@@ -30277,7 +31254,9 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("decided_at_ms", a.decided_at_ms)
                             .add("justification", a.justification)
                             .raw("grant_snapshot",
-                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot));
+                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot)
+                            .add("decision_seq", a.decision_seq)
+                            .raw("history", history.str()));
                 }
                 (void)audit_fn(req, "access_review.get", "success", "AccessReview", campaign_id, "");
                 JObj payload;
@@ -30411,6 +31390,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto campaign_id = param_str(args, "campaign_id");
                 if (campaign_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "campaign_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
                                     "application/json");
                     return;
                 }

@@ -268,15 +268,15 @@ TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-b
     CHECK(pending_rows() == 50);
     CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
     CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
-    // MCP table shape: 72 rows, 22 exempt, 50 pending (#2146 batch B added two
+    // The MCP table shape: 73 rows, 23 exempt, 50 pending (#2146 batch B added the two
     // execution twins, both exempt: cancel_execution kCancelsRecord, record_execution_rerun
-    // kCreatesRerunRecord; and execute_instruction_definition, exempt kExecutionDispatch;
-    // ADR-0070 R1 added the four revocation-source mutations, all pending).
-    CHECK(std::size(kMcpStepUpPolicy) == 72);
+    // kCreatesRerunRecord; and execute_instruction_definition and execute_workflow, both exempt
+    // kExecutionDispatch; ADR-0070 R1 added the four revocation-source mutations, all pending).
+    CHECK(std::size(kMcpStepUpPolicy) == 73);
     std::size_t exempt = 0;
     for (const auto& e : kMcpStepUpPolicy)
         exempt += (e.cls == StepUpClass::kExempt) ? 1 : 0;
-    CHECK(exempt == 22);
+    CHECK(exempt == 23);
 }
 
 TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is never weaker",

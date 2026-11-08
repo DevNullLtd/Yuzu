@@ -36,7 +36,7 @@ public:
         const yuzu::server::WorkflowExecutionListQuery&, const yuzu::server::authz::VisibleSet&)>;
 
     // The fourth function defaults to unwired so the existing three-argument construction sites
-    // (which never list executions) stay unchanged.
+    // (which never list) stay unchanged.
     FnWorkflowApi(ListFn list_fn, GetFn get_fn, GetExecutionFn get_execution_fn,
                   ListExecutionsFn list_executions_fn = {})
         : list_fn_(std::move(list_fn)), get_fn_(std::move(get_fn)),

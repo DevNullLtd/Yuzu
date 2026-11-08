@@ -176,6 +176,8 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("mint_upload_grant",                    "POST",   R"(/api/v1/upload-grants)"),
     // UserManagement:Write
     step_up_mcp_detail::pending("unlock_account",                       "POST",   R"(/api/v1/users/([^/]+)/unlock)"),
+    // Workflow:Execute
+    step_up_mcp_detail::exempt ("execute_workflow",                     step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/workflows/([^/]+)/execute)"),
 };
 // clang-format on
 

@@ -17,7 +17,9 @@
 #include "settings_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
 #include <chrono>
+#include <limits>
 #include <string>
 
 #include <yuzu/server/server.hpp>
@@ -439,8 +441,12 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
     CHECK(j.at("echo").at("tick_seconds").get<int>() == 900);
     const auto& tiers = j.at("echo").at("tiers");
     REQUIRE(tiers.is_array());
-    for (const auto& t : tiers)
-        CHECK(t.size() == 6);
+    for (const auto& t : tiers) {
+        CHECK(t.size() == 7);
+        REQUIRE(t.at("budget_dependent").is_boolean());
+        CHECK(t.at("budget_dependent").get<bool>() == (t.at("tier") == "hourly"));
+    }
+    CHECK(j.at("echo").at("db_budget_bytes").get<long long>() == 262144000);
 
     const auto find = [&](const char* src, const char* tier) -> const nlohmann::json* {
         for (const auto& t : tiers)
@@ -448,20 +454,14 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
                 return &t;
         return nullptr;
     };
-    // The one row-count tier left among the sources: usage keeps its own live table.
-    const auto* live = find("usage", "live");
-    REQUIRE(live);
-    CHECK(live->at("limit_kind") == "rows");
-    CHECK(live->at("limit").get<long long>() == 200000);
-    CHECK(live->at("bucket_seconds").get<long long>() == 0);
-    CHECK(live->at("guaranteed_depth_seconds").is_null());
-    // A roll-up tier: 90 days hourly, a bucket START cut, so the depth is the limit less a bucket.
-    const auto* hourly = find("perf", "hourly");
+    const auto* hourly = find("process", "hourly");
     REQUIRE(hourly);
     CHECK(hourly->at("limit_kind") == "seconds");
     CHECK(hourly->at("limit").get<long long>() == 7776000);
     CHECK(hourly->at("bucket_seconds").get<long long>() == 3600);
-    CHECK(hourly->at("guaranteed_depth_seconds").get<long long>() == 7772400);
+    CHECK(hourly->at("guaranteed_depth_seconds").get<long long>() ==
+          hourly->at("limit").get<long long>() - 3600);
+    CHECK(hourly->at("budget_dependent").get<bool>());
     const auto* daily = find("process", "daily");
     REQUIRE(daily);
     CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 15465600);
@@ -511,12 +511,13 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     const auto wo = sm::render_retention_table(without);
     CHECK(w.compare(0, wo.size(), wo) == 0);
     CHECK_FALSE(has(wo, "Echo capture sources"));
-    // 90 days hourly, 180 days daily, a year monthly; usage keeps its own live rows and a 31-day
-    // daily tier; the look-again figure is the monthly depth.
-    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
-                          "<th>Look again after</th>", ">process<", "200,000 rows", ">3 months<",
-                          ">6 months<", ">31 days<", ">12 months<", ">11 months<", "400 rows",
-                          ">30 days<", "every 900 s", "never pruned", "not per-device"})
+    // Only what the builder guarantees on a table with or without `live` rows: the Exact column
+    // and the live-row cells (100,000 rows, Row count only, 1 day, 7 days) belong to the renderer
+    // and the table contents, which other changes own.
+    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Boot</th>",
+                          "<th>Look again after</th>", ">process<", ">3 months<", ">6 months<", ">31 days<", ">12 months<",
+                          ">11 months<", "400 rows", ">30 days<", "every 900 s", "never pruned",
+                          "not per-device"})
         CHECK(has(w, n));
     const auto cap = w.find("<caption");
     REQUIRE(cap != std::string::npos);
@@ -549,6 +550,17 @@ TEST_CASE("echo_duration_text worked examples", "[settings][settings_model][rete
     CHECK(sm::echo_duration_text(60 * d) == "2 months");
     CHECK(sm::echo_duration_text(14 * d) == "2 weeks");
     CHECK(sm::echo_duration_text(13 * d) == "13 days");
+}
+
+TEST_CASE("Echo row counts group thousands including the most negative value",
+          "[settings][settings_model][retention][echo]") {
+    // Negating INT64_MIN as a signed value is undefined; the magnitude is formatted unsigned.
+    const auto html = sm::render_retention_table(retention_with_echo(nlohmann::json::array({
+        tier("A", "hourly", "rows", std::numeric_limits<long long>::min()),
+        tier("B", "hourly", "rows", 1234567),
+    })));
+    CHECK(has(html, "<td>-9,223,372,036,854,775,808 rows</td>"));
+    CHECK(has(html, "<td>1,234,567 rows</td>"));
 }
 
 TEST_CASE("Echo tier table escapes the source name", "[settings][settings_model][retention][echo]") {

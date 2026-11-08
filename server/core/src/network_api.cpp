@@ -71,7 +71,7 @@ private:
                     tags_->get_values_for_key(cohort_key)
                         .value_or(std::unordered_map<std::string, std::string>{});
         }
-        const auto health = health_.net_snapshot(std::chrono::seconds{90});
+        const auto health = health_.net_snapshot(detail::kAgentHealthStaleness);
         std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
         by_id.reserve(health.size());
         for (const auto& h : health)
