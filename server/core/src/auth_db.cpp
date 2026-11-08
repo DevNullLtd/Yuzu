@@ -676,13 +676,13 @@ decrypt_mfa_secret(pg::SecretCodec& codec, const LoadedMfaRow& row) {
 // migration history: the trigger must exist, be ENABLE ALWAYS (tgenabled = 'A', so it also fires
 // under `session_replication_role = replica`), be a BEFORE UPDATE row trigger whose column list
 // is EXACTLY those two columns (attnum equality of the sorted lists; a superset is refused too,
-// so a catalog edit that widened the list reads as altered), with the INSERT/DELETE/TRUNCATE bits clear and no WHEN clause, and call the plpgsql
-// function of that name, in the table's schema, whose body is byte-identical to the pinned
-// constant and whose `proconfig` is exactly `{"search_path=pg_catalog, pg_temp"}` (one element;
-// pg_temp last so the session's temporary schema cannot shadow a type name first): the pin keeps
-// the function's name resolution and operators independent of the caller's search_path, and a
-// NULL `proconfig` (what `CREATE OR REPLACE FUNCTION` without the SET clause leaves) reads as
-// Invalid.
+// so a catalog edit that widened the list reads as altered), with the INSERT/DELETE/TRUNCATE
+// bits clear and no WHEN clause, and call the plpgsql function of that name, in the table's
+// schema, whose body is byte-identical to the pinned constant and whose `proconfig` is exactly
+// `{"search_path=pg_catalog, pg_temp"}` (one element; pg_temp last so the session's temporary
+// schema cannot shadow a type name first): the pin keeps the function's name resolution and
+// operators independent of the caller's search_path, and a NULL `proconfig` (what
+// `CREATE OR REPLACE FUNCTION` without the SET clause leaves) reads as Invalid.
 // `tgtype` bits (pg_trigger.h): ROW 1, BEFORE 2,
 // INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
 enum class BindingCheck : std::uint8_t {

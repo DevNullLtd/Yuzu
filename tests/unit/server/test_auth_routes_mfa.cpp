@@ -46,7 +46,6 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
-#include <yuzu/metrics.hpp>
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -2345,8 +2344,7 @@ TEST_CASE("a latched rebind guard makes the local proof read unavailable and lea
           "(the OIDC approver arm) alone (#6079 K1)",
           "[pg][mfa][routes][auth_routes][binding][approval_routes]") {
     AuthRoutesHarness h;
-    yuzu::MetricsRegistry metrics;
-    h.auth_mgr.set_metrics_registry(&metrics);
+    auto& metrics = h.metrics; // the harness registry, which outlives auth_mgr
     auto secret = h.enroll_mfa("admin");
     const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
     const std::string token = cookie.substr(std::string("yuzu_session=").size());
@@ -2426,8 +2424,7 @@ TEST_CASE("an inconclusive rebind-guard validation refuses that one local proof 
           "other (#6079)",
           "[pg][mfa][routes][auth_routes][binding][approval_routes]") {
     AuthRoutesHarness h;
-    yuzu::MetricsRegistry metrics;
-    h.auth_mgr.set_metrics_registry(&metrics);
+    auto& metrics = h.metrics; // the harness registry, which outlives auth_mgr
     auto secret = h.enroll_mfa("admin");
     const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
     const std::string token = cookie.substr(std::string("yuzu_session=").size());

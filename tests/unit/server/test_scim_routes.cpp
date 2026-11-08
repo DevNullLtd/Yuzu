@@ -7439,6 +7439,8 @@ TEST_CASE("ScimRoutes: classify_role_read maps every AuthDB role-read outcome (#
 
     // Every AuthDBError value is either a store fault (is_store_unavailable) or Refused:
     // the classifier is exactly is_store_unavailable plus the role comparison.
+    static_assert(static_cast<unsigned>(AuthDBError::EntropyUnavailable) == 11,
+                  "AuthDBError::EntropyUnavailable moved: dev (#6995) pins it at 11");
     static_assert(static_cast<unsigned>(AuthDBError::FactorChanged) == 12,
                   "AuthDBError grew: extend the classify_role_read coverage loop and revisit "
                   "is_store_unavailable");

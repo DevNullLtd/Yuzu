@@ -18,6 +18,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_principal_lock_gate.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
@@ -26,6 +27,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <thread>
@@ -1297,6 +1299,114 @@ TEST_CASE("SessionStore v3: a validation that cannot run flags that read and onl
         pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard"));
     REQUIRE(store.find("h1").has_value());
     CHECK_FALSE(store.rebind_guard_ok());
+}
+
+namespace {
+
+// An OPEN transaction holding ACCESS EXCLUSIVE on the sessions table, so a concurrent `find` parks
+// at its row SELECT AFTER its catalog validation has already run (the validation reads pg_catalog
+// only and takes no lock on the table). No production seam is involved.
+class SessionsTableLock {
+public:
+    explicit SessionsTableLock(PgPool& pool) : lease_(pool.acquire()) {
+        REQUIRE(lease_);
+        PgResult begin = pg::exec_params(lease_.get(), "BEGIN", std::vector<std::string>{});
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        open_ = true; // a failing REQUIRE below still rolls back through the destructor
+        PgResult lock = pg::exec_params(
+            lease_.get(), "LOCK TABLE session_store.sessions IN ACCESS EXCLUSIVE MODE",
+            std::vector<std::string>{});
+        REQUIRE(lock.status() == PGRES_COMMAND_OK);
+    }
+    SessionsTableLock(const SessionsTableLock&) = delete;
+    SessionsTableLock& operator=(const SessionsTableLock&) = delete;
+    ~SessionsTableLock() { rollback(); }
+
+    // Runs from the destructor and from the `Workers` pre-join callback, both implicitly
+    // noexcept, so it must not throw.
+    void rollback() {
+        if (!open_)
+            return;
+        open_ = false;
+        try {
+            PgResult r =
+                pg::exec_params(lease_.get(), "ROLLBACK", std::vector<std::string>{});
+            if (r.status() != PGRES_COMMAND_OK)
+                std::fprintf(stderr, "SessionsTableLock: ROLLBACK failed\n");
+        } catch (...) {
+            std::fprintf(stderr, "SessionsTableLock: ROLLBACK threw\n");
+        }
+    }
+
+private:
+    PgPool::Lease lease_;
+    bool open_{false};
+};
+
+// True once at least `want` backends of this database are blocked on a relation lock.
+bool wait_for_relation_waiters(PgPool& pool, int want) {
+    const auto end = std::chrono::steady_clock::now() + yuzu::test::kLockWaitDeadline;
+    while (std::chrono::steady_clock::now() < end) {
+        if (std::atoi(scalar(pool,
+                             "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                             "current_database() AND wait_event_type = 'Lock' AND "
+                             "wait_event = 'relation'")
+                          .c_str()) >= want)
+            return true;
+        std::this_thread::sleep_for(yuzu::test::kLockWaitPoll);
+    }
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("SessionStore v3: a find keeps its own inconclusive verdict when a concurrent clean "
+          "validation clears the shared flag",
+          "[session_store][pg][mfa_binding]") {
+    // Reader A's catalog check is inconclusive (forced), then A parks at its row SELECT behind a
+    // table lock. Reader B then validates cleanly, which clears the shared flag, and parks too.
+    // When the lock drops, A must still report its own verdict: sampling the shared flag after the
+    // SELECT, as the code did before, would read the false B stored.
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create(make_params("h1", "pia")).has_value());
+    store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+
+    SessionsTableLock lock(pool);
+    yuzu::test::Workers workers([&] { lock.rollback(); }); // declared AFTER the lock it releases
+    bool a_served = false;
+    bool a_unverified = false;
+    bool b_served = false;
+    bool b_unverified = true;
+
+    store.set_binding_validation_inconclusive_for_test(true);
+    workers.add([&] {
+        auto r = store.find("h1");
+        a_served = r.has_value() && r->has_value();
+        if (a_served)
+            a_unverified = (*r)->guard_unverified;
+    });
+    REQUIRE(wait_for_relation_waiters(pool, 1)); // A has finished its check and is parked
+
+    store.set_binding_validation_inconclusive_for_test(false);
+    workers.add([&] {
+        auto r = store.find("h1");
+        b_served = r.has_value() && r->has_value();
+        if (b_served)
+            b_unverified = (*r)->guard_unverified;
+    });
+    REQUIRE(wait_for_relation_waiters(pool, 2)); // B has validated cleanly and is parked
+
+    lock.rollback();
+    workers.join_all();
+
+    CHECK(a_served);
+    CHECK(b_served);
+    CHECK(a_unverified);        // its own inconclusive verdict, not the flag B cleared
+    CHECK_FALSE(b_unverified);  // proves the shared flag really was cleared in between
+    CHECK(store.rebind_guard_ok());
 }
 
 TEST_CASE("SessionStore v3: an inconclusive validation is retried on the next find even inside "

@@ -2070,7 +2070,7 @@ such a query: it serves the row and retries the check on the next read.
 validation sets (at most one catalog query per minute per process while checks succeed, on an MFA
 status read for `auth` and a session lookup for `session`; a check that could not run is retried on the
 next read until one succeeds, and meanwhile latches the binding as not enforced without moving the gauge). A tampering that is in place when a validation runs (the trigger
-missing, disabled, replica-only, or its function altered) makes every local binding decision fail
+missing, disabled, replica-only, its column list widened or narrowed, or its function altered) makes every local binding decision fail
 closed until the server restarts, and the boot check must pass before it serves again. A disable,
 change and re-enable completed entirely between two validations is not observable by this mechanism,
 and shortening the memo does not change that. The control's trust boundary is the database role: a
