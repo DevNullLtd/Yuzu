@@ -2842,8 +2842,8 @@
       "changelog.d/2026-11-02-echo-fold-substrate.added.md",
       "changelog.d/2026-11-02-echo-fold-substrate.changed.md",
       "changelog.d/2026-11-02-echo-offline-hive-baselines.added.md",
-      "changelog.d/2026-11-03-echo-rollup-only-server.changed.md",
-      "changelog.d/7037-echo-rollup-only-v10.changed.md"
+      "changelog.d/7037-echo-rollup-only-v10.changed.md",
+      "changelog.d/7318-echo-rollup-only-server.changed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
