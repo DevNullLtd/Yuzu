@@ -184,7 +184,7 @@ TEST_CASE("UpdateRegistry: remove_package makes latest_for return nullopt",
     REQUIRE(reg.is_open());
 
     REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0")));
-    reg.remove_package("windows", "x86_64", "0.1.0");
+    CHECK(reg.remove_package("windows", "x86_64", "0.1.0"));
 
     auto result = reg.latest_for("windows", "x86_64");
     REQUIRE_FALSE(result.has_value());
@@ -198,8 +198,8 @@ TEST_CASE("UpdateRegistry: remove_package for nonexistent does not crash",
     UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 
-    // Should not throw or crash
-    reg.remove_package("darwin", "aarch64", "9.9.9");
+    // Should not throw or crash; a statement that matched no row still completed
+    CHECK(reg.remove_package("darwin", "aarch64", "9.9.9"));
 
     auto packages = reg.list_packages();
     REQUIRE(packages.empty());
@@ -354,7 +354,7 @@ TEST_CASE("UpdateRegistry: a store that fails to open degrades every method to a
     // write must REPORT that it did not commit — the degrade is the behaviour
     // under test, so asserting the false is stronger than discarding it.
     CHECK_FALSE(reg.upsert_package(make_pkg()));
-    reg.remove_package("windows", "x86_64", "0.1.0");
+    CHECK_FALSE(reg.remove_package("windows", "x86_64", "0.1.0"));
     CHECK(reg.list_packages().empty());
 }
 
@@ -489,4 +489,43 @@ TEST_CASE("UpdateRegistry reports !is_open when schema_meta claims v1 but update
     REQUIRE(pool.valid());
     UpdateRegistry reg(pool, tmp.path());
     CHECK_FALSE(reg.is_open()); // → smoke-read fails closed, not just the runner's own guard
+}
+
+// ── Input validation and honest write results ───────────────────────────────
+
+TEST_CASE("is_safe_package_filename refuses a NUL, other control byte or DEL",
+          "[update_registry][validation]") {
+    CHECK(is_safe_package_filename("yuzu-agent-1.0.0"));
+    CHECK(is_safe_package_filename("agent \xc3\xa9 (1).exe")); // spaces and UTF-8 stay legal
+
+    CHECK_FALSE(is_safe_package_filename(std::string("a\0b", 3)));
+    CHECK_FALSE(is_safe_package_filename(std::string("agent\0", 6)));
+    CHECK_FALSE(is_safe_package_filename("agent\x01"));
+    CHECK_FALSE(is_safe_package_filename("agent\t1"));
+    CHECK_FALSE(is_safe_package_filename("agent\x1f"));
+    CHECK_FALSE(is_safe_package_filename("agent\x1b[0m"));
+    CHECK_FALSE(is_safe_package_filename("agent\x7f"));
+}
+
+TEST_CASE("UpdateRegistry: remove_package reports false when the DELETE fails, true otherwise",
+          "[update_registry][pg][remove][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
+    TempUpdateDir tmp;
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
+    REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0")));
+
+    // A text parameter holding a NUL is refused by the statement layer: the call
+    // reports the failure and the row stays.
+    CHECK_FALSE(reg.remove_package("windows", "x86_64", std::string("0.1.0\0", 6)));
+    CHECK(reg.list_packages().size() == 1);
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult drop{PQexec(conn.get(), "DROP TABLE update_registry.update_packages")};
+        REQUIRE(drop.ok());
+    }
+    CHECK_FALSE(reg.remove_package("windows", "x86_64", "0.1.0"));
 }

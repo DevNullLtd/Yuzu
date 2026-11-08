@@ -49,6 +49,8 @@
 /// (fenced-leader/outbox model already scoped there) — not something this
 /// migration solves.
 
+#include "rbac_text.hpp"
+
 #include <cstdint>
 #include <cstddef>
 #include <filesystem>
@@ -188,8 +190,12 @@ public:
                                                        const std::string& arch,
                                                        const std::string& version, int rollout_pct);
 
-    void remove_package(const std::string& platform, const std::string& arch,
-                        const std::string& version);
+    /// Delete a package row. Returns true when the DELETE statement completed
+    /// (including when no row matched); false when the store was closed, no
+    /// connection was available in time, or the statement failed. A caller that
+    /// audits the removal or unlinks the package files must act on this result.
+    [[nodiscard]] bool remove_package(const std::string& platform, const std::string& arch,
+                                      const std::string& version);
     std::vector<UpdatePackage> list_packages() const;
     std::optional<UpdatePackage> latest_for(const std::string& platform,
                                             const std::string& arch) const;
@@ -235,13 +241,16 @@ private:
 /// "just one more" separator or encoding to be handled. Callers reject; nothing
 /// rewrites the operator's name behind their back.
 ///
-/// Rejects: empty; `.` and `..`; anything containing `/`, `\\`, or `:`. The
+/// Rejects: empty; `.` and `..`; anything containing a NUL byte, another control
+/// byte (0x01-0x1F) or DEL; anything containing `/`, `\\`, or `:`. The
 /// backslash and colon are rejected on every platform, not just Windows — the
 /// server may run on Windows, where both are path-significant (`:` also selects
 /// an NTFS alternate data stream), and a rule that varies by build host is a rule
 /// nobody can reason about.
 [[nodiscard]] inline bool is_safe_package_filename(std::string_view name) {
     if (name.empty() || name == "." || name == "..")
+        return false;
+    if (!rbac_text_is_clean(name))
         return false;
     return name.find_first_of("/\\:") == std::string_view::npos;
 }

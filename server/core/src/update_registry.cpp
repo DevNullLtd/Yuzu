@@ -197,18 +197,18 @@ bool UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
     return true;
 }
 
-void UpdateRegistry::remove_package(const std::string& platform, const std::string& arch,
+bool UpdateRegistry::remove_package(const std::string& platform, const std::string& arch,
                                     const std::string& version) {
     if (!open_) {
         note_write_degrade(metrics_, kReasonStoreNotOpen);
-        return;
+        return false;
     }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         note_write_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: remove_package skipped, no connection in time ({})",
                       pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -219,9 +219,10 @@ void UpdateRegistry::remove_package(const std::string& platform, const std::stri
         note_write_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: remove_package failed for {}/{}/{}: {}", platform, arch,
                       version, PQerrorMessage(lease.get()));
-        return;
+        return false;
     }
     spdlog::info("UpdateRegistry: removed package {}/{}/{}", platform, arch, version);
+    return true;
 }
 
 UpdateRegistry::RolloutChange UpdateRegistry::update_rollout_checked(const std::string& platform,

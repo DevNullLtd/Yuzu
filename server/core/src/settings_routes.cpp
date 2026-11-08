@@ -35,6 +35,7 @@
 #include "sso_boot_guard.hpp" // oidc_config_complete + publish_oidc_provider_gauges (#4160)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
+#include "rbac_text.hpp"        // rbac_text_is_clean: the shared clean-text predicate
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
@@ -6507,6 +6508,21 @@ void SettingsRoutes::register_routes(
         }
 
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
+
+        // The platform, arch and filename become row keys and path components:
+        // a NUL or other control byte in any of them is refused before anything
+        // is written. The audit row carries a fixed token and an empty target id,
+        // never the supplied value.
+        if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
+            !rbac_text_is_clean(uploaded.filename)) {
+            audit_fn_(req, "ota.package.uploaded", "denied", "UpdatePackage", "",
+                      "invalid_package_field");
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">The platform, architecture and "
+                            "filename must not contain control characters.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
         // Case-INSENSITIVE: the server may store packages on a case-insensitive
         // filesystem (macOS, Windows), where "foo.SIG" and "foo.sig" are the
         // same file, so a case-sensitive guard is bypassable there.
@@ -6724,10 +6740,34 @@ void SettingsRoutes::register_routes(
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
-        // Upload path: the row is best-effort here and the failure is already
-        // visible in the log; the rollout path is the one that audits a committed
-        // transition and therefore must not discard this.
-        (void)update_registry_->upsert_package(pkg);
+        // The files above are already published. If the registry row is not
+        // written they are removed again (best effort), so the update directory
+        // does not hold a package no row refers to, and the request reports the
+        // failure instead of success.
+        struct PublishedFilesGuard {
+            std::filesystem::path binary;
+            std::filesystem::path sidecar;
+            bool armed{true};
+            ~PublishedFilesGuard() {
+                if (!armed)
+                    return;
+                std::error_code rm_ec;
+                std::filesystem::remove(binary, rm_ec);
+                std::filesystem::remove(sidecar, rm_ec);
+            }
+        } published{out_path, sidecar_path};
+        if (!update_registry_->upsert_package(pkg)) {
+            spdlog::error("OTA upload for {}/{}: the registry row could not be written; the "
+                          "uploaded files were removed",
+                          platform, arch);
+            audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
+                      platform + "/" + arch + "/" + version, "store_error");
+            respond_lifecycle_store_unavailable(
+                res, "The package could not be recorded. Nothing was changed; retry the "
+                     "upload.");
+            return;
+        }
+        published.armed = false;
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
@@ -6764,6 +6804,44 @@ void SettingsRoutes::register_routes(
                     auto arch = req.matches[2].str();
                     auto version = req.matches[3].str();
 
+                    // A NUL or other control byte in a key is refused up front;
+                    // the audit row carries a fixed token and an empty target id.
+                    if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
+                        !rbac_text_is_clean(version)) {
+                        audit_fn_(req, "ota.package.deleted", "denied", "UpdatePackage", "",
+                                  "invalid_package_field");
+                        res.status = 400;
+                        res.set_content("<span class=\"feedback-error\">The platform, "
+                                        "architecture and version must not contain control "
+                                        "characters.</span>",
+                                        "text/html; charset=utf-8");
+                        return;
+                    }
+
+                    // The registry row goes FIRST, and the files are unlinked only
+                    // once that succeeded: a failed row delete leaves the package
+                    // exactly as it was (row, binary and sidecar all present).
+                    const auto matched_pkg = [&]() -> std::optional<UpdatePackage> {
+                        for (auto& pkg : update_registry_->list_packages()) {
+                            if (pkg.platform == platform && pkg.arch == arch &&
+                                pkg.version == version)
+                                return std::move(pkg);
+                        }
+                        return std::nullopt;
+                    }();
+
+                    if (!update_registry_->remove_package(platform, arch, version)) {
+                        spdlog::error("OTA package delete for {}/{} v{}: the registry row could "
+                                      "not be removed; the package files were left in place",
+                                      platform, arch, version);
+                        audit_fn_(req, "ota.package.deleted", "failure", "UpdatePackage",
+                                  platform + "/" + arch + "/" + version, "store_error");
+                        respond_lifecycle_store_unavailable(
+                            res, "The package could not be removed. Nothing was changed; "
+                                 "retry the delete.");
+                        return;
+                    }
+
                     PackageDeleteOutcome outcome;
                     // Each remove gets its OWN error_code. Sharing one lets the
                     // second call's result overwrite the first, so a failed
@@ -6771,31 +6849,26 @@ void SettingsRoutes::register_routes(
                     // wholly successful.
                     std::error_code bin_ec;
                     std::error_code sig_ec;
-                    auto packages = update_registry_->list_packages();
-                    for (const auto& pkg : packages) {
-                        if (pkg.platform == platform && pkg.arch == arch &&
-                            pkg.version == version) {
-                            outcome.matched = true;
-                            auto bin_path = update_registry_->binary_path(pkg);
-                            outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
-                            // Remove the signature sidecar with it. Leaving it
-                            // behind would let a later upload of a same-named
-                            // package inherit a signature made over DIFFERENT
-                            // bytes — which the agent would then reject as
-                            // tampered, with no obvious cause.
-                            outcome.signature_removed = std::filesystem::remove(
-                                update_registry_->signature_path(pkg), sig_ec);
-                            if (bin_ec) {
-                                outcome.binary_error = bin_ec.message();
-                            }
-                            if (sig_ec) {
-                                outcome.signature_error = sig_ec.message();
-                            }
-                            break;
+                    if (matched_pkg) {
+                        const auto& pkg = *matched_pkg;
+                        outcome.matched = true;
+                        auto bin_path = update_registry_->binary_path(pkg);
+                        outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
+                        // Remove the signature sidecar with it. Leaving it
+                        // behind would let a later upload of a same-named
+                        // package inherit a signature made over DIFFERENT
+                        // bytes — which the agent would then reject as
+                        // tampered, with no obvious cause.
+                        outcome.signature_removed = std::filesystem::remove(
+                            update_registry_->signature_path(pkg), sig_ec);
+                        if (bin_ec) {
+                            outcome.binary_error = bin_ec.message();
+                        }
+                        if (sig_ec) {
+                            outcome.signature_error = sig_ec.message();
                         }
                     }
 
-                    update_registry_->remove_package(platform, arch, version);
                     spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
                     // Audited for the same reason as the upload: this removes a
                     // binary AND its signature from the fleet's update surface.
