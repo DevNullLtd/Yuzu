@@ -6,9 +6,8 @@
 /// (CRL source registration is its first consumer), so every later consumer shares ONE classifier
 /// and none can disagree about NXDOMAIN.
 ///
-/// POSIX: `getaddrinfo` return codes. Windows: Winsock error codes (plain `getaddrinfo` returns the
-/// WSA values). Literals are used on Windows
-/// so this header needs no socket includes.
+/// The codes are the platform resolver's return codes; literals are used where a platform's
+/// codes would otherwise need socket includes, so this header needs none.
 
 #ifndef _WIN32
 #include <netdb.h>

@@ -679,9 +679,9 @@ public:
                           "dns_budget_exhausted/validation_busy)",
                           "counter");
         metrics_.describe("yuzu_server_revocation_source_resolver_in_flight",
-                          "Name lookups outstanding in the 16-slot resolver pool CRL source registration "
-                          "resolves hosts in, published every 15 s; a value pinned at 16 means a stuck "
-                          "resolver is refusing every registration",
+                          "Name lookups outstanding in the resolver pool CRL source registration "
+                          "resolves hosts in, published every 15 s; a value at the pool's cap means "
+                          "registrations are refused until lookups return",
                           "gauge");
         metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".

@@ -14,8 +14,8 @@
 ///
 /// RESOURCE LEDGER (what this adds): one DETACHED worker thread per outstanding lookup, bounded
 /// by the pool's cap (`kMaxInFlightLookups` for the process pool; a lookup beyond the cap is
-/// refused `kBusy`, never queued). A worker whose resolver call has not returned keeps its slot
-/// and its thread until it does (or until process exit); the cap bounds that. Nothing is joined
+/// refused `kBusy`, never queued). A worker releases its slot and exits when its resolver call
+/// returns; the cap bounds how many are outstanding at once. Nothing is joined
 /// at shutdown: a worker holds no pointer into any object that is destroyed (the shared state,
 /// the host string, the lookup function and the pool are all owned through the worker's own
 /// copies / shared_ptrs).
@@ -35,9 +35,9 @@
 ///    name"). A consumer that keeps last-good state must treat it as a failed cycle, never as a
 ///    reason to drop that state.
 ///  - `kTemporary`, `kTimeout`, `kBusy` are retryable and mean "unknown".
-///  - WINDOWS: the Winsock DLL must be initialised (WSAStartup) before the first call. httplib
-///    initialises it once in a static initialiser, which every server TU links; a consumer in a
-///    binary without httplib must call WSAStartup itself.
+///  - The platform socket library must be initialised before the first call. httplib does this
+///    once in a static initialiser, which every server TU links; a consumer in a binary without
+///    httplib must initialise it itself.
 ///  - The lookup function runs on a worker thread: it must not assert, throw to the caller, or
 ///    touch caller-owned state (an exception is caught and reported `kTemporary`).
 ///
