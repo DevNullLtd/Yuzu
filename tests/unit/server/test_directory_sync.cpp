@@ -1033,3 +1033,67 @@ TEST_CASE("DiscoveryRoutes[pg]: a lost failure row still marks Sec-Audit-Failed 
     CHECK(missing->status == 400);
     CHECK(missing->get_header_value("Sec-Audit-Failed") == "true");
 }
+
+// ── A record with an embedded NUL is skipped and counted, never fatal ───────
+//
+// Identity-provider text can carry a NUL (a JSON \u0000 escape decodes to one) and Postgres text
+// cannot hold it. One such record must not abort the whole snapshot: a frozen sync keeps users
+// that were removed upstream in the roster, which delays deprovisioning. The poisoned record is
+// skipped and counted, everything else is applied, and the skipped record's earlier row (if any)
+// goes the way of any user absent from the snapshot.
+
+TEST_CASE("DirectorySync[pg]: a user or group with an embedded NUL is skipped and counted, the "
+          "rest of the snapshot still applies and removals still happen",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    DirectorySyncTestAccess::EntraSyncData first;
+    first.users.push_back(make_user("u1", "Alice"));
+    first.users.push_back(make_user("u2", "Bob"));
+    first.users.push_back(make_user("u_gone", "Removed Upstream"));
+    first.groups.push_back(make_group("g1", "Engineering"));
+    first.memberships["g1"] = {"u1", "u2", "u_gone"};
+    REQUIRE(acc.apply_entra_sync(first).has_value());
+    REQUIRE(store->get_user("u_gone").has_value());
+    REQUIRE(store->skipped_records() == 0);
+
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData second;
+    second.users.push_back(make_user("u1", "Alice"));
+    second.users.push_back(make_user("u2", "Bob" + nul + "Poisoned")); // display_name
+    second.users.push_back(make_user("u3", "Carol", "carol" + nul + "@example.com"));  // email
+    second.users.push_back(make_user("u4" + nul + "x", "Dana"));                        // id
+    second.users.push_back(make_user("u5", "Erin"));
+    auto bad_group = make_group("g_bad", "Poisoned");
+    bad_group.description = "d" + nul + "x";
+    second.groups.push_back(make_group("g1", "Engineering"));
+    second.groups.push_back(bad_group);
+    second.groups.push_back(make_group("g_bad2" + nul, "Poisoned id"));
+    second.memberships["g1"] = {"u1", "u2", "u3", "u5"};
+    second.memberships["g_bad"] = {"u1"};
+
+    auto result = acc.apply_entra_sync(second);
+    REQUIRE(result.has_value());
+
+    // Three poisoned users (u2, u3, u4) and two poisoned groups were skipped and counted.
+    CHECK(store->skipped_records() == 5);
+
+    // The good records applied, with their memberships.
+    CHECK(store->get_user("u1").has_value());
+    CHECK(store->get_user("u5").has_value());
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    REQUIRE(alice->groups.size() == 1);
+    CHECK(alice->groups[0] == "Engineering");
+
+    // A user removed upstream is gone: the sync was not frozen by the poisoned records.
+    CHECK_FALSE(store->get_user("u_gone").has_value());
+    // A skipped record is not stored; a row it had before goes like any absent user.
+    CHECK_FALSE(store->get_user("u2").has_value());
+    CHECK_FALSE(store->get_user("u3").has_value());
+
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].id == "g1");
+}

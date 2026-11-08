@@ -245,6 +245,13 @@ public:
     std::vector<DirectoryGroup> get_synced_groups() const;
 
     /// Get sync status for each configured provider.
+    /// Number of directory records (users and groups) skipped because a field carried an
+    /// embedded NUL byte, since this object was constructed. Postgres text cannot hold a NUL,
+    /// so such a record is skipped and counted instead of aborting the whole snapshot.
+    [[nodiscard]] std::uint64_t skipped_records() const noexcept {
+        return skipped_records_.load(std::memory_order_relaxed);
+    }
+
     SyncStatus get_status() const;
 
     /// Checked variant of `get_synced_groups`.
@@ -281,6 +288,9 @@ private:
     /// `compare_exchange_strong` at entry, reset via RAII on every exit path
     /// (the function has several early `return std::unexpected(...)`s).
     std::atomic<bool> entra_sync_in_progress_{false};
+
+    /// See `skipped_records()`.
+    std::atomic<std::uint64_t> skipped_records_{0};
 
     /// Complete remote snapshot fetched from Microsoft Graph before any
     /// database write — see the file header's transaction-shape note.

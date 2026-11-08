@@ -897,9 +897,53 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     return {};
 }
 
-std::expected<void, std::string> DirectorySync::apply_entra_sync(const EntraSyncData& data) {
+std::expected<void, std::string> DirectorySync::apply_entra_sync(const EntraSyncData& incoming) {
     if (!open_)
         return std::unexpected("directory sync store not open");
+
+    // Postgres text cannot hold an embedded NUL byte, and a JSON "\u0000" escape in an
+    // identity-provider response decodes to one. One such record must not fail the whole
+    // snapshot: a sync that cannot complete leaves users removed upstream in the roster, which
+    // delays deprovisioning. A record with a NUL in any stored field is skipped and counted;
+    // everything else applies. A skipped record is treated like any record absent from the
+    // snapshot, so a row it had before is removed by the stale-row delete below, and
+    // memberships naming a skipped group are dropped with it.
+    const auto has_nul = [](const std::string& v) { return v.find('\0') != std::string::npos; };
+    EntraSyncData data;
+    data.users.reserve(incoming.users.size());
+    data.groups.reserve(incoming.groups.size());
+    std::uint64_t skipped = 0;
+    for (const auto& u : incoming.users) {
+        if (has_nul(u.id) || has_nul(u.display_name) || has_nul(u.email) || has_nul(u.upn)) {
+            ++skipped;
+            continue;
+        }
+        data.users.push_back(u);
+    }
+    std::unordered_set<std::string> kept_group_ids;
+    for (const auto& g : incoming.groups) {
+        if (has_nul(g.id) || has_nul(g.display_name) || has_nul(g.description)) {
+            ++skipped;
+            continue;
+        }
+        kept_group_ids.insert(g.id);
+        data.groups.push_back(g);
+    }
+    for (const auto& [group_id, member_ids] : incoming.memberships) {
+        if (!kept_group_ids.contains(group_id))
+            continue;
+        auto& kept = data.memberships[group_id];
+        for (const auto& member_id : member_ids) {
+            if (!has_nul(member_id))
+                kept.push_back(member_id);
+        }
+    }
+    if (skipped != 0) {
+        skipped_records_.fetch_add(skipped, std::memory_order_relaxed);
+        spdlog::warn("DirectorySync: skipped {} directory record(s) with an embedded NUL byte; "
+                     "the rest of the snapshot is applied",
+                     skipped);
+    }
 
     // Filter membership pairs to users present in THIS snapshot. Graph's
     // /groups/{id}/members can return non-user directoryObjects (devices,
