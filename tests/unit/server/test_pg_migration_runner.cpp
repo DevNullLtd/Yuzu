@@ -635,6 +635,9 @@ TEST_CASE("PgMigrationRunner hash recording under concurrent runners (#7158)",
     SECTION("same vector on a fresh store: every runner succeeds, one apply row per version") {
         // Pins the re-read in the version-0-with-tables guard: a loser that read 0 just
         // before the winner committed must not be refused as "schema_meta loss".
+        // Probabilistic by nature (about 1 run in 6 catches the regression with the re-read
+        // removed; nothing here can force the interleaving without a production hook). A red
+        // run of this section is the re-read gone, not noise: do not retry it away.
         const auto r = run_concurrently(db.dsn(), "store_c", {v3, v3, v3, v3});
         for (int x : r)
             CHECK(x == 1);

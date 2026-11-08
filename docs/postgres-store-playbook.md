@@ -686,8 +686,9 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   predates the table. The per-store
   projection smoke-read below remains the second line of defence (column presence, which a hash
   cannot tell you); it is not mass-adopted by this change.
-- **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
-  refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
+- **Runner guards**: schema-drift guard — a schema whose version is still 0 on a re-read, yet already
+  contains tables, is refused (never blindly re-run migration 1); a concurrent first boot that
+  commits between the two reads is adopted, not refused. Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match
   `[a-z_][a-z0-9_]{0,62}` and must not be `public`/`information_schema`/`pg_*`. **Duplicate/
   non-monotonic version guard (#3013, #2961/#2964):** `run()` checks a store's own
