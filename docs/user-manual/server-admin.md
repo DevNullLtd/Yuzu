@@ -364,6 +364,26 @@ separately.
 
 > **Fresh deployment only for 0.15.0.** Entries below that tell you to upgrade, roll back or restore an earlier build are historical and not a supported path (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Entries describing behaviour of the 0.15.0 build still apply.
 
+### vNEXT - role removal and engine-role assignment refuse a role name containing a control byte; a NUL byte in a database text value is refused (breaking for deployments with such a role)
+
+**What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (REST `DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (REST `POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F): REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name`. Every other role name is accepted, including one granted out of band. Separately, a text value containing a NUL byte is now refused rather than shortened before it reaches the database.
+
+**Who is affected.** A deployment holding a role created out of band (direct SQL) whose name contains one of those bytes. Find them with:
+
+```sql
+SELECT name FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]';
+```
+
+**What to do.** Delete or rename the role in SQL (`DELETE FROM rbac_store.roles WHERE name = '<name>';` also removes its permissions and every grant of it, through the foreign keys' `ON DELETE CASCADE`), then re-create it under a clean name if it is still needed and grant it again.
+
+**Other effects.**
+
+- Where an input check exists, a NUL byte is answered as a client error (`400`, or -32602 on MCP). Elsewhere it may surface as a server error that retrying will not fix: treat it as permanent and do not retry. Database logs may show new SQLSTATE `22021` errors from a statement beginning `DO $yuzu_param$`; the value itself is never logged.
+- Directory sync skips and counts a record with a NUL byte in a key field, replaces a NUL byte in a display field with U+FFFD, and refuses a snapshot in which every user (or every group) would be skipped, leaving the stored roster unchanged. An already-synced record that gains a NUL byte in a key field is removed on the next sync, as any record absent upstream is.
+- A gateway that sends a NUL byte in a stream identifier receives `INVALID_ARGUMENT`.
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)): every server replica and gateway runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; mixed-version operation is not supported. See also [Upgrading](upgrading.md).
+
 ### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and echo (related issue #5291; breaking for fleets with non-standard profile roots)
 
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
@@ -4902,6 +4922,8 @@ For containerized deployments (Docker Compose), ensure the host volumes backing 
 The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Database role privileges.** The server's database role needs `USAGE` on the `plpgsql` procedural language, which PostgreSQL grants to every role by default (a deployment that revoked it from `PUBLIC` must grant it back): `pg::exec_params` refuses a bound text value that contains a NUL byte with a server-side `DO` block, and without `USAGE` that refusal would surface as a permission error instead of the NUL-byte message.
 
 **Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election, **plus one** for the `/readyz` reachability probe (HA WS-8). (The probe's connection runs one plain query per tick and holds no session state, so unlike the leader-election connection it works through a transaction-mode pooler; it reconnects after any failure.) Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 

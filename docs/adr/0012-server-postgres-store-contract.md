@@ -371,3 +371,21 @@ of `title_triples` at the rollup, because that table's primary key is a btree ov
 columns and Postgres refuses an entry beyond about 2,704 bytes, which would otherwise roll back the
 whole hourly refresh. Such a title is not normalised. The catalogue rollup's own
 `catalog_rollup_grain_key` has the same class of limit and is not changed here.
+
+## Update (2026-11-09) -- `pg::exec_params` refuses a NUL byte in a bound text parameter
+
+`pg::exec_params` (`pg/pg_exec.hpp`) binds text-format parameters, and libpq reads such a value as a
+C string, so an embedded NUL byte ended the value early instead of reaching the server. The helper
+now refuses a bound text parameter that contains a NUL byte: the call returns a failed result
+(SQLSTATE 22021, "parameter $N contains a NUL byte") and the caller's statement is not executed.
+The value is never echoed. An open transaction aborts exactly as it does for any other failed
+statement, so a caller that runs inside `with_txn_for` rolls back as it already does for a failed
+query. Only NUL is refused; tab, newline and the rest of the control range are valid text and are
+bound unchanged. The refusal is produced by a server-side `DO` block, so it needs `USAGE` on
+`plpgsql`, which every database has by default.
+
+A trust boundary (a route or tool that takes the value from a client) should validate first, so the
+client receives a client error (400 or -32602) rather than a store failure. `sanitize_pg_text`
+remains the rule for free text that should be kept: it replaces the byte and stores the rest. The
+only direct-bind exceptions, which call `PQexecParams` themselves and are not covered by the
+helper, are `pg/secret_codec.cpp` and `pg/pg_migration_runner.cpp`.

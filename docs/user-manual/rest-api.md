@@ -878,6 +878,8 @@ Add an agent to a static management group.
 }
 ```
 
+**Errors:** `400` if `agent_id` contains a NUL or other control byte (audited `management_group.add_member`, `result=denied`, `detail=invalid_agent_id`). `503` if the store could not apply the add (audited `result=failure`, `detail=store_error`). `added: true` and the success audit row are only produced after the store reports the add.
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}/members/{agent_id}`
@@ -894,6 +896,8 @@ Remove an agent from a management group.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `400` if `agent_id` contains a NUL or other control byte (audited `management_group.remove_member`, `result=denied`, `detail=invalid_agent_id`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `removed: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -1002,6 +1006,8 @@ Remove a role assignment from this management group.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `400` if `role_name` or `principal_id` contains a NUL or other control byte (audited `management_group.unassign_role`, `result=denied`, `detail=invalid_role_name` or `invalid_principal_id`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `unassigned: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -2957,7 +2963,10 @@ a principal).
 }
 ```
 
-**Errors:** `400` — invalid JSON, missing `role`, unknown role name, or the
+**Errors:** `400` — invalid JSON, missing `role`, a `role` containing a NUL,
+other control byte (0x01-0x1F) or DEL (audited `result=denied`,
+`detail=invalid_role_name`, checked before the principal and role are looked
+up), unknown role name, or the
 role is admin/built-in/otherwise rejected by `validate_assignment` (design
 §4.2 — always a `4xx`, never a `500`); `401`/`403` — not authenticated, missing
 `Security:Write`, an engine session, or MFA step-up required/failed; `404` — no active (live,
@@ -2986,7 +2995,9 @@ Unassign a fleet-wide role from an engine principal.
 ```
 
 **Errors:** the call is idempotent: a role that was not held also answers `200`
-(`removed=false` appears only in the audit detail). `401` or `403`: not
+(`removed=false` appears only in the audit detail). `400`: the `{role}` contains a
+NUL, other control byte (0x01-0x1F) or DEL (audited `result=denied`,
+`detail=invalid_role_name`). `401` or `403`: not
 authenticated, missing `Security:Write`, an engine session, or MFA step-up
 required or failed. `503`: the RBAC store is unavailable or the query failed.
 Audited
@@ -8432,7 +8443,7 @@ surfaces, not reads. `from-echo-query` runs SQL on Echo agents; `from-instructio
 runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
 re-runs a set's own source query and creates a **sibling** (same parent, new id).
 
-A `name` that contains a NUL byte (and, on the two producers that take one, a matcher or source payload that does) is refused with `400` before anything is dispatched, so a command is never run and then reported as failed because the result-set row could not be stored. The MCP twins refuse it as invalid params (-32602).
+A NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value) of `from-instruction-result`, in `parent_id`, or in a `matcher` is refused with `400` (`RESULT_SET_BAD_REQUEST`) before an execution row is written or anything is dispatched, so a command is never run and then reported as failed because the result-set row could not be stored. The refusal is audited as `result_set.create` with `result=denied` and `reason=field_contains_nul`. The MCP twins refuse it as invalid params (-32602) with the same audit row.
 
 **Permission:** `Execution:Execute`, **confined per device**
 
@@ -8490,6 +8501,7 @@ re-eval, unchanged.
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
+| 400 | `RESULT_SET_BAD_REQUEST`: a NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value), in `parent_id` or in a `matcher`; nothing is dispatched and the refusal is audited `result_set.create\|denied`, `reason=field_contains_nul`. On `re-eval`, a NUL in the stored `sql` or parameters is refused the same way |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_REEVAL_STALE_SOURCE` — on `from-echo-query`, the `sql` reads a raw capture table (a `$<Source>_Live` name or a `<source>_live` table); on `from-instruction-result`, an `echo.sql` definition's SQL does (the `params.sql` value, else the definition's declared default: the text the dashboard submits for a canned query; a default is never injected at dispatch, so a dispatch without `sql` is answered with an error by the agent and counted in `agents_failed`); on `re-eval`, the stored SQL does (for an `instruction_result` set, the stored `sql` param, else that same declared default). Echo keeps roll-up tiers only, so such a query answers with no rows and the set would be silently empty. Nothing is dispatched; query the hourly roll-up instead (for example `$Process_Hourly`). A match inside a comment, or inside a longer string literal (`'see process_live'`), is not a reference; a single-quoted token that is exactly a raw table name (`'process_live'`, `'$Process_Live'`) is one wherever it stands, because SQLite reads such a token as the table after `FROM`, `JOIN`, `IN` and in other positions, so `FROM 'process_live'` and `x IN 'process_live'` are refused, and so is a string literal equal to a raw table name (`WHERE name = 'process_live'`), the price of a rule that does not depend on position. This is a behaviour change for a stale client that stored a set over a `$<Source>_Live` name |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
@@ -13260,7 +13272,9 @@ minutes used to become an every-minute schedule) is `400` and nothing is created
 #### `DELETE /api/schedules/{id}`
 
 Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
-principal is left untouched (reports `deleted: false`, same as a nonexistent id).
+principal is left untouched (reports `deleted: false`, same as a nonexistent id). A store
+fault answers `503` (audited `schedule.delete`, `result=failure`, `detail=store_error`), not
+the `deleted: false` answer.
 
 #### `POST /api/schedules/{id}/enable`
 
@@ -13273,6 +13287,12 @@ fire — an operator can always disable a schedule to stop it even without
 (empty or whitespace-only) body enables, as before. A string (including the old `"true"` / `"false"` encoding), any other number,
 `null`, an array or object, or a body that is truncated or not a JSON object is `400` and the schedule
 is neither armed nor changed: `{"enabled":0}` used to arm it (#4644).
+
+A schedule id containing a NUL or other control byte is `400` (audited `result=denied`,
+`detail=invalid_schedule_id`). When the change is not applied, the route answers `404` for a
+schedule you cannot see, or `503` for a store fault (audited `result=failure`,
+`detail=store_error`), instead of `200` with the requested state. `200` and the success audit
+row mean the change was applied.
 
 ---
 
