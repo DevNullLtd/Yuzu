@@ -2820,6 +2820,78 @@ TEST_CASE("#3972 T10: an unstamped (seq == 0) entry is never held and never bloc
     CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1); // unchanged
 }
 
+TEST_CASE("UP-14: the cross-lane hold keys on seq alone; boot_epoch neither holds nor exempts",
+          "[spark][guardian][drain][order][emit_seq]") {
+    HoldRig f(20, std::chrono::hours{1});
+    f.sink.set_permits(kComplianceIdx, 0);
+    // A paged-style running send (seq stamped, boot_epoch 0) still blocks a younger stamped
+    // entry that carries a nonzero epoch: the wire epoch plays no part in the hold.
+    auto running = hand_entry(OutboxDomain::Compliance, 5, "c-5");
+    running.boot_epoch = 0;
+    CHECK(f.worker->wrapped_send_for_test(running) == SendResult::Retain);
+    REQUIRE(f.compliance().in_flight_snapshot().running);
+    auto younger = hand_entry(OutboxDomain::Lifecycle, 9, "l-9");
+    younger.boot_epoch = 7;
+    CHECK(f.worker->wrapped_send_for_test(younger) == SendResult::Retain);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1);
+    f.sink.open_all();
+    REQUIRE(spin_until([&] { return !f.compliance().in_flight_snapshot().running; }));
+
+    // A nonzero epoch does not rescue an unstamped (seq == 0) entry from the fail-open rule:
+    // a seq 0 running send holds nothing, whatever epoch it carries.
+    f.sink.set_permits(kComplianceIdx, 0);
+    auto unstamped = hand_entry(OutboxDomain::Compliance, 0, "c-0");
+    unstamped.boot_epoch = 7;
+    CHECK(f.worker->wrapped_send_for_test(unstamped) == SendResult::Retain);
+    REQUIRE(f.compliance().in_flight_snapshot().running);
+    auto free_entry = hand_entry(OutboxDomain::Lifecycle, 12, "l-12");
+    free_entry.boot_epoch = 7;
+    CHECK(f.worker->wrapped_send_for_test(free_entry) == SendResult::Sent);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1); // unchanged
+}
+
+TEST_CASE("UP-14: a Retain resend through the worker re-sends the entry with its pair intact",
+          "[spark][guardian][drain][emit_seq]") {
+    auto src = std::make_shared<GuardianEmitSeqSource>(1'790'000'777ULL);
+    GuardianSparkRuntime::Config cfg;
+    cfg.emit_seq_source = src;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b, cfg);
+
+    std::mutex mu;
+    std::vector<OutboxEntry> seen;
+    std::atomic<bool> link_up{false};
+    auto sink = [&](const OutboxEntry& e) -> SendResult {
+        {
+            std::lock_guard<std::mutex> lk{mu};
+            seen.push_back(e);
+        }
+        return link_up.load() ? SendResult::Sent : SendResult::Retain;
+    };
+    GuardianOutboxDrainWorker worker(*rt, std::ref(sink), /*periodic_bound_ms=*/20);
+    worker.start();
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    const auto seen_count = [&] {
+        std::lock_guard<std::mutex> lk{mu};
+        return seen.size();
+    };
+    REQUIRE(spin_until([&] { return seen_count() >= 1; }, 3s)); // first attempt: Retain
+    link_up = true;
+    REQUIRE(spin_until([&] { return !rt->lifecycle_front_seq().has_value(); },
+                       3s)); // resent, then Sent
+    worker.stop();
+
+    std::lock_guard<std::mutex> lk{mu};
+    REQUIRE(seen.size() >= 2);
+    for (const auto& e : seen) {
+        CHECK(e.seq > 0);
+        CHECK(e.boot_epoch == 1'790'000'777ULL);
+        CHECK(e.seq == seen.front().seq);
+        CHECK(e.boot_epoch == seen.front().boot_epoch);
+    }
+}
+
 TEST_CASE("#3972 T10b: an unstamped (seq == 0) entry is counted on its own lane; a stamped one is not",
           "[spark][guardian][drain][order]") {
     // The counter is the observable half of the fail-open diagnostic (the once-per-lane warn is

@@ -15,9 +15,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <latch>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -178,6 +181,43 @@ struct MixedOutcomeSend {
     }
 };
 
+/// UP-14: a send that records every delivered event's wire ordering pair in
+/// delivery order, thread-safely, and returns Sent. The delivery order is the
+/// executor's FIFO order (one worker), so this is also the wire send order.
+struct StampRecordingSend {
+    struct Stamp {
+        std::string rule_id;
+        std::uint64_t boot_epoch{0};
+        std::uint64_t emit_seq{0};
+        std::int64_t timestamp_s{0};
+    };
+    std::mutex mu;
+    std::vector<Stamp> stamps;
+    /// Declared LAST - see StallingSend::tripwire.
+    DestroyedFunctorTripwire tripwire;
+
+    LegacySendOutcome operator()(const Event& ev) {
+        tripwire.check("StampRecordingSend");
+        std::lock_guard<std::mutex> lk{mu};
+        stamps.push_back({ev.rule_id(), ev.boot_epoch(), ev.emit_seq(), ev.timestamp().seconds()});
+        return LegacySendOutcome::Sent;
+    }
+    std::size_t count() {
+        std::lock_guard<std::mutex> lk{mu};
+        return stamps.size();
+    }
+    std::vector<Stamp> snapshot() {
+        std::lock_guard<std::mutex> lk{mu};
+        return stamps;
+    }
+};
+
+GuardianLegacySinkExecutor::Config config_with_source(std::shared_ptr<GuardianEmitSeqSource> src) {
+    GuardianLegacySinkExecutor::Config cfg;
+    cfg.emit_seq_source = std::move(src);
+    return cfg;
+}
+
 /// Zero-padded "r000".."r099"-shaped rule_id, so lexicographic string order
 /// matches numeric order - used by the #4783 Gate 4 UP-2 rotation tests so the
 /// rule_id tie-break in gapped_rules_needing_repair()'s sort is predictable.
@@ -217,6 +257,24 @@ void require_completes_within(std::chrono::milliseconds timeout, const char* wha
         std::this_thread::sleep_for(1ms);
     }
 }
+
+// Joins every started thread on scope exit, including when a later emplace_back throws.
+// std::jthread is not used: Apple libc++ ships it only behind -fexperimental-library by
+// default, and the tree already works around its absence (see PortableJThread in
+// test_guardian_spark_runtime.cpp). Declare it BEFORE any thread starts
+// and AFTER every local the workers reference, so the joins run before those locals are
+// destroyed.
+struct JoinGuard {
+    std::vector<std::thread> threads;
+    JoinGuard() = default;
+    JoinGuard(const JoinGuard&) = delete;
+    JoinGuard& operator=(const JoinGuard&) = delete;
+    ~JoinGuard() {
+        for (auto& t : threads)
+            if (t.joinable())
+                t.join();
+    }
+};
 
 } // namespace
 
@@ -333,7 +391,9 @@ TEST_CASE("bytes-bound refusal counts, gaps, and leaves earlier events untouched
 
     GuardianLegacySinkExecutor::Config cfg;
     cfg.max_events = 100;
-    cfg.max_bytes = one_event_bytes; // room for exactly one queued event
+    // Room for exactly one queued event: offer() charges the unstamped size plus the
+    // worst-case emit-pair stamp (UP-14).
+    cfg.max_bytes = one_event_bytes + GuardianLegacySinkExecutor::kEmitPairMaxWireBytes;
     GuardianLegacySinkExecutor exec{cfg};
     StallingSend send;
     ScopeExit cleanup{[&] {
@@ -1581,4 +1641,288 @@ TEST_CASE("Per-loss attribution log: fires exactly once (warn) on a rule_id's fi
     CHECK(infos[0].rule_id == "r-loss");
     CHECK(infos[0].kind == "RefusedAdmission");
     CHECK(observed.size() == 2); // nothing else fired across all 150 losses
+}
+
+// ---------------------------------------------------------------------------------
+// UP-14: the wire (boot_epoch, emit_seq) pair is drawn at admission, under state_->mu,
+// from the shared GuardianEmitSeqSource - a draw that is SEPARATE from next_seq.
+// ---------------------------------------------------------------------------------
+
+TEST_CASE("emit-seq: admission order, not the event timestamp, decides emit_seq",
+          "[guardian][legacy_sink][emit_seq]") {
+    auto src = std::make_shared<GuardianEmitSeqSource>(42);
+    GuardianLegacySinkExecutor exec{config_with_source(src)};
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] { CHECK(exec.wait_workers_retired_for_test(5s)); }};
+
+    // The agent wall clock steps backward between events: each later offer carries an
+    // EARLIER timestamp. The wire ordinal must still follow admission order.
+    for (int i = 0; i < 3; ++i) {
+        Event ev = make_event("r" + std::to_string(i), "guard.compliant");
+        ev.mutable_timestamp()->set_seconds(1000 - 10 * i);
+        REQUIRE(exec.offer(std::move(ev), std::ref(send)) == OfferOutcome::Queued);
+    }
+    REQUIRE(spin_until([&] { return send.count() == 3; }));
+
+    const auto got = send.snapshot();
+    REQUIRE(got.size() == 3);
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        CHECK(got[i].rule_id == "r" + std::to_string(i)); // FIFO
+        CHECK(got[i].boot_epoch == 42);
+        CHECK(got[i].emit_seq == i + 1);
+    }
+    CHECK(got[0].timestamp_s > got[1].timestamp_s);
+    CHECK(got[1].timestamp_s > got[2].timestamp_s);
+}
+
+TEST_CASE("emit-seq: a capacity refusal consumes a value", "[guardian][legacy_sink][emit_seq]") {
+    auto src = std::make_shared<GuardianEmitSeqSource>(9);
+    auto cfg = config_with_source(src);
+    cfg.max_events = 1;
+    GuardianLegacySinkExecutor exec{cfg};
+    StallingSend blocker;
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] {
+        blocker.release();
+        CHECK(exec.wait_workers_retired_for_test(5s));
+    }};
+
+    // X occupies the worker (not counted against max_events once dequeued).
+    REQUIRE(exec.offer(make_event("X", "guard.compliant"), std::ref(blocker)) ==
+            OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return blocker.invocations.load() >= 1; }));
+
+    // A fills the one queue slot, B is refused, then C follows once A has drained.
+    REQUIRE(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) == OfferOutcome::Queued);
+    REQUIRE(exec.offer(make_event("B", "guard.compliant"), std::ref(send)) ==
+            OfferOutcome::RefusedCapacity);
+    blocker.release();
+    REQUIRE(spin_until([&] { return send.count() == 1; }));
+    REQUIRE(exec.offer(make_event("C", "guard.compliant"), std::ref(send)) == OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return send.count() == 2; }));
+
+    const auto got = send.snapshot();
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].rule_id == "A");
+    CHECK(got[1].rule_id == "C");
+    // X drew 1, A drew 2, the refused B drew 3, C drew 4.
+    CHECK(got[0].emit_seq == 2);
+    CHECK(got[1].emit_seq == got[0].emit_seq + 2);
+}
+
+TEST_CASE("emit-seq: an admission fault (ThrowOnNode) consumes a value",
+          "[guardian][legacy_sink][emit_seq]") {
+    auto src = std::make_shared<GuardianEmitSeqSource>(3);
+    GuardianLegacySinkExecutor exec{config_with_source(src)};
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] { CHECK(exec.wait_workers_retired_for_test(5s)); }};
+
+    exec.set_admission_fault_for_test(AdmissionFaultForTest::ThrowOnNode);
+    REQUIRE(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) ==
+            OfferOutcome::RefusedAdmission);
+    exec.set_admission_fault_for_test(AdmissionFaultForTest::None);
+    // The faulted attempt reached the lock and drew; the catch path emits nothing, so
+    // it must not draw a second value.
+    CHECK(src->last.load() == 1);
+
+    REQUIRE(exec.offer(make_event("B", "guard.compliant"), std::ref(send)) == OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return send.count() == 1; }));
+    const auto got = send.snapshot();
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].emit_seq == 2);
+    CHECK(src->last.load() == 2);
+}
+
+TEST_CASE("emit-seq: a RefusedStopping refusal consumes a value",
+          "[guardian][legacy_sink][emit_seq]") {
+    // The draw sits before the stopping check, so an offer refused because the executor is
+    // stopping still consumes one emit_seq value: a harmless gap, exactly as for a capacity
+    // refusal. (ThrowOnTicket, the other refusal fault, is not covered here: it throws
+    // before the lock is taken and before draw(), so it consumes no sequence number and has
+    // no draw to pin.)
+    auto src = std::make_shared<GuardianEmitSeqSource>(5);
+    GuardianLegacySinkExecutor exec{config_with_source(src)};
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] { CHECK(exec.wait_workers_retired_for_test(5s)); }};
+
+    require_completes_within(5s, "stop() on an idle executor", [&] { exec.stop(); });
+    CHECK(src->last.load() == 0);
+    REQUIRE(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) ==
+            OfferOutcome::RefusedStopping);
+    CHECK(src->last.load() == 1); // the refused offer drew, and drew exactly once
+    CHECK(send.count() == 0);
+}
+
+TEST_CASE("emit-seq: kEmitPairMaxWireBytes is the exact worst-case wire growth",
+          "[guardian][legacy_sink][emit_seq]") {
+    // offer() charges this many bytes against max_bytes BEFORE the stamp is applied under the
+    // lock. Pin the constant against a real serialization: with both fields at uint64 max
+    // (two 2-byte tags, two 10-byte varints) the event grows by exactly that many bytes.
+    static_assert(GuardianLegacySinkExecutor::kEmitPairMaxWireBytes == 24);
+    const Event plain = make_event("r", "guard.compliant");
+    Event stamped = plain;
+    stamp_emit_pair(stamped, std::numeric_limits<std::uint64_t>::max(),
+                    std::numeric_limits<std::uint64_t>::max());
+    CHECK(stamped.ByteSizeLong() - plain.ByteSizeLong() ==
+          GuardianLegacySinkExecutor::kEmitPairMaxWireBytes);
+}
+
+TEST_CASE("emit-seq: an epoch-0 source still draws but puts nothing on the wire",
+          "[guardian][legacy_sink][emit_seq]") {
+    auto src = std::make_shared<GuardianEmitSeqSource>(0);
+    auto cfg = config_with_source(src);
+    cfg.max_events = 1;
+    GuardianLegacySinkExecutor exec{cfg};
+    StallingSend blocker;
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] {
+        blocker.release();
+        CHECK(exec.wait_workers_retired_for_test(5s));
+    }};
+
+    REQUIRE(exec.offer(make_event("X", "guard.compliant"), std::ref(blocker)) ==
+            OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return blocker.invocations.load() >= 1; }));
+    REQUIRE(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) == OfferOutcome::Queued);
+    REQUIRE(exec.offer(make_event("B", "guard.compliant"), std::ref(send)) ==
+            OfferOutcome::RefusedCapacity);
+
+    // next_seq (the SEQ-GUARDED CLEARING counter) advanced independently of the wire
+    // gate: B was the third admission, so its gap records lost_seq 3.
+    const auto gaps = exec.gapped_rules_needing_repair(10);
+    REQUIRE(gaps.size() == 1);
+    CHECK(gaps[0].first == "B");
+    CHECK(gaps[0].second.lost_seq == 3);
+    CHECK(src->last.load() == 3); // the hold key is always drawn
+
+    blocker.release();
+    REQUIRE(spin_until([&] { return send.count() == 1; }));
+    const auto got = send.snapshot();
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].boot_epoch == 0);
+    CHECK(got[0].emit_seq == 0);
+}
+
+TEST_CASE("emit-seq: an executor with no injected source stamps nothing",
+          "[guardian][legacy_sink][emit_seq]") {
+    GuardianLegacySinkExecutor exec;
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] { CHECK(exec.wait_workers_retired_for_test(5s)); }};
+    REQUIRE(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) == OfferOutcome::Queued);
+    REQUIRE(spin_until([&] { return send.count() == 1; }));
+    const auto got = send.snapshot();
+    CHECK(got[0].boot_epoch == 0);
+    CHECK(got[0].emit_seq == 0);
+}
+
+TEST_CASE("emit-seq: two executors sharing one source draw unique interleaved values",
+          "[guardian][legacy_sink][emit_seq]") {
+    auto src = std::make_shared<GuardianEmitSeqSource>(5);
+    GuardianLegacySinkExecutor exec1{config_with_source(src)};
+    GuardianLegacySinkExecutor exec2{config_with_source(src)};
+    StampRecordingSend send1;
+    StampRecordingSend send2;
+    ScopeExit cleanup{[&] {
+        CHECK(exec1.wait_workers_retired_for_test(5s));
+        CHECK(exec2.wait_workers_retired_for_test(5s));
+    }};
+
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(exec1.offer(make_event("a", "guard.compliant"), std::ref(send1)) ==
+                OfferOutcome::Queued);
+        REQUIRE(exec2.offer(make_event("b", "guard.compliant"), std::ref(send2)) ==
+                OfferOutcome::Queued);
+    }
+    REQUIRE(spin_until([&] { return send1.count() == 3 && send2.count() == 3; }));
+
+    const auto g1 = send1.snapshot();
+    const auto g2 = send2.snapshot();
+    std::set<std::uint64_t> all;
+    for (const auto& s1 : g1) {
+        CHECK(s1.boot_epoch == 5);
+        all.insert(s1.emit_seq);
+    }
+    for (const auto& s2 : g2) {
+        CHECK(s2.boot_epoch == 5);
+        all.insert(s2.emit_seq);
+    }
+    CHECK(all.size() == 6); // no value repeated across the two executors
+    for (std::size_t i = 0; i < 3; ++i) {
+        // Sequential offers alternate between the executors: 1,3,5 and 2,4,6.
+        CHECK(g1[i].emit_seq == 2 * i + 1);
+        CHECK(g2[i].emit_seq == 2 * i + 2);
+    }
+}
+
+TEST_CASE("emit-seq: the byte cap accounts for the stamp", "[guardian][legacy_sink][emit_seq]") {
+    const Event probe = make_event("A", "guard.compliant");
+    const std::size_t unstamped = probe.ByteSizeLong();
+    auto make_cfg = [&](std::size_t max_bytes) {
+        auto cfg = config_with_source(std::make_shared<GuardianEmitSeqSource>(1));
+        cfg.max_bytes = max_bytes;
+        return cfg;
+    };
+
+    {
+        GuardianLegacySinkExecutor exec{make_cfg(unstamped + 23)};
+        StampRecordingSend send;
+        CHECK(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) ==
+              OfferOutcome::RefusedCapacity);
+        CHECK(exec.stats().backpressure_drops == 1);
+    }
+    {
+        GuardianLegacySinkExecutor exec{make_cfg(unstamped + 24)};
+        StampRecordingSend send;
+        ScopeExit cleanup{[&] { CHECK(exec.wait_workers_retired_for_test(5s)); }};
+        CHECK(exec.offer(make_event("A", "guard.compliant"), std::ref(send)) ==
+              OfferOutcome::Queued);
+        REQUIRE(spin_until([&] { return send.count() == 1; }));
+    }
+}
+
+TEST_CASE("emit-seq: concurrent offers are delivered in strictly increasing emit_seq order",
+          "[guardian][legacy_sink][emit_seq][tsan]") {
+    constexpr int kThreads = 4;
+    constexpr int kOffers = 200;
+    auto src = std::make_shared<GuardianEmitSeqSource>(11);
+    GuardianLegacySinkExecutor exec{config_with_source(src)};
+    StampRecordingSend send;
+    ScopeExit cleanup{[&] { CHECK(exec.wait_workers_retired_for_test(10s)); }};
+
+    {
+        std::latch start(kThreads);
+        JoinGuard workers;
+        workers.threads.reserve(kThreads);
+        int spawned = 0;
+        try {
+            for (int t = 0; t < kThreads; ++t) {
+                workers.threads.emplace_back([&, t] {
+                    start.arrive_and_wait();
+                    for (int i = 0; i < kOffers; ++i) {
+                        // Offers all fit the default bounds, so every one is Queued; a
+                        // refusal would only shrink the delivered set, never break the
+                        // order check below.
+                        (void)exec.offer(make_event("t" + std::to_string(t), "guard.compliant"),
+                                         std::ref(send));
+                    }
+                });
+                ++spawned;
+            }
+        } catch (...) {
+            start.count_down(kThreads - spawned); // release the started workers, then join
+            throw;
+        }
+    } // the guard joins here
+    REQUIRE(spin_until([&] { return send.count() == std::size_t{kThreads} * kOffers; }));
+
+    // Order is checked over the GLOBAL delivery sequence, not per producer thread:
+    // a draw taken outside the admission lock lets two threads queue out of draw order.
+    const auto got = send.snapshot();
+    REQUIRE(got.size() == std::size_t{kThreads} * kOffers);
+    std::uint64_t prev = 0;
+    for (const auto& s : got) {
+        CHECK(s.boot_epoch == 11);
+        CHECK(s.emit_seq > prev);
+        prev = s.emit_seq;
+    }
 }
