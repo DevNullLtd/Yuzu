@@ -10,6 +10,7 @@
  * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
+#include "access_review_store.hpp" // kHistoryJustificationPreviewChars (description drift pin)
 #include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
@@ -124,6 +125,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -2533,6 +2535,133 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
                 token_id_required = true;
         CHECK(token_id_required);
     }
+}
+
+// #4752: the access-review decision history is part of the served contract. record_attestation
+// stays destructive (the current decision is replaced and a grant cannot go back to pending) but
+// its prose must no longer claim the earlier decision is lost, and get_access_review types the
+// attestation items, decision_seq and history, not a bare array.
+TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the append contract; "
+          "get_access_review types decision_seq and history",
+          "[mcp][2g][4752]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const nlohmann::json* record = nullptr;
+    const nlohmann::json* get = nullptr;
+    for (const auto& t : tools) {
+        if (t["name"] == "record_attestation")
+            record = &t;
+        if (t["name"] == "get_access_review")
+            get = &t;
+    }
+    REQUIRE(record != nullptr);
+    REQUIRE(get != nullptr);
+
+    CHECK((*record)["annotations"]["destructiveHint"] == true);
+    const auto rdesc = (*record)["description"].get<std::string>();
+    // The descriptions state the preview length from the constant, so a change to one that
+    // leaves the other behind fails.
+    const std::string first_n =
+        "first " + std::to_string(yuzu::server::kHistoryJustificationPreviewChars) + " characters";
+    for (const std::string& needle : std::vector<std::string>{
+             "destructiveHint:true", "every decision is kept", "decision_seq",
+             "must differ from the subject of the grant",
+             "the reviewer must differ from the subject of this grant; ask another "
+             "reviewer to record this decision",
+             "at most 1024 bytes each and justification at most 4096 bytes", "the 100th is final",
+             "until the grant reaches its limit of 100 decisions", "at most 100 recorded decisions",
+             "refused with invalid params and records nothing", "returns decision_seq",
+             "previous_decision", "retry_after_ms can mean the decision was recorded anyway",
+             "before retrying, call get_access_review, compare decision_seq",
+             "match reviewer, justification and decided_at_ms",
+             "an earlier entry shows at most its " + first_n,
+             "a blind retry appends another identical decision"})
+        CHECK(rdesc.find(needle) != std::string::npos);
+    for (const char* stale : {"UPSERT", "OVERWRITES", "not retained"})
+        CHECK(rdesc.find(stale) == std::string::npos);
+
+    const auto gdesc = (*get)["description"].get<std::string>();
+    CHECK(gdesc.find("decision_seq") != std::string::npos);
+    CHECK(gdesc.find("history") != std::string::npos);
+    CHECK(gdesc.find("justification_truncated") != std::string::npos);
+    CHECK(gdesc.find("at most its " + first_n) != std::string::npos);
+
+    const auto& items = (*get)["outputSchema"]["properties"]["attestations"]["items"];
+    REQUIRE(items.is_object());
+    CHECK(items["properties"]["decision_seq"]["type"] == "integer");
+    const auto& hist = items["properties"]["history"];
+    CHECK(hist["type"] == "array");
+    for (const char* k : {"seq", "decision", "previous_decision", "reviewer", "justification",
+                          "justification_truncated", "decided_at_ms"}) {
+        CHECK(hist["items"]["properties"].contains(k));
+        const auto& hreq = hist["items"]["required"];
+        CHECK(std::find(hreq.begin(), hreq.end(), k) != hreq.end());
+    }
+    CHECK(hist["items"]["properties"]["justification_truncated"]["type"] == "boolean");
+    CHECK(hist["items"]["properties"]["seq"]["type"] == "integer");
+    CHECK(hist["items"]["properties"]["previous_decision"]["enum"] ==
+          nlohmann::json::array({"", "pending", "attested", "flagged_revoke"}));
+    const auto required = items["required"];
+    CHECK(std::find(required.begin(), required.end(), "decision_seq") != required.end());
+    CHECK(std::find(required.begin(), required.end(), "history") != required.end());
+}
+
+// #4752: the history preview length appears as a literal number in many description strings.
+// The tests above tie some of them to kHistoryJustificationPreviewChars; this sweeps the whole
+// served OpenAPI document and the whole MCP tools/list for every "first|than|to N characters"
+// phrase within 200 characters of the word "justification" and requires N to equal the
+// constant, so a stale literal anywhere fails rather than only the sites a test names.
+TEST_CASE("MCP 4752: every history-preview length in the OpenAPI document and tools/list "
+          "equals kHistoryJustificationPreviewChars",
+          "[mcp][2g][4752][openapi]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+
+    struct Sweep {
+        std::size_t matched = 0;
+        std::vector<std::string> wrong; // context of every site whose number is stale
+    };
+    const auto sweep = [](const std::string& text) {
+        std::string lowered = text;
+        for (auto& c : lowered)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        static const std::regex phrase(R"((first|than|to) (\d+) characters)");
+        constexpr std::size_t kNear = 200;
+        Sweep out;
+        for (std::sregex_iterator it(text.begin(), text.end(), phrase), end; it != end; ++it) {
+            const auto pos = static_cast<std::size_t>(it->position());
+            const std::size_t from = pos > kNear ? pos - kNear : 0;
+            const std::size_t len = std::min(
+                lowered.size() - from, kNear + static_cast<std::size_t>(it->length()) + kNear);
+            if (lowered.substr(from, len).find("justification") == std::string::npos)
+                continue; // an unrelated numeric phrase
+            ++out.matched;
+            if (std::stoll((*it)[2].str()) !=
+                static_cast<long long>(yuzu::server::kHistoryJustificationPreviewChars))
+                out.wrong.push_back(text.substr(from, len));
+        }
+        return out;
+    };
+
+    const auto openapi = sweep(yuzu::server::openapi_spec_with_guides_json());
+    const auto mcp = sweep(res->body);
+    // Floors so a rephrase cannot make the sweep pass vacuously. Counted when this was written:
+    // 7 in the OpenAPI document with guides (the history entry's justification and
+    // justification_truncated descriptions, the Access Reviews guide's decision-history note
+    // twice, GET /access-reviews/{id}, and the POST attestations description twice) and 3 in
+    // tools/list (get_access_review once, record_attestation twice). The sweep also sees, and
+    // skips as unrelated, phrases such as "longer than 512 characters" and "up to 128
+    // characters", which sit more than 200 characters from the word justification.
+    CHECK(openapi.matched >= 7);
+    CHECK(mcp.matched >= 3);
+    // Comparing against an empty vector makes Catch print the stale contexts on failure.
+    CHECK(openapi.wrong == std::vector<std::string>{});
+    CHECK(mcp.wrong == std::vector<std::string>{});
 }
 
 // #2383: C8 fail-closed. The boot validator and the three-way dispatch

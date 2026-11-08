@@ -4358,6 +4358,11 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > corresponding audit verb is recorded with `result=denied` and
 > `detail="engine_session_denied"`.
 
+**Response envelope.** Every successful JSON response of the access-review routes below is wrapped as
+`{"data": ..., "meta": {"api_version": "v1"}}`, and a body written in shorthand below is the content of `data` (where a
+shorthand names `data` and `meta` itself it is shown as written). The JSON export adds `pagination` and
+`rbac_enforcement` beside them; the CSV export (`?format=csv`) is not wrapped.
+
 **Grant-table-driven completeness.** The export and every campaign freeze
 are driven by the grant table, not a roster walk — a principal with **zero**
 role grants produces no row (the export answers "who currently has access",
@@ -4468,8 +4473,10 @@ exists to surface.
 
 List every review campaign's metadata (**not** its attestations — use
 `GET /api/v1/access-reviews/{id}` for those), newest-first, capped at the
-most recent 500. The surface an auditor needs to prove reviews ran on
-cadence without already knowing a `campaign_id` out-of-band.
+most recent 500, so a `campaign_id` need not be known out-of-band. The list
+carries no decided or pending counts and is not by itself proof that a review
+was completed: read a campaign with `GET /api/v1/access-reviews/{id}` to see
+`pending_count` and the attestation rows.
 
 **Permission:** `AccessReview:Read`.
 
@@ -4508,10 +4515,11 @@ below.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `title` | string | Yes | Human-readable campaign name |
+| `title` | string | Yes | Human-readable campaign name, 1 to 256 bytes, no NUL byte |
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
-or `title` missing/empty. `403` without `AccessReview:Attest` (or an
+or `title` missing, empty, longer than 256 bytes or containing a NUL byte (neither an over-long nor a
+NUL-bearing title writes an audit row). `403` without `AccessReview:Attest` (or an
 engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `415` — `Content-Type` is not
@@ -4525,34 +4533,104 @@ Audited as `access_review.campaign_opened` (`detail` carries
 
 Full evidentiary state of one review campaign: metadata plus every frozen
 attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
-(the review-completeness number).
+(the review-completeness number). Each attestation row carries its current
+decision, `decision_seq` and `history[]`, the decisions recorded for that grant (the
+limits are below).
 
 **Permission:** `AccessReview:Read`.
 
-**Responses:** `200` —
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`. A path that is
+longer than 256 bytes in all is refused by the server before the route runs
+(`404`, with the connection closed), so an id of a few hundred characters never
+reaches this check (see "Refusals that come before this gate" above).
+
+**Responses:** `200`, the object below, in `data`, with `meta` as shown.
 
 ```json
 {
-  "campaign": {
-    "campaign_id": "...", "title": "...", "status": "open",
-    "created_by": "alice", "created_at_ms": 0,
-    "closed_by": "", "closed_at_ms": 0,
-    "rbac_enforcement": "enabled"
+  "data": {
+    "campaign": {
+      "campaign_id": "...", "title": "...", "status": "open",
+      "created_by": "alice", "created_at_ms": 0,
+      "closed_by": "", "closed_at_ms": 0,
+      "rbac_enforcement": "enabled"
+    },
+    "attestations": [
+      {
+        "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
+        "decision": "pending", "reviewer": "", "decided_at_ms": 0,
+        "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." },
+        "decision_seq": 0, "history": []
+      }
+    ],
+    "pending_count": 1
   },
-  "attestations": [
-    {
-      "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
-      "decision": "pending", "reviewer": "", "decided_at_ms": 0,
-      "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." }
-    }
-  ],
-  "pending_count": 1
+  "meta": { "api_version": "v1" }
 }
 ```
 
-`403` without `AccessReview:Read` (or an engine-classed caller). `404` — no
-campaign with that id. `503` — the access-review store is unavailable, or a
-genuine read failure.
+`decision_seq` is the number of decisions recorded for the grant: `0` exactly
+while it is `pending`, then `1`, `2` and so on. `history[]` lists the grant's
+decisions in `seq` order, oldest first (at most the latest 100), and is empty
+while the grant is pending. Each entry has `seq` (1 for the first decision on the grant; order is by
+`seq`, never by time), `decision`, `previous_decision` (the decision it replaced:
+`pending` for the first one; an empty string means *not recorded*, for a decision
+that predates the history table, and never means pending), `reviewer`,
+`justification`, `justification_truncated` and `decided_at_ms` (authored by the
+database clock, the write transaction's `now()` in epoch milliseconds; it is the transaction START time, so it can precede the
+commit by the lock wait, and a decision queued behind a lock can carry an earlier stamp than the one it follows, so order one
+grant's decisions by `seq`). `created_at_ms` and `closed_at_ms` are authored the same way. A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host. The grant's own `decision`, `reviewer`,
+`justification` and `decided_at_ms` are the latest entry. Only the latest entry
+carries its whole `justification`. Every earlier entry carries at most the first
+64 characters of the text it was recorded with (counted in characters, so on a
+UTF8 database a multibyte character is never split; see "Database encoding" in
+`docs/auth-architecture.md`), and `justification_truncated` is `true`
+exactly when text was cut (always `false` for the latest entry and for a short
+one). The full text of an earlier entry stays in the database and is not
+returned by this call, which limits the response for a campaign with many
+grants: at most 100 entries per grant, and at most 64 characters of
+justification on all but the latest. The API and the Access page show only that
+preview of a superseded decision, never the full record; the full text is a
+database read of `access_review_store.access_review_attestation_history`
+(queries and caveats: "Obtaining the full justification of a superseded
+decision" in `docs/auth-architecture.md`; the read is outside the product and
+Yuzu does not audit it). To match your own earlier entry after a lost
+answer (see `POST .../attestations` below), compare its `justification` with the
+first 64 characters of what you sent. The response grows with every recorded
+decision, up to 100 per grant: `history[]` lists at most the latest 100 entries of
+a grant, and `decision_seq` stays the total, so `decision_seq` greater than the
+number of entries means earlier ones are not shown (the write cap keeps a grant at
+or under 100 for rows written through the application path, so this appears only if
+rows were added or removed by other means, such as owner-level SQL with the guard
+triggers disabled, which is outside the guarantee). The server builds the whole response in
+memory, and a campaign of 1000 grants at the limits measured 32 MB to 105 MB on the wire with a server
+peak several times that; the figures and the sizing advice are in `docs/auth-architecture.md`,
+"The decision history".
+The Settings campaign fragment shows the latest decision only and has
+no marker for earlier ones; that difference is intended. The Access page shows the
+latest decision with a marker and the earlier ones behind a disclosure; when the
+grant has more recorded decisions than are listed, the disclosure starts with the
+line "N earlier decisions are not shown" ("1 earlier decision is not shown" for
+one). The marker
+reads "re-recorded" when every later entry repeats the one before it exactly (the
+same decision, reviewer and justification), which is what a retry after an
+unacknowledged commit produces (see `POST .../attestations` below), and
+"superseded <n> earlier decisions" otherwise. An entry's own line says whether it
+is a re-recording or supersedes the one before. An entry whose justification was
+cut shows the shortened text followed by "(truncated)". A pair in which either
+entry was cut is never labelled a re-recording, because a cut text cannot be
+shown to equal the next one; it reads as superseding even when the full texts
+were identical.
+
+`400`: the campaign id is malformed (see the rule above). `403` without
+`AccessReview:Read` (or an engine-classed caller). `404` — no campaign with
+that id. `503` — the access-review store is unavailable, or a genuine read
+failure.
 
 Audited as `access_review.get`.
 
@@ -4561,6 +4639,13 @@ Audited as `access_review.get`.
 Record one reviewer decision against a grant frozen into an open campaign.
 
 **Permission:** `AccessReview:Attest`.
+
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`.
 
 **Request body:**
 
@@ -4577,10 +4662,10 @@ Record one reviewer decision against a grant frozen into an open campaign.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `principal_type` | string | Yes | `user` \| `group` \| `engine` |
-| `principal_id` | string | Yes | Principal identifier |
-| `role_name` | string | Yes | Role being reviewed |
+| `principal_id` | string | Yes | Principal identifier, 1 to 1024 bytes, no NUL byte |
+| `role_name` | string | Yes | Role being reviewed, 1 to 1024 bytes, no NUL byte |
 | `decision` | string | Yes | `attested` \| `flagged_revoke` |
-| `justification` | string | No | Free-text reviewer note |
+| `justification` | string | No | Free-text reviewer note, at most 4096 bytes. It is kept with the decision and the application never deletes it: do not enter personal data beyond what the review requires. |
 
 **`flagged_revoke` records evidence ONLY — it never itself revokes the
 grant.** No RBAC/EnginePrincipal mutation happens on this path; acting on
@@ -4588,40 +4673,176 @@ the flag (unassigning the role, revoking the engine principal, etc.) is a
 separate, explicit operator action performed after reading this evidence.
 flag ≠ revoke.
 
-**Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
-`principal_id`, or `role_name` missing, or `decision` is neither `attested`
-nor `flagged_revoke`, or an identifier contains a NUL byte or is longer than 512 bytes (a `campaign_id` in the URL path
-that makes the whole path longer than 256 bytes answers `404` with the connection closed instead), or the
-`justification` contains a NUL byte or is longer than 8192 bytes. `403` without `AccessReview:Attest` (or an engine-classed
-caller), or for a browser (session-cookie) request that carries no
-`Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
-callers are exempt). Also `403` when the caller is the subject of the grant
-(a `user` grant whose `principal_id` is the caller's own username) or the owner
-of the `engine` principal being reviewed — see "Separation of duties" below.
-`404` — no campaign with that id, no such frozen grant in it, or
-the campaign is already closed. `409` — the grant already has a decision.
-`415` — `Content-Type` is not
-`application/json`. `503` — the access-review store is
-unavailable, or a genuine write failure.
+**Responses:** `200` with `{recorded: true, decision_seq, previous_decision}`:
+`decision_seq` is this decision's position in the grant's history (`1` for the
+first) and `previous_decision` is the decision it replaced (`pending` for the
+first), so a reviewer working from a stale view can see that it replaced another
+decision. `400`, one cause each:
 
-**A decision is final.** The first `attested` or `flagged_revoke` recorded for a
-`(campaign_id, principal_type, principal_id, role_name)` grant stays: a second
-call, by any reviewer, returns `409` and changes nothing. If a decision was a
-mistake, open a new campaign and review the grant again. (`record_attestation`
-on MCP is `destructiveHint:true` because the write is irreversible, see
-`docs/mcp-server.md`.)
+- The campaign id is malformed (see the rule above).
+- `principal_type`, `principal_id` or `role_name` is missing, or `decision` is neither `attested` nor
+  `flagged_revoke`.
+- `principal_type`, `principal_id` or `role_name` is longer than 1024 bytes or contains a NUL byte. The
+  message is `principal_type, principal_id and role_name must be 1-1024 bytes without NUL`. It is decided
+  before any lookup, so it holds for all three principal types, and it writes no audit row (the schema
+  `maxLength` values are discovery metadata; the handler enforces the limit). The limit bounds the
+  audit rows and no known creation path produces a longer id, but a frozen grant whose `principal_id` or
+  `role_name` exceeds 1024 bytes cannot be attested: it stays `pending` and is reported as an incomplete
+  review when the campaign closes.
+- `justification` is present and not a string (a number, boolean, array or object; `null` counts as
+  absent). It is refused before the gate and writes no audit row: an entry cannot be corrected once
+  recorded, so a note is never read as empty and dropped.
+- `justification` is longer than 4096 bytes or contains a NUL byte. The store checks this after the
+  separation-of-duties gate and writes a `failure` audit row.
+- The grant already holds the maximum of 100 recorded decisions. The message is
+  `this grant already has the maximum number of recorded decisions (100) in this campaign; no further decision can be recorded on it. To review it again, open a new campaign (closing this one is a separate choice: it leaves every undecided grant pending). If an earlier attempt may have been recorded, read the campaign first`,
+  with no `bad_request:` prefix. It is decided in the store, leaves the state unchanged and writes a
+  `failure` audit row.
 
-**Separation of duties.** You cannot decide your own access. The route returns
-`403` when the caller is the subject of a `user` grant, or the owner of an
-`engine` principal as recorded when the campaign was opened; another reviewer
-must decide it. The comparison is exact (no case folding), and a call made with
-an API token counts as the token's owner. Group grants have no owner, so they
-are not covered by this check. When one call breaks both rules, the `403` is
-returned.
+Other statuses: `403`
+without `AccessReview:Attest` (or an engine-classed caller), for a browser
+(session-cookie) request that carries no `Origin`/`Referer` naming this site
+(audited as `csrf.denied`; API-token callers are exempt), or because the reviewer
+is the subject of the grant (see the next paragraph). `404` — no campaign with
+that id, no such frozen grant in it, or the campaign is already closed (a
+reviewer who is the subject of the grant, of any of the three types, gets the
+`403` instead, even for a closed campaign). `415` — `Content-Type` is not `application/json`. `503` — the
+access-review store is unavailable, a genuine write failure (including a row-lock
+wait that expired after 3 seconds, SQLSTATE `55P03`, in which nothing was
+committed), or the check that the reviewer differs from the subject could not be
+answered (see below).
+
+**The reviewer must differ from the subject of the grant.** The reviewer is the
+session's principal. The route refuses the decision when the reviewer is the
+subject of the grant, by `principal_type`: a `user` grant whose `principal_id` is
+the reviewer (an exact, case-sensitive comparison of the account name); an
+`engine` grant for an engine principal the reviewer owns now or owned when the campaign opened (revoked ones included; the owner is frozen into the grant at open, so a former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner);
+a `group` grant for a group the reviewer is a member of (memberships an identity
+provider assigns count). An engine id or group with no record is admitted. The
+same rule holds for both decisions, so a subject cannot flag or un-flag a grant
+that names them. The group check, and the check of who owns the engine principal now,
+are read just before the write, not inside it, so a membership change, or an ownership the
+reviewer acquires, that lands in between is not seen; the user rule and the comparison with
+the owner frozen at campaign open (made inside the write transaction, answered with the same
+`403` body and the audit reason `sod_engine_owner`) have no such gap. The two identities of one
+person (a local account and an SSO identity) count as two reviewers.
+
+**How fresh the engine and group checks are.** Both pre-reads see the state at the
+moment of the attest, so a member who left a group before attesting is admitted, and a
+reviewer who owns the engine principal now is refused even if they did not own it at open.
+An owner who transferred the engine away is still refused by the frozen owner comparison. The way out is to ask another reviewer to record the decision, or to open a new campaign, which freezes the current owner as the grant's owner.
+Current engine ownership is a live read. Group membership is read
+from Yuzu's stored membership, which an identity provider updates only when that
+member signs in: a change at the identity provider is not seen by the group rule
+until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token
+skips the membership refresh (for example an Entra groups-overage token) does not
+refresh it. For identity-provider-governed groups the group rule is therefore not
+a current-membership check; review those groups at the identity provider when the
+campaign closes. For an engine or group grant the history entry does not record the
+ownership or membership basis; the `sod=pass` audit row is the evidence of
+independence (see `docs/auth-architecture.md` "Periodic access reviews"). Treat
+independence as unevidenced if that row was not persisted (`Sec-Audit-Failed: true`
+on the response).
+
+**Every decision is kept.** A second decision for the same `(campaign_id,
+principal_type, principal_id, role_name)` does not replace the first: it is
+appended to the grant's history at the next `seq`, with the decision it replaced.
+Only the grant's current decision, reviewer and justification are replaced, and
+a grant cannot return to `pending`. An identical repeat is appended too, as a new
+entry. `decision_seq` in the `GET /api/v1/access-reviews/{id}` response shows how
+many decisions the grant has. A grant keeps at most 100: the 100th decision is
+final, and no further decision is accepted on that grant in that campaign. The
+history and the audit rows identify who wrote the entries. To review the grant
+again, open a new campaign, which re-freezes the whole population as pending (closing this one is a separate choice that leaves every undecided grant pending). `record_attestation`'s MCP `destructiveHint` stays
+`true` because the current decision is replaced with no route back to pending; the
+earlier one is kept in the history (a read returns the latest 100 entries per grant,
+an earlier justification cut to its first 64 characters).
+
+**If the answer is lost, read before retrying.** A decision is recorded when its
+transaction commits. If the connection drops after the commit was sent, the server
+cannot tell whether it was recorded and answers a write failure (`503`). Before
+retrying, `GET /api/v1/access-reviews/{id}`, compare `decision_seq` with the value
+you last saw and look for your own entry (match `reviewer`, `justification` and
+`decided_at_ms`; once a later decision exists, an earlier entry's `justification`
+is at most its first 64 characters). A blind retry after an unacknowledged commit appends an identical
+decision at the next `seq`; it is kept and visible, not an error, until the
+grant reaches its limit of 100 decisions, after which the request is refused (read
+the campaign first if your earlier attempt may have been recorded). The first
+attempt writes a `failure` audit row, so an auditor sees a failure row next to a
+committed decision. There is no idempotency key.
+
+**Store failure answer.** A store failure that is not the caller's (a lease timeout,
+a query error, a row-lock wait that expired after 3 seconds (SQLSTATE `55P03`, nothing
+committed), a lost commit acknowledgement) is answered `503` with the fixed
+message `the decision store is unavailable or the decision may not have been
+committed; read the campaign and compare decision_seq before retrying`,
+`retry_after_ms: 5000` and that remediation. It never carries database text, which
+goes to the server log; the `failure` audit row carries the same fixed message.
+
+**Separation-of-duties answers.** `403` with the message `the reviewer must
+differ from the subject of this grant; ask another reviewer to record this
+decision` when the reviewer is the subject of the grant. The error body names no
+`permission` (the caller already holds `AccessReview:Attest`, so there is no grant
+to ask for) and carries `remediation: "ask another reviewer to record this
+decision"`; nothing is recorded. This case is decided before the campaign is
+looked up, for all three principal types, so it is also the answer for a grant in a closed campaign.
+`503` with the message `could not confirm that the reviewer differs from the subject of this
+grant; no decision was recorded` and `retry_after_ms: 5000` when the engine or
+group lookup could not be answered (nothing is recorded; retry the request).
 
 Audited as `access_review.attested` (decision `attested`) or
 `access_review.flagged` (decision `flagged_revoke`) — the two outcomes are
-separately countable/alertable, not one verb with a buried field.
+separately countable/alertable, not one verb with a buried field. Every row of
+these two verbs for an outcome that reaches the gate or the store has
+`target_id=<campaign_id>` alone and the grant in the detail as
+`principal_type=<t> principal_id=<id> role=<role>`; the refusal of an engine session
+and the `415` refusal carry an empty `target_id`. On the REST route the engine-session
+refusal writes that row; on the MCP twin it writes only the `mcp.record_attestation`
+wrapper row and no `access_review.*` row. Each value is passed through the
+audit token filter, which folds spaces and a few separators, so two grants whose ids
+fold to the same text cannot be told apart in a row, a success row included. A
+success row also carries `seq`, which numbers the decisions of one grant: with the
+campaign id and the grant it identifies one history entry. Rows written before this
+build keep the earlier shape (`target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`),
+so an archive holds both:
+
+| Outcome | `result` | `detail` (then the grant, as above) |
+|---|---|---|
+| Recorded | `success` | `decision=<d> previous=<pending\|attested\|flagged_revoke\|-> seq=<n> sod=pass` (`-` for a previous decision that was not recorded) |
+| Reviewer is the user subject | `denied` | `sod_self_subject` |
+| Reviewer owns the engine now, or owned it when the campaign opened | `denied` | `sod_engine_owner` (covers the live-owner and the frozen-owner refusal; the two cannot be told apart in the audit row) |
+| Reviewer is a group member | `denied` | `sod_group_member` |
+| Engine or group lookup unavailable | `failure` | `sod_check_unavailable store=engine` or `store=rbac` |
+| Store fault that is not the caller's (lease timeout, query error, lost commit) | `failure` | the fixed store-failure message above, never the database text |
+| Store refusal of the request (the 100-decision cap, a justification over its bound, no such grant or campaign) | `failure` | the store's message |
+
+A refusal row is written before the `403`/`503` body. The recorded decision is
+committed first and its audit row follows: a failed audit write never undoes the
+decision and sets `Sec-Audit-Failed: true`. The decision history, not the audit row,
+is the primary record of what was decided. A failed audit row for a successful open
+or close of a campaign likewise leaves the change in place and sets the header.
+
+For a refusal, the header depends on which refusal it is. A failed refusal row sets
+it for an engine-session refusal (all three write routes) and, on the attestation
+route, for the separation-of-duties refusals and the store failures and refusals; the
+refusal stands. A cross-site cookie request (all three routes) is refused earlier, by the
+server-wide same-site check, before the route runs; that check writes its own `csrf.denied`
+row and sets the header when the row cannot be saved (see the Audit Log guide). The route's
+own copy of the check is defence in depth, which a cookie session does not reach. A failed
+refusal row does not set the header for a wrong Content-Type (open and attestation; close
+takes no body) or for a store refusal on open or close: those rows are attempted and a
+failure to save one is ignored. A refusal by the permission check writes its own row and
+sets no header, and a malformed request (a bad id, bad JSON, a grant field over its bound, a
+`justification` that is not a string, a `title` that is over-long or holds a NUL byte) writes no
+row. A `justification` over 4096 bytes or holding a NUL byte is refused by the store after the
+separation-of-duties gate and does write a `failure` row.
+
+Both machine contracts declare the signal: the OpenAPI success responses of the three
+write routes (201 for open, 200 for attest and close) document the `Sec-Audit-Failed` header, and
+the output schemas of the MCP tools `open_access_review`, `record_attestation` and
+`close_access_review` list `audit_persisted` as an optional boolean that is present,
+and false, only when the audit row was not saved. Refusals are counted in
+`yuzu_access_review_attestation_refused_total{surface,reason}`.
 
 #### `POST /api/v1/access-reviews/{id}/close`
 
@@ -4632,12 +4853,23 @@ forces to completion.
 
 **Permission:** `AccessReview:Attest`.
 
-**Responses:** `200` — `{closed: true}`. `403` without `AccessReview:Attest`
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`.
+
+**Responses:** `200` — `{closed: true}`. `400`: the campaign id is malformed
+(see the rule above). `403` without `AccessReview:Attest`
 (or an engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `404` — no campaign with that id, or already
 closed. `503` — the access-review store is unavailable, or a genuine write
-failure. The route reads no body, so it has no `Content-Type` requirement.
+failure, including a row-lock wait that expired after 3 seconds (SQLSTATE `55P03`,
+nothing committed; retry). A close whose answer was lost may already have closed
+the campaign, and the retry then gives `404`: read the campaign first. The route
+reads no body, so it has no `Content-Type` requirement.
 
 Audited as `access_review.closed`.
 
@@ -4648,38 +4880,34 @@ Audited as `access_review.closed`.
 | `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv\|view> rows=<N> rbac_enforcement=<value>` (`view` is the dashboard's Current grants panel, `GET /fragments/access/reviews/grants`). `result=success`. |
 | `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews` or the dashboard fragment `GET /fragments/access/reviews/campaigns`. `target_type=AccessReview`. `result=success`. |
 | `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
-| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>` on `success` and `denied` rows; a `failure` row carries `<campaign_id>` only (empty when the request was a `400` for a NUL-bearing or over-long identifier). `result` ∈ {`success`, `failure`, `denied`}. |
+| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations` (or MCP `record_attestation`). `target_id=<campaign_id>` alone; the grant is in `detail` (see the attestations route for the `detail` shapes). `result` ∈ {`success`, `failure`, `denied`}: `denied` when the reviewer is the subject of the grant (`sod_self_subject`, `sod_engine_owner`, `sod_group_member`), `failure` when the lookup behind that check was unavailable (`sod_check_unavailable store=engine\|rbac`) or the store failed. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}` or the dashboard fragment `GET /fragments/access/reviews/campaign`. `target_id=<campaign_id>`. `result=success`. |
 
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
-engine-classed — see the "Engine-session denial" note above.
+engine-classed on a REST route — see the "Engine-session denial" note above. An
+engine session refused by an MCP twin writes only the `mcp.<tool>` wrapper row and no
+`access_review.*` row.
 The Settings Access reviews fragments (`GET /fragments/settings/access-reviews` and its
 `/campaign` view) write the same denied rows, under `access_review.list` and
 `access_review.get`, with an empty `target_id`.
 `access_review.campaign_opened` and `access_review.attested` also record
 `result=denied`, `detail=content_type_not_json` (empty `target_id`) when a
 request is refused with `415`.
-`access_review.attested` and `access_review.flagged` (by the decision requested)
-record `result=denied` when the store refuses the decision on purpose:
-`detail=self_attestation_blocked` for the `403` (the caller is the subject or
-owner) and `detail=already_decided` for the `409`. `target_id` is the full
-`<campaign_id>:<principal_type>:<principal_id>:<role_name>`. A denied row means
-nothing was recorded. If a denied row cannot be saved, the `403` or `409` still
-stands and the response carries `Sec-Audit-Failed: true`. The `409` message names the
-decision already recorded.
 
 The three mutating routes (`POST /api/v1/access-reviews`,
 `POST /api/v1/access-reviews/{id}/attestations` and
 `POST /api/v1/access-reviews/{id}/close`) are called by the dashboard with a
 session cookie, so a cookie-authenticated request must carry an `Origin` (or
 `Referer`) naming this site, or it is refused with `403` before the body is
-read and a `csrf.denied` row is written (`target_type=Endpoint`, `target_id` is
-the route as written above). A request that authenticates with an API token is
-not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
-the dashboard origin to `--csrf-trusted-origin`.
+read and a `csrf.denied` row is written by the server-wide same-site check
+(`target_type=Endpoint`, `target_id` is the method and path of the request, for example
+`POST /api/v1/access-reviews/<id>/attestations`, and `detail` ends with `reason=<token>`).
+The route's own copy of the check is defence in depth and is not reached by a cookie session.
+A request that authenticates with an API token is not riding a cookie and is not gated.
+Behind a proxy that rewrites `Host`, add the dashboard origin to `--csrf-trusted-origin`.
 
 MCP twins (JSON only — the REST `?format=csv` export path has no MCP
 equivalent): `export_access_review`, `open_access_review`,

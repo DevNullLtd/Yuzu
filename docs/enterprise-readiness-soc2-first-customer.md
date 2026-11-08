@@ -110,7 +110,8 @@ decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
 
 **Addendum — the Settings Access reviews panel did not refuse engine sessions until #6744
 (CC6.1/CC6.2).** Every `/api/v1/access-reviews` route and MCP twin refused an engine principal's
-session ("only a human can sign this evidence"), but the two Settings fragments
+session (the intent being that engine credentials do not produce this evidence; the refusal covers engine
+sessions only, see the #4752 addendum below for who else can still attest; the wording "only a human can sign this evidence" is withdrawn and narrowed to a reviewer account, see the amendment note at the end of that addendum), but the two Settings fragments
 (`GET /fragments/settings/access-reviews` and its `/campaign` view) did not, so an engine
 principal holding `AccessReview:Read` through a custom role could read the grant population and
 the campaign attestation rows through them; #6744 closes it, and a refused engine session now
@@ -120,27 +121,6 @@ audit log cannot show such a read (a successful read wrote no row), and the
 `AccessReview:Read`, so an auditor testing that period should review the custom roles assigned to
 engine principals for `AccessReview:Read` rather than rely on the audit trail.
 
-**Addendum — access-review decisions were not final and could be self-attested until #4752
-(CC6.2).** Recorded here because this section cites "access review sign-offs" as CC6.2
-evidence. Before #4752, `record_attestation` (REST and MCP) overwrote any earlier decision on
-a grant and did not compare the reviewer with the grant's subject, so a holder of
-`AccessReview:Attest` (the non-admin `Reviewer` role has it) could sign off their own grant,
-and a subject could replace another reviewer's `flagged_revoke` with `attested` while the
-campaign was open. For any assessment period before #4752, closed campaigns may therefore
-contain self-attested grants and silently overwritten decisions. Since #4752 the server
-refuses both, inside the database write, and a recorded decision is final. To assess an earlier
-period, run the detection query in `docs/user-manual/upgrading.md` (self-attested `user` and
-`engine` grants) and look in the audit log for more than one `access_review.attested` or
-`access_review.flagged` `result=success` row for the same `target_id` (overwrites are not
-visible in the table), and note that audit rows are kept for 365 days by default while campaign
-rows are kept indefinitely, so for an older period the audit rows may already be pruned. An
-honest statement of the control today: once every server replica runs a build with #4752, the
-application refuses to let a reviewer decide a `user` grant held under their own username or an
-engine principal they owned when the campaign opened, and refuses to change a decision once it
-is recorded. That is enforced by the application, not by the database: a replica that has not
-been upgraded, or someone with write access to the database, can still change a row. It does
-not cover group grants, one person holding more than one account, or ownership changed after
-a campaign opened, and it needs at least two people able to attest.
 
 **Addendum — the access-review export now states whether RBAC was actually enforced
 (CC6.2, RBAC delivery plan A3).** #2376 above closed *who* can read the grant-population
@@ -161,6 +141,106 @@ discussion, including the operator-facing metric to correlate against
 `docs/user-manual/rbac.md` → "The access-review export's `rbac_enforcement` stamp
 inherits this same degrade-vs-outage ambiguity"; field reference:
 `docs/user-manual/rest-api.md` → `GET /api/v1/access-reviews/export`.
+
+**Addendum: access-review attestations now require the reviewer to differ from the subject of
+the grant, and every decision is kept (CC6.2, #4752, 2026-11-03, amended 2026-11-04 and 2026-11-07).** Before this change a
+reviewer holding `AccessReview:Attest` could record a decision on a grant that named them, and a
+later decision on a grant replaced the earlier one, so the campaign record could not show who
+decided what, in what order. Now: (1) the reviewer must differ from the subject of the grant, on
+REST (`POST /api/v1/access-reviews/{id}/attestations`) and on MCP (`record_attestation`), through
+one shared rule: a `user` grant whose `principal_id` is the reviewer's account name (byte-exact),
+an engine principal the reviewer owns now or owned when the campaign opened (the store compares the owner frozen into the grant inside the transaction, so a former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner), or a group the reviewer is a member of (as Yuzu's stored
+membership records it; see the limit below for identity-provider-assigned memberships) is refused
+with `403` and nothing is recorded; the rule applies
+to an administrator with RBAC off as well; (2) every decision is appended to
+`access_review_attestation_history` with the decision it replaced and a sequence number, and the
+grant row keeps only the latest; (3) a refusal writes an `access_review.attested` or
+`access_review.flagged` row with `result=denied` and a fixed token, and moves
+`yuzu_access_review_attestation_refused_total{surface,reason}`; a check that cannot be answered
+fails closed with `503`. Limits an assessor should know, stated as limits: **the group rule, and an engine
+ownership acquired after the campaign opened, are decided by a read before the write transaction** (the
+Postgres store contract forbids one store consulting another while it holds a lease), so a membership change
+or an ownership the reviewer acquires inside that window is not seen, and there is no re-read after the
+commit; the user rule and the frozen engine owner have no such window. **Group membership is as fresh as the
+member's last sign-in:** the current engine owner is read live, but group membership is read from Yuzu's stored membership, which an identity provider updates
+only when that member signs in, so a change at the identity provider is not seen by the group rule
+until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token skips the membership
+refresh (for example an Entra groups-overage token) does not refresh it. For identity-provider-
+governed groups the rule is not a current-membership check, and a review of those groups at the
+identity provider at campaign close is the compensating step. A member who left a group before attesting
+is admitted; an owner who transferred an engine away is still refused by the frozen owner comparison (the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner).
+**Recorded owner acceptance (2026-11-07).** Accepted by Dave Rae (project owner), questions-window ruling 2026-11-07, for the
+release carrying #4752. (1) The group-member check, and an engine ownership acquired after the campaign
+opened, are decided from a read made before the attest transaction; a membership or ownership change
+committed between that read and the attest COMMIT is not seen. Normally milliseconds; worst case about 4 s
+acquire plus up to 6 s of lock waits plus statement time; no bound is promised. (2) "Member" means a row in
+`rbac_store.group_members`. For identity-provider groups (entra, saml) that row is written only when the
+member signs in interactively; token sessions and groups-overage tokens do not refresh it. Precision notes (drafted by the session, from the code): membership
+held only at the provider or in the SCIM store is not consulted and bears no Yuzu role grant. This is not a
+current-membership check. Not covered by this acceptance: the user rule and the frozen engine owner (no
+window), in-flight reviewer revocation, anything after COMMIT. Compensating control: review of
+provider-governed groups at the provider at campaign close, procedural, not enforced by Yuzu. Precision notes (drafted by the session, from the code): the evidence of
+independence is the set-and-proceed `sod=pass` audit row only. **Independence evidence for engine and
+group grants:** the history row does not record the ownership or membership basis; the `sod=pass`
+audit row (set-and-proceed, kept for the audit retention period) is the evidence, so export audit
+rows to the evidence store within that period; if that row was not persisted (`audit_persisted:false`
+on MCP, `Sec-Audit-Failed` on REST), an assessor should treat that grant's independence as
+unevidenced; recording the basis in the history row is tracked under #6060. **Per-grant limit:** a
+grant keeps at most 100 decisions; the 100th is final and no further decision is accepted on that
+grant in that campaign. The history and the audit rows identify who wrote the entries, and the
+remedy is to open a new campaign, which re-freezes the whole population as pending (closing the old one is a separate choice that leaves every undecided grant pending). A blind retry
+of an unacknowledged attempt appends an identical decision until that limit, after which the request
+is refused. **Superseded justifications are shown truncated:** a history read returns, for every entry
+except a grant's latest, at most the first 64 characters of its justification, flagged by
+`justification_truncated`, so a campaign with many grants cannot make one response grow without bound
+(100 entries per grant alone would not bound it). The full text stays in the database; an assessor who
+needs it reads it from `access_review_store.access_review_attestation_history` in the database, not through the API;
+the API and the Access page show only the 64-character preview, the read is outside the product and Yuzu does not audit
+it, and it needs a database credential, the same trust class that could edit these rows (queries and caveats:
+`docs/auth-architecture.md`, "Obtaining the full justification of a superseded decision").
+**The history table is
+append-only against the application path and ordinary SQL, not against the application's database
+credential** (it owns the schema and could disable the guard, drop a trigger, replace the guard function, forge a matching row,
+truncate or drop the table; detection is outside the product, see `docs/auth-architecture.md`, Periodic access
+reviews, "Evidence outside these tables, and detection"), a
+role granted TRUNCATE, or a database administrator; the audit rows are evidence independent of
+these tables but not of the database credential (the audit store is in the same database and has
+no guard triggers), so they are independent of it only to the extent they are exported off the
+database. The guard triggers protect the frozen grants, the decisions and the history; the
+campaign row (status, `closed_at_ms`, `closed_by`, title) is protected by the application only, which
+refuses further decisions on a closed campaign, so a database credential holder can reopen one. **One person with two identities (a local account and an SSO identity, or two SSO
+identities) counts as two reviewers**; this is the maintainer-accepted exception recorded in the
+approver-assurance addendum below (residual risk (e)), not a four-eyes guarantee across identities,
+and the same compensating controls apply (narrowing the identity sources in use, an
+identity-to-HR-record check at the review, sampling). A decision is committed before its audit row
+is written and a failed audit write never undoes it, so the decision history, not the audit row, is
+the primary record. A deployment that carries forward a database holding a `user` grant decided by
+the account it names is refused at start (a hard cutover; fresh database only, see
+`docs/user-manual/upgrading.md`); decisions on engine or group grants made by earlier builds are not
+checked and read as "previous: not recorded", and a database carried forward is unsupported either
+way. **More limits an assessor should know.** A "reviewer" is an account, not proof of a person: engine
+principal sessions, service-scoped tokens (403) and the MCP read-only and operator tiers are refused, but an
+API-token caller (acting as its owning user) and a supervised-tier MCP token can still attest; the three
+write routes are step-up exempt (`kEvidenceCapture`), so no fresh MFA proof is required (the exemption
+covers the REST and dashboard path only: MCP is not step-up gated and token principals do not take the MFA
+path); the history row stores only `reviewer`, and on the audit side `principal_class` is a persisted column stamped only by how the credential was presented (an `Authorization` or `X-Yuzu-Token` header gives `agent`, a `yuzu_session` cookie gives `human`), so an API-token caller and an MCP-token caller cannot be told apart on the `access_review.attested` row, and there is no auth-source field. `AuditEvent::mcp_tool` is never persisted: on MCP the tool name is on the separate companion row `mcp.record_attestation` (`target_type=mcp_tool`). The domain row is set-and-proceed, so it can be absent (`Sec-Audit-Failed` on REST, `audit_persisted:false` on MCP). Audit rows are kept for the audit retention period
+(365 days by default). Open and close have no separation of duties. **Audit limit:** `sod_engine_owner` (audit detail) and `engine_owner` (metric reason) cover BOTH the live-owner refusal and the frozen-owner refusal and cannot tell them apart. **Completeness test for an assessor:** A campaign is complete only when it is closed AND `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`) shows `pending_count` 0; a campaign closed with `pending_count` above 0 is recorded as incomplete evidence, and the campaign list (metadata only) cannot show which of the two a campaign is. Two colluding reviewers can decide each
+other's grants, so this is not four-eyes beyond the two-identity case above. A reviewer whose authority is
+revoked while their attest is in flight can still commit it (the documented window). `created_at_ms`, `decided_at_ms` and `closed_at_ms` are authored by the database clock (the write transaction's `now()`, in epoch milliseconds), not by each replica's system clock. A decision's stamp is the transaction START time, so it can precede the COMMIT by the lock wait, and the history entry and the state row carry the identical value. `decision_seq` is the ordering authority for the decisions on one grant: a decision queued behind a lock can carry an earlier stamp than the one it follows. A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host. A sole Administrator on an RBAC-off install cannot decide their own grants, so the
+campaign can only close with those grants `pending`. Revisit under the four-eyes primitive work (epic #6060). See
+`docs/auth-architecture.md` "Periodic access reviews".
+
+**Amendment 2026-11-07 (CC8.1 traceability).** The wording "only a human can sign this evidence", and any
+statement that an attestation is proof that a person reviewed a grant, is withdrawn and narrowed: a decision
+is evidence that a reviewer ACCOUNT recorded it. Reason: an API-token caller and a supervised-tier MCP token
+can attest as the owning user with no fresh MFA proof, and the audit row cannot tell those callers apart
+(`principal_class` reflects only how the credential was presented; the MCP tool name is on the companion
+`mcp.record_attestation` row, not on the domain row). The same amendment also records: the cap-refusal remedy is now "open a new campaign" (closing the old one is
+a separate choice that leaves every undecided grant pending); the campaign list is metadata only and is not by
+itself proof that a review was completed (read a campaign for `pending_count` and the attestation rows); the
+timestamps come from the database clock; and the engine-owner rule now also compares the owner frozen at
+campaign open inside the write transaction. The detail is in `docs/security-reviews/access-reviews-2026-07-21.md`,
+"Amended 2026-11-07".
 
 **Addendum — service-scoped token fleet-wide confinement, durably closed
 (CC6.1/CC6.3, guardian-confinement-2298 PR 3 — "the flip", 2026-08-18).**
@@ -778,6 +858,7 @@ the SQLite table above. Each new server store registers here.
 | Offline-endpoint state | `offline_endpoint_store` (schema `endpoint_state`) | Per-device last-seen record: `agent_id`, hostname, OS, architecture, agent version, last heartbeat and a presence session id. **Not PII-free:** hostname (often user-named) and `agent_id` are **stable device-persistent identifiers** — personal data under GDPR when a device is person-assigned, the same class as the `device_ci` and discovery rows above. Drives the offline-inclusive `/hardware` roster (30 days) and stale-flagging of departed hosts in `/viz/fleet` (7 days). Device-attributable (`agent_id`). | Current-state upsert per heartbeat; a graceful disconnect clears only the presence session id and keeps the row (#5678). A clock-guarded hourly prune deletes rows unseen for 37 days (30-day roster window + 7-day margin; per replica, at most 12,000 rows per hour, so a large backlog drains over hours). | **Per-device purge is WIRED** (#5682) — `OfflineEndpointStore::delete_agent` is fanned by the same `AgentDecommission` cascade behind **`DELETE /api/v1/sle/agents/{id}`** as `software_inventory_store` above, and deletes the row whatever its `session_id` (the store's other write, `remove_if_session`, only clears the presence session id on a graceful disconnect, which a decommissioned agent never sends). A rolled-back delete is reported failed, never a false erasure. Erasure is point-in-time: an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. A still-enrolled agent re-creates it on its next heartbeat, so stop the agent first (stop or uninstall it; revocation cannot be undone through the API, since the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), and it does not cut a gateway-connected agent off, #5578) and then issue the DELETE; the stop-first steps and the confirmation caveats are in `docs/user-manual/rest-api.md` under `DELETE /api/v1/sle/agents/{agent_id}`. Devices that are never decommissioned age out through the 37-day prune in the previous column (#5678, #1545). Row-level / per-subject erasure remains unwired (#1666). | n/a |
 | Pre-flight run results | `preflight_run_store` (`runs`, `run_device`) | `/auto` pre-flight check **configuration + results** — device scope, the per-device pass/fail/warn check grid, summary counts. **Operational / machine-health**: asset-inventory-class facts (free disk, OS version, reboot state, target-app version). Device-attributable (`agent_id` / `hostname`); no end-user PII, no behavioral telemetry. | **14-day rolling** — best-effort `prune_older_than` on the background pre-flight runner thread; owner can also delete a run. | Owner-scoped `delete_run` (manual) + time-based prune (automatic). No wired DSAR / decommission purge (the platform #1666 gap). | No per-store retention knob. |
 | Deployment run state | `deployment_run_store` (`deployments`, `deployment_device`) | The `/auto` deploy stage — artifact delivery spec (download **URL**, filename, expected **SHA-256**, install args) + per-device deployment execution state (step, exit code, error, hostname, OS). **Operational / machine-health**: device-attributable (`agent_id` / `hostname`); no end-user PII, no behavioral telemetry. The artifact URL/args are operator-supplied and may carry internal infrastructure detail (file-server host, paths). | **14-day rolling** — best-effort `prune_older_than` piggy-backed on the pre-flight runner thread; owner can also delete a deployment. | Owner-scoped `delete_deployment` (manual) + time-based prune (automatic). No wired DSAR / decommission purge (#1666). | No per-store retention knob. |
+| Access review campaigns and attestations | `access_review_store` (`access_review_campaign`, `access_review_attestation`, `access_review_attestation_history`) | SOC 2 CC6.2 review evidence. **Personal data:** reviewer and subject account ids, a free-text `justification` of up to 4096 bytes kept with every decision, the frozen `grant_snapshot` per grant (`display_name` and `owner_or_email`: an email address for a user when it resolves, the owner's username for an engine principal) and the campaign `title` (free text). | **Indefinite by design** (the campaign record is the evidence; the routed no-prune clause). A grant keeps at most 100 decisions, and nothing prunes them. | **None on the application path.** A redaction request is a database-administrator procedure (disable the guard triggers inside one transaction, redact, re-verify) that ends append-only for the affected rows and needs a recorded decision by the data-protection owner. It must cover the state row's latest reviewer and justification, the history rows, the subject id (part of a primary key and of a restricted foreign key, so redacting key columns is not feasible without rewriting keys and the frozen snapshot), the frozen `grant_snapshot` of each grant (it holds `display_name` and `owner_or_email`, and the state row's guard trigger pins it as immutable, so redacting it needs that trigger disabled too), the campaign's `title`, `created_by` and `closed_by`, and the audit rows (kept for the audit retention period). "Re-verify" means checking that the guard triggers are enabled again and that the consistency trigger holds. This procedure has not been exercised. Reviewers should not enter personal data beyond what the review requires. No wired DSAR / decommission purge. | No per-store retention knob. |
 | Execution tracker | `execution_tracker` (`executions`, `agent_exec_status`, `command_execution`, `event_outbox`) | Operational **execution records**: which definition was dispatched by whom to which scope (`dispatched_by`, `scope_expression`, `parameter_values`, operator-supplied and possibly holding internal detail), and per-agent status, exit code and failure text (`error_detail`, agent-supplied; for a command of a Forensics-tier plugin written since #4990 it is kept only when the agent's message already has the bounded token shape `scope:cause[:detail]` (at most 96 bytes), and is otherwise replaced by the fixed value `forensics_error`), the 24-hour dispatch record (`command_execution`: command id to dispatched plugin and execution id, the source of a stored response's plugin label) and the durable event outbox. Device-attributable (`agent_id`); no behavioral telemetry. | `command_execution` and `event_outbox`: **24 hours**, clock-guarded capped reaps (`reap_command_execution_mappings`, `reap_event_outbox`). `executions` and `agent_exec_status` carry **no retention sweep of their own**, so execution records and per-agent failure text are kept indefinitely (the failure text of a Forensics-tier command in its reduced form; the deployment contract in the upgrade guide, a fresh database with no data from earlier builds, is what makes that the whole population). | No wired DSAR / decommission purge (not in the ADR-0024 cascade; the platform #1666 gap). | No retention knob. |
 | Workflow engine | `workflow_engine` (`workflows`, `workflow_steps`, `workflow_executions`, `workflow_step_results`) | Operator-authored **workflow definitions** (configuration: ordered steps naming instruction ids) and **run history**. A run row (`workflow_executions`) pairs the calling operator's account name (`principal`, set on every run the v1 REST route and MCP `execute_workflow` start, keyed or not, and NULL for the legacy route) and the call's `correlation_id` with the device ids the caller named (`agent_ids_json`, distinct ids, at most 1,000 and 131,072 bytes, then a count and digest marker) and a start time, plus the client-chosen `idempotency_key` and a request fingerprint. **Usage-class personal data about the operator** (works-council and subject-access relevant, the same class as the audit log); the key is a client string stored and audited verbatim apart from clipping, so clients must not put a secret or personal data in one. `workflow_step_results` holds per-step status and the dispatch acknowledgement (command id, agents reached), not device output. | **None: no prune exists and none is added** (a recorded decline, `docs/clock-guarded-retention.md`). The size is observed, not bounded: `yuzu_server_workflow_executions_rows` and the `YuzuWorkflowExecutionsTableLarge` alert (above 100,000 rows for 30 minutes). The same calls' audit rows follow `--audit-retention-days` (365 by default); the run rows outlive them. | **None.** No route or tool deletes a run, and deleting or deactivating an account leaves its rows (a recreated username inherits the old account's keys). A keyed row's `principal` cannot be nulled in place (CHECK `wf_exec_idem_complete`), so erasure means deleting the row, which releases its key. A soft-deleted workflow keeps its history. No issue owns an erasure path yet (ADR-1005 residual 13). | None (not configurable). |
 | Policy compliance | `policy_store` (`policies`, `policy_fragments`, `policy_inputs`, `policy_triggers`, `policy_groups`, `policy_status`, `policy_dispatch_state`) | Operator-authored **compliance policies** and the per-(policy, agent) compliance status, including `check_result` (text derived from the check instruction's output; for a check that runs a Forensics-tier plugin it is empty and the status `unknown` since #4990). Device-attributable through `policy_status.agent_id`; the check output is whatever the operator-authored instruction returns. | Policy configuration: indefinite, operator lifecycle. `policy_status` rows live as long as their policy and are overwritten only when that (policy, agent) pair is next evaluated; there is no age-based sweep. | `DELETE /api/policies/{id}` (`Policy:Delete`) cascades the policy's status rows. **Not wired into the ADR-0024 `AgentDecommission` cascade**, so a decommissioned agent's status rows persist (the #1666-class gap). | No retention knob. |

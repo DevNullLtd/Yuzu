@@ -65,7 +65,8 @@ struct ReviewsDeps {
     AuditFn audit_fn;
     /// `AccessReviewStore::list_campaigns()`; unexpected = the store did not answer (log-only text).
     std::function<std::expected<std::vector<AccessReviewCampaignRow>, std::string>()> list_campaigns_fn;
-    /// `AccessReviewStore::get_campaign(id)`; the store's "not_found:" prefix passes through verbatim.
+    /// `AccessReviewStore::get_campaign(id, include_history=true)`; the page shows each grant's
+    /// decision history. The store's "not_found:" prefix passes through verbatim.
     std::function<std::expected<CampaignView, std::string>(const std::string&)> get_campaign_fn;
     /// `build_access_review(...)` + `access_review_rbac_enforcement(...)`; unexpected = a read failed.
     std::function<std::expected<GrantsView, std::string>()> grants_fn;

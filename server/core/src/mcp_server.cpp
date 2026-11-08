@@ -98,6 +98,7 @@
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
+#include "access_review_attest_gate.hpp" // reviewer != subject of the grant, shared with REST
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
 #include "enrollment_directory_model.hpp" // #4031: shared row builders — REST/MCP parity (Rule 1)
@@ -3875,9 +3876,10 @@ static const ToolDef kTools[] = {
      "(enabled|disabled|degraded) stamps whether RBAC actually governs this grant population "
      "right now — degraded means the read could not confirm state, so gates deny "
      "defensively, NOT that an admin turned RBAC off. Self-audited as "
-     "access_review.exported. Requires AccessReview:Read.",
+     "access_review.exported; if that audit write fails the export still stands and the "
+     "result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]}},"required":["count","rows","rbac_enforcement"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","rows","rbac_enforcement"]})j"},
 
     {"open_access_review",
      "Open a review campaign — freeze the CURRENT cross-principal grant population "
@@ -3887,78 +3889,116 @@ static const ToolDef kTools[] = {
      "stays reviewable (frozen, not re-derived from live state). The fleet's current RBAC "
      "enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same "
      "moment — see get_access_review. Mirrors POST "
-     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
+     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. If the audit "
+     "row cannot be saved the campaign is still open and the result carries "
+     "audit_persisted:false. This records "
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j("title":{"type":"string","minLength":1,"maxLength":256,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'. At most 256 bytes and no NUL (a longer one is refused with invalid-params)"})j"
      R"j(},"required":["title"]})j",
-     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
+     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["campaign_id","grant_count"]})j"},
 
+    // campaign_id on the three id tools below carries maxLength/pattern as DISCOVERY METADATA
+    // only: the schema validator runs just for approval-gated calls, so each handler's own
+    // valid_campaign_id check is the enforcement.
     {"record_attestation",
      "Record one reviewer decision against a grant frozen into an open campaign — "
      "'attested' (the reviewer confirms this grant is still appropriate) or "
      "'flagged_revoke' (the reviewer believes it should be revoked). flag != revoke: this "
      "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
      "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
-     "engine-principal-revoke call an operator makes after reading this evidence. This is "
-     "FINAL and irreversible, so destructiveHint:true: the first decision on a "
-     "(campaign_id, principal_type, principal_id, role_name) grant sticks and cannot be "
-     "changed while the campaign is open (a second call is refused as already_decided; open "
-     "a new campaign to re-review). Separation of duties: the reviewer may NOT decide their "
-     "own grant (principal_type 'user' whose principal_id is the caller) nor an engine "
-     "principal they own — refused as self_attestation, and another reviewer must decide it. "
-     "Group grants are not covered by the owner check. Both refusals are audited with "
-     "result=denied. An identifier with a NUL byte or over 512 bytes, or a justification with "
-     "a NUL byte or over 8192 bytes, is refused as invalid-params (nothing is truncated). "
-     "Mirrors POST /api/v1/access-reviews/{id}/attestations. Self-audited as "
-     "access_review.attested or access_review.flagged (by decision). Requires "
-     "AccessReview:Attest.",
+     "engine-principal-revoke call an operator makes after reading this evidence. Calling it "
+     "again for the same (campaign_id, principal_type, principal_id, role_name) makes the new "
+     "decision the CURRENT one and it can never return the grant to pending, so "
+     "destructiveHint:true; the earlier decision is NOT lost, every decision is kept in the "
+     "grant's history (get_access_review returns the latest 100 entries per grant, with an "
+     "earlier justification cut to its first 64 characters, and a decision_seq). The "
+     "reviewer must differ from the subject of the grant: a user grant naming the caller, an "
+     "engine principal the caller owns now or owned when the campaign opened, or a group the caller "
+     "belongs to is refused with a "
+     "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
+     "another reviewer to record this decision', and records nothing. principal_id and "
+     "role_name are at most 1024 bytes each and justification at most 4096 bytes (a "
+     "justification that is present and not a string is refused with invalid params). Each grant "
+     "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
+     "invalid params and records nothing, and the way to review that grant again is to open a "
+     "new campaign. A successful call returns decision_seq (this "
+     "decision's position in the grant's history, 1 for the first) and previous_decision "
+     "(the decision it superseded, 'pending' for the first), so you can see when you replaced "
+     "another reviewer's decision. "
+     "An internal error that carries retry_after_ms can mean the decision was recorded anyway "
+     "(a lost commit acknowledgement): before retrying, call get_access_review, compare "
+     "decision_seq with the value you last saw and look for your own entry (match reviewer, "
+     "justification and decided_at_ms; an earlier entry shows at most its first 64 "
+     "characters), because a blind retry appends another identical "
+     "decision, which is kept and visible, not an error, until the grant reaches its limit of "
+     "100 decisions, after which the request is refused. Mirrors POST "
+     "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
+     "access_review.flagged (by decision). If the audit row cannot be saved the decision "
+     "still stands and the result carries audit_persisted:false. Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("role_name":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
-     R"j("justification":{"type":"string","maxLength":8192})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"},)j"
+     R"j("principal_type":{"type":"string","enum":["user","group","engine"],"description":"Type of the principal that holds the grant"},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024,"description":"Id of the principal that holds the grant, as listed in get_access_review (at most 1024 bytes)"},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":1024,"description":"Role of the grant being decided (at most 1024 bytes)"},)j"
+     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested records that the grant is still appropriate; flagged_revoke records evidence that it should be revoked. Neither changes any grant"},)j"
+     R"j("justification":{"type":"string","maxLength":4096,"description":"Reviewer's reason (at most 4096 bytes). Only the latest entry of a grant's history is returned whole"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
-     R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
+     R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["recorded","decision_seq","previous_decision"]})j"},
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
-     "attestation row (pending/attested/flagged_revoke) plus pending_count. "
+     "attestation row (pending/attested/flagged_revoke) plus pending_count. Each attestation "
+     "carries its current decision, a decision_seq (0 while pending) and history, the latest "
+     "decisions recorded for that grant (at most 100) oldest first as {seq, decision, "
+     "previous_decision, reviewer, justification, justification_truncated, decided_at_ms}; "
+     "previous_decision \"\" means not recorded (the decision predates the history), never "
+     "pending. The response grows with every re-recorded decision, up to 100 decisions per "
+     "grant; a history lists at most the latest 100, so decision_seq greater than the number "
+     "of history entries means earlier ones are not shown. Only the latest history entry "
+     "carries its whole justification; an earlier entry carries at most its first 64 "
+     "characters, with justification_truncated true when text was cut (the full text stays "
+     "in the database). "
      "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
      "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
-     "for those), newest-first, capped at the most recent 500. The surface an auditor "
-     "needs to prove reviews ran on cadence. Each campaign's rbac_enforcement "
+     "for those), newest-first, capped at the most recent 500. Metadata only, with no "
+     "decided or pending counts: use get_access_review (pending_count and the attestation rows) "
+     "to see how complete a campaign is. Each campaign's rbac_enforcement "
      "(enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN (empty string for "
      "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
-     "Self-audited as access_review.list. Requires AccessReview:Read.",
+     "Self-audited as access_review.list; if that audit write fails the list still stands and "
+     "the result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
      "first — a campaign closed with pending rows still outstanding is itself evidence, "
      "not something this tool silently forces to completion. Mirrors POST "
-     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Closing is a "
+     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. If the audit "
+     "row cannot be saved the campaign is still closed and the result carries "
+     "audit_persisted:false. Closing is a "
      "one-way lifecycle transition (no reopen path) that permanently freezes every still-pending "
      "attestation, so destructiveHint:true; it deletes no evidence (attestation rows are "
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
+     R"j({"type":"object","properties":{"closed":{"type":"boolean"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["closed"]})j"},
 
     // ── KEK (key-encryption-key) rotation tools (#2395 track C) — MCP twins
     // of POST/GET /api/v1/secrets/kek/* (kek_routes.hpp/.cpp), sharing the
@@ -6068,9 +6108,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"raise_guardian_policy_generation",
      {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
-    // record_attestation: writes a FINAL, irreversible reviewer decision (#4752 — once-only,
-    // no overwrite) → stays Destructive. Do NOT lower it: that would loosen tier gating, a
-    // security decision rather than a side effect of making the write once-only.
+    // record_attestation: the current decision is replaced and a grant can never return to
+    // pending → Destructive. The earlier decision is kept in the grant's history (the read
+    // returns the latest 100 per grant, earlier justifications cut), so this is not a loss of
+    // evidence; the hint stays true because the current state is replaced.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
@@ -6639,40 +6680,28 @@ int mcp_error_for_store_msg(const std::string& msg) {
 
 // AccessReviewStore error → JSON-RPC code (mirrors rest_api_v1.cpp's
 // access_review_error_status(), translated into the JSON-RPC vocabulary).
-// The store's documented "not_found: " prefix (access_review_store.hpp —
+// The store's documented "not_found: " prefix (access_review_store.hpp,
 // machine-checkable) means a bad campaign_id, a grant never in the frozen
 // population, or an already-closed campaign: client input, not a server
-// fault, so it maps to kInvalidParams like the REST twin's 404. Any other
-// message is a genuine read/write failure → kInternalError (retryable).
+// fault, so it maps to kInvalidParams like the REST twin's 404. The
+// "bad_request: " prefix (campaign_id shape, an embedded NUL, an oversized
+// justification) is client input the store refused before touching the pool,
+// so it is kInvalidParams too, like the REST twin's 400. The "forbidden: "
+// prefix (the reviewer is the subject of the grant) is kPermissionDenied, like
+// the REST twin's 403. Any other message is a genuine read/write failure ->
+// kInternalError (retryable).
 //
-// Contract pin: same classes as rest_api_v1.cpp's access_review_error_status —
-// self_attestation: -> kPermissionDenied, already_decided: and bad_request: ->
-// kInvalidParams (#4752), not_found: -> kInvalidParams, else kInternalError.
-// Every tool handler above also pre-validates its own required fields
-// (title/decision/campaign_id/principal_type/principal_id/role_name) BEFORE
-// calling into AccessReviewStore, so the store's remaining bare validation
-// strings never actually reach this function today; they would otherwise land
-// in the `else -> kInternalError` arm, which is wrong (client error, not
-// retryable). Callers MUST keep pre-validating; a store error a handler cannot
-// pre-validate gets a `bad_request:` prefix (see
-// AccessReviewStore::record_attestation) and is mapped here and in the matching
-// 400 arm in rest_api_v1.cpp rather than falling through to kInternalError.
+// Contract pin: every tool handler above pre-validates its own required
+// fields (title/decision/campaign_id/principal_type/principal_id/role_name)
+// BEFORE calling into AccessReviewStore, so the store's other
+// input-validation strings never actually reach this function today; an
+// unprefixed one would land in the `else -> kInternalError` arm, which is
+// wrong (client error, not retryable). Callers MUST keep pre-validating, and
+// any new store-side validation error gets the `bad_request:` prefix (the
+// arm below and the matching 400 arm in rest_api_v1.cpp's
+// access_review_error_status already map it).
 int mcp_error_for_access_review_msg(const std::string& msg) {
-    // #4752: a deliberate refusal of an attestation. self_attestation is a
-    // permission problem (the reviewer may not decide their own grant);
-    // already_decided is bad input against the row's current state. Neither is
-    // retryable, so neither may fall into kInternalError.
-    switch (classify_attestation_refusal(msg)) {
-    case AttestationRefusal::SelfAttestation:
-        return kPermissionDenied;
-    case AttestationRefusal::AlreadyDecided:
-        return kInvalidParams;
-    case AttestationRefusal::None:
-        break;
-    }
-    if (is_bad_request_error(msg))
-        return kInvalidParams;
-    return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
+    return access_review_sod::store_error_jsonrpc_code(access_review_sod::classify_store_error(msg));
 }
 
 // B4 (#2146 API-parity) — ManagementGroupStore error → JSON-RPC code + retry
@@ -30267,6 +30296,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Enforced here, not by the input schema: its maxLength is discovery metadata only
+                // (the schema validator runs just for approval-gated tools).
+                if (title.size() > kCampaignTitleMaxLen) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleTooLongMessage),
+                                    "application/json");
+                    return;
+                }
+                if (title.find('\0') != std::string::npos) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleNulMessage),
+                                    "application/json");
+                    return;
+                }
                 auto rows_res = build_access_review(auth_db, rbac_store, engine_principal_store_,
                                                     engine_credential_store_, directory_sync);
                 if (!rows_res) {
@@ -30296,7 +30337,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::string snapshot =
                         JObj()
                             .add("display_name", r.display_name)
-                            .add("owner_or_email", r.owner_or_email)
+                            .add(kSnapshotOwnerKey, r.owner_or_email)
                             .add("effective_permission_count", r.effective_permission_count)
                             .add("last_activity_ms", r.last_activity_ms)
                             .add("last_activity_kind", r.last_activity_kind)
@@ -30372,44 +30413,114 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
+                                    "application/json");
+                    return;
+                }
                 if (decision != "attested" && decision != "flagged_revoke") {
                     res.set_content(
                         a4_error(kInvalidParams, "decision must be attested or flagged_revoke"),
                         "application/json");
                     return;
                 }
+                // A present justification that is not a string is refused, not read as "" (the
+                // REST twin does the same): the entry is append-only. Absent and null both mean
+                // no justification.
+                if (args.is_object() && args.contains("justification") &&
+                    !args["justification"].is_null() && !args["justification"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, kJustificationTypeMessage),
+                                    "application/json");
+                    return;
+                }
+                // Bound the grant tuple BEFORE the gate (the REST twin does the same): the gate's
+                // refusal rows and the failure row embed it, so an unbounded or NUL-bearing id
+                // would write a forged, oversized audit row per call. The schema's maxLength is
+                // discovery metadata only; this is the enforcement.
+                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name)) {
+                    res.set_content(a4_error(kInvalidParams, kGrantFieldInvalidMessage),
+                                    "application/json");
+                    return;
+                }
+                // decision selects the audit verb so the two outcomes are
+                // separately countable evidence, matching the REST twin exactly. Every
+                // row of this verb has one shape: target_id = the campaign alone, the
+                // grant tuple in the detail (access_review_attest_gate.hpp).
+                const std::string audit_action =
+                    access_review_sod::attest_audit_action(decision);
+                const std::string tuple_detail =
+                    access_review_sod::attest_tuple_detail(principal_type, principal_id,
+                                                           role_name);
+                // One refusal path for the gate's verdict and for the store's in-write
+                // `forbidden:` backstop. The domain row is written first, then the
+                // `mcp.<tool>` wrapper row; either failing to persist is surfaced as
+                // audit_persisted:false (MCP has no response-header channel) and the
+                // refusal stands.
+                auto refuse = [&](const access_review_sod::SodVerdict& verdict) {
+                    const auto refusal = access_review_sod::sod_refusal_for(verdict.outcome);
+                    const bool domain_ok = access_review_sod::audit_and_count_refusal(
+                        audit_fn, req, metrics, access_review_sod::AttestSurface::kMcp, verdict,
+                        audit_action, campaign_id, tuple_detail);
+                    const bool wrapper_ok = mcp_audit(
+                        std::string(refusal.audit_result),
+                        access_review_sod::sod_refusal_detail(verdict, refusal, {}));
+                    res.set_content(
+                        a4_error(refusal.jsonrpc_code, refusal.message, refusal.remediation,
+                                 static_cast<long>(refusal.retry_after_ms.value_or(-1)), {},
+                                 domain_ok && wrapper_ok),
+                        "application/json");
+                };
+                // The LAST call before the store (see the REST twin): the reviewer must
+                // differ from the subject of the grant; engine-owner and group-member are a
+                // pre-read outside the store's transaction (documented window).
+                const auto verdict = access_review_sod::evaluate_attestation_sod(
+                    session->username, principal_type, principal_id, engine_principal_store_,
+                    rbac_store);
+                if (verdict.outcome != access_review_sod::SodOutcome::kPass) {
+                    refuse(verdict);
+                    return;
+                }
                 auto rec_res = access_review_store->record_attestation(
                     campaign_id, principal_type, principal_id, role_name, decision,
                     session->username, justification);
-                // decision selects the audit verb so the two outcomes are
-                // separately countable evidence, matching the REST twin exactly.
-                const std::string audit_action = decision == "flagged_revoke"
-                                                     ? "access_review.flagged"
-                                                     : "access_review.attested";
                 if (!rec_res) {
-                    // #4752: a deliberate refusal is audited `denied` with a
-                    // stable token (matches the REST twin); other errors keep
-                    // `failure`.
-                    const auto refusal = classify_attestation_refusal(rec_res.error());
-                    const bool refused = refusal != AttestationRefusal::None;
-                    const bool denied_audit_ok =
-                        refused ? audit_fn(req, audit_action, "denied", "AccessReview",
-                                           campaign_id + ":" + principal_type + ":" +
-                                               principal_id + ":" + role_name,
-                                           attestation_refusal_token(refusal))
-                                : audit_fn(req, audit_action, "failure", "AccessReview",
-                                           // bad_request: an identifier (possibly this very
-                                           // campaign_id) was NUL-bearing or over-long, so the
-                                           // row carries a fixed empty target, not the bytes.
-                                           is_bad_request_error(rec_res.error()) ? std::string{}
-                                                                                 : campaign_id,
-                                           rec_res.error());
-                    mcp_audit(refused ? "denied" : "failure",
-                              refused ? std::string(attestation_refusal_token(refusal))
-                                      : rec_res.error());
+                    if (const auto sod =
+                            access_review_sod::sod_from_store_error(rec_res.error())) {
+                        refuse({*sod, {}});
+                        return;
+                    }
+                    if (access_review_sod::classify_store_error(rec_res.error()) ==
+                        access_review_sod::StoreErrorClass::kTransient) {
+                        // A fault that is not the caller's (see the REST twin): the raw text goes
+                        // to the log, the caller gets a fixed message and a retry hint, and both
+                        // audit rows carry the fixed message, never the raw error.
+                        access_review_sod::log_store_failure(campaign_id, "mcp", rec_res.error());
+                        const bool failure_audit_ok = yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                            access_review_sod::store_failure_audit_detail(tuple_detail));
+                        const bool wrapper_ok = mcp_audit(
+                            "failure", std::string(access_review_sod::kStoreFailureMessage));
+                        res.set_content(
+                            a4_error(kInternalError, access_review_sod::kStoreFailureMessage,
+                                     access_review_sod::kStoreFailureRemediation,
+                                     static_cast<long>(access_review_sod::kStoreFailureRetryMs),
+                                     {}, failure_audit_ok && wrapper_ok),
+                            "application/json");
+                        return;
+                    }
+                    const bool denied_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                        flatten_audit_text(rec_res.error()) + tuple_detail);
+                    mcp_audit("failure", rec_res.error());
+                    // The cap refusal goes out without the store's `bad_request: ` classification
+                    // prefix; every other store refusal keeps the text it has always had.
+                    const std::string wire_text{
+                        decision_cap_wire_message(rec_res.error()).value_or(rec_res.error())};
                     res.set_content(
                         error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
-                                       rec_res.error(),
+                                       wire_text,
                                        denied_audit_ok
                                            ? std::string_view{}
                                            : std::string_view{R"({"audit_persisted":false})"}),
@@ -30422,12 +30533,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 // on this path (flag != revoke). Acting on the flag is a separate,
                 // explicit RBAC/EnginePrincipal write an operator performs after
                 // reading this evidence.
-                const bool audit_ok = audit_fn(
-                    req, audit_action, "success", "AccessReview",
-                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
-                    "decision=" + decision);
+                //
+                // Set-and-proceed: the decision and its history row are already
+                // committed, so the audit row is secondary evidence and never a gate. A
+                // throwing audit callback is caught inside try_persist_audit.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, audit_action, "success", "AccessReview", campaign_id,
+                    access_review_sod::attest_success_detail(decision, rec_res->previous_decision,
+                                                             rec_res->seq, tuple_detail));
                 JObj payload;
-                payload.add("recorded", true);
+                payload.add("recorded", true)
+                    .add("decision_seq", static_cast<int64_t>(rec_res->seq))
+                    .add("previous_decision", rec_res->previous_decision);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", campaign_id);
@@ -30460,7 +30577,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto view_res = access_review_store->get_campaign(campaign_id);
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
+                                    "application/json");
+                    return;
+                }
+                // Same read as GET /api/v1/access-reviews/{id}: the grant's history.
+                auto view_res = access_review_store->get_campaign(campaign_id, /*include_history=*/true);
                 if (!view_res) {
                     mcp_audit("failure", view_res.error());
                     const int code = mcp_error_for_access_review_msg(view_res.error());
@@ -30487,6 +30612,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // grant_snapshot is raw-embedded, not escaped: this store's only
                     // writer (open_access_review/POST /api/v1/access-reviews) always
                     // freezes it as a JObj().str() JSON object.
+                    // Oldest first; previous_decision "" is "not recorded", never "pending".
+                    JArr history;
+                    for (const auto& h : a.history)
+                        history.add(JObj()
+                                        .add("seq", h.seq)
+                                        .add("decision", h.decision)
+                                        .add("previous_decision", h.previous_decision)
+                                        .add("reviewer", h.reviewer)
+                                        .add("justification", h.justification)
+                                        .add("justification_truncated", h.justification_truncated)
+                                        .add("decided_at_ms", h.decided_at_ms));
                     attestations.add(
                         JObj()
                             .add("principal_type", a.principal_type)
@@ -30497,7 +30633,9 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("decided_at_ms", a.decided_at_ms)
                             .add("justification", a.justification)
                             .raw("grant_snapshot",
-                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot));
+                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot)
+                            .add("decision_seq", a.decision_seq)
+                            .raw("history", history.str()));
                 }
                 (void)audit_fn(req, "access_review.get", "success", "AccessReview", campaign_id, "");
                 JObj payload;
@@ -30631,6 +30769,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto campaign_id = param_str(args, "campaign_id");
                 if (campaign_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "campaign_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
                                     "application/json");
                     return;
                 }
