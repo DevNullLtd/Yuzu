@@ -399,13 +399,15 @@ from the registry changes what a FRESH database gets and nothing about a deploye
   constructor (a `LIMIT 0` SELECT of every table and column the runtime reads, which refuses to
   open the store and names the table, so a registry ahead of its database fails at boot and not
   as `42P01`/`42703` on the first sections read).
-- **This is not the runner's drift detection** (#7158, a version recorded with different text).
-  That is a different question (same version, different SQL) and does not replace the projection
-  check: do not consolidate the two. The projection is column PRESENCE only (an extra column is
-  tolerated, in line with the ahead-database stance of #3894); names, types, nullability, order and
-  the key shape (primary key, cascading foreign key) are pinned for the shipped literals by the
-  schema test, and column defaults are pinned by nothing. A third test pins each registry kind's
-  column list to the stored digest layout, so a column change cannot land without this rule.
+- **This is not the runner's drift detection** (#7158). The runner now refuses a store whose
+  recorded migration hash differs from this build's text (see "Runner guards"); the projection
+  check asks a different question (does the schema carry every column this build reads) and
+  does not replace it: do not consolidate the two. The projection is column PRESENCE only (an
+  extra column is tolerated, in line with the ahead-database stance of #3894); names, types,
+  nullability, order and the key shape (primary key, cascading foreign key) are pinned for the
+  shipped literals by the schema test, and column defaults are pinned by nothing. A third test
+  pins each registry kind's column list to the stored digest layout, so a column change cannot
+  land without this rule.
 - **The refusal is a boot failure.** The store's `is_open()` is checked in `server.cpp` and a
   closed store stops the server from starting, so a registry ahead of its database never runs
   degraded. The log message distinguishes SQLSTATE 42P01/42703 (a schema defect) from any other
@@ -449,11 +451,15 @@ from the registry changes what a FRESH database gets and nothing about a deploye
   to get subtly wrong by reasoning alone.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
-- **Editing an already-shipped migration's DDL in place.** `PgMigrationRunner` tracks only an
-  integer `version` per store in `schema_meta` (no content/checksum verification) — so an in-place
-  edit to a migration that already ran against a real deployed database silently diverges that
-  deployment's actual schema from what a fresh install now creates, with nothing to detect the
-  drift. Safe **only** when the migration has never shipped to any real deployment (confirm via
+- **Editing an already-shipped migration's DDL in place.** `PgMigrationRunner` gates on the integer
+  `version` per store in `schema_meta`, so an in-place edit to a migration that already ran
+  against a real deployed database never runs there and diverges that deployment's schema from
+  what a fresh install now creates. Since #7158 the runner records each applied migration's
+  SHA-256 in `public.schema_migrations` and REFUSES to start the store when a recorded hash
+  differs from this build's text, so the edit is now caught at boot on any database that
+  recorded the old text after that change landed (a database that predates the table is
+  recorded as first seen and cannot be checked retroactively); it is still wrong, and the
+  refusal is a boot failure. Safe **only** when the migration has never shipped to any real deployment (confirm via
   `git merge-base --is-ancestor <the-migrating-PR> origin/main` returning false, or an equivalent
   release-history check) — PolicyStore's `sqlite_backfill_source` table removal (ADR-0009's
   fresh-start-by-default retirement, 2026-08-25) is the reference case: its PG migration never
@@ -656,6 +662,23 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   or reshapes a table is still a hazard for an older build: say so in that release's `upgrading.md`
   section. Operator text: `upgrading.md` "When a server build finds its database ahead of it
   (every Postgres store)".
+- **Recorded-hash drift guard (#7158)**: every applied migration's SHA-256 (exact bytes of the
+  SQL, no normalisation) is written to `public.schema_migrations` in the same transaction that
+  bumps `schema_meta`, as an UPSERT (a rewound `schema_meta` re-applies and overwrites the row:
+  the text that just ran is the authority). On every `run()` the hash of each version at or
+  below the recorded schema version is compared with this build's; a difference makes `run()`
+  return false with one error line (store, version, both hashes) and the store does not open.
+  It fails closed, with no override, because it is on-procedure (same build lineage) and the
+  refusal is the first failure, unlike the ahead-database case (#3894, WARN-only). A version
+  applied before the table existed has no row and is recorded as first seen
+  (`recorded_by = 'tofu'`, under the per-store lock with a re-read); that cannot detect drift
+  that predates the table, and it assumes ONE build lineage per database (a binary that applied
+  different text and was then replaced is recorded as whatever the current build holds, which
+  the hard-cutover deployment contract excludes). Steady state is one lock-free read. A migration's
+  SQL must therefore be byte-identical across processes and deployments: never interpolate a
+  config value, environment variable, timestamp or random value into it. The per-store
+  projection smoke-read below remains the second line of defence (column presence, which a hash
+  cannot tell you); it is not mass-adopted by this change.
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match

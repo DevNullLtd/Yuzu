@@ -81,6 +81,25 @@ public:
     /// the WHOLE call closed rather than silently skipping whichever one
     /// loses the `<= current` race in the apply loop below.
     ///
+    /// #7158: every applied migration's SHA-256 is recorded in
+    /// `public.schema_migrations`, and every `run()` compares the recorded hash
+    /// of each version at or below the recorded schema version with this
+    /// binary's text. A DIFFERENT hash means the database recorded a version
+    /// whose DDL is not what this build's runtime queries were written against
+    /// (an in-place edit of an already-applied migration): `run()` refuses
+    /// (returns false, one error line naming the store, the version and both
+    /// hashes) instead of letting the store open and fail at its first query.
+    /// Unlike the ahead case below this is ON-procedure (same build lineage)
+    /// and the refusal is the FIRST failure, so it fails closed; there is
+    /// deliberately no override. A version applied before this table existed
+    /// has no recorded hash: it is recorded as it is first seen
+    /// (`recorded_by = 'tofu'`, trust on first use). That cannot detect drift
+    /// that predates the table, and it assumes one build lineage per database
+    /// (the hard-cutover deployment contract): a binary that applied different
+    /// text and was later replaced is recorded as whatever the current build
+    /// holds. Steady state is one lock-free read; only first sight of an
+    /// unhashed version takes the per-store lock.
+    ///
     /// #3894: the complementary case — a database already AHEAD of this
     /// binary's vector (an older build started against a database a newer one
     /// migrated). That situation is outside the supported procedure (rolling
@@ -107,6 +126,29 @@ public:
     /// decision is testable without a database.
     [[nodiscard]] static bool is_schema_ahead(int db_version,
                                               const std::vector<PgMigration>& migrations);
+
+    /// One (version, SHA-256 hex) pair: what this binary's migration text hashes
+    /// to (`expected`) or what `public.schema_migrations` recorded (`recorded`).
+    struct VersionHash {
+        int version;
+        std::string sha256;
+    };
+
+    /// #7158: the verdict of comparing recorded migration hashes with this
+    /// binary's. Both lists hold versions, ascending.
+    struct HashVerdict {
+        std::vector<int> missing; ///< applied (<= db_version) but no recorded hash
+        std::vector<int> drifted; ///< recorded hash differs from this binary's text
+    };
+
+    /// #7158: pure comparison, exposed so the decision is testable without a
+    /// database. Only versions at or below `db_version` are judged: a recorded
+    /// row ABOVE it (a rewound `schema_meta`) is overwritten when that version
+    /// re-applies, and a version above this binary's vector (#3894, a newer
+    /// build) has no expected hash and is ignored.
+    [[nodiscard]] static HashVerdict check_recorded_hashes(int db_version,
+                                                           const std::vector<VersionHash>& expected,
+                                                           const std::vector<VersionHash>& recorded);
 
     /// Current schema version for a store. Returns 0 if the store (or the
     /// schema_meta table itself) is untracked, -1 on query error.

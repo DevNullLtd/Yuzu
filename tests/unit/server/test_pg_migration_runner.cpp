@@ -5,6 +5,7 @@
 
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_raii.hpp"
+#include "sha256_hex.hpp"
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
@@ -34,6 +35,18 @@ int scalar(PGconn* conn, const std::string& sql) {
     REQUIRE(PQntuples(res.get()) >= 1);
     REQUIRE(PQnfields(res.get()) >= 1);
     return std::atoi(PQgetvalue(res.get(), 0, 0));
+}
+
+std::string text_scalar(PGconn* conn, const std::string& sql) {
+    PgResult res{PQexec(conn, sql.c_str())};
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    return PQgetvalue(res.get(), 0, 0);
+}
+
+void exec_ok_or_fail(PGconn* conn, const std::string& sql) {
+    PgResult res{PQexec(conn, sql.c_str())};
+    REQUIRE(res.ok());
 }
 
 bool table_exists(PGconn* conn, const std::string& schema, const std::string& table) {
@@ -340,5 +353,178 @@ TEST_CASE("PgMigrationRunner version-ahead warning (#3894)", "[pg][migration]") 
              pos = logs.find(needle, pos + needle.size()))
             ++count;
         CHECK(count == 2); // pins the documented per-call (not per-process) contract
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #7158: recorded migration hashes — drift refuses, first sight is recorded
+// ---------------------------------------------------------------------------
+
+TEST_CASE("PgMigrationRunner check_recorded_hashes decision (#7158)", "[pg][migration]") {
+    using VH = PgMigrationRunner::VersionHash;
+    const std::vector<VH> expected = {{1, "a"}, {2, "b"}, {3, "c"}};
+
+    SECTION("everything recorded and equal") {
+        const auto v = PgMigrationRunner::check_recorded_hashes(3, expected, expected);
+        CHECK(v.missing.empty());
+        CHECK(v.drifted.empty());
+    }
+    SECTION("an applied version with no row is missing, not drifted") {
+        const auto v = PgMigrationRunner::check_recorded_hashes(3, expected, {{1, "a"}});
+        CHECK(v.missing == std::vector<int>{2, 3});
+        CHECK(v.drifted.empty());
+    }
+    SECTION("a differing hash is drift, at any applied version") {
+        const auto v1 = PgMigrationRunner::check_recorded_hashes(3, expected, {{1, "X"}, {2, "b"}, {3, "c"}});
+        CHECK(v1.drifted == std::vector<int>{1});
+        const auto v2 = PgMigrationRunner::check_recorded_hashes(3, expected, {{1, "a"}, {2, "X"}, {3, "c"}});
+        CHECK(v2.drifted == std::vector<int>{2});
+    }
+    SECTION("versions above the recorded schema version are not judged (rewound schema_meta)") {
+        const auto v = PgMigrationRunner::check_recorded_hashes(1, expected, {{1, "a"}, {2, "OLD"}});
+        CHECK(v.missing.empty());
+        CHECK(v.drifted.empty());
+    }
+    SECTION("a recorded row above this binary's vector is ignored (#3894 ahead)") {
+        const auto v = PgMigrationRunner::check_recorded_hashes(
+            5, expected, {{1, "a"}, {2, "b"}, {3, "c"}, {4, "from a newer build"}});
+        CHECK(v.missing.empty());
+        CHECK(v.drifted.empty());
+    }
+    SECTION("nothing applied, nothing to judge") {
+        const auto v = PgMigrationRunner::check_recorded_hashes(0, expected, {});
+        CHECK(v.missing.empty());
+        CHECK(v.drifted.empty());
+    }
+}
+
+TEST_CASE("PgMigrationRunner hashes the exact migration bytes (#7158)", "[pg][migration]") {
+    // Pins the helper and the "exact bytes, no normalisation" decision: this text
+    // has newlines and a trailing newline, and a runner that trimmed or folded
+    // whitespace would hash something else.
+    const auto h = yuzu::server::sha256_hex("CREATE TABLE t (\n  id INT\n);\n");
+    REQUIRE(h.has_value());
+    CHECK(*h == "4eab02f428e85198d82945a894e72cee24ecdc1d711ec09795a787c79fa65f03");
+    const auto trimmed = yuzu::server::sha256_hex("CREATE TABLE t (\n  id INT\n);");
+    REQUIRE(trimmed.has_value());
+    CHECK(*trimmed != *h);
+}
+
+TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
+          "[pg][migration][drift]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgConn conn = connect(db.dsn());
+
+    const std::string t1 = "CREATE TABLE items (id INT PRIMARY KEY)";
+    const std::string t2 = "ALTER TABLE items ADD COLUMN IF NOT EXISTS name TEXT";
+    const std::string t3 = "ALTER TABLE items ADD COLUMN IF NOT EXISTS note TEXT";
+    const std::vector<PgMigration> v3 = {{1, t1}, {2, t2}, {3, t3}};
+    const auto hash_of = [](const std::string& sql) { return *yuzu::server::sha256_hex(sql); };
+    const auto recorded = [&](int version, const char* col) {
+        return text_scalar(conn.get(), std::string("SELECT ") + col +
+                                           " FROM public.schema_migrations WHERE store = 'store_h' "
+                                           "AND version = " + std::to_string(version));
+    };
+    const auto row_count = [&] {
+        return scalar(conn.get(),
+                      "SELECT count(*) FROM public.schema_migrations WHERE store = 'store_h'");
+    };
+
+    SECTION("apply records one verified row per version") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        CHECK(row_count() == 3);
+        CHECK(recorded(1, "sha256") == hash_of(t1));
+        CHECK(recorded(3, "sha256") == hash_of(t3));
+        CHECK(recorded(2, "recorded_by") == "apply");
+    }
+
+    SECTION("a changed text for an applied version refuses and changes nothing") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        const std::vector<PgMigration> edited = {
+            {1, t1}, {2, "ALTER TABLE items ADD COLUMN IF NOT EXISTS name_edited TEXT"}, {3, t3}};
+        std::string logs;
+        bool ok = true;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::err};
+            ok = PgMigrationRunner::run(conn.get(), "store_h", edited);
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK_FALSE(ok);
+        CHECK(logs.find("store 'store_h' recorded migration v2") != std::string::npos);
+        CHECK(logs.find(hash_of(t2).substr(0, 12)) != std::string::npos);
+        CHECK(logs.find(hash_of(edited[1].sql).substr(0, 12)) != std::string::npos);
+        CHECK(logs.find("DROP") == std::string::npos); // names no destructive step
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_h") == 3);
+        CHECK(recorded(2, "sha256") == hash_of(t2));
+        // The unedited text still opens: the refusal is about content, not state.
+        CHECK(PgMigrationRunner::run(conn.get(), "store_h", v3));
+    }
+
+    SECTION("drift at the first version refuses too") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        const std::vector<PgMigration> edited = {
+            {1, "CREATE TABLE items (id INT PRIMARY KEY) -- edited"}, {2, t2}, {3, t3}};
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", edited));
+    }
+
+    SECTION("a rewound schema_meta re-applies and the hash row is overwritten") {
+        // This is the documented dev/UAT reset: the text that just ran is the authority.
+        const std::vector<PgMigration> two = {{1, t1}, {2, t2}};
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", two));
+        exec_ok_or_fail(conn.get(),
+                        "UPDATE public.schema_meta SET version = 1 WHERE store = 'store_h'");
+        const std::string t2b = "ALTER TABLE items ADD COLUMN IF NOT EXISTS name_b TEXT";
+        const std::vector<PgMigration> changed = {{1, t1}, {2, t2b}};
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", changed));
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_h") == 2);
+        CHECK(recorded(2, "sha256") == hash_of(t2b));
+        CHECK(recorded(2, "recorded_by") == "apply");
+        CHECK(row_count() == 2);
+    }
+
+    SECTION("a database that predates the table is recorded as first seen, then checked") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        exec_ok_or_fail(conn.get(), "DELETE FROM public.schema_migrations WHERE store = 'store_h'");
+        REQUIRE(row_count() == 0);
+
+        std::string logs;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::info};
+            REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK(logs.find("trust on first use") != std::string::npos);
+        CHECK(row_count() == 3);
+        CHECK(recorded(1, "recorded_by") == "tofu");
+        CHECK(recorded(3, "sha256") == hash_of(t3));
+
+        // Second run records nothing new and stays quiet.
+        {
+            yuzu::test::LogCapture capture{spdlog::level::info};
+            REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+            capture.stop();
+            CHECK(capture.text().find("trust on first use") == std::string::npos);
+        }
+        CHECK(row_count() == 3);
+
+        // And a later in-place edit of a first-seen version is now caught.
+        const std::vector<PgMigration> edited = {{1, t1}, {2, t2}, {3, t3 + " "}};
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", edited));
+    }
+
+    SECTION("a database ahead of this binary is not judged on versions it does not know") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        const std::vector<PgMigration> older = {{1, t1}, {2, t2}};
+        CHECK(PgMigrationRunner::run(conn.get(), "store_h", older)); // #3894: WARN only
+        CHECK(row_count() == 3);
+    }
+
+    SECTION("an unreadable hash record fails closed") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        exec_ok_or_fail(conn.get(), "ALTER TABLE public.schema_migrations RENAME COLUMN sha256 TO sha");
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        exec_ok_or_fail(conn.get(), "ALTER TABLE public.schema_migrations RENAME COLUMN sha TO sha256");
     }
 }

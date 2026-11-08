@@ -371,3 +371,40 @@ of `title_triples` at the rollup, because that table's primary key is a btree ov
 columns and Postgres refuses an entry beyond about 2,704 bytes, which would otherwise roll back the
 whole hourly refresh. Such a title is not normalised. The catalogue rollup's own
 `catalog_rollup_grain_key` has the same class of limit and is not changed here.
+
+## Update (2026-11-08) -- the runner records and checks each migration's hash (#7158)
+
+Decision. Option (a) of #7158: `PgMigrationRunner` records the SHA-256 of every applied
+migration's SQL in `public.schema_migrations (store, version, sha256, recorded_by, recorded_at)`,
+written in the transaction that bumps `schema_meta` (an UPSERT, because a rewound `schema_meta`
+re-applies a version), and every `run()` compares the recorded hash of each version at or below
+the recorded schema version with this build's text. Option (b), a per-store projection smoke-read
+adopted by every store, is not mass-adopted: it needs a hand-written probe per store and detects
+only a missing column, not a changed type, constraint or index; it stays the second line of
+defence (playbook "Runner guards").
+
+A mismatch fails the store closed: `run()` returns false, the store does not open and the server
+does not start. This is deliberately not the #3894 posture. A database ahead of the binary is
+off-procedure and a refusal would be a second failure; a recorded version whose text differs is
+on-procedure (same build lineage), the build knows exactly what is wrong, and the alternative is
+the fail-open at the first query that the issue names. There is no override flag and there was
+no warn-only phase: drift can only be detected against a hash this feature wrote, so introducing
+it cannot refuse any existing database.
+
+Hash identity is the exact bytes of `PgMigration::sql`, with no normalisation, because
+normalising would hide a real change. Every migration at this change's HEAD is built from literals
+or compile-time constants, so the bytes are the same in every process and deployment; a migration
+must stay that way.
+
+Trust on first use. A version applied before the table existed has no row. It is recorded as
+first seen with `recorded_by = 'tofu'`, so an auditor can tell it from a hash verified when
+applied (`'apply'`). The write takes the per-store advisory lock and re-reads, so two processes
+cannot both believe they verified; steady state takes no lock. Not detected, and excluded by the
+hard-cutover deployment contract: drift that predates the table, and a database that two build
+lineages touched (a long-lived newer replica records whatever an older binary applied, with the
+newer text).
+
+Operator consequence: an in-place edit of an already-applied migration now refuses the boot
+(`docs/user-manual/upgrading.md`). The golden-hash CI test (#3895) is the matching author-side
+guard and should ship in the same release, so that an edit to shipped text is stopped at the
+source and not discovered at the first customer boot.

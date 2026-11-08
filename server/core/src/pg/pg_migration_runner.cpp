@@ -1,5 +1,6 @@
 #include "pg_migration_runner.hpp"
 
+#include "../sha256_hex.hpp"
 #include "pg_exec.hpp"
 #include "pg_raii.hpp"
 
@@ -7,8 +8,10 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 namespace yuzu::server::pg {
 
@@ -78,6 +81,140 @@ bool exec_ok(PGconn* conn, const std::string& sql, std::string_view what, std::s
     return true;
 }
 
+
+// The heading the drift log line points at. Kept in one place so the log, the
+// header comment and docs/user-manual/upgrading.md cannot drift apart (#7164
+// had exactly that defect between a log line and a renamed heading).
+constexpr const char* kDriftDocHeading =
+    "the server refuses to start when a recorded migration differs from this build "
+    "(every Postgres store)";
+
+std::string short_hash(const std::string& h) {
+    return h.substr(0, 12);
+}
+
+/// Reads every recorded (version, sha256) row for `store`, ascending. False on
+/// a query error: an unreadable record is a refusal, never "nothing recorded".
+bool read_recorded_hashes(PGconn* conn, const std::string& store,
+                          std::vector<PgMigrationRunner::VersionHash>& out) {
+    out.clear();
+    PgResult res = exec_param(conn,
+                              "SELECT version, sha256 FROM public.schema_migrations "
+                              "WHERE store = $1 ORDER BY version",
+                              store);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("PgMigrationRunner: reading recorded migration hashes failed for {}: {}",
+                      store, PQerrorMessage(conn));
+        return false;
+    }
+    const int n = PQntuples(res.get());
+    for (int i = 0; i < n; ++i)
+        out.push_back({std::atoi(PQgetvalue(res.get(), i, 0)), PQgetvalue(res.get(), i, 1)});
+    return true;
+}
+
+const std::string* find_hash(const std::vector<PgMigrationRunner::VersionHash>& v, int version) {
+    for (const auto& e : v)
+        if (e.version == version)
+            return &e.sha256;
+    return nullptr;
+}
+
+void log_drift(const std::string& store, int version, const std::string& recorded,
+               const std::string& expected) {
+    spdlog::error("PgMigrationRunner: store '{}' recorded migration v{} with SHA-256 {}... but "
+                  "this build's v{} hashes to {}... - the migration text was changed after this "
+                  "database applied it, so its schema may not match what this build's queries "
+                  "expect. Refusing to start this store; nothing was applied or changed. See "
+                  "docs/user-manual/upgrading.md, \"{}\".",
+                  store, version, short_hash(recorded), version, short_hash(expected),
+                  kDriftDocHeading);
+}
+
+/// UPSERT, never INSERT: a rewound schema_meta re-applies a version over its
+/// old row, and the text that just ran is the authority.
+bool upsert_applied_hash(PGconn* conn, const std::string& store, int version,
+                         const std::string& sha) {
+    PgResult res = exec_params(
+        conn,
+        "INSERT INTO public.schema_migrations (store, version, sha256, recorded_by, recorded_at) "
+        "VALUES ($1, $2::int, $3, 'apply', extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (store, version) DO UPDATE "
+        "SET sha256 = EXCLUDED.sha256, recorded_by = 'apply', recorded_at = EXCLUDED.recorded_at",
+        std::vector<std::string>{store, std::to_string(version), sha});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error("PgMigrationRunner: failed to record the hash of v{} for {}: {}", version,
+                      store, PQerrorMessage(conn));
+        return false;
+    }
+    return true;
+}
+
+/// #7158 verify phase. Steady state is ONE lock-free read and a compare. Only
+/// first sight of an applied-but-unhashed version (a database that predates the
+/// table) writes, and it does so under the per-store advisory lock with a
+/// re-read, so two processes cannot both believe they verified.
+bool verify_recorded_hashes(PGconn* conn, const std::string& store, int current,
+                            const std::vector<PgMigrationRunner::VersionHash>& expected) {
+    std::vector<PgMigrationRunner::VersionHash> recorded;
+    if (!read_recorded_hashes(conn, store, recorded))
+        return false;
+    auto verdict = PgMigrationRunner::check_recorded_hashes(current, expected, recorded);
+    const auto refuse = [&](int version) {
+        const std::string* r = find_hash(recorded, version);
+        const std::string* e = find_hash(expected, version);
+        if (r && e)
+            log_drift(store, version, *r, *e);
+        return false;
+    };
+    if (!verdict.drifted.empty())
+        return refuse(verdict.drifted.front());
+    if (verdict.missing.empty())
+        return true;
+
+    if (!exec_ok(conn, "BEGIN", "BEGIN (hash record)", store))
+        return false;
+    PgTxn txn{conn};
+    {
+        PgResult lock = exec_param(conn, kAdvisoryLockSql, store);
+        if (lock.status() != PGRES_TUPLES_OK) {
+            spdlog::error("PgMigrationRunner: advisory lock failed for {}: {}", store,
+                          PQerrorMessage(conn));
+            return false;
+        }
+    }
+    // Re-read under the lock: another process may have applied or recorded
+    // some of these versions while we compared lock-free.
+    if (!read_recorded_hashes(conn, store, recorded))
+        return false;
+    verdict = PgMigrationRunner::check_recorded_hashes(current, expected, recorded);
+    if (!verdict.drifted.empty())
+        return refuse(verdict.drifted.front());
+    for (int version : verdict.missing) {
+        const std::string* e = find_hash(expected, version);
+        PgResult res = exec_params(
+            conn,
+            "INSERT INTO public.schema_migrations (store, version, sha256, recorded_by, "
+            "recorded_at) VALUES ($1, $2::int, $3, 'tofu', extract(epoch FROM now())::bigint) "
+            "ON CONFLICT (store, version) DO NOTHING",
+            std::vector<std::string>{store, std::to_string(version), *e});
+        if (res.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PgMigrationRunner: failed to record the hash of v{} for {}: {}",
+                          version, store, PQerrorMessage(conn));
+            return false;
+        }
+    }
+    if (!txn.commit()) {
+        spdlog::error("PgMigrationRunner: COMMIT failed recording migration hashes for {}: {}",
+                      store, PQerrorMessage(conn));
+        return false;
+    }
+    spdlog::info("PgMigrationRunner: {} had {} applied migration(s) with no recorded hash; "
+                 "recorded this build's text as first seen (trust on first use)",
+                 store, verdict.missing.size());
+    return true;
+}
+
 } // namespace
 
 bool PgMigrationRunner::valid_store_name(std::string_view name) {
@@ -109,6 +246,22 @@ bool PgMigrationRunner::is_schema_ahead(int db_version,
     return !migrations.empty() && db_version > migrations.back().version;
 }
 
+PgMigrationRunner::HashVerdict
+PgMigrationRunner::check_recorded_hashes(int db_version, const std::vector<VersionHash>& expected,
+                                         const std::vector<VersionHash>& recorded) {
+    HashVerdict out;
+    for (const auto& e : expected) {
+        if (e.version > db_version)
+            continue;
+        const std::string* r = find_hash(recorded, e.version);
+        if (!r)
+            out.missing.push_back(e.version);
+        else if (*r != e.sha256)
+            out.drifted.push_back(e.version);
+    }
+    return out;
+}
+
 bool PgMigrationRunner::ensure_meta_and_schema(PGconn* conn, std::string_view store_name) {
     const std::string store{store_name};
     if (!exec_ok(conn, "BEGIN", "BEGIN (meta)", store))
@@ -134,6 +287,20 @@ bool PgMigrationRunner::ensure_meta_and_schema(PGconn* conn, std::string_view st
                  "  version     INTEGER NOT NULL,"
                  "  upgraded_at BIGINT NOT NULL)",
                  "CREATE schema_meta", store))
+        return false;
+    // #7158: the SHA-256 of each applied migration's SQL. Additive (schema_meta is
+    // unchanged), created under the same global lock for the same UP-1 reason.
+    // `recorded_by` separates "verified when applied" from "recorded as first
+    // seen on a database that predates this table" (trust on first use).
+    if (!exec_ok(conn,
+                 "CREATE TABLE IF NOT EXISTS public.schema_migrations ("
+                 "  store       TEXT    NOT NULL,"
+                 "  version     INTEGER NOT NULL,"
+                 "  sha256      TEXT    NOT NULL CHECK (length(sha256) = 64),"
+                 "  recorded_by TEXT    NOT NULL CHECK (recorded_by IN ('apply', 'tofu')),"
+                 "  recorded_at BIGINT  NOT NULL,"
+                 "  PRIMARY KEY (store, version))",
+                 "CREATE schema_migrations", store))
         return false;
     // store_name is validated as [a-z_][a-z0-9_]* by run(); quoted anyway.
     if (!exec_ok(conn, "CREATE SCHEMA IF NOT EXISTS \"" + store + "\"", "CREATE SCHEMA", store))
@@ -257,6 +424,24 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
             store, current, migrations.back().version);
     }
 
+    // #7158: hash this binary's text once, then compare it with what the database
+    // recorded for every version it already has. A failed digest aborts the whole
+    // call: a bogus digest must never be recorded or compared.
+    std::vector<VersionHash> expected;
+    expected.reserve(migrations.size());
+    for (const auto& m : migrations) {
+        auto digest = yuzu::server::sha256_hex(m.sql);
+        if (!digest) {
+            spdlog::error("PgMigrationRunner: could not hash migration v{} for store '{}'; "
+                          "refusing to run",
+                          m.version, store);
+            return false;
+        }
+        expected.push_back({m.version, std::move(*digest)});
+    }
+    if (!verify_recorded_hashes(conn, store, current, expected))
+        return false;
+
     bool any_applied = false;
     for (const auto& m : migrations) {
         if (m.version <= current)
@@ -282,6 +467,17 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
             return false;
         if (m.version <= locked_version) { // another process applied it
             current = locked_version;
+            // #7158: it applied ITS text; ours must be the same (the winner wrote its
+            // hash in the txn that bumped the version, so the row is committed).
+            std::vector<VersionHash> rec;
+            if (!read_recorded_hashes(conn, store, rec))
+                return false;
+            const std::string* r = find_hash(rec, m.version);
+            const std::string* e = find_hash(expected, m.version);
+            if (r && e && *r != *e) {
+                log_drift(store, m.version, *r, *e);
+                return false;
+            }
             continue; // txn dtor rolls back the empty transaction
         }
 
@@ -315,6 +511,10 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
                 return false;
             }
         }
+
+        if (const std::string* h = find_hash(expected, m.version);
+            !h || !upsert_applied_hash(conn, store, m.version, *h))
+            return false;
 
         if (!txn.commit()) {
             spdlog::error("PgMigrationRunner: COMMIT failed for {} v{}: {}", store, m.version,
