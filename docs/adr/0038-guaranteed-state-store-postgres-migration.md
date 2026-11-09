@@ -254,6 +254,26 @@ retired automatically (a decommissioned agent's, and one whose rule was deleted 
 are listed in docs/clock-guarded-retention.md and counted on
 `yuzu_server_guardian_census_pending_events`.
 
+## Update (2026-11-09) - a decommission erases the census and retires its pending evidence (#5675)
+
+The Update (2026-11-03) above lists two classes of pending event that nothing retires. The first,
+a decommissioned agent's, is now retired by the agent decommission cascade, which gains
+`GuaranteedStateStore::delete_agent` as its ninth store (public key `guaranteed_state`). In one
+transaction it locks the agent's pending events in `ingest_seq` order, sets `projection_pending` false on exactly those
+rows (the step `delete_rule` takes for a rule), then deletes the agent's `guardian_agent_rule_status`
+rows. That is the census writers' own lock order (pending events, then the census row), so it adds no
+lock and no cycle. The method is not a rule mutation: no policy-generation bump, no hook and no push.
+The second class, a first delivery whose projection failed while its rule was being deleted, is
+unchanged.
+
+The decommission does NOT erase `guaranteed_state_events` or `guardian_observations`. The event log
+stays an immutable audit-style log and time-based expiry stays its single retention mechanism; the
+retired pending rows expire on that clock like any other event. Widening the decommission to erase
+the events or the DEX observations is a separate decision, needs its own Update to this ADR and the
+store header, and is not made here. A still-running agent re-creates its census row on its next
+census-bearing event, and a journal replay cannot rebuild the census from retired evidence (the
+retained events are redelivered with no repair), so the agent is stopped first.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

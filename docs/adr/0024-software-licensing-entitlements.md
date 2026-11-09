@@ -476,6 +476,15 @@ Decision numbers are stable, since other documents cite them.
     `CertificateInventoryStore` (schema `certificate_inventory_store`, the fleet certificate inventory of
     ADR-0070 D12) joined, and its `delete_agent` erases its rows in one transaction. Its read securable,
     `CertificateInventory`, arrives in PR 2a-2b.)*
+    *(Update 2026-11-09, #5675: the cascade now covers **nine** stores. `GuaranteedStateStore` (schema
+    `guaranteed_state_store`, public key `guaranteed_state`) joined: its `delete_agent` erases the device's
+    compliance-census rows (`guardian_agent_rule_status`) and retires its pending census evidence in one
+    transaction, so a decommissioned agent stops counting in `errored_rules` and `uncertain_rules`. Its
+    read securable is `GuaranteedState:Read`, which makes it the second `GuaranteedState`-governed member
+    after `AppPerfDailyStore`. The Guardian event log and DEX observations are NOT erased by this
+    decommission and expire by retention; widening the erasure to them is a separate follow-up that needs an
+    ADR-0038 Update. The "five per-agent stores" list in Decisions 9 and 11 is left as written; it is history.
+    A still-running agent re-creates its census row on its next census-bearing event, so stop the agent first.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`

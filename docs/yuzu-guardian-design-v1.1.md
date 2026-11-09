@@ -1308,7 +1308,10 @@ non-atomic observations: a pair repaired between them can appear in both the gua
 for one request, never in neither. The count read runs under a 5 s statement timeout; its expiry (most likely a large
 retained pending backlog; a lock wait, a loaded database or an administrator cancel is reported the same way) is a non-transient failure, reported separately from an ordinary store degrade and counted on the
 `guardian_census_device` source of `yuzu_server_guardian_read_degrade_total`. See the user manual's Compliance
-overview for the operator-facing contract.
+overview for the operator-facing contract. A device decommission (the ninth agent-decommission cascade store, key
+`guaranteed_state`, #5675) takes the same two steps in the same order for one agent: it locks the agent's pending events
+in `ingest_seq` order, sets `projection_pending` false on them, then deletes the agent's census rows, adding no lock; the
+event log and DEX observations are not erased by it and expire by retention.
 
 ### 9.2 REST API endpoints
 
