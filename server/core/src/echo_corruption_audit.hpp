@@ -35,10 +35,7 @@
  * the reservation and the write cannot strand the slot. While an agent's slot
  * is held every other should_log() for THAT agent returns false (retried on a
  * later heartbeat); other agents are admitted, so a burst of distinct agents
- * (a mass quarantine) is not serialised to one row per heartbeat (#5033). The
- * lookup and the write are synchronous on the heartbeat ingest threads, so at
- * most one store call per ingest thread is in flight regardless; the former
- * gate-wide slot bought nothing beyond that.
+ * (a mass quarantine) is not serialised to one row per heartbeat (#5033).
  *
  * Durability choice, stated for a future third case: this gate round-trips
  * the audit store itself so dedup survives a restart/HA switch, unlike the
@@ -228,9 +225,8 @@ public:
             if (gate_)
                 gate_->mark_failed(*agent_);
         }
-        /// `agent_id` must be the one this Reservation was constructed with.
-        void logged(const std::string& agent_id, const std::string& quarantine) {
-            gate_->mark_logged(agent_id, quarantine);
+        void logged(const std::string& quarantine) {
+            gate_->mark_logged(*agent_, quarantine);
             gate_ = nullptr;
         }
         void failed() {

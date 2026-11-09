@@ -6388,8 +6388,7 @@ public:
                     if (!gate->should_log(agent_id, quarantine))
                         return;
                     // Reservation completes the slot even if AuditEvent construction
-                    // or audit_store_->log() throws (log() is not noexcept). It
-                    // references agent_id, which outlives `res` (lambda parameter).
+                    // or audit_store_->log() throws (log() is not noexcept).
                     detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
                     AuditEvent ev;
                     ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -6403,7 +6402,7 @@ public:
                     ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
                     ev.result = "success";
                     if (audit_store_->log(ev))
-                        res.logged(agent_id, quarantine);
+                        res.logged(quarantine);
                     else
                         res.failed();
                 });
