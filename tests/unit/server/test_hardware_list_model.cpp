@@ -1935,6 +1935,7 @@ TEST_CASE(
     CHECK(logs.find("agent=agent-warn") != std::string::npos);
     CHECK(logs.find("kind=cpu") != std::string::npos);
     CHECK(logs.find("reason=row_count_mismatch") != std::string::npos);
+    CHECK(logs.find("rows withheld") != std::string::npos); // the WARN says what was served (#7165)
     CHECK(logs.find("SECRET-CPU-MODEL") == std::string::npos);
     const auto first = logs.find("section integrity fault");
     REQUIRE(first != std::string::npos);
@@ -1947,6 +1948,8 @@ TEST_CASE(
         record_section_integrity({edited}, "agent-warn", nullptr);
         cap.stop();
         CHECK(cap.text().find("reason=content_digest_mismatch") != std::string::npos);
+        CHECK(cap.text().find("rows withheld") != std::string::npos);
+        CHECK(cap.text().find("rows served") == std::string::npos);
     }
 }
 
