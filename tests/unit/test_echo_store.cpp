@@ -3863,11 +3863,10 @@ TEST_CASE("EchoDatabase: a busy echo.db is refused and never quarantined (#7286)
     CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
 }
 
-// #7286. Quarantine plus a fresh file is the fail-OPEN side (a fresh database re-enables every
-// source an operator paused), so only an explicit integrity failure may quarantine. A read error
-// such as IOERR cannot be provoked portably at the integrity stage, so the rc classifier open()
-// uses is a pure function and pinned here: the error codes that say nothing about the file's
-// health are "unreadable" and make open() refuse without moving anything.
+// #7286. IOERR-class failures cannot be provoked portably at the integrity stage, so the rc
+// classifier open() uses is a pure function, pinned here: codes that say nothing about the file's
+// health are "unreadable" and make open() refuse without moving anything (rationale:
+// check_integrity, echo_db.cpp).
 TEST_CASE("classify_integrity_rc: only CORRUPT and NOTADB quarantine, BUSY refuses, the rest is unreadable (#7286)",
           "[echo][store][corruption]") {
     // Busy: the holder's problem, not the file's -- including the extended codes.

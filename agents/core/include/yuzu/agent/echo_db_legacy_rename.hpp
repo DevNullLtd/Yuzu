@@ -140,10 +140,8 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db,
         return std::unexpected(std::format("cannot stat {}: {}", legacy.string(), ec.message()));
 
     if (legacy_present && owner_of) {
-        // The planted-file self-heal (#6695, header comment). Probe every candidate BEFORE moving
-        // any: a file whose owner cannot be resolved cancels the whole step (nothing moved). With
-        // echo.db present every echo.db file is a candidate and echo.db must itself be foreign;
-        // without it only a sidecar colliding with tar.db's own is (a lone one is the resume state).
+        // Planted-file self-heal (#6695, see the header comment). Probe every candidate before
+        // moving any.
         std::vector<fs::path> foreign;
         bool echo_foreign = false;
         bool unresolved = false;

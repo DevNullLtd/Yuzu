@@ -864,10 +864,8 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     case IntegrityCheck::ok:
         break;
     case IntegrityCheck::unreadable:
-        // The file could not be read for a reason that is not corruption (an I/O error, a
-        // permission or space fault, WAL lock contention). Quarantine would replace it with a
-        // fresh database that re-enables every paused source, so refuse to open instead and let
-        // the next start retry (#7286).
+        // Not corruption (I/O, permission, space, lock contention): refuse and let the next start
+        // retry; quarantine nothing. Rationale: check_integrity's comment (#7286).
         return std::unexpected(std::format(
             "echo.db could not be checked (sqlite rc {}): not quarantined and not opened; "
             "retried on the next start: {}",
