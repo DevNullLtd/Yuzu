@@ -1628,7 +1628,7 @@ private:
 /// merged: the core reads "No such file or directory" from it to treat an
 /// already-absent table as a clean release, and quotes a first line of it in
 /// failure notes. The one spawn site of the containment legs: sink-manifest
-/// IDs firewall/do_quarantine_linux#1..#8 and firewall/do_quarantine_macos#1..#10
+/// IDs firewall/sudo_runner#1..#18, one per argv shape the legs hand it
 /// (docs/agent-spawn-sink-manifest.md).
 [[maybe_unused]] fq::Runner sudo_runner() {
     return [](const fq::Argv& argv, std::chrono::milliseconds budget) {
@@ -1788,6 +1788,8 @@ private:
 
 constexpr NET_FW_PROFILE_TYPE2 kQuarantineProfiles[] = {
     NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC};
+// The prior-policy image is indexed by the same profile position.
+static_assert(std::tuple_size_v<fq::WinPriorPolicy> == std::size(kQuarantineProfiles));
 
 /// A BSTR out-param owner (the shared BStr type only builds by allocating).
 struct OwnedBstr {
@@ -1865,6 +1867,9 @@ template <class Fn> [[nodiscard]] bool for_each_rule(INetFwRules& rules, Fn&& fn
 [[nodiscard]] fq::WinAction to_win_action(NET_FW_ACTION a) {
     return a == NET_FW_ACTION_ALLOW ? fq::WinAction::allow : fq::WinAction::block;
 }
+[[nodiscard]] NET_FW_ACTION to_net_fw_action(fq::WinAction a) {
+    return a == fq::WinAction::allow ? NET_FW_ACTION_ALLOW : NET_FW_ACTION_BLOCK;
+}
 
 class WinLeg final : public fq::Leg {
 public:
@@ -1932,7 +1937,7 @@ public:
 
         // 2. Capture the prior profile policy, write-once, BEFORE any write.
         fq::WinPriorPolicy prior{};
-        for (std::size_t i = 0; i < 3; ++i) {
+        for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
             NET_FW_ACTION in = NET_FW_ACTION_BLOCK, out = NET_FW_ACTION_BLOCK;
             const HRESULT hi = policy->get_DefaultInboundAction(kQuarantineProfiles[i], &in);
             const HRESULT ho = policy->get_DefaultOutboundAction(kQuarantineProfiles[i], &out);
@@ -1961,7 +1966,7 @@ public:
         //    after disabling must not strand rules nobody remembers. The first
         //    apply writes it; later applies only ever add names (a rule created
         //    or re-enabled during the quarantine is disabled too).
-        auto to_disable = fq::win_rules_to_disable(infos);
+        const auto to_disable = fq::win_rules_to_disable(infos);
         const std::string list_key{fq::kWinDisabledRulesKey};
         const bool list_exists = yuzu_ctx_storage_exists(raw_, list_key.c_str()) == 0;
         std::vector<std::string> stored;
@@ -1971,15 +1976,10 @@ public:
                 return fq::StepResult::fail("disabled_list_unreadable");
             stored = *parsed;
         }
-        bool grew = !list_exists; // the first apply always writes the list, even an empty one
-        for (const auto& name : to_disable)
-            if (std::find(stored.begin(), stored.end(), name) == stored.end()) {
-                stored.push_back(name);
-                grew = true;
-            }
-        if (stored.size() > fq::kMaxDisabledRules)
+        const auto merged = fq::win_merge_disabled_list(std::move(stored), to_disable, list_exists);
+        if (merged.over_cap)
             return fq::StepResult::fail("too_many_rules");
-        if (grew && !pc.storage_set(list_key, fq::serialize_disabled_rules(stored)))
+        if (merged.grew && !pc.storage_set(list_key, fq::serialize_disabled_rules(merged.list)))
             return fq::StepResult::fail("disabled_list_not_persisted");
 
         // 4. Our rules for this generation: add what is missing FIRST.
@@ -2016,21 +2016,32 @@ public:
                 ++refused;
             return true;
         });
+        // Every failure from here to the end of step 6 takes this generation's own
+        // new rules back out (an update must not leave its looser rules live beside
+        // the previous generation's record; an initial apply is removed whole by the
+        // driver anyway, and the removal is idempotent).
+        const auto undo_added = [&] { (void)remove_rules_by_name(*rules.get(), added); };
         if (!disabled_pass) {
-            (void)remove_rules_by_name(*rules.get(), added);
+            undo_added();
             return fq::StepResult::fail("rule_enumeration_failed");
         }
-        if (dl.expired())
+        if (dl.expired()) {
+            undo_added();
             return fq::StepResult::fail("deadline_exceeded");
+        }
 
         // 6. Default-block, per profile, inbound and outbound.
         for (const auto profile : kQuarantineProfiles) {
             hr = policy->put_DefaultInboundAction(profile, NET_FW_ACTION_BLOCK);
-            if (hr != S_OK)
+            if (hr != S_OK) {
+                undo_added();
                 return fq::StepResult::fail(hr_token("default_inbound_failed", hr));
+            }
             hr = policy->put_DefaultOutboundAction(profile, NET_FW_ACTION_BLOCK);
-            if (hr != S_OK)
+            if (hr != S_OK) {
+                undo_added();
                 return fq::StepResult::fail(hr_token("default_outbound_failed", hr));
+            }
         }
 
         // 7. Remove the stale generation's rules LAST. One that will not go is
@@ -2116,17 +2127,12 @@ public:
         if (image_exists)
             prior = fq::parse_prior_policy(pc.storage_get(prior_key));
         if (prior || !ours_at_start.empty()) {
-            for (std::size_t i = 0; i < 3; ++i) {
-                const NET_FW_ACTION in = prior ? (prior->at(i).in == fq::WinAction::allow
-                                                      ? NET_FW_ACTION_ALLOW
-                                                      : NET_FW_ACTION_BLOCK)
-                                               : NET_FW_ACTION_BLOCK;
-                const NET_FW_ACTION out = prior ? (prior->at(i).out == fq::WinAction::allow
-                                                       ? NET_FW_ACTION_ALLOW
-                                                       : NET_FW_ACTION_BLOCK)
-                                                : NET_FW_ACTION_ALLOW;
-                if (policy->put_DefaultInboundAction(kQuarantineProfiles[i], in) != S_OK ||
-                    policy->put_DefaultOutboundAction(kQuarantineProfiles[i], out) != S_OK)
+            for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
+                const auto want = fq::win_release_policy(prior, i);
+                if (policy->put_DefaultInboundAction(kQuarantineProfiles[i],
+                                                     to_net_fw_action(want.in)) != S_OK ||
+                    policy->put_DefaultOutboundAction(kQuarantineProfiles[i],
+                                                      to_net_fw_action(want.out)) != S_OK)
                     ++failures;
             }
             if (!prior)
@@ -2347,7 +2353,7 @@ void emit(yuzu::CommandContext& ctx, const fq::Outcome& o) {
 }
 
 int emit_refusal(yuzu::CommandContext& ctx, std::string reason) {
-    const auto o = fq::detail::refused(std::move(reason));
+    const auto o = fq::refused(std::move(reason));
     emit(ctx, o);
     return o.rc();
 }
@@ -2362,10 +2368,10 @@ int emit_busy(yuzu::CommandContext& ctx) {
 /// The OS leg plus the durable record, built per call. The leg follows the
 /// backend the record says applied (a host that gained or lost nft since must
 /// still release what it applied); a fresh quarantine picks the best available.
-struct Rig {
+struct Containment {
     KvStateStore store;
     std::unique_ptr<fq::Leg> leg;
-    Rig(YuzuPluginContext* raw, bool for_apply) : store(raw) {
+    Containment(YuzuPluginContext* raw, bool for_apply) : store(raw) {
         const auto l = store.load();
         leg = make_leg(raw, l.kind == fq::StateLoad::Kind::ok ? l.state.backend : fq::BackendKind::none,
                        for_apply);
@@ -2375,39 +2381,38 @@ struct Rig {
     }
 };
 
-[[nodiscard]] bool register_ttl_trigger(YuzuPluginContext* raw) {
-    const auto cfg = std::format(
-        R"({{"interval_seconds":{},"plugin":"firewall","action":"release","parameters":{{"if_ttl_expired":"1"}}}})",
-        fq::kTtlPollSeconds);
-    return yuzu::PluginContext{raw}.register_trigger(fq::kTtlTriggerId, "interval", cfg);
-}
+/// The agent's trigger engine, reached through the plugin context. The TTL
+/// decision itself (fq::settle_ttl) is in the core.
+class ContextTriggers final : public fq::TriggerRegistry {
+public:
+    explicit ContextTriggers(YuzuPluginContext* raw) : ctx_{raw} {}
+    bool register_trigger(std::string_view id, std::string_view type,
+                          std::string_view config_json) override {
+        return ctx_.register_trigger(id, type, config_json);
+    }
+    bool unregister_trigger(std::string_view id) override { return ctx_.unregister_trigger(id); }
 
-/// A TTL is enforced by an interval trigger that fires `release if_ttl_expired=1`.
-/// A failed registration keeps the quarantine (lifting containment is never the
-/// safe response to a bookkeeping failure) and says so: PARTIAL, retried at the
-/// next start. A completed release removes the trigger.
+private:
+    yuzu::PluginContext ctx_;
+};
+
 void settle_ttl(fq::Outcome& o, YuzuPluginContext* raw) {
     if (!raw)
         return;
-    // Any outcome that leaves a record with a TTL behind keeps the trigger, even a
-    // failed boot-time re-apply: the TTL still bounds the quarantine, and the
-    // expiry release works on a record in any phase.
-    if (o.state && o.state->ttl_expires > 0 && o.status != "inactive") {
-        if (!register_ttl_trigger(raw)) {
-            o.notes.emplace_back("ttl_trigger_unregistered=1");
-            if (o.status == "active" || o.status == "active_unproven")
-                o.status = "partial";
-        }
-    } else if (o.status == "inactive") {
-        (void)yuzu::PluginContext{raw}.unregister_trigger(fq::kTtlTriggerId);
-    }
+    ContextTriggers triggers{raw};
+    fq::settle_ttl(o, triggers);
 }
 
-int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
+/// The ONE place the mutation gate is taken. Every mutating action runs through
+/// here and answers `busy` when it cannot get in; `quarantine_status` never does.
+template <class Body> int gated(yuzu::CommandContext& ctx, Body&& body) {
     auto guard = g_quarantine_gate.try_enter();
     if (!guard)
         return emit_busy(ctx);
+    return body();
+}
 
+int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
     const auto ttl = fq::parse_ttl_param(params.get("ttl_seconds"));
     if (!ttl)
         return emit_refusal(ctx, ttl.error());
@@ -2415,7 +2420,7 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     if (!exceptions)
         return emit_refusal(ctx, "exceptions_invalid:" + exceptions.error());
 
-    Rig rig(raw, /*for_apply=*/true);
+    Containment rig(raw, /*for_apply=*/true);
     if (!rig.leg)
         return emit_refusal(ctx, "unsupported_platform");
 #ifndef _WIN32
@@ -2448,15 +2453,11 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
 }
 
 int do_release(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
-    auto guard = g_quarantine_gate.try_enter();
-    if (!guard)
-        return emit_busy(ctx);
-
     fq::ReleaseRequest req;
     const auto due = params.get("if_ttl_expired");
     req.if_ttl_expired = due == "1" || due == "true";
 
-    Rig rig(raw, /*for_apply=*/false);
+    Containment rig(raw, /*for_apply=*/false);
     if (!rig.leg) {
         // No firewall tool and no record of one: nothing of ours can be in force.
         fq::Outcome o;
@@ -2477,10 +2478,6 @@ int do_release(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext
 }
 
 int do_quarantine_allow(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
-    auto guard = g_quarantine_gate.try_enter();
-    if (!guard)
-        return emit_busy(ctx);
-
     const auto op = params.get("op");
     if (op != "add" && op != "remove")
         return emit_refusal(ctx, "op_invalid");
@@ -2490,7 +2487,7 @@ int do_quarantine_allow(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPlug
     if (exceptions->empty())
         return emit_refusal(ctx, "exceptions_required");
 
-    Rig rig(raw, /*for_apply=*/true);
+    Containment rig(raw, /*for_apply=*/true);
     if (!rig.leg)
         return emit_refusal(ctx, "not_active");
     auto env = rig.env();
@@ -2502,7 +2499,7 @@ int do_quarantine_allow(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPlug
 
 int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
                          const std::string& init_note) {
-    Rig rig(raw, /*for_apply=*/false);
+    Containment rig(raw, /*for_apply=*/false);
     fq::Outcome o;
     if (!rig.leg) {
         if (rig.store.load().kind == fq::StateLoad::Kind::absent) {
@@ -2525,14 +2522,15 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 
 /// Agent start: complete an interrupted operation, re-apply a stored containment
 /// the OS no longer enforces (a reboot), re-register the TTL trigger. Bounded by
-/// the operation deadline; never throws; never rolls back or releases.
+/// the apply deadline (60 s) plus the verification budget (10 s); never throws;
+/// never rolls back or releases.
 [[nodiscard]] std::string recover_containment_at_start(YuzuPluginContext* raw) {
     try {
         KvStateStore probe_store(raw);
         const auto l = probe_store.load();
         if (l.kind == fq::StateLoad::Kind::absent)
             return {};
-        Rig rig(raw, /*for_apply=*/true);
+        Containment rig(raw, /*for_apply=*/true);
         if (!rig.leg)
             return "no_firewall_tool";
         auto env = rig.env();
@@ -2732,12 +2730,12 @@ private:
                             yuzu::Params params) {
         try {
             if (action == "quarantine")
-                return do_quarantine(ctx, params, ctx_);
+                return gated(ctx, [&] { return do_quarantine(ctx, params, ctx_); });
             if (action == "release")
-                return do_release(ctx, params, ctx_);
+                return gated(ctx, [&] { return do_release(ctx, params, ctx_); });
             if (action == "quarantine_allow")
-                return do_quarantine_allow(ctx, params, ctx_);
-            return do_quarantine_status(ctx, ctx_, init_note_);
+                return gated(ctx, [&] { return do_quarantine_allow(ctx, params, ctx_); });
+            return do_quarantine_status(ctx, ctx_, init_note_); // a read: never gated
         } catch (...) {
             ctx.write_output("status|refused|exception");
             ctx.write_output("refused|exception");

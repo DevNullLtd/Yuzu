@@ -1,8 +1,22 @@
 /**
- * test_firewall_quarantine_live.cpp -- real-host runs of the firewall plugin's
- * containment actions. HIDDEN: tagged [.][firewall_quarantine_live], so the
- * shard partition never selects it; it changes the firewall of the machine it
- * runs on and needs root / Administrator.
+ * test_firewall_quarantine_live.cpp -- the BUILT firewall plugin's containment
+ * actions, driven through its descriptor. Two kinds of case live here:
+ *
+ *  - "action boundary" cases, tagged [agent][firewall_quarantine]: they run in the
+ *    normal agent suite on every OS, need no privilege and never reach the host
+ *    firewall -- each one dispatches along a path the plugin refuses (or answers)
+ *    BEFORE its first OS call, over a fresh KV store. They prove the action
+ *    routing, parameter checks, record read and result emission of the real
+ *    plugin, which the pure-core tests cannot.
+ *  - live cases, tagged [.][firewall_quarantine_live]: HIDDEN, so the shard
+ *    partition never selects them; they change the firewall of the machine they
+ *    run on and need root / Administrator. The rest of this comment is about
+ *    those.
+ *
+ * Running the live tag WITHOUT YUZU_FIREWALL_QUARANTINE_LIVE=1 skips every case
+ * and Catch2 then exits 4 (all tests skipped), not 0: a harness that checks for
+ * rc == 0 must set the variable first (rc 4 means the environment is unset, or an
+ * OS filter matched nothing).
  *
  * Run (on a disposable or operator-attended host):
  *   YUZU_FIREWALL_QUARANTINE_LIVE=1 \
@@ -189,6 +203,17 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall()
 #endif
 }
 
+/// The rules the containment put in force, as text, for "this address is (not) in
+/// the live ruleset". macOS reads our anchor: `pfctl -s rules` lists only the main
+/// ruleset.
+[[nodiscard, maybe_unused]] std::string contained_rules_text() {
+#if defined(__APPLE__)
+    return capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", "rules"});
+#else
+    return firewall_snapshot();
+#endif
+}
+
 // ── a tiny portable TCP client (probe + pre-established stream) ─────────────
 
 #ifdef _WIN32
@@ -306,7 +331,9 @@ private:
 };
 
 /// The plugin, loaded and init()-ed over a real KV store, the way the agent does.
-struct LiveRig {
+/// Teardown shuts the plugin down and nothing else: the action-boundary cases use
+/// this directly because they must never reach the OS (a `release` here would).
+struct PluginRig {
     yuzu::test::TempDbFile db{"yuzu_test_fq_"};
     yuzu::test::TempDir data_dir{"yuzu_test_fq_data_"}; // agent.data_dir: the private staging dir lives here
     std::optional<yuzu::agent::KvStore> kv;
@@ -314,7 +341,7 @@ struct LiveRig {
     std::unique_ptr<yuzu::agent::StandalonePluginContext> ctx;
     yuzu::agent::LocalDispatcher dispatcher;
 
-    LiveRig(const std::string& server_address, const std::string& resolved_ip) {
+    PluginRig(const std::string& server_address, const std::string& resolved_ip) {
         std::error_code mk_ec;
         fs::create_directories(data_dir.path, mk_ec);
         REQUIRE_FALSE(mk_ec);
@@ -334,12 +361,13 @@ struct LiveRig {
             &*kv);
         REQUIRE(plugin->descriptor()->init(ctx->get()) == 0);
     }
-    ~LiveRig() {
-        if (plugin && ctx) {
-            (void)run("release");
+    ~PluginRig() {
+        if (plugin && ctx)
             plugin->descriptor()->shutdown(ctx->get());
-        }
     }
+    PluginRig(const PluginRig&) = delete;
+    PluginRig& operator=(const PluginRig&) = delete;
+
     /// Re-runs the plugin's init() the way an agent restart does.
     void restart() {
         plugin->descriptor()->shutdown(ctx->get());
@@ -359,6 +387,15 @@ struct LiveRig {
     }
     void put_record(const fq::QuarantineState& s) {
         REQUIRE(kv->set("firewall", std::string{fq::kStateKey}, fq::serialize_state(s)));
+    }
+};
+
+/// The live rig: releases whatever a case left applied, then shuts the plugin down.
+struct LiveRig : PluginRig {
+    using PluginRig::PluginRig;
+    ~LiveRig() {
+        if (plugin && ctx)
+            (void)run("release");
     }
 };
 
@@ -390,7 +427,129 @@ struct LiveEnv {
         FAIL("YUZU_FQ_SERVER_ADDRESS and YUZU_FQ_PROBE_TARGET are required under "                 \
              "YUZU_FIREWALL_QUARANTINE_LIVE=1")
 
+/// Is the built plugin in this tree? A partial build (no agent plugins) has none,
+/// and the neighbouring local-dispatcher tests skip the same way.
+[[nodiscard]] bool firewall_plugin_built() { return load_firewall().has_value(); }
+
+#define PLUGIN_RIG_OR_RETURN(rig)                                                                  \
+    if (!firewall_plugin_built()) {                                                                \
+        WARN("firewall plugin not found in the build tree -- skipping (build with "                \
+             "-Dbuild_agent=true)");                                                               \
+        SUCCEED();                                                                                 \
+        return;                                                                                    \
+    }                                                                                              \
+    PluginRig rig("203.0.113.7:50051", "203.0.113.7")
+
+/// A refusal as the plugin reports it: rc 1, `status|refused|<reason>` plus the
+/// `refused|<reason>` row, and the typed result UNAVAILABLE / PARTIAL.
+void check_refused(const yuzu::agent::LocalDispatcher::Result& r, const std::string& reason) {
+    INFO(r.captured);
+    CHECK(r.rc == 1);
+    CHECK(has_row(r.captured, "status|refused|" + reason));
+    CHECK(has_row(r.captured, "refused|" + reason));
+    CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(r.result_provenance == "firewall:refused");
+}
+
 } // namespace
+
+// ── the built plugin's action boundary: runs in the normal suite, never reaches the OS ──
+//
+// Every dispatch below is refused (or answered) before the plugin's first call
+// into the host firewall: the checks precede the OS leg's construction, or the
+// record they read is absent. The success and failure DECISIONS of an update are
+// pinned on the pure core (test_firewall_quarantine_parsers.cpp); what only the
+// built plugin can show is that the action is routed, its parameters are checked,
+// the KV record is read and the result is emitted.
+
+TEST_CASE("quarantine_allow: the plugin action refuses bad input and an inactive host",
+          "[agent][firewall_quarantine]") {
+    PLUGIN_RIG_OR_RETURN(rig);
+
+    SECTION("an unknown or missing op") {
+        check_refused(rig.run("quarantine_allow", {{"op", "bogus"}, {"exceptions", "198.18.0.9"}}),
+                      "op_invalid");
+        check_refused(rig.run("quarantine_allow", {{"exceptions", "198.18.0.9"}}), "op_invalid");
+        check_refused(rig.run("quarantine_allow", {{"op", "ADD"}, {"exceptions", "198.18.0.9"}}),
+                      "op_invalid");
+    }
+    SECTION("exceptions that do not parse") {
+        const auto r = rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", "garbage"}});
+        INFO(r.captured);
+        CHECK(r.rc == 1);
+        CHECK(has_prefix(r.captured, "status|refused|exceptions_invalid:"));
+        CHECK(has_prefix(r.captured, "refused|exceptions_invalid:"));
+        CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        // one bad entry spoils the whole list: nothing is half-applied
+        const auto mixed = rig.run("quarantine_allow",
+                                   {{"op", "add"}, {"exceptions", "198.18.0.9:22/tcp/in,garbage"}});
+        CHECK(has_prefix(mixed.captured, "status|refused|exceptions_invalid:"));
+    }
+    SECTION("no exceptions at all") {
+        check_refused(rig.run("quarantine_allow", {{"op", "add"}}), "exceptions_required");
+        check_refused(rig.run("quarantine_allow", {{"op", "remove"}, {"exceptions", ""}}),
+                      "exceptions_required");
+    }
+    SECTION("a valid add or remove on a host that is not contained") {
+        // This is the case that tells a working handler from one that refuses everything:
+        // op, exceptions, the KV read and the record check all pass, and only the missing
+        // containment refuses.
+        check_refused(
+            rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", "198.18.0.9:22/tcp/in"}}),
+            "not_active");
+        check_refused(
+            rig.run("quarantine_allow", {{"op", "remove"}, {"exceptions", "198.18.0.9:22/tcp/in"}}),
+            "not_active");
+        CHECK_FALSE(rig.record().has_value()); // a refusal writes nothing
+    }
+    SECTION("a record that is not active is not contained either") {
+        // phase=applying and phase=releasing are both "an operation in progress": no update
+        fq::QuarantineState st;
+        st.phase = fq::Phase::releasing;
+        st.generation = 3;
+        st.backend = fq::BackendKind::nft;
+        st.allow = *fq::build_allow_set("203.0.113.7", "203.0.113.7:50051", {}, {});
+        rig.put_record(st);
+        const auto r = rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", "198.18.0.9"}});
+        // a host without the recorded backend's tool has no leg at all, and refuses the same way
+        CHECK(has_row(r.captured, "status|refused|not_active"));
+        const auto after = rig.record();
+        REQUIRE(after.has_value());
+        CHECK(after->phase == fq::Phase::releasing); // untouched
+        CHECK(after->generation == 3);
+    }
+}
+
+TEST_CASE("quarantine: the plugin action checks its parameters before it touches anything",
+          "[agent][firewall_quarantine]") {
+    PLUGIN_RIG_OR_RETURN(rig);
+
+    // below 60 s, above 30 days, and not a number
+    check_refused(rig.run("quarantine", {{"ttl_seconds", "5"}}), "ttl_out_of_bounds");
+    check_refused(rig.run("quarantine", {{"ttl_seconds", "59"}}), "ttl_out_of_bounds");
+    check_refused(rig.run("quarantine", {{"ttl_seconds", "2592001"}}), "ttl_out_of_bounds");
+    check_refused(rig.run("quarantine", {{"ttl_seconds", "soon"}}), "ttl_out_of_bounds");
+    const auto bad = rig.run("quarantine", {{"exceptions", "garbage"}});
+    CHECK(has_prefix(bad.captured, "status|refused|exceptions_invalid:"));
+    CHECK(bad.rc == 1);
+    CHECK_FALSE(rig.record().has_value()); // no recovery record was even started
+}
+
+TEST_CASE("release if_ttl_expired: with nothing contained, the trigger's firing is a clean no-op",
+          "[agent][firewall_quarantine]") {
+    PLUGIN_RIG_OR_RETURN(rig);
+
+    // this is what the TTL interval trigger dispatches every 30 s; with no record it
+    // must answer inactive and touch nothing (a bare `release` would run the OS undo)
+    const auto r = rig.run("release", {{"if_ttl_expired", "1"}});
+    INFO(r.captured);
+    CHECK(r.rc == 0);
+    CHECK(has_row(r.captured, "status|inactive"));
+    CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(r.result_provenance == "firewall:inactive");
+    CHECK_FALSE(rig.record().has_value());
+}
 
 TEST_CASE("live: apply, verify the block, release restores the host byte-identical",
           "[.][firewall_quarantine_live]") {
@@ -508,6 +667,42 @@ TEST_CASE("live: a control channel that cannot be reached rolls the apply back",
     CHECK(firewall_snapshot() == before);
 }
 
+TEST_CASE("live: quarantine_allow adds and removes an exception through the plugin action",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    LiveRig rig(env.server, env.server_ip());
+    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+
+    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
+    REQUIRE(rig.record().has_value());
+    const auto gen0 = rig.record()->generation;
+    const std::string exception = "198.18.0.9:22/tcp/in";
+    CHECK(contained_rules_text().find("198.18.0.9") == std::string::npos);
+
+    const auto add = rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", exception}});
+    INFO(add.captured);
+    CHECK(add.rc == 0);
+    CHECK(has_row(add.captured, "status|active"));
+    CHECK(has_prefix(add.captured, "allow|exception|198.18.0.9"));
+    REQUIRE(rig.record().has_value());
+    CHECK(rig.record()->generation == gen0 + 1);
+    CHECK(rig.record()->phase == fq::Phase::active);
+    CHECK(contained_rules_text().find("198.18.0.9") != std::string::npos); // live, not just recorded
+    CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);           // still contained
+
+    const auto rm = rig.run("quarantine_allow", {{"op", "remove"}, {"exceptions", exception}});
+    INFO(rm.captured);
+    CHECK(rm.rc == 0);
+    CHECK(has_row(rm.captured, "status|active"));
+    CHECK_FALSE(has_prefix(rm.captured, "allow|exception|198.18.0.9"));
+    REQUIRE(rig.record().has_value());
+    CHECK(rig.record()->generation == gen0 + 2);
+    CHECK(contained_rules_text().find("198.18.0.9") == std::string::npos);
+    CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
+
+    CHECK(has_row(rig.run("release").captured, "status|inactive"));
+}
+
 TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
@@ -594,8 +789,11 @@ TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
     params.emplace_back("ttl_seconds", "60");
     const auto q = rig.run("quarantine", params);
     // the standalone harness has no trigger engine, so the TTL trigger cannot register:
-    // the quarantine stays applied and says so
-    CHECK((has_row(q.captured, "status|active") || has_row(q.captured, "status|partial")));
+    // the quarantine stays applied and says so, deterministically (the registration
+    // contract itself is pinned against the engine's own parser in
+    // test_firewall_quarantine_parsers.cpp)
+    CHECK(has_row(q.captured, "status|partial"));
+    CHECK(has_row(q.captured, "note|ttl_trigger_unregistered=1"));
     auto rec = rig.record();
     REQUIRE(rec.has_value());
     REQUIRE(rec->ttl_expires > 0);

@@ -15,6 +15,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/agent/trigger_engine.hpp>
+
 #include <algorithm>
 #include <map>
 #include <set>
@@ -121,6 +123,7 @@ struct NftWorld {
     std::map<std::string, std::string> files;
     int next_file = 0;
     bool fail_load = false;
+    bool fail_delete = false; // the table cannot be removed (a refused sudo, say)
     bool legacy = false;
     Crash crash;
     std::vector<Argv> log;
@@ -136,6 +139,8 @@ struct NftWorld {
             return done(0);
         }
         if (a[1] == "delete") {
+            if (fail_delete)
+                return done(1, "sudo: a password is required");
             if (!table)
                 return done(1, "Error: No such file or directory");
             table = false;
@@ -866,6 +871,75 @@ TEST_CASE("windows: disabled-rule list round trip and update plan", "[agent][fir
     CHECK(resume.remove.empty());
 }
 
+TEST_CASE("windows: the disabled-rule list is written on the first apply and only ever grows",
+          "[agent][firewall_quarantine]") {
+    SECTION("the first apply always writes the list, even an empty one") {
+        const auto m = win_merge_disabled_list({}, {}, /*list_exists=*/false);
+        CHECK(m.grew);
+        CHECK(m.list.empty());
+        CHECK_FALSE(m.over_cap);
+    }
+    SECTION("the first apply stores what it disables") {
+        const auto m = win_merge_disabled_list({}, {"RDP", "SMB"}, false);
+        CHECK(m.grew);
+        CHECK(m.list == std::vector<std::string>{"RDP", "SMB"});
+    }
+    SECTION("a later apply with nothing new writes nothing") {
+        const auto m = win_merge_disabled_list({"RDP", "SMB"}, {"SMB"}, true);
+        CHECK_FALSE(m.grew);
+        CHECK(m.list == std::vector<std::string>{"RDP", "SMB"});
+        // an empty stored list that exists is not rewritten either
+        CHECK_FALSE(win_merge_disabled_list({}, {}, true).grew);
+    }
+    SECTION("a later apply appends only the names it has not seen, in order") {
+        const auto m = win_merge_disabled_list({"RDP", "SMB"}, {"SMB", "WinRM", "RDP", "Print"}, true);
+        CHECK(m.grew);
+        CHECK(m.list == std::vector<std::string>{"RDP", "SMB", "WinRM", "Print"});
+    }
+    SECTION("a name enabled again during the quarantine is never dropped from the list") {
+        const auto m = win_merge_disabled_list({"RDP", "SMB"}, {}, true);
+        CHECK(m.list == std::vector<std::string>{"RDP", "SMB"});
+    }
+    SECTION("the cap refuses the apply") {
+        std::vector<std::string> at_cap;
+        for (std::size_t i = 0; i < kMaxDisabledRules; ++i)
+            at_cap.push_back(std::format("rule-{}", i));
+        CHECK_FALSE(win_merge_disabled_list(at_cap, {"rule-3"}, true).over_cap); // nothing new
+        const auto over = win_merge_disabled_list(at_cap, {"one-more"}, true);
+        CHECK(over.over_cap);
+        CHECK(over.grew);
+        CHECK(win_merge_disabled_list({}, at_cap, false).over_cap == false);
+    }
+}
+
+TEST_CASE("windows: release restores the captured policy; the default applies only without an image",
+          "[agent][firewall_quarantine]") {
+    WinPriorPolicy image{};
+    image[0] = {WinAction::allow, WinAction::allow};
+    image[1] = {WinAction::block, WinAction::block};
+    image[2] = {WinAction::block, WinAction::allow};
+    for (std::size_t i = 0; i < image.size(); ++i)
+        CHECK(win_release_policy(image, i) == image[i]);
+
+    // no image: Windows' own default, inbound block and outbound allow, on every profile
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto d = win_release_policy(std::nullopt, i);
+        CHECK(d.in == WinAction::block);
+        CHECK(d.out == WinAction::allow);
+    }
+    // a hardened image is restored as captured, never replaced by the default
+    WinPriorPolicy hardened{};
+    for (auto& x : hardened)
+        x = {WinAction::block, WinAction::block};
+    CHECK(win_release_policy(hardened, 1) == WinProfilePolicy{WinAction::block, WinAction::block});
+    // an unknown action (parse_prior_policy never yields one) restores on the safe side
+    WinPriorPolicy odd{};
+    odd[0] = {WinAction::unknown, WinAction::unknown};
+    CHECK(win_release_policy(odd, 0) == WinProfilePolicy{WinAction::block, WinAction::block});
+    // an index outside the three profiles reads as no image
+    CHECK(win_release_policy(image, 3) == WinProfilePolicy{WinAction::block, WinAction::allow});
+}
+
 // ── nftables ────────────────────────────────────────────────────────────────
 
 TEST_CASE("nft ruleset text: atomic idiom, drop chains, safe lines", "[agent][firewall_quarantine]") {
@@ -896,6 +970,8 @@ TEST_CASE("nft ruleset text: atomic idiom, drop chains, safe lines", "[agent][fi
     CHECK(t.find("ip daddr 203.0.113.53 udp dport 53 accept") != t.npos);
     CHECK(t.find("ip6 daddr 2001:4860:4860::8888 tcp dport 53 accept") != t.npos);
     CHECK(t.find("icmpv6 type { nd-router-solicit") != t.npos);
+    // neighbour discovery is 133-136 on every leg: redirect (137) is not allowed
+    CHECK(t.find("nd-redirect") == t.npos);
     CHECK(t.find("ip6 daddr 2001:db8::/32 tcp dport 443 accept") != t.npos);
     // stateless: no established accept
     CHECK(t.find("established") == t.npos);
@@ -1698,6 +1774,202 @@ TEST_CASE("recover_at_init with no record does nothing", "[agent][firewall_quara
     CHECK(rig.world.crash.calls == 0);
 }
 
+// ── TTL enforcement through the trigger registry ───────────────────────────
+
+namespace {
+
+/// The agent's trigger engine as a fake: records what the core registers and can
+/// refuse (the standalone harness has none, so registration there always fails).
+struct FakeTriggers final : TriggerRegistry {
+    struct Reg {
+        std::string id, type, json;
+    };
+    bool accept = true;
+    std::vector<Reg> registered;
+    std::vector<std::string> unregistered;
+    bool register_trigger(std::string_view id, std::string_view type,
+                          std::string_view config_json) override {
+        if (!accept)
+            return false;
+        registered.push_back({std::string{id}, std::string{type}, std::string{config_json}});
+        return true;
+    }
+    bool unregister_trigger(std::string_view id) override {
+        unregistered.emplace_back(id);
+        return true;
+    }
+};
+
+} // namespace
+
+TEST_CASE("ttl trigger: the registration the core emits is what the engine's own parser accepts",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
+    REQUIRE(o.status == "active");
+    FakeTriggers trig;
+    settle_ttl(o, trig);
+
+    REQUIRE(trig.registered.size() == 1);
+    CHECK(trig.unregistered.empty());
+    const auto& reg = trig.registered[0];
+    CHECK(reg.id == kTtlTriggerId);
+    CHECK(reg.id == "firewall.quarantine.ttl");
+    CHECK(reg.type == "interval");
+    // a successful registration changes nothing about the result
+    CHECK(o.status == "active");
+    CHECK_FALSE(contains(o.notes, "ttl_trigger_unregistered=1"));
+
+    // the contract with the trigger engine, proven against the engine's own parser
+    const auto cfg = yuzu::agent::parse_trigger_config(reg.id, reg.type, reg.json);
+    REQUIRE(cfg.has_value());
+    CHECK(cfg->id == "firewall.quarantine.ttl");
+    CHECK(cfg->type == yuzu::agent::TriggerType::Interval);
+    CHECK(cfg->plugin == "firewall");
+    CHECK(cfg->action == "release");
+    CHECK(cfg->interval_seconds == kTtlPollSeconds);
+    CHECK(cfg->interval_seconds >= 30); // the engine's floor
+    REQUIRE(cfg->parameters.size() == 1);
+    CHECK(cfg->parameters.at("if_ttl_expired") == "1");
+    // and the action it fires is the no-op-until-expiry release
+    CHECK(reg.json == ttl_trigger_config());
+}
+
+TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PARTIAL",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    FakeTriggers trig;
+    trig.accept = false; // what the standalone harness (no trigger engine) answers
+
+    auto verified = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
+    REQUIRE(verified.status == "active");
+    settle_ttl(verified, trig);
+    CHECK(verified.status == "partial");
+    CHECK(contains(verified.notes, "ttl_trigger_unregistered=1"));
+    CHECK(contains(render_rows(verified), "status|partial"));
+    CHECK(contains(render_rows(verified), "note|ttl_trigger_unregistered=1"));
+    CHECK(result_kind(verified).partial);
+    // the containment itself is untouched: still applied, record still active
+    CHECK(rig.world.table);
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::active);
+
+    // unproven contained stays contained too, and is partial
+    Outcome unproven;
+    unproven.status = "active_unproven";
+    unproven.state = rig.store.state();
+    settle_ttl(unproven, trig);
+    CHECK(unproven.status == "partial");
+    CHECK(contains(unproven.notes, "ttl_trigger_unregistered=1"));
+
+    // a status that is already worse than active is not improved, only annotated
+    Outcome degraded;
+    degraded.status = "degraded";
+    degraded.reason = "reapply_failed:nft_load_failed";
+    degraded.state = rig.store.state();
+    settle_ttl(degraded, trig);
+    CHECK(degraded.status == "degraded");
+    CHECK(contains(degraded.notes, "ttl_trigger_unregistered=1"));
+}
+
+TEST_CASE("ttl trigger: no ttl registers nothing; a completed release unregisters",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    FakeTriggers trig;
+
+    auto no_ttl = apply_and_verify(rig.env, rig.request(), dl);
+    REQUIRE(no_ttl.status == "active");
+    settle_ttl(no_ttl, trig);
+    CHECK(trig.registered.empty());
+    CHECK(trig.unregistered.empty());
+    CHECK(no_ttl.status == "active");
+
+    // a ttl'd quarantine, then released: the trigger goes with it
+    REQUIRE(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+    auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 90), dl);
+    REQUIRE(o.status == "active");
+    settle_ttl(o, trig);
+    CHECK(trig.registered.size() == 1);
+    auto rel = release(rig.env, ReleaseRequest{}, dl);
+    REQUIRE(rel.status == "inactive");
+    settle_ttl(rel, trig);
+    REQUIRE(trig.unregistered.size() == 1);
+    CHECK(trig.unregistered[0] == kTtlTriggerId);
+    CHECK(trig.registered.size() == 1); // not re-registered
+
+    // a refused action leaves the trigger alone
+    auto refused_o = refused("op_invalid");
+    settle_ttl(refused_o, trig);
+    CHECK(trig.registered.size() == 1);
+    CHECK(trig.unregistered.size() == 1);
+}
+
+TEST_CASE("ttl trigger: a release that did not complete keeps the trigger; the expiry path releases",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl).status == "active");
+    FakeTriggers trig;
+
+    // a release the OS refuses is partial and the record (with its ttl) stays: keep firing
+    rig.world.fail_delete = true;
+    auto failed = release(rig.env, ReleaseRequest{}, dl);
+    REQUIRE(failed.status == "partial");
+    settle_ttl(failed, trig);
+    CHECK(trig.registered.size() == 1);
+    CHECK(trig.unregistered.empty());
+    rig.world.fail_delete = false;
+
+    // the trigger's own firing: release if_ttl_expired=1, a no-op before the deadline
+    // and the real release after it, which then takes the trigger away
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+    rig.now += 119;
+    auto early = release(rig.env, due, dl);
+    CHECK(contains(early.notes, "ttl_not_expired=1"));
+    CHECK(rig.world.table);
+    rig.now += 2;
+    auto late = release(rig.env, due, dl);
+    REQUIRE(late.status == "inactive");
+    CHECK_FALSE(rig.world.table);
+    settle_ttl(late, trig);
+    CHECK(trig.unregistered.size() == 1);
+}
+
+TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a failed registration",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    FakeTriggers trig;
+    trig.accept = false;
+    auto first = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
+    settle_ttl(first, trig);
+    REQUIRE(first.status == "partial"); // registration failed at quarantine time
+
+    // agent restart: the OS still enforces, the record says active with a ttl
+    trig.accept = true;
+    auto boot = recover_at_init(rig.env, dl);
+    REQUIRE(boot.state);
+    CHECK(boot.state->ttl_expires > 0);
+    settle_ttl(boot, trig);
+    REQUIRE(trig.registered.size() == 1);
+    CHECK(trig.registered[0].id == kTtlTriggerId);
+    CHECK(boot.status == "active"); // registered this time: nothing partial left to say
+
+    // a reboot with a failed re-apply (degraded) still keeps the ttl bounded
+    FakeTriggers again;
+    rig.world.table = false;
+    rig.world.fail_load = true;
+    auto failed = recover_at_init(rig.env, dl);
+    REQUIRE(failed.status == "degraded");
+    settle_ttl(failed, again);
+    CHECK(again.registered.size() == 1);
+    CHECK(failed.status == "degraded");
+}
+
 // ── crash safety ────────────────────────────────────────────────────────────
 
 TEST_CASE("crash at every runner call during apply: never unrestricted with an active record",
@@ -2350,21 +2622,66 @@ TEST_CASE("pf: a failed state flush is a failed apply, never active", "[agent][f
         CHECK_FALSE(rig.world.pf_on);
         CHECK(rig.store.raw.empty());
     }
-    SECTION("a failed update keeps the record and the reference it took") {
+    SECTION("a failed update flush reports the generation that is in force, partial") {
+        // No external disable: the enable plan is `reuse`, so the failure is the flush alone.
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto gen_before = rig.store.state()->generation;
+        rig.world.fail_flush_states = 2;
+        const auto added = ex("10.0.0.9:22/tcp/in");
+        const auto o = update(rig.env, true, {added}, dl);
+        // the anchor load already committed the new set; the record and the output say so
+        auto want = make_set();
+        want.exceptions.push_back(added);
+        CHECK(rig.world.anchor_text == pf_anchor_ruleset(want));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->allow == want);
+        CHECK(rig.store.state()->phase == Phase::active);
+        CHECK(rig.store.state()->generation == gen_before + 1);
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "state_flush_failed=1"));
+        REQUIRE(o.state);
+        CHECK(o.state->allow == want);
+        CHECK(rig.world.flush_states == 3); // the apply's one, then the update's two attempts
+        // a later successful update builds on what is in force
+        const auto again = update(rig.env, false, {added}, dl);
+        CHECK(again.status == "active");
+        CHECK(rig.world.anchor_text == pf_anchor_ruleset(make_set()));
+        CHECK(rig.store.state()->allow == make_set());
+    }
+    SECTION("a failed flush on a remove is partial too") {
+        PfRig rig;
+        auto dl = rig.dl();
+        const auto kept = ex("10.0.0.9:22/tcp/in");
+        REQUIRE(apply_and_verify(rig.env, [&] {
+                    auto r = rig.request();
+                    r.allow = make_set({"203.0.113.53"}, {kept});
+                    return r;
+                }(), dl).status == "active");
+        rig.world.fail_flush_states = 2;
+        const auto o = update(rig.env, false, {kept}, dl);
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "state_flush_failed=1"));
+        CHECK(rig.world.anchor_text == pf_anchor_ruleset(make_set()));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->allow == make_set());
+    }
+    SECTION("a failed update that also took a fresh reference records it") {
         PfRig rig;
         auto dl = rig.dl();
         REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
         rig.world.external_disable(); // the next apply must take a fresh reference
         rig.world.fail_flush_states = 2;
         const auto o = update(rig.env, true, {ex("10.0.0.9:22/tcp/in")}, dl);
-        CHECK(o.status == "update_failed");
-        CHECK(o.reason == "state_flush_failed");
-        // the record carries the reference the failed attempt took, so it can be released
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "state_flush_failed=1"));
+        // the record carries the reference the attempt took, so it can be released
         REQUIRE(rig.store.state());
         CHECK(rig.store.state()->phase == Phase::active);
         REQUIRE(rig.world.tokens.size() == 1);
         CHECK(rig.store.state()->os.pf_token == rig.world.tokens[0]);
-        CHECK(rig.world.pf_on); // containment stays on after the anchor loaded
+        CHECK(rig.world.pf_on);
         CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
         CHECK(rig.world.tokens.empty());
     }

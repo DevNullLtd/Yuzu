@@ -1452,6 +1452,49 @@ parse_disabled_rules(std::string_view text) {
     return out;
 }
 
+struct WinDisabledMerge {
+    std::vector<std::string> list; // the list to keep
+    bool grew = false;             // it differs from what is stored: write it
+    bool over_cap = false;         // more than kMaxDisabledRules: refuse the apply
+};
+
+/// The disabled-rule list across generations. `stored` is the persisted list
+/// (empty when none exists), `list_exists` whether one is stored at all. The
+/// FIRST apply always writes the list, even an empty one (its presence is what
+/// the release keys on); later applies only ever ADD names (a rule created or
+/// re-enabled during the quarantine is disabled too), never drop one -- the
+/// release must re-enable everything any generation disabled.
+[[nodiscard]] inline WinDisabledMerge win_merge_disabled_list(std::vector<std::string> stored,
+                                                              const std::vector<std::string>& to_disable,
+                                                              bool list_exists) {
+    WinDisabledMerge m;
+    m.list = std::move(stored);
+    m.grew = !list_exists;
+    for (const auto& name : to_disable)
+        if (std::find(m.list.begin(), m.list.end(), name) == m.list.end()) {
+            m.list.push_back(name);
+            m.grew = true;
+        }
+    m.over_cap = m.list.size() > kMaxDisabledRules;
+    return m;
+}
+
+/// The default action a release puts back for profile `profile_index`: the
+/// captured one when an image exists, else Windows' own default (inbound block,
+/// outbound allow). The shell uses the fallback ONLY when it actually removed
+/// rules of ours, so a second release on an untouched host never rewrites a
+/// hardened policy. An `unknown` action in an image (parse_prior_policy never
+/// yields one) restores as block, the safe side; an index outside the three
+/// profiles reads as no image.
+[[nodiscard]] constexpr WinProfilePolicy win_release_policy(const std::optional<WinPriorPolicy>& prior,
+                                                            std::size_t profile_index) noexcept {
+    if (!prior || profile_index >= prior->size())
+        return {WinAction::block, WinAction::allow};
+    const auto& p = (*prior)[profile_index];
+    return {p.in == WinAction::allow ? WinAction::allow : WinAction::block,
+            p.out == WinAction::allow ? WinAction::allow : WinAction::block};
+}
+
 struct WinUpdatePlan {
     std::vector<WinRuleSpec> add;      // new rules, created FIRST
     std::vector<std::string> remove;   // stale rules in our group, removed LAST
@@ -1505,8 +1548,9 @@ inline void add_unique(std::vector<std::string>& v, std::string line) {
             continue;
         }
         if (r.kind == RuleKind::nd) {
+            // 133-136 only: redirect (137) is not needed and is not allowed on any leg.
             const std::string nd = "icmpv6 type { nd-router-solicit, nd-router-advert, "
-                                   "nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } accept";
+                                   "nd-neighbor-solicit, nd-neighbor-advert } accept";
             detail::add_unique(in_rules, nd);
             detail::add_unique(out_rules, nd);
             continue;
@@ -2097,8 +2141,12 @@ using PersistOs = std::function<bool(const OsPayload&)>;
 /// macOS: the current boot's identity (`kern.boottime`), or nullopt when unreadable.
 using BootTime = std::function<std::optional<std::string>()>;
 
-/// The operation-wide deadline. The clock is injectable so a test advances it
-/// from a fake runner instead of sleeping.
+/// One operation's deadline (kOperationBudget bounds the apply plan). The undo of
+/// a failed initial apply gets a fresh one and the verification a fresh
+/// kVerifyBudget (see fresh()), so one quarantine is bounded by about 60 s + 10 s
+/// when it succeeds and 60 s + 10 s + 60 s when it fails and is undone; a boot-time
+/// re-apply by the first two. The clock is injectable so a test advances it from a
+/// fake runner instead of sleeping.
 class Deadline {
 public:
     using Clock = std::chrono::steady_clock;
@@ -2168,7 +2216,10 @@ public:
     [[nodiscard]] virtual std::optional<std::string> preflight(Deadline& dl) = 0;
     /// Make `next` the effective generation. On failure the previously effective
     /// generation must still be in force (an initial apply may leave partial
-    /// state, which the caller removes with remove()).
+    /// state, which the caller removes with remove()). A leg that cannot meet
+    /// that after its commit point (the pf anchor load) reports success with
+    /// `partial` for an update (`prev_gen != 0`), so the record and the output
+    /// describe what is in force.
     [[nodiscard]] virtual StepResult apply(const AllowSet& next, std::uint32_t gen,
                                            std::uint32_t prev_gen, OsPayload& os, Deadline& dl,
                                            const PersistOs& persist) = 0;
@@ -2519,12 +2570,16 @@ private:
 ///      result partial (`anchor_not_first`), never a clean success.
 ///   5. `-a <anchor> -f <staged file>`: atomic per anchor.
 ///   6. `-F states`: pf passes a state-matched packet without evaluating any rule,
-///      so pre-existing connections would survive the load. Retried once; a
-///      failure is a FAILED apply (`state_flush_failed`), never `active`. The
+///      so pre-existing connections would survive the load. Retried once. A
+///      failure on an INITIAL apply is a FAILED apply (`state_flush_failed`), never
+///      `active`. On an UPDATE (`prev_gen != 0`) the anchor already holds the new
+///      generation and the previous one flushed the states at its own apply, so
+///      the leg reports success with `partial` and `state_flush_failed=1`: the
+///      driver then records and reports the generation actually in force. The
 ///      control channel is stateless, so the flush cannot touch it.
 /// A failure before step 5 gives back a reference taken in this call. After the
 /// anchor is loaded the reference is kept: pf stays on, and the driver either
-/// removes the anchor (initial apply) or reports an update failure.
+/// removes the anchor (initial apply) or records the new generation.
 class PfLeg final : public Leg {
 public:
     PfLeg(Runner run, Stage stage, BootTime boot)
@@ -2536,8 +2591,8 @@ public:
     // marker in `pfctl -s rules` that could be refused on (design note section 3).
     [[nodiscard]] std::optional<std::string> preflight(Deadline&) override { return std::nullopt; }
 
-    [[nodiscard]] StepResult apply(const AllowSet& next, std::uint32_t, std::uint32_t, OsPayload& os,
-                                   Deadline& dl, const PersistOs& persist) override {
+    [[nodiscard]] StepResult apply(const AllowSet& next, std::uint32_t, std::uint32_t prev_gen,
+                                   OsPayload& os, Deadline& dl, const PersistOs& persist) override {
         const auto text = pf_anchor_ruleset(next);
         if (!is_safe_ruleset_text(text))
             return StepResult::fail("unsafe_ruleset");
@@ -2622,8 +2677,17 @@ public:
                 break; // the deadline is spent: no retry
             flushed = fl->ok();
         }
-        if (!flushed)
-            return StepResult::fail("state_flush_failed");
+        if (!flushed) {
+            // The anchor load already committed `next`, and putting `prev` back would
+            // need its allow set, which Leg::apply is not given: an update therefore
+            // reports the generation that IS in force, partial. Connections the
+            // previous generation allowed and this one does not may live on until
+            // they end (the previous apply flushed the states that predate it).
+            if (prev_gen == 0)
+                return StepResult::fail("state_flush_failed");
+            ok.partial = true;
+            ok.notes.emplace_back("state_flush_failed=1");
+        }
         return ok;
     }
 
@@ -2747,6 +2811,14 @@ struct Outcome {
     }
 };
 
+/// A refusal: nothing was touched.
+[[nodiscard]] inline Outcome refused(std::string reason) {
+    Outcome o;
+    o.status = "refused";
+    o.reason = std::move(reason);
+    return o;
+}
+
 namespace detail {
 
 /// Applied but not completely: the leg said so, or the record remembers rules
@@ -2764,13 +2836,6 @@ namespace detail {
             return true;
     }
     return false;
-}
-
-[[nodiscard]] inline Outcome refused(std::string reason) {
-    Outcome o;
-    o.status = "refused";
-    o.reason = std::move(reason);
-    return o;
 }
 
 struct VerifyResult {
@@ -2844,7 +2909,6 @@ struct ApplyRequest {
 /// touching anything, write the `applying` record, only then mutate; verify; on
 /// failure of an initial apply remove our own rules and the record.
 [[nodiscard]] inline Outcome apply_and_verify(Env& env, const ApplyRequest& req, Deadline& dl) {
-    using detail::refused;
     std::optional<ProbeTarget> target;
     if (!req.probe_target.empty()) {
         auto t = parse_probe_target(req.probe_target);
@@ -3040,7 +3104,6 @@ namespace detail {
 /// removed; an unchanged set is a no-op (no mutation, no new generation).
 [[nodiscard]] inline Outcome update(Env& env, bool add, const std::vector<Endpoint>& exceptions,
                                     Deadline& dl) {
-    using detail::refused;
     const auto loaded = env.store.load();
     if (loaded.kind == StateLoad::Kind::unreadable)
         return refused("state_unreadable");
@@ -3195,6 +3258,47 @@ struct ReleaseRequest {
         o.notes.emplace_back("state_not_persisted=1");
     o.state = st;
     return o;
+}
+
+// ── TTL enforcement ─────────────────────────────────────────────────────────
+
+/// The agent's trigger engine as the core sees it; the plugin implements it over
+/// its PluginContext. Two methods, each a plain success flag.
+class TriggerRegistry {
+public:
+    virtual ~TriggerRegistry() = default;
+    [[nodiscard]] virtual bool register_trigger(std::string_view id, std::string_view type,
+                                                std::string_view config_json) = 0;
+    [[nodiscard]] virtual bool unregister_trigger(std::string_view id) = 0;
+};
+
+inline constexpr std::string_view kTtlTriggerType = "interval";
+
+/// The trigger's config: every `kTtlPollSeconds` the agent dispatches
+/// `firewall.release` with `if_ttl_expired=1`, a no-op until the record's TTL has
+/// passed. The shape agents/core's parse_trigger_config accepts.
+[[nodiscard]] inline std::string ttl_trigger_config() {
+    return std::format(
+        R"({{"interval_seconds":{},"plugin":"firewall","action":"release","parameters":{{"if_ttl_expired":"1"}}}})",
+        kTtlPollSeconds);
+}
+
+/// A TTL is enforced by that interval trigger. Any outcome that leaves a record
+/// with a TTL behind keeps the trigger registered (a failed boot-time re-apply
+/// included: the TTL still bounds the quarantine, and the expiry release works on
+/// a record in any phase); a completed release removes it. A failed registration
+/// keeps the quarantine (lifting containment is never the safe response to a
+/// bookkeeping failure) and says so: PARTIAL, retried at the next start.
+inline void settle_ttl(Outcome& o, TriggerRegistry& triggers) {
+    if (o.state && o.state->ttl_expires > 0 && o.status != "inactive") {
+        if (!triggers.register_trigger(kTtlTriggerId, kTtlTriggerType, ttl_trigger_config())) {
+            o.notes.emplace_back("ttl_trigger_unregistered=1");
+            if (o.status == "active" || o.status == "active_unproven")
+                o.status = "partial";
+        }
+    } else if (o.status == "inactive") {
+        (void)triggers.unregister_trigger(kTtlTriggerId);
+    }
 }
 
 /// `quarantine_status`: record x live OS. Never mutates, never takes the gate.

@@ -150,14 +150,19 @@ already has open would keep working. After the anchor load the leg runs:
 pfctl -F states
 ```
 
-- A failure of that call is retried once and then **is a failed apply**
-  (`state_flush_failed`): the prohibited streams are still alive, so the result is
-  never `active`. An initial apply is rolled back (anchor emptied, enable
-  reference released, record deleted). A failed `quarantine_allow` update reports
-  `update_failed` and keeps the record; the anchor already holds the new
-  generation (the load is atomic, the flush is not), which is a residual: an
+- A failure of that call is retried once. On an **initial apply** it **is a failed
+  apply** (`state_flush_failed`): the prohibited streams are still alive, so the
+  result is never `active`, and the apply is rolled back (anchor emptied, enable
+  reference released, record deleted). On an **update** (`quarantine_allow`, a
+  repair, a boot-time re-apply) the anchor load has already committed the new
+  generation (the load is atomic, the flush is not) and the previous generation
+  flushed the states that predate it at its own apply, so the leg reports the
+  generation that IS in force: the record is written for it and the result is
+  `partial` with `note|state_flush_failed=1`. The alternative, loading the previous
+  generation back, would need that generation's allow set inside the leg, and
+  would itself end in the same unflushed state. The residual is bounded: an
   allowance that was *removed* may keep serving its old connections until they
-  end.
+  end, and the next successful update or repair flushes again.
 - Prohibited streams die (their next packet matches no state and then
   `block drop quick all`). Loopback survives (stateless). The agent's control
   channel survives: it is stateless, so the flush has nothing of it to remove and
@@ -428,8 +433,11 @@ The live capture is taken on a **disposable macOS VM**, never on a shared build
 host: the apply flushes every pf state on the machine, and the live test
 (`tests/unit/test_firewall_quarantine_live.cpp`, hidden, gated on
 `YUZU_FIREWALL_QUARANTINE_LIVE=1`) switches pf off and on behind the plugin's back.
-The narrative and the answers below go in the PR body; no probe source is
-committed.
+Run the `[firewall_quarantine_live]` tag only with that variable set: without it
+every case skips and Catch2 exits 4 (all tests skipped), not 0, so a harness that
+checks for exit code 0 must set the variable first (an exit of 4 means the
+environment is unset or the OS filter matched nothing). The narrative and the
+answers below go in the PR body; no probe source is committed.
 
 Verified on the development host (macOS 26.6.2, no privilege): `pfctl -n -f` parses
 the generated anchor ruleset, `no nat all` and `no rdr all` included, and rejects a
