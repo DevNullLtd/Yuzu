@@ -3435,7 +3435,7 @@ SoftwareInventoryStore::query_components(const SoftwareComponentQuery& q) {
     }
     // Every component read runs under the 5 s bound (the table has no per-title fan-out limit),
     // so the scan-shaped flag the predicate reports is not needed here.
-    (void)add_name_predicate(sql, params, p, "c.name", q.name, q.match);
+    add_name_predicate(sql, params, p, "c.name", q.name, q.match);
     if (!q.q.empty()) {
         // One clamped, LIKE-escaped bind reused over name | path | anchor_app (literal substring).
         const std::string ph = "$" + std::to_string(++p);
