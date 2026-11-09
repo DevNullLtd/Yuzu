@@ -3152,8 +3152,8 @@ struct ApplyRequest {
                 // Nothing a re-apply would repair: answer what `quarantine_status`
                 // would (residue, an unreadable host and a failed proof included),
                 // never `active` over a known gap, notes and all.
-                detail::status_from_record(o, cur, ls);
                 detail::add_notes(o, ls.notes);
+                detail::status_from_record(o, cur, ls);
                 o.state = cur;
                 if (o.status != "degraded")
                     o.notes.emplace_back("already_active=1");
@@ -3340,8 +3340,16 @@ namespace detail {
     }
     if (changed == 0) {
         Outcome o;
-        o.status = cur.last_verify.find("unproven") != std::string::npos ? "active_unproven"
-                                                                         : "active";
+        if (has_residue(cur.os)) {
+            // Still no mutation and no leg read, but never `active` over a gap the
+            // record remembers: answer what `quarantine_status` would.
+            o.status = "partial";
+            o.reason = std::string{residue_reason(cur.os)};
+            detail::add_notes(o, residue_notes(cur.os));
+        } else {
+            o.status = cur.last_verify.find("unproven") != std::string::npos ? "active_unproven"
+                                                                             : "active";
+        }
         o.state = cur;
         o.notes.emplace_back("exceptions_unchanged=1");
         return o;

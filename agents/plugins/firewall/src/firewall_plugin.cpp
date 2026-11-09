@@ -1743,8 +1743,9 @@ private:
 }
 
 /// Does this host have an IPv6 stack that could carry traffic? Three answers:
-/// yes (/proc/net/if_inet6 exists, or disable_ipv6 reads 0), no (disable_ipv6
-/// reads 1: the host turned IPv6 off), and nullopt when neither can be read. The
+/// yes (/proc/net/if_inet6 exists, or disable_ipv6 reads 0), no (if_inet6 is
+/// absent and disable_ipv6 reads 1: the host turned IPv6 off), and nullopt when
+/// neither can be read. The
 /// last is NOT "no": the module may simply not be loaded yet (a socket load
 /// pulls it in) and an unreadable answer must never be read as "IPv4 is the whole
 /// host" (iptables_v6_plan refuses on it when ip6tables is also missing).

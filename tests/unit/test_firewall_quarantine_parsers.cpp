@@ -2033,6 +2033,31 @@ struct ScriptRig {
     }
 };
 
+/// A `quarantine_allow` that changes nothing, over a record carrying residue, answers
+/// what `quarantine_status` would (partial, the residue named) and still mutates
+/// nothing: no store write, no new generation, the stored record byte-identical. Both
+/// no-op shapes are driven: an add of an exception already present and a removal of
+/// one that is not.
+template <class Rig>
+void check_noop_update_reports_residue(Rig& rig, Deadline& dl, const Endpoint& present,
+                                       const Endpoint& absent, std::string_view reason,
+                                       std::string_view note) {
+    const auto raw = rig.store.raw;
+    const auto saves = rig.store.saves;
+    const auto generation = rig.store.state()->generation;
+    const auto check = [&](const Outcome& o) {
+        CHECK(o.status == "partial");
+        CHECK(o.reason == reason);
+        CHECK(contains(o.notes, note));
+        CHECK(contains(o.notes, "exceptions_unchanged=1"));
+        CHECK(rig.store.raw == raw);
+        CHECK(rig.store.saves == saves);
+        CHECK(rig.store.state()->generation == generation);
+    };
+    check(update(rig.env, true, {present}, dl));
+    check(update(rig.env, false, {absent}, dl));
+}
+
 } // namespace
 
 TEST_CASE("a switched-off Windows profile refuses before anything is touched, and is never re-applied over",
@@ -2205,6 +2230,19 @@ TEST_CASE("a retried quarantine answers what quarantine_status would, never acti
         CHECK(agrees(o));
         CHECK(rig.leg.applies == applies); // nothing a re-apply would repair
     }
+    SECTION("live-leg notes come before residue notes, as in quarantine_status") {
+        auto st = *rig.store.state();
+        st.os.rules_not_disabled = 4;
+        rig.store.save(st);
+        rig.leg.status.notes.emplace_back("leg_note=1");
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        const auto s = report_status(rig.env, dl);
+        const auto at = [](const Outcome& r, std::string_view n) {
+            return std::ranges::find(r.notes, n) - r.notes.begin();
+        };
+        CHECK(at(o, "leg_note=1") < at(o, "rules_not_disabled=4"));
+        CHECK(at(s, "leg_note=1") < at(s, "rules_not_disabled=4"));
+    }
     SECTION("a gap the leg itself reports") {
         rig.leg.status.partial = true;
         rig.leg.status.reason = "stale_state_entries";
@@ -2297,6 +2335,37 @@ TEST_CASE("windows stale-generation residue is partial, persisted, and recompute
     const auto r = recover_at_init(rig.env, dl);
     CHECK(r.status == "partial");
     CHECK(rig.store.state()->os.stale_rules_left == 1);
+}
+
+TEST_CASE("windows: a no-op quarantine_allow over stale-generation residue answers partial, mutating nothing",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    // the update that produces the residue: it commits, but two old rules will not delete
+    rig.leg.on_apply = [](OsPayload& os) {
+        os.stale_rules_left = 2;
+        auto r = StepResult::success();
+        r.partial = true;
+        r.notes.emplace_back("stale_rules_left=2");
+        return r;
+    };
+    const auto present = ex("10.0.0.5:22/tcp/in");
+    CHECK(update(rig.env, true, {present}, dl).status == "partial");
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->os.stale_rules_left == 2);
+
+    const auto applies = rig.leg.applies;
+    const auto removes = rig.leg.removes;
+    check_noop_update_reports_residue(rig, dl, present, ex("10.9.9.9"), "stale_rules_left",
+                                      "stale_rules_left=2");
+    CHECK(rig.leg.applies == applies); // no leg write, no probe-driven converge
+    CHECK(rig.leg.removes == removes);
+
+    // and it is the answer quarantine_status gives
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "stale_rules_left");
 }
 
 // ── TTL enforcement through the trigger registry ───────────────────────────
@@ -3529,6 +3598,29 @@ TEST_CASE("pf: a failed state flush is recorded on the state record; status stay
     CHECK_FALSE(rig.store.state()->os.state_flush_failed);
     CHECK(rig.store.raw.find("flush_failed") == std::string::npos);
     CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("pf: a no-op quarantine_allow after a failed state flush answers partial, mutating nothing",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    // the update that produces the residue: the anchor load commits, both flushes fail
+    rig.world.fail_flush_states = 2;
+    const auto present = ex("10.0.0.9:22/tcp/in");
+    CHECK(update(rig.env, true, {present}, dl).status == "partial");
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->os.state_flush_failed);
+
+    const auto mark = rig.world.log.size();
+    check_noop_update_reports_residue(rig, dl, present, ex("10.9.9.9"), "state_flush_failed",
+                                      "state_flush_failed=1");
+    CHECK(rig.world.log.size() == mark); // no pfctl call of any kind: nothing read, nothing written
+
+    // and it is the answer quarantine_status gives
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "state_flush_failed");
 }
 
 TEST_CASE("pf: a reboot re-apply whose flush fails is partial in the NEXT status too",
