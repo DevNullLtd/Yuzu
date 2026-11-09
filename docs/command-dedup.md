@@ -55,8 +55,7 @@ regressible — nothing fails loudly when one is broken.
    - `SQLITE_CORRUPT` / `SQLITE_NOTADB` from any open step (open, the `journal_mode`/`synchronous` pragmas,
      creating the two tables). Damage confined to the unused `meta` table is tolerated: the
      `schema_version` seed that touches it only logs a warning. BUSY, IOERR, FULL, CANTOPEN and PERM are NOT corruption and never quarantine (that
-     would discard good history). Do not copy echo's `integrity_ok`, which treats any prepare failure as
-     corrupt.
+     would discard good history). Echo's `classify_integrity_rc` draws the same line (#7286).
    - **There is no whole-file integrity scan, by owner ruling.** A file that opens but has a few damaged pages
      keeps serving the ids on intact pages (in one experiment with a single damaged leaf page nearly every id
      still resolved; damage to an interior or root page costs many more), and only the claims that touch a bad

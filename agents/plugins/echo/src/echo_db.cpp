@@ -670,8 +670,12 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
 // which can let Users read a corrupt database's WAL (process, network and registry capture) while
 // the live files are protected. Re-apply the protected DACL to each sidecar that exists beside the
 // quarantined file, by handle and without following a link, opened as secure_echo_db_files opens
-// the live names but with no owner or hard-link test first (recorded residual S1: a hard link
-// squatted at a claimed sidecar name would have its target's DACL rewritten). A renamed sidecar
+// the live names and judged by the same two tests first: the pass runs for every OCCUPIED derived
+// name, and a local user who predicts the quarantine name (the current epoch second) can squat
+// `<claimed>-wal` ahead of time with a hard link, which shares its target's security descriptor,
+// so applying the DACL to it would rewrite the TARGET's. A name with a foreign owner or a second
+// link is therefore left alone and logged (the live sidecar that could not take that name was
+// removed by the quarantine: recorded residual S1 in sqlite_quarantine.hpp). A renamed sidecar
 // keeps its DACL, so for it this repeats what it has. Not secure_echo_db_files itself: its
 // OPEN_ALWAYS would create empty sidecars beside the evidence.
 // Best effort and logged, the same availability-over-confidentiality posture as the live files.
@@ -679,28 +683,46 @@ void secure_quarantined_sidecars(const std::filesystem::path& quarantined,
                                  const EchoDbDacl& dacl) {
     if (!dacl.ok())
         return; // open() warned once, when it built the DACL
+    constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES; // link count
+    const yuzu::win::EchoDbOwnerProbe& probe = dacl.owner_probe();
     for (const char* suffix : {"-wal", "-shm", "-journal"}) {
         std::filesystem::path file = quarantined;
         file += suffix;
-        HANDLE raw = ::CreateFileW(file.c_str(), READ_CONTROL | WRITE_DAC, kShareAll, nullptr,
-                                   OPEN_EXISTING,
+        const std::string name = yuzu::win::from_wide(file.c_str());
+        HANDLE raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, nullptr, OPEN_EXISTING,
                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (raw == INVALID_HANDLE_VALUE) {
             const DWORD err = ::GetLastError();
             if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
                 spdlog::warn("EchoDatabase: could not open quarantined {} to secure it (error {}); "
                              "it keeps its current ACL",
-                             yuzu::win::from_wide(file.c_str()), err);
+                             name, err);
             }
             continue; // no such sidecar in this quarantine set
         }
         const HandlePtr h{raw, ::CloseHandle};
+        // Positive evidence only, as for the live names: a failed owner read is no evidence.
+        DWORD owner_rc = ERROR_SUCCESS;
+        std::optional<std::string> why = probe.foreign_owner(h.get(), &owner_rc);
+        if (!why)
+            why = yuzu::win::EchoDbOwnerProbe::extra_links(h.get());
+        if (owner_rc != ERROR_SUCCESS) {
+            spdlog::warn("EchoDatabase: could not read the owner of quarantined {} (error {}); the "
+                         "owner test is skipped for it",
+                         name, owner_rc);
+        }
+        if (why) {
+            spdlog::warn("EchoDatabase: quarantined {} {} and is not Echo's; it keeps its current "
+                         "ACL",
+                         name, *why);
+            continue;
+        }
         if (const DWORD rc = ::SetSecurityInfo(h.get(), SE_FILE_OBJECT, kDaclInfo, nullptr, nullptr,
                                                dacl.acl(), nullptr);
             rc != ERROR_SUCCESS) {
             spdlog::warn("EchoDatabase: could not apply the owner-only DACL to quarantined {} "
                          "(error {}); it keeps its current ACL",
-                         yuzu::win::from_wide(file.c_str()), rc);
+                         name, rc);
         }
     }
 }

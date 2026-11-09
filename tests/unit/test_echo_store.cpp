@@ -1964,9 +1964,9 @@ TEST_CASE("EchoDatabase: a second corruption never overwrites the first quaranti
 
 TEST_CASE("EchoDatabase: a valid DB opens cleanly with no quarantine and preserves data (#559)",
           "[echo][store][lifecycle][corruption]") {
-    // The happy path: integrity_ok returns true, so a previously-written DB is
+    // The happy path: check_integrity answers ok, so a previously-written DB is
     // re-opened in place with its data intact and NO `.corrupt-*` sidecar minted
-    // (guards against an integrity_ok that wrongly fails every open).
+    // (guards against an integrity check that wrongly fails every open).
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_valid_");
     {
         auto opened = EchoDatabase::open(tmp);
@@ -4533,6 +4533,52 @@ TEST_CASE("EchoDatabase (Windows): a quarantined sidecar that had to be copied i
         CHECK(slurp_file(copied) == sc.bytes);
         assert_owner_only(copied); // protected, and no Users ACE inherited from the directory
     }
+}
+
+// adv-S-A. The re-secure pass above runs for every OCCUPIED derived name, and the quarantine name
+// is predictable (the current epoch second, n = 0), so a local user can squat `<claimed>-wal`
+// ahead of a corruption with a hard link to a file of theirs, or to any file the service holds
+// WRITE_DAC on. A hard link shares its target's security descriptor: without the owner and link
+// tests the pass would rewrite the TARGET's DACL. The squat covers a window of epochs around now
+// so the claim lands on one of them without a seam into the clock; the live sidecar that could
+// not take the squatted name is removed by the quarantine (recorded residual S1), which is not
+// what this case is about: here there is none.
+TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar name is left alone",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    AclDir d;
+    if (!volume_has_hard_links(d.dir.path))
+        SKIP("the temp directory's volume is not NTFS or ReFS: no hard links");
+    spit_file(d.db, "this is not a SQLite database");
+    const fs::path decoy = d.dir.path / "decoy.bin"; // inherits the directory's Users ACE
+    spit_file(decoy, "not a wal");
+    REQUIRE(dacl_facts(decoy).allows(kUsers));
+    REQUIRE_FALSE(dacl_facts(decoy).dacl_protected);
+
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    constexpr int kSquats = 11; // now .. now + 10 s
+    for (int i = 0; i < kSquats; ++i) {
+        std::error_code ec;
+        fs::create_hard_link(decoy, d.dir.path / std::format("echo.db.corrupt-{}-wal", now + i), ec);
+        REQUIRE_FALSE(ec);
+    }
+    REQUIRE(fs::hard_link_count(decoy) == kSquats + 1);
+
+    auto opened = EchoDatabase::open(d.db);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->quarantined_this_open().has_value());
+    // The claim landed inside the squatted window, so the pass met a squatted `-wal` name.
+    const fs::path squatted =
+        d.dir.path / std::format("echo.db.corrupt-{}-wal", *opened->quarantined_this_open());
+    REQUIRE(fs::exists(squatted));
+    REQUIRE(fs::exists(d.dir.path / std::format("echo.db.corrupt-{}", *opened->quarantined_this_open())));
+
+    // Nothing was re-secured through the squat: the target keeps its descriptor and every link.
+    CHECK(fs::hard_link_count(decoy) == kSquats + 1);
+    CHECK(read_file(decoy) == "not a wal");
+    CHECK_FALSE(dacl_facts(decoy).dacl_protected);
+    CHECK(dacl_facts(decoy).allows(kUsers));
 }
 
 // The real probe (default_echo_owner_probe, the owner test open() applies), not a fake: a file
