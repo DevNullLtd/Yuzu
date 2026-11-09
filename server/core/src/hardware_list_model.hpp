@@ -289,12 +289,12 @@ inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
 ///
 /// Pure. Rules, on top of the row-count rules above:
 ///  - `content_digest == nullopt` (a status-only kind, or a row written before migration v3):
-///    not verifiable, served as the row-count rule left it. So is a WELL-FORMED digest of a
+///    not compared, served as the row-count rule left it. So is a WELL-FORMED digest of a
 ///    different layout version (`classify_stored_digest` == `kOtherLayout`, e.g. `v2:...`; the
 ///    version is one to six digits): this
 ///    build cannot recompute it. Any other non-NULL value that is not the current `v1:` form (an
 ///    empty or whitespace value, `V1:`, bare hex, garbage, a malformed version, `v2:` with nothing
-///    after it) is a MISMATCH, never unverified: a damaged column must not let an edit through.
+///    after it) is a MISMATCH, never left unchecked: a damaged column must not let an edit through.
 ///  - `unavailable`, `permission_denied`, an unknown or blank level: never touched (no rows by
 ///    contract).
 ///  - If the row count already disagrees, that verdict is returned alone: the count token is the

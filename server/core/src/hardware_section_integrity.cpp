@@ -20,10 +20,17 @@ namespace yuzu::server {
 
 namespace {
 
-/// The faults that are counted: every non-None `SectionFault`. The one list the pre-seed, the
-/// sampler lookup and the test reset all iterate.
+/// The faults that are counted: every non-None `SectionFault`. The one list the pre-seed and the
+/// test reset iterate; `integrity_sampler` and `section_fault_label` are `switch`es that must stay
+/// in step with it (neither has a `default`, so -Wswitch flags a new enumerator there).
 constexpr std::array<SectionFault, 3> kCountedFaults{SectionFault::RowCount, SectionFault::Content,
                                                      SectionFault::Unverifiable};
+// `None` is enumerator 0, so a counted list covering every other enumerator has exactly as many
+// entries as the highest enumerator's value. This catches a removed or renumbered enumerator; a
+// NEW enumerator appended after `Unverifiable` is caught by -Wswitch on the two switches above.
+static_assert(kCountedFaults.size() == static_cast<std::size_t>(SectionFault::Unverifiable),
+              "SectionFault changed: update kCountedFaults, integrity_sampler, section_fault_label "
+              "and the pre-seed test");
 
 /// Per-reason WARN state, mirroring DeviceInventoryStore's DegradeSampler: log the leading edge of
 /// an episode, then every Nth occurrence, so a partial restore across a fleet cannot flood the

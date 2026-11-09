@@ -1903,7 +1903,8 @@ TEST_CASE(
     CHECK(integrity_count(m, "row_count_mismatch") == 2.0);
     CHECK(integrity_count(m, "content_digest_mismatch") == 1.0);
     CHECK(integrity_count(m, "digest_unverifiable") == 0.0);
-    // Counts served reads, not distinct defects: the same call again doubles it.
+    // Counts reads composed with a faulted section, not distinct defects: the same call again
+    // doubles it.
     record_section_integrity(sections, "agent-1", &m);
     CHECK(integrity_count(m, "row_count_mismatch") == 4.0);
     // An empty list (a v1 record, or nothing stored) counts nothing; a null registry is safe.
@@ -1949,7 +1950,8 @@ TEST_CASE(
 }
 
 // Kills: a series that exists only after its first fault (a dashboard cannot tell "no fault" from
-// "series absent"), or a hand-kept label list drifting from section_fault_label.
+// "series absent"). The expected labels below are hand-kept on purpose: a new SectionFault must be
+// added here too (the static_assert on kCountedFaults and -Wswitch flag the production side).
 TEST_CASE("register_section_integrity_metrics: pre-seeds one series per counted fault at zero",
           "[hardware][model][sections][metrics]") {
     yuzu::MetricsRegistry m;

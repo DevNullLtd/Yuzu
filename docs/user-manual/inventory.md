@@ -1512,9 +1512,9 @@ sync, defeating the hash-skip protocol.
   rows, so no device sync clears it. The verdict is recomputed on every read, so a transient
   provider fault may clear on a later read; a persistent one needs an operator to fix the server's
   OpenSSL provider or FIPS configuration (for example `openssl list -providers` in the server's
-  environment). None of the tokens is stored: all are worked out each time the record is read, so they never appear in
-  the `device_ci_section` query further down. Each served fault is also counted in
-  `yuzu_hardware_section_integrity_total` ([Metrics](metrics.md#hardware-record-section-integrity-metric-7159)).
+  environment). None of the tokens is stored: all are worked out each time the record is read,
+  so they never appear in the `device_ci_section` query further down. Each faulted section of a
+  read composed is also counted in `yuzu_hardware_section_integrity_total` ([Metrics](metrics.md#hardware-record-section-integrity-metric-7159)).
   Reading the record again does not clear either mismatch token (it may clear
   `server:content_digest_unverifiable`, see above). **Only a full device-record sync
   repairs either mismatch** (a device whose hardware has not changed sends only a hash on its daily sync,

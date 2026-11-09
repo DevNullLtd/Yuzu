@@ -1045,9 +1045,9 @@ SectionVerdict verify_section_content(const DeviceCiSection& section, DigestFn d
     if (row_count_disagrees(section))
         return v; // the count already reports the loss; a lost row always changes the digest too
     if (!section.content_digest.has_value())
-        return v; // not verifiable: served as the count rule left it
+        return v; // not compared: served as the count rule left it
     if (classify_stored_digest(*section.content_digest) == StoredDigestForm::kOtherLayout)
-        return v; // a well-formed digest of another layout version: unverified. Anything else that
+        return v; // a well-formed digest of another layout version: unchecked. Anything else that
                   // is not the current form falls through to the comparison and mismatches.
     if (section.level != "ok" && section.level != "constrained")
         return v; // no rows by contract: nothing to hash

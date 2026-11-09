@@ -32,7 +32,7 @@
 ///     value, garbage, a malformed version (`v:`, `vx:`, `v0:`, `v01:`, `v1` with no colon, more
 ///     than six digits), a
 ///     different layout version with nothing after the colon. A damaged column must never read as
-///     "unverified" and let a same-count edit through as complete. See the warning in
+///     "unchecked" and let a same-count edit through as complete. See the warning in
 ///     `device_ci_kinds.hpp`.
 ///
 /// Pure: no store, no PG, no I/O. The digest provider is OpenSSL's one-shot SHA-256
@@ -113,10 +113,10 @@ inline void digest_put_cell(std::string& out, std::string_view s) {
 /// The layout version this build writes and recomputes.
 inline constexpr std::string_view kSectionDigestPrefix = "v1:";
 
-/// What a non-NULL stored digest is, for the verifier. Only `kOtherLayout` is unverified.
+/// What a non-NULL stored digest is, for the verifier. Only `kOtherLayout` is left unchecked.
 enum class StoredDigestForm {
     kCurrent,     ///< starts with `v1:`: compare it with the recomputed digest
-    kOtherLayout, ///< a well-formed digest of a layout version other than 1: unverified
+    kOtherLayout, ///< a well-formed digest of a layout version other than 1: left unchecked
     kMalformed,   ///< anything else: a mismatch
 };
 
