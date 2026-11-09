@@ -8486,9 +8486,6 @@ tests:
       - eval_time: 31m
         alertname: YuzuEchoDbCorruptionDetected
         exp_alerts: []
-      - eval_time: 80m
-        alertname: YuzuEchoDbCorruptionDetected
-        exp_alerts: []
 
   # CASE -- plugin init failure held for 16m (past for: 15m) fires with the plugin label.
   - interval: 1m

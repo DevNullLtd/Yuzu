@@ -7858,23 +7858,14 @@ groups:
             the mechanism inert).
 
   - name: yuzu-echo
-    # Echo fleet signals. DECISION (#6521): the five registry_* keys of the on-demand echo.status
-    # action have NO fleet gauge, so there is deliberately no alert on them yet. Exporting one
-    # (for example "watcher dead": unarmed roots == roots) needs a new heartbeat tag on the agent
-    # and a new gauge on the server; that is a deferred follow-up. Recorded in
-    # docs/observability-conventions.md.
+    # No alert on the echo.status registry_* keys yet (no fleet gauge); decision and follow-up in
+    # docs/observability-conventions.md (#6521).
     rules:
-      # yuzu_fleet_echo_db_corruption_agents counts agents whose cumulative-ever quarantine total
-      # is > 0 at the sweep. Each agent counts once per sweep regardless of its total, so a RISE
-      # is a LOWER BOUND on new quarantines, not an event count. Three limits, all by design:
-      #   - an agent returning to the fleet with an old quarantine raises the gauge (false
-      #     positive: nothing new happened);
-      #   - a repeat quarantine on an agent that is already counted does not raise it (missed);
-      #   - a departure in the same window can mask an arrival (missed).
-      # The gauge counts only agents currently reporting heartbeats. It is a gauge, so `delta`,
-      # not `increase`. `for: 0m`: a rise is an event, a sustained condition would never clear.
-      # Warning, not critical: the value is agent-self-reported inside the heartbeat trust
-      # boundary, so one forged or buggy agent can raise it.
+      # The gauge counts agents once per sweep, so a rise is a lower bound on new quarantines
+      # (limits spelled out in the description). It is a gauge, so `delta`, not `increase`.
+      # `for: 0m`: a rise is an event, a sustained condition would never clear. Warning, not
+      # critical: the value is agent-self-reported inside the heartbeat trust boundary, so one
+      # forged or buggy agent can raise it.
       - alert: YuzuEchoDbCorruptionDetected
         expr: |
           delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
