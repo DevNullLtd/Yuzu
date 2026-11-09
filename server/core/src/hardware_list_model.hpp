@@ -43,10 +43,6 @@
 #include <utility>
 #include <vector>
 
-namespace yuzu {
-class MetricsRegistry; // sdk/include/yuzu/metrics.hpp; the header stays metrics-free
-}
-
 namespace yuzu::server {
 
 /// Whitelisted sort keys for the Hardware CI list. Never accept an arbitrary column
@@ -255,8 +251,9 @@ inline constexpr std::string_view kSectionRowCountMismatchReason = "server:row_c
 ///
 /// `fault` is the PURE cause of the downgrade this server applied (None when it applied none: an
 /// agent-reported `constrained` stays None). It is the one source for both the served token and
-/// the `yuzu_hardware_section_integrity_total` counter label (`record_section_integrity`), so the
-/// two can never disagree about why a section was downgraded.
+/// the `yuzu_hardware_section_integrity_total` counter label (`record_section_integrity`); both
+/// read it from `served_section_verdict`, so they name the same cause for the same rows (see the
+/// intermittent-provider caveat there).
 enum class SectionFault : std::uint8_t { None, RowCount, Content, Unverifiable };
 struct SectionVerdict {
     std::string level;
@@ -286,8 +283,9 @@ inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
 [[nodiscard]] std::string_view section_fault_label(SectionFault fault) noexcept;
 
 /// The level and reason a table-backed section is SERVED with: `verify_section_row_count` first,
-/// then the content digest. This is the function every serving path uses (`ci_sections_json`);
-/// anything that serves raw `get_device_ci_sections` levels must call it.
+/// then the content digest. Serving paths call it through `served_section_verdict`, which adds the
+/// registered/table-backed guard; anything that serves raw `get_device_ci_sections` levels must
+/// call one of the two.
 ///
 /// Pure. Rules, on top of the row-count rules above:
 ///  - `content_digest == nullopt` (a status-only kind, or a row written before migration v3):
@@ -322,26 +320,21 @@ inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
 [[nodiscard]] SectionVerdict verify_section_content(const DeviceCiSection& section,
                                                     DigestFn digest);
 
-/// Counts the integrity faults of the sections of ONE served read of a record, and logs the first
-/// of an episode: `yuzu_hardware_section_integrity_total{reason}` once per faulted section per
-/// read (the served-read count, NOT distinct defects: a polled device inflates it), plus a
-/// rate-limited WARN per reason naming the device id and the section kind, never row contents.
+/// THE serving predicate: the level and reason `section` is served with, as one function both
+/// the response body (`ci_sections_json`) and the integrity counter
+/// (`record_section_integrity`, hardware_section_integrity.hpp) call. A kind that is not in the
+/// section registry, or is registered but not table-backed (status-only), is served exactly as
+/// stored with `fault == None` - even if it carries a stored `row_count` or digest, which are
+/// never compared for such a kind. A table-backed kind goes through `verify_section_content`
+/// (which itself leaves a level other than `ok`/`constrained` untouched). `digest` nullptr means
+/// `sha256_hex`.
 ///
-/// It calls `verify_section_content` itself, so the counted cause is by construction the one the
-/// served body carries (never a parallel verifier). Re-verifying costs two SHA-256 passes over at
-/// most 96 KiB of section rows (the `device_ci_kinds.hpp` static_assert), sub-millisecond against
-/// a Postgres round-trip; precomputing the verdicts at read time and carrying them would create
-/// the second serving path this header forbids. The provider is a PARAMETER (no process-global
-/// state); nullptr (the default) means `sha256_hex`. `metrics` may be null (nothing counted, still
-/// logged). Called from the one `hw_ci_detail_fn` closure, after the sections read, for
-/// `CiRead::WithSections` only - so both transports are covered and the dashboard is not.
-void record_section_integrity(const std::vector<DeviceCiSection>& sections,
-                              std::string_view agent_id, yuzu::MetricsRegistry* metrics,
-                              DigestFn digest = nullptr);
-
-/// TEST SEAM (#7159): forget the per-reason WARN sampling state, so a test can assert the
-/// leading-edge WARN regardless of which tests ran before it in the same process.
-void reset_section_integrity_log_state_for_test() noexcept;
+/// One function and the same rows, but two CALLS per read (once for the body, once for the
+/// counter): an INTERMITTENT digest-provider failure between them could make the counted label
+/// differ from the served token. That is documented and accepted; carrying a precomputed verdict
+/// from the first call to the second would create a second serving path.
+[[nodiscard]] SectionVerdict served_section_verdict(const DeviceCiSection& section,
+                                                    DigestFn digest = nullptr);
 
 inline constexpr std::size_t kHwSoftwareCap = 2000;
 

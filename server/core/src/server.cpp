@@ -242,6 +242,7 @@
 #include "device_containment_routes.hpp"
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
+#include "hardware_section_integrity.hpp"
 #include "software_collection_settings_routes.hpp"
 #include "software_collection_settings_store.hpp"
 #include "software_curation_routes.hpp"
@@ -2456,20 +2457,9 @@ public:
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
-        // Hardware record section integrity (#7159): faults SERVED on a record read, by closed
-        // reason set (the label values are section_fault_label()'s). Pre-seeded so a dashboard
-        // can tell "no fault" from "series absent".
-        metrics_.describe("yuzu_hardware_section_integrity_total",
-                          "Hardware record sections served downgraded to constrained because the "
-                          "rows read back disagree with the row count or content digest the server "
-                          "recorded when the section was written (row_count_mismatch, "
-                          "content_digest_mismatch), or the server could not compute the digest to "
-                          "compare (digest_unverifiable: a fault of this server, not of the "
-                          "device). Counts served reads, once per section per read, so a polled "
-                          "device inflates it; it is not a count of distinct defects",
-                          "counter");
-        for (const auto reason : {"row_count_mismatch", "content_digest_mismatch", "digest_unverifiable"})
-            metrics_.counter("yuzu_hardware_section_integrity_total", {{"reason", reason}});
+        // Hardware record section integrity (#7159): describe + pre-seed the three series
+        // (hardware_section_integrity.cpp owns the metric name, help and label set).
+        register_section_integrity_metrics(metrics_);
         // /crypto admission refusals (reason=admission_full): pre-seeded so the series is
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",

@@ -11,6 +11,7 @@
 /// null-vs-value contract for the new fields, and the POST .../sync route matrix.
 
 #include "hardware_routes.hpp"
+#include "hardware_section_integrity.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_forensics_tier_fixture.hpp"

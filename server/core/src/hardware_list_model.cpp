@@ -7,15 +7,10 @@
 #include "device_ci_kinds.hpp" // the section registry: kind order and declared columns (constexpr only)
 #include "tag_store.hpp" // TagStore::validate_key - the .cpp only; the header stays store-free (#6558)
 
-#include <yuzu/log_token.hpp> // log_token: ids and kinds in a log line
-#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
-
-#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -252,8 +247,7 @@ nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
         // The served level/reason: the stored status reconciled with the rows actually read
         // (count, then content digest). A downgrade only ever moves ok -> constrained, so the
         // row-serving test below is unchanged by it.
-        const SectionVerdict verdict = def.table != nullptr ? verify_section_content(*it)
-                                                            : SectionVerdict{it->level, it->reason};
+        const SectionVerdict verdict = served_section_verdict(*it);
         nlohmann::json rows = nlohmann::json::array();
         if (def.table != nullptr && (it->level == "ok" || it->level == "constrained")) {
             const auto cols = ci_columns(def);
@@ -1074,74 +1068,11 @@ SectionVerdict verify_section_content(const DeviceCiSection& section, DigestFn d
     return v;
 }
 
-namespace {
-
-/// Per-reason WARN state, mirroring DeviceInventoryStore's DegradeSampler: log the leading edge of
-/// an episode, then every Nth occurrence, so a partial restore across a fleet cannot flood the
-/// log - the counter is the continuous signal, the log a sampled breadcrumb.
-struct IntegritySampler {
-    std::atomic<std::uint64_t> count{0};
-    std::atomic<std::int64_t> last_ts{0};
-};
-constexpr std::uint64_t kIntegrityLogSample = 100;
-constexpr std::int64_t kIntegrityEpisodeGapSecs = 60;
-
-IntegritySampler& integrity_sampler(SectionFault fault) {
-    static IntegritySampler row_count, content, unverifiable;
-    switch (fault) {
-    case SectionFault::RowCount:
-        return row_count;
-    case SectionFault::Content:
-        return content;
-    case SectionFault::Unverifiable:
-    case SectionFault::None:
-        break;
-    }
-    return unverifiable;
-}
-
-} // namespace
-
-void reset_section_integrity_log_state_for_test() noexcept {
-    for (const auto fault :
-         {SectionFault::RowCount, SectionFault::Content, SectionFault::Unverifiable}) {
-        auto& s = integrity_sampler(fault);
-        s.count.store(0, std::memory_order_relaxed);
-        s.last_ts.store(0, std::memory_order_relaxed);
-    }
-}
-
-namespace {
-
-} // namespace
-
-void record_section_integrity(const std::vector<DeviceCiSection>& sections,
-                              std::string_view agent_id, yuzu::MetricsRegistry* metrics,
-                              DigestFn digest) {
-    for (const auto& section : sections) {
-        const SectionFault fault = verify_section_content(section, digest).fault;
-        if (fault == SectionFault::None)
-            continue;
-        const std::string_view label = section_fault_label(fault);
-        if (metrics != nullptr)
-            metrics
-                ->counter("yuzu_hardware_section_integrity_total", {{"reason", std::string(label)}})
-                .increment();
-        auto& s = integrity_sampler(fault);
-        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-        const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
-        const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
-        const bool new_episode = prev == 0 || (now - prev) > kIntegrityEpisodeGapSecs;
-        if (new_episode || (n % kIntegrityLogSample) == 0) {
-            // Device id and section kind only - never row contents (a section's rows are
-            // agent-supplied bytes and may hold personal data).
-            spdlog::warn("hardware record: section integrity fault agent={} kind={} reason={} "
-                         "(served constrained; occurrence {})",
-                         yuzu::log_token(agent_id), yuzu::log_token(section.kind), label, n);
-        }
-    }
+SectionVerdict served_section_verdict(const DeviceCiSection& section, DigestFn digest) {
+    const auto idx = device_ci_section_index(section.kind);
+    if (!idx || kDeviceCiSections[*idx].table == nullptr)
+        return SectionVerdict{section.level, section.reason}; // never compared: served as stored
+    return verify_section_content(section, digest);
 }
 
 } // namespace yuzu::server

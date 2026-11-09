@@ -16,6 +16,7 @@
 #include "device_ci_kinds.hpp"
 #include "device_ci_section_digest.hpp"
 #include "hardware_list_model.hpp"
+#include "hardware_section_integrity.hpp"
 #include "hardware_routes.hpp"
 #include "mcp_jsonrpc.hpp"
 #include "mcp_server.hpp"
