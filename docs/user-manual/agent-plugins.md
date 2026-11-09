@@ -79,7 +79,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `tags` | ✅ ✅ ✅ | Device tagging — set, get, delete, list tags for scope evaluation | [README](../../agents/plugins/tags/README.md) |
 | `update_source_trust` | 🟡 🟡 ✅ | Package and update-source trust posture (facts only) | [README](../../agents/plugins/update_source_trust/README.md) |
 | `users` | ✅ ✅ ✅ | Reports logged-on users, sessions, local accounts, admin group members, group membership, primary user, and session history | [README](../../agents/plugins/users/README.md) |
-| `virtualization` | 🟡 ✅ ✅ | Virtualization facts: VM or not, which hypervisor, container membership | [README](../../agents/plugins/virtualization/README.md) |
+| `virtualization` | 🟡 ✅ ✅ | Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions | [README](../../agents/plugins/virtualization/README.md) |
 | `vuln_scan` | ✅ ✅ ✅ | Host vulnerability scanning — CVE matching and configuration compliance checks | [README](../../agents/plugins/vuln_scan/README.md) |
 | `wifi` | ✅ 🟡 🟡 | Scans visible WiFi networks and reports current connection status | [README](../../agents/plugins/wifi/README.md) |
 | `windows_optional_features` | ✅ ⛔ ⛔ | Windows optional OS feature state (enabled/disabled/pending) via the DISM API | [README](../../agents/plugins/windows_optional_features/README.md) |

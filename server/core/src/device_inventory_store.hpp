@@ -27,6 +27,7 @@
 ///     agent-supplied `collected_at` (the #1685 lesson, baked in from day one).
 
 #include "device_inventory_types.hpp"
+#include "digest_fn.hpp"                // DigestFn (the writer's test seam; no OpenSSL here)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
 
 #include <cstdint>
@@ -61,6 +62,13 @@ public:
     /// Wire a metrics registry (read-degrade counter). Set ONCE during
     /// single-threaded startup; read without synchronisation on serving threads.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// TEST SEAM (#7163): replace the digest provider the full-replace writer hashes section
+    /// rows with, so a test can fail it (return std::nullopt, as `sha256_hex` does when
+    /// `EVP_Digest` fails) and reach the `digest_provider_failed` abort. nullptr (the default)
+    /// means `sha256_hex`; production never calls this. Set before the store is used from other
+    /// threads, like `set_metrics`.
+    void set_digest_provider_for_test(DigestFn digest) noexcept { digest_fn_ = digest; }
 
     /// Canonical content hash over a device-CI record — the SAME bytes the agent
     /// hashes. PER VERSION: v1 (`blob_version` 1) = positional 22-field join + SHA-256
@@ -141,6 +149,7 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    DigestFn digest_fn_{nullptr}; // nullptr = sha256_hex; see set_digest_provider_for_test
 };
 
 } // namespace yuzu::server

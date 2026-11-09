@@ -1,7 +1,11 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-06 · euid 0 · leg-hash d3f729438b24
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-08 · euid 0 · leg-hash 2a955b994291
 == action=host
 status|host|supported|-
 host|yes|guest|hyperv|-|cpuid|high
 container|no|linux:no_container_marker
 [result_status] OK / FULL / 
+
+== action=wsl
+status|wsl|unsupported|linux:virtualization:wsl:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / linux:virtualization:wsl:unsupported
 

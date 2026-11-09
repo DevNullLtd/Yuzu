@@ -2221,7 +2221,7 @@ TEST_CASE(
     const auto call = src.find("detail::run_in_handler_step_up(", wired);
     REQUIRE(call != std::string::npos);
     CHECK(call - wired < 2500);
-    // The out-parameter is a real admission, not the nullptr the 35 kRequired rows pass.
+    // The out-parameter is a real admission, not the nullptr the 39 kRequired rows pass.
     const auto args = src.substr(call, 800);
     CHECK(args.find("&admitted") != std::string::npos);
 }

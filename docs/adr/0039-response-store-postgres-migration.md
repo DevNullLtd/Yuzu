@@ -40,7 +40,10 @@ cap — see the 2026-11-02 Update below.
 lands as **migration v2** (`ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT
 NULL DEFAULT 0`), not folded into v1's `CREATE TABLE` — `PgMigrationRunner` stamps
 `schema_meta(store, version)` once per numbered migration and never replays an edited one, so
-changing v1 in place would silently no-op on any database that already ran it.
+changing v1 in place would silently no-op on any database that already ran it. (Update
+2026-11-09, #7158: the runner now also records a SHA-256 of each applied migration and refuses a
+store whose recorded hash differs from this build's text, so such an edit is refused at start
+rather than silently ignored.)
 
 ### Posture (ADR-0012 §1)
 

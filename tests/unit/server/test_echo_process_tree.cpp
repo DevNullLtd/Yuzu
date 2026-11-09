@@ -1,302 +1,751 @@
 /// @file test_echo_process_tree.cpp
-/// Unit tests for the Echo process-tree reconstruction engine (echo_process_tree.*):
-/// the __schema__ parsers, point-in-time/window reconstruction, pid-reuse,
-/// orphan→root, the suspicious parent→child anomaly, anomalies-only pruning, the
-/// timescale anchors + window resolution, and render HTML-escaping. Pure — no store,
-/// no network.
+/// Unit tests for the Echo process-tree engine (echo_process_tree.*): the hourly
+/// __schema__ parsers, the whole-hour window math, the name-level tree over one selected
+/// hour (self-parent, cycles and fan-in each place every node once), the by-name anomaly
+/// flags, and render HTML-escaping + the capture-source cards. Pure — no store, no
+/// network. Package acceptance is fixture-only: parent_name and abnormal_exit_count are
+/// not populated by the agent until the fold writes them.
 
 #include "echo_process_tree.hpp"
+#include "source_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::test::source_scan::count_occurrences;
 
 // The Echo page shell is a raw-string constant in its own TU (echo_page_ui.cpp), at global scope.
 extern const char* const kEchoPageHtml;
 
 namespace {
 
-EchoProcEvent ev(std::int64_t ts, const char* action, std::uint32_t pid, std::uint32_t ppid,
-                const char* name, const char* user = "", const char* cmd = "") {
-    EchoProcEvent e;
-    e.ts = ts;
-    e.action = action;
-    e.pid = pid;
-    e.ppid = ppid;
-    e.name = name;
-    e.user = user;
-    e.cmdline = cmd;
-    return e;
+constexpr std::int64_t kHour = 3600;
+const std::string kToken = "0123456789abcdef0123456789abcdef";
+
+EchoProcHourRow hr(std::int64_t hour, const char* name, const char* parent, const char* user = "",
+                   std::int64_t starts = 1, std::int64_t stops = 0, std::int64_t abnormal = 0) {
+    EchoProcHourRow r;
+    r.hour_ts = hour;
+    r.name = name;
+    r.parent_name = parent;
+    r.user = user;
+    r.start_count = starts;
+    r.stop_count = stops;
+    r.abnormal_exit_count = abnormal;
+    return r;
 }
 
-// First node with `pid`; nullptr if absent. `running_pref` picks a running
-// incarnation when a pid has several.
-const EchoProcNode* find_pid(const EchoProcTree& t, std::uint32_t pid, bool running_pref = false) {
-    const EchoProcNode* any = nullptr;
-    for (const auto& n : t.nodes) {
-        if (n.pid != pid)
-            continue;
-        if (!any)
-            any = &n;
-        if (running_pref && n.running)
-            return &n;
-    }
-    return any;
-}
-
-int count_pid(const EchoProcTree& t, std::uint32_t pid) {
-    int c = 0;
+// First node with `name` (and `user` when given); nullptr if absent.
+const EchoProcNode* find_node(const EchoProcTree& t, const std::string& name,
+                              const char* user = nullptr) {
     for (const auto& n : t.nodes)
-        if (n.pid == pid)
-            ++c;
+        if (n.name == name && (!user || n.user == user))
+            return &n;
+    return nullptr;
+}
+
+// Number of rendered tree rows carrying this exact process name.
+int rendered_rows(const std::string& html, const std::string& name) {
+    return count_occurrences(html, "<span class=\"tt-name\">" + name + "</span>");
+}
+
+EchoTcpHourRow conn(std::int64_t hour, const char* proc, const char* raddr, int rport,
+                    const char* proto = "tcp", std::int64_t connects = 1) {
+    EchoTcpHourRow c;
+    c.hour_ts = hour;
+    c.process_name = proc;
+    c.remote_addr = raddr;
+    c.remote_port = rport;
+    c.proto = proto;
+    c.connect_count = connects;
     return c;
+}
+
+std::string lower(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
 }
 
 } // namespace
 
-TEST_CASE("echo parse: process __schema__ output", "[echo][tree][parse]") {
+// =============================================================================
+// Parsers
+// =============================================================================
+
+TEST_CASE("echo parse: process hourly __schema__ output", "[echo][tree][parse]") {
+    // Columns located by NAME (deliberately reordered), a trailer row and a torn row.
     const std::string out =
-        "__schema__|ts|action|pid|ppid|name|cmdline|user\n"
-        "100|started|1|0|systemd||root\n"
-        "110|started|100|1|bash||alice\n"
-        "total|2\n"; // trailer row — too few cells, must be skipped
-    auto events = parse_echo_process_output(out);
-    REQUIRE(events.size() == 2);
-    CHECK(events[0].ts == 100);
-    CHECK(events[0].pid == 1);
-    CHECK(events[0].ppid == 0);
-    CHECK(events[0].name == "systemd");
-    CHECK(events[0].action == "started");
-    CHECK(events[1].pid == 100);
-    CHECK(events[1].user == "alice");
+        "__schema__|user|name|hour_ts|stop_count|start_count|parent_name|abnormal_exit_count\n"
+        "root|systemd|7200|0|1||0\n"
+        "alice|bash|7200|3|4|systemd|2\n"
+        "torn|row\n"
+        "total|2\n"; // trailer row: too few cells, must be skipped
+    const auto rows = parse_echo_process_hourly_output(out);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].hour_ts == 7200);
+    CHECK(rows[0].name == "systemd");
+    CHECK(rows[0].parent_name.empty());
+    CHECK(rows[0].start_count == 1);
+    CHECK(rows[1].name == "bash");
+    CHECK(rows[1].user == "alice");
+    CHECK(rows[1].parent_name == "systemd");
+    CHECK(rows[1].start_count == 4);
+    CHECK(rows[1].stop_count == 3);
+    CHECK(rows[1].abnormal_exit_count == 2);
 }
 
-TEST_CASE("echo parse: error payload and wrong shape yield empty", "[echo][tree][parse]") {
-    CHECK(parse_echo_process_output("error|database is locked\n").empty());
-    // Missing the required `pid` column → refuse rather than guess.
-    CHECK(parse_echo_process_output("__schema__|ts|action|ppid|name\n100|started|0|x\n").empty());
+TEST_CASE("echo parse: process hourly rejects a missing required column and an error payload",
+          "[echo][tree][parse]") {
+    CHECK(parse_echo_process_hourly_output("error|database is locked\n").empty());
+    const std::string cols[] = {"hour_ts", "name", "parent_name", "user", "start_count", "stop_count"};
+    for (const auto& dropped : cols) {
+        std::string schema = "__schema__";
+        std::string row;
+        for (const auto& c : cols) {
+            if (c == dropped)
+                continue;
+            schema += "|" + c;
+            row += (row.empty() ? "" : "|") + std::string(c == "name" || c == "parent_name" || c == "user"
+                                                              ? "x"
+                                                              : "5");
+        }
+        INFO("dropped " << dropped);
+        CHECK(parse_echo_process_hourly_output(schema + "\n" + row + "\n").empty());
+    }
+    // abnormal_exit_count is optional: its absence is not a wrong shape.
+    CHECK(parse_echo_process_hourly_output("__schema__|hour_ts|name|parent_name|user|start_count|stop_count\n"
+                                           "3600|a||u|1|1\n")
+              .size() == 1);
 }
 
-TEST_CASE("echo parse: tcp __schema__ output", "[echo][tree][parse]") {
+TEST_CASE("echo parse: process hourly skips torn rows and out-of-range numbers",
+          "[echo][tree][parse]") {
     const std::string out =
-        "__schema__|pid|process_name|proto|local_port|remote_addr|remote_port|state|ts|action\n"
-        "100|bash|tcp|54321|1.2.3.4|443|ESTABLISHED|160|connected\n";
-    auto conns = parse_echo_tcp_output(out);
-    REQUIRE(conns.size() == 1);
-    CHECK(conns[0].pid == 100);
+        "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+        "3600|ok||u|1|1|0\n"
+        "3600|torn||u|1|1\n"                      // shorter than the abnormal column
+        "abc|bad-hour||u|1|1|0\n"                 // non-numeric required cell
+        "3600|neg||u|-4|1|0\n"                    // negative count
+        "3600|huge||u|99999999999999999999|1|0\n" // overflows int64
+        "3600|garbage-optional||u|2|2|zzz\n";     // optional measure → 0, row kept
+    const auto rows = parse_echo_process_hourly_output(out);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].name == "ok");
+    CHECK(rows[1].name == "garbage-optional");
+    CHECK(rows[1].abnormal_exit_count == 0);
+}
+
+TEST_CASE("echo parse: process hourly is bounded by max_rows", "[echo][tree][parse]") {
+    std::string out = "__schema__|hour_ts|name|parent_name|user|start_count|stop_count\n";
+    for (int i = 0; i < 50; ++i)
+        out += "3600|n" + std::to_string(i) + "||u|1|1\n";
+    CHECK(parse_echo_process_hourly_output(out, 10).size() == 10);
+}
+
+TEST_CASE("echo parse: tcp hourly __schema__ output", "[echo][tree][parse]") {
+    const std::string out =
+        "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+        "disconnect_count|failed_count\n"
+        "7200|1.2.3.4|443|tcp|bash|5|4|1\n"
+        "7200|5.6.7.8|99999|tcp|bash|1|1|0\n"; // out-of-range port → 0, row kept
+    const auto conns = parse_echo_tcp_hourly_output(out);
+    REQUIRE(conns.size() == 2);
+    CHECK(conns[0].hour_ts == 7200);
+    CHECK(conns[0].process_name == "bash");
     CHECK(conns[0].remote_addr == "1.2.3.4");
     CHECK(conns[0].remote_port == 443);
-    CHECK(conns[0].state == "ESTABLISHED");
+    CHECK(conns[0].connect_count == 5);
+    CHECK(conns[0].disconnect_count == 4);
+    CHECK(conns[0].failed_count == 1);
+    CHECK(conns[1].remote_port == 0);
+    // The join key is required.
+    CHECK(parse_echo_tcp_hourly_output("__schema__|hour_ts|remote_addr\n7200|1.2.3.4\n").empty());
+    CHECK(parse_echo_tcp_hourly_output("error|nope\n").empty());
 }
 
-TEST_CASE("echo tree: basic parent/child reconstruction", "[echo][tree]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(110, "started", 100, 1, "bash", "alice"),
-        ev(120, "started", 200, 100, "python", "alice"),
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    REQUIRE(t.roots.size() == 1);
-    const EchoProcNode& root = t.nodes[t.roots[0]];
-    CHECK(root.pid == 1);
-    REQUIRE(root.children.size() == 1);
-    const EchoProcNode& bash = t.nodes[root.children[0]];
-    CHECK(bash.pid == 100);
-    REQUIRE(bash.children.size() == 1);
-    CHECK(t.nodes[bash.children[0]].pid == 200);
-    CHECK(t.running_count == 3);
-    CHECK(t.exited_count == 0);
+TEST_CASE("echo parse: dns hourly schema-located; skips torn and error rows", "[echo][dns][panel]") {
+    const std::string out =
+        "__schema__|hour_ts|name|record_type|data|appear_count|remove_count\n"
+        "7200|example.com|A|93.184.216.34|3|2\n"
+        "torn-row-missing-cells\n"
+        "7200|evil.test|A||0|5\n"
+        "__total__|2\n";
+    EchoParseStats st;
+    const auto rows = parse_echo_dns_hourly_output(out, 20000, &st);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].name == "example.com");
+    CHECK(rows[0].record_type == "A");
+    CHECK(rows[0].appear_count == 3);
+    CHECK(rows[0].remove_count == 2);
+    CHECK(rows[1].remove_count == 5);
+    CHECK(st.schema);
+    CHECK(st.unreadable == 1); // the torn row; the trailer is not a row
+    CHECK(parse_echo_dns_hourly_output("error|dns source disabled\n").empty());
+    CHECK(parse_echo_dns_hourly_output("__schema__|hour_ts|name\n7200|x\n").empty());
 }
 
-TEST_CASE("echo tree: window overlap includes exited-in-window, excludes exited-before",
+TEST_CASE("echo parse: arp hourly schema-located", "[echo][arp][panel]") {
+    const std::string out =
+        "__schema__|hour_ts|interface|ip_address|mac_address|appear_count|remove_count\n"
+        "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n"
+        "7200|eth0|10.0.0.7|11:22:33:44:55:66|2|2\n";
+    const auto rows = parse_echo_arp_hourly_output(out);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].iface == "eth0");
+    CHECK(rows[0].appear_count == 1);
+    CHECK(rows[1].ip_address == "10.0.0.7");
+    CHECK(rows[1].remove_count == 2);
+    CHECK(parse_echo_arp_hourly_output("__schema__|hour_ts|interface\n7200|eth0\n").empty());
+}
+
+TEST_CASE("echo parse: the hour list is distinct newest first and bounded", "[echo][tree][parse]") {
+    EchoParseStats st;
+    const auto hours = parse_echo_hours_output(
+        "__schema__|hour_ts\n3600\n10800\n7200\n7200\n__total__|4\n", &st);
+    CHECK(hours == std::vector<std::int64_t>{10800, 7200, 3600});
+    CHECK(st.schema);
+    CHECK(st.unreadable == 0);
+    CHECK(parse_echo_hours_output("error|nope\n").empty());
+    CHECK(parse_echo_hours_output("").empty());
+    std::string many = "__schema__|hour_ts\n";
+    for (int i = 0; i < 400; ++i)
+        many += std::to_string(3600 * (i + 1)) + "\n";
+    CHECK(parse_echo_hours_output(many).size() == static_cast<std::size_t>(kEchoMaxWindowHours));
+}
+
+// B6: the agent writes cells raw, so a `|` or newline inside a value shifts cells or forges a row.
+// The server cannot undo that, but it must not accept a row whose cell count is not the schema's
+// width, must count what it dropped and must not amplify memory on a pipe-heavy line.
+TEST_CASE("echo parse: a row with extra cells is dropped and counted", "[echo][tree][parse][security]") {
+    const std::string out =
+        "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+        "3600|ok||u|1|1|0\n"
+        "3600|x|winword.exe|SYSTEM|5|5|0|9|9\n" // a name carrying pipes: 9 cells, not 7
+        "3600|torn||u|1|1\n"                      // 6 cells
+        "abc|bad-hour||u|1|1|0\n"                 // a required number that does not parse
+        "__total__|4\n";
+    EchoParseStats st;
+    const auto rows = parse_echo_process_hourly_output(out, 120000, &st);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].name == "ok");
+    CHECK(st.schema);
+    CHECK(st.unreadable == 3);
+    // The same payload without a stats pointer parses the same.
+    CHECK(parse_echo_process_hourly_output(out).size() == 1);
+}
+
+TEST_CASE("echo parse: a payload with no schema reports none and an error payload reads nothing",
+          "[echo][tree][parse]") {
+    EchoParseStats st;
+    CHECK(parse_echo_process_hourly_output("3600|ok||u|1|1|0\n", 120000, &st).empty());
+    CHECK_FALSE(st.schema);
+    EchoParseStats err;
+    CHECK(parse_echo_tcp_hourly_output("error|no such column: failed_count", 20000, &err).empty());
+    CHECK_FALSE(err.schema);
+    // A schema far wider than any Echo table is refused as the wrong shape.
+    std::string wide = "__schema__";
+    for (int i = 0; i < 200; ++i)
+        wide += "|c" + std::to_string(i);
+    EchoParseStats w;
+    CHECK(parse_echo_process_hourly_output(wide + "\n", 120000, &w).empty());
+    CHECK_FALSE(w.schema);
+}
+
+TEST_CASE("echo_split_pipe stops splitting at the bound", "[echo][tree][parse][security]") {
+    CHECK(echo_split_pipe("a|b|c", 10) == std::vector<std::string>{"a", "b", "c"});
+    // width 3 → bound 4: a fourth cell holds the unsplit remainder.
+    CHECK(echo_split_pipe("a|b|c|d|e|f", 4) == std::vector<std::string>{"a", "b", "c", "d|e|f"});
+    CHECK(echo_split_pipe("a|b", 1) == std::vector<std::string>{"a|b"});
+    // A 1 MiB line of pipes yields at most width+1 cells, not a million.
+    const std::string pipes(1 << 20, '|');
+    const auto cells = echo_split_pipe(pipes, 8);
+    CHECK(cells.size() == 8);
+    CHECK(cells.back().size() == pipes.size() - 7);
+    // End to end: such a line in a process answer is one unreadable row.
+    EchoParseStats st;
+    const std::string out =
+        "__schema__|hour_ts|name|parent_name|user|start_count|stop_count\n" + pipes + "\n";
+    CHECK(parse_echo_process_hourly_output(out, 120000, &st).empty());
+    CHECK(st.unreadable == 1);
+}
+
+// =============================================================================
+// Presets + window math
+// =============================================================================
+
+TEST_CASE("echo canonical_echo_preset: allowlist passes; garbage gives the 24h default",
+          "[echo][tree][audit]") {
+    for (const char* ok : {"1h", "24h", "7d", "custom"})
+        CHECK(canonical_echo_preset(ok) == ok);
+    // The retired anchors and sub-hour presets are no longer tokens.
+    for (const char* gone : {"on_boot", "on_install", "1m", "10m", "1d"})
+        CHECK(canonical_echo_preset(gone) == "24h");
+    CHECK(canonical_echo_preset("") == "24h");
+    CHECK(canonical_echo_preset("bogus") == "24h");
+    // An injection attempt is canonicalized away (no audit-field forgery survives).
+    CHECK(canonical_echo_preset("x command_id=forged") == "24h");
+    CHECK(canonical_echo_preset("24h\r\nnodes=0") == "24h");
+}
+
+TEST_CASE("echo window: presets map to whole hourly buckets ending at the last complete hour",
           "[echo][tree][window]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(100, "started", 60, 1, "early"),
-        ev(120, "stopped", 60, 1, "early"), // exited 120 — before `from`
-        ev(150, "started", 50, 1, "recent"),
-        ev(160, "stopped", 50, 1, "recent"), // exited 160 — within window
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, /*from=*/155, /*to=*/2000, a);
-    CHECK(find_pid(t, 60) == nullptr);          // exited before the window
-    const EchoProcNode* recent = find_pid(t, 50);
-    REQUIRE(recent != nullptr);                 // exited inside the window → shown
-    CHECK_FALSE(recent->running);
-    CHECK(recent->exited_ts == 160);
-    CHECK(find_pid(t, 1) != nullptr);           // long-running → always present
+    const std::int64_t now = 1'000'000'000 + 1234; // mid-hour: the current hour is not complete
+    const std::int64_t last = (now / kHour) * kHour - kHour;
+
+    auto w = resolve_echo_window("1h", 0, 0, now);
+    CHECK(w.from_ts == last);
+    CHECK(w.to_ts == last);
+    w = resolve_echo_window("24h", 0, 0, now);
+    CHECK(w.to_ts == last);
+    CHECK(w.from_ts == last - 23 * kHour);
+    w = resolve_echo_window("7d", 0, 0, now);
+    CHECK(w.to_ts == last);
+    CHECK(w.from_ts == last - 167 * kHour);
+    CHECK(w.from_ts % kHour == 0);
+    // Garbage and the retired tokens fall back to the 24h default.
+    for (const char* bad : {"garbage", "", "10m", "on_boot"}) {
+        w = resolve_echo_window(bad, 0, 0, now);
+        CHECK(w.from_ts == last - 23 * kHour);
+        CHECK(w.to_ts == last);
+    }
+    // An hour-aligned `now` still ends at the hour BEFORE it.
+    CHECK(resolve_echo_window("1h", 0, 0, 100 * kHour).to_ts == 99 * kHour);
+    // Early epoch: the start is clamped at 0, never negative.
+    w = resolve_echo_window("24h", 0, 0, 10000);
+    CHECK(w.from_ts == 0);
+    CHECK(w.to_ts == kHour);
 }
 
-TEST_CASE("echo tree: long-running started before window still appears (running)",
+TEST_CASE("echo window: custom range floors to the hour; unset ends default; reversed collapses",
           "[echo][tree][window]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(100, "started", 500, 1, "longproc"), // started long ago, never stops
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, /*from=*/1000, /*to=*/2000, a);
-    const EchoProcNode* lp = find_pid(t, 500);
-    REQUIRE(lp != nullptr);
-    CHECK(lp->running);
+    const std::int64_t now = 1'000'000'000;
+    const std::int64_t last = (now / kHour) * kHour - kHour;
+
+    auto w = resolve_echo_window("custom", 5000 * kHour + 17, 5010 * kHour + 3599, now);
+    CHECK(w.from_ts == 5000 * kHour);
+    CHECK(w.to_ts == 5010 * kHour);
+    // Unset `to` → the last complete hour; unset `from` → 23 hours before `to`.
+    w = resolve_echo_window("custom", last - 5 * kHour + 9, 0, now);
+    CHECK(w.from_ts == last - 5 * kHour);
+    CHECK(w.to_ts == last);
+    w = resolve_echo_window("custom", 0, 0, now);
+    CHECK(w.to_ts == last);
+    CHECK(w.from_ts == last - 23 * kHour);
+    // A reversed range collapses to a single bucket at `from`.
+    w = resolve_echo_window("custom", 5000 * kHour + 7, 4000 * kHour + 9, now);
+    CHECK(w.from_ts == 5000 * kHour);
+    CHECK(w.to_ts == w.from_ts);
+    // A wide range is clamped to the 168-hour span, keeping the newest hours.
+    w = resolve_echo_window("custom", 1 * kHour, 9000 * kHour, now);
+    CHECK(w.to_ts == 9000 * kHour);
+    CHECK(w.from_ts == 9000 * kHour - 167 * kHour);
 }
 
-TEST_CASE("echo tree: to excludes later starts (point-in-time upper bound)", "[echo][tree][window]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(300, "started", 77, 1, "future"),
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, /*from=*/0, /*to=*/200, a);
-    CHECK(find_pid(t, 77) == nullptr);
-    CHECK(find_pid(t, 1) != nullptr);
+// =============================================================================
+// Name-level tree
+// =============================================================================
+
+TEST_CASE("echo tree: three hours each build their own name-level tree", "[echo][tree]") {
+    const std::int64_t h1 = 3600, h2 = 7200, h3 = 10800;
+    const std::vector<EchoProcHourRow> rows{
+        // hour 1: systemd -> bash
+        hr(h1, "systemd", "", "root", 1, 0), hr(h1, "bash", "systemd", "alice", 2, 2),
+        // hour 2: systemd -> {bash, cron}; bash -> ls
+        hr(h2, "systemd", "", "root", 1, 0), hr(h2, "bash", "systemd", "alice", 5, 4),
+        hr(h2, "cron", "systemd", "root", 1, 1), hr(h2, "ls", "bash", "alice", 9, 9),
+        // hour 3: only an orphan whose parent is not in this hour
+        hr(h3, "ls", "bash", "alice", 1, 1)};
+
+    const auto t1 = build_echo_process_tree(rows, h1);
+    CHECK(t1.hour_ts == h1);
+    REQUIRE(t1.nodes.size() == 2);
+    REQUIRE(t1.roots.size() == 1);
+    CHECK(t1.nodes[t1.roots[0]].name == "systemd");
+    CHECK(t1.nodes[t1.roots[0]].children.size() == 1);
+    CHECK(t1.start_total == 3);
+
+    const auto t2 = build_echo_process_tree(rows, h2);
+    REQUIRE(t2.nodes.size() == 4);
+    REQUIRE(t2.roots.size() == 1);
+    const auto* sd = find_node(t2, "systemd");
+    const auto* bash = find_node(t2, "bash");
+    const auto* ls = find_node(t2, "ls");
+    REQUIRE((sd && bash && ls));
+    CHECK(sd->children.size() == 2);
+    CHECK(t2.nodes[bash->parent].name == "systemd");
+    CHECK(t2.nodes[ls->parent].name == "bash");
+    CHECK(ls->start_count == 9);
+    // Siblings are ordered by name: bash before cron.
+    CHECK(t2.nodes[sd->children[0]].name == "bash");
+    CHECK(t2.nodes[sd->children[1]].name == "cron");
+
+    const auto t3 = build_echo_process_tree(rows, h3);
+    REQUIRE(t3.nodes.size() == 1);
+    REQUIRE(t3.roots.size() == 1); // the parent "bash" is not in this hour → a root
+    CHECK(t3.nodes[0].name == "ls");
+
+    // An hour with no rows is an empty tree, not an error.
+    const auto none = build_echo_process_tree(rows, 99 * kHour);
+    CHECK(none.nodes.empty());
+    CHECK(none.roots.empty());
 }
 
-TEST_CASE("echo tree: pid reuse yields two incarnations", "[echo][tree][reuse]") {
-    std::vector<EchoProcEvent> e{
-        ev(50, "started", 1, 0, "systemd"),
-        ev(100, "started", 100, 1, "bash"),
-        ev(150, "stopped", 100, 1, "bash"),
-        ev(200, "started", 100, 1, "powershell.exe"), // pid reused, still running
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    CHECK(count_pid(t, 100) == 2);
-    const EchoProcNode* run = find_pid(t, 100, /*running_pref=*/true);
-    REQUIRE(run != nullptr);
-    CHECK(run->running);
-    CHECK(run->name == "powershell.exe");
-    // Both incarnations parent to the single pid-1 root.
-    const EchoProcNode& root = t.nodes[t.roots[0]];
-    CHECK(root.children.size() == 2);
-}
-
-TEST_CASE("echo tree: orphan whose parent is absent becomes a root", "[echo][tree]") {
-    std::vector<EchoProcEvent> e{ev(100, "started", 500, 400, "orphan")}; // ppid 400 absent
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
+TEST_CASE("echo tree: a row whose parent_name equals its own name is a root and rendered once",
+          "[echo][tree][cycle]") {
+    const std::vector<EchoProcHourRow> rows{hr(3600, "bash", "bash", "alice", 4, 4),
+                                            hr(3600, "ls", "bash", "alice", 2, 2)};
+    const auto t = build_echo_process_tree(rows, 3600);
+    REQUIRE(t.nodes.size() == 2);
     REQUIRE(t.roots.size() == 1);
-    CHECK(t.nodes[t.roots[0]].pid == 500);
+    CHECK(t.nodes[t.roots[0]].name == "bash");
+    CHECK(t.nodes[t.roots[0]].children.size() == 1); // ls hangs under it, bash not under itself
+    const auto html = render_echo_tree_fragment(t, {}, kToken);
+    CHECK(rendered_rows(html, "bash") == 1);
+    CHECK(rendered_rows(html, "ls") == 1);
 }
 
-TEST_CASE("echo anomaly: suspicious parent->child flagged, benign parent not", "[echo][tree][anomaly]") {
+TEST_CASE("echo tree: a 2-cycle places every node once and terminates", "[echo][tree][cycle]") {
+    const std::vector<EchoProcHourRow> rows{hr(3600, "a", "b", "u"), hr(3600, "b", "a", "u")};
+    const auto t = build_echo_process_tree(rows, 3600);
+    REQUIRE(t.nodes.size() == 2);
+    REQUIRE(t.roots.size() == 1);
+    // The cycle is cut at its lowest-index member: a is the root, b hangs under it.
+    CHECK(t.nodes[t.roots[0]].name == "a");
+    REQUIRE(t.nodes[t.roots[0]].children.size() == 1);
+    CHECK(t.nodes[t.nodes[t.roots[0]].children[0]].name == "b");
+    const auto html = render_echo_tree_fragment(t, {}, kToken);
+    CHECK(rendered_rows(html, "a") == 1);
+    CHECK(rendered_rows(html, "b") == 1);
+}
+
+TEST_CASE("echo tree: a longer cycle with a tail renders every node exactly once",
+          "[echo][tree][cycle]") {
+    // cmd -> conhost -> cmd, plus `tail` hanging off the loop: cmd/conhost/cmd by construction.
+    const std::vector<EchoProcHourRow> rows{hr(3600, "tail", "conhost", "u"),
+                                            hr(3600, "cmd", "conhost", "u"),
+                                            hr(3600, "conhost", "cmd", "u")};
+    const auto t = build_echo_process_tree(rows, 3600);
+    REQUIRE(t.nodes.size() == 3);
+    REQUIRE(t.roots.size() == 1);
+    int reachable = 0;
+    std::vector<std::size_t> stack{t.roots[0]};
+    while (!stack.empty()) {
+        const auto id = stack.back();
+        stack.pop_back();
+        ++reachable;
+        for (const auto c : t.nodes[id].children)
+            stack.push_back(c);
+    }
+    CHECK(reachable == 3);
+    const auto html = render_echo_tree_fragment(t, {}, kToken);
+    for (const char* n : {"tail", "cmd", "conhost"})
+        CHECK(rendered_rows(html, n) == 1);
+}
+
+TEST_CASE("echo tree: a name with two parents is placed once under the one with the most starts",
+          "[echo][tree][fan-in]") {
+    const std::vector<EchoProcHourRow> rows{
+        hr(3600, "p1", "", "u", 1, 0),          hr(3600, "p2", "", "u", 1, 0),
+        hr(3600, "x", "p1", "u", 3, 2, 1),      // 3 starts under p1
+        hr(3600, "x", "p2", "u", 4, 4, 0)};     // 4 starts under p2: p2 wins
+    const auto t = build_echo_process_tree(rows, 3600);
+    REQUIRE(t.nodes.size() == 3);
+    const auto* x = find_node(t, "x");
+    REQUIRE(x != nullptr);
+    CHECK(t.nodes[x->parent].name == "p2");
+    CHECK(x->parent_name == "p2");
+    CHECK(x->start_count == 7);
+    CHECK(x->stop_count == 6);
+    CHECK(x->abnormal_exit_count == 1);
+    CHECK(find_node(t, "p1")->children.empty());
+    CHECK(rendered_rows(render_echo_tree_fragment(t, {}, kToken), "x") == 1);
+
+    // Equal starts: the lowest parent name wins, whichever row came first.
+    const auto tie = build_echo_process_tree(
+        {hr(3600, "pb", ""), hr(3600, "pa", ""), hr(3600, "x", "pb", "u", 2), hr(3600, "x", "pa", "u", 2)},
+        3600);
+    CHECK(find_node(tie, "x")->parent_name == "pa");
+    // A parent other than the node's own name beats its own, which can never be placed.
+    const auto self = build_echo_process_tree(
+        {hr(3600, "sshd", ""), hr(3600, "bash", "bash", "u", 9), hr(3600, "bash", "sshd", "u", 1)}, 3600);
+    CHECK(find_node(self, "bash")->parent_name == "sshd");
+    CHECK(self.nodes[find_node(self, "bash")->parent].name == "sshd");
+}
+
+TEST_CASE("echo tree: the same name under two users is two nodes; the parent link is by name",
+          "[echo][tree][fan-in]") {
+    const std::vector<EchoProcHourRow> rows{
+        hr(3600, "svchost", "", "SYSTEM", 18, 17), hr(3600, "svchost", "", "NETWORK SERVICE", 6, 6),
+        hr(3600, "wuauserv", "svchost", "SYSTEM", 1, 1)};
+    const auto t = build_echo_process_tree(rows, 3600);
+    REQUIRE(t.nodes.size() == 3);
+    REQUIRE(t.roots.size() == 2);
+    // The child attaches to ONE svchost, the one with the lowest user, never to both.
+    const auto* low = find_node(t, "svchost", "NETWORK SERVICE");
+    const auto* high = find_node(t, "svchost", "SYSTEM");
+    REQUIRE((low && high));
+    CHECK(low->children.size() == 1);
+    CHECK(high->children.empty());
+    CHECK(rendered_rows(render_echo_tree_fragment(t, {}, kToken), "wuauserv") == 1);
+}
+
+TEST_CASE("echo tree: a 5000-deep chain terminates and stops at the depth guard",
+          "[echo][tree][cap]") {
+    std::vector<EchoProcHourRow> rows;
+    rows.push_back(hr(3600, "n0", ""));
+    for (int i = 1; i < 5000; ++i)
+        rows.push_back(hr(3600, ("n" + std::to_string(i)).c_str(), ("n" + std::to_string(i - 1)).c_str()));
+    const auto t = build_echo_process_tree(rows, 3600);
+    REQUIRE(t.nodes.size() == 5000);
+    REQUIRE(t.roots.size() == 1);
+    CHECK(t.depth_capped);
+    const auto html = render_echo_tree_fragment(t, {}, kToken);
+    CHECK(html.find("deeper than the display limit") != std::string::npos);
+    CHECK(html.find("(depth capped)") != std::string::npos);
+    // The render stops at the cap: far fewer rows than nodes.
+    CHECK(count_occurrences(html, "class=\"echo-tree-row\"") <= kEchoRenderDepthCap + 2);
+
+    // A shallow tree must NOT flag depth_capped.
+    CHECK_FALSE(build_echo_process_tree({hr(3600, "root", ""), hr(3600, "child", "root")}, 3600)
+                    .depth_capped);
+}
+
+TEST_CASE("echo tree: more distinct names than the node cap sets truncated", "[echo][tree][cap]") {
+    std::vector<EchoProcHourRow> rows;
+    rows.reserve(kEchoTreeMaxNodes + 5);
+    for (std::size_t i = 0; i < kEchoTreeMaxNodes + 5; ++i)
+        rows.push_back(hr(3600, ("p" + std::to_string(i)).c_str(), ""));
+    const auto t = build_echo_process_tree(rows, 3600);
+    CHECK(t.truncated);
+    CHECK(t.nodes.size() == kEchoTreeMaxNodes);
+    CHECK(render_echo_tree_fragment(t, {}, kToken).find("exceeds the render limit") != std::string::npos);
+}
+
+TEST_CASE("echo anomaly: suspicious parent->child and abnormal exits are flagged; benign is not",
+          "[echo][tree][anomaly]") {
     std::string evidence;
     CHECK(echo_is_suspicious_spawn("winword.exe", "powershell.exe", &evidence));
     CHECK(evidence.find("winword.exe") != std::string::npos);
     CHECK_FALSE(echo_is_suspicious_spawn("explorer.exe", "cmd.exe")); // benign — explorer excluded
     CHECK_FALSE(echo_is_suspicious_spawn("bash", "ls"));
 
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(110, "started", 10, 1, "winword.exe", "bob"),
-        ev(120, "started", 20, 10, "powershell.exe", "bob"),
-        ev(130, "started", 40, 1, "explorer.exe"),
-        ev(140, "started", 50, 40, "cmd.exe"),
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    const EchoProcNode* ps = find_pid(t, 20);
-    REQUIRE(ps != nullptr);
-    CHECK(ps->anomaly);
-    const EchoProcNode* benign = find_pid(t, 50);
-    REQUIRE(benign != nullptr);
-    CHECK_FALSE(benign->anomaly);
-    CHECK(t.anomaly_count == 1);
+    const std::vector<EchoProcHourRow> rows{
+        hr(3600, "init", "", "root"),
+        hr(3600, "winword.exe", "init", "bob"),
+        hr(3600, "powershell.exe", "winword.exe", "bob"),
+        hr(3600, "explorer.exe", "init", "bob"),
+        hr(3600, "cmd.exe", "explorer.exe", "bob"),
+        hr(3600, "crasher", "init", "bob", 2, 2, 3)};
+    const auto t = build_echo_process_tree(rows, 3600);
+    CHECK(find_node(t, "powershell.exe")->anomaly);
+    CHECK_FALSE(find_node(t, "cmd.exe")->anomaly);
+    CHECK_FALSE(find_node(t, "winword.exe")->anomaly);
+    const auto* crasher = find_node(t, "crasher");
+    CHECK(crasher->anomaly);
+    CHECK(crasher->anomaly_evidence.find("3 abnormal exit") != std::string::npos);
+    CHECK(t.anomaly_count == 2);
+    CHECK(t.abnormal_total == 3);
+    // The full tree is never pruned: anomalies-only filtering is client-side.
+    CHECK(t.nodes.size() == 6);
+    const auto html = render_echo_tree_fragment(t, {}, kToken);
+    CHECK(html.find("data-anom=\"1\"") != std::string::npos);
+    CHECK(html.find("data-anom=\"0\"") != std::string::npos);
 }
 
-TEST_CASE("echo tree: full tree is never pruned (filtering is client-side)", "[echo][tree][anomaly]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(110, "started", 10, 1, "winword.exe"),
-        ev(120, "started", 20, 10, "powershell.exe"), // the anomaly
-        ev(130, "started", 30, 1, "sshd"),
-        ev(140, "started", 40, 30, "bash"),
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    // Reconstruction keeps EVERY node (running/exited/anomalies filtering is a
-    // client-side display concern); the flag is set but the tree is not pruned.
-    CHECK(t.running_count == 5);
-    CHECK(t.anomaly_count == 1);
-    REQUIRE(t.roots.size() == 1);
-    const EchoProcNode& root = t.nodes[t.roots[0]];
-    REQUIRE(root.children.size() == 2);          // BOTH winword and sshd remain
-    CHECK(find_pid(t, 40) != nullptr);           // bash under sshd still present
+// B2: the spawn check runs on every stored row, whatever the placement, and the tree does not
+// depend on row order.
+TEST_CASE("echo anomaly: the result does not depend on row order", "[echo][tree][anomaly]") {
+    // cmd.exe is started under explorer.exe (benign) and under winword.exe (flagged).
+    const std::vector<EchoProcHourRow> a{
+        hr(3600, "explorer.exe", ""), hr(3600, "winword.exe", ""),
+        hr(3600, "cmd.exe", "explorer.exe", "bob", 2), hr(3600, "cmd.exe", "winword.exe", "bob", 1)};
+    std::vector<EchoProcHourRow> b = a;
+    std::reverse(b.begin(), b.end());
+    const auto ta = build_echo_process_tree(a, 3600);
+    const auto tb = build_echo_process_tree(b, 3600);
+    CHECK(ta.anomaly_count == 1);
+    CHECK(tb.anomaly_count == 1);
+    for (const auto* t : {&ta, &tb}) {
+        const auto* cmd = find_node(*t, "cmd.exe");
+        REQUIRE(cmd != nullptr);
+        CHECK(cmd->anomaly);
+        CHECK(cmd->anomaly_evidence.find("winword.exe") != std::string::npos);
+        CHECK(cmd->parent_name == "explorer.exe"); // 2 starts beat 1, in either order
+        CHECK(t->nodes[cmd->parent].name == "explorer.exe");
+        CHECK(cmd->start_count == 3); // all the starts are summed on the one node
+    }
 }
 
-TEST_CASE("echo render: rows carry data-state and data-anom for client filters",
+TEST_CASE("echo anomaly: a parent that ran all hour or is spelled in another case still flags",
+          "[echo][tree][anomaly]") {
+    // outlook.exe has no row of its own in the hour (it started yesterday and is still running).
+    const auto none = build_echo_process_tree({hr(3600, "powershell.exe", "outlook.exe", "bob")}, 3600);
+    REQUIRE(none.nodes.size() == 1);
+    CHECK(none.nodes[0].parent == EchoProcNode::kNoParent); // not linkable...
+    CHECK(none.nodes[0].anomaly);                           // ...and still flagged
+    CHECK(none.anomaly_count == 1);
+    // WINWORD.EXE vs the node winword.exe: the link is by exact name, the check is not.
+    const auto cased = build_echo_process_tree(
+        {hr(3600, "winword.exe", "", "bob"), hr(3600, "cmd.exe", "WINWORD.EXE", "bob")}, 3600);
+    CHECK(find_node(cased, "cmd.exe")->anomaly);
+    // Distinct spellings of the same flagged parent keep one evidence line each.
+    const auto both = build_echo_process_tree(
+        {hr(3600, "cmd.exe", "WINWORD.EXE", "bob"), hr(3600, "cmd.exe", "winword.exe", "bob")}, 3600);
+    CHECK(both.anomaly_count == 1);
+    CHECK(both.nodes[0].anomaly_evidence.find("WINWORD.EXE") != std::string::npos);
+    CHECK(both.nodes[0].anomaly_evidence.find("winword.exe") != std::string::npos);
+}
+
+TEST_CASE("echo anomaly: a wscript.exe and cmd.exe cycle still flags the pair", "[echo][tree][anomaly][cycle]") {
+    std::vector<EchoProcHourRow> rows{hr(3600, "wscript.exe", "cmd.exe", "bob"),
+                                      hr(3600, "cmd.exe", "wscript.exe", "bob")};
+    for (int order = 0; order < 2; ++order) {
+        if (order == 1)
+            std::reverse(rows.begin(), rows.end());
+        const auto t = build_echo_process_tree(rows, 3600);
+        REQUIRE(t.nodes.size() == 2);
+        REQUIRE(t.roots.size() == 1);
+        // The cycle is cut at its lowest (name, user) member whichever row came first.
+        CHECK(t.nodes[t.roots[0]].name == "cmd.exe");
+        CHECK(t.anomaly_count == 1); // wscript.exe -> cmd.exe is on the denylist
+        CHECK(find_node(t, "cmd.exe")->anomaly);
+    }
+}
+
+TEST_CASE("echo anomaly: a name with more stops than starts is a soft flag and not an anomaly",
+          "[echo][tree][anomaly]") {
+    const auto t = build_echo_process_tree({hr(3600, "daemon", "", "root", 1, 4)}, 3600);
+    const auto* d = find_node(t, "daemon");
+    REQUIRE(d != nullptr);
+    CHECK(d->stops_exceed_starts);
+    CHECK_FALSE(d->anomaly);
+    CHECK(render_echo_tree_fragment(t, {}, kToken).find("more stops than starts") != std::string::npos);
+    CHECK_FALSE(build_echo_process_tree({hr(3600, "ok", "", "root", 2, 2)}, 3600)
+                    .nodes[0]
+                    .stops_exceed_starts);
+}
+
+TEST_CASE("echo anomaly: denylist is basename-stripped and case-insensitive", "[echo][tree][anomaly]") {
+    CHECK(echo_is_suspicious_spawn("C:\\Program Files\\Microsoft Office\\WINWORD.EXE",
+                                  "POWERSHELL.EXE"));
+    CHECK(echo_is_suspicious_spawn("/opt/MsEdge/msedge.exe", "Cmd.Exe"));
+    CHECK_FALSE(echo_is_suspicious_spawn("notepad.exe", "powershell.exe")); // benign parent
+}
+
+// =============================================================================
+// Render
+// =============================================================================
+
+TEST_CASE("echo render: rows carry data-anom and the hour's counts with no pid or run state",
           "[echo][tree][render]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(110, "started", 10, 1, "winword.exe"),
-        ev(120, "started", 20, 10, "powershell.exe"), // anomaly, running
-        ev(130, "started", 50, 1, "old"),
-        ev(140, "stopped", 50, 1, "old"),             // exited
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    auto html = render_echo_tree_fragment(t, {}, "dev1", "0123456789abcdef0123456789abcdef", "linux");
-    CHECK(html.find("data-state=\"running\"") != std::string::npos);
-    CHECK(html.find("data-state=\"exited\"") != std::string::npos);
-    CHECK(html.find("data-anom=\"1\"") != std::string::npos); // powershell flagged
+    const auto t = build_echo_process_tree({hr(7200, "bash", "", "alice", 3, 2, 1)}, 7200);
+    const auto html = render_echo_tree_fragment(t, {}, kToken);
+    CHECK(html.find("detail?token=" + kToken + "&amp;node=0") != std::string::npos);
+    CHECK(html.find("data-anom=\"1\"") != std::string::npos);
+    CHECK(html.find("started 3 &middot; stopped 2 &middot; 1 abnormal") != std::string::npos);
+    CHECK(html.find("1970-01-01T02:00:00Z") != std::string::npos); // the hour in the banner
+    CHECK(html.find("data-state") == std::string::npos);
+    CHECK(html.find("tt-pid") == std::string::npos);
+    CHECK(html.find("names only") != std::string::npos);
+    CHECK(html.find("$Process_Hourly") != std::string::npos);
 }
 
-TEST_CASE("echo render: inline network summary shows remote IP:port", "[echo][tree][render][net]") {
-    std::vector<EchoProcEvent> e{ev(100, "started", 1234, 1, "curl")};
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    std::vector<EchoTcpConn> conns;
-    EchoTcpConn c;
-    c.pid = 1234;
-    c.proto = "tcp";
-    c.remote_addr = "203.0.113.7"; // public
-    c.remote_port = 443;
-    c.local_port = 51000;
-    c.state = "ESTABLISHED";
-    conns.push_back(c);
-    auto html = render_echo_tree_fragment(t, conns, "dev1", "0123456789abcdef0123456789abcdef", "linux");
-    CHECK(html.find("203.0.113.7:443") != std::string::npos); // IP:port surfaced inline
-    CHECK(html.find("tt-net") != std::string::npos);
-    CHECK(html.find("tt-ep-pub") != std::string::npos);        // public endpoint highlighted
+TEST_CASE("echo render: an empty hour says so", "[echo][tree][render]") {
+    const auto html = render_echo_tree_fragment(build_echo_process_tree({}, 0), {}, kToken);
+    CHECK(html.find("echo-tree-empty") != std::string::npos);
+    CHECK(html.find("echo-tree-row") == std::string::npos);
 }
 
-TEST_CASE("echo render: same-name siblings group past the threshold", "[echo][tree][render]") {
-    std::vector<EchoProcEvent> e{ev(100, "started", 1, 0, "services.exe")};
-    for (std::uint32_t p = 2000; p < 2005; ++p) // 5 svchost.exe under services.exe
-        e.push_back(ev(110, "started", p, 1, "svchost.exe"));
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    auto html = render_echo_tree_fragment(t, {}, "dev1", "0123456789abcdef0123456789abcdef", "windows");
-    CHECK(html.find("echo-tree-group") != std::string::npos);
-    CHECK(html.find("\xC3\x97" "5") != std::string::npos); // "×5" group count
+TEST_CASE("echo render: net summary joins by name then dedups then orders public first and labels listeners",
+          "[echo][tree][render][net]") {
+    const auto t = build_echo_process_tree({hr(7200, "proc", ""), hr(7200, "other", "")}, 7200);
+    const std::vector<EchoTcpHourRow> conns{
+        conn(7200, "proc", "203.0.113.9", 443), // public (sorts first, shown inline)
+        conn(7200, "proc", "203.0.113.9", 443), // duplicate → deduped
+        conn(7200, "proc", "", 0),              // listener (2nd distinct, shown inline)
+        conn(7200, "stranger", "198.51.100.1", 80)};
+    const auto html = render_echo_tree_fragment(t, conns, kToken);
+    CHECK(html.find("listening") != std::string::npos);
+    CHECK(html.find("203.0.113.9:443") != std::string::npos);
+    CHECK(html.find("tt-ep-pub") != std::string::npos); // public endpoint highlighted
+    // 2 distinct endpoints (one dup removed): badge count "2" appears in the net cell.
+    CHECK(html.find("tt-net-ico\">\xE2\x86\x97</span>2") != std::string::npos);
+    // A connection under another name is not attached to either node.
+    CHECK(html.find("198.51.100.1") == std::string::npos);
+    CHECK(count_occurrences(html, "tt-net-ico") == 1);
 }
 
-TEST_CASE("echo render: few same-name siblings are not grouped", "[echo][tree][render]") {
-    std::vector<EchoProcEvent> e{ev(100, "started", 1, 0, "services.exe"),
-                                ev(110, "started", 2000, 1, "svchost.exe"),
-                                ev(110, "started", 2001, 1, "svchost.exe")}; // only 2
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    auto html = render_echo_tree_fragment(t, {}, "dev1", "0123456789abcdef0123456789abcdef", "windows");
-    CHECK(html.find("echo-tree-group") == std::string::npos);
+// S1: nodes sharing a process name show the same net cell, so it is built once per name.
+// Counted, not timed: the work is "cells built", not a clock reading.
+TEST_CASE("echo render: the net cell is built once per process name and not once per node",
+          "[echo][tree][render][net]") {
+    std::vector<EchoProcHourRow> rows;
+    for (int i = 0; i < 500; ++i)
+        rows.push_back(hr(7200, "svchost", "", ("user" + std::to_string(i)).c_str()));
+    rows.push_back(hr(7200, "other", ""));
+    const auto t = build_echo_process_tree(rows, 7200);
+    REQUIRE(t.nodes.size() == 501);
+    std::vector<EchoTcpHourRow> conns;
+    for (int i = 0; i < 20000; ++i)
+        conns.push_back(conn(7200, "svchost", ("10.0." + std::to_string(i / 250) + "." +
+                                               std::to_string(i % 250)).c_str(), 443));
+    conns.push_back(conn(7200, "other", "203.0.113.9", 443));
+    EchoRenderStats stats;
+    const auto html = render_echo_tree_fragment(t, conns, kToken, &stats);
+    CHECK(stats.net_cells_built == 2);     // svchost once, other once
+    CHECK(stats.net_cells_reused == 499);  // the other 499 svchost nodes
+    // Every node still carries its cell.
+    CHECK(count_occurrences(html, "class=\"tt-net\"") + count_occurrences(html, "class=\"tt-net tt-net-pub\"") == 501);
 }
 
-TEST_CASE("echo render: grouping threshold boundary (3 no, 4 yes)", "[echo][tree][render]") {
-    auto build = [](std::uint32_t count) {
-        std::vector<EchoProcEvent> e{ev(100, "started", 1, 0, "services.exe")};
-        for (std::uint32_t i = 0; i < count; ++i)
-            e.push_back(ev(110, "started", 2000 + i, 1, "svchost.exe"));
-        auto a = compute_echo_anchors(e);
-        auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-        return render_echo_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "windows");
-    };
-    CHECK(build(3).find("echo-tree-group") == std::string::npos); // exactly 3 → no group
-    CHECK(build(4).find("echo-tree-group") != std::string::npos);  // exactly 4 → group
+TEST_CASE("echo render: agent-controlled fields are HTML-escaped", "[echo][tree][render]") {
+    const auto t = build_echo_process_tree(
+        {hr(3600, "<script>evil</script>", "", "us\"er")}, 3600);
+    const auto html = render_echo_tree_fragment(
+        t, {conn(3600, "<script>evil</script>", "<img src=x>", 80)}, kToken);
+    CHECK(html.find("<script>evil") == std::string::npos);
+    CHECK(html.find("&lt;script&gt;") != std::string::npos);
+    CHECK(html.find("<img src=x>") == std::string::npos);
+    CHECK(html.find("us\"er") == std::string::npos);
+
+    const auto detail = render_echo_proc_detail(
+        t.nodes[0], {conn(3600, "<script>evil</script>", "<img src=x>", 80)});
+    CHECK(detail.find("<script>evil") == std::string::npos);
+    CHECK(detail.find("<img src=x>") == std::string::npos);
+    CHECK(detail.find("&lt;script&gt;") != std::string::npos);
+}
+
+TEST_CASE("echo render: detail shows the counts and the parent name and the connections by name",
+          "[echo][tree][render]") {
+    const auto t = build_echo_process_tree(
+        {hr(7200, "systemd", "", "root"), hr(7200, "bash", "systemd", "alice", 3, 4, 2)}, 7200);
+    const auto* bash = find_node(t, "bash");
+    REQUIRE(bash != nullptr);
+    EchoTcpHourRow c = conn(7200, "bash", "1.2.3.4", 443, "tcp", 5);
+    c.disconnect_count = 4;
+    c.failed_count = 1;
+    const auto html = render_echo_proc_detail(*bash, {c});
+    CHECK(html.find("echo-detail") != std::string::npos);
+    CHECK(html.find(">systemd<") != std::string::npos);       // parent name
+    CHECK(html.find("Started in this hour") != std::string::npos);
+    CHECK(html.find("Abnormal exits") != std::string::npos);
+    CHECK(html.find("more stops than starts") != std::string::npos);
+    CHECK(html.find("1.2.3.4:443") != std::string::npos);
+    CHECK(html.find("<th>Connects</th>") != std::string::npos);
+    CHECK(html.find("Not kept: process ids, command lines and file paths") != std::string::npos);
+    CHECK(html.find("pid") == std::string::npos);
+    // No connections → the empty line, not an empty table.
+    const auto none = render_echo_proc_detail(*bash, {});
+    CHECK(none.find("No TCP connections recorded under this name") != std::string::npos);
+    CHECK(none.find("<table") == std::string::npos);
 }
 
 // ── Hardening-round coverage (governance Gate 3/4) ──────────────────────────
@@ -376,247 +825,6 @@ TEST_CASE("echo parse_ts_param_strict: every month accepts its last day and refu
     }
 }
 
-TEST_CASE("echo anchors: non-positive ts cannot poison observed_since", "[echo][tree][anchor]") {
-    std::vector<EchoProcEvent> e{ev(0, "started", 9, 0, "garbage"),     // ts<=0 ignored
-                                ev(-5, "started", 8, 0, "garbage"),    // negative ignored
-                                ev(1000, "started", 1, 0, "systemd")};
-    auto a = compute_echo_anchors(e);
-    CHECK(a.observed_since == 1000);
-    CHECK(a.install_ts == 1000);
-}
-
-TEST_CASE("echo anchors: boot falls back to install when no root start", "[echo][tree][anchor]") {
-    std::vector<EchoProcEvent> e{ev(500, "started", 100, 50, "bash")}; // no ppid==0 start
-    auto a = compute_echo_anchors(e);
-    CHECK(a.observed_since == 500);
-    CHECK(a.boot_ts == a.install_ts); // fallback
-}
-
-TEST_CASE("echo tree: stop-without-start synthesises a start_known=false incarnation",
-          "[echo][tree]") {
-    // Only the stop survives (the start aged out of the cap). Window covers the stop.
-    std::vector<EchoProcEvent> e{ev(200, "stopped", 777, 1, "ghost", "alice")};
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    const EchoProcNode* n = find_pid(t, 777);
-    REQUIRE(n != nullptr);
-    CHECK_FALSE(n->start_known);
-    CHECK_FALSE(n->running);
-    CHECK(n->exited_ts == 200);
-    CHECK(n->name == "ghost");
-}
-
-TEST_CASE("echo anomaly: denylist is basename-stripped and case-insensitive", "[echo][tree][anomaly]") {
-    CHECK(echo_is_suspicious_spawn("C:\\Program Files\\Microsoft Office\\WINWORD.EXE",
-                                  "POWERSHELL.EXE"));
-    CHECK(echo_is_suspicious_spawn("/opt/MsEdge/msedge.exe", "Cmd.Exe"));
-    CHECK_FALSE(echo_is_suspicious_spawn("notepad.exe", "powershell.exe")); // benign parent
-}
-
-TEST_CASE("echo tree: parent resolution prefers the containing incarnation", "[echo][tree][reuse]") {
-    // ppid 10 has an exited incarnation [100,150] and a running one [180,..]; a child
-    // starting at 200 must link to the RUNNING (containing) incarnation, not the exited.
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 10, 1, "parent"),
-        ev(150, "stopped", 10, 1, "parent"),
-        ev(180, "started", 10, 1, "parent"), // reused, running, contains 200
-        ev(200, "started", 50, 10, "child"),
-        ev(90, "started", 1, 0, "systemd"),
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    const EchoProcNode* child = find_pid(t, 50);
-    REQUIRE(child != nullptr);
-    REQUIRE(child->parent != EchoProcNode::kNoParent);
-    const EchoProcNode& par = t.nodes[child->parent];
-    CHECK(par.pid == 10);
-    CHECK(par.running);          // the containing (live) incarnation
-    CHECK(par.started_ts == 180);
-}
-
-TEST_CASE("echo tree: cycle guard leaves a reused-pid loop node as a root", "[echo][tree][reuse]") {
-    // A forged stream where 10's parent is 20 and 20's parent is 10 (a loop). The guard
-    // must break it — every node still renders, none infinitely recurses.
-    std::vector<EchoProcEvent> e{ev(100, "started", 10, 20, "a"),
-                                ev(100, "started", 20, 10, "b")};
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    REQUIRE_FALSE(t.roots.empty());      // not all nodes are children of each other
-    CHECK(t.running_count == 2);          // both reachable, counted once
-}
-
-TEST_CASE("echo tree: node cap sets truncated", "[echo][tree][cap]") {
-    std::vector<EchoProcEvent> e;
-    e.reserve(kEchoTreeMaxNodes + 2);
-    for (std::uint32_t i = 0; i < kEchoTreeMaxNodes + 1; ++i)
-        e.push_back(ev(100 + i, "started", 1000 + i, 0, "p")); // all running roots
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 0x7fffffffLL, a);
-    CHECK(t.truncated);
-    CHECK(t.running_count == static_cast<int>(kEchoTreeMaxNodes)); // capped, running kept
-}
-
-TEST_CASE("echo render: net_cell dedups, orders public first, labels listeners",
-          "[echo][tree][render][net]") {
-    std::vector<EchoProcEvent> e{ev(100, "started", 42, 1, "proc")};
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    auto conn = [](const char* raddr, int rport, int lport, const char* state) {
-        EchoTcpConn c; c.pid = 42; c.proto = "tcp"; c.remote_addr = raddr;
-        c.remote_port = rport; c.local_port = lport; c.state = state; return c;
-    };
-    std::vector<EchoTcpConn> conns{
-        conn("203.0.113.9", 443, 5001, "ESTABLISHED"),// public (sorts first, shown inline)
-        conn("203.0.113.9", 443, 5001, "ESTABLISHED"),// duplicate → deduped
-        conn("", 0, 8080, "LISTEN"),                  // listener (2nd distinct, shown inline)
-    };
-    auto html = render_echo_tree_fragment(t, conns, "d", "0123456789abcdef0123456789abcdef", "linux");
-    CHECK(html.find(":8080 listen") != std::string::npos);  // listener label
-    CHECK(html.find("203.0.113.9:443") != std::string::npos);
-    CHECK(html.find("tt-ep-pub") != std::string::npos);      // public endpoint highlighted
-    // 2 distinct endpoints (one dup removed): badge count "2" appears in the net cell.
-    CHECK(html.find("tt-net-ico\">\xE2\x86\x97</span>2") != std::string::npos);
-}
-
-TEST_CASE("echo anchors: install = min ts, boot = latest root start", "[echo][tree][anchor]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "systemd"),
-        ev(500, "started", 1, 0, "systemd"), // reboot — newer ppid==0 start
-        ev(600, "started", 100, 1, "bash"),
-    };
-    auto a = compute_echo_anchors(e);
-    CHECK(a.observed_since == 100);
-    CHECK(a.install_ts == 100);
-    CHECK(a.boot_ts == 500);
-}
-
-TEST_CASE("echo window: preset resolution", "[echo][tree][window]") {
-    EchoTreeAnchors a;
-    a.observed_since = 100;
-    a.install_ts = 100;
-    a.boot_ts = 500;
-    const std::int64_t now = 10000;
-
-    CHECK(resolve_echo_window("1m", 0, 0, a, now).from_ts == now - 60);
-    CHECK(resolve_echo_window("10m", 0, 0, a, now).from_ts == now - 600);
-    CHECK(resolve_echo_window("1h", 0, 0, a, now).from_ts == now - 3600);
-    CHECK(resolve_echo_window("1d", 0, 0, a, now).from_ts == 0); // now-86400 < 0 → clamped
-    CHECK(resolve_echo_window("on_install", 0, 0, a, now).from_ts == 100);
-    CHECK(resolve_echo_window("on_boot", 0, 0, a, now).from_ts == 500);
-    CHECK(resolve_echo_window("garbage", 0, 0, a, now).from_ts == now - 600); // default 10m
-
-    auto custom = resolve_echo_window("custom", 2000, 3000, a, now);
-    CHECK(custom.from_ts == 2000);
-    CHECK(custom.to_ts == 3000);
-    auto blank = resolve_echo_window("custom", 0, 0, a, now);
-    CHECK(blank.from_ts == 100);   // unset from → install
-    CHECK(blank.to_ts == now);     // unset to → now
-    auto reversed = resolve_echo_window("custom", 5000, 4000, a, now);
-    CHECK(reversed.to_ts == reversed.from_ts); // reversed range collapses to a point
-}
-
-TEST_CASE("echo render: agent-controlled fields are HTML-escaped", "[echo][tree][render]") {
-    std::vector<EchoProcEvent> e{
-        ev(100, "started", 1, 0, "<script>evil</script>", "us\"er"),
-    };
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    auto html = render_echo_tree_fragment(t, {}, "dev1", "0123456789abcdef0123456789abcdef", "linux");
-    CHECK(html.find("<script>evil") == std::string::npos);
-    CHECK(html.find("&lt;script&gt;evil") != std::string::npos);
-
-    auto detail = render_echo_proc_detail(t.nodes[0], {}, "linux");
-    CHECK(detail.find("<script>evil") == std::string::npos);
-    CHECK(detail.find("&lt;script&gt;") != std::string::npos);
-}
-
-TEST_CASE("echo render: Windows names-only caption, Linux shows cmdline", "[echo][tree][render]") {
-    EchoProcNode n;
-    n.pid = 42;
-    n.ppid = 1;
-    n.name = "proc";
-    n.cmdline = "/usr/bin/proc --flag";
-    n.running = true;
-    n.start_known = true;
-    n.started_ts = 100;
-
-    auto win = render_echo_proc_detail(n, {}, "windows");
-    CHECK(win.find("names-only on Windows") != std::string::npos);
-    CHECK(win.find("/usr/bin/proc") == std::string::npos); // not surfaced on Windows
-
-    auto lin = render_echo_proc_detail(n, {}, "linux");
-    CHECK(lin.find("/usr/bin/proc --flag") != std::string::npos);
-}
-
-// ── Review-round coverage (PR #1551 should-fix cluster) ─────────────────────
-
-TEST_CASE("echo render: interleaved same-name siblings group by first appearance",
-          "[echo][tree][render]") {
-    // 4 alpha.exe + 3 beta.exe, interleaved. alpha crosses the threshold (grouped),
-    // beta does not (individual). The O(n) bucketing must reproduce first-appearance
-    // ordering — alpha's group emits where alpha first appears, before beta's rows.
-    std::vector<EchoProcEvent> e{ev(100, "started", 1, 0, "services.exe")};
-    const char* names[] = {"alpha.exe", "beta.exe", "alpha.exe", "beta.exe",
-                           "alpha.exe", "beta.exe", "alpha.exe"};
-    std::uint32_t pid = 2000;
-    for (const char* nm : names)
-        e.push_back(ev(110, "started", pid++, 1, nm));
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    auto html = render_echo_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "windows");
-    CHECK(html.find("echo-tree-group") != std::string::npos);      // alpha grouped
-    CHECK(html.find("\xC3\x97" "4") != std::string::npos);        // "×4"
-    CHECK(html.find("alpha.exe") < html.find("beta.exe"));        // first-appearance order
-}
-
-TEST_CASE("echo render: wide distinct-name fan-out stays ungrouped and complete",
-          "[echo][tree][render]") {
-    // 200 distinct-name children under one parent: none reaches the group threshold,
-    // so every child renders individually (exercises the O(n) bucketing at scale).
-    std::vector<EchoProcEvent> e{ev(100, "started", 1, 0, "root")};
-    for (std::uint32_t i = 0; i < 200; ++i)
-        e.push_back(ev(110, "started", 2000 + i, 1, ("proc" + std::to_string(i)).c_str()));
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    auto html = render_echo_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "linux");
-    CHECK(html.find("echo-tree-group") == std::string::npos);
-    CHECK(html.find("proc0") != std::string::npos);   // first child rendered
-    CHECK(html.find("proc199") != std::string::npos); // last child rendered
-}
-
-TEST_CASE("echo tree: a branch deeper than the render cap sets depth_capped",
-          "[echo][tree][cap]") {
-    // Linear chain deeper than kEchoRenderDepthCap → the count pass flags depth_capped
-    // and the banner warns the count includes hidden descendants.
-    std::vector<EchoProcEvent> e;
-    const std::uint32_t depth = static_cast<std::uint32_t>(kEchoRenderDepthCap) + 20;
-    e.push_back(ev(100, "started", 1, 0, "p1"));
-    for (std::uint32_t i = 2; i <= depth; ++i)
-        e.push_back(ev(100, "started", i, i - 1, ("p" + std::to_string(i)).c_str()));
-    auto a = compute_echo_anchors(e);
-    auto t = reconstruct_echo_process_tree(e, 0, 1000, a);
-    CHECK(t.depth_capped);
-    auto html = render_echo_tree_fragment(t, {}, "d", "0123456789abcdef0123456789abcdef", "linux");
-    CHECK(html.find("deeper than the display limit") != std::string::npos);
-
-    // A shallow tree must NOT flag depth_capped.
-    std::vector<EchoProcEvent> shallow{ev(100, "started", 1, 0, "root"),
-                                      ev(110, "started", 2, 1, "child")};
-    auto t2 = reconstruct_echo_process_tree(shallow, 0, 1000, compute_echo_anchors(shallow));
-    CHECK(!t2.depth_capped);
-}
-
-TEST_CASE("echo canonical_echo_preset: allowlist passes, garbage → 10m default",
-          "[echo][tree][audit]") {
-    for (const char* ok : {"on_boot", "on_install", "1m", "10m", "1h", "1d", "custom"})
-        CHECK(canonical_echo_preset(ok) == ok);
-    CHECK(canonical_echo_preset("") == "10m");
-    CHECK(canonical_echo_preset("bogus") == "10m");
-    // An injection attempt is canonicalized away (no audit-field forgery survives).
-    CHECK(canonical_echo_preset("x command_id=forged") == "10m");
-    CHECK(canonical_echo_preset("10m\r\nnodes=0") == "10m");
-}
-
 TEST_CASE("echo normalize_echo_os: maps to a closed audit-safe set", "[echo][tree][audit]") {
     CHECK(normalize_echo_os("Windows 11 Pro") == "windows");
     CHECK(normalize_echo_os("Microsoft Windows") == "windows");
@@ -632,106 +840,255 @@ TEST_CASE("echo normalize_echo_os: maps to a closed audit-safe set", "[echo][tre
 
 // =============================================================================
 // Device DNS / ARP panels (ADR-0015) — parsers + current-state reduction + escape
+
+// =============================================================================
+// Device DNS / ARP panels (ADR-0015) — hourly activity + escape
 // =============================================================================
 
-TEST_CASE("parse_echo_dns_output: schema-located, skips torn/error rows", "[echo][dns][panel]") {
-    const std::string out =
-        "__schema__|name|record_type|data|ttl_remaining_s|source|ts|action\n"
-        "example.com|A|93.184.216.34|60|cache|100|appeared\n"
-        "torn-row-missing-cells\n"
-        "evil.test|A|10.0.0.9|30|cache|101|appeared\n"
-        "total|2\n";
-    auto rows = parse_echo_dns_output(out);
-    REQUIRE(rows.size() == 2);
-    CHECK(rows[0].name == "example.com");
-    CHECK(rows[0].record_type == "A");
-    CHECK(rows[0].ttl_remaining_s == 60);
-    CHECK(rows[0].action == "appeared");
-    CHECK(rows[1].name == "evil.test");
-}
-
-TEST_CASE("parse_echo_dns_output: an error| payload yields no rows", "[echo][dns][panel]") {
-    CHECK(parse_echo_dns_output("error|dns source disabled\n").empty());
-}
-
-TEST_CASE("render_echo_dns_panel: newest-wins, removed dropped, fields escaped",
+TEST_CASE("render_echo_dns_panel: only the selected hour; counts shown; fields escaped",
           "[echo][dns][panel]") {
-    // Rows are newest-first. A 'removed' newest action drops the binding; an older
-    // duplicate of an already-seen key is ignored.
-    std::vector<EchoDnsCacheEntry> rows = {
-        {200, "gone.test", "A", "1.2.3.4", 5, "cache", "removed"},
-        {150, "keep.test", "A", "<script>", 9, "cache", "appeared"},
-        {100, "keep.test", "A", "<script>", 60, "cache", "appeared"}, // older dup — ignored
-    };
-    const std::string html = render_echo_dns_panel(rows);
-    CHECK(html.find("keep.test") != std::string::npos);
-    CHECK(html.find("gone.test") == std::string::npos);          // removed → omitted
-    CHECK(html.find("&lt;script&gt;") != std::string::npos);     // agent field escaped
-    CHECK(html.find("<script>") == std::string::npos);           // never raw
-    CHECK(html.find("devnet-count\">1<") != std::string::npos);  // one current entry
+    std::vector<EchoDnsHourRow> rows;
+    EchoDnsHourRow a;
+    a.hour_ts = 7200;
+    a.name = "<b>evil</b>.test";
+    a.record_type = "A";
+    a.data = "1.1.1.1";
+    a.appear_count = 14;
+    a.remove_count = 13;
+    rows.push_back(a);
+    EchoDnsHourRow other = a;
+    other.hour_ts = 3600;
+    other.name = "older.test";
+    rows.push_back(other);
+    const auto html = render_echo_dns_panel(rows, 7200);
+    CHECK(html.find("devnet-count\">1<") != std::string::npos);
+    CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
+    CHECK(html.find("<b>evil") == std::string::npos);
+    CHECK(html.find("older.test") == std::string::npos);
+    CHECK(html.find("<td>14</td><td>13</td></tr>") != std::string::npos);
+    // Only the counts the agent measures are columns: no "no such name" count it never writes.
+    CHECK(html.find("<th>Appeared</th><th>Removed</th></tr>") != std::string::npos);
+    CHECK(html.find("No such name") == std::string::npos);
+    CHECK(html.find("<th>TTL</th>") == std::string::npos);
+    CHECK(html.find("<th>Src</th>") == std::string::npos);
+    // An hour with no rows says so.
+    const auto none = render_echo_dns_panel(rows, 9999);
+    CHECK(none.find("devnet-count\">0<") != std::string::npos);
+    CHECK(none.find("devnet-empty") != std::string::npos);
 }
 
-TEST_CASE("parse_echo_arp_output + render_echo_arp_panel", "[echo][arp][panel]") {
-    const std::string out =
-        "__schema__|interface|ip_address|mac_address|entry_type|ts|action\n"
-        "Ethernet|192.168.1.1|aa:bb:cc:dd:ee:ff|dynamic|100|appeared\n"
-        "Ethernet|192.168.1.9|11:22:33:44:55:66|static|90|removed\n";
-    auto rows = parse_echo_arp_output(out);
-    REQUIRE(rows.size() == 2);
-    CHECK(rows[0].iface == "Ethernet");
-    CHECK(rows[0].ip_address == "192.168.1.1");
-    const std::string html = render_echo_arp_panel(rows);
-    CHECK(html.find("192.168.1.1") != std::string::npos);
-    CHECK(html.find("192.168.1.9") == std::string::npos); // removed → omitted
+TEST_CASE("render_echo_arp_panel: appeared and removed counts for the selected hour",
+          "[echo][arp][panel]") {
+    EchoArpHourRow first;
+    first.hour_ts = 7200;
+    first.iface = "eth0";
+    first.ip_address = "10.0.0.1";
+    first.mac_address = "aa:bb:cc:dd:ee:ff";
+    first.appear_count = 1;
+    EchoArpHourRow second = first;
+    second.ip_address = "10.0.0.7";
+    second.appear_count = 4;
+    second.remove_count = 3;
+    EchoArpHourRow older = first;
+    older.hour_ts = 3600;
+    older.ip_address = "10.9.9.9";
+    const auto html = render_echo_arp_panel({first, second, older}, 7200);
+    CHECK(html.find("devnet-count\">2<") != std::string::npos);
+    CHECK(html.find("<td>4</td><td>3</td></tr>") != std::string::npos);
+    CHECK(html.find("10.9.9.9") == std::string::npos);
+    CHECK(html.find("<th>Type</th>") == std::string::npos);
+    // Role and rebinds are not measured by the agent yet, so they are not columns or claims.
+    for (const char* gone : {"<th>Role</th>", "<th>Rebinds</th>", "router", "MAC change", "rebind"})
+        CHECK(html.find(gone) == std::string::npos);
+    CHECK(render_echo_arp_panel({}, 7200).find("devnet-empty") != std::string::npos);
 }
 
-TEST_CASE("render_echo_capture_sources: rows, badges, staged toggles, device attr",
+// B4/B1/B6: a failed, cut or partly unreadable read is said in the panel, never shown as quiet.
+TEST_CASE("render_echo_dns_panel and arp: a failed read is an error and never an empty note",
+          "[echo][dns][arp][panel]") {
+    EchoReadNotes failed;
+    failed.error = "This device runs an agent without the roll-up store: upgrade the agent";
+    for (const auto& html : {render_echo_dns_panel({}, 7200, failed), render_echo_arp_panel({}, 7200, failed)}) {
+        CHECK(html.find("upgrade the agent") != std::string::npos);
+        CHECK(html.find("devnet-empty") == std::string::npos);
+        CHECK(html.find("recorded for this hour") == std::string::npos);
+        CHECK(html.find("devnet-count\">&mdash;<") != std::string::npos);
+        CHECK(html.find("<table") == std::string::npos);
+    }
+    // The error is agent text: escaped.
+    EchoReadNotes hostile;
+    hostile.error = "<img src=x>";
+    const auto esc = render_echo_dns_panel({}, 7200, hostile);
+    CHECK(esc.find("<img src=x>") == std::string::npos);
+    CHECK(esc.find("&lt;img") != std::string::npos);
+}
+
+TEST_CASE("render_echo_dns_panel and arp: cut and unreadable notes sit above the rows",
+          "[echo][dns][arp][panel]") {
+    EchoDnsHourRow d;
+    d.hour_ts = 7200;
+    d.name = "example.test";
+    EchoReadNotes notes;
+    notes.cut = true;
+    notes.unreadable = 3;
+    const auto html = render_echo_dns_panel({d}, 7200, notes);
+    const auto cut = html.find("Results were cut at 10,000 rows for this hour");
+    const auto bad = html.find("3 rows unreadable");
+    const auto table = html.find("<table");
+    REQUIRE((cut != std::string::npos && bad != std::string::npos && table != std::string::npos));
+    CHECK(cut < table);
+    CHECK(bad < table);
+    CHECK(html.find("example.test") != std::string::npos); // the rows that did read are still shown
+}
+
+TEST_CASE("render_echo_read_notes: says nothing when there is nothing to say", "[echo][tree][render]") {
+    CHECK(render_echo_read_notes({}).empty());
+    EchoReadNotes one;
+    one.unreadable = 1;
+    CHECK(render_echo_read_notes(one).find("1 row unreadable") != std::string::npos);
+    EchoReadNotes cut;
+    cut.cut = true;
+    const auto conn = render_echo_read_notes(cut, "Connection results", "connection rows");
+    CHECK(conn.find("Connection results were cut at 10,000 rows for this hour") != std::string::npos);
+    EchoReadNotes both = cut;
+    both.unreadable = 2;
+    CHECK(render_echo_read_notes(both, "Results", "<b>rows").find("&lt;b&gt;rows unreadable") !=
+          std::string::npos);
+}
+
+// B4: one pure mapping from an agent failure to the sentence the operator reads.
+TEST_CASE("echo_agent_error_note: a missing roll-up table or column says to upgrade the agent",
+          "[echo][routes][skew]") {
+    const std::string upgrade = "This device runs an agent without the roll-up store: upgrade the agent";
+    // Every shape an agent without the roll-up tables answers with, for every table we read.
+    for (const char* skew : {"error|no such column: parent_name", "error|query failed: no such column: failed_count",
+                             "error|query failed: no such table: process_hourly",
+                             "error|unknown table: $Process_Hourly", "error|unknown table: $DNS_Hourly",
+                             "error|QUERY FAILED: NO SUCH COLUMN: is_router",
+                             "no such column: parent_name"}) { // a command's error detail has no prefix
+        INFO(skew);
+        CHECK(echo_agent_error_note(skew) == upgrade);
+    }
+}
+
+TEST_CASE("echo_agent_error_note: any other failure keeps its reason and only its first record",
+          "[echo][routes][skew]") {
+    CHECK(echo_agent_error_note("error|database is locked") == "The device reported an error: database is locked");
+    CHECK(echo_agent_error_note("database is locked") == "The device reported an error: database is locked");
+    // Only the first record of a multi-record reply; the next record never leaks in.
+    const auto note = echo_agent_error_note("error|Echo storage is offline.\nstorage_state|offline");
+    CHECK(note == "The device reported an error: Echo storage is offline.");
+    CHECK(note.find("storage_state") == std::string::npos);
+    // A reply with no reason still says it failed.
+    CHECK(echo_agent_error_note("error|") == "The device reported an error.");
+    CHECK(echo_agent_error_note("") == "The device reported an error.");
+    // Bounded: a long reason is cut, not echoed whole.
+    CHECK(echo_agent_error_note("error|" + std::string(5000, 'x')).size() < 500);
+}
+
+// =============================================================================
+// Capture-source cards
+// =============================================================================
+
+namespace {
+// One source's card: from its src-name span to the card's closing </dl></div>.
+std::string card(const std::string& html, const std::string& name) {
+    const auto b = html.find("<span class=\"src-name\">" + name + "</span>");
+    REQUIRE(b != std::string::npos);
+    return html.substr(b, html.find("</dl></div>", b) - b);
+}
+} // namespace
+
+TEST_CASE("render_echo_capture_sources: cards; hourly names; staged toggles; device attr",
           "[echo][capture-sources]") {
     const std::string status =
-        "config|process_enabled|true\nconfig|process_live_rows|18204\n"
-        "config|arp_enabled|false\nconfig|arp_live_rows|0\n"
-        "config|dns_enabled|true\nconfig|dns_live_rows|42\n";
-    const std::string compat =
-        "header|source|os|status|capture_method|notes\n"
-        "row|arp|windows|supported|iphlpapi|x\nrow|arp|linux|planned|procfs|y\n"
-        "row|dns|windows|supported|dnsapi|x\n";
-    const std::string html = render_echo_capture_sources("agent-123", status, compat);
+        "config|process_enabled|true\nconfig|process_rows|18204\nconfig|process_oldest_ts|1760000400\n"
+        "config|arp_enabled|false\nconfig|arp_rows|0\n"
+        "config|dns_enabled|true\nconfig|dns_rows|42\n";
+    const std::string html = render_echo_capture_sources("agent-123", status);
     CHECK(html.find("data-device=\"agent-123\"") != std::string::npos);
+    CHECK(html.find("id=\"capCards\"") != std::string::npos);
+    CHECK(html.find("<table") == std::string::npos);                 // cards, not a table
     CHECK(html.find("always on") != std::string::npos);             // process is locked
     CHECK(html.find("data-source=\"arp\"") != std::string::npos);   // arp is a staged toggle
     CHECK(html.find("badge-new") != std::string::npos);             // arp/dns NEW badge
-    CHECK(html.find("badge-pii") != std::string::npos);             // dns PII badge
     CHECK(html.find("stageCapToggle(this)") != std::string::npos);  // guardrail wiring
     CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
+    CHECK(html.find("<dt>Hourly rows</dt>") != std::string::npos);
+    CHECK(html.find("Live rows") == std::string::npos);
+    CHECK(html.find("$Process_Hourly") != std::string::npos);
+    CHECK(html.find("$DNS_Hourly") != std::string::npos);
+    CHECK(html.find("$Process<") == std::string::npos);
+    CHECK(html.find("OS support") == std::string::npos);
+    // 1760000400 = 2025-10-09 09:00:00 UTC → shown as its bucket-resolution label.
+    CHECK(card(html, "process").find("2025-10-09 09:00 UTC") != std::string::npos);
+    CHECK(card(html, "process").find("Hourly</span><span>Daily</span><span>Monthly") != std::string::npos);
+    CHECK(card(html, "dns").find("Hourly</span></dd>") != std::string::npos); // hourly only
 }
 
-TEST_CASE("render_echo_capture_sources: the registry source gets the System chip, a NEW badge and no PII badge",
+TEST_CASE("render_echo_capture_sources: the row count reads <src>_rows and never relabels <src>_live_rows",
           "[echo][capture-sources]") {
-    const std::string compat =
-        "header|source|os|status|capture_method|notes\nrow|registry|windows|supported|etw|x\n";
-    const auto row = [](const std::string& h, const std::string& name) {
-        const auto b = h.find("<span class=\"src-name\">" + name + "</span>");
+    const auto rows_of = [](const std::string& status) {
+        const std::string c = card(render_echo_capture_sources("d", status), "process");
+        const auto b = c.find("<dt>Hourly rows</dt>");
         REQUIRE(b != std::string::npos);
-        return h.substr(b, h.find("</tr>", b) - b);
+        return c.substr(b, c.find("</dd>", b) - b);
     };
+    const std::string upgrade = "This device runs an agent without the roll-up tables; upgrade the agent";
+    const auto note_count = [&](const std::string& status) {
+        return count_occurrences(render_echo_capture_sources("d", status), upgrade);
+    };
+    // `_rows` alone: shown, no note.
+    CHECK(rows_of("config|process_enabled|true\nconfig|process_rows|111\n").find(">111<") !=
+          std::string::npos);
+    CHECK(note_count("config|process_enabled|true\nconfig|process_rows|111\n") == 0);
+    // `_live_rows` alone (an agent without the roll-up tables): the raw count is NOT shown as an
+    // hourly row count; a dash, and ONE note above the cards.
+    const auto alias = rows_of("config|process_enabled|true\nconfig|process_live_rows|222\n");
+    CHECK(alias.find("222") == std::string::npos);
+    CHECK(alias.find("&mdash;") != std::string::npos);
+    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|222\n") == 1);
+    const std::string html = render_echo_capture_sources(
+        "d", "config|process_enabled|true\nconfig|process_live_rows|222\n");
+    CHECK(html.find(upgrade) < html.find("id=\"capCards\"")); // above the cards
+    // Several sources on the same old agent: still one note.
+    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|1\n"
+                     "config|tcp_enabled|true\nconfig|tcp_live_rows|2\n") == 1);
+    // Both keys for one source: `_rows` wins and there is nothing to say.
+    const auto both = rows_of("config|process_enabled|true\nconfig|process_live_rows|222\nconfig|process_rows|111\n");
+    CHECK(both.find(">111<") != std::string::npos);
+    CHECK(both.find("222") == std::string::npos);
+    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|222\nconfig|process_rows|111\n") == 0);
+    // One source answers both while another answers only the alias: the note is for the second.
+    CHECK(note_count("config|process_enabled|true\nconfig|process_rows|111\n"
+                     "config|tcp_enabled|true\nconfig|tcp_live_rows|2\n") == 1);
+    // Neither: unknown is a dash, not a false zero, and not an upgrade claim.
+    const auto none = rows_of("config|process_enabled|true\n");
+    CHECK(none.find("&mdash;") != std::string::npos);
+    CHECK(none.find(">0<") == std::string::npos);
+    CHECK(note_count("config|process_enabled|true\n") == 0);
+    // The old wording is gone.
+    CHECK(html.find("live data") == std::string::npos);
+}
+
+TEST_CASE("render_echo_capture_sources: the registry source gets the System chip and a NEW badge",
+          "[echo][capture-sources]") {
     const auto npos = std::string::npos;
 
     SECTION("reported by a Windows agent") {
         const std::string html = render_echo_capture_sources(
-            "agent-123", "config|registry_enabled|true\nconfig|registry_live_rows|7\n", compat);
-        const auto r = row(html, "registry");
-        CHECK(r.find("badge-new") != npos);
-        CHECK(r.find("badge-pii") == npos); // values are unmasked, deliberately no PII badge
-        CHECK(r.find("<td class=\"cat\">System</td>") != npos);
-        CHECK(r.find("$Registry") != npos);
-        CHECK(r.find("data-source=\"registry\"") != npos); // a staged toggle, not locked
+            "agent-123", "config|registry_enabled|true\nconfig|registry_rows|7\n");
+        const auto c = card(html, "registry");
+        CHECK(c.find("badge-new") != npos);
+        CHECK(c.find("System") != npos);
+        CHECK(c.find("$Registry_Hourly") != npos);
+        CHECK(c.find("data-source=\"registry\"") != npos); // a staged toggle, not locked
         CHECK(html.find("data-cat=\"System\"") != npos);
         // the sixth chip, filtering to the System category
         CHECK(html.find("filterCap(this,'System')\">System</a>") != npos);
     }
-    SECTION("an older agent that does not report registry_enabled: no row") {
-        const std::string html =
-            render_echo_capture_sources("agent-123", "config|process_enabled|true\n", compat);
+    SECTION("an older agent that does not report registry_enabled: no card") {
+        const std::string html = render_echo_capture_sources("agent-123", "config|process_enabled|true\n");
         CHECK(html.find("src-name\">registry<") == npos);
         CHECK(html.find("$Registry") == npos);
     }
@@ -741,45 +1098,44 @@ TEST_CASE("render_echo_capture_sources: a paused core source reads paused with a
           "[echo][capture-sources]") {
     const std::string status =
         "config|process_enabled|true\nconfig|tcp_enabled|true\nconfig|service_enabled|false\n"
-        "config|user_enabled|true\nconfig|perf_enabled|true\nconfig|arp_enabled|false\n";
-    const std::string compat = "header|source|os|status|capture_method|notes\n";
-    const std::string html = render_echo_capture_sources("agent-123", status, compat);
-    const auto row = [&](const std::string& h, const std::string& name) {
-        const auto b = h.find("<span class=\"src-name\">" + name + "</span>");
-        REQUIRE(b != std::string::npos);
-        return h.substr(b, h.find("</tr>", b) - b);
-    };
+        "config|user_enabled|true\nconfig|perf_enabled|true\nconfig|arp_enabled|false\n"
+        "config|service_paused_at|1760000400\n";
+    const std::string html = render_echo_capture_sources("agent-123", status);
     const auto npos = std::string::npos;
 
     SECTION("core enabled") {
-        const auto r = row(html, "process");
+        const auto r = card(html, "process");
         CHECK(r.find("checked disabled") != npos);
         CHECK(r.find("state-on\">always on") != npos);
     }
     SECTION("core paused") {
-        const auto r = row(html, "service");
+        const auto r = card(html, "service");
         CHECK(r.find("tgl locked") != npos);
         CHECK(r.find("type=\"checkbox\" disabled>") != npos);
         CHECK(r.find("checked") == npos);
         CHECK(r.find("state-txt\">paused<") != npos);
+        CHECK(r.find("since 2025-10-09T09:00:00Z") != npos);
         CHECK(r.find("always on") == npos);
         CHECK(r.find("data-source") == npos);
-        CHECK(row(html, "tcp").find("always on") != npos);
+        CHECK(card(html, "tcp").find("always on") != npos);
     }
     SECTION("hostile device is escaped") {
-        const std::string h = render_echo_capture_sources("a\"><script>", status, compat);
+        const std::string h = render_echo_capture_sources("a\"><script>", status);
         CHECK(h.find("data-device=\"a&quot;&gt;&lt;script&gt;\"") != npos);
         CHECK(h.find("<script>") == npos);
     }
 }
 
+TEST_CASE("render_echo_capture_sources: no sources reported says so", "[echo][capture-sources]") {
+    const auto html = render_echo_capture_sources("d", "storage_state|ok\n");
+    CHECK(html.find("No capture sources reported") != std::string::npos);
+    CHECK(html.find("capApplyBar") == std::string::npos);
+}
+
 TEST_CASE("Echo page: the capture-sources push bar stays hidden until a change is staged",
           "[echo][capture-sources][page]") {
-    const std::string status = "config|arp_enabled|false\n";
-    const std::string compat =
-        "header|source|os|status|capture_method|notes\nrow|arp|windows|supported|iphlpapi|x\n";
     // The renderer emits the bar with the `hidden` attribute; refreshCapBar() flips it.
-    const std::string html = render_echo_capture_sources("agent-123", status, compat);
+    const std::string html = render_echo_capture_sources("agent-123", "config|arp_enabled|false\n");
     CHECK(html.find("id=\"capApplyBar\" hidden>") != std::string::npos);
     // `.apply-bar { display: flex }` outranks the UA `[hidden]` rule, so without this override
     // the bar is always visible ("0 pending changes").
@@ -787,34 +1143,36 @@ TEST_CASE("Echo page: the capture-sources push bar stays hidden until a change i
     CHECK(page.find(".apply-bar[hidden] { display: none; }") != std::string::npos);
 }
 
-TEST_CASE("Echo page CSS declares the table-prefixed cell colour selectors",
-          "[echo][page]") {
-    // yuzu.css's `:is(.panel table, .tw table) td { color: var(--ink2) }` has specificity (0,1,2);
-    // a bare single-class cell rule loses to it, so these selectors carry a table / id prefix.
-    // This pins that the selectors are declared, not their computed outcome.
-    const std::string page = kEchoPageHtml;
-    CHECK(page.find("#capTable .os-ok { color: var(--ok); }") != std::string::npos);
-    CHECK(page.find("#capTable .os-con { color: var(--warn); }") != std::string::npos);
-    CHECK(page.find(".devnet-table .arp-type-other { color: var(--warn); }") != std::string::npos);
-}
-
-TEST_CASE("render_echo_dns_panel: newest-first input is a load-bearing invariant (ADR-0015)",
-          "[echo][dns][panel]") {
-    // The route feeds rows ORDER BY ts DESC; the reduction is newest-wins. Pin that
-    // the ORDER BY is load-bearing — a future refactor dropping it would corrupt the
-    // panel (the wrong row would win per key).
-    std::vector<EchoDnsCacheEntry> newest_first = {
-        {200, "x.test", "A", "1.1.1.1", 5, "cache", "removed"},   // newest action: removed
-        {100, "x.test", "A", "1.1.1.1", 60, "cache", "appeared"}, // older
-    };
-    CHECK(render_echo_dns_panel(newest_first).find("devnet-count\">0<") !=
-          std::string::npos); // removed wins → empty cache
-
-    std::vector<EchoDnsCacheEntry> oldest_first = {
-        {100, "x.test", "A", "1.1.1.1", 60, "cache", "appeared"},
-        {200, "x.test", "A", "1.1.1.1", 5, "cache", "removed"},
-    };
-    // Fed oldest-first the FIRST-seen (appeared) wrongly wins → entry shown. This is
-    // the documented wrong result the route's ORDER BY prevents.
-    CHECK(render_echo_dns_panel(oldest_first).find("devnet-count\">1<") != std::string::npos);
+TEST_CASE("Echo renderers add no personal-data or privacy or usage-class wording to the UI",
+          "[echo][render][copy]") {
+    // Binding product rule: no such note, badge, pill, warning or caption is added to any
+    // Echo UI string, and the old PII badge is not carried into the capture-source cards.
+    EchoDnsHourRow d;
+    d.hour_ts = 3600;
+    d.name = "example.test";
+    d.record_type = "A";
+    EchoArpHourRow a;
+    a.hour_ts = 3600;
+    a.ip_address = "10.0.0.1";
+    a.mac_address = "aa:bb";
+    const auto tree = build_echo_process_tree({hr(3600, "bash", "", "alice", 1, 1, 1)}, 3600);
+    const std::string all =
+        render_echo_tree_fragment(tree, {conn(3600, "bash", "1.2.3.4", 443)}, kToken) +
+        render_echo_proc_detail(tree.nodes[0], {conn(3600, "bash", "1.2.3.4", 443)}) +
+        render_echo_dns_panel({d}, 3600) + render_echo_arp_panel({a}, 3600) +
+        render_echo_dns_panel({}, 3600) + render_echo_arp_panel({}, 3600) +
+        render_echo_capture_sources(
+            "d", "config|process_enabled|true\nconfig|dns_enabled|true\nconfig|arp_enabled|true\n"
+                 "config|registry_enabled|true\nconfig|service_enabled|false\n") +
+        // the failure, cut, unreadable and old-agent wording added for honest reads
+        render_echo_capture_sources("d", "config|process_enabled|true\nconfig|process_live_rows|1\n") +
+        render_echo_read_notes(EchoReadNotes{.unreadable = 2, .cut = true}) +
+        render_echo_read_notes(EchoReadNotes{.unreadable = 1, .cut = true}, "Connection results",
+                               "connection rows") +
+        render_echo_dns_panel({}, 3600, EchoReadNotes{.error = echo_agent_error_note("error|no such column: x")}) +
+        render_echo_arp_panel({}, 3600, EchoReadNotes{.error = echo_agent_error_note("error|boom")});
+    const std::string text = lower(all);
+    for (const char* banned : {"pii", "personal", "privacy", "sensitive", "usage-class", "usage class",
+                               "gdpr", "badge-pii"})
+        CHECK(text.find(banned) == std::string::npos);
 }

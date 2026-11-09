@@ -1383,6 +1383,14 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   refusal covers only the fetching replica's own addresses, not the other replicas'; reaching
   another replica's listener needs a registered URL naming it, which only an administrator can
   register. That classifier is hoisted to a shared pure header rather than copied.
+- **IPv6 at registration: declared prefixes only** (owner ruling on #6583, 2026-11-04). An IPv6
+  address that embeds an IPv4 address is judged by that IPv4 address for the well-known
+  `64:ff9b::/96`, 6to4, IPv4-mapped and the operator-declared (`--oidc-nat64-prefix`) prefixes.
+  Registration does **no RFC 7050 discovery**, so it refuses only as far as the declared prefixes
+  allow: an address behind a prefix the network advertises but the operator did not declare is
+  judged as plain IPv6 at registration. That is safe because nothing fetches at registration and
+  the fetcher re-classifies every address (below). The MCP and REST descriptions both state it
+  as "Declared prefixes only at registration".
 - **`PUT` replaces** the source's name, keys and URLs. This is how a renewed CA key is added. A
   `PUT` that drops a URL deletes that URL's `source_url` and `fetch_status` rows, and every held
   `crl` row fetched from it, in the same transaction. A `PUT` that drops a key deletes every held
@@ -1428,6 +1436,18 @@ review, as a new egress surface.
   elsewhere. The OIDC client already pins this way with httplib's `set_hostname_addr_map`
   (`oidc_provider.cpp:1468`, `:2275`) and turns off redirect following (`:2296`); that
   resolve-classify-pin helper is hoisted to a shared place and reused, not copied.
+- **NAT64 discovery belongs to the fetcher (2b-1b).** The fetcher, not registration, discovers the
+  network's NAT64 prefixes (RFC 7050) and:
+  - judges the declared and the discovered views **separately**, never merged, so a discovered
+    prefix can only tighten a verdict;
+  - refuses the never-allowed tier and loopback **regardless of any confirmation**;
+  - decides the **never-answered** case explicitly (no lookup has ever answered for this
+    process): fail closed at the fetcher, with an audit mark, rather than a blanket refusal of
+    every IPv6 target at registration.
+
+  A class confirmed at registration (judged on declared prefixes only) may therefore be refused
+  at the first fetch once discovery is on (`address_class_changed`), so 2b-1b needs a
+  **re-confirm path** for the administrator, not only a refusal.
 - **Cleartext.** Plain `http` is allowed to any confirmed address class, unlike the OIDC policy's
   refusal of cleartext to a public address (`oidc_egress_policy.hpp:25-30`). A CRL's integrity comes
   from its signature, not the transport, and most CDPs are `http`. A tampered response fails

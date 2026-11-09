@@ -128,7 +128,7 @@ using StepUpAuditFn = std::function<bool(const httplib::Request&,
 /// inside the window on the database clock as well as the cached anchor); no other caller
 /// ever reads it. Null (or empty) is fail-closed: such a caller is refused 503, never
 /// judged without the proof. `admitted`, when not null, receives what a PASS admitted for
-/// a local account (`StepUpAdmission`); pass nullptr for the 35 `kRequired` rows. The row's
+/// a local account (`StepUpAdmission`); pass nullptr for the 39 `kRequired` rows. The row's
 /// class is resolved from `action_label` (`step_up_policy_for_label`), so the two
 /// `kFactorCredential` labels get the approver window with no hatch, the local-session-only
 /// rule and the admission here exactly as the central chokepoint gives them; an unknown

@@ -450,7 +450,7 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-**Enrolled accounts at generation 0 (#6079).** An enrolled account whose factor generation is not positive (`SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;`) is refused `503` (audit `reason=mfa_proof_unavailable`) on the 37 step-up routes and on the 3 JIT-elevation routes (they probe the same factor state) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). The 37 are the 35 ordinary rows, approve and reject among them, and the 2 factor-credential routes (Settings recovery-code regeneration, `POST /api/settings/mfa/recovery-codes`, and MFA disable, `POST /api/settings/mfa/disable`). The 35 ordinary routes refuse only while `--mfa-step-up-window-secs` is above 0 (at 0 they pass without reading the store); approve and reject, the 2 factor-credential routes and the elevation routes refuse regardless. The command needs a host shell, the Postgres DSN and the keys directory, so an affected user cannot recover on their own. An administrator API token is no substitute for the reset: such a token is refused `403` on the two factor-credential routes, cannot approve or reject, and a generation-0 administrator cannot mint one while the window is above 0 (creating a token is itself an ordinary step-up row).
+**Enrolled accounts at generation 0 (#6079).** An enrolled account whose factor generation is not positive (`SELECT username FROM auth.users WHERE mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;`) is refused `503` (audit `reason=mfa_proof_unavailable`) on the 41 step-up routes and on the 3 JIT-elevation routes (they probe the same factor state) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). The 41 are the 39 ordinary rows, approve and reject among them, and the 2 factor-credential routes (Settings recovery-code regeneration, `POST /api/settings/mfa/recovery-codes`, and MFA disable, `POST /api/settings/mfa/disable`). The 39 ordinary routes refuse only while `--mfa-step-up-window-secs` is above 0 (at 0 they pass without reading the store); approve and reject, the 2 factor-credential routes and the elevation routes refuse regardless. The command needs a host shell, the Postgres DSN and the keys directory, so an affected user cannot recover on their own. An administrator API token is no substitute for the reset: such a token is refused `403` on the two factor-credential routes, cannot approve or reject, and a generation-0 administrator cannot mint one while the window is above 0 (creating a token is itself an ordinary step-up row).
 
 ## Sessions are durable
 
@@ -1736,7 +1736,7 @@ one of the two paths above.
 
 ## Step-up returns 503 while the authentication store is unavailable
 
-The 37 routes that need a fresh MFA step-up (token, session, engine-principal,
+The 41 routes that need a fresh MFA step-up (token, session, engine-principal,
 RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
 check the caller's MFA state before the route runs. Other mutating routes and all
@@ -1965,8 +1965,8 @@ keeps the [direct SQL fallback](#fallback-direct-sql) for a corrupt blob header.
 ### Last resort: disable the proof requirement fleet-wide
 
 `--mfa-step-up-window-secs 0` (or less) makes the check pass without reading the
-enrollment, so one of the 35 ordinary gated routes runs again for a local session. It is a deliberate
-security reduction for those 35 routes and every account (see
+enrollment, so one of the 39 ordinary gated routes runs again for a local session. It is a deliberate
+security reduction for those 39 routes and every account (see
 [Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
 for the other recovery lever), so use it only when you cannot restore the
 authentication store or reset the affected account. Know its limits:
@@ -1986,13 +1986,13 @@ authentication store or reset the affected account. Know its limits:
   read. The two factor-credential routes (`POST /api/settings/mfa/recovery-codes` and
   `/disable`) ignore it too, with a window of at most 300 s.
 - **It also switches the binding check off, and does not fix a binding fault.** At a window of `0` or
-  less the 35 ordinary routes do not read the stored proof, so the factor-generation binding is not
+  less the 39 ordinary routes do not read the stored proof, so the factor-generation binding is not
   applied to them either; that stops them answering `503` for a failing binding only by turning the
   control off for them. Approvals, the two factor-credential routes and JIT elevation still answer
   `503` in that state, so the lever is not a remedy for
   [MFA binding enforcement failed](#mfa-binding-enforcement-failed): repair the trigger instead.
 - **SAML sessions pass too.** The window check precedes the SAML denial, so while
-  the window is `0` or less a SAML session reaches the 35 ordinary central routes instead of
+  the window is `0` or less a SAML session reaches the 39 ordinary central routes instead of
   getting its `403` (the two factor-credential routes, recovery-code regeneration and MFA disable,
   ignore the lever and refuse every non-local session), except approve and reject (`POST /api/approvals/{id}/approve` and
   `/reject`), which keep their own gate whatever this value is (next bullet).

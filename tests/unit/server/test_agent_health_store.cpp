@@ -3001,3 +3001,185 @@ TEST_CASE("REAL AgentHealthStore: a counter can count an agent whose flag was re
     CHECK(series_val(out, "yuzu_fleet_agents_dedup_claim_erroring ") == 1.0);
     CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
 }
+
+// ── #2240: yuzu_fleet_guardian_backend{os,backend} ──────────────────────────────────────
+//
+// REAL AgentHealthStore, not TestAgentHealthStore (header rule, lines 4-23): the mirror has no
+// guardian_backend code, so only the shipped store can make these red when the publisher is
+// deleted. The gauge is a CATEGORICAL partition count: each recognised agent lands in exactly
+// one {os,backend} series. A missing tag is NotReported (never `legacy`), a non-empty value
+// outside the closed table is REJECTED (counted in _tag_rejected, in no bucket). Gauge and meta
+// gauge names are typed out here on purpose: the pin test
+// (test_guardian_backend_fleet_tags.cpp) binds them to the shipped header constants.
+
+namespace {
+
+struct BackendBeat {
+    std::string id;
+    std::string os; // empty => omit yuzu.os
+    std::optional<std::string> backend; // nullopt => omit the tag
+};
+
+std::string backend_sweep(const std::vector<BackendBeat>& beats,
+                          std::chrono::seconds staleness = std::chrono::seconds{300}) {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    for (const auto& b : beats) {
+        google::protobuf::Map<std::string, std::string> tags;
+        if (!b.os.empty())
+            tags["yuzu.os"] = b.os;
+        if (b.backend)
+            tags["yuzu.guardian_backend"] = *b.backend;
+        store.upsert(b.id, tags);
+    }
+    store.recompute_metrics(metrics, staleness);
+    return metrics.serialize();
+}
+
+std::string backend_series(const std::string& os, const std::string& backend) {
+    return "yuzu_fleet_guardian_backend{os=\"" + os + "\",backend=\"" + backend + "\"} ";
+}
+
+bool has_backend_sample(const std::string& out, const std::string& series) {
+    return out.find("\n" + series) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore: guardian backend is a per-os partition count",
+          "[guardian][backend][rollup][real]") {
+    const auto out = backend_sweep({
+        {"l1", "linux", "legacy"},
+        {"l2", "linux", "legacy"},
+        {"l3", "linux", "spark"},
+        {"l4", "linux", "spark_failed"},
+        {"w1", "windows", "unwired"},
+        {"w2", "windows", "legacy"},
+    });
+    CHECK(series_val(out, backend_series("linux", "legacy")) == 2.0);
+    CHECK(series_val(out, backend_series("linux", "spark")) == 1.0);
+    CHECK(series_val(out, backend_series("linux", "spark_failed")) == 1.0);
+    CHECK(series_val(out, backend_series("windows", "unwired")) == 1.0);
+    CHECK(series_val(out, backend_series("windows", "legacy")) == 1.0);
+    // Partition: reporting is the sum of every series, one agent in exactly one bucket.
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 6.0);
+    // Absent-not-zero: a (os,backend) pair nobody reports is never pre-seeded, and an OS with
+    // no reporting agent has no series at all.
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "unwired")));
+    CHECK_FALSE(has_backend_sample(out, backend_series("windows", "spark")));
+    CHECK(out.find("yuzu_fleet_guardian_backend{os=\"darwin\"") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a missing guardian backend tag is NotReported, never legacy",
+          "[guardian][backend][rollup][real]") {
+    // Two agents that never send the tag (old agent, no Guardian, a faulted Group C beat, a
+    // stopping agent) and one honest legacy. Reading absence as `legacy` would make the
+    // pre-flip fleet look 100 percent reporting legacy when it is not.
+    const auto out = backend_sweep({
+        {"old-1", "linux", std::nullopt},
+        {"old-2", "linux", std::nullopt},
+        {"honest", "linux", "legacy"},
+    });
+    CHECK(series_val(out, backend_series("linux", "legacy")) == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_tag_rejected ") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a forged guardian backend value pages on no bucket",
+          "[guardian][backend][rollup][real]") {
+    // Strict, case-sensitive, closed-set parse: unknown, differently cased, padded, numeric,
+    // oversized and unterminated values contribute to NO bucket (never `legacy`, never
+    // `spark_failed`) and are counted once each in _tag_rejected. A present-empty value is
+    // NotReported, not rejected.
+    std::vector<BackendBeat> beats = {
+        {"honest", "linux", "spark_failed"},
+        {"empty", "linux", std::string{}},
+        {"f1", "linux", "Legacy"},
+        {"f2", "linux", "LEGACY"},
+        {"f3", "linux", " legacy"},
+        {"f4", "linux", "legacy "},
+        {"f5", "linux", "spark_failed\n"},
+        {"f6", "linux", "0"},
+        {"f7", "linux", "true"},
+        {"f8", "linux", "spark-failed"},
+        {"f9", "linux", "a-future-backend"},
+        {"f10", "linux", "legacy,spark"},
+        {"f11", "linux", std::string("legacy\0x", 8)},
+        {"huge", "linux", std::string(4u * 1024u * 1024u, 'x')},
+    };
+    const auto out = backend_sweep(beats);
+    CHECK(series_val(out, backend_series("linux", "spark_failed")) == 1.0);
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "legacy")));
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_tag_rejected ") == 12.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 1.0);
+    // The forged payload never becomes a label value.
+    CHECK(out.find("a-future-backend") == std::string::npos);
+    CHECK(out.find("xxxxxxxx") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a stale agent leaves the guardian backend gauge",
+          "[guardian][backend][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_backend"] = "legacy";
+    store.upsert("doomed", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(series_val(metrics.serialize(), backend_series("linux", "legacy")) == 1.0);
+
+    // Zero window: the prune runs before accumulation, so the aged-out agent is not counted.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    const auto out = metrics.serialize();
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "legacy")));
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a backend change moves the agent between series",
+          "[guardian][backend][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    auto beat = [&](const std::string& backend) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        tags["yuzu.guardian_backend"] = backend;
+        store.upsert("flip", tags); // upsert REPLACES the whole tag map
+    };
+    beat("legacy");
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(series_val(metrics.serialize(), backend_series("linux", "legacy")) == 1.0);
+
+    beat("spark");
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK(series_val(out, backend_series("linux", "spark")) == 1.0);
+    // The old series is cleared each sweep, not left at a stale 1.
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "legacy")));
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian backend os label is allowlisted",
+          "[guardian][backend][rollup][real]") {
+    const auto out = backend_sweep({
+        {"a", "freebsd", "legacy"},
+        {"b", "Windows", "legacy"},
+        {"c", "", "legacy"},
+        {"d", "pwn-uniquely-named-series", "legacy"},
+    });
+    CHECK(series_val(out, backend_series("other", "legacy")) == 3.0);
+    CHECK(series_val(out, backend_series("unknown", "legacy")) == 1.0);
+    CHECK(out.find("pwn-") == std::string::npos);
+    CHECK(out.find("freebsd") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian backend meta gauges publish at zero, family stays absent",
+          "[guardian][backend][rollup][real]") {
+    // Quiet fleet: nobody reports. The two unlabelled meta gauges are published every sweep
+    // (including 0, so their absence means the sweep did not run); the labelled family has no
+    // sample at all.
+    const auto out = backend_sweep({{"a", "linux", std::nullopt}});
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 0.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_tag_rejected ") == 0.0);
+    CHECK(out.find("\nyuzu_fleet_guardian_backend{") == std::string::npos);
+}

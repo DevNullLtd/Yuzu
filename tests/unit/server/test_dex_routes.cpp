@@ -230,6 +230,11 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][rout
     // behind it (the Alerts fragment itself shows the role note).
     CHECK(html.find("hx-get=\"/fragments/dex/alerts?window=7d\"") != std::string::npos);
     CHECK(html.find(">Alerts</a>") != std::string::npos);
+    // The Scoring tab is static chrome too, placed before Alerts.
+    const auto scoring = html.find("hx-get=\"/fragments/dex/scoring?window=7d\"");
+    CHECK(scoring != std::string::npos);
+    CHECK(html.find(">Scoring</a>") != std::string::npos);
+    CHECK(scoring < html.find("hx-get=\"/fragments/dex/alerts?window=7d\""));
     CHECK(html.find("actively monitored") != std::string::npos);
     CHECK(html.find("of 114 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)

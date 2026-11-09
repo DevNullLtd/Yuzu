@@ -184,6 +184,16 @@ inline bool requires_approval(std::string_view mcp_tier,
         // above, which admits only Execution:Execute among execute operations.
         if (securable_type == "Workflow" && operation == "Execute") return true;
 
+        // RevocationSource:Write (ADR-0070 R1, slice 2b-1a): register, replace, remove and reset
+        // the anti-rollback marks of a registered CRL source. Registering a source adds an
+        // egress target the server will fetch from, and a reset reopens the CRL replay window,
+        // so a supervised MCP token held by an administrator must not do either with no
+        // ticket. This is a DELIBERATE addition to the supervised list (removal, reset and
+        // registration are all a `Write`, never a `Delete`, so the `Delete` rule above does not
+        // cover them). (REST refuses an MCP-tier token outright, so on the REST routes
+        // this entry is defence in depth, not the gate.)
+        if (securable_type == "RevocationSource" && operation == "Write") return true;
+
         // ApiToken:Write (create_api_token / POST /api/v1/tokens) gates here too
         // (gov security-guardian finding, #2146 B4 fix round): minting a NEW
         // credential is a genuinely different risk shape from ApiToken:Rotate

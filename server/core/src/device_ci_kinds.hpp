@@ -88,7 +88,7 @@ struct DeviceCiSectionDef {
 // read as `server:content_digest_mismatch` (a false integrity alarm) until each device's next full
 // sync, up to the weekly floor, because a hash-only daily report does NOT rewrite rows. Do one of:
 // (a) bump the digest layout version (`kSectionDigestPrefix`, e.g. to `v2:`), so values stored under
-// the old version are a well-formed digest of another layout and read as unverified; or (b) ship a
+// the old version are a well-formed digest of another layout and read as unchecked; or (b) ship a
 // migration that sets `row_count` and `content_digest` to NULL for that kind. Adding a new
 // table-backed kind gets a digest automatically, BUT the registry is not the schema (#7164): migration
 // v2 is a frozen literal in device_inventory_store.cpp, so a new table-backed kind or a changed column

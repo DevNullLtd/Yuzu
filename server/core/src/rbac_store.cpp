@@ -566,7 +566,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 38> types = {
+    const std::array<std::string_view, 39> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -677,7 +677,15 @@ void RbacStore::seed_defaults() {
         // PowerManagement/PluginConfig precedent — unused ops are harmless
         // and keep the loop uniform); ITServiceOwner gets a TARGETED
         // Decommission:Delete grant below (see that grant's comment).
-        "Decommission"
+        "Decommission",
+        // ADR-0070 R1 (slice 2b-1a): registered CRL sources - operator-registered egress targets
+        // (the URLs the server may fetch) plus the CA certificates a CRL is checked against.
+        // Only `Read` and `Write` are consumed (removal is a Write, not a Delete); the
+        // Administrator loop below grants every operation, and NO other role is seeded. The pair
+        // is ALSO gated on the durable-administrator predicate (revocation_source_admin_gate.hpp),
+        // so a custom role granted it under RBAC on is still refused, and `Read` is in the
+        // topology floor so an RBAC-off install stays admin-only.
+        "RevocationSource"
     };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "

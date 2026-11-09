@@ -2439,8 +2439,9 @@ TEST_CASE("a v2 database upgrades to v3 in place and existing sections have no c
     CHECK(served_section(store, "agent-up", "dimm")["reason"] == "server:row_count_mismatch");
 }
 
-// Kills: migration 3 without IF NOT EXISTS. The runner is gated on the recorded version number
-// only, so a database that already has the columns but is rewound to version 2 (the fix for a
+// Kills: migration 3 without IF NOT EXISTS. The runner's apply decision is the recorded version
+// number (its hash check, #7158, only refuses edited text), so a database that already has the
+// columns but is rewound to version 2 (the fix for a
 // database that ran an earlier build of v3) must run migration 3 again without failing.
 TEST_CASE("migration 3 is re-runnable over a database that already has its columns",
           "[pg][device_ci][migration][v3][digest]") {
@@ -2779,5 +2780,119 @@ TEST_CASE("every registered kind persists its row count and a v1 digest and stat
         CHECK(dg.substr(0, 3) == "v1:");
         CHECK(dg.find_first_not_of("0123456789abcdef", 3) == std::string::npos);
         CHECK(served_section(store, "agent-all", d.section)["complete"] == true);
+    }
+}
+
+// ── #7163: the writer's digest-provider failure, through the DigestFn test seam ──────────────────
+
+namespace {
+// As sha256_hex behaves when EVP_Digest fails: no digest, never a digest of zeros.
+std::optional<std::string> failing_digest_provider(std::string_view) {
+    return std::nullopt;
+}
+} // namespace
+
+// Kills: a writer that stores a section without its digest when the provider fails (a section the
+// reader could then never verify), or one that leaves a half-replaced set. The whole full replace
+// aborts: kError, the previous rows, record hash and section statuses survive intact, and the
+// cause is named in the log.
+TEST_CASE("a failing digest provider aborts the full replace and leaves the previous set intact",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto first = blob_with_rows(3, 2);
+    REQUIRE(put_record(store, "agent-dp", first) == InventoryIngestOutcome::kStored);
+    const auto digests_before = persisted_digests(pool, "agent-dp");
+    const auto counts_before = persisted_row_counts(pool, "agent-dp");
+    auto before = store.get_device_ci_with_sections("agent-dp");
+    REQUIRE(before.has_value());
+    REQUIRE(before->record.has_value());
+
+    const auto second = blob_with_rows(1, 4); // different content AND counts
+    InventoryIngestOutcome outcome{};
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        store.set_digest_provider_for_test(&failing_digest_provider);
+        outcome = put_record(store, "agent-dp", second);
+        store.set_digest_provider_for_test(nullptr);
+        cap.stop();
+        logs = cap.text();
+    }
+    CHECK(outcome == InventoryIngestOutcome::kError);
+    CHECK(logs.find("digest_provider_failed") != std::string::npos);
+    CHECK(logs.find("stage=digest") != std::string::npos);
+
+    // Nothing partially stored: statuses, counts and digests are the first generation's.
+    CHECK(persisted_digests(pool, "agent-dp") == digests_before);
+    CHECK(persisted_row_counts(pool, "agent-dp") == counts_before);
+    auto after = store.get_device_ci_with_sections("agent-dp");
+    REQUIRE(after.has_value());
+    REQUIRE_FALSE(after->sections_failed);
+    REQUIRE(after->record.has_value());
+    CHECK(DeviceInventoryStore::canonical_hash(*after->record) ==
+          DeviceInventoryStore::canonical_hash(*before->record));
+    CHECK(after->record->sections.size() == before->record->sections.size());
+    CHECK(served_section(store, "agent-dp", "cpu")["complete"] == true);
+    CHECK(served_section(store, "agent-dp", "cpu")["rows"].size() == 3);
+    CHECK(served_section(store, "agent-dp", "dimm")["rows"].size() == 2);
+
+    // The provider is healthy again: the same replace now stores (the abort left no lock or state).
+    REQUIRE(put_record(store, "agent-dp", second) == InventoryIngestOutcome::kStored);
+    CHECK(served_section(store, "agent-dp", "dimm")["rows"].size() == 4);
+}
+
+// ── #7159: the sections-read degrade reason is its own ──────────────────────────────────────────
+
+// Kills: both failures counting under one reason (an operator cannot tell "the record read failed"
+// from "the record read but its sections did not", which are answered differently), and a
+// failure that moves no counter at all. The standalone sections reader takes the sections reason.
+TEST_CASE("the read-degrade counter tells a failed record read from a failed sections read",
+          "[pg][device_ci][v2][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto degrades = [&](const char* reason) {
+        return metrics
+            .counter("yuzu_inventory_read_degrade_total",
+                     {{"reason", reason}, {"source", "device_ci"}})
+            .value();
+    };
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    REQUIRE(store.apply_device_ci("agent-dg2", DeviceInventoryStore::canonical_hash(a),
+                                  std::optional<DeviceCiRecord>{a},
+                                  1) == InventoryIngestOutcome::kStored);
+    CHECK(degrades("query_error") == 0.0);
+    CHECK(degrades("sections_query_error") == 0.0);
+
+    SECTION("a failed sections statement counts sections_query_error, keeps the record") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+        auto got = store.get_device_ci_with_sections("agent-dg2");
+        REQUIRE(got.has_value());
+        CHECK(got->sections_failed);
+        CHECK(degrades("sections_query_error") == 1.0);
+        CHECK(degrades("query_error") == 0.0);
+        // The single-purpose sections reader fails on the same fault and counts the same reason.
+        CHECK_FALSE(store.get_device_ci_sections("agent-dg2").has_value());
+        CHECK(degrades("sections_query_error") == 2.0);
+        CHECK(degrades("query_error") == 0.0);
+    }
+    SECTION("a failed record statement counts query_error and no sections reason") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
+        auto got = store.get_device_ci_with_sections("agent-dg2");
+        REQUIRE_FALSE(got.has_value());
+        CHECK(degrades("query_error") == 1.0);
+        CHECK(degrades("sections_query_error") == 0.0);
     }
 }

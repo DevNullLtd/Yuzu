@@ -3,8 +3,8 @@
 Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
 encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
-high-risk REST + Settings surfaces (PR 2; since extended to 40 mutating
-routes, 37 enforced at one chokepoint and three by their own JIT-elevation gate, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
+high-risk REST + Settings surfaces (PR 2; since extended to 44 mutating
+routes, 41 enforced at one chokepoint and three by their own JIT-elevation gate, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
 bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
 encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres
@@ -373,7 +373,7 @@ destructive as updating one), keeping the count at eleven.
 The eleven-site count above describes PR 2. The gated set has since grown
 (engine-principal, RBAC assignment and enforcement toggle, password reset,
 unlock, Guardian guard update / delete, MFA recovery-code regeneration and
-MFA disable, and others) to 40 mutating routes, 37 enforced by one
+MFA disable, and others) to 44 mutating routes, 41 enforced by one
 chokepoint and three, the JIT-elevation routes, by their own stricter
 handler gate. Other mutating routes (73 REST rows are still
 `kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
@@ -781,7 +781,7 @@ regress:
    reads the MFA store). The order is: after the pre-routing
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
-   SAML denial and the store read (so a window of 0 or less lets SAML through the 35 `kRequired` rows). A `kFactorCredential` row takes a different order: after the engine denial its window becomes the approver window, so the hatch is unreachable for it, and any non-local session is refused `403` before the store read;
+   SAML denial and the store read (so a window of 0 or less lets SAML through the 39 `kRequired` rows). A `kFactorCredential` row takes a different order: after the engine denial its window becomes the approver window, so the hatch is unreachable for it, and any non-local session is refused `403` before the store read;
    (g) a gated request authorised by a principal other than the one the check passed:
    the binding removed while handlers still resolve more than once. One principal per request: once the central check passes a gated request,
    every `AuthRoutes::resolve_session` call for that request yields the same principal or

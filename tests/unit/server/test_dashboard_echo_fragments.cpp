@@ -892,6 +892,23 @@ TEST_CASE("echo-execute REFUSES a supplied-but-empty scope even under a non-form
     CHECK(res->body.find("No target selected") != std::string::npos);
 }
 
+// The Echo page shell is a raw-string constant in its own TU, at global scope.
+extern const char* const kEchoPageHtml;
+
+TEST_CASE("echo page shell: capture-sources frame and hourly process record text",
+          "[server][echo][shell]") {
+    const std::string page = kEchoPageHtml;
+    CHECK(page.find("id=\"frame-capture-sources\"") != std::string::npos);
+    CHECK(page.find("id=\"capture-sources\"") != std::string::npos);
+    CHECK(page.find("Built from the hourly process record") != std::string::npos);
+    CHECK(page.find("Reconstructed from") == std::string::npos);
+    CHECK(page.find("#capCards .card.pending") != std::string::npos);
+    CHECK(page.find("cb.closest('.card')") != std::string::npos);
+    CHECK(page.find("capTable") == std::string::npos);
+    CHECK(page.find("echoTreeState") == std::string::npos);
+    CHECK(page.find("badge-pii") == std::string::npos);
+}
+
 // ── (#3619) Audit-failure posture (ADR-0033 §9: no audit row, no mutation) ──
 //
 // Re-enable and purge change a device's capture state (purge is Destructive), so each writes an

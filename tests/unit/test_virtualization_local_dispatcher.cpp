@@ -10,7 +10,7 @@
  * The live-host cases assert SHAPE (status row first, fixed row order, closed vocabularies),
  * never host-specific values: whether a shared CI runner is a VM, which hypervisor, or whether
  * it sits in a container is unknown. Every classification case lives in
- * test_virtualization_parsers.cpp; the [seam] cases here only pin execute_host and the
+ * test_virtualization_parsers.cpp; the [seam] cases here only pin execute_action and the
  * report_host status pairing, without loading the plugin.
  */
 #include <catch2/catch_test_macros.hpp>
@@ -21,7 +21,7 @@
 
 #include "local_dispatcher.hpp"
 
-#include "virtualization_legs.hpp" // execute_host / report_host
+#include "virtualization_legs.hpp" // execute_action / report_host
 
 #include <algorithm>
 #include <cstdlib>
@@ -120,7 +120,7 @@ std::optional<LoadedPlugin> load_plugin() {
     return LoadedPlugin{std::move(*loaded), d};
 }
 
-/// Seam probes: execute_host over legs that throw / report a constrained read.
+/// Seam probes: execute_action over legs that throw / report a constrained read.
 int throwing_leg(yuzu::CommandContext&) { throw std::runtime_error("probe: the leg threw"); }
 
 /// Throws AFTER report_host already wrote its rows: the catch arm appends a second status row.
@@ -146,11 +146,13 @@ int supported_leg(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-template <yuzu::virtualization::LegFn Leg>
+template <yuzu::virtualization::LegFn Leg, yuzu::virtualization::LegFn WslLeg = Leg>
 int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
                  std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
-    return yuzu::virtualization::execute_host(ctx, action, Leg, "linux:leg:exception");
+    return yuzu::virtualization::execute_action(ctx, action,
+                                                yuzu::virtualization::Legs{Leg, WslLeg},
+                                                "linux:leg:exception");
 }
 
 std::size_t field_count(const std::string& row) {
@@ -333,4 +335,90 @@ TEST_CASE("virtualization execute seam: a leg that throws after reporting keeps 
     CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE); // the recovery's status, not the leg's OK
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     CHECK(r.result_provenance == "linux:leg:exception");
+}
+
+// ---------------------------------------------------------------------------------------------
+// wsl
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("virtualization plugin: wsl answers per OS (one unsupported row off Windows)",
+          "[virtualization][dispatcher][wsl]") {
+#if defined(_WIN32)
+    // The Windows leg walks the machine's real ProfileList and may mount every logged-off
+    // NTUSER.DAT (disk I/O, and it changes those hives' sequence numbers, #4977): not something a
+    // unit suite does on a shared runner. Its content-bearing evidence is the plugin-capture
+    // `--action host --action wsl` run on a Windows host, recorded in the PR body.
+    SKIP("the Windows wsl leg reads the live profile list and hives; see the PR's Windows capture");
+#else
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "wsl");
+    CHECK(result.rc == 0); // a degraded read is never a failed command
+    CHECK_FALSE(result.truncated);
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1);
+#if defined(__APPLE__)
+    CHECK(rows[0] == "status|wsl|unsupported|macos:virtualization:wsl:unsupported");
+#else
+    CHECK(rows[0] == "status|wsl|unsupported|linux:virtualization:wsl:unsupported");
+#endif
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+#endif
+}
+
+TEST_CASE("virtualization descriptor advertises wsl and version 1.1.0",
+          "[virtualization][dispatcher][wsl]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    const YuzuPluginDescriptor& d = *plugin->descriptor;
+    CHECK(std::string{d.version} == "1.1.0");
+
+    REQUIRE(d.actions != nullptr);
+    std::vector<std::string> actions;
+    for (const char* const* a = d.actions; *a != nullptr; ++a)
+        actions.emplace_back(*a);
+    CHECK(actions == std::vector<std::string>{"host", "wsl"});
+
+    REQUIRE(d.action_descriptors != nullptr);
+    REQUIRE(d.action_descriptor_count == 2);
+    const YuzuActionDescriptor* wsl = nullptr;
+    for (std::size_t i = 0; i < d.action_descriptor_count; ++i)
+        if (std::string{d.action_descriptors[i].action} == "wsl")
+            wsl = &d.action_descriptors[i];
+    REQUIRE(wsl != nullptr);
+    // Windows-only: constrained at rung 1 there, unsupported at rung 0 elsewhere.
+    CHECK(wsl->linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+    CHECK(wsl->linux_leg.rung == 0);
+    CHECK(wsl->macos_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+    CHECK(wsl->macos_leg.rung == 0);
+    CHECK(wsl->windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(wsl->windows_leg.rung == 1);
+}
+
+TEST_CASE("virtualization execute seam: a throwing wsl leg is contained under its own action name",
+          "[virtualization][dispatcher][seam][wsl]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &seam_execute<&supported_leg, &throwing_leg>;
+
+    const auto w = dispatcher.run(&d, "wsl");
+    CHECK(w.rc == 0);
+    const auto wrows = captured_rows(w.captured);
+    REQUIRE(wrows.size() == 1);
+    CHECK(wrows[0] == "status|wsl|unsupported|linux:leg:exception");
+    CHECK(w.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+
+    // The host leg of the same table is untouched and keeps its own status name.
+    const auto h = dispatcher.run(&d, "host");
+    const auto hrows = captured_rows(h.captured);
+    REQUIRE(hrows.size() == 1);
+    CHECK(hrows[0] == "status|host|supported|-");
 }

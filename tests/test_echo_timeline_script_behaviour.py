@@ -857,9 +857,22 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     const a = new El('a'); a.attrs['data-ref'] = 'p2'; a.attrs['data-ts'] = '152'; c.selected.appendChild(a);
     const e = fire(a, 'click', {});
     eq([e.defaultPrevented, c.play.attrs['aria-pressed'], c.intervals.size], [true, 'false', 0], 'a linked-item click stops playback');
-    eq(urls(c).slice(1), [MOM + '152', SEL + 'p2&at=152', SEL + 'p2&at=152'],
-       'the stop time is flushed once with the new selection, then the explicit request carries the same URL');
-    eq(c.fetches.slice(2).map((f) => f.signal.aborted), [true, false], 'and the explicit selected request supersedes the flushed one');
+    eq(urls(c).slice(1), [MOM + '152', SEL + 'p2&at=152'],
+       'a selection click while playing issues exactly one selected request and still refreshes the moment panel');
+    eq(c.fetches.slice(1).map((f) => f.signal.aborted), [false, false], 'and neither request is superseded');
+  }
+  {
+    // with a different item already selected, the old selection is not requested again either
+    const c = build(); const t = show(c);
+    tap(c, t.buttons[0], {});                       // p1 at 130
+    await settle(c);
+    fire(c.speed, 'click', {}); fire(c.play, 'click', {}); c.tick();
+    const n = c.fetches.length;
+    const a = new El('a'); a.attrs['data-ref'] = 'p2'; a.attrs['data-ts'] = '152'; c.selected.appendChild(a);
+    fire(a, 'click', {});
+    const got = urls(c).slice(n);
+    eq([got.filter((u) => u.startsWith(MOM)).length, got.filter((u) => u.startsWith(SEL)).length, got.some((u) => u.includes('ref=p1'))],
+       [1, 1, false], 'one moment flush and one selected request, for the new item only');
   }
 
   // ---- playback: failure, hidden, unbind
