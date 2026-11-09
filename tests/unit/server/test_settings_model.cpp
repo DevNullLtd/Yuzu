@@ -518,7 +518,13 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     CHECK_FALSE(has(w, "<th>Exact</th>"));
     const auto cap = w.find("<caption");
     REQUIRE(cap != std::string::npos);
-    CHECK_FALSE(has(w.substr(cap), "class=\"pill"));
+    // The only pill the table draws is the budget-dependent one on a budget-dependent hourly
+    // cell; the retired exact/capped pills are gone.
+    auto table = w.substr(cap);
+    const std::string budget_pill = "<span class=\"pill info\">budget-dependent</span>";
+    for (auto at = table.find(budget_pill); at != std::string::npos; at = table.find(budget_pill))
+        table.erase(at, budget_pill.size());
+    CHECK_FALSE(has(table, "class=\"pill"));
 }
 
 TEST_CASE("render_retention_table with echo:null renders only the three windows",
