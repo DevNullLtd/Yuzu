@@ -54,9 +54,14 @@ namespace {
 // fragment/legacy routes (a v1-keyed row is legal only with an `exception:` status, which would
 // be false for a tool that HAS a twin), so no legal row exists yet. #6700 decides the row shape;
 // the change that lands it deletes these three names and lowers the cap back to 0.
+// A fourth name, `list_hardware_ci_records`, was added by the bulk device-CI read
+// (GET /api/v1/hardware/ci): same situation (a REST twin only under /api/v1, no fragment or legacy
+// route to key a row on), and the user approved adding it while #6700 is open. The change that
+// lands #6700's row shape deletes it with the other three.
 const std::set<std::string> kLedgerBackfill{"export_crypto_cbom", "list_crypto_widgets",
-                                            "set_crypto_dashboard_layout"};
-constexpr std::size_t kLedgerBackfillCap = 3;
+                                            "set_crypto_dashboard_layout",
+                                            "list_hardware_ci_records"};
+constexpr std::size_t kLedgerBackfillCap = 4;
 
 // Registry tools with no kExpectedTwins row yet. discover_routes is ledgered (settings.json) but
 // its gate is not pinned in the twin table. Shrink-only: delete the entry when the row lands.
