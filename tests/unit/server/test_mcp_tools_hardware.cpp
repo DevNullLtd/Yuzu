@@ -1526,9 +1526,10 @@ TEST_CASE("mcp hardware twins: a served integrity fault is counted once per read
     CHECK(integrity(t, "content_digest_mismatch") == 2.0);
 }
 
-// Kills: moving the fetch (and so the count) above the scope check - a caller outside its scope
-// would then move a fleet-wide counter and could probe which hidden ids carry damage. The fake
-// ci_detail_fn is never reached for an out-of-scope id on either transport.
+// Kills: a tool or route that reaches its ci_detail_fn before the scope check - the fake records
+// every call, so a fetch for an out-of-scope id shows in `ci_reads` (and, were it counted, would
+// move a fleet-wide counter and let a caller probe which hidden ids carry damage). Each transport
+// is checked on its own, and the in-scope read afterwards proves the recorder is not vacuous.
 TEST_CASE("mcp hardware twins: an out-of-scope read does not fetch the record or move the "
           "integrity counter",
           "[mcp][hardware][sections][metrics][security]") {
@@ -1539,17 +1540,26 @@ TEST_CASE("mcp hardware twins: an out-of-scope read does not fetch the record or
     HardwareCiDetail d = full_detail("hidden");
     d.ci_sections = std::vector<DeviceCiSection>{cpu_section_serving(r2, {r2[0]})}; // faulted
     t.ci_by_id["hidden"] = d;
-    t.ci_by_id["a"] = full_detail("a");
+    HardwareCiDetail in_scope = full_detail("a");
+    in_scope.ci_sections =
+        std::vector<DeviceCiSection>{cpu_section_serving(r2, {r2[0]})}; // faulted
+    t.ci_by_id["a"] = in_scope;
     t.scope = std::unordered_set<std::string>{"a"};
 
     const json mcp = t.call("get_hardware_ci", {{"agent_id", "hidden"}});
-    CHECK(mcp.contains("error"));
+    REQUIRE(mcp.contains("error"));
+    CHECK(mcp["error"]["code"] == mcp::kInvalidParams);
+    CHECK(mcp["error"]["message"] == "not found");
+    CHECK(t.ci_reads.empty()); // the MCP twin never fetched
+    CHECK(integrity(t, "row_count_mismatch") == 0.0);
     auto res = t.sink.Get("/api/v1/hardware/hidden");
     REQUIRE(res);
     CHECK(res->status == 404);
-    CHECK(t.ci_reads.empty()); // never fetched
+    CHECK(t.ci_reads.empty()); // nor did the REST route
     CHECK(integrity(t, "row_count_mismatch") == 0.0);
-    // The in-scope device still reads and counts nothing for an intact record.
+    // The in-scope (faulted) device fetches exactly once and counts once.
     (void)t.call("get_hardware_ci", {{"agent_id", "a"}});
-    CHECK(integrity(t, "row_count_mismatch") == 0.0);
+    REQUIRE(t.ci_reads.size() == 1);
+    CHECK(t.ci_reads[0] == CiRead::WithSections);
+    CHECK(integrity(t, "row_count_mismatch") == 1.0);
 }

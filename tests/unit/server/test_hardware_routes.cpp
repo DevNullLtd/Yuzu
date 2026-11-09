@@ -2480,7 +2480,12 @@ TEST_CASE("software lens header: count and last synced, never-synced told apart 
 
 // #7159: only the sections-reading record route moves the integrity counter. The dashboard
 // fragment, the sync-now poll and the actions lens ask for the record only, so they never reach the
-// count even for a record whose sections are faulted. Kills: counting on a RecordOnly read.
+// count even for a record whose sections are faulted. What this proves: the routes pass the right
+// `CiRead` (WithSections only for the REST record, RecordOnly for the three dashboard surfaces).
+// It does NOT prove the real closure counts only on WithSections - the fake ci_detail_fn below
+// mirrors that rule; the real one is pinned lexically (test_hw_ci_detail_wiring_lexical.cpp).
+// Kills: a dashboard route asking for CiRead::WithSections, or the REST record asking for
+// RecordOnly.
 TEST_CASE(
     "route: only the REST record moves the section integrity counter; the dashboard never does",
     "[hardware][route][rest][sections][metrics]") {
@@ -2514,8 +2519,9 @@ TEST_CASE(
     CHECK(count() == 1.0);
 }
 
-// Kills: moving the fetch above the scope check: a caller outside its scope would move a
-// fleet-wide counter (and could probe which hidden ids carry damage).
+// Kills: a route that reaches its ci_detail_fn before the scope check: the fake records every
+// call, so a fetch for an out-of-scope id shows in `ci_reads` (and would move a fleet-wide
+// counter).
 TEST_CASE(
     "route: an out-of-scope REST read neither fetches the record nor moves the integrity counter",
     "[hardware][route][rest][sections][metrics][security]") {

@@ -1948,6 +1948,119 @@ TEST_CASE(
     }
 }
 
+// Kills: a series that exists only after its first fault (a dashboard cannot tell "no fault" from
+// "series absent"), or a hand-kept label list drifting from section_fault_label.
+TEST_CASE("register_section_integrity_metrics: pre-seeds one series per counted fault at zero",
+          "[hardware][model][sections][metrics]") {
+    yuzu::MetricsRegistry m;
+    register_section_integrity_metrics(m);
+    const std::string text = m.serialize();
+    std::size_t series = 0;
+    for (const auto fault :
+         {SectionFault::RowCount, SectionFault::Content, SectionFault::Unverifiable}) {
+        const std::string label(section_fault_label(fault));
+        INFO(label);
+        REQUIRE_FALSE(label.empty());
+        CHECK(text.find("yuzu_hardware_section_integrity_total{reason=\"" + label + "\"} 0\n") !=
+              std::string::npos);
+        CHECK(integrity_count(m, label.c_str()) == 0.0);
+    }
+    for (std::size_t at = 0;
+         (at = text.find("yuzu_hardware_section_integrity_total{", at)) != std::string::npos; ++at)
+        ++series;
+    CHECK(series == 3); // exactly one per non-None SectionFault
+    CHECK(text.find("# TYPE yuzu_hardware_section_integrity_total counter") != std::string::npos);
+    CHECK(text.find("# HELP yuzu_hardware_section_integrity_total ") != std::string::npos);
+}
+
+// Kills: an unverifiable provider masking a count mismatch (the count is the more specific report
+// and is checked first), in either order of evaluation.
+TEST_CASE("verify_section_content: a count mismatch with a failing provider reports the count",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.rows.pop_back();
+    const auto v = verify_section_content(s, &failing_digest);
+    CHECK(v.fault == SectionFault::RowCount);
+    CHECK(v.reason == "server:row_count_mismatch");
+    CHECK(served_section_verdict(s, &failing_digest).fault == SectionFault::RowCount);
+}
+
+// Each fault token is appended after an agent-reported reason with a ';' and the level is
+// downgraded to constrained, whichever of the three causes it is.
+TEST_CASE("verify_section_content: every fault token is ';'-joined after an agent reason",
+          "[hardware][model][sections][digest]") {
+    auto lost = digested_section("cpu", "ok", "agent:note", cpu_rows(3));
+    lost.rows.pop_back();
+    CHECK(verify_section_content(lost).reason == "agent:note;server:row_count_mismatch");
+    auto edited = digested_section("cpu", "ok", "agent:note", cpu_rows(2));
+    edited.rows[0][1] = "Edited";
+    CHECK(verify_section_content(edited).reason == "agent:note;server:content_digest_mismatch");
+    const auto intact = digested_section("cpu", "ok", "agent:note", cpu_rows(2));
+    const auto u = verify_section_content(intact, &failing_digest);
+    CHECK(u.level == "constrained");
+    CHECK(u.reason == "agent:note;server:content_digest_unverifiable");
+    // An agent-constrained section with an intact digest keeps its reason and is counted as
+    // nothing.
+    const auto agent_only = digested_section("cpu", "constrained", "agent:note", cpu_rows(2));
+    CHECK(served_section_verdict(agent_only).fault == SectionFault::None);
+    CHECK(served_section_verdict(agent_only).reason == "agent:note");
+}
+
+// Kills: the counter counting a fault the body does not carry. A status-only kind (or an
+// unregistered one) is served as stored and never compared, even if a row_count is stored for it;
+// `verify_section_content` alone WOULD flag it, which is why both the body and the counter go
+// through `served_section_verdict`. An unavailable / permission_denied section is likewise never
+// compared.
+TEST_CASE(
+    "served_section_verdict: a non-table or unregistered kind is served as stored, never counted",
+    "[hardware][model][sections][metrics]") {
+    for (const char* kind : {"chassis", "baseboard", "machine_id", "no_such_kind"}) {
+        INFO(kind);
+        auto s = make_section(kind, "ok", "r", {});
+        s.row_count = 3; // a stored count the (empty) rows would disagree with
+        s.content_digest = "v1:" + std::string(64, 'a');
+        const auto v = served_section_verdict(s);
+        CHECK(v.level == "ok");
+        CHECK(v.reason == "r");
+        CHECK(v.fault == SectionFault::None);
+        yuzu::MetricsRegistry m;
+        record_section_integrity({s}, "agent-1", &m);
+        CHECK(integrity_count(m, "row_count_mismatch") == 0.0);
+        CHECK(integrity_count(m, "content_digest_mismatch") == 0.0);
+        CHECK(integrity_count(m, "digest_unverifiable") == 0.0);
+    }
+    // The guard matters: the bare verifier would report the count for a status-only kind.
+    auto chassis = make_section("chassis", "ok", "", {});
+    chassis.row_count = 3;
+    CHECK(verify_section_content(chassis).fault == SectionFault::RowCount);
+    // No rows by contract for these levels: nothing to compare, nothing counted.
+    for (const char* level : {"unavailable", "permission_denied"}) {
+        INFO(level);
+        auto s = digested_section("cpu", level, "x", cpu_rows(2));
+        s.rows.clear();
+        CHECK(served_section_verdict(s).fault == SectionFault::None);
+        CHECK(served_section_verdict(s, &failing_digest).fault == SectionFault::None);
+    }
+}
+
+// SectionFault::None has no sampler: passing it anywhere cannot pollute another reason's WARN
+// state.
+TEST_CASE("served_section_verdict: an intact table-backed section counts nothing and logs nothing",
+          "[hardware][model][sections][metrics]") {
+    reset_section_integrity_log_state_for_test();
+    yuzu::MetricsRegistry m;
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        record_section_integrity({digested_section("cpu", "ok", "", cpu_rows(2))}, "agent-quiet",
+                                 &m);
+        cap.stop();
+        logs = cap.text();
+    }
+    CHECK(logs.find("section integrity fault") == std::string::npos);
+    CHECK(integrity_count(m, "digest_unverifiable") == 0.0);
+}
+
 // Kills: verifying (or downgrading) a section that has no stored digest - the pre-feature path.
 TEST_CASE("verify_section_content: a NULL digest leaves the section as the count rule left it",
           "[hardware][model][sections][digest]") {

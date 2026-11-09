@@ -7,6 +7,7 @@
  * reaches a store, or proves that a request through the running server returns the right record;
  * the route and MCP tests use a fake `ci_detail_fn`, and the real mapping
  * (`apply_ci_with_sections_read`, `record_section_integrity`) is covered by its own unit tests.
+ * It also pins the guard and arguments of the count call and the boot registration of the metric.
  * What this pins is the wiring those tests cannot see, by reading the stripped server.cpp text at
  * test run time (YUZU_SERVER_SRC_DIR):
  *   1. the closure is defined once and is the very one assigned to BOTH the REST routes' deps
@@ -112,9 +113,22 @@ TEST_CASE(
                                "device_ci_with_sections(agent_id));");
     REQUIRE(with_read != npos);
     CHECK(with_read > with_arm);
-    const auto counted = pos("record_section_integrity(**detail.ci_sections,agent_id,&metrics_);");
+    // The count: guarded by the sections actually being present, passing the registry (not
+    // nullptr), and directly after the sections read - not in a dead branch.
+    const std::string guarded_call =
+        "if(detail.ci_sections&&*detail.ci_sections)"
+        "record_section_integrity(**detail.ci_sections,agent_id,&metrics_);";
+    const auto counted = pos(guarded_call);
     REQUIRE(counted != npos);
     CHECK(counted > with_read);
+    CHECK(counted == with_read + std::string_view("apply_ci_with_sections_read(detail,device_"
+                                                  "inventory_store_->get_device_ci_with_sections("
+                                                  "agent_id));")
+                                     .size()); // adjacent: nothing wedged between read and count
+    CHECK(count_occurrences(body, "&metrics_") == 1); // the registry is passed, once
+    CHECK(count_occurrences(body, "nullptr") == 0);
+    for (const std::string_view dead : {"if(false)", "if(0)", "if(!true)", "#if0", "#ifdef"})
+        CHECK(body.find(dead) == npos);
 
     // Every other read mode (the dashboard and the actions lens: RecordOnly) takes the record-only
     // read, after the WithSections arm closes; the sections method is named exactly once.
@@ -124,4 +138,15 @@ TEST_CASE(
     CHECK(count_occurrences(body, "get_device_ci_with_sections(") == 1);
     CHECK(count_occurrences(body, "get_device_ci(") == 1);
     CHECK(count_occurrences(body, "record_section_integrity(") == 1);
+}
+
+TEST_CASE("hw_ci_detail_fn wiring (LEXICAL pin, not behaviour): the integrity metric is registered "
+          "at boot",
+          "[hardware][wiring][lexical]") {
+    // The describe + the three pre-seeded series live in register_section_integrity_metrics; if
+    // ServerImpl stops calling it the series appear only after a first fault.
+    const std::string flat = squeeze(comment_free_source("server.cpp"));
+    CHECK(count_occurrences(flat, "register_section_integrity_metrics(metrics_);") == 1);
+    CHECK(count_occurrences(flat, "yuzu_hardware_section_integrity_total") ==
+          0); // one home for the name
 }
