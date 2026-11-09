@@ -1706,7 +1706,9 @@ flip, with a red-first test each:
     Windows runs. The new cases have run on Linux debug only: ASan/UBSan, TSan, Windows (MSVC) and
     macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
     after it re-inspects its claim (the race in which the claim resolved before attach_core
-    returned) carries a rebuild reason and has no test. The line has not been observed on a
+    returned) carries a rebuild reason, but no test forces that race: the io-class case in
+    `test_guardian_spark_reapply_skip_runtime.cpp` asserts the reason on whichever return is taken
+    and does not assert which one. The line has not been observed on a
     flipped fleet; (c) MEASURED, release build (base `45f727420` against branch tip
     `3f8dd8d0d`, uncommitted throwaway harness; counts are exact, wall times are not): Linux
     (shared box; the cells that waited for a 1-minute load of 8 or less recorded it, the box

@@ -48,7 +48,9 @@
  * grouped by reason); an id that no longer fits in the remaining bytes is left off while a later,
  * shorter one can still be listed. first_attach and content_changed are COUNT-ONLY: on
  * a first push or a rename every rule lands there and an id list would only repeat the push.
- * The line deliberately matches none of the fullsync_blackout_diag.py driver patterns.
+ * The line deliberately matches none of the fullsync_blackout_diag.py log-line patterns that
+ * tests/test_spark_evidence_format_lockstep.py lists in DRIVER_REGEX_NAMES (a new driver line
+ * pattern is added there in the same change).
  *
  * Contract a reader of this file must keep:
  *   (a) note() and format() run under GuardianEngine::mtx_ (apply_rules, or start_local's boot
@@ -58,10 +60,11 @@
  *       not the enum order; the two differ in the health block (the code tests the recorded bit,
  *       then an absent probe, then subscription_replaced, then Dead, then any other non-Healthy
  *       state).
- *   (c) first_attach means no committed arm and no scoped-detach record. That INCLUDES a rule
- *       on_subscription_lost detached between pushes (a Lost event, or the convergence
- *       scheduler's dead-key poll check), which looks the same to the attach path as a rule
- *       never armed.
+ *   (c) first_attach means no committed rule, or no entry for the key the rule now targets (a
+ *       retarget: the rule is committed on its old key), and no scoped-detach record. That
+ *       INCLUDES a rule on_subscription_lost detached between pushes (a Lost event, or the
+ *       convergence scheduler's dead-key poll check), which looks the same to the attach path
+ *       as a rule never armed.
  *   (d) A genuinely new rule queued behind a forced disarm of the same key reports key_busy with
  *       its id, not first_attach.
  *   (e) The count includes Pending and Accepted outcomes that may still fail. There is no

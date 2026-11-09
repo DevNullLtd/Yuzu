@@ -1422,9 +1422,12 @@ TEST_CASE("#5719 reason R1: a healthy identical attach is skipped and carries no
 
 // ---------------------------------------------------------------------------------------
 // R2. FirstAttach, on each success return that must carry a reason.
-// Mutation: leave `.rebuild_reason` off the Pending return (the io-class SECTION), off the
-// inline Armed return (the Startup SECTION) or off the join return (the shared-key SECTION)
-// in attach_core, or in attach_rule(NonWaiting)'s four ArmOutcome constructions.
+// Mutation (caught here): leave `.rebuild_reason` off the Pending return (the parked io-class
+// SECTION), off the inline Armed return (the Startup SECTION) or off the join return (the
+// shared-key SECTION) in attach_core.
+// Not caught here: the Armed return attach_rule makes after it re-inspects its claim (the
+// claim resolved before attach_core returned). The unparked io-class SECTION asserts the reason
+// on whichever post-check return is taken; no test forces the race or asserts `out.kind`.
 // ---------------------------------------------------------------------------------------
 TEST_CASE("#5719 reason R2: a first attach reports first_attach on every success return",
           "[spark][runtime][4415prA][5719]") {

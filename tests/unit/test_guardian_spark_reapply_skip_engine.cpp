@@ -875,6 +875,15 @@ TEST_CASE("#4415 PR-A (3): a one-rule content change rebuilds only that rule (sa
     const std::string moved_key = file_key(moved);
     r.dispatch(build("renamed-r2", moved));
     CHECK(r.settle());
+    // The rebuild line labels a retarget first_attach: the rule has a committed arm, but on its
+    // OLD key, so reuse_existing_locked finds no entry for its new target key (not a lost arm).
+    {
+        const auto line = r.engine->last_full_sync_rebuild_line_for_test();
+        CHECK(line.find("path=spark") != std::string::npos);
+        CHECK(line.find("rebuilt 1 rule(s)") != std::string::npos);
+        CHECK(line.find("first_attach=1") != std::string::npos);
+        CHECK(line.find("content_changed=0") != std::string::npos);
+    }
     CHECK(r.fm->watch_calls(moved_key) == 1);
     CHECK(r.fm->unwatch_calls(keys[2]) == 2); // phase 1's teardown plus this one
     for (int i : {0, 1, 3})

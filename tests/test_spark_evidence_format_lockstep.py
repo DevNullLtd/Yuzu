@@ -62,7 +62,12 @@ FIXTURE_PATH = REPO_ROOT / "tests" / "unit" / "fixtures" / "spark" / "arm_commit
 DRIVER_PATH = REPO_ROOT / "docs" / "spark-rebuild-baselines" / "fullsync_blackout_diag.py"
 REBUILD_FIXTURE_PATH = REPO_ROOT / "tests" / "unit" / "fixtures" / "spark" / "rebuild_line.json"
 # The driver regexes the #5719 rebuild line must never match (names as in the driver module).
-DRIVER_REGEX_NAMES = ("PRESERVED_RE", "T0_RE", "T0D_RE", "T1_RE", "T2_RE", "ARM_LEGACY_RE")
+# Every log-line regex the driver defines for Guardian/Spark lines. A new driver line regex is added
+# here in the same change; the rebuild line is then checked against it.
+DRIVER_REGEX_NAMES = (
+    "PRESERVED_RE", "T0_RE", "T0D_RE", "T1_RE", "T2_RE", "ARM_LEGACY_RE", "ARM_SPARK_RE",
+    "T0_FALLBACK_RE", "PUSH_CMD_RE", "BACKEND_RE", "NETWORK_CONNECTED_RE",
+)
 
 
 def _load_driver() -> types.ModuleType:
