@@ -707,7 +707,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(out.dump(), "application/json");
     });
 
-    // -- REST v1: GET /api/v1/hardware/ci — the bulk CI read, one keyset page per call --
+    // -- REST v1: GET /api/v1/hardware/ci: the bulk CI read, one keyset page per call --
     // Registered BEFORE `GET /api/v1/hardware/{id}`: that pattern matches any single segment, so
     // registered first it would take `/ci` as a device id. The router takes the first registered
     // match; the cost is that a device whose agent_id is literally `ci` is only reachable here
@@ -760,7 +760,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     hardware_ci_page::audit_detail_scope_too_wide("REST"));
                 res.status = 400;
                 res.set_content(
-                    detail::a4_error(res, std::string(hardware_ci_page::read_error_message(why))),
+                    detail::a4_error(res, std::string(hardware_ci_page::read_error_message(why)),
+                                     {.remediation = hardware_ci_page::kScopeTooWideRemediation}),
                     "application/json");
                 return;
             }
@@ -789,7 +790,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // anything to carry. Confinement is reported as a status instead
         // (hardware_ci_page::apply_scope_disclosure, shared with MCP). A named device outside the
         // scope gets the same empty page as a device with no record; only the audit outcome
-        // differs (`denied`), as on the software devices route.
+        // differs: one `denied` row instead of a `success` row.
         const bool confined = gate.scope.has_value();
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices.ci", page.target_denied ? "denied" : "success",

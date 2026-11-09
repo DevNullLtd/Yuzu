@@ -1596,7 +1596,7 @@ TEST_CASE("mcp list_hardware_ci_records: a confined caller sees only its scope a
     CHECK(t.ci_store.reads == reads_before); // no SQL for a device outside the scope
     REQUIRE(t.domain_rows.size() == 1);
     CHECK(t.domain_rows[0] == "inventory.devices.ci|denied|Agent|out-c");
-    CHECK(t.domain_details[0] == "hardware CI records (MCP): state=agent_id outside the caller's scope");
+    CHECK(t.domain_details[0] == "hardware CI records (MCP) state=agent_id outside the caller's scope");
     REQUIRE(t.generic_rows.size() == 1);
     CHECK(t.generic_rows[0] == "mcp.list_hardware_ci_records|denied");
 
@@ -1608,7 +1608,7 @@ TEST_CASE("mcp list_hardware_ci_records: a confined caller sees only its scope a
     CHECK_FALSE(gr["result"]["structuredContent"].contains("scope_basis"));
 }
 
-// D4: the audit detail grammar, as exact strings, on this transport.
+// The audit detail grammar, as exact strings, on this transport.
 TEST_CASE("mcp list_hardware_ci_records: audit detail is the exact documented grammar",
           "[mcp][hardware][ci_page][security]") {
     Twin t;
@@ -1649,7 +1649,7 @@ TEST_CASE("mcp list_hardware_ci_records: audit detail is the exact documented gr
     CHECK(t.domain_details.back() == "hardware CI records (MCP) state=store unreadable");
 }
 
-// D5 on this transport: an out-of-scope id that exists and an in-scope id with no record are the
+// An out-of-scope id that exists and an in-scope id with no record are the
 // same bytes (apart from the per-request correlation id); only the audit outcome differs.
 TEST_CASE("mcp list_hardware_ci_records: an out-of-scope id and an unknown id answer identically",
           "[mcp][hardware][ci_page][security]") {
@@ -1670,7 +1670,7 @@ TEST_CASE("mcp list_hardware_ci_records: an out-of-scope id and an unknown id an
     CHECK(hidden["result"]["structuredContent"]["devices"].empty());
     CHECK(hidden["result"]["structuredContent"]["next_cursor"] == "");
     CHECK(hidden_row ==
-          "inventory.devices.ci|denied|Agent|out-b / hardware CI records (MCP): state=agent_id outside the caller's scope");
+          "inventory.devices.ci|denied|Agent|out-b / hardware CI records (MCP) state=agent_id outside the caller's scope");
     CHECK(ghost_row ==
           "inventory.devices.ci|success|Agent|in-ghost / hardware CI records (MCP): rows=0 scope=authority_scoped");
 }
@@ -1733,14 +1733,14 @@ TEST_CASE("mcp list_hardware_ci_records: a scope of 10001 ids and no agent_id is
     CHECK_FALSE(r.contains("result"));
     CHECK(r["error"]["code"] == mcp::kInvalidParams);
     CHECK(r["error"]["message"] ==
-          "the caller's scope covers more than 10000 devices; pass agent_id or ask an administrator to narrow the scope");
-    CHECK(r["error"]["data"]["remediation"] == "pass agent_id, or narrow the caller's scope");
+          "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit");
+    CHECK(r["error"]["data"]["remediation"] == "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope");
     CHECK(r["error"]["data"]["retry_after_ms"].is_null()); // terminal: nothing to wait for
     CHECK(t.ci_store.reads == 0);
     CHECK(r.dump().find("in-a") == std::string::npos);
     REQUIRE(t.domain_rows.size() == 1);
     CHECK(t.domain_rows[0] == "inventory.devices.ci|denied|Inventory|fleet");
-    CHECK(t.domain_details[0] == "hardware CI records (MCP): state=scope too wide");
+    CHECK(t.domain_details[0] == "hardware CI records (MCP) state=scope too wide");
     REQUIRE(t.generic_rows.size() == 1);
     CHECK(t.generic_rows[0] == "mcp.list_hardware_ci_records|denied");
 
@@ -1752,6 +1752,29 @@ TEST_CASE("mcp list_hardware_ci_records: a scope of 10001 ids and no agent_id is
     REQUIRE(dr.contains("error"));
     CHECK(dr["error"]["code"] == mcp::kInvalidParams);
     CHECK(d.ci_store.reads == 0);
+}
+
+// The scope refusal serves nothing, so its two audit rows are best effort: when either does not
+// persist the -32602 stands and the error data says audit_persisted:false. Kills: turning the
+// refusal into a retryable kInternalError like a withheld page, or hiding the dropped row.
+TEST_CASE("mcp list_hardware_ci_records: scope-too-wide -32602 stands, audit_persisted false, when a row is dropped",
+          "[mcp][hardware][ci_page][ceiling][security]") {
+    for (const bool drop_domain : {true, false}) {
+        INFO((drop_domain ? "domain row dropped" : "generic row dropped"));
+        Twin t;
+        seed(t, {"in-a", "in-d"});
+        t.scope = mcp_scope_of_size({"in-a", "in-d"}, 10001);
+        t.clear_audit();
+        t.domain_audit_ok = !drop_domain;
+        t.generic_audit_ok = drop_domain;
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["data"]["audit_persisted"] == false);
+        CHECK(t.ci_store.reads == 0);
+        CHECK(r.dump().find("in-a") == std::string::npos);
+    }
 }
 
 TEST_CASE("mcp list_hardware_ci_records: a scope of 10001 ids with an agent_id reads that one device by key",

@@ -218,7 +218,7 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
             // retry-hint-exempt: caller-input rejection
             answer(ctx, ctx.a4_error(kInvalidParams,
                                      std::string(hardware_ci_page::read_error_message(why)),
-                                     "pass agent_id, or narrow the caller's scope", -1, {},
+                                     std::string(hardware_ci_page::kScopeTooWideRemediation), -1, {},
                                      domain_ok && generic_ok));
             return;
         }
@@ -244,7 +244,8 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     // so the page is exact and neither the body, the cursor nor the audit detail has anything to
     // carry. Confinement is reported as a STATUS instead (the same rule REST applies,
     // hardware_ci_page::apply_scope_disclosure). A named device outside the scope gets the same
-    // empty page as a device with no record; only the audit outcome differs (`denied`).
+    // empty page as a device with no record; only the audit outcome differs: a `denied` row
+    // (the domain row, plus the generic MCP row) instead of a `success` row.
     const bool authority_scoped = gate.scope.has_value();
     const char* outcome = page.target_denied ? "denied" : "success";
     const std::string detail_text = page.target_denied
@@ -414,7 +415,8 @@ constexpr ToolRecord kToolRecords[] = {
      "narrowed to the devices the caller may read and carry scope_basis authority_scoped (a "
      "status, set whether or not any device was hidden); no count of hidden devices is ever "
      "returned. A caller whose scope covers more than 10000 devices and passes no agent_id gets "
-     "-32602 (pass agent_id or narrow the scope); that is terminal, do not retry it. A failed "
+     "-32602 (a credential with global read has no such limit; otherwise pass agent_id or narrow "
+     "the scope); that is terminal, do not retry it. A failed "
      "store read is a retryable error (wait retry_after_ms, 5000, then call once more; do not "
      "loop), never an empty page. Serial, system UUID, MAC and the chassis and board serials are "
      "personal data: every served page is audited as inventory.devices.ci and, unlike most MCP "

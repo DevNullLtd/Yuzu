@@ -3043,3 +3043,61 @@ TEST_CASE("list_device_ci_after degrades (not empty) on a closed store", "[devic
     // a closed store is a degrade even for a deny-all read
     CHECK_FALSE(store.list_device_ci_after(deny_all).has_value());
 }
+
+namespace {
+
+double ci_read_degrades(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter("yuzu_inventory_read_degrade_total", {{"reason", reason}, {"source", "device_ci"}})
+        .value();
+}
+
+} // namespace
+
+// The keyset read's three degrade causes are counted under three different reason labels, which is
+// what lets an operator tell a closed store from a saturated pool from a failing query.
+TEST_CASE("list_device_ci_after counts a closed store as store_not_open", "[device_ci][keyset]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
+    CHECK(ci_read_degrades(metrics, "store_not_open") == 1.0);
+    CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+    CHECK(ci_read_degrades(metrics, "query_error") == 0.0);
+}
+
+TEST_CASE("list_device_ci_after counts a saturated pool as pool_acquire_timeout and a failing query as query_error",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    SECTION("the only connection is held elsewhere") {
+        auto held = pool.acquire();
+        REQUIRE(held);
+        CHECK_FALSE(store.list_device_ci_after({}).has_value());
+        CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 1.0);
+        CHECK(ci_read_degrades(metrics, "query_error") == 0.0);
+        CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+    }
+    SECTION("the SELECT itself fails") {
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "ALTER TABLE device_inventory_store.device_ci RENAME TO device_ci_renamed_away",
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.list_device_ci_after({}).has_value());
+        CHECK(ci_read_degrades(metrics, "query_error") == 1.0);
+        CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+        CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+    }
+}

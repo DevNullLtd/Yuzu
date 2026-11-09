@@ -821,9 +821,15 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
     static DegradeSampler query_sampler;
     if (note_read_degrade(metrics_, entered ? kReasonQueryError : kReasonPoolTimeout,
                           entered ? query_sampler : pool_sampler)
-            .should_log)
-        spdlog::warn("DeviceInventoryStore: keyset list degraded: {}",
-                     entered ? ::yuzu::log_key_token(err) : pool_.last_error());
+            .should_log) {
+        // `err` is empty only when the callback returned true and the COMMIT then did not take: the
+        // transaction helper does not expose the COMMIT's error text, so say so rather than log
+        // nothing.
+        const std::string cause = !entered ? pool_.last_error()
+                                  : err.empty() ? std::string("commit failed")
+                                                : ::yuzu::log_key_token(err);
+        spdlog::warn("DeviceInventoryStore: keyset list degraded: {}", cause);
+    }
     return std::nullopt;
 }
 

@@ -644,20 +644,63 @@ A repeated parameter keeps its first value and an unknown parameter is ignored.
 - `content_hash` is the stored hash of the record (`null` when none is stored). Equal to your copy means unchanged; unequal means re-read. It also covers section rows this route does not return, so it can change while every field you were given is the same, and it changes when an agent moves from the v1 to the v2 record with identical scalars. `ci.first_seen` and `ci.last_seen` can change without a hash change, so read `last_seen` even when the hash matches.
 - `blob_version` is `1` for the older record and `2` for the versioned one.
 
+An example `200` body for a page of one device (the `ci` object is shortened here: a real one carries all 34 scalar keys, and the keys are in alphabetical order on the wire):
+
+```json
+{
+  "data": {
+    "devices": [
+      {
+        "agent_id": "pc-0042",
+        "blob_version": 2,
+        "ci": {
+          "manufacturer": "Example Corp",
+          "model": "Example 5440",
+          "serial": "SN0042",
+          "ram_bytes": 17179869184,
+          "first_seen": 1762300000,
+          "last_seen": 1762690000
+        },
+        "content_hash": "9f2c4a1e7b6d3085c1a94e27d0b83f5a6c7e1d92b4a08f3e5d6c7b8a9f0e1d2c",
+        "hostname": "pc-0042.example.test"
+      }
+    ],
+    "next_cursor": "h1:0a1b2c3d4e5f6071:CHBjLTAwNDIe"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
 Rows are in ascending `agent_id` order. There is no server-side "changed since" filter yet: each run re-reads every row, so use `limit=1000`.
 
-**Paging:** follow `data.next_cursor` as `cursor` until it is empty. An empty `next_cursor` means there is nothing further to read. A non-empty one is an opaque token (it holds the last device served and nothing else): do not parse it, and do not reuse it with a different `agent_id`. A cursor is not authenticated: handing a forged one to the route can only change where the walk starts within what the caller may already read. Pages are exact for every caller: the walk is a keyset walk, so a device registered or removed between pages cannot make another device be skipped or served twice (a device added behind the cursor is returned by the next walk). A cursor does not survive a server upgrade; start the walk again. Walk the pages one at a time, not in parallel, because each page leases one connection of the server's shared PostgreSQL pool (the one that also serves permission checks and audit writes), and run large walks off-peak.
+**Paging:** follow `data.next_cursor` as `cursor` until it is empty. An empty `next_cursor` means there is nothing further to read. A non-empty one is an opaque token (it holds the last device served and nothing else): do not parse it, and do not reuse it with a different `agent_id`. A cursor is not authenticated: handing a forged one to the route can only change where the walk starts within what the caller may already read. Pages are exact for every caller: the walk is a keyset walk, so a device registered or removed between pages cannot make another device be skipped or served twice (a device added behind the cursor is returned by the next walk). This relies on the database's text indexes being consistent with its collation; see the collation note in [server-admin.md](server-admin.md#postgresql-collation-version). A cursor does not survive a server upgrade; start the walk again. Walk the pages one at a time, not in parallel, because each page leases one connection of the server's shared PostgreSQL pool (the one that also serves permission checks and audit writes), and run large walks off-peak.
 
-**Scope too wide.** A caller whose scope covers more than 10,000 devices cannot be served a page without naming a device: with no `agent_id` the route answers `400` ("the caller's scope covers more than 10000 devices; pass agent_id or ask an administrator to narrow the scope"), no store read runs and the refusal is terminal (`retry_after_ms` is `null`). With an `agent_id` the one device is read by key and served only if the scope admits it. A caller with global read (no scope) pages through any number of devices.
+**Scope too wide.** A caller whose scope covers more than 10,000 devices cannot be served a page without naming a device: with no `agent_id` the route answers `400`, no store read runs and the refusal is terminal (`retry_after_ms` is `null`; do not retry it). With an `agent_id` the one device is read by key and served only if the scope admits it. A caller with global read (no scope) pages through any number of devices. The `400` body is:
+
+```json
+{
+  "error": {
+    "code": 400,
+    "message": "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit",
+    "correlation_id": "0d4f6c1e-0000-0000-0000-000000000000",
+    "retry_after_ms": null,
+    "remediation": "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The limit is judged on every page, against the caller's scope at that moment. A walk that started under a scope of at most 10,000 devices therefore aborts if the scope grows past 10,000 between two pages: the next page is this `400`, and starting the walk again gives the same `400` until the scope is narrowed or a global-read credential is used.
 
 | Status | Meaning |
 |---|---|
 | `200` | A page. |
-| `400` | `limit` is not an integer; `agent_id` is over 256 bytes or carries a byte below `0x20`; `agent_id` or `cursor` is not valid UTF-8 or carries a NUL (`invalid parameter encoding`); `cursor` is malformed, over 2,048 bytes or was issued for a different `agent_id` (restart from the first page); or the caller's scope covers more than 10,000 devices and no `agent_id` was given (above). |
+| `400` | `limit` is not an integer; `agent_id` is over 256 bytes or carries a byte below `0x20`; `agent_id` or `cursor` is not valid UTF-8 or carries a NUL (`invalid parameter encoding`); `cursor` is malformed, over 2,048 bytes or was issued for a different `agent_id` (message `invalid cursor; restart from the first page`); or the caller's scope covers more than 10,000 devices and no agent_id was given (above). The scope refusal writes a best-effort `denied` audit row, so this one `400` can also carry `Sec-Audit-Failed: true` when that row did not persist; nothing is served on that path, so the `400` stands. |
 | `403` | Caller lacks `Inventory:Read`. |
+| `429` | The server's general per-source-address rate limit was exceeded (default 100 requests per second per source address with a burst of 100, `--rate-limit`; see [server-admin.md](server-admin.md)). The answer carries `Retry-After: 1` and `retry_after_ms` 1000. Wait and retry the same cursor. |
 | `503` | The CI provider is unwired, the CI store could not be read (`retry_after_ms` 5000), the authorization store is unavailable (`retry_after_ms` 5000), or the audit row for the page could not be persisted (the page is withheld; the response carries `Sec-Audit-Failed: true` and `retry_after_ms` 5000). A failed store read is never a `200` with an empty page. |
 
-On a `503`, wait `retry_after_ms` and retry the SAME cursor; do not restart the walk. A `503` that carries `Sec-Audit-Failed: true` means the audit store is unavailable, which is an operator action rather than something a retry will clear.
+On a `503`, wait `retry_after_ms` and retry the SAME cursor; do not restart the walk. A `503` that carries `Sec-Audit-Failed: true` means the audit store is unavailable: the answer carries `retry_after_ms` 5000, so retry the same cursor after that delay, and escalate to an operator if it persists. Do not retry a `503` forever. As client guidance (the server does not enforce it), give up and raise an alert after 5 consecutive `503` answers on the same cursor.
 
 **Credentials.** Use a dedicated API token whose principal holds only `Inventory:Read`. Do not use a service-scoped token for the bulk pull: it is confined, and a confined scope over 10,000 devices is refused without an `agent_id`. With RBAC enforcement off (the default) every authenticated non-service principal reads the whole fleet and confinement does not exist.
 
@@ -666,18 +709,19 @@ On a `503`, wait `retry_after_ms` and retry the SAME cursor; do not restart the 
 ```bash
 cursor=""
 while :; do
-  page=$(curl -sf -H "Authorization: Bearer $YUZU_TOKEN" \
+  page=$(curl -sSf -H "Authorization: Bearer $YUZU_TOKEN" \
     --get "$YUZU_URL/api/v1/hardware/ci" \
-    --data-urlencode "limit=1000" --data-urlencode "cursor=$cursor") || break
+    --data-urlencode "limit=1000" --data-urlencode "cursor=$cursor") \
+    || { echo "page failed (cursor=$cursor)" >&2; exit 1; }
   jq -c '.data.devices[] | {agent_id, hash: .content_hash, serial: .ci.serial}' <<<"$page"
-  cursor=$(jq -r '.data.next_cursor' <<<"$page")
+  cursor=$(jq -r '.data.next_cursor // empty' <<<"$page")
   [ -z "$cursor" ] && break
 done
 ```
 
-The loop stops on any non-2xx answer (`curl -f`); production code should honour `retry_after_ms` on a `503` and retry the same cursor.
+The loop exits non-zero on any non-2xx answer (`curl -f`, with `-S` so the HTTP error is printed). Production code must honour `retry_after_ms` and retry the SAME cursor rather than stop. Never retire or delete configuration items on the basis of a walk that did not reach an empty `next_cursor`; a partial walk proves nothing about the devices it did not reach.
 
-**Audit:** `inventory.devices.ci`, one row per served page, written after the read and fail-closed: serial, system UUID, MAC and the chassis and board serials are personal data, so a page whose audit row does not persist is not served. The detail is `hardware CI records (REST): rows=<n>[ page=continuation] scope=<fleet|authority_scoped>`; it never lists device ids. The target is `Inventory`/`fleet`, or `Agent`/`<agent_id>` when `agent_id` was given. A failed store read writes the same verb with `result=failure`; a named `agent_id` outside the caller's scope, and a scope over 10,000 devices with no `agent_id`, write `result=denied`. A request refused for a malformed parameter or cursor writes no row, because nothing was served. Field-level detail is in [audit-log.md](audit-log.md).
+**Audit:** `inventory.devices.ci`, one row per served page, written after the read and fail-closed: serial, system UUID, MAC and the chassis and board serials are personal data, so a page whose audit row does not persist is not served. The detail is `hardware CI records (REST): rows=<n>[ page=continuation] scope=<fleet|authority_scoped>`; it never lists device ids. The target is `Inventory`/`fleet`, or `Agent`/`<agent_id>` when `agent_id` was given. A failed store read writes the same verb with `result=failure`. A named `agent_id` outside the caller's scope writes ONE `result=denied` row (detail `hardware CI records (REST) state=agent_id outside the caller's scope`, target `Agent`/`<agent_id>`) and the answer is the same empty page as for a device with no record; a scope over 10,000 devices with no `agent_id` writes one `result=denied` row (detail `hardware CI records (REST) state=scope too wide`). The `denied` row of the scope refusal is best effort (nothing is served on that path), so a row that does not persist marks the `400` `Sec-Audit-Failed: true` and the `400` stands; the `denied` row of a named out-of-scope `agent_id` is fail-closed like a served page. A request refused for a malformed parameter or cursor writes no row, because nothing was served. Field-level detail is in [audit-log.md](audit-log.md).
 
 ---
 

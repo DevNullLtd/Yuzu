@@ -5067,7 +5067,7 @@ groups:
             only when the rows served include a Forensics-tier plugin's) on the v1
             execution-scoped response, response get, export and visualization routes, on
             bundle collation (GET /api/v1/bundles/{id}) and on the legacy get and export
-            routes) is returning 503 and withholding PII or response
+            routes) are returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
             executions drawer, the hardware result poll, the MCP query_responses tool and

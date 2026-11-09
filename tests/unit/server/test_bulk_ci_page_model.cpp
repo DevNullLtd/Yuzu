@@ -10,6 +10,7 @@
 #include "hardware_list_model.hpp"
 #include "list_keyset.hpp"
 #include "model_param_helpers.hpp"
+#include "software_catalogue_model.hpp" // kScopePushdownMaxIds, the sibling surface's ceiling
 #include "test_fake_ci_keyset_store.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -229,13 +230,24 @@ TEST_CASE("hardware ci page: cursor round-trips and refuses tampering", "[hardwa
         refused("x:agent" + sep);
         refused(":" + sep);
         refused("3:a" + std::string(1, '\0') + "b" + sep); // NUL inside after
-        refused("3:a\nb" + sep);               // control byte
-        refused("3:a\x1f" "b" + sep);          // the separator byte inside after
     }
-    SECTION("DEL is not a control byte below 0x20, so an id carrying it is accepted like any other") {
-        // id_is_audit_safe is the audit-trail floor (no byte below 0x20), not a charset rule.
+    // `after` reaches only the bound SQL parameter of the keyset query, never a log, audit or
+    // response string, so it is held to what a bound text parameter needs (strict UTF-8, no NUL,
+    // at most 256 bytes) and NOT to the audit-trail floor the `agent_id` request filter meets.
+    // `encode_cursor` mints a token from any stored id, so an id with a control byte must decode.
+    SECTION("a stored id with a byte below 0x20 or DEL decodes: the decoder accepts what the encoder mints") {
         const std::string sep(1, kSepChar);
-        CHECK(hcp::decode_cursor(forge_token(fp, "3:a\x7f" "b" + sep), fp).has_value());
+        for (const std::string& id : {std::string("a\x01" "b"), std::string("a\nb"), std::string("a\tb"),
+                                      std::string("a\x1f" "b"), std::string("a\x7f" "b"),
+                                      std::string("\x01")}) {
+            INFO(id.size());
+            const std::string minted = hcp::encode_cursor(hcp::Position{id}, fp);
+            const auto back_id = hcp::decode_cursor(minted, fp);
+            REQUIRE(back_id.has_value());
+            CHECK(back_id->after == id);
+        }
+        // and a hostile spelling of one is accepted exactly like the encoder's own
+        CHECK(hcp::decode_cursor(forge_token(fp, "3:a\x01" "b" + sep), fp).has_value());
     }
     SECTION("invalid UTF-8 in the id") {
         const std::string sep(1, kSepChar);
@@ -265,12 +277,26 @@ TEST_CASE("hardware ci page: cursor round-trips and refuses tampering", "[hardwa
         CHECK(hcp::decode_cursor(forge_token(fp, "257:" + ok + "x" + sep), fp).error() ==
               hcp::CursorError::kMalformed);
     }
-    SECTION("a token over the cursor cap is refused by the decoder too") {
+    // The decoder's own length check is defence in depth: no WELL-FORMED token can reach the cap
+    // (an id is at most 256 bytes, so the longest valid token is a few hundred bytes), and a token
+    // longer than the cap is malformed on its shape alone. What is observable is that every such
+    // token is refused, and that both parsers enforce the cap at exactly 2048.
+    SECTION("no valid token reaches the cursor cap, and an over-cap token is refused everywhere") {
+        const std::string longest = hcp::encode_cursor(hcp::Position{std::string(256, 'x')}, fp);
+        CHECK(longest.size() < hcp::kCursorMaxBytes);
+        CHECK(hcp::decode_cursor(longest, fp).has_value());
+        const std::string head = "h1:" + fp + ":";
+        for (const std::size_t total : {hcp::kCursorMaxBytes, hcp::kCursorMaxBytes + 1}) {
+            INFO(total);
+            const std::string padded = head + std::string(total - head.size(), 'A');
+            REQUIRE(padded.size() == total);
+            const auto r = hcp::decode_cursor(padded, fp);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == hcp::CursorError::kMalformed);
+        }
         const std::string at_cap = std::string(hcp::kCursorMaxBytes, 'A');
         const std::string over_cap = std::string(hcp::kCursorMaxBytes + 1, 'A');
-        CHECK(hcp::decode_cursor(at_cap, fp).error() == hcp::CursorError::kMalformed);
-        CHECK(hcp::decode_cursor(over_cap, fp).error() == hcp::CursorError::kMalformed);
-        // and the REST/MCP parsers: 2048 passes the parse, 2049 does not
+        // 2048 passes the parse, 2049 does not
         CHECK(hcp::parse_params(params({{"cursor", at_cap}})).has_value());
         CHECK_FALSE(hcp::parse_params(params({{"cursor", over_cap}})).has_value());
         json args{{"cursor", at_cap}};
@@ -358,6 +384,25 @@ TEST_CASE("hardware ci page: an unfiltered walk visits every device exactly once
         REQUIRE(page.has_value());
         CHECK(page->rows.empty());
         CHECK(page->next_cursor.empty());
+    }
+    // A stored id carrying a control byte can land on a page boundary. The cursor minted from it
+    // must decode, or the walk would hit a deterministic 400 there and never finish.
+    SECTION("a stored id with a control byte at a page boundary does not wedge the walk") {
+        FakeStore odd;
+        const std::string boundary = "q\x01r";
+        for (const std::string& id : {std::string("p"), boundary, std::string("s")})
+            odd.add(id);
+        hcp::Request rq;
+        rq.limit = 2; // page 1 = {p, q\x01r}: the cursor is minted FROM the control-byte id
+        int pages = 0;
+        const auto all = walk(odd, rq, std::nullopt, &pages);
+        CHECK(pages == 2);
+        CHECK(all == std::vector<std::string>{"p", boundary, "s"});
+        const auto first = hcp::read_page(odd.reader(), rq, std::nullopt);
+        REQUIRE(first.has_value());
+        const auto pos = hcp::decode_cursor(first->next_cursor, hcp::filter_fingerprint(rq));
+        REQUIRE(pos.has_value());
+        CHECK(pos->after == boundary);
     }
     SECTION("the cursor resumes after a row inserted behind it, without a duplicate") {
         hcp::Request rq;
@@ -466,6 +511,11 @@ FakeStore forty_devices(std::set<std::string>& in_scope_real) {
 
 static_assert(hcp::kMaxPushdownScopeIds == 10000);
 
+// This model keeps its own copy of the push-down ceiling so it does not include the software
+// catalogue model; the two surfaces document the same figure, so a drift is a defect.
+static_assert(hcp::kMaxPushdownScopeIds == yuzu::server::software_catalogue::kScopePushdownMaxIds,
+              "the bulk CI ceiling must equal the software catalogue's push-down ceiling");
+
 // Kills: raising or dropping the ceiling, using `>=` for `>`, and pushing a set at the ceiling
 // into SQL as anything but the full id list. Pages are exact at the ceiling.
 TEST_CASE("hardware ci page: a scope of exactly the ceiling is pushed into SQL, pages exact",
@@ -527,7 +577,7 @@ TEST_CASE("hardware ci page: a scope over the ceiling with no agent_id is refuse
     const std::string msg(hcp::read_error_message(hcp::ReadError::kScopeTooWide));
     CHECK(msg.find("agent_id") != std::string::npos);
     CHECK(msg.find("10001") == std::string::npos);
-    CHECK(hcp::audit_detail_scope_too_wide("REST") == "hardware CI records (REST): state=scope too wide");
+    CHECK(hcp::audit_detail_scope_too_wide("REST") == "hardware CI records (REST) state=scope too wide");
 }
 
 // Kills: sending the id array with a named device (a 10001-element ANY for one row), and serving a
@@ -682,7 +732,7 @@ TEST_CASE("hardware ci page: page JSON shape and audit text", "[hardware_ci_page
     CHECK(hcp::audit_target_id(rq) == "dev-9");
     // the detail never names the device: the target does
     CHECK(hcp::audit_detail(page, rq, "REST", false).find("dev-9") == std::string::npos);
-    CHECK(hcp::audit_detail_target_denied("MCP") == "hardware CI records (MCP): state=agent_id outside the caller's scope");
+    CHECK(hcp::audit_detail_target_denied("MCP") == "hardware CI records (MCP) state=agent_id outside the caller's scope");
 }
 
 TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and nothing about hidden devices",

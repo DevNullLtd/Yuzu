@@ -2479,7 +2479,7 @@ TEST_CASE("software lens header: count and last synced, never-synced told apart 
     CHECK(contains(synced, "hx-trigger=\"click\""));
 }
 
-// ───────────────────────── GET /api/v1/hardware/ci — the bulk keyset page ──────────────────
+// ───────────────────────── GET /api/v1/hardware/ci: the bulk keyset page ──────────────────
 
 namespace {
 
@@ -2670,7 +2670,7 @@ TEST_CASE("route: GET /api/v1/hardware/ci never returns a device outside the cal
         // Audited as a refusal (like the software devices route), target Agent/<id>, no row of it.
         REQUIRE(h.audit_full.size() == 1);
         CHECK(h.audit_full[0] == "inventory.devices.ci|denied|Agent|out-c");
-        CHECK(h.audit_details[0] == "hardware CI records (REST): state=agent_id outside the caller's scope");
+        CHECK(h.audit_details[0] == "hardware CI records (REST) state=agent_id outside the caller's scope");
         CHECK(h.ci_store.reads == reads_before); // the named read ran no SQL
     }
     SECTION("an engaged-empty scope returns nothing") {
@@ -2750,19 +2750,24 @@ TEST_CASE("route: GET /api/v1/hardware/ci with a scope of 10001 ids and no agent
     REQUIRE_FALSE(body.is_discarded());
     CHECK_FALSE(body.contains("data"));
     CHECK(body["error"]["message"] ==
-          "the caller's scope covers more than 10000 devices; pass agent_id or ask an administrator to narrow the scope");
+          "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit");
     CHECK(body["error"]["retry_after_ms"].is_null()); // terminal: no retry hint
+    CHECK(body["error"]["remediation"] ==
+          "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope");
     CHECK_FALSE(contains(res->body, "in-a"));
     CHECK(h.ci_store.reads == 0);
     REQUIRE(h.audit_full.size() == 1);
     CHECK(h.audit_full[0] == "inventory.devices.ci|denied|Inventory|fleet");
-    CHECK(h.audit_details[0] == "hardware CI records (REST): state=scope too wide");
+    CHECK(h.audit_details[0] == "hardware CI records (REST) state=scope too wide");
 
-    // a continuation page is refused the same way
+    // A malformed cursor is judged before the scope ceiling: it gets the cursor message (not the
+    // scope one), still reads nothing, and writes no second audit row.
     auto cont = h.sink.Get("/api/v1/hardware/ci?cursor=garbage");
     REQUIRE(cont);
-    CHECK(cont->status == 400); // the cursor is judged first
+    CHECK(cont->status == 400);
+    CHECK(nlohmann::json::parse(cont->body)["error"]["message"] == "invalid cursor; restart from the first page");
     CHECK(h.ci_store.reads == 0);
+    CHECK(h.audit_full.size() == 1);
 
     // the refusal is not the store-degrade answer
     HwHarness d;
@@ -2772,6 +2777,27 @@ TEST_CASE("route: GET /api/v1/hardware/ci with a scope of 10001 ids and no agent
     REQUIRE(refused);
     CHECK(refused->status == 400);
     CHECK(d.ci_store.reads == 0);
+}
+
+// The scope refusal writes nothing to a client, so its audit row is best effort: a row that does
+// not persist marks the answer Sec-Audit-Failed but the 400 stands (it is NOT turned into a 503).
+// Kills: making the refusal fail closed like a served page.
+TEST_CASE("route: GET /api/v1/hardware/ci scope-too-wide 400 stands, marked Sec-Audit-Failed, when its audit row fails",
+          "[hardware][route][rest][ci_page][ceiling][security]") {
+    HwHarness h;
+    seed_ci(h, {"in-a"});
+    h.scope = ci_scope_of_size({"in-a"}, 10001);
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware/ci");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body["error"]["code"] == 400);
+    CHECK_FALSE(contains(res->body, "in-a"));
+    CHECK(h.ci_store.reads == 0);
 }
 
 TEST_CASE("route: GET /api/v1/hardware/ci with a scope of 10001 ids and an agent_id reads that one device",
@@ -2834,7 +2860,7 @@ TEST_CASE("route: GET /api/v1/hardware/ci answers an out-of-scope id and an unkn
     CHECK(body["data"]["scope_basis"] == "authority_scoped");
 
     CHECK(hidden_audit ==
-          "inventory.devices.ci|denied|Agent|out-b / hardware CI records (REST): state=agent_id outside the caller's scope");
+          "inventory.devices.ci|denied|Agent|out-b / hardware CI records (REST) state=agent_id outside the caller's scope");
     CHECK(ghost_audit ==
           "inventory.devices.ci|success|Agent|in-ghost / hardware CI records (REST): rows=0 scope=authority_scoped");
 }

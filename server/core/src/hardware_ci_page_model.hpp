@@ -12,15 +12,16 @@
 /// (`list_keyset.hpp`). The keyset itself is different (one unique key, `agent_id`), so the page
 /// walk below is this surface's own.
 ///
-/// Scope: the caller's `authz::VisibleSet` is the SOLE filter and it is always applied in SQL.
-/// TOP (nullopt) reads everything, in any number of pages; an engaged-empty set reads nothing and
-/// runs no SQL; a set of at most `kMaxPushdownScopeIds` ids is pushed into the query as
-/// `agent_ids`, so every page is exact. A larger set is NOT read: without an `agent_id` the read
-/// is refused (`ReadError::kScopeTooWide`, no SQL), because a post-filter over a wider set would
-/// make a short page, or a cursor that skips past hidden rows, tell the caller how many devices
-/// lie outside its scope. With an `agent_id` the one device is read by key and served only when
-/// `authz::in_scope` admits it. A confined caller therefore never receives an out-of-scope row,
-/// id or count, in the body, the cursor or the audit detail.
+/// Scope: the caller's `authz::VisibleSet` is the SOLE filter. TOP (nullopt) reads everything, in
+/// any number of pages; an engaged-empty set reads nothing and runs no SQL; a set of at most
+/// `kMaxPushdownScopeIds` ids is applied in SQL as `agent_ids`, so every page is exact. A larger
+/// set is NOT applied in SQL and no page of rows is ever filtered after the read: without an
+/// `agent_id` the read is refused (`ReadError::kScopeTooWide`, no SQL), because a post-filter over
+/// a wider set would make a short page, or a cursor that skips past hidden rows, tell the caller
+/// how many devices lie outside its scope. With an `agent_id` the one device is read by key (SQL
+/// `agent_id = X`) and served only when `authz::in_scope` admits it, which is the C++ check that
+/// stands in for the id array. A confined caller therefore never receives an out-of-scope row, id
+/// or count, in the body, the cursor or the audit detail.
 ///
 /// Cursors are OPAQUE and not authenticated (the same posture as the software catalogue's): a
 /// hand-made well-formed cursor is accepted, which is harmless because the scope is applied to
@@ -77,7 +78,8 @@ struct Request {
 
 enum class CursorError { kMalformed, kFilterMismatch };
 
-/// Wire message for a refused cursor (an HTTP 400 on REST).
+/// Wire message for a refused cursor (an HTTP 400 on REST): the same text for both causes, so the
+/// answer does not say which of a malformed token and a filter mismatch it was.
 [[nodiscard]] std::string_view cursor_error_message(CursorError e);
 
 /// A continuation position: the last `agent_id` the caller was served (empty = the head). Every
@@ -119,9 +121,15 @@ struct Page {
 enum class ReadError { kDegraded, kCursorMalformed, kCursorFilterMismatch, kScopeTooWide };
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the
-/// same text on REST and MCP. `kDegraded` has no caller-input message (it is a 503); it yields
+/// same text on REST and MCP (it names the global-read way out and carries no count). `kDegraded` has no caller-input message (it is a 503); it yields
 /// the generic unavailable text.
 [[nodiscard]] std::string_view read_error_message(ReadError e);
+
+/// The A4 `remediation` hint for a `kScopeTooWide` refusal, the same text on REST and MCP: a
+/// global-read credential first (it has no such limit), then a named device, then a narrower scope.
+inline constexpr std::string_view kScopeTooWideRemediation =
+    "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
+    "caller's scope";
 
 /// One page: decode the cursor, apply the scope as described in the file comment, read.
 [[nodiscard]] std::expected<Page, ReadError>
@@ -162,13 +170,13 @@ void apply_scope_disclosure(nlohmann::json& body, bool confined);
 [[nodiscard]] std::string audit_detail(const Page& page, const Request& rq, std::string_view surface,
                                        bool confined);
 
-/// `hardware CI records (<surface>): state=scope too wide`: the detail of the `denied` row written
+/// `hardware CI records (<surface>) state=scope too wide`: the detail of the `denied` row written
 /// when a read is refused with `ReadError::kScopeTooWide`. No count.
 [[nodiscard]] std::string audit_detail_scope_too_wide(std::string_view surface);
 
-/// `hardware CI records (<surface>): state=agent_id outside the caller's scope`: the detail of the `denied` row
-/// written when the request named an `agent_id` outside the caller's scope (`Page::target_denied`).
-/// The response itself is the same empty page a device with no record gets.
+/// `hardware CI records (<surface>) state=agent_id outside the caller's scope`: the detail of the
+/// `denied` row written when the request named an `agent_id` outside the caller's scope
+/// (`Page::target_denied`). The response itself is the same empty page a device with no record gets.
 [[nodiscard]] std::string audit_detail_target_denied(std::string_view surface);
 
 } // namespace yuzu::server::hardware_ci_page

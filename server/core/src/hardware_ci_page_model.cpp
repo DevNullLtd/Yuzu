@@ -4,6 +4,8 @@
 #include "list_keyset.hpp"               // the strict base64url codec shared by every cursor
 #include "model_param_helpers.hpp"       // shared param/cursor helpers (one copy across models)
 
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
@@ -63,7 +65,7 @@ std::optional<std::string> text_error(const std::string& agent_id, const std::st
     if (!agent_id.empty() && !id_is_audit_safe(agent_id))
         return "invalid agent_id";
     if (cursor.size() > kCursorMaxBytes)
-        return "invalid cursor";
+        return "invalid cursor; restart from the first page";
     return std::nullopt;
 }
 
@@ -127,11 +129,10 @@ std::expected<Request, std::string> request_from_args(const nlohmann::json& args
 std::string_view cursor_error_message(CursorError e) {
     switch (e) {
     case CursorError::kMalformed:
-        return "invalid cursor";
     case CursorError::kFilterMismatch:
-        return "cursor does not match this request's agent_id filter; restart from the first page";
+        return "invalid cursor; restart from the first page";
     }
-    return "invalid cursor";
+    return "invalid cursor; restart from the first page";
 }
 
 std::string filter_fingerprint(const Request& rq) {
@@ -163,9 +164,13 @@ std::expected<Position, CursorError> decode_cursor(std::string_view token, std::
         return std::unexpected(CursorError::kMalformed);
     const std::string after((*fields)[0]);
     // A token is only ever minted after a served row, so `after` is never empty: an empty one
-    // would be a second spelling of the first page. The decoded id is bound as a SQL parameter:
-    // strict UTF-8, no NUL, and the audit-safe floor every id on this surface meets.
-    if (after.empty() || !valid_text(after) || !id_is_audit_safe(after))
+    // would be a second spelling of the first page. The decoded id reaches only the bound SQL
+    // parameter of the keyset query, never a log, audit or response string, so it needs only what
+    // a bound text parameter needs (strict UTF-8, no NUL) and the id length bound. It is
+    // deliberately NOT held to the audit-trail floor (no byte below 0x20) that the `agent_id`
+    // request filter meets: `encode_cursor` mints a token from any stored id, so a stored id with
+    // a control byte at a page boundary must still decode, or the walk would wedge on a 400.
+    if (after.empty() || after.size() > auth::kMaxAgentIdLength || !valid_text(after))
         return std::unexpected(CursorError::kMalformed);
     const Position pos{after};
     // One spelling per position: a token that does not re-encode to itself (non-canonical
@@ -188,8 +193,8 @@ std::string_view read_error_message(ReadError e) {
     case ReadError::kCursorFilterMismatch:
         return cursor_error_message(CursorError::kFilterMismatch);
     case ReadError::kScopeTooWide:
-        return "the caller's scope covers more than 10000 devices; pass agent_id or ask an "
-               "administrator to narrow the scope";
+        return "the caller's scope covers more than 10000 devices and no agent_id was given; a "
+               "credential with global read has no such limit";
     }
     return "invalid request";
 }
@@ -295,11 +300,11 @@ std::string audit_detail(const Page& page, const Request& rq, std::string_view s
 }
 
 std::string audit_detail_scope_too_wide(std::string_view surface) {
-    return std::format("hardware CI records ({}): state=scope too wide", surface);
+    return std::format("hardware CI records ({}) state=scope too wide", surface);
 }
 
 std::string audit_detail_target_denied(std::string_view surface) {
-    return std::format("hardware CI records ({}): state=agent_id outside the caller's scope", surface);
+    return std::format("hardware CI records ({}) state=agent_id outside the caller's scope", surface);
 }
 
 } // namespace yuzu::server::hardware_ci_page
