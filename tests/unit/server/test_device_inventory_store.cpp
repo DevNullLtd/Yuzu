@@ -2781,3 +2781,66 @@ TEST_CASE("every registered kind persists its row count and a v1 digest and stat
         CHECK(served_section(store, "agent-all", d.section)["complete"] == true);
     }
 }
+
+// ── #7163: the writer's digest-provider failure, through the DigestFn test seam ──────────────────
+
+namespace {
+// As sha256_hex behaves when EVP_Digest fails: no digest, never a digest of zeros.
+std::optional<std::string> failing_digest_provider(std::string_view) {
+    return std::nullopt;
+}
+} // namespace
+
+// Kills: a writer that stores a section without its digest when the provider fails (a section the
+// reader could then never verify), or one that leaves a half-replaced set. The whole full replace
+// aborts: kError, the previous rows, record hash and section statuses survive intact, and the
+// cause is named in the log.
+TEST_CASE("a failing digest provider aborts the full replace and leaves the previous set intact",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto first = blob_with_rows(3, 2);
+    REQUIRE(put_record(store, "agent-dp", first) == InventoryIngestOutcome::kStored);
+    const auto digests_before = persisted_digests(pool, "agent-dp");
+    const auto counts_before = persisted_row_counts(pool, "agent-dp");
+    auto before = store.get_device_ci_with_sections("agent-dp");
+    REQUIRE(before.has_value());
+    REQUIRE(before->record.has_value());
+
+    const auto second = blob_with_rows(1, 4); // different content AND counts
+    InventoryIngestOutcome outcome{};
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        store.set_digest_provider_for_test(&failing_digest_provider);
+        outcome = put_record(store, "agent-dp", second);
+        store.set_digest_provider_for_test(nullptr);
+        cap.stop();
+        logs = cap.text();
+    }
+    CHECK(outcome == InventoryIngestOutcome::kError);
+    CHECK(logs.find("digest_provider_failed") != std::string::npos);
+    CHECK(logs.find("stage=digest") != std::string::npos);
+
+    // Nothing partially stored: statuses, counts and digests are the first generation's.
+    CHECK(persisted_digests(pool, "agent-dp") == digests_before);
+    CHECK(persisted_row_counts(pool, "agent-dp") == counts_before);
+    auto after = store.get_device_ci_with_sections("agent-dp");
+    REQUIRE(after.has_value());
+    REQUIRE_FALSE(after->sections_failed);
+    REQUIRE(after->record.has_value());
+    CHECK(DeviceInventoryStore::canonical_hash(*after->record) ==
+          DeviceInventoryStore::canonical_hash(*before->record));
+    CHECK(after->record->sections.size() == before->record->sections.size());
+    CHECK(served_section(store, "agent-dp", "cpu")["complete"] == true);
+    CHECK(served_section(store, "agent-dp", "cpu")["rows"].size() == 3);
+    CHECK(served_section(store, "agent-dp", "dimm")["rows"].size() == 2);
+
+    // The provider is healthy again: the same replace now stores (the abort left no lock or state).
+    REQUIRE(put_record(store, "agent-dp", second) == InventoryIngestOutcome::kStored);
+    CHECK(served_section(store, "agent-dp", "dimm")["rows"].size() == 4);
+}

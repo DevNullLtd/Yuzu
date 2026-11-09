@@ -1786,6 +1786,35 @@ TEST_CASE("verify_section_content: a count mismatch is reported alone and wins o
     CHECK(verify_section_content(n).reason == "server:content_digest_mismatch");
 }
 
+namespace {
+// A provider that always fails, as sha256_hex does when EVP_Digest returns an error (#7163).
+std::optional<std::string> failing_digest(std::string_view) {
+    return std::nullopt;
+}
+} // namespace
+
+// #7163: the reader's provider-failure branch, reached through the DigestFn seam. A section whose
+// stored digest is intact must NEVER be served ok when the server cannot recompute the digest.
+TEST_CASE("verify_section_content: a failing digest provider is never served ok",
+          "[hardware][model][sections][digest]") {
+    const auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+    REQUIRE(verify_section_content(s).level == "ok"); // the default provider verifies it
+    const auto v = verify_section_content(s, &failing_digest);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:content_digest_mismatch");
+    // An already-constrained section keeps its level and tokens and gains the digest token.
+    const auto c = digested_section("cpu", "constrained", "server_cap:2", cpu_rows(2));
+    const auto cv = verify_section_content(c, &failing_digest);
+    CHECK(cv.level == "constrained");
+    CHECK(cv.reason == "server_cap:2;server:content_digest_mismatch");
+    // A section that needs no digest is not touched by a failing provider.
+    auto none = digested_section("cpu", "ok", "", cpu_rows(2));
+    none.content_digest.reset();
+    CHECK(verify_section_content(none, &failing_digest).level == "ok");
+    auto denied = digested_section("cpu", "permission_denied", "x", {});
+    CHECK(verify_section_content(denied, &failing_digest).level == "permission_denied");
+}
+
 // Kills: verifying (or downgrading) a section that has no stored digest - the pre-feature path.
 TEST_CASE("verify_section_content: a NULL digest leaves the section as the count rule left it",
           "[hardware][model][sections][digest]") {

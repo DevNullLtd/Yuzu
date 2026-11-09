@@ -39,6 +39,7 @@
 /// (`sha256_hex`), which reports failure rather than returning a zero digest.
 
 #include "device_ci_kinds.hpp"
+#include "digest_fn.hpp"
 #include "sha256_hex.hpp"
 
 #include <cstddef>
@@ -150,9 +151,14 @@ inline constexpr std::size_t kMaxDigestLayoutDigits = 6;
 /// column count always come from the registry. nullopt when the digest provider fails. Callers
 /// treat nullopt as "cannot verify": the writer aborts the ingest (never stores a section without
 /// its digest by accident), the reader serves the section as a mismatch.
+/// `digest` is the provider (#7163): production callers take the default (`sha256_hex`); a test
+/// passes a failing one to reach the provider-failure branches.
 [[nodiscard]] inline std::optional<std::string>
-section_content_digest(const DeviceCiSectionDef& def, const std::vector<std::vector<std::string>>& rows) {
-    auto hex = sha256_hex(section_content_preimage(def.section, static_cast<std::size_t>(def.n_fields), rows));
+section_content_digest(const DeviceCiSectionDef& def,
+                       const std::vector<std::vector<std::string>>& rows,
+                       DigestFn digest = &sha256_hex) {
+    auto hex =
+        digest(section_content_preimage(def.section, static_cast<std::size_t>(def.n_fields), rows));
     if (!hex)
         return std::nullopt;
     std::string out{kSectionDigestPrefix};

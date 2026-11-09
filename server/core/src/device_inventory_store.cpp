@@ -586,7 +586,8 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             const std::size_t ncol = cols.size();
             // Computed from exactly what is about to be stored (short rows pad, long rows
             // truncate to the registry's columns - the same rule the INSERT applies below).
-            const auto digest = section_content_digest(def, sec.rows);
+            const auto digest =
+                section_content_digest(def, sec.rows, digest_fn_ ? digest_fn_ : &sha256_hex);
             if (!digest) {
                 const bool failed = fail("digest");
                 fail_err = "digest_provider_failed"; // no libpq statement failed: name the cause

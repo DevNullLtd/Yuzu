@@ -1004,6 +1004,10 @@ SectionVerdict verify_section_row_count(const DeviceCiSection& section) {
 }
 
 SectionVerdict verify_section_content(const DeviceCiSection& section) {
+    return verify_section_content(section, &sha256_hex);
+}
+
+SectionVerdict verify_section_content(const DeviceCiSection& section, DigestFn digest) {
     SectionVerdict v = verify_section_row_count(section);
     if (row_count_disagrees(section))
         return v; // the count already reports the loss; a lost row always changes the digest too
@@ -1017,7 +1021,7 @@ SectionVerdict verify_section_content(const DeviceCiSection& section) {
     const auto idx = device_ci_section_index(section.kind);
     if (!idx || kDeviceCiSections[*idx].table == nullptr)
         return v; // not a table-backed registered kind: no digest to compare
-    const auto computed = section_content_digest(kDeviceCiSections[*idx], section.rows);
+    const auto computed = section_content_digest(kDeviceCiSections[*idx], section.rows, digest);
     if (computed.has_value() && *computed == *section.content_digest)
         return v;
     downgrade_with(v, kSectionContentDigestMismatchReason);

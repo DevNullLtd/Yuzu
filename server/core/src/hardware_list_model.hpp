@@ -21,6 +21,7 @@
 #include "authz_model.hpp"                // authz::VisibleSet
 #include "device_containment_render.hpp" // kContainmentUi
 #include "device_inventory_types.hpp"    // DeviceCiRecord, CiReadError
+#include "digest_fn.hpp"                 // DigestFn (the verify seam; no OpenSSL here)
 #include "inventory_types.hpp"           // InventoryDeviceRow
 #include "offline_endpoint_types.hpp"    // OfflineEndpoint, PresenceReadError, OfflineRosterRead
 #include "software_inventory_types.hpp"  // SoftwareEntry
@@ -287,6 +288,11 @@ inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:
 /// child tables can also rewrite the digest, so this is not tamper resistance. The digest covers
 /// the rows only, not the level or reason columns.
 [[nodiscard]] SectionVerdict verify_section_content(const DeviceCiSection& section);
+
+/// The same function with an injectable digest provider (#7163). The one-argument form above
+/// passes `sha256_hex`; only a test passes anything else, to drive the "provider failed" branch.
+[[nodiscard]] SectionVerdict verify_section_content(const DeviceCiSection& section,
+                                                    DigestFn digest);
 
 inline constexpr std::size_t kHwSoftwareCap = 2000;
 
