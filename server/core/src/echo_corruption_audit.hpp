@@ -22,9 +22,12 @@
  * kEchoCorruptionAuditMinRowInterval seconds PER SERVER PROCESS (in-memory; a
  * restart or another HA node opens a fresh window). Intermediate quarantines
  * inside one window collapse to the newest identity, which persists in the
- * agent's `last` tag and logs on the first heartbeat after the window. A
- * degraded audit store is probed at most once per
- * kEchoCorruptionAuditDegradedRetry seconds gate-wide.
+ * agent's `last` tag and logs on the first heartbeat after the window. Once a
+ * lookup or write has reported the audit store degraded, no lookup runs until
+ * kEchoCorruptionAuditDegradedRetry seconds have passed (gate-wide: a degraded
+ * store is a store property). The probes that follow the window are per admitted
+ * agent, bounded by the ingest threads, and the first one to fail re-opens the
+ * window.
  *
  * Reservation contract: a true from should_log() reserves that AGENT's
  * in-flight slot (a set of agent ids, bounded by kMaxAgents: at the bound a
@@ -215,8 +218,10 @@ public:
     /// Lifetime rule: `agent_id` is referenced, not copied (the constructor stays
     /// noexcept and non-allocating), so it must outlive the Reservation. At the one
     /// production site (the server.cpp corruption sink) it is the sink lambda's
-    /// parameter, which outlives the scoped reservation. A temporary is rejected at
-    /// compile time (the deleted rvalue overload below).
+    /// parameter, which outlives the scoped reservation. A non-const rvalue (a string
+    /// literal, a std::string&&) is rejected at compile time (the deleted rvalue
+    /// overload below); a const prvalue would still bind the const-lvalue overload,
+    /// so the lifetime rule is the caller's to keep.
     class Reservation {
     public:
         Reservation(EchoCorruptionAuditGate& gate, const std::string& agent_id) noexcept

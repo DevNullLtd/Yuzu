@@ -2184,6 +2184,49 @@ TEST_CASE("EchoCorruptionAuditGate: a second call for the same agent while its l
     gate.mark_logged("c", "3:h");
 }
 
+TEST_CASE("EchoCorruptionAuditGate: a degraded store is probed once per admitted agent; the first "
+          "failure re-opens the gate-wide window (#5033)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int lookups = 0;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate* gp = nullptr;
+    bool reenter = true;
+    bool inner_b = true, inner_c = true;
+    int lookups_after_b = 0;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            if (reenter) {
+                reenter = false;
+                inner_b = gp->should_log("b", "2:g"); // distinct agent: admitted, probes too
+                lookups_after_b = lookups;
+                inner_c = gp->should_log("c", "3:h"); // b's failure already re-opened the window
+            }
+            return std::optional<std::optional<std::string>>{}; // degraded store
+        },
+        [&] { return clock; });
+    gp = &gate;
+
+    // Both distinct agents enter latest_() inside one degraded interval (the stated bound is
+    // per admitted agent, not one probe gate-wide) ...
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK_FALSE(inner_b);
+    CHECK(lookups_after_b == 2);
+    // ... but the first nullopt re-opened the window, so a third agent is refused without a
+    // lookup, from inside a's still-in-flight probe and afterwards.
+    CHECK_FALSE(inner_c);
+    CHECK(lookups == 2);
+    CHECK_FALSE(gate.should_log("c", "3:h"));
+    CHECK(lookups == 2);
+    // After the window the next probe runs again (and re-opens it on failure).
+    clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(gate.should_log("c", "3:h"));
+    CHECK(lookups == 3);
+    CHECK_FALSE(gate.should_log("d", "4:i"));
+    CHECK(lookups == 3);
+}
+
 TEST_CASE("EchoCorruptionAuditGate: the in-flight set refuses at the bound, never evicts",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;

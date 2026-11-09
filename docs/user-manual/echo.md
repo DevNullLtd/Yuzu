@@ -448,8 +448,10 @@ minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
 identity) — see the audit-log reference. Agents are no longer serialised against
 each other, so a quarantine that hits many devices at once produces each device's
-audit row on its own next heartbeat; only a repeat report from a device whose
-lookup is already in flight is deferred. A plugin that failed to initialise
+audit row on its own next heartbeat while the audit store is healthy; a repeat
+report from a device whose lookup is already in flight, a report arriving inside
+the 60 s back-off after a failed lookup or write, or one arriving while the
+in-flight set is at capacity, is deferred to a later heartbeat. A plugin that failed to initialise
 (including Echo when the corrupt file cannot be moved aside) is reported
 in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". The plugin keeps its
