@@ -51752,7 +51752,7 @@ TEST_CASE("MCP result-sets: a NUL in sql, an instruction parameter or parent_id 
 // The direct create is Infrastructure:Write (supervised tier, as the sibling NUL-name test).
 // A NUL in `name` or `parent_id` is refused as invalid params and audited as denied with the
 // caller's source_kind; no row is stored.
-TEST_CASE("MCP result-sets: create_result_set audits a NUL name or parent_id as denied",
+TEST_CASE("MCP result-sets: create_result_set audits a NUL name, source_kind or parent_id as denied",
           "[pg][mcp][integration][result-sets][validation]") {
     McpTestServer ts;
     yuzu::test::ExecutionTrackerPg tracker_bundle;
