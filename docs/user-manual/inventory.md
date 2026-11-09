@@ -28,7 +28,9 @@ cadences.
   that answers "unsupported on this OS", is reported `not_collected` (tokens `not_loaded` and
   `unsupported`). An action that fails (a non-zero exit, `rc=<n>`; truncated output, `truncated`; a
   `constrained` or malformed status row or an `unavailable` answer, the status tokens; a typed result
-  completeness of `PARTIAL`, the plugin's provenance token; no feature rows from
+  completeness of `PARTIAL`, the plugin's provenance token, or none declared at all, `unknown`
+  (never read as complete; counted in the heartbeat tag
+  `yuzu.sync.installed_software.completeness_unknown_total`); no feature rows from
   `windows_optional_features`; or no applications at all from `installed_apps`, `no_rows`) is
   reported `constrained` with that token and contributes **no rows**: the server keeps the source's
   last confirmed rows and shows them as unconfirmed until a later `full` section confirms them, so a
@@ -39,7 +41,9 @@ cadences.
   running from an earlier day is reported `timeout` with token `busy` and is not started twice; when a
   worker cannot be started the token is `rejected`; a source whose rows exceed 20,000, or whose full
   section cannot fit in one report, is `oversize` (`rows=<n>`, `bytes=<n>`) and sends no rows. A
-  status-only section is sent again each day it persists, so a changed reason reaches the server. The
+  status-only section is sent when its status or token changes, and again after Sync now or a server
+  request for the source, not every day it persists: a host with sources its OS cannot collect still
+  sends the report hash alone on a quiet day. The
   source no longer skips a report, so it no longer publishes the
   `yuzu.sync.installed_software.skip_streak` and `yuzu.sync.installed_software.last_skip` heartbeat
   tags (the other sources still do); a failing source is its section's status and token instead. Every row's
@@ -542,14 +546,15 @@ whole source name.
   `hardware`, 60 s for the rest), so one plugin that hangs costs its own section only, and it is
   not started again while the earlier run is still going (`busy`). A first report larger than one
   call (20,000 rows or 3 MiB) is split across successive calls 30 seconds apart. A source whose
-  rows alone cannot fit in one report is `oversize` and sends no rows. Sync now, a server request
-  for the whole source and the weekly safety net each resend every section in full.
+  rows alone cannot fit in one report is `oversize` and sends no rows. Sync now and a server request
+  for the whole source resend every section in full; there is no weekly full resend of this report,
+  because a section that has drifted is refused by the server and asked for again on its own.
 - **Hash-skip.** If a device's installed software hasn't changed since its last
   successful sync, the agent sends only a small **content hash** (the `v3:` report hash, over the
   sections it holds) instead of any section. The server replies asking for the full list only when it can't match
-  the hash (e.g. a fresh/restored server). A full list is also sent at least once
-  a week regardless, as a safety net (up to 8 days for the nightly window, across
-  a spring-forward clock change).
+  the hash (e.g. a fresh/restored server). Unlike the other sources, the installed-software
+  report has no weekly full resend: the server checks every delta against the section it holds
+  and asks for the full section again when they differ.
 - **Resilient.** Sync state is kept on the agent and survives reconnects and
   reboots; a failed sync simply retries on the next cycle.
 
@@ -1113,7 +1118,8 @@ collected actions failed, and a failure now affects only that source's section: 
 sources are reported as usual and the failing source keeps its last good rows (nothing is
 deleted; they read as unconfirmed). The section's token names the cause:
 `rc=<n>` or `truncated` (the action exited non-zero or its output was cut at the capture cap),
-the action's own status tokens, the plugin's provenance token for a typed `PARTIAL` result, `bad_status`
+the action's own status tokens, the plugin's provenance token for a typed `PARTIAL` result, `unknown`
+(the plugin declared no completeness at all, so its rows are not trusted as complete), `bad_status`
 (a malformed status row), `no_rows` (an empty `installed_apps` listing: never reported as
 "everything uninstalled"), `timeout` (the action did not return within its limit; the worker is left
 to finish), `busy` (an earlier run is still going), `rejected` (no worker could be started), and

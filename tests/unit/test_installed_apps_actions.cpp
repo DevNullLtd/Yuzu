@@ -312,6 +312,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     std::size_t pkg_bad_ecosystem = 0, pkg_non_numeric_date = 0;
     std::size_t publisher_without_signature = 0;
     std::size_t apps_with_location = 0;
+    std::size_t relative_locations = 0;
 
     std::istringstream iss(result.captured);
     std::string line;
@@ -352,8 +353,11 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
             ++app_rows;
             // A macOS app row carries its .app path as install_location when system_profiler
             // reported a Location (a pkgutil receipt has none).
-            if (!f[13].empty())
+            if (!f[13].empty()) {
                 ++apps_with_location;
+                if (f[13].front() != '/')
+                    ++relative_locations;
+            }
             if (signature == "signed")
                 ++signed_apps;
             else if (signature == "unsigned")
@@ -380,7 +384,11 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     CHECK(bad_field_count == 0);
     CHECK(bad_sig_value == 0);
     CHECK(publisher_without_signature == 0);
-    CHECK(apps_with_location > 0);
+    // A location is whatever system_profiler reported for the host's apps (the sync writer blanks
+    // a per-user one), so how many rows carry one depends on the host and is only reported; the
+    // shape every one must have is the contract.
+    INFO("apps with an install_location: " << apps_with_location);
+    CHECK(relative_locations == 0);
 
     // The #2273 enrichment actually ran and populated the previously
     // always-empty fields.

@@ -63,10 +63,18 @@ struct SyncSource {
     /// compile-time default per source: no settings channel pushes it yet.
     std::optional<SyncWindow> window;
 
+    /// Exempt this source from the weekly forced full (kFullFloor). Only for a source whose
+    /// payload heals divergence by itself, section by section: installed_software (blob v3)
+    /// names the facets it holds in its report hash, and the server refuses a delta over a base
+    /// that no longer matches (`installed_software:<facet>` nack -> that facet is resent in
+    /// full), so a weekly blanket resend of every facet would only add load. A force, a whole-source
+    /// nack and a never-acknowledged hash still send full.
+    bool no_full_floor{false};
+
     /// A source that keeps its own per-section state (installed_software, blob v3) is told when
     /// the scheduler is about to send FULL regardless of what it collects: the operator forced
     /// the source (request_now), the server nacked it (force_full), no hash has ever been
-    /// acknowledged, or the weekly floor is due. Called on the ticking thread immediately
+    /// acknowledged, or the weekly floor is due (never for a no_full_floor source). Called on the ticking thread immediately
     /// BEFORE collect(), in both tick passes, so a forced send always carries a full payload.
     /// Unset for every other source.
     std::function<void()> on_force_full;
@@ -150,7 +158,8 @@ public:
     static constexpr std::string_view kAllSources{"all"};
 
     /// Hard floor: even with hash-skip, send a full payload at least this often
-    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4). A
+    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4), except
+    /// for a source that sets SyncSource::no_full_floor. A
     /// windowed source fires at a local-time moment, so across a spring-forward the 7th
     /// day's fire is an hour short of this floor and the full send lands on the 8th.
     static constexpr std::chrono::seconds kFullFloor{7 * 24 * 60 * 60};
@@ -233,7 +242,7 @@ private:
     /// force or a server nack, no acknowledged hash yet, or the weekly floor. Computed BEFORE
     /// collect() so a source can be told (SyncSource::on_force_full) and is therefore
     /// guaranteed to produce a full payload whenever decide_full will ask for one.
-    bool forced_full_due(const State& st, std::int64_t now_secs) const;
+    bool forced_full_due(std::size_t idx, const State& st, std::int64_t now_secs) const;
     /// Hash-skip decision for one source at `now_secs`, given its freshly
     /// collected `hash` — factored out of tick() so the forced-source (pass 1)
     /// and batched (pass 2) paths make the identical decision.
@@ -295,6 +304,26 @@ void emit_sync_skip_tags(TagMap& tags, const std::vector<std::string>& sources,
         tags["yuzu.sync." + name + ".skip_streak"] = *streak;
         tags["yuzu.sync." + name + ".last_skip"] = *reason;
     }
+}
+
+/// Publish the installed_software collector's count of answers that declared no completeness
+/// (sync_software_completeness_unknown_total) as the heartbeat tag
+/// `yuzu.sync.installed_software.completeness_unknown_total`, read from the `__sync__` KV the
+/// collector persists it in. Emitted only for a positive value of at most nine ASCII digits; no
+/// protobuf field is added (#1567), the same pattern as emit_sync_skip_tags.
+template <typename TagMap>
+void emit_sync_completeness_unknown_tag(
+    TagMap& tags,
+    const std::function<std::optional<std::string>(const std::string& key)>& get_fn) {
+    const auto total = get_fn(SyncScheduler::kv_key("installed_software", "completeness_unknown_total"));
+    if (!total || total->empty() || total->size() > 9)
+        return;
+    for (char c : *total) {
+        if (c < '0' || c > '9')
+            return;
+    }
+    if (std::stol(*total) > 0)
+        tags["yuzu.sync.installed_software.completeness_unknown_total"] = *total;
 }
 
 } // namespace yuzu::agent

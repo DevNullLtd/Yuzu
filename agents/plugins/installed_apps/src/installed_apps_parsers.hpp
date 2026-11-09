@@ -416,6 +416,13 @@ constexpr long kErrorNoMoreItems = 259;
     return HiveRead::failed;
 }
 
+// Whether one root's read degrades the whole walk: only a failed read, and only on a root that is
+// machine scope. The agent identity's own HKCU is per-user data, so its failure is logged
+// (WalkResult::failed_roots) but never degrades the machine-scope collection.
+[[nodiscard]] constexpr bool walk_degrades(HiveRead read, bool root_degrades_walk) noexcept {
+    return read == HiveRead::failed && root_degrades_walk;
+}
+
 // ── Degraded-acquisition contract (every OS) ────────────────────────────────
 // ONE place declares what a degraded acquisition looks like to the caller, so
 // list / query / list_per_user / list_inventory cannot drift. Templated on the

@@ -697,6 +697,18 @@ TEST_CASE("classify_reg_status: absent only when the root allows it; all else no
     CHECK(classify_reg_status(kErrorMoreData, true) == HiveRead::failed);
 }
 
+TEST_CASE("walk_degrades: only a failed read of a root that degrades the walk does",
+          "[installed_apps]") {
+    // The own-HKCU root (degrades_walk = false) logs a failure and never degrades; a machine-scope
+    // root degrades on a failure and on nothing else.
+    for (const HiveRead r : {HiveRead::ok, HiveRead::absent}) {
+        CHECK_FALSE(walk_degrades(r, true));
+        CHECK_FALSE(walk_degrades(r, false));
+    }
+    CHECK(walk_degrades(HiveRead::failed, true));
+    CHECK_FALSE(walk_degrades(HiveRead::failed, false));
+}
+
 namespace {
 // Recording stand-in for yuzu::CommandContext: the degraded-acquisition helpers
 // are templated on the context so this pins the contract with no plugin load.

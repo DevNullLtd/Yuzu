@@ -1470,8 +1470,11 @@ collector in `sync_source_installed_software.cpp`.
 the `source` of every row in it. A source that answered in full is `full` the first time and after
 any `need_full`, then a `delta` against the last acknowledged set, and no section at all while its set
 is unchanged; any other answer is a status-only section (`constrained`, `timeout`, `oversize`,
-`not_collected`) that costs only that source. The sources run one at a time, in the collector's table
-order, so a single detached worker is in flight at any moment.
+`not_collected`) that costs only that source. A status-only section is sent when its status and token
+differ from the ones the server last acknowledged for that source, and not again while they stay the same
+(memory only: a restart costs one resend, which the server's upsert makes harmless), so a host with
+sources its OS cannot collect still sends the report hash alone on a quiet day. The sources run one at a
+time, in the collector's table order, so a single detached worker is in flight at any moment.
 
 **Rows.** A `+` record is the 16 wire slots of the stored form: every field through `clamp_field` (scrub to
 UTF-8, clamp to 1,024 bytes on a codepoint boundary, then strip 0x1F, 0x1E and NUL, the one preparation
@@ -1509,13 +1512,22 @@ those it sent `full` or `delta`.
 **Acknowledgement and forced sends.** The scheduler matches a nack token that equals the source name or
 starts with `<name>:`. The whole-source token marks every facet `need_full` and makes the next send
 full (`SyncSource::on_force_full`, called before `collect()` in both tick passes whenever the
-scheduler is about to send full: `request_now`, a whole-source nack, no acknowledged hash yet, or the
-weekly floor, so a forced blob always carries a full section per facet and never a header-only blob,
-which the server's parser refuses). A per-section token (`installed_software:<facet>`) marks only that
+scheduler is about to send full: `request_now`, a whole-source nack or no acknowledged hash yet, so a
+forced blob always carries a full section per facet, and every status-only section again, and never a
+header-only blob, which the server's parser refuses). A per-section token (`installed_software:<facet>`) marks only that
 facet `need_full`; the scheduler does not force the other facets. `SyncSource::wants_blob` is OR-ed into
 the full decision after the hash comparison and is true whenever a collection wrote any section, so a
 status or token change reaches the server although the held-facet hash did not move; on a quiet pass it
-is false and the report is the hash alone. The weekly floor is therefore a full resend of every facet.
+is false and the report is the hash alone.
+
+**No weekly full resend (`SyncSource::no_full_floor`).** The source is exempt from the scheduler's 7-day
+full floor (roadmap R3: no weekly forced full for v3); a force, a whole-source nack and a
+never-acknowledged hash still send full. Divergence heals without a floor: the server recomputes each
+section's hash after every apply and refuses a delta over a base that no longer matches, answering
+`installed_software:<facet>`, which the agent resends in full, and a facet with no acknowledged hash is
+always sent in full. The report hash covers only the facets the agent holds, so a facet the server lost is
+named by the next mismatch. A per-source pause knob to restore the weekly full temporarily is not built:
+nothing measures the `need_full` rate yet, and the exemption is one flag on the source.
 
 **First contact larger than a call.** A call carries at most 20,000 `+`, 20,000 `-`, 20,000 `comp` and 3 MiB.
 Status-only sections are written first, then row-bearing sections in table order; one that would cross
@@ -1544,7 +1556,10 @@ reconnect waits up to the limit.
 
 **Retired policies.** `ConstrainedPolicy`, `accept_partial` and the `withheld` status are removed.
 Every degraded answer is a status-only section: a non-zero return, a truncated capture, a
-`constrained` status row, a typed PARTIAL completeness (the provenance is the token) and an
+`constrained` status row, a typed PARTIAL completeness (the provenance is the token), an answer that
+declared no completeness at all (UNKNOWN is never read as FULL: token `unknown`, counted in the
+heartbeat tag `yuzu.sync.installed_software.completeness_unknown_total`; every plugin of the table
+declares `OK`/`FULL` on a clean pass, so this fires only for a plugin that stopped declaring) and an
 `installed_apps` listing with no rows (`no_rows`; never a deleting `full`). The server keeps the facet's rows
 and reads them as unconfirmed (R23) until a `full` section confirms them again. This changes what a
 constrained `runtimes.python` or `middleware.ibm_mq` read does (the rows were removed under v2) and what a

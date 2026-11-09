@@ -2758,12 +2758,14 @@ public:
                                     std::lock_guard<std::mutex> lk(sync_sched_mu_);
                                     sched = sync_scheduler_;
                                 }
-                                if (sched && kv_store_)
-                                    yuzu::agent::emit_sync_skip_tags(
-                                        tags, sched->source_names(),
-                                        [this](const std::string& k) {
-                                            return kv_store_->get(kSyncKvNamespace, k);
-                                        });
+                                if (sched && kv_store_) {
+                                    const auto sync_kv = [this](const std::string& k) {
+                                        return kv_store_->get(kSyncKvNamespace, k);
+                                    };
+                                    yuzu::agent::emit_sync_skip_tags(tags, sched->source_names(),
+                                                                     sync_kv);
+                                    yuzu::agent::emit_sync_completeness_unknown_tag(tags, sync_kv);
+                                }
                             } catch (const std::exception& e) {
                                 spdlog::warn("Heartbeat plugin-tag bridge failed: {}", e.what());
                             } catch (...) {

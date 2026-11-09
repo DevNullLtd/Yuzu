@@ -17,6 +17,7 @@
 #include "runtimes_parsers.hpp"
 #include "runtimes_python_parsers.hpp"
 #include "sync_source_installed_software.hpp"
+#include "test_helpers.hpp" // ScopeExit
 #include "windows_optional_features_parsers.hpp"
 
 #include <inventory_status_row.hpp>
@@ -522,6 +523,78 @@ TEST_CASE("SyncScheduler: weekly full-floor resends a full payload even when unc
     // Past last_full + kFullFloor, still unchanged → the next sync is a forced FULL.
     live_advance(sched, floor_at, floor_at + 86400 + 1, [&] { return last_had_blob; });
     CHECK(last_had_blob);
+}
+
+TEST_CASE("SyncScheduler: a no_full_floor source stays hash-only past the weekly floor; a floor source "
+          "still resends",
+          "[sync][scheduler]") {
+    for (const bool exempt : {true, false}) {
+        INFO("no_full_floor = " << exempt);
+        std::map<std::string, std::string> kv;
+        auto g = [&](const std::string& k) {
+            auto it = kv.find(k);
+            return it == kv.end() ? std::string{} : it->second;
+        };
+        auto s = [&](const std::string& k, const std::string& v) { kv[k] = v; };
+        int calls = 0;
+        bool last_had_blob = false;
+        auto sender = [&](const std::vector<std::pair<std::string, std::string>>&,
+                          const std::vector<std::pair<std::string, std::string>>& blobs)
+            -> std::optional<std::vector<std::string>> {
+            ++calls;
+            last_had_blob = !blobs.empty();
+            return std::vector<std::string>{};
+        };
+        SyncSource src;
+        src.name = "installed_software";
+        src.interval = std::chrono::seconds{86400};
+        src.no_full_floor = exempt;
+        src.collect = []() -> std::optional<std::pair<std::string, std::string>> {
+            return std::make_pair(std::string{"b"}, std::string{"h"}); // never changes
+        };
+        SyncScheduler sched("agent-nofloor", g, s, sender);
+        sched.add_source(src);
+
+        sched.tick(1000);
+        sched.tick(1000 + 700); // first send → FULL (last_full = 1700)
+        REQUIRE(calls == 1);
+        REQUIRE(last_had_blob);
+
+        // Walk the clock the way the live agent does, to a day past the weekly floor.
+        bool blob_after_first = false;
+        std::int64_t t = 1700;
+        const std::int64_t end = 1700 + SyncScheduler::kFullFloor.count() + 86400 + 1;
+        while (t < end) {
+            const int before = calls;
+            t = std::min(t + SyncScheduler::kMaxTickSeconds.count(), end);
+            sched.tick(t);
+            blob_after_first = blob_after_first || (calls != before && last_had_blob);
+        }
+        CHECK(blob_after_first == !exempt);
+    }
+}
+
+TEST_CASE("emit_sync_completeness_unknown_tag publishes only a positive count of at most nine digits",
+          "[sync][scheduler]") {
+    const auto tag = [](std::optional<std::string> v) {
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_sync_completeness_unknown_tag(
+            tags, [&v](const std::string& k) -> std::optional<std::string> {
+                if (k == "sync.installed_software.completeness_unknown_total")
+                    return v;
+                return std::nullopt;
+            });
+        return tags;
+    };
+    CHECK(tag(std::nullopt).empty());
+    for (const char* bad : {"", "0", "abc", "-1", "1234567890", "1 2"}) {
+        INFO("value " << bad);
+        CHECK(tag(std::string(bad)).empty());
+    }
+    const auto t = tag(std::string("7"));
+    REQUIRE(t.size() == 1);
+    CHECK(t.at("yuzu.sync.installed_software.completeness_unknown_total") == "7");
+    CHECK(tag(std::string("999999999")).size() == 1);
 }
 
 TEST_CASE("SyncScheduler: collect returning nothing sends no RPC and retries next interval",
@@ -1328,6 +1401,11 @@ const V3Sec* find_sec(const std::vector<V3Sec>& secs, std::string_view facet) {
 
 // --- fake in-process plugins: canned output per action, test-set rc ---
 struct FakeOut {
+    // Dispatches of any action of this fake plugin (bumped on the worker thread).
+    std::atomic<int> calls{0};
+    // Actions that declare NO typed result (their completeness reads UNKNOWN). Every real plugin
+    // declares OK/FULL on a clean pass, so a fake does too unless it opts out here.
+    std::set<std::string> undeclared;
     std::map<std::string, std::string> out;
     std::map<std::string, std::string> overflow; // optional 2nd write, after `out`
     std::map<std::string, int> rc;
@@ -1341,6 +1419,7 @@ FakeOut g_fake[7]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_feat
 template <int I>
 int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
                  std::size_t /*param_count*/) {
+    ++g_fake[I].calls;
     const auto it = g_fake[I].out.find(action);
     if (it != g_fake[I].out.end())
         yuzu_ctx_write_output(ctx, it->second.c_str());
@@ -1351,6 +1430,8 @@ int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /
     if (rs != g_fake[I].result_status.end())
         yuzu_ctx_set_result_status(ctx, std::get<0>(rs->second), std::get<1>(rs->second),
                                    std::get<2>(rs->second).c_str());
+    else if (!g_fake[I].undeclared.contains(action))
+        yuzu_ctx_set_result_status(ctx, YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
     const auto rc = g_fake[I].rc.find(action);
     return rc == g_fake[I].rc.end() ? 0 : rc->second;
 }
@@ -1390,6 +1471,8 @@ void reset_fakes() {
         f.overflow.clear();
         f.rc.clear();
         f.result_status.clear();
+        f.undeclared.clear();
+        f.calls = 0;
     }
     // runtimes.python, .dotnet and .jvm default to a clean empty read (the sample-shaped runs below
     // pin digests that carry none of their rows); the runtimes cases override them.
@@ -2503,15 +2586,52 @@ TEST_CASE("collector: a constrained managers answer is status-only, even beside 
     CHECK(got->second == yuzu::agent::v3_report_hash(held));
 }
 
-TEST_CASE("collector: typed completeness - FULL and an undeclared answer collect; PARTIAL does not; "
-          "in-band unsupported wins",
+TEST_CASE("collector: typed completeness - FULL collects; UNKNOWN is constrained `unknown` and "
+          "counted; PARTIAL does not collect; in-band unsupported wins",
           "[sync][collector]") {
     constexpr auto kPartial = YUZU_RESULT_COMPLETENESS_PARTIAL;
+    const std::string kUnknownTotal = "sync.installed_software.completeness_unknown_total";
     SECTION("packages OK/FULL: collected") {
         fake_mac();
         g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_OK,
                                                YUZU_RESULT_COMPLETENESS_FULL, ""};
         CHECK(section_of(all_plugins(), "pkg_inventory.packages")->status == "full");
+    }
+    SECTION("packages that declare nothing (UNKNOWN): status-only `unknown`, rows withheld, counted") {
+        fake_mac();
+        g_fake[1].undeclared.insert("packages");
+        Collector c(all_plugins());
+        const auto got = c.collect();
+        REQUIRE(got.has_value());
+        const auto secs = sections_of(got->first);
+        const V3Sec* pk = find_sec(secs, "pkg_inventory.packages");
+        REQUIRE(pk != nullptr);
+        CHECK(pk->status == "constrained");
+        CHECK(pk->token == "unknown");
+        CHECK(pk->adds.empty());
+        // ...alone: the sibling action of the same plugin, which did declare, is collected.
+        CHECK(find_sec(secs, "pkg_inventory.managers")->status == "full");
+        CHECK(c.kv.at(kUnknownTotal) == "1");
+        // A pass inside the cooldown reuses the answer: the same observation is not counted twice.
+        c.ack();
+        REQUIRE(c.collect().has_value());
+        CHECK(c.kv.at(kUnknownTotal) == "1");
+        // A real re-dispatch that is UNKNOWN again counts again.
+        c.pass_cooldown();
+        REQUIRE(c.collect().has_value());
+        CHECK(c.kv.at(kUnknownTotal) == "2");
+    }
+    SECTION("PARTIAL is constrained but is not an UNKNOWN answer: not counted") {
+        fake_mac();
+        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_OK, kPartial, "x"};
+        Collector c(all_plugins());
+        const auto got = c.collect();
+        REQUIRE(got.has_value());
+        const V3Sec* pk = find_sec(sections_of(got->first), "pkg_inventory.packages");
+        REQUIRE(pk != nullptr);
+        CHECK(pk->status == "constrained");
+        CHECK(pk->token == "x");
+        CHECK(c.kv.count(kUnknownTotal) == 0);
     }
     SECTION("managers CONSTRAINED/PARTIAL with a present row: no opt-in, status-only") {
         fake_mac();
@@ -4601,7 +4721,8 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
     CHECK(by == expected);
 
     // Every action of the table is exercised: a new inventory action without a case here fails.
-    for (const auto& [plugin, action] : yuzu::agent::installed_software_actions()) {
+    for (const auto& [plugin, action, limit] : yuzu::agent::installed_software_actions()) {
+        static_cast<void>(limit);
         const std::string source = std::string(plugin) + "." + std::string(action);
         INFO(source);
         const bool seen = std::any_of(by.begin(), by.end(), [&](const auto& kv) {
@@ -4765,9 +4886,20 @@ constexpr const char* kFacetApps = "installed_apps.list_inventory";
 constexpr const char* kFacetPkgs = "pkg_inventory.packages";
 constexpr const char* kFacetPy = "runtimes.python";
 
+// A macOS-shaped host: the committed samples for the supported facets, and store_packages, msi, WOF
+// and the drivers inventory answering `unsupported`, so four facets are permanently status-only (as
+// on every real host, which always has facets its OS cannot collect).
+void fake_mac_host() {
+    fake_mac();
+    g_fake[5].out["ibm_mq"] = supported_status("ibm_mq") + "\n";
+    g_fake[6].out["drivers_inventory"] =
+        yuzu::shared::format_status_row("drivers_inventory", yuzu::shared::StatusLevel::unsupported,
+                                        "macos:no_enumeration_api") +
+        "\n";
+}
+
 // Every facet answers a clean read, so each is a FULL section: installed_apps carries three rows,
-// the rest are honest-empty. (A fake_mac() run leaves several facets status-only, which emit a
-// section every pass and so cannot show a quiet pass.)
+// the rest are honest-empty.
 void fake_all_supported() {
     reset_fakes();
     g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\ninv|beta|2.0|Acme\ninv|gamma|3.0|Acme\n";
@@ -4801,11 +4933,15 @@ std::size_t full_sections(const std::string& blob) {
 
 TEST_CASE("collector: an unchanged pass writes no section, keeps the report hash and asks for no blob",
           "[sync][collector][v3]") {
-    fake_all_supported();
+    // A real-shaped host: four facets are permanently status-only, and they are sent once.
+    fake_mac_host();
     Collector c(every_plugin());
     const auto first = c.collect_forced();
     REQUIRE(first.has_value());
-    CHECK(full_sections(first->first) == 11); // one full section per facet, none status-only
+    const auto sent = sections_of(first->first);
+    CHECK(sent.size() == 11); // one section per facet
+    CHECK(find_sec(sent, "msi_packages.list_inventory")->status == "not_collected");
+    CHECK(find_sec(sent, "hardware.drivers_inventory")->status == "not_collected");
     CHECK(c.src.wants_blob());
     c.ack();
 
@@ -4816,6 +4952,105 @@ TEST_CASE("collector: an unchanged pass writes no section, keeps the report hash
     CHECK(sections_of(second->first).empty());      // nothing changed: no section at all
     CHECK_FALSE(c.src.wants_blob());                // so the scheduler sends the hash alone
     CHECK_FALSE(c.src.has_more());
+}
+
+TEST_CASE("collector: a section header carries the measured bytes_read and a non-negative duration",
+          "[sync][collector][v3]") {
+    fake_all_supported();
+    // The oracle for what the collector captured: the same in-process fake, dispatched directly.
+    const std::string captured =
+        yuzu::agent::LocalDispatcher{}.run(&kFakeIa, "list_inventory").captured;
+    REQUIRE_FALSE(captured.empty());
+    Collector c(all_plugins()); // no middleware or hardware plugin: those two facets never run
+    const auto got = c.collect();
+    REQUIRE(got.has_value());
+    const auto secs = sections_of(got->first);
+    const V3Sec* apps = find_sec(secs, kFacetApps);
+    REQUIRE(apps != nullptr);
+    CHECK(apps->bytes_read == std::to_string(captured.size()));
+    // duration_ms is real-clock telemetry (excluded from every hash), so only its shape is pinned.
+    CHECK(std::stoll(apps->duration_ms) >= 0);
+    const V3Sec* never_ran = find_sec(secs, "hardware.drivers_inventory");
+    REQUIRE(never_ran != nullptr);
+    CHECK(never_ran->status == "not_collected");
+    CHECK(never_ran->bytes_read == "0");
+}
+
+TEST_CASE("collector: a status-only section is re-sent only on a change, a nack, a forced send or after "
+          "its facet returned rows",
+          "[sync][collector][v3]") {
+    fake_mac_host();
+    Collector c(every_plugin());
+    constexpr const char* kMsi = "msi_packages.list_inventory";
+    const auto statuses_only = [](const std::string& blob) {
+        std::vector<std::string> out;
+        for (const auto& sec : sections_of(blob)) {
+            if (sec.status != "full" && sec.status != "delta")
+                out.push_back(sec.facet);
+        }
+        return out;
+    };
+    REQUIRE(c.collect_forced().has_value());
+    c.ack();
+
+    SECTION("same status and token: quiet") {
+        c.pass_cooldown();
+        CHECK(statuses_only(c.collect()->first).empty());
+    }
+    SECTION("a changed status is a change: the section is sent again, then quiet") {
+        c.pass_cooldown();
+        g_fake[3].rc["list_inventory"] = 1; // not_collected -> constrained `rc=1`
+        const auto changed = c.collect();
+        REQUIRE(changed.has_value());
+        CHECK(statuses_only(changed->first) == std::vector<std::string>{kMsi});
+        CHECK(c.src.wants_blob());
+        c.ack();
+        c.pass_cooldown();
+        CHECK(statuses_only(c.collect()->first).empty());
+        // ...and a changed token on the same status is a change too.
+        c.pass_cooldown();
+        g_fake[3].rc["list_inventory"] = 2; // constrained `rc=2`
+        CHECK(statuses_only(c.collect()->first) == std::vector<std::string>{kMsi});
+    }
+    SECTION("a section that was never acknowledged is sent again") {
+        c.pass_cooldown();
+        g_fake[3].rc["list_inventory"] = 1;
+        REQUIRE(c.collect().has_value()); // not acknowledged (the send failed)
+        const auto retry = c.collect();   // inside the cooldown: the cached answer
+        CHECK(statuses_only(retry->first) == std::vector<std::string>{kMsi});
+    }
+    SECTION("a nack of that facet sends it again") {
+        c.pass_cooldown();
+        REQUIRE(c.collect().has_value());
+        c.ack({std::string("installed_software:") + kMsi});
+        const auto again = c.collect();
+        REQUIRE(again.has_value());
+        CHECK(statuses_only(again->first) == std::vector<std::string>{kMsi});
+    }
+    SECTION("a forced send carries every status-only section: never a header-only blob") {
+        c.pass_cooldown();
+        const auto forced = c.collect_forced();
+        REQUIRE(forced.has_value());
+        CHECK(statuses_only(forced->first) ==
+              std::vector<std::string>{"pkg_inventory.store_packages",
+                                       "windows_optional_features.list", kMsi,
+                                       "hardware.drivers_inventory"});
+        CHECK(full_sections(forced->first) == 7);
+    }
+    SECTION("the facet returning rows is full, and a later status change is sent") {
+        c.pass_cooldown();
+        g_fake[3].out["list_inventory"] = "status|list_inventory|supported|-\n";
+        const auto rows = c.collect();
+        REQUIRE(rows.has_value());
+        CHECK(find_sec(sections_of(rows->first), kMsi)->status == "full");
+        c.ack();
+        c.pass_cooldown();
+        g_fake[3].out["list_inventory"] =
+            msi::unsupported_status_row("macos:owned_by_installed_apps") + "\n";
+        const auto back = c.collect();
+        REQUIRE(back.has_value());
+        CHECK(statuses_only(back->first) == std::vector<std::string>{kMsi});
+    }
 }
 
 TEST_CASE("collector: one upgraded row is exactly one delta section with one - and one + and expect",
@@ -5053,21 +5288,32 @@ TEST_CASE("collector: a first contact over the per-call row cap is split across 
     CHECK(first->second == yuzu::agent::v3_report_hash(held));
     c.ack();
 
-    // The next collection (inside the cooldown: no plugin is dispatched again) sends the rest.
+    // The next collection sits inside the cooldown: no plugin is dispatched again, so the rest is
+    // built from the rows already collected. Prove it: the plugin's answer changes in between,
+    // and the dispatch counter must not move.
+    int dispatched_before = 0;
+    for (const auto& f : g_fake)
+        dispatched_before += f.calls.load();
+    REQUIRE(dispatched_before > 0);
+    std::string changed = supported_status("packages") + "\n";
+    for (int i = 0; i < 12000; ++i)
+        changed += pkg::format_package_row("g" + std::to_string(i), "9.9", pkg::PackageKind::formula) + "\n";
+    g_fake[1].out["packages"] = changed;
     const auto second = c.collect();
     REQUIRE(second.has_value());
+    int dispatched_after = 0;
+    for (const auto& f : g_fake)
+        dispatched_after += f.calls.load();
+    CHECK(dispatched_after == dispatched_before);
     const auto s2 = sections_of(second->first);
-    // The only row-bearing section is the deferred one (the absent plugins' status-only sections
-    // ride every pass).
-    std::vector<const V3Sec*> rows;
-    for (const auto& sec : s2) {
-        if (sec.status == "full" || sec.status == "delta")
-            rows.push_back(&sec);
-    }
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0]->facet == kFacetPkgs);
-    CHECK(rows[0]->status == "full");
-    CHECK(rows[0]->adds.size() == 12000);
+    // The only section is the deferred one: the absent plugins' status-only sections were
+    // acknowledged with the first collection and are not sent again.
+    REQUIRE(s2.size() == 1);
+    CHECK(s2[0].facet == kFacetPkgs);
+    CHECK(s2[0].status == "full");
+    REQUIRE(s2[0].adds.size() == 12000);
+    // ...and they are the CACHED rows ("f<n>" at 1.0), not the plugin's new answer ("g<n>").
+    CHECK(entries_of(s2[0]).front().version == "1.0");
     CHECK_FALSE(c.src.has_more());
 }
 
@@ -5083,6 +5329,7 @@ int blocking_execute(YuzuCommandContext* ctx, const char* /*action*/, const Yuzu
     ++g_blocking_entered;
     g_blocking_release.wait();
     yuzu_ctx_write_output(ctx, "inv|alpha|1.0|Acme\n");
+    yuzu_ctx_set_result_status(ctx, YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
     return 0;
 }
 const char* const kBlockingActions[] = {"list_inventory", nullptr};
@@ -5097,8 +5344,20 @@ TEST_CASE("collector: a blocked plugin times out alone, stays single-flight, and
     g_blocking_release_p = std::promise<void>{};
     g_blocking_release = g_blocking_release_p.get_future().share();
     CollectorTuning tuning;
-    tuning.time_limit = std::chrono::milliseconds{50}; // a blocked worker NEVER returns by itself
+    // Real-clock wait is the contract under test (a never-returning worker must be abandoned at
+    // its limit); bounded at 50 ms.
+    tuning.time_limit = std::chrono::milliseconds{50};
     Collector c({{"installed_apps", &kBlockingIa}}, tuning);
+    // Releases the parked worker on ANY exit, a failing REQUIRE included (the explicit release
+    // below sets `released`, so the guard never sets the promise twice).
+    bool released = false;
+    const auto release_worker = [&released] {
+        if (!released) {
+            released = true;
+            g_blocking_release_p.set_value();
+        }
+    };
+    const yuzu::test::ScopeExit guard{release_worker};
 
     const auto first = c.collect();
     REQUIRE(first.has_value());
@@ -5117,7 +5376,7 @@ TEST_CASE("collector: a blocked plugin times out alone, stays single-flight, and
     CHECK(c.workers->outstanding() == 1);
 
     // Release it; the flag clears when the worker physically returns.
-    g_blocking_release_p.set_value();
+    release_worker();
     CHECK(yuzu::agent::drain_collector_workers(*c.workers, std::chrono::seconds{10}, {}));
     CHECK(c.workers->outstanding() == 0);
     CHECK(g_blocking_entered.load() == 1);
@@ -5167,6 +5426,8 @@ TEST_CASE("the teardown barrier waits the grace for outstanding workers, then es
         CHECK_FALSE(stuck);
     }
     SECTION("one outstanding past the grace: the escalation hook runs with the count") {
+        // Real-clock wait is the contract under test (the barrier gives up after its grace);
+        // bounded at 60 ms.
         REQUIRE(w.try_begin("installed_apps.list_inventory"));
         std::size_t seen = 0;
         CHECK_FALSE(yuzu::agent::drain_collector_workers(w, std::chrono::milliseconds{60},

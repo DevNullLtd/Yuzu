@@ -4231,6 +4231,18 @@ test('agent __sync__.now wiring lexical gate',
   timeout: 30,
 )
 
+# Installed-software worker drain (SAM-15): the collector's detached workers must be drained
+# before any plugin is shut down, on BOTH agent.cpp teardown paths, and the single-flight state
+# must be the agent-owned object the factory receives. The unit tests cover the drain helper;
+# nothing runs the teardown, so this pins the call sites and the ownership. Carries its own
+# in-memory mutation self-test. No build required.
+test('agent installed-software drain wiring lexical gate',
+  _python3_test,
+  args: [files('test_installed_software_drain_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Command-dedup fleet telemetry (#3663): the agent's `yuzu.dedup_*` heartbeat tags and the
 # server's yuzu_fleet_agents_dedup_* table share no header (no upward server -> agent edge), so
 # nothing in the compiler binds them. This pins that every emitted tag has a server row and vice

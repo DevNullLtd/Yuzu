@@ -35,8 +35,8 @@ std::string facet_label(std::string_view facet) {
 // Input caps — the report is untrusted (security-guardian). A blob over the cap
 // is rejected (dropped + nacked); entries/fields beyond the cap are
 // dropped/truncated.
-// kMaxBlobBytes MUST equal the agent source's kMaxBlobBytes
-// (agents/core/src/sync_source_installed_software.cpp) — comment-coordinated, a
+// kMaxBlobBytes MUST equal the agent writer's kV3MaxBlobBytes
+// (agents/core/src/installed_software_v3.hpp) — comment-coordinated, a
 // one-sided bump reintroduces the agent-sends/server-drops tight loop (UP-7).
 // Set below the gRPC 4 MiB receive ceiling for the wire-framing reason
 // documented agent-side (UP-6).
@@ -72,7 +72,7 @@ static_assert(kMaxBlobBytes == kV3MaxBlobBytes && kMaxEntries == kV3MaxRows &&
 // (the documented mixed-version behaviour — an old agent's rows store with empty
 // trailing columns). Tokens beyond the 16th are dropped. The server hash covers
 // the tail only when package_id or source is non-empty (SoftwareInventoryStore::canonical_hash);
-// the agent-side builder (installed_software_canonical_blob) must mirror that. A
+// the agent-side writer (installed_software_v3.cpp, record_of) must mirror that. A
 // fully populated row is up to 4 x kMaxFieldLen bytes longer, so kMaxBlobBytes may
 // bind before kMaxEntries; the caps are deliberately unchanged here. nullopt only
 // when the blob exceeds the cap; an empty list is a legitimate "nothing here".
@@ -114,7 +114,7 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
                 std::string_view raw = rec.substr(p, f_end - p);
                 // Scrub to valid UTF-8 FIRST (governance UP-IN1), then truncate on a
                 // codepoint boundary. Both steps MUST match the agent's clamp_field
-                // (sync_source_installed_software.cpp) byte-for-byte — scrub before
+                // (sync_canonical.cpp, used by installed_software_v3.cpp) byte-for-byte — scrub before
                 // clamp, U+FFFD for any invalid byte — or the server-recomputed hash
                 // diverges from the agent's (governance UP-10 for the clamp half).
                 std::string f = sanitize_utf8_strict(raw);

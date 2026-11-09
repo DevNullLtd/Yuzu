@@ -168,11 +168,10 @@ WalkResult collect_uninstall_apps(std::span<const UninstallRoot> roots,
                                   const Ops& ops = Ops{}) {
     WalkResult out;
     for (std::size_t i = 0; i < roots.size(); ++i) {
-        if (enumerate_uninstall_key(roots[i], out.apps, ops) == HiveRead::failed) {
-            if (roots[i].degrades_walk)
-                out.degraded = true;
+        const HiveRead read = enumerate_uninstall_key(roots[i], out.apps, ops);
+        out.degraded = out.degraded || parsers::walk_degrades(read, roots[i].degrades_walk);
+        if (read == HiveRead::failed)
             out.failed_roots.push_back(i);
-        }
     }
     return out;
 }

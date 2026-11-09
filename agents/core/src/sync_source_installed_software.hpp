@@ -48,6 +48,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -211,9 +212,10 @@ YUZU_EXPORT AdaptedRows parse_middleware_output(const std::string& out, std::str
 YUZU_EXPORT AdaptedRows parse_hardware_drivers_inventory_output(const std::string& out,
                                                                 bool kernel_module_leg);
 
-/// The action table's (plugin, action) names in table order, as views into static literals —
-/// for the descriptor pin test (tests/unit/test_inventory_sync_action_table.cpp).
-YUZU_EXPORT std::vector<std::pair<std::string_view, std::string_view>> installed_software_actions();
+/// The action table's (plugin, action, time limit) in table order, the names as views into static
+/// literals — for the descriptor pin test (tests/unit/test_inventory_sync_action_table.cpp).
+YUZU_EXPORT std::vector<std::tuple<std::string_view, std::string_view, std::chrono::seconds>>
+installed_software_actions();
 
 /// Origin-label prefix of a publisher the source does not declare (`via:<ecosystem>`). MUST equal
 /// the server's kOriginLabelPrefix (product_normalize.hpp), which treats it as "no vendor"; the
@@ -287,11 +289,14 @@ struct CollectorTuning {
 ///     any nack, a row-hash `delta` against the last acknowledged set otherwise, nothing at all
 ///     when nothing changed;
 ///   - anything else a status-only section naming why: `constrained` (`rc=<n>`, `truncated`, the
-///     plugin's own status tokens, typed PARTIAL completeness, `no_rows` from installed_apps),
+///     plugin's own status tokens, typed PARTIAL completeness, `unknown` for an answer that
+///     declared no completeness at all, `no_rows` from installed_apps),
 ///     `timeout` (`timeout`, `busy` while an earlier worker of that facet is still inside the
 ///     plugin, `rejected` when no worker could be started), `oversize` (`rows=<n>` / `bytes=<n>`),
 ///     `not_collected` (`not_loaded`, or the plugin's own `unsupported` answer).
-/// The server keeps the rows of a facet it holds through any status-only section.
+/// A status-only section is sent when its {status, token} differs from the one the server last
+/// acknowledged for that facet, and not again while it stays the same. The server keeps the rows
+/// of a facet it holds through any status-only section.
 ///
 /// Each action runs on a bounded detached worker (agents/shared/bounded_wait.hpp), one at a
 /// time, under its table time limit. `workers` is the agent-owned single-flight state above;

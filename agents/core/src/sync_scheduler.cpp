@@ -275,8 +275,11 @@ std::vector<std::size_t> SyncScheduler::drain_pending(std::int64_t now_secs) {
     return valid;
 }
 
-bool SyncScheduler::forced_full_due(const State& st, std::int64_t now_secs) const {
+bool SyncScheduler::forced_full_due(std::size_t idx, const State& st, std::int64_t now_secs) const {
+    // A source that heals divergence per section (SyncSource::no_full_floor) is exempt from the
+    // weekly floor only; a force, a nack and a never-acknowledged hash still send full.
     const bool floor_due =
+        !sources_[idx].no_full_floor &&
         (now_secs - st.last_full) >= static_cast<std::int64_t>(kFullFloor.count());
     return st.force_full || st.last_hash.empty() || floor_due;
 }
@@ -284,7 +287,7 @@ bool SyncScheduler::forced_full_due(const State& st, std::int64_t now_secs) cons
 bool SyncScheduler::decide_full(std::size_t idx, const State& st, const std::string& hash,
                                 std::int64_t now_secs) const {
     const SyncSource& src = sources_[idx];
-    return forced_full_due(st, now_secs) || hash != st.last_hash ||
+    return forced_full_due(idx, st, now_secs) || hash != st.last_hash ||
            (src.wants_blob && src.wants_blob());
 }
 
@@ -373,7 +376,7 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
         handled[i] = true;
         const SyncSource& src = sources_[i];
         State& st = load_state(i, now_secs);
-        if (src.on_force_full && forced_full_due(st, now_secs))
+        if (src.on_force_full && forced_full_due(i, st, now_secs))
             src.on_force_full();
         auto collected = src.collect ? src.collect() : std::nullopt;
         if (!collected) {
@@ -419,7 +422,7 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
         if (now_secs < st.next_fire)
             continue;
 
-        if (src.on_force_full && forced_full_due(st, now_secs))
+        if (src.on_force_full && forced_full_due(i, st, now_secs))
             src.on_force_full();
         auto collected = src.collect ? src.collect() : std::nullopt;
         if (!collected) {

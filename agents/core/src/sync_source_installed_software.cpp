@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -658,10 +660,11 @@ AdaptedRows parse_hardware_drivers_inventory_output(const std::string& out,
     }, /*escaped=*/true, /*max_tokens=*/11);
 }
 
-std::vector<std::pair<std::string_view, std::string_view>> installed_software_actions() {
-    std::vector<std::pair<std::string_view, std::string_view>> out;
+std::vector<std::tuple<std::string_view, std::string_view, std::chrono::seconds>>
+installed_software_actions() {
+    std::vector<std::tuple<std::string_view, std::string_view, std::chrono::seconds>> out;
     for (const auto& row : kInventoryActions)
-        out.emplace_back(row.plugin, row.action);
+        out.emplace_back(row.plugin, row.action, row.time_limit);
     return out;
 }
 
@@ -725,6 +728,18 @@ struct FacetState {
     bool pending_rows{false};
     bool pending_status{false};
     AckedSet pending;
+    // A status-only section as the server last acknowledged it. While the facet keeps answering
+    // the same {status, token} the section is left out (an unchanged section is omitted, so a
+    // quiet host sends a hash-only report). Memory only: a restart costs one resend, which the
+    // server's upsert makes harmless. Cleared by a nack, by a forced send and by a row-bearing
+    // section being acknowledged.
+    struct StatusKey {
+        V3Status status{V3Status::not_collected};
+        std::string token;
+        bool operator==(const StatusKey&) const = default;
+    };
+    std::optional<StatusKey> last_status;
+    StatusKey pending_status_key; // what this collect put in the blob; set with pending_status
     // The cooldown cache (kPassCooldown).
     std::optional<Collected> cache;
     std::chrono::steady_clock::time_point cache_at{};
@@ -739,6 +754,10 @@ struct CollectorState {
     std::chrono::milliseconds time_limit_override{0};
     CollectorRunner runner;
     std::vector<FacetState> facets; // parallel to kInventoryActions
+    // Answers that declared no completeness (UNKNOWN), counted over the agent's life and
+    // published as the heartbeat tag yuzu.sync.installed_software.completeness_unknown_total.
+    std::string unknown_total_key;
+    std::uint64_t unknown_total{0};
     bool loaded{false};
     bool emitted{false}; // the last collect() put at least one section in the blob
     bool more{false};    // ...and left a row-bearing section for the next one
@@ -757,6 +776,12 @@ struct CollectorState {
             f.need_full_persisted = kv_get(f.need_full_key) == "1";
             f.need_full = f.need_full_persisted;
         }
+        unknown_total = std::strtoull(kv_get(unknown_total_key).c_str(), nullptr, 10);
+    }
+
+    // An UNKNOWN answer is never read as FULL; each one is counted and persisted at once (rare).
+    void count_unknown() {
+        kv_set(unknown_total_key, std::to_string(++unknown_total));
     }
 
     void set_need_full(FacetState& f, bool on) {
@@ -879,12 +904,24 @@ struct CollectorState {
         case AdaptedRows::Status::ok:
             break;
         }
-        if (r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL) {
-            // The typed answer overrides rows the plugin did hand over: they are a partial roster.
-            spdlog::warn("sync: {} typed result completeness PARTIAL — reported constrained",
-                         source);
+        if (r.result_completeness != YUZU_RESULT_COMPLETENESS_FULL) {
+            // Only a plugin that declares FULL is believed to have read everything. PARTIAL
+            // overrides rows the plugin did hand over (a partial roster); an answer that declares
+            // nothing (UNKNOWN) is not FULL either, and is counted.
+            const bool partial = r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL;
+            if (partial) {
+                spdlog::warn("sync: {} typed result completeness PARTIAL — reported constrained",
+                             source);
+            } else {
+                count_unknown();
+                spdlog::warn("sync: {} declared no result completeness — reported constrained "
+                             "(unknown), never read as full",
+                             source);
+            }
             c.status = V3Status::constrained;
-            c.token = r.result_provenance.empty() ? "partial" : r.result_provenance;
+            c.token = !partial                     ? "unknown"
+                      : r.result_provenance.empty() ? "partial"
+                                                    : r.result_provenance;
             return c;
         }
         for (auto& e : rows.entries)
@@ -904,6 +941,10 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
+    // No weekly blanket resend: the server's per-section checks (a delta over a base that no
+    // longer matches is refused, answered `installed_software:<facet>` and resent in full) heal a
+    // diverged facet on their own.
+    src.no_full_floor = true;
     // Nightly maintenance window, 01:00-05:00 machine-local time (a compile-time default:
     // no settings channel exists yet). Each agent keeps a stable moment inside it.
     src.window = SyncWindow{60, 300};
@@ -917,6 +958,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
                              : CollectorClock{[] { return std::chrono::steady_clock::now(); }};
     st->time_limit_override = tuning.time_limit;
     st->runner = std::move(tuning.runner);
+    st->unknown_total_key = SyncScheduler::kv_key("installed_software", "completeness_unknown_total");
     for (const auto& row : kInventoryActions) {
         FacetState f;
         f.source = std::string(row.plugin) + '.' + std::string(row.action);
@@ -928,8 +970,11 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
 
     src.on_force_full = [st] {
         st->ensure_loaded();
-        for (auto& f : st->facets)
-            f.need_full = true; // this send is full for every facet; nothing to persist
+        for (auto& f : st->facets) {
+            f.need_full = true;    // this send is full for every facet; nothing to persist
+            f.last_status.reset(); // ...and carries every status-only section again, so a forced
+                                   // blob is never header-only (the server refuses one)
+        }
     };
 
     src.wants_blob = [st] { return st->emitted; };
@@ -954,16 +999,19 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
                 // Nothing of this facet is committed: it is resent in full. A whole-source nack
                 // commits nothing at all (the blob may not have been attributable).
                 st->set_need_full(f, true);
+                f.last_status.reset();
             } else if (f.pending_rows) {
                 f.acked = f.pending;
                 st->kv_set(f.acked_key, acked_encode(*f.acked)); // ONE value: hash and set together
                 st->set_need_full(f, false);
+                f.last_status.reset();
             } else if (f.pending_status) {
                 // The server refuses a delta over any facet whose stored status is not full or
                 // delta, so after a status-only section the next row-bearing one must be full.
                 f.acked.reset();
                 st->kv_set(f.acked_key, std::string{});
                 st->set_need_full(f, false);
+                f.last_status = f.pending_status_key;
             }
             f.pending_rows = false;
             f.pending_status = false;
@@ -1001,6 +1049,10 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
             SectionPlan plan = c->status == V3Status::full
                                    ? plan_section(f.source, c->rows, f.acked, f.need_full)
                                    : status_section(f.source, c->status, c->token);
+            // A status-only answer the server already holds is not sent again.
+            if (!v3_status_carries_rows(plan.status) && f.last_status &&
+                *f.last_status == FacetState::StatusKey{plan.status, plan.token})
+                plan.unchanged = true;
             plan.duration_ms = c->duration_ms;
             plan.bytes_read = c->bytes_read;
             plans.push_back(std::move(plan));
@@ -1020,6 +1072,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
                 held.emplace_back(f.source, plan.section_hash);
             } else if (sent) {
                 f.pending_status = true; // held no longer: the server drops it from its report hash
+                f.pending_status_key = {plan.status, plan.token};
             } else if (f.acked) {
                 held.emplace_back(f.source, f.acked->section_hash); // unchanged or deferred
             }
