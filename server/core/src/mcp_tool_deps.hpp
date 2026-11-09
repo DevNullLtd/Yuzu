@@ -52,9 +52,11 @@
 // it; a handler must null-check `ctx.deps` and each closure it uses and answer
 // an internal error rather than an empty result.
 //
-// The type aliases are pinned to their HardwareRoutes / McpServer twins by
-// static_assert in mcp_server.cpp, so a signature change on either side is a
-// build failure, not a silent copy that drifted.
+// The type aliases are pinned to their HardwareRoutes / McpServer / AuthRoutes
+// twins by static_assert in mcp_server.cpp, so a signature change on either side
+// is a build failure, not a silent copy that drifted. The one alias with no twin
+// to pin is SessionFn: it is wired from the member function
+// `AuthRoutes::resolve_session`, which has no alias of its own.
 
 #include "authz_gates.hpp"        // authz::FleetReadGate
 #include "crypto_api.hpp"         // CryptoApi's query / result types (the abstract seam, no store)
@@ -155,6 +157,9 @@ struct ToolDeps {
     // as `RestApiV1::AuditAsSessionFn`): REST binds every row to the session its route resolved
     // (#6065 PR-Q), so a credential that lapses mid-request cannot leave a row naming no one
     // while the write proceeds. `audit_fn` above re-resolves the caller per row.
+    // AuditAsSessionFn is pinned to `AuthRoutes::AuditAsSessionFn` by static_assert in
+    // mcp_server.cpp; SessionFn is wired from `AuthRoutes::resolve_session` (a member function,
+    // so there is no alias to pin it to).
     using SessionFn = std::function<std::optional<auth::Session>(const httplib::Request&)>;
     using AuditAsSessionFn = std::function<bool(
         const httplib::Request&, const auth::Session&, const std::string& principal_role,

@@ -48,9 +48,10 @@
 // (scripts/ci/check-mcp-retry-hints.py) scans each tool's own handler body. Three shared
 // helpers answer outside a handler, and all are non-retryable by design, each marked
 // `// retry-hint-exempt:` on its a4_error line: refuse_params (a caller-input rejection),
-// tier_admits (the token's tier never changes) and writer_identity (an unwired closure or
-// unresolved caller is a misconfiguration, not a transient fault). Every retryable answer
-// lives inside a handle_* body.
+// tier_admits (the token's tier never changes) and writer_identity (an unwired closure is a
+// misconfiguration; an unresolved caller is a credential that no longer resolves, revoked or
+// lapsed mid-request; neither is retryable as sent). Every retryable answer lives inside a
+// handle_* body.
 
 #include "mcp_tool_registry.hpp"
 
@@ -146,7 +147,9 @@ ToolDeps::DexScorePolicyAuditFn audit_hook(const ToolCallContext& ctx, const Wri
     return [&ctx, &who, &persisted](std::string_view verb, std::string_view result,
                                     const std::string& detail_json) {
         // The kernel takes the bool(req, 5 strings) shape every route class shares; the session
-        // and role are bound here, as RestApiV1's audit_as binds them.
+        // and role are bound here, as RestApiV1's audit_as binds them. A std::function, not a
+        // bare lambda: the kernel null-checks its sink (`!audit_fn`), which a capturing lambda
+        // cannot answer.
         const std::function<bool(const httplib::Request&, const std::string&, const std::string&,
                                  const std::string&, const std::string&, const std::string&)>
             bound = [&](const httplib::Request& req, const std::string& action,
@@ -179,7 +182,7 @@ std::optional<WriterIdentity> writer_identity(const ToolCallContext& ctx, std::s
     const auto refuse = [&](const std::string& detail, const std::string& log) {
         spdlog::error("{}", log);
         const bool audited = ctx.audit("failure", detail);
-        answer(ctx, ctx.a4_error(kInternalError, "service unavailable", remediation, -1, {}, audited)); // retry-hint-exempt: an unwired closure or unresolved caller is a misconfiguration, not a transient fault
+        answer(ctx, ctx.a4_error(kInternalError, "service unavailable", remediation, -1, {}, audited)); // retry-hint-exempt: an unwired closure is a misconfiguration and an unresolved caller a credential that no longer resolves; neither is retryable as sent
     };
     if (ctx.deps == nullptr || !ctx.deps->dex_score_policy_apply_fn ||
         !ctx.deps->session_fn || !ctx.deps->audit_as_session_fn) {

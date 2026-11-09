@@ -101,6 +101,11 @@ struct Twin {
     int session_calls = 0;
     bool session_lapses_after_first = false;
     bool session_unresolved = false; // the caller resolves to no session at all
+    // The base role the resolved session carries, and whether a live JIT elevation (an hour from
+    // now, so it cannot lapse mid-test) sits on top: an elevated `user` session's effective role
+    // is `admin`, an unelevated one's is `user`.
+    auth::Role session_role = auth::Role::admin;
+    bool session_elevated = false;
     // The per-row resolvers the write tools must NOT use for domain rows: ToolDeps::audit_fn and
     // ToolDeps::username_fn. Both are wired as traps (a row written through audit_fn lands here;
     // username_fn names someone else).
@@ -207,7 +212,13 @@ struct Twin {
                     return std::nullopt;
                 auth::Session s;
                 s.username = username;
-                s.role = auth::Role::admin;
+                s.role = session_role;
+                if (session_elevated) {
+                    // The pair is_elevated() accepts: a steady deadline plus the absolute
+                    // authored instant.
+                    s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+                    s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+                }
                 return s;
             };
         // Traps: the per-row re-resolving sink and username resolver the write tools used to
@@ -310,14 +321,15 @@ struct Twin {
         legacy_rows.clear();
     }
 
-    /// Every domain row was stamped from the one session this write resolved, with the role
-    /// captured once, and none went through the per-row resolving sink.
-    void check_rows_stamped_as_session() const {
+    /// Every domain row was stamped from the one session this write resolved, with the
+    /// effective role captured once (`role`: "admin" for the default admin session), and none
+    /// went through the per-row resolving sink.
+    void check_rows_stamped_as_session(const std::string& role = "admin") const {
         CHECK_FALSE(domain_rows.empty());
         for (const auto& p : domain_principals)
             CHECK(p == username);
         for (const auto& r : domain_roles)
-            CHECK(r == "admin");
+            CHECK(r == role);
         CHECK(domain_principals.size() == domain_rows.size());
         CHECK(domain_roles.size() == domain_rows.size());
         CHECK(legacy_rows.empty());
@@ -412,21 +424,36 @@ TEST_CASE("dex score policy mcp: the request builder is strict and maps dry_run 
             Op::Put, {{"document", doc}, {"if_match", std::string(65, 'a')}}));
     }
     SECTION("an unknown key cut inside a multibyte character stays valid UTF-8") {
-        // 63 ASCII bytes, then a 2-byte character whose lead byte is the 64th: the cap cuts
-        // between its bytes. The message must still be valid UTF-8 (json::dump refuses a string
-        // that is not), and still the unknown-argument refusal.
-        const std::string key = std::string(63, 'k') + "\xC3\xA9" + "b";
-        const auto rq = dex_score_policy_mcp_request(Op::Reset, json::object({{key, 1}}));
-        REQUIRE_FALSE(rq);
-        CHECK(rq.error().starts_with("unknown argument '"));
-        CHECK_NOTHROW(json(rq.error()).dump());
-        // The stray lead byte is neutralised, not echoed.
-        CHECK(rq.error().find('\xC3') == std::string::npos);
-        // A whole character inside the cap passes through unchanged.
-        const auto kept =
-            dex_score_policy_mcp_request(Op::Reset, json::object({{"caf\xC3\xA9", 1}}));
-        REQUIRE_FALSE(kept);
-        CHECK(kept.error() == "unknown argument 'caf\xC3\xA9'");
+        // 64 bytes of key survive the cap. Put a 2-, 3- and 4-byte character so that the cap cuts
+        // between its bytes at every interior position (log_token neutralises each stray byte,
+        // and each truncated lead byte is a distinct shape of utf8_sequence_length returning 0).
+        // The message must still be valid UTF-8 (json::dump refuses a string that is not), still
+        // the unknown-argument refusal, and must not echo the stray lead byte.
+        struct Shape {
+            const char* name;
+            std::string ch;
+        };
+        const Shape shapes[] = {{"2-byte U+00E9", "\xC3\xA9"},
+                                {"3-byte U+20AC", "\xE2\x82\xAC"},
+                                {"4-byte U+1F600", "\xF0\x9F\x98\x80"}};
+        for (const auto& shape : shapes) {
+            for (std::size_t kept = 1; kept < shape.ch.size(); ++kept) {
+                INFO(shape.name << " cut after " << kept << " byte(s)");
+                const std::string key = std::string(64 - kept, 'k') + shape.ch + "b";
+                const auto rq = dex_score_policy_mcp_request(Op::Reset, json::object({{key, 1}}));
+                REQUIRE_FALSE(rq);
+                CHECK(rq.error().starts_with("unknown argument '"));
+                CHECK_NOTHROW(json(rq.error()).dump());
+                // The stray lead byte is neutralised, not echoed.
+                CHECK(rq.error().find(shape.ch[0]) == std::string::npos);
+            }
+            // A whole character inside the cap passes through unchanged.
+            const std::string whole = "caf" + shape.ch;
+            INFO(shape.name << " whole inside the cap");
+            const auto kept = dex_score_policy_mcp_request(Op::Reset, json::object({{whole, 1}}));
+            REQUIRE_FALSE(kept);
+            CHECK(kept.error() == "unknown argument '" + whole + "'");
+        }
     }
     SECTION("an unknown key is named, neutralised and capped, and no value is echoed") {
         const auto rq = dex_score_policy_mcp_request(
@@ -808,6 +835,47 @@ TEST_CASE("set and reset: every domain row and updated_by come from the session 
     }
 }
 
+// The role every domain row carries is the caller's EFFECTIVE role (a live JIT elevation makes a
+// `user` session `admin`), read once with the session. Not simulated: an elevation whose deadline
+// lapses BETWEEN two rows of one request. auth::is_elevated reads steady_clock::now() directly
+// (no injectable clock), and WriterIdentity holds the Session by value, so a per-row recompute
+// from that copy could differ from the captured string only after a real deadline passed
+// mid-request, which a test cannot cause without sleeping. What this case does pin is the other
+// way to get the role wrong: reading the base `role` instead of the effective one, or hard-coding
+// "admin".
+TEST_CASE("set and reset: every domain row carries the caller's effective role, elevated or not",
+          "[mcp][dex][score_policy][security]") {
+    SECTION("a base-role caller with a live elevation is stamped admin; updated_by stays the username") {
+        Twin t;
+        t.tier = ""; // reset is then not ticket-gated; set is not ticket-gated at any tier
+        t.session_role = auth::Role::user;
+        t.session_elevated = true;
+        REQUIRE_FALSE(t.call("set_dex_score_policy", set_args(95.0, "default")).contains("error"));
+        REQUIRE(t.domain_rows.size() == 2);
+        t.check_rows_stamped_as_session("admin");
+        REQUIRE(t.cas_actors.size() == 1);
+        CHECK(t.cas_actors[0] == "tester");
+        t.clear_audit();
+        REQUIRE_FALSE(
+            t.call("reset_dex_score_policy", {{"if_match", rev_of(*t.stored)}}).contains("error"));
+        REQUIRE(t.domain_rows.size() == 2);
+        t.check_rows_stamped_as_session("admin");
+    }
+    SECTION("an unelevated base-role caller is stamped with that role on both writes") {
+        Twin t;
+        t.tier = "";
+        t.session_role = auth::Role::user;
+        REQUIRE_FALSE(t.call("set_dex_score_policy", set_args(95.0, "default")).contains("error"));
+        REQUIRE(t.domain_rows.size() == 2);
+        t.check_rows_stamped_as_session("user");
+        t.clear_audit();
+        REQUIRE_FALSE(
+            t.call("reset_dex_score_policy", {{"if_match", rev_of(*t.stored)}}).contains("error"));
+        REQUIRE(t.domain_rows.size() == 2);
+        t.check_rows_stamped_as_session("user");
+    }
+}
+
 TEST_CASE("set_dex_score_policy: caller refusals are non-retryable invalid-params errors with a "
           "denied row and no store write",
           "[mcp][dex][score_policy]") {
@@ -1161,13 +1229,15 @@ TEST_CASE("set_dex_score_policy: a second writer in this process is told to retr
     rq1.body = doc_with_excellent(95.0);
     rq1.actor = "first";
     std::optional<DexScorePolicyWriteResult> first;
-    json r;
-    {
+
+    // Runs `body` while the first write is parked in its commit. The guard is the only release
+    // path: it runs on EVERY exit from this scope, a throwing REQUIRE, json::parse or `body`
+    // included (destroying a joinable std::thread would terminate the binary, and joining one
+    // still parked on the gate would hang). A second set_value throws, hence the swallow. It also
+    // publishes `first` before the checks read it. Each SECTION re-runs the setup above, so the
+    // thread and the promises are fresh every time.
+    const auto while_first_is_parked = [&](const std::function<void()>& body) {
         std::thread parked([&] { first = apply_dex_score_policy(rq1, d1); });
-        // The only release path: it runs on EVERY exit from this scope, a throwing REQUIRE or
-        // json::parse in t.call included (destroying a joinable std::thread would terminate the
-        // binary, and joining one still parked on the gate would hang). A second set_value
-        // throws, hence the swallow. It also publishes `first` before the checks read it.
         yuzu::test::ScopeExit release_and_join{[&] {
             try {
                 release_p.set_value();
@@ -1179,20 +1249,40 @@ TEST_CASE("set_dex_score_policy: a second writer in this process is told to retr
         // Bounded: a first write that never reaches its commit fails the case instead of hanging it.
         if (entered.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
             FAIL("the first write never reached its commit");
-        r = t.call("set_dex_score_policy", set_args(96.0, "default"));
-    }
+        body();
+    };
 
-    REQUIRE(r.contains("error"));
-    CHECK(r["error"]["code"] == mcp::kInternalError);
-    CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyRetryMs);
-    CHECK(t.cas_calls == 0); // this call's commit never ran
-    CHECK_FALSE(t.stored.has_value());
-    REQUIRE(t.domain_rows.size() == 2);
-    CHECK(t.domain_rows[0] == kAttemptedUpdate);
-    CHECK(t.domain_rows[1] == "dex.score_policy.update|failure|RuntimeConfig|dex_score_policy");
-    CHECK(audit_count(t.generic_rows, "mcp.set_dex_score_policy|failure") == 1);
-    REQUIRE(first);
-    CHECK(first->status == St::Ok);
+    SECTION("the second writer is refused as busy while the first is parked") {
+        json r;
+        while_first_is_parked([&] { r = t.call("set_dex_score_policy", set_args(96.0, "default")); });
+
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyRetryMs);
+        CHECK(t.cas_calls == 0); // this call's commit never ran
+        CHECK_FALSE(t.stored.has_value());
+        REQUIRE(t.domain_rows.size() == 2);
+        CHECK(t.domain_rows[0] == kAttemptedUpdate);
+        CHECK(t.domain_rows[1] == "dex.score_policy.update|failure|RuntimeConfig|dex_score_policy");
+        CHECK(audit_count(t.generic_rows, "mcp.set_dex_score_policy|failure") == 1);
+        REQUIRE(first);
+        CHECK(first->status == St::Ok);
+    }
+    SECTION("an exception unwinding while the first write is parked still releases and joins it") {
+        // The guard's only other exercise is the normal exit above. Here something throws after
+        // the writer has entered its commit; the exception is caught OUTSIDE the guarded scope,
+        // so the release-and-join has already run during the unwind (a missing guard terminates
+        // the binary on the joinable thread's destructor, or hangs on the gate).
+        bool unwound = false;
+        try {
+            while_first_is_parked([] { throw std::runtime_error("probe"); });
+        } catch (const std::runtime_error&) {
+            unwound = true;
+        }
+        CHECK(unwound);
+        REQUIRE(first);
+        CHECK(first->status == St::Ok);
+    }
 }
 
 TEST_CASE("set_dex_score_policy: a dropped generic mcp.<tool> row is reported on the success body "
@@ -1316,21 +1406,41 @@ TEST_CASE("reset_dex_score_policy: dry_run and any other argument are refused; r
           "[mcp][dex][score_policy]") {
     Twin t;
     t.tier = "";
-    const json dry = t.call("reset_dex_score_policy", {{"if_match", "default"}, {"dry_run", true}});
-    REQUIRE(dry.contains("error"));
-    CHECK(dry["error"]["message"].get<std::string>().find("unknown argument") != std::string::npos);
-    check_a4_refusal(dry, "correct the arguments and call again");
-    // The parse refusal is a post-consumption refusal like any other: it carries the recovery.
-    check_a4_refusal(dry, "fresh ticket");
-    CHECK(t.domain_rows.empty());
-
-    t.stored = doc_with_excellent(80.0);
-    const json stale = t.call("reset_dex_score_policy", {{"if_match", "default"}});
-    REQUIRE(stale.contains("error"));
-    CHECK(stale["error"]["code"] == mcp::kInvalidParams);
-    CHECK(stale["error"]["data"]["remediation"].get<std::string>().find("fresh ticket") !=
-          std::string::npos);
-    CHECK(t.car_calls == 0);
+    SECTION("an argument the tool does not take") {
+        const json dry = t.call("reset_dex_score_policy", {{"if_match", "default"}, {"dry_run", true}});
+        REQUIRE(dry.contains("error"));
+        CHECK(dry["error"]["message"].get<std::string>().find("unknown argument") != std::string::npos);
+        check_a4_refusal(dry, "correct the arguments and call again");
+        // The parse refusal is a post-consumption refusal like any other: it carries the recovery.
+        check_a4_refusal(dry, "fresh ticket");
+        CHECK(t.domain_rows.empty());
+    }
+    SECTION("a stale revision") {
+        t.stored = doc_with_excellent(80.0);
+        const json stale = t.call("reset_dex_score_policy", {{"if_match", "default"}});
+        REQUIRE(stale.contains("error"));
+        CHECK(stale["error"]["code"] == mcp::kInvalidParams);
+        CHECK(stale["error"]["data"]["remediation"].get<std::string>().find("fresh ticket") !=
+              std::string::npos);
+        CHECK(t.car_calls == 0);
+    }
+    SECTION("a missing or empty if_match is worded for the argument, not the REST header") {
+        // The empty tier skips the dispatch chain's schema check, so the handler (and apply
+        // behind it) judges the value: apply's REST wording must be rewritten for the argument.
+        for (const json& args : {json::object(), json{{"if_match", ""}}}) {
+            INFO(args.dump());
+            t.clear_audit();
+            const json r = t.call("reset_dex_score_policy", args);
+            REQUIRE(r.contains("error"));
+            CHECK(r["error"]["code"] == mcp::kInvalidParams);
+            const std::string msg = r["error"]["message"].get<std::string>();
+            CHECK(msg.starts_with("If-Match (the if_match argument)"));
+            CHECK(msg.find("header") == std::string::npos);
+            CHECK(r["error"]["data"]["remediation"].get<std::string>().find("fresh ticket") !=
+                  std::string::npos);
+        }
+        CHECK(t.car_calls == 0);
+    }
 }
 
 TEST_CASE("reset_dex_score_policy: a store error after the remove with another document in place "
@@ -1348,6 +1458,8 @@ TEST_CASE("reset_dex_score_policy: a store error after the remove with another d
     CHECK(rem.find("get_dex_score_policy") != std::string::npos);
     CHECK(rem.find("compare its revision") != std::string::npos);
     CHECK(rem.find("without approval_id") != std::string::npos);
+    // The spent-ticket note is appended whole, fallback for an error that names no revision included.
+    CHECK(rem.find("(or with your if_match when none is named)") != std::string::npos);
 }
 
 TEST_CASE("reset_dex_score_policy: a sink that refuses the attempted row removes nothing, is "
@@ -1561,6 +1673,9 @@ TEST_CASE("reset_dex_score_policy: an unwired apply closure, session-bound audit
         CHECK(rem.find("spent") != std::string::npos);
         CHECK(rem.find("without approval_id") != std::string::npos);
         CHECK(rem.find("fresh ticket") != std::string::npos);
+        // No revision is named here, so the fallback to the caller's own if_match is what the
+        // recovery relies on.
+        CHECK(rem.find("(or with your if_match when none is named)") != std::string::npos);
         CHECK(audit_count(t.generic_rows, "mcp.reset_dex_score_policy|failure") == 1);
         CHECK(t.car_calls == 0);
         CHECK(t.stored.has_value());
