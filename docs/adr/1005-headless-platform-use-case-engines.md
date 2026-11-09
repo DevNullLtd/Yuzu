@@ -1634,7 +1634,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (its validation half); the tier-change diff it adds has no headless twin and
        stays the exception recorded in the 2026-11-06 entry. `prior_document`
        on reset audit rows is a core audit-row change, deferred as a follow-up.
-       Revisit by 2027-01-31; the follow-up issues are to be filed on merge.
+       Revisit by 2027-01-31; the follow-ups are #7377 (`prior_document`), #7378 (result-level audit flag), #7379 (headless tier-change preview), #7380 (session-bound audit for every MCP write tool), #7381 (`ConsumePrecondition`) and #7382 (config-read bypass).
        The audit-detail size cap (#6619, a core change) is tracked separately. The REST registration lambdas hold no
        readable gate call (the `perm_fn` sits in the shared
        `score_policy_write` lambda), so gate parity (check 6) cannot compare
@@ -1655,11 +1655,12 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        4. The generic `mcp.<tool>` audit row is resolved per row by the
           dispatcher (a core MCP change); sibling registry write tools keep the
           per-row pattern.
-       Follow-ups, all to be filed on merge: `prior_document` on reset audit
-       rows, a result-level audit flag, the headless tier-change diff,
-       session-bound domain audit for every MCP write tool, audit-detail volume
-       (#6619), `ConsumePrecondition` for an audit or store outage, and the
-       config-read bypass of `GuaranteedState:Read`.
+       Follow-ups: `prior_document` on reset audit rows (#7377), a result-level
+       audit flag (#7378), the headless tier-change diff (#7379),
+       session-bound domain audit for every MCP write tool (#7380),
+       audit-detail volume (#6619), `ConsumePrecondition` for an audit or store
+       outage (#7381), and the config-read bypass of `GuaranteedState:Read`
+       (#7382).
      - Wire reference: `docs/user-manual/mcp.md` (tools 213 to 215),
        `docs/user-manual/rest-api.md` "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`
