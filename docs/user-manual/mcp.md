@@ -787,10 +787,10 @@ admission check now prevents.
 > read a token-keyed reconstruction cache. `/detail`'s `token` is a CSPRNG value
 > minted and principal-bound only inside the `/result` handler itself — no other
 > path mints one, so a `/detail` twin genuinely has no usable input today.
-> `/result`'s `pcmd`/`tcmd` pair is an ordinary `echo sql` dispatch result
+> `/result`'s `pcmd`/`tcmd`/`hcmd` set is an ordinary `echo sql` dispatch result
 > (`Infrastructure:Read`, no execute gate) and could in principle be obtained
 > through the already-twinned generic dispatch surface (`execute_instruction` /
-> `POST /api/command`) by reproducing the two canned `$Process_Live`/`$TCP_Live`
+> `POST /api/command`) by reproducing the three canned `$Process_Hourly`/`$TCP_Hourly`
 > queries verbatim — but that is not a dedicated API path, and a real `/result`
 > twin would still need a new async "not ready yet" polling contract (no
 > htmx-style auto-reissue on REST/MCP). Both are otherwise reachable today only

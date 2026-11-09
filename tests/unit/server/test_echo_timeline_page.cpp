@@ -142,7 +142,9 @@ TEST_CASE("echo timeline script: pinned tokens present", "[echo][timeline][js]")
           "credentials: 'same-origin'", "AbortController", "setPointerCapture", "data-tl-bound", "data-ts",
           "data-from", "data-ref", "location.origin", "calc(var(--gut) + (100% - var(--gut)) * ",
           "aria-pressed", "visibilitychange", "htmx:afterSettle", "htmx:responseError", "htmx:sendError",
-          "htmx:timeout", "'HX-Request': 'true'", "res.redirected", "assign('/login')", "performance.now()"}) {
+          "htmx:timeout", "'HX-Request': 'true'", "res.redirected", "assign('/login')", "performance.now()",
+          // a selection click flushes the moment panel only; it makes the one selected request itself
+          "st.ref = ref;"}) {
         INFO(want);
         CHECK_THAT(js(), ContainsSubstring(want));
     }

@@ -2845,7 +2845,9 @@
       "changelog.d/2026-11-03-echo-followups-mixed.changed.md",
       "changelog.d/2026-11-03-echo-followups-mixed.fixed.md",
       "changelog.d/7037-echo-rollup-only-v10.changed.md",
-      "changelog.d/7318-echo-rollup-only-server.changed.md"
+      "changelog.d/7318-echo-rollup-only-server.changed.md",
+      "changelog.d/7371-echo-rollup-only-ui.changed.md",
+      "changelog.d/7371-echo-rollup-only-ui.removed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
