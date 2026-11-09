@@ -44,11 +44,16 @@ std::string header() {
     return std::string(kV3Header);
 }
 
-// `S` record. duration/bytes are strings so a test can feed junk.
+// `S` record. duration/bytes are strings so a test can feed junk. `expect` defaults to a valid
+// 64-hex value for a delta section (the field a delta must carry) and to empty otherwise; pass
+// any literal to override.
 std::string sec(std::string_view facet, std::string_view status, std::string_view base = "",
                 std::string_view token = "", std::string_view dur = "0",
-                std::string_view bytes = "0") {
-    return rec({"S", facet, status, base, token, dur, bytes});
+                std::string_view bytes = "0", std::string_view expect = "auto") {
+    const std::string valid(64, 'e');
+    if (expect == "auto")
+        expect = status == "delta" ? std::string_view(valid) : std::string_view{};
+    return rec({"S", facet, status, base, token, dur, bytes, expect});
 }
 
 // `+` record with the 16 row slots (slot 14 is the reserved uninstall_string).
@@ -160,6 +165,39 @@ TEST_CASE("v3 parses every record kind", "[server][inventory_blob_v3]") {
     CHECK(mq->refusal == V3Refusal::kNone);
 }
 
+TEST_CASE("v3 S record field 7 is the expect hash: parsed, mandatory on delta, ignored on full",
+          "[server][inventory_blob_v3]") {
+    const std::string want(64, 'c');
+    SECTION("a delta section parses expect as field 7") {
+        const V3Report r = parse_ok(header() + sec(kApps, "delta", "b", "", "0", "0", want));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+        CHECK(r.sections[0].expect == want);
+    }
+    SECTION("a delta section without a 64-hex expect is refused bad_record") {
+        for (const std::string& bad :
+             {std::string{}, std::string(63, 'c'), std::string(65, 'c'), std::string(64, 'C'),
+              std::string(64, 'g')}) {
+            const V3Report r = parse_ok(header() + sec(kApps, "delta", "b", "", "0", "0", bad) +
+                                        rec({"-", std::string(64, 'a')}));
+            REQUIRE(r.sections.size() == 1);
+            CHECK(r.sections[0].refusal == V3Refusal::kBadRecord);
+        }
+        // The field absent altogether (a six-field header) is the same refusal.
+        const V3Report none =
+            parse_ok(header() + rec({"S", kApps, "delta", "b", "", "0", "0"}));
+        CHECK(none.sections[0].refusal == V3Refusal::kBadRecord);
+    }
+    SECTION("a full section accepts any expect value and keeps it") {
+        const V3Report r = parse_ok(header() + sec(kApps, "full", "", "", "0", "0", "whatever") +
+                                    plus("A", kApps));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+        CHECK(r.sections[0].expect == "whatever");
+        CHECK(r.sections[0].rows.size() == 1);
+    }
+}
+
 TEST_CASE("v3 status vocabulary round-trips and only full/delta carry rows",
           "[server][inventory_blob_v3]") {
     for (const auto name :
@@ -218,6 +256,11 @@ TEST_CASE("v3 grammar refusals isolate to the section", "[server][inventory_blob
         {"a NUL in a row's install location",
          sec(kApps, "full") + plus("A", kApps, std::string("C:\\x\0y", 6)), V3Refusal::kNulByte},
         {"a NUL in the section header token", sec(kApps, "full", "", std::string("t\0k", 3)),
+         V3Refusal::kNulByte},
+        {"a NUL in a delta section's expect field",
+         sec(kApps, "delta", "b", "", "0", "0", std::string(32, 'e') + std::string("\0", 1) +
+                                                    std::string(31, 'e')) +
+             rec({"-", h}),
          V3Refusal::kNulByte},
         {"a NUL in a comp record",
          sec(kComponentInventoryFacet, "full") +
@@ -372,6 +415,33 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
         CHECK(r.sections[1].refusal == V3Refusal::kNone);
         CHECK(r.sections[1].rows.size() == 1);
     }
+    SECTION("a refused delta section gives its `-` budget and storage back") {
+        std::string d;
+        for (std::size_t i = 0; i < kV3MaxDeletions; ++i) {
+            std::string h = std::to_string(i);
+            h.insert(0, 64 - h.size(), 'a');
+            d += rec({"-", h});
+        }
+        const V3Report r =
+            parse_ok(header() + sec(kApps, "delta", "b") + d + rec({"zzz", "x"}) +
+                     sec("pkg_inventory.packages", "delta", "b") + rec({"-", std::string(64, 'b')}));
+        REQUIRE(r.sections.size() == 2);
+        CHECK(r.sections[0].refusal == V3Refusal::kUnknownRecord);
+        CHECK(r.sections[0].deletions.capacity() == 0);
+        CHECK(r.sections[1].refusal == V3Refusal::kNone);
+        CHECK(r.sections[1].deletions.size() == 1);
+    }
+    SECTION("a refused component section gives its `comp` budget and storage back") {
+        std::string c;
+        for (std::size_t i = 0; i < kV3MaxComponents; ++i)
+            c += rec({"comp", "jar", "n" + std::to_string(i), "1", "pom", "/p", "1", "1", ""});
+        const V3Report r =
+            parse_ok(header() + sec(kComponentInventoryFacet, "full") + c + rec({"zzz", "x"}));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kUnknownRecord);
+        CHECK(r.sections[0].components.empty());
+        CHECK(r.sections[0].components.capacity() == 0);
+    }
     SECTION("a blob over kV3MaxBlobBytes is oversize") {
         std::string blob = header() + sec(kApps, "full");
         blob.append(kV3MaxBlobBytes - blob.size() + 1, 'x');
@@ -493,6 +563,55 @@ TEST_CASE("v3 drops a 17th token and a nameless row", "[server][inventory_blob_v
     CHECK(s2.sections[0].refusal == V3Refusal::kSourceMismatch);
 }
 
+TEST_CASE("v3 a 0x1E or 0x1F byte inside a field frames the record and never reaches a parsed "
+          "field",
+          "[server][inventory_blob_v3]") {
+    // The stored canonical records (row and component hashes, identity_key segments) rely on no
+    // stored field holding a separator. The parser splits on both bytes, so a producer that
+    // leaves one inside a name or path shifts or cuts its record; it can never store one.
+    const auto clean = [](std::string_view f) { return f.find_first_of("\x1e\x1f") == f.npos; };
+    const auto comp_rec = [](std::string_view name, std::string_view path) {
+        return rec({"comp", "jar", name, "1.0", "pom", path, "10", "20", "App"});
+    };
+    const auto comp_sec = [&](const std::string& record) {
+        const V3Report r = parse_ok(header() + sec("component_inventory", "full") + record);
+        REQUIRE(r.sections.size() == 1);
+        return r.sections[0];
+    };
+
+    // 0x1F in a path: the fields shift (size reads the tail of the path as 0); nothing kept
+    // carries the byte.
+    const auto shifted = comp_sec(comp_rec("core", std::string("/opt/a") + kFs + "b.jar"));
+    CHECK(shifted.refusal == V3Refusal::kNone);
+    REQUIRE(shifted.components.size() == 1);
+    const auto& c = shifted.components[0];
+    CHECK(c.path == "/opt/a");
+    CHECK(c.size == 0);
+    CHECK(c.mtime == 10);
+    CHECK(c.anchor_app == "20");
+    for (const auto f : {std::string_view(c.kind), std::string_view(c.name),
+                         std::string_view(c.version), std::string_view(c.version_source),
+                         std::string_view(c.path), std::string_view(c.anchor_app)})
+        CHECK(clean(f));
+
+    // 0x1F in a name: the shift lands a version in version_source, refused.
+    const auto by_name = comp_sec(comp_rec(std::string("log4j") + kFs + "core", "/opt/a.jar"));
+    CHECK(by_name.refusal == V3Refusal::kBadVersionSource);
+    CHECK(by_name.components.empty());
+
+    // 0x1E in a path: the record ends there and its tail is an unknown record, refused.
+    const auto cut = comp_sec(comp_rec("core", std::string("/opt/a") + kRs + "b.jar"));
+    CHECK(cut.refusal == V3Refusal::kUnknownRecord);
+    CHECK(cut.components.empty());
+
+    // 0x1F in a `+` row name shifts the source slot: refused as a source mismatch.
+    const V3Report row = parse_ok(header() + sec(kApps, "full") +
+                                  plus(std::string("Al") + kFs + "pha", kApps));
+    REQUIRE(row.sections.size() == 1);
+    CHECK(row.sections[0].refusal == V3Refusal::kSourceMismatch);
+    CHECK(row.sections[0].rows.empty());
+}
+
 TEST_CASE("v3 empty records are skipped", "[server][inventory_blob_v3]") {
     std::string blob = header() + sec(kApps, "full");
     blob += kRs; // an empty record
@@ -550,6 +669,12 @@ TEST_CASE("v3 an unterminated final record is refused, never applied",
         auto r = parse_v3_blob(header() + unterminated(plus("A", kApps)));
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == V3ParseErrorKind::kRecordBeforeSection);
+    }
+    SECTION("a delta header cut off inside its expect field fails the whole blob") {
+        auto r = parse_v3_blob(header() + sec(kApps, "full") + plus("A", kApps) +
+                               unterminated(sec("pkg_inventory.packages", "delta", "b")));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
     }
     SECTION("a header alone is not a section") {
         CHECK_FALSE(parse_v3_blob(header() + unterminated(sec(kApps, "full"))).has_value());
@@ -620,12 +745,12 @@ TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem"
 
 TEST_CASE("the section outcome labels are the literals the alerts and the manual name",
           "[server][inventory_v3][metrics]") {
-    // YuzuInventorySectionIngestRefused reads "rejected", YuzuInventorySectionDeltaUnsupported
-    // reads "delta_unsupported", and metrics.md lists all six: a rename must be deliberate.
+    // YuzuInventorySectionIngestRefused reads "rejected", YuzuInventorySectionDeltaMismatch
+    // reads "mismatch", and metrics.md lists all six: a rename must be deliberate.
     CHECK(v3_section_outcome_name(V3SectionOutcome::kStored) == "stored");
     CHECK(v3_section_outcome_name(V3SectionOutcome::kStatusOnly) == "status_only");
     CHECK(v3_section_outcome_name(V3SectionOutcome::kNeedFull) == "need_full");
-    CHECK(v3_section_outcome_name(V3SectionOutcome::kDeltaUnsupported) == "delta_unsupported");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kMismatch) == "mismatch");
     CHECK(v3_section_outcome_name(V3SectionOutcome::kRejected) == "rejected");
     CHECK(v3_section_outcome_name(V3SectionOutcome::kError) == "error");
     CHECK(kV3SectionOutcomes.size() == 6);
@@ -659,6 +784,15 @@ TEST_CASE("seed_section_ingest_series creates every closed facet x outcome serie
          at = text.find("\nyuzu_inventory_section_ingest_total{", at + 1))
         ++lines;
     CHECK(lines == series);
+
+    // The ledger counter's closed `kind` set is seeded too, so its first increment is a rate.
+    CHECK(kSoftwareChangeKinds.size() == 3);
+    for (const auto kind : kSoftwareChangeKinds) {
+        CAPTURE(software_change_kind_name(kind));
+        CHECK(text.find("yuzu_software_changes_total{kind=\"" +
+                        std::string(software_change_kind_name(kind)) + "\"} 0") !=
+              std::string::npos);
+    }
 
     // Idempotent.
     seed_section_ingest_series(m);
