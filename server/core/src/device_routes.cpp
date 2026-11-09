@@ -385,7 +385,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         return body;
     }
 
-    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_live_rows|N
+    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_rows|N (alias <src>_live_rows)
         // Display order + presentation metadata. The server does NOT link the agent's
         // echo_schema_registry, so source name/$-table/category are held here; we only
         // render a row for a source the agent actually reported (its `<src>_enabled` key
@@ -417,8 +417,14 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             s.dollar = m.dollar;
             s.category = m.category;
             s.enabled = (en->second == "true");
-            if (auto it = cfg.find(std::string(m.name) + "_live_rows"); it != cfg.end()) {
-                try { s.live_rows = std::stoll(it->second); } catch (...) {}
+            // Row count: `<src>_rows` is the hourly count. An agent that sends only the
+            // one-release alias `<src>_live_rows` has not moved to the roll-up store, so its
+            // figure counts raw capture rows and is not shown under the hourly label.
+            auto rows_it = cfg.find(std::string(m.name) + "_rows");
+            if (rows_it != cfg.end()) {
+                try { s.live_rows = std::stoll(rows_it->second); } catch (...) {}
+            } else if (cfg.contains(std::string(m.name) + "_live_rows")) {
+                s.pre_rollup_agent = true;
             }
             if (s.enabled) ++on;
             rows.push_back(std::move(s));
@@ -506,6 +512,10 @@ nlohmann::json device_agent_row_json(const DeviceListRow& row) {
         {"os", row.os},
         {"arch", row.arch},
         {"agent_version", row.agent_version},
+        // #2240: the key is ALWAYS present. JSON null = not reported (never "legacy"); the
+        // value, when present, is already one of the server's closed token strings.
+        {"guardian_backend", row.guardian_backend ? nlohmann::json(*row.guardian_backend)
+                                                  : nlohmann::json(nullptr)},
     };
 }
 
@@ -599,7 +609,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- /fragments/devices/list — global Infrastructure:Read + per-operator scope.
     // Exact /api/agents parity: the gate admits Infrastructure:Read operators and
     // the caller's OWN confinement filter (visible_set_fn_, applied via
-    // authz::in_scope over api_->list_devices()'s unscoped rows — ADR-0031 WS-A4
+    // authz::in_scope over api_->list_devices_basic()'s unscoped rows, ADR-0031 WS-A4
     // wave 2) admits only the caller's visible devices, so an operator never
     // enumerates devices outside their scope. --
     sink.Get("/fragments/devices/list", [this, to_device_row](const httplib::Request& req,
@@ -607,7 +617,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         // Fleet-wide identity/inventory disclosure (SEC-2/SEC-3 confinement-gap
-        // class, found during a docs sweep): api_->list_devices() below is
+        // class, found during a docs sweep): api_->list_devices_basic() below is
         // fleet-wide/UNSCOPED (see device_api.hpp's own banner) and does not by
         // itself confine a service-scoped API token whose principal resolves to
         // an unscoped grant — the full device roster (hostname, agent_id, OS,
@@ -639,7 +649,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 : std::nullopt;
         std::vector<DeviceRow> all;
         if (api_) {
-            for (const auto& r : api_->list_devices()) {
+            // The basic list: this fragment never renders the per-device backend, so it must
+            // not pay the health-store read for it (and cannot carry it by construction).
+            for (const auto& r : api_->list_devices_basic()) {
                 if (!authz::in_scope(scope, r.agent_id)) continue;
                 all.push_back(to_device_row(r));
             }

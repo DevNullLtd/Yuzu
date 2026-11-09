@@ -641,6 +641,17 @@ public:
     std::optional<std::vector<std::string>>
     find_local_groups_with_prefix(const std::string& prefix) const;
     std::vector<std::string> get_group_members(const std::string& group_name) const;
+
+    /// Authoritative group names `username` is a member of (the `group_members` rows; IdP
+    /// memberships are reconciled into the same table at login). Unlike `get_group_members`, which
+    /// collapses a failed read into an empty vector, a failure is an `unexpected` the caller MUST
+    /// fail closed on, never read as "not a member". Breaker-gated, `kAuthzAcquireTimeout` budget:
+    /// every call feeds the replica's RBAC breaker and a failure bumps
+    /// `yuzu_server_rbac_read_degrade_total` (the ADR-0017 admit-then-filter chokepoint's read,
+    /// also used by the attestation separation-of-duties gate). Errors: `kRbacErrStoreNotOpen`,
+    /// `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
+    user_rbac_group_names_checked(const std::string& username) const;
     std::expected<void, std::string> add_group_member(const std::string& group_name,
                                                       const std::string& username);
     std::expected<void, std::string> remove_group_member(const std::string& group_name,
@@ -780,13 +791,14 @@ private:
                                          const std::string& operation) const;
 
     // #2703 Gate 7 item 3 — same shape as PreflightRoutesTestAccess /
-    // DashboardResultsColumnsTestAccess: user_rbac_group_names/role_effects_for
-    // are legitimately private (internal helpers `resolve_perm_groups` shares),
-    // but their OWN degrade-emission sites are what this fix adds, and
-    // resolve_perm_groups short-circuits on the FIRST failure — so a black-box
-    // test through the public `authorize_list_read()` chokepoint can only ever
-    // exercise user_rbac_group_names's sites, never role_effects_for's. The
-    // friend seam lets the test drive each directly.
+    // DashboardResultsColumnsTestAccess: role_effects_for is legitimately private (an
+    // internal helper `resolve_perm_groups` shares; its sibling
+    // user_rbac_group_names_checked is public since the attestation gate reads it), but its
+    // OWN degrade-emission sites are what this fix adds, and resolve_perm_groups
+    // short-circuits on the FIRST failure, so a black-box test through the public
+    // `authorize_list_read()` chokepoint can only ever exercise
+    // user_rbac_group_names_checked's sites, never role_effects_for's. The friend seam lets
+    // the test drive it directly.
     friend struct RbacStoreTestAccess;
 
     pg::PgPool& pool_;
@@ -850,9 +862,6 @@ private:
 
     std::expected<std::vector<std::string>, std::string>
     expand_visible_set(const PermGroups& pg, const ManagementGroupStore* mgmt_store) const;
-
-    std::expected<std::vector<std::string>, std::string>
-    user_rbac_group_names(const std::string& username) const;
 
     std::expected<std::unordered_map<std::string, int>, std::string>
     role_effects_for(const std::string& securable_type, const std::string& operation) const;

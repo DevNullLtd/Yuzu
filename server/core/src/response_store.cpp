@@ -1156,9 +1156,25 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
                 binds.push_back(std::to_string(*q.until));
             }
+            if (q.continue_after) {
+                // Keyset cursor over the read's total order (`timestamp DESC, id DESC`): the
+                // row comparison selects the rows strictly after the cursor in that order.
+                // Two placeholders: number them in separate statements, because the operand
+                // order of one `+` chain is unspecified and a swap would silently compare the
+                // id against the timestamp.
+                const int ts_idx = idx++;
+                const int id_idx = idx++;
+                sql += " AND (timestamp, id) < ($" + std::to_string(ts_idx) + "::bigint, $" +
+                       std::to_string(id_idx) + "::bigint)";
+                binds.push_back(std::to_string(q.continue_after->first));
+                binds.push_back(std::to_string(q.continue_after->second));
+            }
             append_scope_clause(sql, binds, idx, scope);
             append_tier_clause(sql, binds, idx, tier);
-            sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
+            // `id DESC` makes the order total: timestamps are epoch seconds and a fleet answers
+            // in bursts, so a page boundary inside a tie must be deterministic.
+            sql += " ORDER BY timestamp DESC, id DESC LIMIT $" + std::to_string(idx++) +
+                   "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
                 sql += " OFFSET $" + std::to_string(idx++) + "::integer";

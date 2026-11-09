@@ -439,7 +439,7 @@ function, `requires_approval(mcp_tier, securable_type, operation)` (in `mcp_poli
 own doc comment, "AFTER `tier_allows()` returns true." **It is not derived from anything else — it
 is its own hard-coded, exact-match `(securable_type, operation)` list** (supervised tier:
 `Execution:Execute`, any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`,
-`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; operator
+`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`, `RevocationSource:Write`; operator
 tier: `Tag:Delete` only; read the supervised branch of `requires_approval()` in `mcp_policy.hpp`
 for the current list, which this paragraph can fall behind). A pair that is destructive in the
 everyday sense but **absent** from this list runs un-approved at supervised tier, full stop: there
@@ -955,7 +955,7 @@ Next, the decision §3's "fifth registration point"
 calls out explicitly: `SoftwareDeployment:Execute` is **not** in `requires_approval()`'s hard-coded
 supervised-tier list today (verified; the list at the time of writing is `Execution:Execute`,
 any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
-`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; read the supervised branch of
+`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`, `RevocationSource:Write`; read the supervised branch of
 `requires_approval()` in `mcp_policy.hpp` for the current one). Starting a deployment pushes a package to live
 endpoints — REST gates the equivalent action behind an MFA step-up (`step_up_fn`,
 `rest_api_v1.cpp:9053`) precisely because it is consequential. The twin PR's job is to make that

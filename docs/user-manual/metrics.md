@@ -1460,7 +1460,8 @@ auto-revoke a row this leaves stranded.
 Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
 access reviews") shipped with zero metrics; the hardening round added four
 bounded-label series wired at the REST handlers (`rest_api_v1.cpp`) only —
-the MCP twins are not double-counted.
+the MCP twins are not double-counted. A fifth series,
+`yuzu_access_review_attestation_refused_total`, covers both surfaces (see below).
 
 ```
 # HELP yuzu_access_review_export_total Access review evidence exports (GET /api/v1/access-reviews/export), by format
@@ -1503,6 +1504,37 @@ yuzu_access_review_attestations_total{decision="flagged_revoke"} 0
   itself revokes anything (flag ≠ revoke, see `docs/auth-architecture.md`);
   a rising `flagged_revoke` count is a worklist size for whoever acts on
   the flags, not an automatic remediation trigger.
+
+```
+# HELP yuzu_access_review_attestation_refused_total Access review attestations refused because the reviewer is the subject of the grant, by surface (rest|mcp) and reason (self_subject|engine_owner|group_member|check_unavailable)
+# TYPE yuzu_access_review_attestation_refused_total counter
+yuzu_access_review_attestation_refused_total{surface="rest",reason="self_subject"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="engine_owner"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="group_member"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="check_unavailable"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="self_subject"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="engine_owner"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="group_member"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="check_unavailable"} 0
+```
+
+`yuzu_access_review_attestation_refused_total{surface,reason}` counts attestations
+refused by the rule that the reviewer must differ from the subject of the grant.
+Unlike the four series above it is counted for both the REST route and the MCP
+`record_attestation` tool (`surface` is `rest` or `mcp`). `reason` is
+`self_subject` (a `user` grant naming the reviewer), `engine_owner` (an engine
+principal the reviewer owns now or owned when the campaign opened; the series counts both the
+live-owner refusal and the frozen-owner refusal and cannot tell them apart), `group_member` (a group the reviewer belongs to) or
+`check_unavailable` (the engine or group lookup behind the check could not be
+answered, so nothing was recorded; this one is a degraded store, not a reviewer
+doing something wrong, and no dedicated alert ships for it: the group path also
+feeds the existing `yuzu_server_rbac_read_degrade_total` (a pool timeout, an open
+breaker or a query error), while the engine path emits no other metric, so an
+engine lookup outage is visible only here and in the `failure` audit rows). All eight series are pre-seeded to `0`. The counter moves
+whether or not the refusal's audit row could be saved. It is operational, not
+`event="security"`, and has no alert rule; the refusal's own audit row
+(`access_review.attested` / `access_review.flagged` with `result=denied`, or
+`result=failure` for `check_unavailable`) is the evidence.
 
 None of the four carries `event="security"` — a review export or an
 attestation decision is expected, privileged, self-audited operator
@@ -2015,7 +2047,7 @@ upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
 | `yuzu_fleet_spark_watch_rejected{os,mechanism}` | gauge | Fleet sum of cumulative watch-cap rejections (a rule that could not arm — denial-of-detection). 0 at rung 1 |
 | `yuzu_fleet_spark_quarantined{os,mechanism}` | gauge | Fleet sum of work a mechanism had to abandon at stop() instead of completing: File - watches leaked to process lifetime (a structural leak); Registry - establishment probes still parked on a detached worker when the mechanism stopped (leaked-and-counted, self-disposing). Should stay 0. 0 at rung 1 |
 | `yuzu_fleet_spark_slow_op{os,mechanism}` | gauge | Fleet sum of cumulative watch-establishment work past the mechanism's own threshold: File - a slow arm-path OS operation under its lock; Registry - an arm or re-arm obligation unestablished past its 50 ms health grace (a stalled, refused or admission-saturated watcher). 0 at rung 1 |
-| `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with NO mechanism registered on that host, OR one that IS registered but BOOT-INERT (`start()` refused to bind its OS facility - #4685), enforced by **neither** backend either way (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. after a reconcile that finds the mechanism available, or the rule being disabled/removed). **0 today**: classification only runs once an agent's `prefer_spark` is enabled, which is not yet true anywhere in production (see `yuzu.guardian_backend`, still `legacy` fleet-wide). Once enabled, every rule on macOS reads `unsupported`, since macOS registers none of file/registry/service - routine and expected there, not page-worthy. A TRANSIENT runtime-degraded File or Registry episode does **not** land a rule here (#4685 fixed this): the rule stays logically armed/committed via spark for the whole episode - detection is unavailable until the mechanism's next successful pass - and recovers with no push or restart needed once that pass succeeds - see `yuzu_fleet_spark_mechanisms` for that signal instead |
+| `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with NO mechanism registered on that host, OR one that IS registered but BOOT-INERT (`start()` refused to bind its OS facility - #4685), enforced by **neither** backend either way (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. after a reconcile that finds the mechanism available, or the rule being disabled/removed). **0 today**: classification only runs once an agent's `prefer_spark` is enabled, which is not yet true anywhere in production (see `yuzu_fleet_guardian_backend`, still `legacy` fleet-wide). Once enabled, every rule on macOS reads `unsupported`, since macOS registers none of file/registry/service - routine and expected there, not page-worthy. A TRANSIENT runtime-degraded File or Registry episode does **not** land a rule here (#4685 fixed this): the rule stays logically armed/committed via spark for the whole episode - detection is unavailable until the mechanism's next successful pass - and recovers with no push or restart needed once that pass succeeds - see `yuzu_fleet_spark_mechanisms` for that signal instead |
 | `yuzu_fleet_spark_watch_faults{os}` | gauge | Fleet sum of cumulative post-arm watch-fault edges (`watch_faults_total`). 0 at rung 1 |
 | `yuzu_fleet_spark_queued_dropped{os}` | gauge | Fleet sum of cumulative queued events dropped (bounded-queue overflow + shutdown). On the enforce lane (rung 3) a drop is a silent compliance failure. 0 at rung 1 |
 | `yuzu_fleet_spark_consumer_errors{os}` | gauge | Fleet sum of cumulative queued handlers that threw (`consumer_errors_total`). 0 at rung 1 |
@@ -2062,6 +2094,8 @@ enforcement-posture table.
 | `yuzu_server_guardian_reconcile_claims` | gauge | Per-agent reconcile claims currently held on this replica (#5513), a 15 s snapshot published on the serial `health_recompute` thread: at most one per agent, erased when an agent converges after the 25 s interval and by the claim sweep. Memory is bounded by the fleet size. Pre-seeded to 0. Per replica. |
 | `yuzu_server_guardian_policy_generation` | gauge | Generation label of the most recent Guardian rule push this server replica dispatched, or of the most recent REST/dashboard policy-bump fan-out that ran. The fan-out sets it after its send loop to the generation it read, even when it dispatched to zero agents (an empty scope, or every send failed), so it can move without any push having been delivered. The heartbeat reconcile (#5513) sets it from the fresh generation read at admission, only when its push was queued (`result="sent"`). Per replica. |
 | `yuzu_server_guardian_policy_generation_raise_total{transport,result}` | counter | Business outcomes of the Guardian policy-generation raise, `POST /api/v1/guaranteed-state/policy-generation/raise` and its MCP twin `raise_guardian_policy_generation`, by `transport` (`rest`/`mcp`) and `result`: `applied` (the counter moved up), `unchanged` (a target at or below the stored value, so nothing changed), `refused` (a rejected request body or target, a target the store rejects as out of range, or an empty rule set raised without `acknowledge_empty_rule_set`, which is counted on both transports) and `failed` (a store that is not open or fails, an unreadable rule or Baseline count, or an `attempted` audit row that could not be written; the count read and the `attempted` row failures change nothing, while a store fault during the raise leaves the outcome unconfirmed). On MCP, a bad argument type is rejected by the input-schema check before the handler's own parse and is not counted, so `transport="mcp",result="refused"` moves only for the empty-rule-set refusal. `applied` and `unchanged` are counted when the store call returns, before the outcome audit row is written, so a raise whose outcome row then failed still counts. A caller turned away by an administrator, tier, step-up, service-scope, current-regime or (REST, cookie sessions) same-site `csrf.denied` gate is not counted in any series. Pair the counter with the `guaranteed_state.policy_generation.raise` audit rows. An example, not shipped as an alert: `sum(increase(yuzu_server_guardian_policy_generation_raise_total{result="failed"}[15m])) > 0`; it keeps firing for up to 15 minutes after the cause is fixed. Zero-seeded for all 8 series so an idle server carries every dimension from boot. Per replica. |
+| `yuzu_server_revocation_source_degrade_total{reason}` | counter | Registration of a CRL source refused for a retryable reason (ADR-0070 R1), pre-seeded at 0. `reason` is one of `own_addresses_unavailable` (this server's own addresses could not be determined, so the own-address refusal could not be applied: registration fails closed), `dns_unavailable` (the resolver failed transiently, including a system error), `dns_timeout` (a name lookup got no answer in its budget), `dns_busy` (16 lookups were already outstanding), `dns_budget_exhausted` (the request's 15 s name-resolution budget ran out), `validation_busy` (four registrations were already resolving names). A sustained rate means CRL source registration is failing for the operators attempting it; check DNS and the host's interfaces. |
+| `yuzu_server_revocation_source_resolver_in_flight` | gauge | Name lookups outstanding in the process-wide bounded resolver pool (cap 16) that CRL source registration resolves hosts in, published from the 15 s health tick (ADR-0070 R1). A value at 16 means every slot is in use and new registrations are refused (`dns_busy`). Pre-seeded at 0. |
 | `yuzu_fleet_agents_dex_observer_disarmed` | gauge | Windows agents (DEX enabled) whose DEX signal observer is not currently healthy — it failed to arm at startup, or a channel subscription died at runtime (EventLog restart / channel ACL change). `> 0` means reliability telemetry is off or degraded on that many endpoints. Agents off Windows or started with `--dex-disable` are excluded, so this is a genuine fault count. Rolled up from agent heartbeats. Note: it does **not** detect a host where the underlying reporter is disabled (e.g. Windows Error Reporting off → no Event 1000, observer still armed). |
 | `yuzu_fleet_dex_observed_total` | gauge | Fleet-wide sum of DEX signals observed (all obs_types) since each agent started. **A gauge, not a monotonic counter** — it resets when an agent restarts, so do not apply `rate()`/`increase()`; per-signal detail lives in the Guardian events store (`GET /api/v1/guaranteed-state/events?rule_id=__observation__`) and the `/dex` dashboard. |
 | `yuzu_server_guardian_census_proj_failures_total` | counter | Compliance-census (`guardian_agent_rule_status`) writes that failed for a reason other than the rule having been deleted (#5674). The failure of a single event does not discard it: it stays stored with pending census evidence (`projection_pending`), and the pair keeps its previous state until a redelivery of that event repairs it or a later event for the pair arrives. A repair that fails is counted here again. `> 0` means the census may be stale: the server log line `census upsert failed` names the agent and rule. No alert rule ships for it yet. A write refused because the rule is not defined on this server (SQLSTATE 23503) is a normal outcome and is not counted; a failure to retire the evidence of such an event is an ingest error. |
@@ -2237,6 +2271,64 @@ unmeasured threshold now - this counter names the fault class only.
 | `yuzu_fleet_guardian_io_arm_disarm_rejected_ceiling` | gauge | Fleet **SUM** of admissions refused at the arm/disarm executor's per-instance physical alive-worker ceiling (workers still alive past `fn()` inside their completion callbacks while ordinary class quota was free). A genuinely cumulative per-agent counter - correctly MONITOR-ONLY: neither `increase()` nor a bare `> 0` is sound over a fleet sum of per-agent cumulative counters. Names the fault class; does not by itself say whether an endpoint is CURRENTLY wedged |
 | `yuzu_fleet_guardian_io_ceiling_reporting` | gauge | Agents whose latest heartbeat carried the ceiling tag - the coverage denominator. **Published every sweep including `0`**. The writer is sparse (a zero ceiling count ships no tag), so `0` here means no currently-retained agent has hit the ceiling since its own process last started (or none is running spark) - counters reset on agent restart and this reads only the latest retained heartbeats, not durable history; not that telemetry is dark |
 | `yuzu_fleet_guardian_io_ceiling_tag_rejected` | gauge | The ceiling tag **present** this sweep but rejected by the forged-value parse. **Published every sweep including `0`** |
+
+### Guardian backend fleet gauge (#2240)
+
+`yuzu_fleet_guardian_backend{os,backend}` rolls up the agent's `yuzu.guardian_backend` heartbeat tag
+([Guaranteed State](guaranteed-state.md)): which detection backend each agent reports its Guardian
+enforcing with. The value is the agent's own report, not independent verification: `legacy` means the
+flip is off, not that enforcement was checked, and an absent series or a `null` is not evidence of
+health. `backend` is one of `legacy`, `spark`, `spark_failed` or `unwired`, taken from a
+closed server-side table, never from the raw heartbeat bytes. It is a **partition count**: each
+agent with a valid tag is in exactly one `{os,backend}` series per sweep, so the series sum to
+`yuzu_fleet_guardian_backend_reporting`. The family is rebuilt every 15 second sweep and is
+**absent-not-zero**: a `(os, backend)` pair nobody is in has no series, and nothing is pre-seeded.
+
+Read it with these limits in mind:
+
+- **`legacy` is every reporting agent until `prefer_spark` is enabled.** The production agent
+  hardcodes `prefer_spark` off, so `spark`, `spark_failed` and `unwired` cannot appear yet.
+  After the flip, `legacy` also covers an operator's `--spark-disable`; `yuzu_fleet_spark_disabled{os}`
+  tells the two apart.
+- **The `spark_failed` value is not `yuzu_fleet_spark_failed{os}`.** The tag value is what an
+  agent with `prefer_spark` on and a failed SparkEngine boot reports. The gauge counts agents
+  with `spark_running=0` and no `spark_disabled`, and can fire before the flip. Before the flip a
+  SparkEngine boot failure shows only on `yuzu_fleet_spark_failed{os}`, never on this family.
+- **A missing tag is never `legacy`.** An agent older than the tag, an agent with no Guardian, an
+  agent whose Guardian heartbeat tag group faulted on that beat, and a stopping agent are all
+  in no series. The gauge can therefore drop an agent for a sweep or two on a faulted beat. Compare
+  `yuzu_fleet_guardian_backend_reporting` with `yuzu_fleet_agents_by_os` for the coverage gap.
+- **Population:** every agent the health store holds a heartbeat for within the last 90 seconds,
+  per core replica. An agent that has just disconnected stays counted until it ages out (up to
+  about 105 seconds: the 90 second window plus one sweep), and a failover or a restart moves that
+  window to another replica, so scrape each replica directly and sum across them; the sum can
+  briefly exceed the fleet. After a restart every device reads `null` and the family is absent
+  until the agents' next beats and the first sweep. The OS label is the agent's self-reported
+  `yuzu.os`, allowlisted to `windows`, `linux`, `darwin`, `other` or `unknown`; it can differ from
+  the `os` on the device row, which comes from the session.
+- **Per-device twin:** the same classification is served per device as the nullable
+  `guardian_backend` field on `GET /api/v1/devices[/{id}]` and the `list_agents` and
+  `get_agent_details` MCP tools. `null` means the device has no valid tag within the window. The two can
+  differ in either direction for up to one sweep, and the field covers only connected devices and
+  is read live, while the gauge is republished every sweep and also counts a just-disconnected
+  agent.
+- **No alert ships.** A rule such as `yuzu_fleet_guardian_backend{backend=~"spark_failed|unwired"} > 0`
+  becomes meaningful only after the flip. No shipped alert rule reads this family, and `unwired` is a
+  state no existing alert covers.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_backend{os,backend}` | gauge | Agents by Guardian detection backend and OS. One series per `(os, backend)` that has at least one agent; absent otherwise. The 5 OS values times 4 backends bound the family at 20 series. |
+| `yuzu_fleet_guardian_backend_reporting` | gauge | Agents whose latest heartbeat carried a valid `yuzu.guardian_backend` tag - the denominator the series above sum to. **Published every sweep including `0`.** |
+| `yuzu_fleet_guardian_backend_tag_rejected` | gauge | Tags **present and non-empty** this sweep but rejected by the closed-set, case-sensitive parse (anything but exactly the four tokens, or over 12 bytes). An empty value is skipped and not counted. **Published every sweep including `0`.** A rejected value lands in no series and reads `null` on the device field, so this is the only fleet signal for it. `> 0` means a forged or malformed tag, or a newer agent shipping a backend this server does not know yet during a rolling upgrade. |
+
+Scrape behaviour to expect. The family and `yuzu_fleet_guardian_backend_reporting` are written at
+different moments in the sweep, so a scrape between them can see an empty family beside the previous
+`_reporting`: "the series sum to `_reporting`" holds per sweep, not per scrape. Ratio and difference
+expressions then return no data for that scrape, which is correct; do not patch them with
+`or vector(0)`. All three families are absent until the first sweep after boot, and the labelled
+family is absent on an empty fleet. `_tag_rejected` cannot name the agent, because the device field
+reads `null` for both a missing and a rejected tag.
 
 ### Guardian M1 health-stream fleet gauges
 

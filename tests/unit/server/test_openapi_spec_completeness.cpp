@@ -45,9 +45,11 @@
 #include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
 #include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
 #include "guaranteed_state_store.hpp" // kUnrepresentedPendingIdCap: the cap the maxItems literals mirror
+#include "guardian_backend_fleet_tags.hpp" // #2240: the closed backend token table the device enum mirrors
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "result_set_model.hpp"
 #include "settings_model.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
@@ -1878,7 +1880,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"3f52c4da8daaf692\"";
+    static const std::string kOperationIdChecksum = "\"22a3dbe209974a9b\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -2356,6 +2358,8 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
             return "integer";
         if (v.is_string())
             return "string";
+        if (v.is_boolean())
+            return "boolean";
         if (v.is_object())
             return "object";
         if (v.is_array())
@@ -2407,6 +2411,11 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK(echo.at("properties").at("tick_seconds").value("type", "") ==
           type_of(real["echo"]["tick_seconds"]));
     CHECK_FALSE(echo.at("properties").at("tick_seconds").value("nullable", false));
+    // The byte budget is published once at the echo level, as the agent's default.
+    REQUIRE(real["echo"].contains("db_budget_bytes"));
+    CHECK(echo.at("properties").at("db_budget_bytes").value("type", "") ==
+          type_of(real["echo"]["db_budget_bytes"]));
+    CHECK_FALSE(echo.at("properties").at("db_budget_bytes").value("nullable", false));
 
     // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
     // tiers (so `nullable` is needed and is not decoration).
@@ -2449,6 +2458,10 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     }
     CHECK(saw_rows);
     CHECK(saw_seconds);
+    // Every row says whether the byte budget can shorten it.
+    const json& budget_dep = item.at("properties").at("budget_dependent");
+    CHECK(budget_dep.value("type", "") == "boolean");
+    CHECK_FALSE(budget_dep.value("nullable", false));
     const json& depth = item.at("properties").at("guaranteed_depth_seconds");
     CHECK(depth.value("type", "") == "integer");
     CHECK(depth.value("nullable", false));
@@ -2478,6 +2491,49 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo 
 
     const std::string ok = get_op["responses"]["200"].value("description", "");
     CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): the ResultSet schema declares what result_set_json emits",
+          "[openapi][result_set][agents_failed]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& schema = spec.at("components").at("schemas").at("ResultSet");
+    const json real = yuzu::server::result_set_json(yuzu::server::ResultSet{});
+
+    std::set<std::string> emitted;
+    for (auto it = real.begin(); it != real.end(); ++it)
+        emitted.insert(it.key());
+    std::set<std::string> declared;
+    for (auto it = schema.at("properties").begin(); it != schema.at("properties").end(); ++it)
+        declared.insert(it.key());
+    std::set<std::string> required;
+    for (const auto& k : schema.at("required"))
+        required.insert(k.get<std::string>());
+    CHECK(declared == emitted);
+    CHECK(required == emitted);
+
+    // The failure signal: a count and a flag derived from it.
+    CHECK(schema.at("properties").at("agents_failed").value("type", "") == "integer");
+    CHECK(schema.at("properties").at("partial").value("type", "") == "boolean");
+    CHECK(real.at("agents_failed").get<long long>() == 0);
+    CHECK_FALSE(real.at("partial").get<bool>());
+    yuzu::server::ResultSet failed;
+    failed.agents_failed = 2;
+    const json partial = yuzu::server::result_set_json(failed);
+    CHECK(partial.at("agents_failed").get<long long>() == 2);
+    CHECK(partial.at("partial").get<bool>());
+}
+
+TEST_CASE("openapi_spec_json(): the re-eval and from-echo-query routes document the stale-source refusal",
+          "[openapi][result_set][stale_source]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    for (const char* path : {"/result-sets/{id}/re-eval", "/result-sets/from-echo-query"}) {
+        INFO(path);
+        const json& bad = spec.at("paths").at(path).at("post").at("responses").at("400");
+        CHECK(bad.at("description").get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+    }
 }
 
 TEST_CASE("openapi documents: the response status set of the hand-checked operations matches "
@@ -2615,6 +2671,42 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
             CHECK(declared == row.statuses);
         }
     }
+}
+
+TEST_CASE("openapi_spec_json(): DevicesListRow carries a nullable guardian_backend pinned to the token table",
+          "[openapi][devices][guardian_backend]") {
+    // #2240. OpenAPI 3.0.3 has no `type: [string, null]`: a nullable enum needs BOTH
+    // `nullable: true` and `null` among the enum values. The enum is compared against the
+    // server's own closed token table, so a fifth token is a red test here, not a client that
+    // silently rejects it.
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& row = spec["components"]["schemas"]["DevicesListRow"];
+    REQUIRE(row["properties"].contains("guardian_backend"));
+    const auto& prop = row["properties"]["guardian_backend"];
+    CHECK(prop["type"] == "string");
+    CHECK(prop["nullable"] == true);
+
+    json expected = json::array();
+    for (const char* t : yuzu::server::detail::kGuardianBackendTokens)
+        expected.push_back(t);
+    expected.push_back(nullptr);
+    CHECK(prop["enum"] == expected);
+
+    // The key is always present in the response, so it is a required property.
+    bool required = false;
+    for (const auto& r : row["required"])
+        required = required || r == "guardian_backend";
+    CHECK(required);
+
+    // The detail schema inherits the row via allOf, so it carries the field too.
+    CHECK(spec["components"]["schemas"]["DevicesDetail"].dump().find("DevicesListRow") !=
+          std::string::npos);
+
+    // The prose that used to say "5 fields" must not.
+    const auto desc = spec["paths"]["/devices"]["get"]["description"].get<std::string>();
+    CHECK(desc.find("5 fields") == std::string::npos);
+    CHECK(desc.find("guardian_backend") != std::string::npos);
 }
 
 TEST_CASE("openapi documents: the plugin-config success responses reference the {data, meta} "
