@@ -665,7 +665,7 @@ An example `200` body for a page of one device (the `ci` object is shortened her
         "hostname": "pc-0042.example.test"
       }
     ],
-    "next_cursor": "h1:0a1b2c3d4e5f6071:CHBjLTAwNDIe"
+    "next_cursor": "h1:73f89ce57dce020f:NzpwYy0wMDQyHw"
   },
   "meta": { "api_version": "v1" }
 }
