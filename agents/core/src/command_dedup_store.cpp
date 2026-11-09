@@ -92,7 +92,8 @@ constexpr int kStateTerminal = 1;
 // journal_mode/synchronous pragmas, or creating the two tables. Damage confined to the unused
 // `meta` table is tolerated (see the schema_version seed below).
 //
-// Two deliberate rules; echo's classify_integrity_rc draws the first the same way (#7286), the
+// Two deliberate rules; echo's classify_integrity_rc makes the first rc split the same way (echo
+// also quarantines on a failed integrity_check row, which this store never runs) (#7286), the
 // second is this store's alone:
 //  1. Only SQLITE_CORRUPT / SQLITE_NOTADB counts. BUSY / LOCKED / IOERR / FULL / CANTOPEN / PERM are
 //     transient or environmental; quarantining on them would discard good history, which lets an

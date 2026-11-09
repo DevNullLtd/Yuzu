@@ -1896,6 +1896,8 @@ TEST_CASE("EchoDatabase: a corrupt echo.db is quarantined and re-initialised fre
     CHECK(q_epoch == std::to_string(*db2.quarantined_this_open()));
     const auto q_file = db2.get_config("db_health_last_quarantine_file", "");
     CHECK(q_file.rfind(tmp.filename().string() + ".corrupt-", 0) == 0);
+    // One clock read names the file and is persisted: the epoch in the name is the stored one.
+    CHECK(q_file == tmp.filename().string() + ".corrupt-" + q_epoch);
     CHECK(q_file.find_first_of("/\\") == std::string::npos);
 
     // A clean re-open of the same path reports no quarantine, but both config
@@ -4480,7 +4482,7 @@ TEST_CASE("adopt_legacy_echo_db: an owner-verified echo.db with a foreign sideca
 }
 
 #ifdef _WIN32
-// adv-S2. A sidecar that cannot be renamed is COPIED into the quarantine set, and a copy takes the
+// A sidecar that cannot be renamed is COPIED into the quarantine set, and a copy takes the
 // directory's inherited ACL (here an inheritable BUILTIN\Users read ACE, as C:\ProgramData has),
 // which would leave a corrupt database's WAL readable by every local user while the live files are
 // protected. open() protects the copy again. Each sidecar is held open without FILE_SHARE_DELETE,
@@ -4535,13 +4537,14 @@ TEST_CASE("EchoDatabase (Windows): a quarantined sidecar that had to be copied i
     }
 }
 
-// adv-S-A. The re-secure pass above runs for every OCCUPIED derived name, and the quarantine name
+// The re-secure pass above runs for every OCCUPIED derived name, and the quarantine name
 // is predictable (the current epoch second, n = 0), so a local user can squat `<claimed>-wal`
 // ahead of a corruption with a hard link to a file of theirs, or to any file the service holds
 // WRITE_DAC on. A hard link shares its target's security descriptor: without the owner and link
-// tests the pass would rewrite the TARGET's DACL. The squat covers a window of epochs around now
+// tests the pass would rewrite the TARGET's DACL. The squat covers now and the ten seconds after it
 // so the claim lands on one of them without a seam into the clock; the live sidecar that could
-// not take the squatted name is removed by the quarantine (recorded residual S1), which is not
+// not take the squatted name is removed by the quarantine (the first recorded limit in
+// sqlite_quarantine.hpp, the squatted-sidecar name), which is not
 // what this case is about: here there is none.
 TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar name is left alone",
           "[echo][store][lifecycle][corruption][hardening]") {
@@ -4579,6 +4582,40 @@ TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar 
     CHECK(read_file(decoy) == "not a wal");
     CHECK_FALSE(dacl_facts(decoy).dacl_protected);
     CHECK(dacl_facts(decoy).allows(kUsers));
+}
+
+// The other half of the same pass: a plain file (one link) squatted at a quarantine sidecar name
+// by another account. The pass tests the owner first, so the file is left as it is and logged
+// rather than re-secured. SeRestorePrivilege hands the plant to Users, so the case SKIPs without it.
+TEST_CASE("EchoDatabase (Windows): a foreign-owned file squatted at a quarantine sidecar name is left alone",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    spit_file(d.db, "this is not a SQLite database");
+
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    constexpr int kSquats = 11; // now .. now + 10 s
+    for (int i = 0; i < kSquats; ++i) {
+        const fs::path squat = d.dir.path / std::format("echo.db.corrupt-{}-wal", now + i);
+        spit_file(squat, "not a wal");
+        set_owner(squat, kUsers);
+    }
+
+    auto opened = EchoDatabase::open(d.db);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->quarantined_this_open().has_value());
+    const fs::path squatted =
+        d.dir.path / std::format("echo.db.corrupt-{}-wal", *opened->quarantined_this_open());
+    REQUIRE(fs::exists(squatted));
+    REQUIRE(fs::exists(d.dir.path / std::format("echo.db.corrupt-{}", *opened->quarantined_this_open())));
+
+    // Left as the planter made it: still theirs, still the inherited (unprotected) ACL.
+    CHECK(owner_sid(squatted) == kUsers);
+    CHECK_FALSE(dacl_facts(squatted).dacl_protected);
+    CHECK(dacl_facts(squatted).allows(kUsers));
 }
 
 // The real probe (default_echo_owner_probe, the owner test open() applies), not a fake: a file

@@ -48,14 +48,14 @@ regressible — nothing fails loudly when one is broken.
    claimed with an atomic hard link; if the hard link fails for any reason other than the name being taken, or
    if every `-n` is taken, it fails closed instead and the file stays where it is), carries any non-empty
    `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty sidecars are removed; one that cannot be
-   renamed is copied, then removed), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
+   renamed is copied, then removed; one whose quarantine name is already taken, or whose copy fails, is removed and not kept, and the note says so), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
    (header-only, unit-tested directly). The claim protects the quarantined EVIDENCE only: two agent daemons on
    one data dir are unsupported (no instance lock covers the dedup store; the Guardian boot-epoch lock guards only the epoch claim), and one can still drop the fresh store the other
    just created. What counts is deliberately narrow:
    - `SQLITE_CORRUPT` / `SQLITE_NOTADB` from any open step (open, the `journal_mode`/`synchronous` pragmas,
      creating the two tables). Damage confined to the unused `meta` table is tolerated: the
      `schema_version` seed that touches it only logs a warning. BUSY, IOERR, FULL, CANTOPEN and PERM are NOT corruption and never quarantine (that
-     would discard good history). Echo's `classify_integrity_rc` draws the same line (#7286).
+     would discard good history). Echo's `classify_integrity_rc` makes the same rc split (#7286); Echo also quarantines on a non-`ok` `integrity_check` row, which this store never runs.
    - **There is no whole-file integrity scan, by owner ruling.** A file that opens but has a few damaged pages
      keeps serving the ids on intact pages (in one experiment with a single damaged leaf page nearly every id
      still resolved; damage to an interior or root page costs many more), and only the claims that touch a bad

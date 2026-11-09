@@ -675,7 +675,7 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
 // `<claimed>-wal` ahead of time with a hard link, which shares its target's security descriptor,
 // so applying the DACL to it would rewrite the TARGET's. A name with a foreign owner or a second
 // link is therefore left alone and logged (the live sidecar that could not take that name was
-// removed by the quarantine: recorded residual S1 in sqlite_quarantine.hpp). A renamed sidecar
+// removed by the quarantine: the first recorded limit in sqlite_quarantine.hpp, the squatted-sidecar name). A renamed sidecar
 // keeps its DACL, so for it this repeats what it has. Not secure_echo_db_files itself: its
 // OPEN_ALWAYS would create empty sidecars beside the evidence.
 // Best effort and logged, the same availability-over-confidentiality posture as the live files.
@@ -982,8 +982,9 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             kBusyTimeoutMs, path.string()));
     case IntegrityCheck::corrupt: {
         guard.reset();
-        const auto quarantine = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(
-            path, now_epoch_seconds());
+        // One clock read: the persisted epoch is the one in the on-disk quarantine name.
+        const std::int64_t epoch = now_epoch_seconds();
+        const auto quarantine = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(path, epoch);
         for (const auto& note : quarantine.notes)
             spdlog::warn("EchoDatabase: {}", note);
         const auto& quarantined = quarantine.dest;
@@ -1000,7 +1001,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
                 "(corrupt and unmovable): {}",
                 path.string()));
         }
-        quarantined_at = now_epoch_seconds();
+        quarantined_at = epoch;
         quarantined_file = quarantined->filename().string();
         spdlog::error("ECHO: echo.db failed PRAGMA integrity_check (echo.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
