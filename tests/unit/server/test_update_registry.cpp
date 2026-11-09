@@ -529,3 +529,61 @@ TEST_CASE("UpdateRegistry: remove_package reports false when the DELETE fails, t
     }
     CHECK_FALSE(reg.remove_package("windows", "x86_64", "0.1.0"));
 }
+
+TEST_CASE("is_valid_utf8 and is_safe_package_filename refuse invalid UTF-8",
+          "[update_registry][validation]") {
+    // Well-formed text of every sequence length.
+    CHECK(is_valid_utf8("plain ascii"));
+    CHECK(is_valid_utf8(""));
+    CHECK(is_valid_utf8("\xc3\xa9"));         // U+00E9
+    CHECK(is_valid_utf8("\xe2\x82\xac"));     // U+20AC
+    CHECK(is_valid_utf8("\xf0\x9f\x98\x80")); // U+1F600
+    CHECK(is_valid_utf8("\xf4\x8f\xbf\xbf")); // U+10FFFF, the last scalar value
+
+    // A lone continuation or lead byte, a truncated sequence, an overlong form, a
+    // surrogate and a value above U+10FFFF are all refused.
+    CHECK_FALSE(is_valid_utf8("\xff"));
+    CHECK_FALSE(is_valid_utf8("\x80"));
+    CHECK_FALSE(is_valid_utf8("ab\xc3"));
+    CHECK_FALSE(is_valid_utf8("\xc0\x80"));
+    CHECK_FALSE(is_valid_utf8("\xe0\x80\x80"));
+    CHECK_FALSE(is_valid_utf8("\xed\xa0\x80"));
+    CHECK_FALSE(is_valid_utf8("\xf4\x90\x80\x80"));
+    CHECK_FALSE(is_valid_utf8("\xf8\x88\x80\x80\x80"));
+
+    CHECK_FALSE(is_safe_package_filename("agent-\xff"));
+    CHECK_FALSE(is_safe_package_filename("agent\xc0\x80"));
+    CHECK_FALSE(is_safe_package_filename("agent\xed\xa0\x80"));
+    CHECK_FALSE(is_safe_package_filename("agent-\xe2\x82"));
+}
+
+TEST_CASE("UpdateRegistry: list_packages_checked keeps a failed read distinct from an empty one",
+          "[update_registry][pg][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
+    TempUpdateDir tmp;
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
+
+    // An empty table is a successful, empty answer.
+    const auto empty = reg.list_packages_checked();
+    REQUIRE(empty.has_value());
+    CHECK(empty->empty());
+
+    REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0")));
+    const auto one = reg.list_packages_checked();
+    REQUIRE(one.has_value());
+    CHECK(one->size() == 1);
+
+    // A column the listing selects is renamed: the read fails while the row stays. The
+    // fail-soft form answers empty, the checked form answers nullopt.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult ren{PQexec(conn.get(), "ALTER TABLE update_registry.update_packages "
+                                        "RENAME COLUMN uploaded_at TO yuzu_test_uploaded_at")};
+        REQUIRE(ren.ok());
+    }
+    CHECK_FALSE(reg.list_packages_checked().has_value());
+    CHECK(reg.list_packages().empty());
+}

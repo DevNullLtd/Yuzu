@@ -40,6 +40,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -912,6 +913,270 @@ TEST_CASE("OTA delete whose registry delete fails reports failure and leaves the
     CHECK(h.audited.front().target_id == "linux/x86_64/1.2.3");
     CHECK_FALSE(has_audit(h, "ota.package.deleted", "success"));
     CHECK(h.registry->list_packages().size() == 1);
+    CHECK(fs::exists(h.update_dir.path / "yuzu-agent-1.2.3"));
+    CHECK(fs::exists(h.update_dir.path / "yuzu-agent-1.2.3.sig"));
+}
+
+// ── Overwrite safety, text validity and the checked listing ─────────────────
+
+namespace {
+
+std::string read_file(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+/// One text cell from a single-row, single-column query on a fresh connection.
+std::string scalar_sql(const std::string& dsn, const char* sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+bool any_entry_contains(const fs::path& dir, const std::string& needle) {
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().filename().string().find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+
+const std::string kNewCms = "-----BEGIN CMS-----\nRUZHSA==\n-----END CMS-----\n";
+
+} // namespace
+
+TEST_CASE("OTA upload whose registry write fails restores the previous package and signature",
+          "[ota][settings_routes][pg][validation]") {
+    // The first upload publishes a signed package. A CHECK constraint then makes the
+    // registry write of any 50% upload fail while reads keep working, so a re-upload of
+    // the same filename reaches the write with the old files already replaced.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    OtaWireServer wire{h};
+    httplib::Client cli("127.0.0.1", wire.port);
+    cli.set_read_timeout(10, 0);
+    const std::string url = std::string(kUploadUrl) + "?platform=linux&arch=x86_64";
+
+    auto r0 = cli.Post(url, httplib::UploadFormDataItems{
+                                {"file", "old-bytes", "yuzu-agent-1.0.0", "application/octet-stream"},
+                                {"signature", kTestCms, "old.cms", "application/octet-stream"}});
+    REQUIRE(r0);
+    REQUIRE(r0->status == 200);
+    const auto before = h.registry->list_packages();
+    REQUIRE(before.size() == 1);
+    const std::string old_sha = before.front().sha256;
+    const auto dir_count = entries_in(h.update_dir.path);
+    CHECK(dir_count == 2); // the binary and its sidecar
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult c{PQexec(conn.get(), "ALTER TABLE update_registry.update_packages "
+                                          "ADD CONSTRAINT yuzu_test_no_half_rollout "
+                                          "CHECK (rollout_pct <> 50)")};
+        REQUIRE(c.ok());
+    }
+
+    // A signed re-upload, then an unsigned one: both fail at the registry write.
+    auto r1 = cli.Post(
+        url + "&rollout_pct=50",
+        httplib::UploadFormDataItems{
+            {"file", "new-bytes", "yuzu-agent-1.0.0", "application/octet-stream"},
+            {"signature", kNewCms, "new.cms", "application/octet-stream"}});
+    REQUIRE(r1);
+    CHECK(r1->status == 503);
+    auto r2 = cli.Post(url + "&rollout_pct=50",
+                       httplib::UploadFormDataItems{{"file", "newer-bytes", "yuzu-agent-1.0.0",
+                                                     "application/octet-stream"}});
+    REQUIRE(r2);
+    CHECK(r2->status == 503);
+    wire.stop();
+
+    REQUIRE(h.audited.size() == 3);
+    CHECK(h.audited[0].result == "success");
+    for (std::size_t i = 1; i < 3; ++i) {
+        CHECK(h.audited[i].action == "ota.package.uploaded");
+        CHECK(h.audited[i].result == "failure");
+        CHECK(h.audited[i].detail == "store_error");
+    }
+
+    // The registry row, the binary and the signature are exactly as before.
+    const auto after = h.registry->list_packages();
+    REQUIRE(after.size() == 1);
+    CHECK(after.front().sha256 == old_sha);
+    CHECK(after.front().rollout_pct == 100);
+    CHECK(read_file(h.update_dir.path / "yuzu-agent-1.0.0") == "old-bytes");
+    CHECK(read_file(h.update_dir.path / "yuzu-agent-1.0.0.sig") == kTestCms);
+    // And no kept copy or staging file is left behind.
+    CHECK(entries_in(h.update_dir.path) == dir_count);
+    CHECK_FALSE(any_entry_contains(h.update_dir.path, "yuzu_prev_"));
+}
+
+TEST_CASE("OTA re-upload over an existing filename succeeds and leaves no kept copies",
+          "[ota][settings_routes][pg][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    OtaWireServer wire{h};
+    httplib::Client cli("127.0.0.1", wire.port);
+    cli.set_read_timeout(10, 0);
+    const std::string url = std::string(kUploadUrl) + "?platform=linux&arch=x86_64";
+
+    auto r0 = cli.Post(url, httplib::UploadFormDataItems{
+                                {"file", "old-bytes", "yuzu-agent-1.0.0", "application/octet-stream"},
+                                {"signature", kTestCms, "old.cms", "application/octet-stream"}});
+    REQUIRE(r0);
+    CHECK(r0->status == 200);
+    auto r1 = cli.Post(
+        url, httplib::UploadFormDataItems{
+                 {"file", "new-bytes", "yuzu-agent-1.0.0", "application/octet-stream"},
+                 {"signature", kNewCms, "new.cms", "application/octet-stream"}});
+    REQUIRE(r1);
+    CHECK(r1->status == 200);
+    CHECK(read_file(h.update_dir.path / "yuzu-agent-1.0.0") == "new-bytes");
+    CHECK(read_file(h.update_dir.path / "yuzu-agent-1.0.0.sig") == kNewCms);
+    CHECK(entries_in(h.update_dir.path) == 2);
+    CHECK_FALSE(any_entry_contains(h.update_dir.path, "yuzu_prev_"));
+
+    // An unsigned re-upload replaces the binary and drops the old signature.
+    auto r2 = cli.Post(url, httplib::UploadFormDataItems{{"file", "newer-bytes", "yuzu-agent-1.0.0",
+                                                          "application/octet-stream"}});
+    REQUIRE(r2);
+    CHECK(r2->status == 200);
+    wire.stop();
+    CHECK(read_file(h.update_dir.path / "yuzu-agent-1.0.0") == "newer-bytes");
+    CHECK_FALSE(fs::exists(h.update_dir.path / "yuzu-agent-1.0.0.sig"));
+    CHECK(entries_in(h.update_dir.path) == 1);
+    CHECK_FALSE(any_entry_contains(h.update_dir.path, "yuzu_prev_"));
+
+    REQUIRE(h.audited.size() == 3);
+    for (const auto& row : h.audited)
+        CHECK(row.result == "success");
+    CHECK(h.registry->list_packages().size() == 1);
+}
+
+TEST_CASE("OTA upload refuses invalid UTF-8 in platform or arch and writes nothing",
+          "[ota][settings_routes][pg][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    OtaWireServer wire{h};
+    httplib::Client cli("127.0.0.1", wire.port);
+    cli.set_read_timeout(10, 0);
+    const httplib::UploadFormDataItems items{
+        {"file", "binary-bytes", "yuzu-agent-1.0.0", "application/octet-stream"}};
+
+    for (const char* query :
+         {"?platform=%FFlinux&arch=x86_64", "?platform=linux&arch=x86_%C0%80",
+          "?platform=lin%ED%A0%80ux&arch=x86_64", "?platform=linux&arch=x86%E2%82"}) {
+        INFO("query=" << query);
+        auto res = cli.Post(std::string(kUploadUrl) + query, items);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    wire.stop();
+
+    REQUIRE(h.audited.size() == 4);
+    for (const auto& row : h.audited) {
+        CHECK(row.action == "ota.package.uploaded");
+        CHECK(row.result == "denied");
+        CHECK(row.target_id.empty());
+        CHECK(row.detail == "invalid_package_field");
+    }
+    CHECK_FALSE(has_audit(h, "ota.package.uploaded", "success"));
+    CHECK(entries_in(h.update_dir.path) == 0);
+    CHECK(h.registry->list_packages().empty());
+}
+
+TEST_CASE("OTA upload refuses invalid UTF-8 or a control byte in the filename and writes nothing",
+          "[ota][settings_routes][pg][validation]") {
+    // Whether the HTTP layer lets these bytes through in a multipart filename is its own
+    // behaviour: if it refuses the request first, no handler runs and no audit row exists.
+    // Either way the answer is a 400 and nothing is written. When the handler does run,
+    // the row is the fixed denied token.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    OtaWireServer wire{h};
+    httplib::Client cli("127.0.0.1", wire.port);
+    cli.set_read_timeout(10, 0);
+
+    for (const std::string& name :
+         {std::string("yuzu-agent-\xff"), std::string("yuzu-agent-\xc0\x80"),
+          std::string("yuzu-agent-\xed\xa0\x80"), std::string("yuzu-agent-\x01") + "1",
+          std::string("yuzu-agent-\x1b") + "[0m"}) {
+        INFO("filename bytes=" << name.size());
+        auto res = cli.Post(std::string(kUploadUrl) + "?platform=linux&arch=x86_64",
+                            httplib::UploadFormDataItems{
+                                {"file", "binary-bytes", name, "application/octet-stream"}});
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    wire.stop();
+
+    for (const auto& row : h.audited) {
+        CHECK(row.action == "ota.package.uploaded");
+        CHECK(row.result == "denied");
+        CHECK(row.target_id.empty());
+        CHECK(row.detail == "invalid_package_field");
+    }
+    CHECK_FALSE(has_audit(h, "ota.package.uploaded", "success"));
+    CHECK(entries_in(h.update_dir.path) == 0);
+    CHECK(h.registry->list_packages().empty());
+}
+
+TEST_CASE("OTA delete refuses invalid UTF-8 in the package key and changes nothing",
+          "[ota][settings_routes][pg][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/100, /*mandatory=*/false);
+    write_file(h.update_dir.path / "yuzu-agent-1.2.3", "bytes");
+
+    auto res = h.sink.Delete(std::string("/api/settings/updates/linux/x86_64/1.2.3") + "\xff");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+
+    REQUIRE(h.audited.size() == 1);
+    CHECK(h.audited.front().action == "ota.package.deleted");
+    CHECK(h.audited.front().result == "denied");
+    CHECK(h.audited.front().target_id.empty());
+    CHECK(h.audited.front().detail == "invalid_package_field");
+    CHECK(h.registry->list_packages().size() == 1);
+    CHECK(fs::exists(h.update_dir.path / "yuzu-agent-1.2.3"));
+}
+
+TEST_CASE("OTA delete whose package listing cannot be read reports failure and removes nothing",
+          "[ota][settings_routes][pg][validation]") {
+    // A column the listing selects is renamed: the list read fails while a DELETE by key
+    // would still succeed, so a route that treated the failed listing as "no such package"
+    // would remove the row and leave its files behind.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/100, /*mandatory=*/false);
+    write_file(h.update_dir.path / "yuzu-agent-1.2.3", "bytes");
+    write_file(h.update_dir.path / "yuzu-agent-1.2.3.sig", kTestCms);
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult ren{PQexec(conn.get(), "ALTER TABLE update_registry.update_packages "
+                                            "RENAME COLUMN uploaded_at TO yuzu_test_uploaded_at")};
+        REQUIRE(ren.ok());
+    }
+
+    auto res = h.sink.Delete("/api/settings/updates/linux/x86_64/1.2.3");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+
+    REQUIRE(h.audited.size() == 1);
+    CHECK(h.audited.front().action == "ota.package.deleted");
+    CHECK(h.audited.front().result == "failure");
+    CHECK(h.audited.front().detail == "store_error");
+    CHECK(h.audited.front().target_id == "linux/x86_64/1.2.3");
+    CHECK_FALSE(has_audit(h, "ota.package.deleted", "success"));
+    CHECK_FALSE(has_audit(h, "ota.package.deleted", "denied"));
+    // The row is still there (read directly: the listing is the broken read) and so are
+    // both files.
+    CHECK(scalar_sql(db.dsn(), "SELECT count(*) FROM update_registry.update_packages") == "1");
     CHECK(fs::exists(h.update_dir.path / "yuzu-agent-1.2.3"));
     CHECK(fs::exists(h.update_dir.path / "yuzu-agent-1.2.3.sig"));
 }

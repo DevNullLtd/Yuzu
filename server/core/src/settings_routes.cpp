@@ -59,6 +59,8 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <mutex>
+#include <random>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -726,6 +728,123 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
     }
     return d;
 }
+
+/// One lock for every operation that publishes or unlinks OTA package files, so an
+/// upload's backup/restore of a filename cannot interleave with another upload or a
+/// delete of the same filename.
+std::mutex& ota_package_files_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+/// Keeps the files an OTA upload is about to replace until the registry row is
+/// written, so a failed registry write puts the previously published package back
+/// instead of leaving the directory without it.
+///
+/// `preserve(path)` is called for every path the upload may replace or remove,
+/// BEFORE the first publish. A present file is kept under a unique name in the same
+/// directory (`<name>.yuzu_prev_<unique>`): a hard link when the filesystem allows
+/// it, so the live name is never absent while the new file is published over it,
+/// otherwise a rename aside. `commit()` deletes the kept copies. The destructor
+/// rolls back unless `commit()` ran: a path that had a predecessor gets it back
+/// (rename over whatever was published there), a path that had none is removed.
+/// Paths are restored independently, and a restore that fails leaves the kept copy
+/// in place and logs its name so the predecessor is never deleted unreplaced.
+class OtaPredecessorGuard {
+public:
+    OtaPredecessorGuard() = default;
+    OtaPredecessorGuard(const OtaPredecessorGuard&) = delete;
+    OtaPredecessorGuard& operator=(const OtaPredecessorGuard&) = delete;
+    OtaPredecessorGuard(OtaPredecessorGuard&&) = delete;
+    OtaPredecessorGuard& operator=(OtaPredecessorGuard&&) = delete;
+    ~OtaPredecessorGuard() {
+        if (!settled_)
+            rollback();
+    }
+
+    /// False when something is at `path` and cannot be kept (not a regular file, an
+    /// unreadable status, or neither link nor rename succeeded). True when nothing
+    /// is there or the existing file is now kept.
+    [[nodiscard]] bool preserve(const std::filesystem::path& path) {
+        std::error_code ec;
+        const auto st = std::filesystem::symlink_status(path, ec);
+        if (st.type() == std::filesystem::file_type::not_found) {
+            entries_.push_back({path, {}});
+            return true;
+        }
+        if (ec || st.type() != std::filesystem::file_type::regular) {
+            spdlog::error("OTA upload: cannot keep the existing {} (not a readable regular file)",
+                          path.filename().string());
+            return false;
+        }
+        auto backup = path;
+        backup += ".yuzu_prev_" + unique_suffix();
+        std::filesystem::create_hard_link(path, backup, ec);
+        if (ec) {
+            std::error_code ren_ec;
+            std::filesystem::rename(path, backup, ren_ec);
+            if (ren_ec) {
+                spdlog::error("OTA upload: cannot keep the existing {}: {}",
+                              path.filename().string(), ren_ec.message());
+                return false;
+            }
+        }
+        entries_.push_back({path, std::move(backup)});
+        return true;
+    }
+
+    /// The new files stay; the kept copies are deleted.
+    void commit() noexcept {
+        settled_ = true;
+        for (const auto& e : entries_) {
+            if (e.backup.empty())
+                continue;
+            std::error_code ec;
+            std::filesystem::remove(e.backup, ec);
+        }
+    }
+
+    void rollback() noexcept {
+        settled_ = true;
+        for (const auto& e : entries_) {
+            std::error_code ec;
+            if (e.backup.empty()) {
+                std::filesystem::remove(e.live, ec);
+                continue;
+            }
+            std::filesystem::rename(e.backup, e.live, ec);
+            if (ec) {
+                spdlog::error("OTA upload: the previous {} could not be restored; it is kept as {}",
+                              e.live.filename().string(), e.backup.filename().string());
+                continue;
+            }
+            // Two names for one file (nothing was published over it) make rename a
+            // no-op that leaves the kept name behind; drop it.
+            std::filesystem::remove(e.backup, ec);
+        }
+    }
+
+private:
+    struct Entry {
+        std::filesystem::path live;
+        std::filesystem::path backup; ///< empty when nothing was there to keep
+    };
+
+    static std::string unique_suffix() {
+        static std::atomic<unsigned long long> seq{0};
+        unsigned long long salt = 0;
+        try {
+            std::random_device rd;
+            salt = (static_cast<unsigned long long>(rd()) << 32) ^ rd();
+        } catch (...) {
+            salt = 0;
+        }
+        return std::format("{:016x}_{}", salt, seq.fetch_add(1));
+    }
+
+    std::vector<Entry> entries_;
+    bool settled_{false};
+};
 } // namespace
 
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
@@ -6510,16 +6629,17 @@ void SettingsRoutes::register_routes(
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
 
         // The platform, arch and filename become row keys and path components:
-        // a NUL or other control byte in any of them is refused before anything
-        // is written. The audit row carries a fixed token and an empty target id,
-        // never the supplied value.
+        // a NUL or other control byte, or a byte sequence that is not valid UTF-8,
+        // in any of them is refused before anything is written. The audit row
+        // carries a fixed token and an empty target id, never the supplied value.
         if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
-            !rbac_text_is_clean(uploaded.filename)) {
+            !rbac_text_is_clean(uploaded.filename) || !is_valid_utf8(platform) ||
+            !is_valid_utf8(arch) || !is_valid_utf8(uploaded.filename)) {
             audit_fn_(req, "ota.package.uploaded", "denied", "UpdatePackage", "",
                       "invalid_package_field");
             res.status = 400;
             res.set_content("<span class=\"feedback-error\">The platform, architecture and "
-                            "filename must not contain control characters.</span>",
+                            "filename must be valid text without control characters.</span>",
                             "text/html; charset=utf-8");
             return;
         }
@@ -6640,6 +6760,20 @@ void SettingsRoutes::register_routes(
         const auto sidecar_path = signature_sidecar_path(out_path);
         const bool signed_upload = !signature_pem.empty();
 
+        // The files this upload replaces are kept until the registry row is
+        // written, and put back if it is not. The lock keeps another upload or a
+        // delete of the same filename out of that window; it is declared before the
+        // guard so the rollback runs while it is still held.
+        const std::lock_guard<std::mutex> package_files_lock(ota_package_files_mutex());
+        OtaPredecessorGuard predecessors;
+        if (!predecessors.preserve(out_path) || !predecessors.preserve(sidecar_path)) {
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Could not prepare the package "
+                            "directory. Nothing was changed; retry the upload.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
         if (signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
             // Nothing has been written yet: the previous binary and its signature
             // are both untouched, so this is a clean refusal, not a partial state.
@@ -6709,13 +6843,13 @@ void SettingsRoutes::register_routes(
         // last, per the ordering rule above, so no failure above this line could
         // have left the served package unprotected.
         if (!signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
-            spdlog::error("OTA upload for {}/{}: the stale signature could not be removed; "
-                          "the package is served with a signature that does not cover it",
+            spdlog::error("OTA upload for {}/{}: the previous signature could not be removed; "
+                          "the previous package is being restored",
                           platform, arch);
             res.status = 500;
-            res.set_content("<span class=\"feedback-error\">The binary was published but its "
-                            "old signature could not be removed. Agents will refuse this "
-                            "package until you retry.</span>",
+            res.set_content("<span class=\"feedback-error\">The old signature could not be "
+                            "removed, so the previous package was restored and the new one "
+                            "was not published. Retry the upload.</span>",
                             "text/html; charset=utf-8");
             return;
         }
@@ -6741,24 +6875,12 @@ void SettingsRoutes::register_routes(
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
         // The files above are already published. If the registry row is not
-        // written they are removed again (best effort), so the update directory
-        // does not hold a package no row refers to, and the request reports the
-        // failure instead of success.
-        struct PublishedFilesGuard {
-            std::filesystem::path binary;
-            std::filesystem::path sidecar;
-            bool armed{true};
-            ~PublishedFilesGuard() {
-                if (!armed)
-                    return;
-                std::error_code rm_ec;
-                std::filesystem::remove(binary, rm_ec);
-                std::filesystem::remove(sidecar, rm_ec);
-            }
-        } published{out_path, sidecar_path};
+        // written, `predecessors` puts back whatever they replaced (and removes
+        // them where there was nothing), so the update directory and the registry
+        // agree again, and the request reports the failure instead of success.
         if (!update_registry_->upsert_package(pkg)) {
             spdlog::error("OTA upload for {}/{}: the registry row could not be written; the "
-                          "uploaded files were removed",
+                          "previous files are being restored",
                           platform, arch);
             audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
                       platform + "/" + arch + "/" + version, "store_error");
@@ -6767,7 +6889,7 @@ void SettingsRoutes::register_routes(
                      "upload.");
             return;
         }
-        published.armed = false;
+        predecessors.commit();
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
@@ -6807,14 +6929,34 @@ void SettingsRoutes::register_routes(
                     // A NUL or other control byte in a key is refused up front;
                     // the audit row carries a fixed token and an empty target id.
                     if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
-                        !rbac_text_is_clean(version)) {
+                        !rbac_text_is_clean(version) || !is_valid_utf8(platform) ||
+                        !is_valid_utf8(arch) || !is_valid_utf8(version)) {
                         audit_fn_(req, "ota.package.deleted", "denied", "UpdatePackage", "",
                                   "invalid_package_field");
                         res.status = 400;
                         res.set_content("<span class=\"feedback-error\">The platform, "
-                                        "architecture and version must not contain control "
-                                        "characters.</span>",
+                                        "architecture and version must be valid text without "
+                                        "control characters.</span>",
                                         "text/html; charset=utf-8");
+                        return;
+                    }
+
+                    const std::lock_guard<std::mutex> package_files_lock(
+                        ota_package_files_mutex());
+
+                    // The package is looked up with a CHECKED read: a listing that
+                    // failed is not "no such package", and going on would remove the
+                    // row while leaving its files behind and audit a miss.
+                    auto listing = update_registry_->list_packages_checked();
+                    if (!listing) {
+                        spdlog::error("OTA package delete for {}/{} v{}: the package list could "
+                                      "not be read; nothing was removed",
+                                      platform, arch, version);
+                        audit_fn_(req, "ota.package.deleted", "failure", "UpdatePackage",
+                                  platform + "/" + arch + "/" + version, "store_error");
+                        respond_lifecycle_store_unavailable(
+                            res, "The package could not be looked up. Nothing was changed; "
+                                 "retry the delete.");
                         return;
                     }
 
@@ -6822,7 +6964,7 @@ void SettingsRoutes::register_routes(
                     // once that succeeded: a failed row delete leaves the package
                     // exactly as it was (row, binary and sidecar all present).
                     const auto matched_pkg = [&]() -> std::optional<UpdatePackage> {
-                        for (auto& pkg : update_registry_->list_packages()) {
+                        for (auto& pkg : *listing) {
                             if (pkg.platform == platform && pkg.arch == arch &&
                                 pkg.version == version)
                                 return std::move(pkg);
