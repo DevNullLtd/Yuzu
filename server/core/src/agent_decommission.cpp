@@ -4,6 +4,7 @@
 #include <utility>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_id_token: agent_id is caller-supplied (CWE-117)
 
 #include "app_perf_daily_store.hpp"
 #include "device_inventory_store.hpp"
@@ -154,33 +155,34 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
                 ++result.failed;
                 spdlog::error("AgentDecommission: store '{}' delete_agent reported failure for "
                               "agent={} (delete did not commit — recorded Failed, not Deleted)",
-                              t.name, agent_id);
+                              t.name, ::yuzu::log_id_token(agent_id));
             }
         } catch (const std::exception& e) {
             r.outcome = DecommissionOutcome::Failed;
             r.error = e.what();
             ++result.failed;
             spdlog::error("AgentDecommission: store '{}' delete_agent threw for agent={}: {}",
-                          t.name, agent_id, e.what());
+                          t.name, ::yuzu::log_id_token(agent_id), e.what());
         } catch (...) {
             r.outcome = DecommissionOutcome::Failed;
             r.error = "unknown exception";
             ++result.failed;
-            spdlog::error("AgentDecommission: store '{}' delete_agent threw a non-std exception for "
-                          "agent={}",
-                          t.name, agent_id);
+            spdlog::error(
+                "AgentDecommission: store '{}' delete_agent threw a non-std exception for "
+                "agent={}",
+                t.name, ::yuzu::log_id_token(agent_id));
         }
         result.stores.push_back(std::move(r));
     }
 
     // One audit-friendly summary line per decommission.
     if (result.failed == 0)
-        spdlog::info("AgentDecommission: agent={} decommissioned (deleted={} skipped={})", agent_id,
-                     result.deleted, result.skipped);
+        spdlog::info("AgentDecommission: agent={} decommissioned (deleted={} skipped={})",
+                     ::yuzu::log_id_token(agent_id), result.deleted, result.skipped);
     else
         spdlog::warn(
             "AgentDecommission: agent={} decommission PARTIAL (deleted={} skipped={} failed={})",
-            agent_id, result.deleted, result.skipped, result.failed);
+            ::yuzu::log_id_token(agent_id), result.deleted, result.skipped, result.failed);
     return result;
 }
 

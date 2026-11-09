@@ -397,10 +397,12 @@ TEST_CASE("sle erase: all-Deleted → 200 decommissioned, attempt+success audite
     CHECK(h.audited("sle.agent.decommission|success"));
 }
 
-// #5675: the response names every store of the nine-store cascade, the Guardian census included,
-// and reports the Guardian line's outcome as the cascade returned it (a failure is not rolled up
-// into a success).
-TEST_CASE("sle erase: the nine-store result is reported per store, Guardian census included",
+// #5675: route passthrough only. The handler reports whatever stores the injected cascade result
+// names, so this pins the nine-entry JSON shape and that a Failed Guardian line is not rolled up
+// into a success. It does not prove the cascade registers or wires the Guardian store: that is
+// the real-store fan-out in test_agent_decommission.cpp and
+// tests/test_decommission_wiring_lexical.py.
+TEST_CASE("sle erase: a nine-entry stores result is passed through per store (route shape)",
           "[sle_routes]") {
     SleHarness h;
     h.allow_scoped_all = true;

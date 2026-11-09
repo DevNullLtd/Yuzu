@@ -14,20 +14,28 @@
 /// fail-closed. It calls `ServerImpl::decommission_agent`, which builds this
 /// cascade. §27 builds the fan-out AND wires its first production caller.
 ///
+/// WHAT `Deleted` MEANS IS PER STORE. For most stores it means every row the store holds for the
+/// device was erased. It does not for `guaranteed_state` (#5675): that store deletes the compliance
+/// census rows and retires the pending census evidence, and the Guardian event log and the DEX
+/// observations are retained until retention expiry (never, when the retention setting is 0 or
+/// below). The Art.17 reading of a result must therefore go through each store's own contract, not
+/// through the word `Deleted` alone.
+///
 /// STANDING RULE — the gate is the single `Decommission:Delete` securable, so
 /// adding a store no longer changes WHO can decommission — but it DOES widen WHAT
 /// the securable destroys, so when you add a store to `AgentDecommissionStores`
 /// you MUST: (a) append the store here, (b) register it in
 /// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
-/// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts and the
-/// real-store fan-out's counts: three pins), (d) add the store to the blast-radius lists in
-/// `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block, ADR-0024 Decisions
-/// 9/11, and `rest-api.md`, and (e) hand the live pointer over in
+/// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts, the
+/// unconfigured-store case's skipped count and the real-store fan-out's counts: four pins), (d) add
+/// the store to the blast-radius lists in `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete
+/// block, ADR-0024 Decisions 9/11, and `rest-api.md`, (e) hand the live pointer over in
 /// `ServerImpl::decommission_agent` (`server.cpp`). The drift guard in
 /// `test_agent_decommission.cpp` fails until (c) is done, so the store list and the documented
 /// radius cannot silently diverge; `tests/test_decommission_wiring_lexical.py` fails until (e) is
 /// done, because nothing else notices a registered store that is never wired (it would be
-/// `Skipped` for every operator decommission).
+/// `Skipped` for every operator decommission). Also update the operator-facing "N stores" text in
+/// `device_estate_render.cpp` and `static/yuzu-estate.js`: no test pins it.
 ///
 /// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
 /// status: true iff the delete actually committed, false on a transient failure

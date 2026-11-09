@@ -27,9 +27,10 @@
 /// Events are an **immutable audit-style log** — intentionally no foreign key
 /// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
 /// When a rule is deleted, its historical events remain for forensic review.
-/// Time-based expiry is the single retention mechanism. The one exception is an agent
-/// decommission (`delete_agent`): it retires the agent's pending census evidence and deletes its
-/// census rows; the event log itself is untouched.
+/// Time-based expiry is the single retention mechanism for events. An agent decommission
+/// (`delete_agent`) does not change that: it retires the agent's pending census evidence (clears
+/// the pending flag of its pending events) and deletes its census rows, and no event row is
+/// deleted.
 ///
 /// ── Posture (ADR-0012 §1 / ADR-0038), split by table family ─────────────────
 ///  - **Rules + meta reads — AUTHORITATIVE, type-distinguishable** (the
@@ -54,9 +55,9 @@
 ///    dropped enforcement-history row is re-derivable from the agent's next
 ///    report cycle; ingest must never block the gRPC thread. Infra-level
 ///    drops (pool exhaustion / lease timeout / BEGIN-prepare-exec-commit
-///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family (ADR-0037
-///    label convention) IN ADDITION to the existing four-way
-///    `EventInsertOutcome` classification + its per-outcome atomics below.
+///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family
+///    (ADR-0037 label convention) IN ADDITION to the existing four-way `EventInsertOutcome`
+///    classification + its per-outcome atomics below.
 ///  - **Status upserts — fail-soft**; the census upsert has its own failure counter and runs in
 ///    the event transaction under a savepoint (ADR-0038 Update, 2026-10-31, #5674); status READS
 ///    stay type-distinguishable (see above).

@@ -19,6 +19,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_id_token: agent_id is a caller-supplied path parameter (CWE-117)
 
 #include <atomic>
 #include <chrono>
@@ -169,7 +170,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                                         "licence data without durable evidence",
                                         cid, 5000, "retry the request"));
                      spdlog::warn("sle.agent.view audit fail-closed (503) cid={} agent_id={}", cid,
-                                  agent_id);
+                                  ::yuzu::log_id_token(agent_id));
                      return;
                  }
 
@@ -272,7 +273,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                                    cid, 5000, "retry the request"));
                 spdlog::warn("sle.agent.decommission audit fail-closed (503, no erase) cid={} "
                              "agent_id={}",
-                             cid, agent_id);
+                             cid, ::yuzu::log_id_token(agent_id));
                 return;
             }
 
