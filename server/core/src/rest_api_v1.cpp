@@ -4497,15 +4497,20 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // The `requested` row exists, so every refusal below gives it a `failure` outcome
+            // row. (The `requested` write above stays unrouted: its result gates the dispatch.)
+            const auto fail = [&](const std::string& prefix) {
+                if (audit_fn)
+                    audit_fn(req, "echo.source.purge", "failure", "command", device_id,
+                             prefix + " device=" + audit_token(device_id) + " source=" + source +
+                                 " cid=" + cid);
+            };
             // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a
             // grant or a JIT elevation withdrawn while the row was being written dispatches
             // nothing. The gate has already written its own 403; the row that already exists
             // gets its outcome.
             if (!scoped_perm_fn(req, res, "Infrastructure", "Delete", device_id)) {
-                if (audit_fn)
-                    audit_fn(req, "echo.source.purge", "failure", "command", device_id,
-                             "permission_revoked device=" + audit_token(device_id) +
-                                 " source=" + source + " cid=" + cid);
+                fail("permission_revoked");
                 bump("denied");
                 return;
             }
@@ -4515,12 +4520,8 @@ void RestApiV1::register_routes(
             // standing between this caller and the fleet.
             const auto caller = resolve_secondary_caller(req, res);
             if (!caller) {
-                // The `requested` row exists, so it gets its outcome (the resolver wrote the
-                // refusal body).
-                if (audit_fn)
-                    audit_fn(req, "echo.source.purge", "failure", "command", device_id,
-                             "caller_unresolved device=" + audit_token(device_id) +
-                                 " source=" + source + " cid=" + cid);
+                // The resolver wrote the refusal body.
+                fail("caller_unresolved");
                 bump("denied");
                 return;
             }
@@ -4539,10 +4540,7 @@ void RestApiV1::register_routes(
                 const auto text = describe_dispatch_denial(denial.reason, "echo", "purge_source",
                                                            denial, DenialSurface::kRest);
                 res.status = text.cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
-                if (audit_fn)
-                    audit_fn(req, "echo.source.purge", "failure", "command", device_id,
-                             "dispatch_denied reason=" + token + " device=" +
-                                 audit_token(device_id) + " source=" + source + " cid=" + cid);
+                fail("dispatch_denied reason=" + token);
                 bump(token.c_str());
                 res.set_content(detail::error_json_a4(res.status,
                                                       "dispatch denied: reason=" + token, cid,

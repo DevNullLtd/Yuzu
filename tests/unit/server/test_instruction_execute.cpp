@@ -3042,47 +3042,35 @@ TEST_CASE("REST execute: a confined operator reaches exactly its visible agent (
 // #7110: the post-`requested`-row recheck (Ports::readmit) and #7114: the dispatch denial.
 // ---------------------------------------------------------------------------------------------
 
-TEST_CASE("instruction execute: readmit returning nullopt after the requested row dispatches nothing "
-          "and writes failure permission_revoked",
+TEST_CASE("instruction execute: a readmit that withdraws (nullopt, or throws = fail closed) after the "
+          "requested row dispatches nothing and writes failure permission_revoked",
           "[instruction_execute][security]") {
-    Rig r;
-    r.defs["d"] = make_def("d");
-    r.on_requested = [&] { r.readmit_withdrawn = true; }; // withdrawn INSIDE the row write
-    auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
-    const auto* ref = as_refusal(out);
-    REQUIRE(ref);
-    CHECK(ref->kind == RefusalKind::kPermissionRevoked);
-    CHECK(ref->reason == "permission_revoked");
-    CHECK_FALSE(ref->denial);
-    CHECK_FALSE(ref->retry_after_ms);
-    CHECK(r.readmits == 1);
-    CHECK(r.calls.empty());
-    CHECK(r.rows.empty()); // refused before the execution row
-    REQUIRE(r.audits.size() == 2);
-    CHECK(r.audits[0].result == "requested");
-    CHECK(r.audits[1].result == "failure");
-    CHECK(r.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
-}
-
-TEST_CASE("instruction execute: a readmit that throws after the requested row reads as withdrawn "
-          "(fail closed): nothing dispatched, failure permission_revoked",
-          "[instruction_execute][security]") {
-    Rig r;
-    r.defs["d"] = make_def("d");
-    r.on_requested = [&] { r.readmit_throws = true; }; // the store faults INSIDE the row write
-    auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
-    const auto* ref = as_refusal(out);
-    REQUIRE(ref);
-    CHECK(ref->kind == RefusalKind::kPermissionRevoked);
-    CHECK(ref->reason == "permission_revoked");
-    CHECK_FALSE(ref->denial);
-    CHECK(r.readmits == 1);
-    CHECK(r.calls.empty());
-    CHECK(r.rows.empty());
-    REQUIRE(r.audits.size() == 2);
-    CHECK(r.audits[0].result == "requested");
-    CHECK(r.audits[1].result == "failure");
-    CHECK(r.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
+    // Each row flips the one Rig flag the readmit port reads; both inside the `requested` row write.
+    const std::vector<std::pair<const char*, bool Rig::*>> withdrawals = {
+        {"readmit nullopt", &Rig::readmit_withdrawn},
+        {"readmit throws reads as withdrawn (fail closed)", &Rig::readmit_throws},
+    };
+    for (const auto& [name, flag] : withdrawals) {
+        DYNAMIC_SECTION(name) {
+            Rig r;
+            r.defs["d"] = make_def("d");
+            r.on_requested = [&] { r.*flag = true; }; // withdrawn INSIDE the row write
+            auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+            const auto* ref = as_refusal(out);
+            REQUIRE(ref);
+            CHECK(ref->kind == RefusalKind::kPermissionRevoked);
+            CHECK(ref->reason == "permission_revoked");
+            CHECK_FALSE(ref->denial);
+            CHECK_FALSE(ref->retry_after_ms);
+            CHECK(r.readmits == 1);
+            CHECK(r.calls.empty());
+            CHECK(r.rows.empty()); // refused before the execution row
+            REQUIRE(r.audits.size() == 2);
+            CHECK(r.audits[0].result == "requested");
+            CHECK(r.audits[1].result == "failure");
+            CHECK(r.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
+        }
+    }
 }
 
 TEST_CASE("instruction execute: an unset readmit port is Misconfigured (fail closed)",

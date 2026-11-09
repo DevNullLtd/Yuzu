@@ -1474,39 +1474,43 @@ TEST_CASE("POST /api/v1/commands: a chokepoint denial on the outcome is zero-rea
     CHECK(rig.has_audit("failure", "reason=dispatch_denied"));
 }
 
-TEST_CASE("POST /api/v1/commands: Execution:Execute withdrawn inside the requested-row write "
-          "dispatches nothing for a non-destructive pair; failure row reason=permission_revoked "
-          "(#7110)",
+TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the requested-row write (Execution:Execute "
+          "at the route gate, or a chokepoint dry run that refuses) dispatches nothing for a "
+          "non-destructive pair; failure row reason=permission_revoked (#7110)",
           "[server][command_v1][dispatch][security][7110]") {
-    Rig rig;
-    rig.facts = {.legacy_open = true};
-    rig.on_requested_row = [&] { rig.perm_denied.insert("Execution:Execute"); };
-    const auto res = rig.post(kRead);
-    CHECK(res->status == 403);
-    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
-    CHECK(rig.dispatch_calls == 0);
-    CHECK(rig.exec_created == 0);
-    // Admission, then the recheck after the row: the route's own gate both times.
-    CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Execution:Execute") == 2);
-    CHECK(rig.has_audit("requested"));
-    CHECK(rig.has_audit("failure", "reason=permission_revoked gate=route"));
-    CHECK_FALSE(rig.has_audit("success"));
-}
-
-TEST_CASE("POST /api/v1/commands: a chokepoint dry run that refuses after the row answers 403 "
-          "permission_revoked naming the dispatch reason; nothing is dispatched (#7110)",
-          "[server][command_v1][dispatch][security][7110]") {
-    Rig rig;
-    rig.facts = {.legacy_open = true};
-    rig.on_requested_row = [&] {
-        rig.authorize_denial = detail::DispatchDenial{
-            detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
-            authz::Operation::Write};
+    struct Withdrawal {
+        const char* name;
+        std::function<void(Rig&)> mutate; // runs INSIDE the requested-row write
+        const char* detail;
     };
-    const auto res = rig.post(kRead);
-    CHECK(res->status == 403);
-    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
-    CHECK(rig.dispatch_calls == 0);
-    CHECK(rig.exec_created == 0);
-    CHECK(rig.has_audit("failure", "gate=dispatch dispatch_reason=approval_required"));
+    const std::vector<Withdrawal> withdrawals = {
+        // Red-before-fix probe for the post-row Execution:Execute recheck: the dry run alone
+        // would not catch this (with RBAC off it admits every human principal).
+        {"gate=route: Execution:Execute withdrawn inside the requested-row write",
+         [](Rig& r) { r.perm_denied.insert("Execution:Execute"); },
+         "reason=permission_revoked gate=route"},
+        {"gate=dispatch: chokepoint dry run refuses after the row",
+         [](Rig& r) {
+             r.authorize_denial = detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
+                                                         "Infrastructure", authz::Operation::Write};
+         },
+         "gate=dispatch dispatch_reason=approval_required"},
+    };
+    for (const auto& w : withdrawals) {
+        DYNAMIC_SECTION(w.name) {
+            Rig rig;
+            rig.facts = {.legacy_open = true};
+            rig.on_requested_row = [&] { w.mutate(rig); };
+            const auto res = rig.post(kRead);
+            CHECK(res->status == 403);
+            CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+            CHECK(rig.dispatch_calls == 0);
+            CHECK(rig.exec_created == 0);
+            // Admission, then the recheck after the row: the route's own gate both times.
+            CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Execution:Execute") == 2);
+            CHECK(rig.has_audit("requested"));
+            CHECK(rig.has_audit("failure", w.detail));
+            CHECK_FALSE(rig.has_audit("success"));
+        }
+    }
 }

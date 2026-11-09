@@ -30,9 +30,8 @@
 //   7. kill_switched_os         kill_switched_os_count > 0        permanent
 //   8. no_agents_reached        catch-all                         retryable
 //
-// `dispatch_denied` is first because the chokepoint refused the pair before any
-// targeting: no other signal on the outcome can be set alongside it, and the
-// denial (not an unreachable agent) is the true cause of the zero reach.
+// `dispatch_denied` ranks first: the chokepoint refused before targeting, so no
+// other outcome signal is set alongside it.
 //
 // `> 0`, not "== every target": a mixed failure (some quarantined, some
 // offline) is still not "just offline", and understating a permanent cause as
@@ -71,11 +70,8 @@
 //     server.cpp also carry no `retry_after_ms`; dashboard_routes.cpp keeps a
 //     plain message. The retryable flag below follows the MCP site.
 //   - denied (#7114, first here): absent from all five cascades, none of which
-//     reads `outcome.denied`. mcp_server.cpp, command_routes.cpp, server.cpp
-//     and workflow_routes.cpp run an authorize dry run before the dispatch, so
-//     a denial there is a race that lands in their catch-all; dashboard_routes.cpp
-//     runs no dry run and checks `denied` BEFORE its cascade on the Echo
-//     re-enable/purge arms and the execute console.
+//     reads `outcome.denied`; which run a dry run and which checks the field
+//     before its cascade is in `ConfinedDispatchOutcome::denied`'s doc comment.
 
 #include "dispatch_confined_arms.hpp"
 

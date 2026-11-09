@@ -360,32 +360,43 @@ TEST_CASE("POST /api/v1/echo/retention-paused/purge: Infrastructure:Delete withd
     CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "denied"}}).value() == 1.0);
 }
 
-TEST_CASE("REST purge: a denied outcome answers 403 reason=<token> and counts it (#7114)",
+TEST_CASE("REST purge: a denied outcome is reported as dispatch_denied reason=<token> and counted, "
+          "never as agent_not_connected (#7114)",
           "[server][echo][purge][rest][security][7114]") {
-    PurgeHarness h;
-    h.dispatch_denied = yuzu::server::detail::DispatchDenial{
-        yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
-        yuzu::server::authz::Operation::Delete};
-    int st = 0;
-    const auto body = h.post(R"({"device_id":"dev-A","source":"process"})", st);
-    CHECK(st == 403);
-    CHECK(body["error"]["message"] == "dispatch denied: reason=forbidden");
-    REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[1].result == "failure");
-    CHECK(h.audits[1].detail.rfind("dispatch_denied reason=forbidden device=dev-A source=process cid=", 0) == 0);
-    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "forbidden"}}).value() == 1.0);
-    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "agent_not_connected"}}).value() == 0.0);
-}
-
-TEST_CASE("REST purge: an Unclassified denial answers 500 (server-literal pair), not the 400 "
-          "describe_dispatch_denial gives a caller-named pair (#7114)",
-          "[server][echo][purge][rest][security][7114]") {
-    PurgeHarness h;
-    h.dispatch_denied = yuzu::server::detail::DispatchDenial{
-        yuzu::server::detail::DispatchDenialReason::Unclassified, {},
-        yuzu::server::authz::Operation::Read};
-    int st = 0;
-    h.post(R"({"device_id":"dev-A","source":"process"})", st);
-    CHECK(st == 500);
-    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "unclassified"}}).value() == 1.0);
+    namespace detail = yuzu::server::detail;
+    struct Denial {
+        const char* name;
+        detail::DispatchDenial denial;
+        int status;
+        const char* token;
+    };
+    const std::vector<Denial> denials = {
+        {"Forbidden answers 403",
+         {detail::DispatchDenialReason::Forbidden, "Infrastructure",
+          yuzu::server::authz::Operation::Delete},
+         403, "forbidden"},
+        // 500, not the 400 describe_dispatch_denial gives a caller-named pair: the pair is a
+        // server literal, so an Unclassified one is a server catalogue fault.
+        {"Unclassified answers 500 (server-literal pair)",
+         {detail::DispatchDenialReason::Unclassified, {}, yuzu::server::authz::Operation::Read},
+         500, "unclassified"},
+    };
+    for (const auto& d : denials) {
+        DYNAMIC_SECTION(d.name) {
+            PurgeHarness h;
+            h.dispatch_denied = d.denial;
+            int st = 0;
+            const auto body = h.post(R"({"device_id":"dev-A","source":"process"})", st);
+            const std::string token = d.token;
+            CHECK(st == d.status);
+            CHECK(body["error"]["message"] == "dispatch denied: reason=" + token);
+            REQUIRE(h.audits.size() == 2);
+            CHECK(h.audits[1].result == "failure");
+            CHECK(h.audits[1].detail.rfind("dispatch_denied reason=" + token +
+                                               " device=dev-A source=process cid=", 0) == 0);
+            CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", token}}).value() == 1.0);
+            CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "agent_not_connected"}})
+                      .value() == 0.0);
+        }
+    }
 }

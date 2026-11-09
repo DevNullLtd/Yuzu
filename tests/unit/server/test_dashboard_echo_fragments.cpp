@@ -1273,45 +1273,51 @@ TEST_CASE("fragment re-enable: a non-admin Execution:Execute holder under RBAC o
     CHECK(h.metric("yuzu_echo_source_reenable_total", "agent_not_connected") == 0.0);
 }
 
-TEST_CASE("fragment purge: a Forbidden denial on the outcome is reported as dispatch_denied, not "
-          "agent_not_connected (#7114)",
-          "[pg][server][echo][purge][fragment][audit][security][7114]") {
-    FragmentHarness h;
-    h.dispatch_decide = [](const std::string&, const std::string&, const yuzu::server::DispatchCaller&) {
-        return std::optional<yuzu::server::detail::DispatchDenial>{yuzu::server::detail::DispatchDenial{
-            yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
-            yuzu::server::authz::Operation::Delete}};
-    };
-    auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
-    CHECK(res->status == 403);
-    REQUIRE(h.audits_for("echo.source.purge", "failure") == 1);
-    CHECK(h.audit_detail("echo.source.purge", "failure") ==
-          "dispatch_denied reason=forbidden device=dev-A source=process");
-    CHECK(h.metric("yuzu_echo_source_purge_total", "forbidden") == 1.0);
-    CHECK(h.metric("yuzu_echo_source_purge_total", "agent_not_connected") == 0.0);
-}
-
-TEST_CASE("fragment re-enable/purge: an Unclassified denial answers 500 (server-literal pair, "
-          "unlike the 400 describe_dispatch_denial gives a caller-named pair) (#7114)",
+TEST_CASE("fragment re-enable/purge: a denial on the outcome is reported as dispatch_denied reason=<token>, "
+          "never agent_not_connected (#7114)",
           "[pg][server][echo][reenable][purge][fragment][audit][security][7114]") {
-    for (const auto& [path, action, metric] :
-         {std::tuple{kReenablePath, "echo.source.reenable", "yuzu_echo_source_reenable_total"},
-          std::tuple{kPurgePath, "echo.source.purge", "yuzu_echo_source_purge_total"}}) {
-        DYNAMIC_SECTION(action) {
-            FragmentHarness h;
-            h.dispatch_decide = [](const std::string&, const std::string&,
-                                   const yuzu::server::DispatchCaller&) {
-                return std::optional<yuzu::server::detail::DispatchDenial>{
-                    yuzu::server::detail::DispatchDenial{
-                        yuzu::server::detail::DispatchDenialReason::Unclassified, {},
-                        yuzu::server::authz::Operation::Read}};
-            };
-            auto res = h.post(path, "device_id=dev-A&source=process");
-            CHECK(res->status == 500);
-            REQUIRE(h.audits_for(action, "failure") == 1);
-            CHECK(h.audit_detail(action, "failure") ==
-                  "dispatch_denied reason=unclassified device=dev-A source=process");
-            CHECK(h.metric(metric, "unclassified") == 1.0);
+    namespace detail = yuzu::server::detail;
+    struct Denial {
+        const char* name;
+        detail::DispatchDenial denial;
+        int status;
+        const char* token;
+    };
+    const std::vector<Denial> denials = {
+        {"Forbidden answers 403",
+         {detail::DispatchDenialReason::Forbidden, "Infrastructure",
+          yuzu::server::authz::Operation::Delete},
+         403, "forbidden"},
+        // 500, unlike the 400 describe_dispatch_denial gives a caller-named pair: both pairs here
+        // are server literals, so an Unclassified one is a server catalogue fault.
+        {"Unclassified answers 500 (server-literal pair)",
+         {detail::DispatchDenialReason::Unclassified, {}, yuzu::server::authz::Operation::Read},
+         500, "unclassified"},
+    };
+    struct Arm {
+        const char* path;
+        const char* action;
+        const char* metric;
+    };
+    const Arm arms[] = {{kReenablePath, "echo.source.reenable", "yuzu_echo_source_reenable_total"},
+                        {kPurgePath, "echo.source.purge", "yuzu_echo_source_purge_total"}};
+    for (const auto& d : denials) {
+        for (const auto& arm : arms) {
+            DYNAMIC_SECTION(arm.action << ": " << d.name) {
+                FragmentHarness h;
+                h.dispatch_decide = [denial = d.denial](const std::string&, const std::string&,
+                                                        const yuzu::server::DispatchCaller&) {
+                    return std::optional<detail::DispatchDenial>{denial};
+                };
+                const std::string token = d.token;
+                auto res = h.post(arm.path, "device_id=dev-A&source=process");
+                CHECK(res->status == d.status);
+                REQUIRE(h.audits_for(arm.action, "failure") == 1);
+                CHECK(h.audit_detail(arm.action, "failure") ==
+                      "dispatch_denied reason=" + token + " device=dev-A source=process");
+                CHECK(h.metric(arm.metric, token) == 1.0);
+                CHECK(h.metric(arm.metric, "agent_not_connected") == 0.0);
+            }
         }
     }
 }
