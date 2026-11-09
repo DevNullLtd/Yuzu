@@ -237,6 +237,11 @@ constexpr ExpectedResolution kExpected[] = {
     {"GET",    "/api/v1/inventory/software/normalization/status",                 64u * 1024, false, "software_curation"},
     {"POST",   "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
     {"PUT",    "/api/v1/inventory/software/normalization/pack",                   1u * 1024 * 1024, false, "software_alias_pack"},
+    // body_cap_policy.hpp software_collection_settings row: the per-group collection settings
+    // routes (one prefix, any method; a sibling path outside the segment boundary is the default).
+    {"PUT",    "/api/v1/inventory/software/collection-settings/abc123",           16u * 1024, false, "software_collection_settings"},
+    {"GET",    "/api/v1/inventory/software/collection-settings",                  16u * 1024, false, "software_collection_settings"},
+    {"PUT",    "/api/v1/inventory/software/collection-settingsevil/abc",          4u * 1024 * 1024, false, "default"},
     {"POST",   "/api/v1/inventory/software/normalization/packevil",               64u * 1024, false, "software_curation"},
     {"POST",   "/api/v1/inventory/software/normalizationevil/aliases",            4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp commands row - POST /api/v1/commands (the REST v1 twin of MCP
@@ -287,6 +292,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "config",
     "software_curation",
     "software_alias_pack",
+    "software_collection_settings",
     "default",
 };
 
@@ -446,8 +452,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
-    // default(1).
-    CHECK(std::size(kBodyCapTable) == 40);
+    // software_collection_settings(1: the collection settings subtree) + default(1).
+    CHECK(std::size(kBodyCapTable) == 41);
 }
 
 // The dex_score_policy_form row is derived from the document's own limits (body_cap_policy.hpp),

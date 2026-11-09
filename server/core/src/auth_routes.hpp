@@ -314,12 +314,15 @@ public:
     /// answered with a retryable 503 (`retry_after_ms`, no `permission` field) instead of the
     /// fail-closed 403 that `require_permission` gives every route (ADR-0041). Same decision path
     /// otherwise (elevation, engine principals, MCP tier, service scope, RBAC, legacy floor), same
-    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the one consumer
-    /// whose correctness depends on telling "could not determine" from "definitively denied", the
+    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the consumers
+    /// whose correctness depends on telling "could not determine" from "definitively denied": the
     /// Forensics-tier resolver (`resolve_forensics_visible`), where a collapsed answer would
-    /// silently serve a 200 with the Forensics rows missing. A new caller needs the same
-    /// justification; do not switch `require_permission` itself (about a hundred routes document
-    /// the 403).
+    /// silently serve a 200 with the Forensics rows missing, and the collection settings authority
+    /// (`global_authority` in `software_collection_settings_routes.cpp`), which writes its own
+    /// audited refusal and re-checks the write grant behind its `requested` audit row, where a
+    /// collapsed answer would record an RBAC outage as a refused or withdrawn grant instead of
+    /// answering 503. A new caller needs the same justification;
+    /// do not switch `require_permission` itself (about a hundred routes document the 403).
     [[nodiscard]] bool probe_permission_unavailable_aware(const httplib::Request& req,
                                                           httplib::Response& res,
                                                           const std::string& securable_type,

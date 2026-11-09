@@ -752,7 +752,7 @@ Request-body rejections at the general pre-routing chokepoint, **every route and
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_body_cap_rejected_total{path_class,reason}` | counter | A request rejected because it failed the resolved route class's cap policy (#2407), from one of TWO chokepoints (the pre-routing handler in `server.cpp`, and the post-read stage `server.cpp` installs and the route sink runs) — see `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for both. `path_class` is always one of `body_cap_policy.hpp`'s fixed table labels (e.g. `mcp`, `bundles`, `scim`, `default`) — **never the raw request path**, which is attacker-controlled and would be an unbounded-cardinality label on a pre-auth metric. The first three reasons fire from the pre-routing chokepoint, **before the body is read**: `reason=over_cap` is a declared `Content-Length` above the class's cap (`413`); `reason=unmeasurable` is a chunked/undeclared body refused outright for a class whose policy entry sets `requires_measurable` (`411`) — `mcp`, `upload_session`, `hardware`, `dex_score_policy`, `dex_score_policy_form` and `commands` set that bit today, so `reason="unmeasurable"` is seeded only for those six `path_class` values and is not yet reachable for any other class; `reason=unsupported_encoding` (D4 hardening) is a `Content-Encoding` other than `identity` (`415`) — refused UNCONDITIONALLY on every class regardless of `requires_measurable`, so unlike `unmeasurable` this reason IS seeded, and reachable, for every `path_class` in the table. `reason=over_cap_post_read` (body-cap-post-read-stage, #2407) is different in kind, not just timing: it fires from the SECOND chokepoint, the post-read stage `server.cpp` installs through `PostReadStageRegistry` (run by the route sink in front of each handler), which runs **after** httplib's `read_content` has already consumed the body into `req.body` and after the route matched, but before the route's own handler. It is the backstop for a body the pre-routing stage could not size in advance (chunked/undeclared framing on a class that does not set `requires_measurable` — 34 of the table's 40 rows) and that, once fully read, turns out to be over the class's cap (`413`). Unlike `unmeasurable`, it is NOT gated on `requires_measurable` — it is pre-seeded, at 0, for EVERY class, same as `unsupported_encoding`. It is mutually exclusive with the three pre-routing reasons **per request**, never additive: httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so a request that already tripped a pre-routing reason (e.g. a measurable `over_cap`) never reaches this stage — a rise in one is never explained by a rise in the other. Two things it does **not** cover: it never fires for a `multipart/form-data` request on ANY class — httplib only appends bytes to `req.body` on the non-multipart branch, so `req.body.size()` reads 0 for every multipart request regardless of the real bytes read off the wire, and the unmeasurable-body gap is unchanged for all of them; and it never fires on an unmatched route (a 404) — the stage lives in a registered route's handler, which httplib only calls once a route has matched, so this is a narrower backstop behind the pre-routing gate, not a second universal one. `resolve_body_cap` also defines a fail-closed sentinel label, `path_class="unmatched"`, returned if `kBodyCapTable`'s always-matching catch-all entry were ever removed or mis-scoped so no row matches. It is deliberately **not** pre-seeded by the boot-time loop that seeds every real table row to 0 — a `static_assert` in `body_cap_policy.hpp` requires the table to carry a `{kBodyCapAnyMethod, ""}` catch-all row, so no row can ever fail to match and this sentinel can never be returned: it is unreachable **by construction**, not merely on the shipped table, and there is no gap to pre-seed against. Pre-auth, so there is no principal and no audit row: the throttled `[#2407]` warn in the journal carries the sanitized method/path/source address for the three pre-routing reasons; the post-read reason's throttled warn carries the same fields under an `[#2407 post-read]` tag instead. See `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for the per-class cap table. |
+| `yuzu_body_cap_rejected_total{path_class,reason}` | counter | A request rejected because it failed the resolved route class's cap policy (#2407), from one of TWO chokepoints (the pre-routing handler in `server.cpp`, and the post-read stage `server.cpp` installs and the route sink runs) — see `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for both. `path_class` is always one of `body_cap_policy.hpp`'s fixed table labels (e.g. `mcp`, `bundles`, `scim`, `default`) — **never the raw request path**, which is attacker-controlled and would be an unbounded-cardinality label on a pre-auth metric. The first three reasons fire from the pre-routing chokepoint, **before the body is read**: `reason=over_cap` is a declared `Content-Length` above the class's cap (`413`); `reason=unmeasurable` is a chunked/undeclared body refused outright for a class whose policy entry sets `requires_measurable` (`411`) — `mcp`, `upload_session`, `hardware`, `dex_score_policy`, `dex_score_policy_form` and `commands` set that bit today, so `reason="unmeasurable"` is seeded only for those six `path_class` values and is not yet reachable for any other class; `reason=unsupported_encoding` (D4 hardening) is a `Content-Encoding` other than `identity` (`415`) — refused UNCONDITIONALLY on every class regardless of `requires_measurable`, so unlike `unmeasurable` this reason IS seeded, and reachable, for every `path_class` in the table. `reason=over_cap_post_read` (body-cap-post-read-stage, #2407) is different in kind, not just timing: it fires from the SECOND chokepoint, the post-read stage `server.cpp` installs through `PostReadStageRegistry` (run by the route sink in front of each handler), which runs **after** httplib's `read_content` has already consumed the body into `req.body` and after the route matched, but before the route's own handler. It is the backstop for a body the pre-routing stage could not size in advance (chunked/undeclared framing on a class that does not set `requires_measurable` — 35 of the table's 41 rows) and that, once fully read, turns out to be over the class's cap (`413`). Unlike `unmeasurable`, it is NOT gated on `requires_measurable` — it is pre-seeded, at 0, for EVERY class, same as `unsupported_encoding`. It is mutually exclusive with the three pre-routing reasons **per request**, never additive: httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so a request that already tripped a pre-routing reason (e.g. a measurable `over_cap`) never reaches this stage — a rise in one is never explained by a rise in the other. Two things it does **not** cover: it never fires for a `multipart/form-data` request on ANY class — httplib only appends bytes to `req.body` on the non-multipart branch, so `req.body.size()` reads 0 for every multipart request regardless of the real bytes read off the wire, and the unmeasurable-body gap is unchanged for all of them; and it never fires on an unmatched route (a 404) — the stage lives in a registered route's handler, which httplib only calls once a route has matched, so this is a narrower backstop behind the pre-routing gate, not a second universal one. `resolve_body_cap` also defines a fail-closed sentinel label, `path_class="unmatched"`, returned if `kBodyCapTable`'s always-matching catch-all entry were ever removed or mis-scoped so no row matches. It is deliberately **not** pre-seeded by the boot-time loop that seeds every real table row to 0 — a `static_assert` in `body_cap_policy.hpp` requires the table to carry a `{kBodyCapAnyMethod, ""}` catch-all row, so no row can ever fail to match and this sentinel can never be returned: it is unreachable **by construction**, not merely on the shipped table, and there is no gap to pre-seed against. Pre-auth, so there is no principal and no audit row: the throttled `[#2407]` warn in the journal carries the sanitized method/path/source address for the three pre-routing reasons; the post-read reason's throttled warn carries the same fields under an `[#2407 post-read]` tag instead. See `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for the per-class cap table. |
 
 ## Cookie-session write gate metrics
 
@@ -1459,7 +1459,8 @@ auto-revoke a row this leaves stranded.
 Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
 access reviews") shipped with zero metrics; the hardening round added four
 bounded-label series wired at the REST handlers (`rest_api_v1.cpp`) only —
-the MCP twins are not double-counted.
+the MCP twins are not double-counted. A fifth series,
+`yuzu_access_review_attestation_refused_total`, covers both surfaces (see below).
 
 ```
 # HELP yuzu_access_review_export_total Access review evidence exports (GET /api/v1/access-reviews/export), by format
@@ -1502,6 +1503,37 @@ yuzu_access_review_attestations_total{decision="flagged_revoke"} 0
   itself revokes anything (flag ≠ revoke, see `docs/auth-architecture.md`);
   a rising `flagged_revoke` count is a worklist size for whoever acts on
   the flags, not an automatic remediation trigger.
+
+```
+# HELP yuzu_access_review_attestation_refused_total Access review attestations refused because the reviewer is the subject of the grant, by surface (rest|mcp) and reason (self_subject|engine_owner|group_member|check_unavailable)
+# TYPE yuzu_access_review_attestation_refused_total counter
+yuzu_access_review_attestation_refused_total{surface="rest",reason="self_subject"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="engine_owner"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="group_member"} 0
+yuzu_access_review_attestation_refused_total{surface="rest",reason="check_unavailable"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="self_subject"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="engine_owner"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="group_member"} 0
+yuzu_access_review_attestation_refused_total{surface="mcp",reason="check_unavailable"} 0
+```
+
+`yuzu_access_review_attestation_refused_total{surface,reason}` counts attestations
+refused by the rule that the reviewer must differ from the subject of the grant.
+Unlike the four series above it is counted for both the REST route and the MCP
+`record_attestation` tool (`surface` is `rest` or `mcp`). `reason` is
+`self_subject` (a `user` grant naming the reviewer), `engine_owner` (an engine
+principal the reviewer owns now or owned when the campaign opened; the series counts both the
+live-owner refusal and the frozen-owner refusal and cannot tell them apart), `group_member` (a group the reviewer belongs to) or
+`check_unavailable` (the engine or group lookup behind the check could not be
+answered, so nothing was recorded; this one is a degraded store, not a reviewer
+doing something wrong, and no dedicated alert ships for it: the group path also
+feeds the existing `yuzu_server_rbac_read_degrade_total` (a pool timeout, an open
+breaker or a query error), while the engine path emits no other metric, so an
+engine lookup outage is visible only here and in the `failure` audit rows). All eight series are pre-seeded to `0`. The counter moves
+whether or not the refusal's audit row could be saved. It is operational, not
+`event="security"`, and has no alert rule; the refusal's own audit row
+(`access_review.attested` / `access_review.flagged` with `result=denied`, or
+`result=failure` for `check_unavailable`) is the evidence.
 
 None of the four carries `event="security"` — a review export or an
 attestation decision is expected, privileged, self-audited operator
@@ -2014,7 +2046,7 @@ upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
 | `yuzu_fleet_spark_watch_rejected{os,mechanism}` | gauge | Fleet sum of cumulative watch-cap rejections (a rule that could not arm — denial-of-detection). 0 at rung 1 |
 | `yuzu_fleet_spark_quarantined{os,mechanism}` | gauge | Fleet sum of work a mechanism had to abandon at stop() instead of completing: File - watches leaked to process lifetime (a structural leak); Registry - establishment probes still parked on a detached worker when the mechanism stopped (leaked-and-counted, self-disposing). Should stay 0. 0 at rung 1 |
 | `yuzu_fleet_spark_slow_op{os,mechanism}` | gauge | Fleet sum of cumulative watch-establishment work past the mechanism's own threshold: File - a slow arm-path OS operation under its lock; Registry - an arm or re-arm obligation unestablished past its 50 ms health grace (a stalled, refused or admission-saturated watcher). 0 at rung 1 |
-| `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with NO mechanism registered on that host, OR one that IS registered but BOOT-INERT (`start()` refused to bind its OS facility - #4685), enforced by **neither** backend either way (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. after a reconcile that finds the mechanism available, or the rule being disabled/removed). **0 today**: classification only runs once an agent's `prefer_spark` is enabled, which is not yet true anywhere in production (see `yuzu.guardian_backend`, still `legacy` fleet-wide). Once enabled, every rule on macOS reads `unsupported`, since macOS registers none of file/registry/service - routine and expected there, not page-worthy. A TRANSIENT runtime-degraded File or Registry episode does **not** land a rule here (#4685 fixed this): the rule stays logically armed/committed via spark for the whole episode - detection is unavailable until the mechanism's next successful pass - and recovers with no push or restart needed once that pass succeeds - see `yuzu_fleet_spark_mechanisms` for that signal instead |
+| `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with NO mechanism registered on that host, OR one that IS registered but BOOT-INERT (`start()` refused to bind its OS facility - #4685), enforced by **neither** backend either way (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. after a reconcile that finds the mechanism available, or the rule being disabled/removed). **0 today**: classification only runs once an agent's `prefer_spark` is enabled, which is not yet true anywhere in production (see `yuzu_fleet_guardian_backend`, still `legacy` fleet-wide). Once enabled, every rule on macOS reads `unsupported`, since macOS registers none of file/registry/service - routine and expected there, not page-worthy. A TRANSIENT runtime-degraded File or Registry episode does **not** land a rule here (#4685 fixed this): the rule stays logically armed/committed via spark for the whole episode - detection is unavailable until the mechanism's next successful pass - and recovers with no push or restart needed once that pass succeeds - see `yuzu_fleet_spark_mechanisms` for that signal instead |
 | `yuzu_fleet_spark_watch_faults{os}` | gauge | Fleet sum of cumulative post-arm watch-fault edges (`watch_faults_total`). 0 at rung 1 |
 | `yuzu_fleet_spark_queued_dropped{os}` | gauge | Fleet sum of cumulative queued events dropped (bounded-queue overflow + shutdown). On the enforce lane (rung 3) a drop is a silent compliance failure. 0 at rung 1 |
 | `yuzu_fleet_spark_consumer_errors{os}` | gauge | Fleet sum of cumulative queued handlers that threw (`consumer_errors_total`). 0 at rung 1 |
@@ -2236,6 +2268,64 @@ unmeasured threshold now - this counter names the fault class only.
 | `yuzu_fleet_guardian_io_arm_disarm_rejected_ceiling` | gauge | Fleet **SUM** of admissions refused at the arm/disarm executor's per-instance physical alive-worker ceiling (workers still alive past `fn()` inside their completion callbacks while ordinary class quota was free). A genuinely cumulative per-agent counter - correctly MONITOR-ONLY: neither `increase()` nor a bare `> 0` is sound over a fleet sum of per-agent cumulative counters. Names the fault class; does not by itself say whether an endpoint is CURRENTLY wedged |
 | `yuzu_fleet_guardian_io_ceiling_reporting` | gauge | Agents whose latest heartbeat carried the ceiling tag - the coverage denominator. **Published every sweep including `0`**. The writer is sparse (a zero ceiling count ships no tag), so `0` here means no currently-retained agent has hit the ceiling since its own process last started (or none is running spark) - counters reset on agent restart and this reads only the latest retained heartbeats, not durable history; not that telemetry is dark |
 | `yuzu_fleet_guardian_io_ceiling_tag_rejected` | gauge | The ceiling tag **present** this sweep but rejected by the forged-value parse. **Published every sweep including `0`** |
+
+### Guardian backend fleet gauge (#2240)
+
+`yuzu_fleet_guardian_backend{os,backend}` rolls up the agent's `yuzu.guardian_backend` heartbeat tag
+([Guaranteed State](guaranteed-state.md)): which detection backend each agent reports its Guardian
+enforcing with. The value is the agent's own report, not independent verification: `legacy` means the
+flip is off, not that enforcement was checked, and an absent series or a `null` is not evidence of
+health. `backend` is one of `legacy`, `spark`, `spark_failed` or `unwired`, taken from a
+closed server-side table, never from the raw heartbeat bytes. It is a **partition count**: each
+agent with a valid tag is in exactly one `{os,backend}` series per sweep, so the series sum to
+`yuzu_fleet_guardian_backend_reporting`. The family is rebuilt every 15 second sweep and is
+**absent-not-zero**: a `(os, backend)` pair nobody is in has no series, and nothing is pre-seeded.
+
+Read it with these limits in mind:
+
+- **`legacy` is every reporting agent until `prefer_spark` is enabled.** The production agent
+  hardcodes `prefer_spark` off, so `spark`, `spark_failed` and `unwired` cannot appear yet.
+  After the flip, `legacy` also covers an operator's `--spark-disable`; `yuzu_fleet_spark_disabled{os}`
+  tells the two apart.
+- **The `spark_failed` value is not `yuzu_fleet_spark_failed{os}`.** The tag value is what an
+  agent with `prefer_spark` on and a failed SparkEngine boot reports. The gauge counts agents
+  with `spark_running=0` and no `spark_disabled`, and can fire before the flip. Before the flip a
+  SparkEngine boot failure shows only on `yuzu_fleet_spark_failed{os}`, never on this family.
+- **A missing tag is never `legacy`.** An agent older than the tag, an agent with no Guardian, an
+  agent whose Guardian heartbeat tag group faulted on that beat, and a stopping agent are all
+  in no series. The gauge can therefore drop an agent for a sweep or two on a faulted beat. Compare
+  `yuzu_fleet_guardian_backend_reporting` with `yuzu_fleet_agents_by_os` for the coverage gap.
+- **Population:** every agent the health store holds a heartbeat for within the last 90 seconds,
+  per core replica. An agent that has just disconnected stays counted until it ages out (up to
+  about 105 seconds: the 90 second window plus one sweep), and a failover or a restart moves that
+  window to another replica, so scrape each replica directly and sum across them; the sum can
+  briefly exceed the fleet. After a restart every device reads `null` and the family is absent
+  until the agents' next beats and the first sweep. The OS label is the agent's self-reported
+  `yuzu.os`, allowlisted to `windows`, `linux`, `darwin`, `other` or `unknown`; it can differ from
+  the `os` on the device row, which comes from the session.
+- **Per-device twin:** the same classification is served per device as the nullable
+  `guardian_backend` field on `GET /api/v1/devices[/{id}]` and the `list_agents` and
+  `get_agent_details` MCP tools. `null` means the device has no valid tag within the window. The two can
+  differ in either direction for up to one sweep, and the field covers only connected devices and
+  is read live, while the gauge is republished every sweep and also counts a just-disconnected
+  agent.
+- **No alert ships.** A rule such as `yuzu_fleet_guardian_backend{backend=~"spark_failed|unwired"} > 0`
+  becomes meaningful only after the flip. No shipped alert rule reads this family, and `unwired` is a
+  state no existing alert covers.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_backend{os,backend}` | gauge | Agents by Guardian detection backend and OS. One series per `(os, backend)` that has at least one agent; absent otherwise. The 5 OS values times 4 backends bound the family at 20 series. |
+| `yuzu_fleet_guardian_backend_reporting` | gauge | Agents whose latest heartbeat carried a valid `yuzu.guardian_backend` tag - the denominator the series above sum to. **Published every sweep including `0`.** |
+| `yuzu_fleet_guardian_backend_tag_rejected` | gauge | Tags **present and non-empty** this sweep but rejected by the closed-set, case-sensitive parse (anything but exactly the four tokens, or over 12 bytes). An empty value is skipped and not counted. **Published every sweep including `0`.** A rejected value lands in no series and reads `null` on the device field, so this is the only fleet signal for it. `> 0` means a forged or malformed tag, or a newer agent shipping a backend this server does not know yet during a rolling upgrade. |
+
+Scrape behaviour to expect. The family and `yuzu_fleet_guardian_backend_reporting` are written at
+different moments in the sweep, so a scrape between them can see an empty family beside the previous
+`_reporting`: "the series sum to `_reporting`" holds per sweep, not per scrape. Ratio and difference
+expressions then return no data for that scrape, which is correct; do not patch them with
+`or vector(0)`. All three families are absent until the first sweep after boot, and the labelled
+family is absent on an empty fleet. `_tag_rejected` cannot name the agent, because the device field
+reads `null` for both a missing and a rejected tag.
 
 ### Guardian M1 health-stream fleet gauges
 

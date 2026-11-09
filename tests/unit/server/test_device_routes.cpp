@@ -35,8 +35,8 @@ using namespace yuzu::server;
 namespace {
 
 // Minimal test double for the DeviceApi seam (ADR-0031 WS-A4 wave 2). `rows`
-// backs list_devices() (UNSCOPED — DeviceRoutes applies its own visible_set_fn
-// filter, matching the real seam's contract); `details` backs lookup_device()
+// backs list_devices() and list_devices_basic() (UNSCOPED -- DeviceRoutes applies its own
+// visible_set_fn filter, matching the real seam's contract); `details` backs lookup_device()
 // by agent_id (explicit per-id entries take precedence). `device_os_ptr`, when
 // wired and non-empty, makes lookup_device(ANY id without an explicit `details`
 // entry) resolve to a bare identity row carrying that OS — the K-4 live-result
@@ -50,7 +50,22 @@ public:
     std::vector<std::string> degraded_ids;
     const std::string* device_os_ptr = nullptr;
 
-    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
+    // Call counters: which list method a route used is the property under test for the
+    // "callers that discard the per-device backend must not pay for it" pin below.
+    mutable int full_list_calls = 0;
+    mutable int basic_list_calls = 0;
+
+    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override {
+        ++full_list_calls;
+        return rows;
+    }
+    [[nodiscard]] std::vector<DeviceListRow> list_devices_basic() const override {
+        ++basic_list_calls;
+        auto out = rows;
+        for (auto& r : out)
+            r.guardian_backend.reset();
+        return out;
+    }
 
     [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
     lookup_device(const std::string& id) const override {
@@ -642,27 +657,58 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
 TEST_CASE("device live capture_sources: echo status -> read-only source table", "[device][routes]") {
     LiveHarness h;
     h.fake_rows = {{"a-1", 1,
-                    "config|process_enabled|true\nconfig|process_live_rows|1234\n"
-                    "config|arp_enabled|false\nconfig|arp_live_rows|0",
+                    "config|process_enabled|true\nconfig|process_rows|1234\n"
+                    "config|arp_enabled|false\nconfig|arp_rows|0",
                     ""}};
     auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
                         "&agent_id=a-1&kind=capture_sources&n=1");
     REQUIRE(r);
-    CHECK(r->body.find("$Process_Live") != std::string::npos);
-    CHECK(r->body.find("1234") != std::string::npos);                  // live-row count
+    CHECK(r->body.find("$Process_Hourly") != std::string::npos);
+    CHECK(r->body.find("1234") != std::string::npos);                  // row count
     CHECK(r->body.find("id=\"ls-cnt-capture_sources\"") != std::string::npos); // OOB "X of N on"
     CHECK(r->body.find("/echo") != std::string::npos);                  // configure-on-Echo link
+}
+
+TEST_CASE("device live capture_sources: row count reads <src>_rows then <src>_live_rows",
+          "[device][routes]") {
+    const auto count_cell = [](const std::string& status) {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, status, ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
+                            "&agent_id=a-1&kind=capture_sources&n=1");
+        REQUIRE(r);
+        return r->body;
+    };
+    // Only the new key: fails if the <src>_rows lookup is removed.
+    CHECK(count_cell("config|process_enabled|true\nconfig|process_rows|4321")
+              .find("<td class=\"ls-num\">4321</td>") != std::string::npos);
+    // Only the one-release alias: the agent has not moved to the roll-up store, so its raw-row
+    // figure is not shown under the hourly label: a dash with the reason, never the number.
+    const auto alias_only = count_cell("config|process_enabled|true\nconfig|process_live_rows|8765");
+    CHECK(alias_only.find("8765") == std::string::npos);
+    CHECK(alias_only.find("title=\"This device runs an agent without the roll-up tables; upgrade "
+                          "the agent\">&mdash;") != std::string::npos);
+    // Both present: the new key wins and the agent is not flagged.
+    const auto both = count_cell(
+        "config|process_enabled|true\nconfig|process_live_rows|1\nconfig|process_rows|2");
+    CHECK(both.find("<td class=\"ls-num\">2</td>") != std::string::npos);
+    CHECK(both.find("<td class=\"ls-num\">1</td>") == std::string::npos);
+    CHECK(both.find("without the roll-up tables") == std::string::npos);
+    // Neither: a dash, not a zero, and no agent note.
+    const auto neither = count_cell("config|process_enabled|true");
+    CHECK(neither.find("&mdash;") != std::string::npos);
+    CHECK(neither.find("without the roll-up tables") == std::string::npos);
 }
 
 TEST_CASE("device live capture_sources: registry row renders with the System category",
           "[device][routes]") {
     LiveHarness h;
-    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_live_rows|7", ""}};
+    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_rows|7", ""}};
     auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
                         "&agent_id=a-1&kind=capture_sources&n=1");
     REQUIRE(r);
     CHECK(r->body.find("<span class=\"src-on\">registry</span>") != std::string::npos);
-    CHECK(r->body.find("<code>$Registry_Live</code></td><td class=\"ls-num\">7</td>"
+    CHECK(r->body.find("<code>$Registry_Hourly</code></td><td class=\"ls-num\">7</td>"
                        "<td><span class=\"ls-pill\">System</span>") != std::string::npos);
     CHECK(r->body.find("1 of 1 on") != std::string::npos);
 }
@@ -810,7 +856,8 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         if (agent_id == "other-team") { res.status = 403; return false; }
         return true;
     };
-    // The API's list_devices() is UNSCOPED (both "mine" and "other-team" resolve);
+    // The API's list_devices()/list_devices_basic() are UNSCOPED (both "mine" and "other-team"
+    // resolve);
     // visible_set_fn_ below is this test's OWN confinement filter, matching a flat
     // get_visible_agents JOIN with no ancestor walk — "ancestor-child" is absent
     // from it even though scoped_perm authorizes it (an ancestor-group role).
@@ -844,6 +891,16 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         CHECK(r->status == 200);
         CHECK(r->body.find("mine-host") != std::string::npos);
         CHECK(r->body.find("other-team") == std::string::npos);
+    }
+    SECTION("the list fragment reads the basic list and never the full one") {
+        // The dashboard row never renders the per-device backend, so it must not pay the
+        // health-store read that list_devices() costs (#2240); a return to the full list
+        // would leave every row-content assertion green.
+        auto r = sink.Get("/fragments/devices/list");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(api->basic_list_calls >= 1);
+        CHECK(api->full_list_calls == 0);
     }
     SECTION("out-of-scope device page is 403, not opened") {
         auto r = sink.Get("/fragments/device/page?id=other-team");

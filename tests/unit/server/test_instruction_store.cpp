@@ -1446,6 +1446,69 @@ TEST_CASE("InstructionStore: trusted reseed does NOT resurrect an operator-delet
     CHECK_FALSE(still_gone->has_value());
 }
 
+TEST_CASE("InstructionStore: a deleted bundled definition is re-created by an operator import "
+          "carrying a new parameter_schema and the next reseed leaves it alone",
+          "[instruction_store][seed][pg]") {
+    // The documented remedy for a bundled definition whose stored parameter_schema is stale
+    // (docs/user-manual/upgrading.md): delete, then import. The tombstone blocks the boot
+    // reseed only; the operator import path is not tombstone-checked.
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    const std::string stale_schema =
+        R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $Process_Live"}}})";
+    const std::string fresh_schema =
+        R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $Process_Hourly"}}})";
+    const auto envelope = [](const std::string& schema) {
+        return nlohmann::json{{"id", "bundled.seed.remedy"},
+                              {"name", "Bundled Seed Remedy"},
+                              {"version", "1.0"},
+                              {"type", "question"},
+                              {"plugin", "os_info"},
+                              {"action", "os_name"},
+                              {"description", "bundled description"},
+                              {"parameter_schema", schema}}
+            .dump();
+    };
+    auto seeded = store.import_definition_json_trusted(envelope(stale_schema));
+    REQUIRE(seeded.has_value());
+
+    // Saving the row again with an empty parameter_schema keeps the stored one: the PUT route
+    // and the editor both blank it before update_definition, so neither can refresh it.
+    auto stored = store.get_definition(*seeded);
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    InstructionDefinition resaved = **stored;
+    resaved.parameter_schema.clear();
+    REQUIRE(store.update_definition(resaved, resaved.updated_at).has_value());
+    auto after_save = store.get_definition(*seeded);
+    REQUIRE(after_save.has_value());
+    REQUIRE(after_save->has_value());
+    CHECK((*after_save)->parameter_schema == stale_schema);
+
+    // Delete, then import with this release's schema: the row comes back with the new default.
+    REQUIRE(store.delete_definition(*seeded).has_value());
+    auto imported = store.import_definition_json(envelope(fresh_schema));
+    REQUIRE(imported.has_value());
+    CHECK(*imported == "bundled.seed.remedy");
+    auto after_import = store.get_definition("bundled.seed.remedy");
+    REQUIRE(after_import.has_value());
+    REQUIRE(after_import->has_value());
+    CHECK((*after_import)->parameter_schema == fresh_schema);
+
+    // The next boot's reseed of the old envelope neither resurrects nor overwrites it.
+    auto reseed = store.import_definition_json_trusted(envelope(stale_schema));
+    REQUIRE_FALSE(reseed.has_value());
+    CHECK(is_conflict_error(reseed.error()));
+    auto still_fresh = store.get_definition("bundled.seed.remedy");
+    REQUIRE(still_fresh.has_value());
+    REQUIRE(still_fresh->has_value());
+    CHECK((*still_fresh)->parameter_schema == fresh_schema);
+}
+
 TEST_CASE("InstructionStore: trusted reseed of a CHANGED bundled envelope (release "
           "upgrade) never updates an existing row, operator-touched or not",
           "[instruction_store][seed][pg]") {
