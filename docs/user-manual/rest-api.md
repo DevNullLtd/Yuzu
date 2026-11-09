@@ -6738,7 +6738,7 @@ List directory-synced users from the last successful sync. Requires `Directory:R
 
 #### `GET /api/directory/status`
 
-Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`.
+Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`. On a `completed` status a non-empty `last_error` is a count note (`<n> record(s) skipped, <m> field(s) sanitized (embedded NUL)`), not a failure.
 
 **Response (200):** `{"provider","status","last_sync_at","user_count","group_count","last_error","groups":[{"id","display_name","description","mapped_role","synced_at"}]}`
 
@@ -6792,7 +6792,7 @@ Every call is audited (`directory.users.view`) — this closes a real pre-existi
 
 #### `GET /api/v1/directory/status`
 
-REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture.
+REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture. As on the legacy route, a non-empty `last_error` on a `completed` status is a count note, not a failure.
 
 **Permission:** `Directory:Read`
 
