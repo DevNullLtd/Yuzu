@@ -22,7 +22,7 @@
 //     Infrastructure:Write only. set is NOT approval-gated (Infrastructure:Write, like
 //     set_runtime_config). The ticket gates this MCP tool, not the capability: the same
 //     supervised token can DELETE over REST with Infrastructure:Write alone and no ticket, and
-//     set stores any valid document without one (an accepted residual, ADR-1005 2026-11-09).
+//     set stores any valid document without one (a declared residual, ADR-1005 2026-11-09).
 //     The ticket is consumed BEFORE the handler runs, so any failure after
 //     that point spends it: the remediation says so and how to recover (the one exception is a
 //     refusal by the handler's own perm_fn gate, whose 403 body is the gate's; the tool
@@ -363,8 +363,9 @@ constexpr ToolRecord kToolRecords[] = {
      "the revision get_dex_score_policy returned, or 'default' when none has been written) so the "
      "write is refused if the policy changed meanwhile. When get_dex_score_policy returns a fault "
      "its document is the shipped defaults, not your stored policy: do not edit it and send it "
-     "back. Do not set during a rolling upgrade or rollback: a document carrying model is stored "
-     "as version 2, which an older replica refuses and scores under the shipped defaults until "
+     "back. Do not set during a rolling upgrade or rollback: a document is stored as version 2 "
+     "when a model parameter differs from its default or a per-application override names one; "
+     "an older replica refuses it and scores under the shipped defaults until "
      "the roll ends. dry_run true validates the document and the revision and answers what WOULD "
      "be in force (revision = what a real set would produce) without storing anything; it leaves "
      "one dex.score_policy.validate audit row. Idempotent: the same document with the current "

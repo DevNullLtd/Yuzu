@@ -157,6 +157,8 @@ struct ToolDeps {
     // as `RestApiV1::AuditAsSessionFn`): REST binds every row to the session its route resolved
     // (#6065 PR-Q), so a credential that lapses mid-request cannot leave a row naming no one
     // while the write proceeds. `audit_fn` above re-resolves the caller per row.
+    // A handler passes ONLY the session session_fn returned to audit_as_session_fn; the writer
+    // stamps whatever session it is given.
     // AuditAsSessionFn is pinned to `AuthRoutes::AuditAsSessionFn` by static_assert in
     // mcp_server.cpp; SessionFn is wired from `AuthRoutes::resolve_session` (a member function,
     // so there is no alias to pin it to).

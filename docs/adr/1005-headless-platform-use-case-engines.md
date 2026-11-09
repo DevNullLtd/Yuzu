@@ -969,6 +969,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - Wire reference: `docs/user-manual/dex.md`, "Scoring"; audit rows:
        `docs/user-manual/audit-log.md`.
      - Recorded by the change author; ADR-owner acceptance pending.
+     - Note, 2026-11-09: the four ledger rows were flipped to `twinned` by the
+       2026-11-09 entry. The tier-change diff did NOT join the twins and
+       remains the open exception on #6087 (revisit by 2027-01-31).
 
    - **2026-11-02 - DEX score policy model parameters on the REST route (#6087).**
      REST-only, still no MCP twin: the `GET`, `PUT` and `DELETE
@@ -1613,8 +1616,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        while the write proceeds. The sibling registry write tools keep the
        per-row pattern (`ToolDeps::audit_fn` resolves the caller for each row);
        session-bound domain audit for every MCP write tool is a separate core
-       change (issue to be filed on the owner's word). Residual, accepted and
-       disclosed: the generic `mcp.<tool>` row is written by the MCP
+       change (issue to be filed on the owner's word). Residual, declared and
+       disclosed (acceptance pending): the generic `mcp.<tool>` row is written by the MCP
        dispatcher (`mcp_audit` in `mcp_server.cpp`), outside this tool, and
        still resolves the caller per row; binding it is a core MCP change.
      - **`mcp_tool_deps.hpp` admission criterion amended.** The write-capable
@@ -1632,13 +1635,31 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        stays the exception recorded in the 2026-11-06 entry. `prior_document`
        on reset audit rows is a core audit-row change, deferred as a follow-up.
        Revisit by 2027-01-31; the follow-up issues are to be filed on merge.
-       Reader size is tracked as #6619. The REST registration lambdas hold no
+       The audit-detail size cap (#6619, a core change) is tracked separately. The REST registration lambdas hold no
        readable gate call (the `perm_fn` sits in the shared
        `score_policy_write` lambda), so gate parity (check 6) cannot compare
        the two REST rows to their twins: they are named in
        `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises by two
        (14 to 16) by this ruling. A REST refactor that inlines the gate is the
        alternative and is not taken here (this change is MCP only).
+     - **Owner decisions pending ADR-owner acceptance (shown at the push
+       gate).**
+       1. The reset ticket gates the MCP tool, not the capability: REST
+          `DELETE` needs `Infrastructure:Write` only and no ticket, and set can
+          store any valid document.
+       2. `GATE_PARITY_NO_GATE_MAX` is raised from 14 to 16 for the `PUT` and
+          `DELETE` score-policy rows.
+       3. The dashboard preview POST's ledger row is twinned onto the dry-run
+          `set_dex_score_policy`, while its tier-change diff has no headless
+          twin (the alternative is `planned:#6087` and 205 untwinned).
+       4. The generic `mcp.<tool>` audit row is resolved per row by the
+          dispatcher (a core MCP change); sibling registry write tools keep the
+          per-row pattern.
+       Follow-ups, all to be filed on merge: `prior_document` on reset audit
+       rows, a result-level audit flag, the headless tier-change diff,
+       session-bound domain audit for every MCP write tool, audit-detail volume
+       (#6619), `ConsumePrecondition` for an audit or store outage, and the
+       config-read bypass of `GuaranteedState:Read`.
      - Wire reference: `docs/user-manual/mcp.md` (tools 213 to 215),
        `docs/user-manual/rest-api.md` "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`
