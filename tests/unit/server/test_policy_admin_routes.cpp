@@ -403,7 +403,7 @@ scope: "tags.env == 'production'"
 } // namespace
 
 TEST_CASE("DELETE /api/policies/:id: an id with an embedded NUL deletes nothing and audits no success",
-          "[compliance][admin][validation]") {
+          "[pg][compliance][admin][validation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     PolicyStore store{pool};
@@ -428,7 +428,7 @@ TEST_CASE("DELETE /api/policies/:id: an id with an embedded NUL deletes nothing 
 }
 
 TEST_CASE("POST /api/policies/:id/disable|enable: an id with an embedded NUL changes nothing",
-          "[compliance][admin][validation]") {
+          "[pg][compliance][admin][validation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     PolicyStore store{pool};
