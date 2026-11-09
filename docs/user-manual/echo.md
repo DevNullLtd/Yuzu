@@ -522,8 +522,6 @@ The first frame surfaces every device × source pair where the collector has bee
 
 The third frame on the `/echo` page shows a **per-host process tree for one hour**, built entirely from that host's own hourly roll-up (`$Process_Hourly` + `$TCP_Hourly`) -- no extra data is collected, and no other host is involved.
 
-> **On an agent on schema v10 the viewer has nothing to replay.** The tree is built from per-event process and connection rows, and the roll-up keeps none: `$Process_Live` and `$TCP_Live` are empty views. The dashboard change that follows replaces the viewer's source. Until then the frame shows an empty tree for such a host.
-
 **Workflow:**
 
 1. **Pick a live host** from the dropdown (only connected agents in your scope are listed). Selecting one loads the default **Last 24 hours** window.
