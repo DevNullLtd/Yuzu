@@ -207,6 +207,22 @@ std::string canonical_release(std::string_view release) {
 }
 
 bool is_per_user_path(std::string_view p) {
+    if (p.size() >= 2 && is_sep(p[0]) && is_sep(p[1])) {
+        // `\\?\` and `\\.\` are the Win32 extended-length and device prefixes: the path after
+        // one is the same path as without it, so classify what follows. Anything else that
+        // opens with two separators is a UNC path (`\\host\share\...`, `\\?\UNC\...`): the
+        // writer cannot tell a home share from an application share, so every UNC path is
+        // blanked (fail closed). Same look-through idiom as redact_mount_points
+        // (sync_source_device_ci.hpp).
+        if (p.size() < 4 || !(p[2] == '?' || p[2] == '.') || !is_sep(p[3]))
+            return true;
+        p.remove_prefix(4);
+        if (starts_with_ci(p, "unc") && p.size() > 3 && is_sep(p[3]))
+            return true;
+    } else if (p.starts_with("/System/Volumes/Data/")) {
+        // macOS firmlink: the Data volume's logical path is the same path without the prefix.
+        p.remove_prefix(20);
+    }
     // <drive>:\Users\ or <drive>:/Users/ (Windows paths are case-insensitive).
     if (p.size() >= 9 && std::isalpha(static_cast<unsigned char>(p[0])) && p[1] == ':' &&
         is_sep(p[2]) && starts_with_ci(p.substr(3), "users") && is_sep(p[8])) {

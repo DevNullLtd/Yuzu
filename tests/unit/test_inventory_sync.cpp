@@ -5403,6 +5403,23 @@ const char* const kBlockingActions[] = {"list_inventory", nullptr};
 const YuzuPluginDescriptor kBlockingIa = {YUZU_PLUGIN_ABI_VERSION, "installed_apps", "1.0.0",
                                           "test fake", kBlockingActions, nullptr, nullptr,
                                           blocking_execute, nullptr};
+
+// A three-action plugin (pkg_inventory's shape) of which only `managers` hangs: the siblings
+// would answer at once if they were ever entered.
+int hung_managers_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
+                          std::size_t /*param_count*/) {
+    ++g_blocking_entered;
+    if (std::string_view(action) == "managers")
+        g_blocking_release.wait();
+    const std::string row =
+        yuzu::shared::format_status_row(action, yuzu::shared::StatusLevel::supported, "") + "\n";
+    yuzu_ctx_write_output(ctx, row.c_str());
+    yuzu_ctx_set_result_status(ctx, YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+    return 0;
+}
+const YuzuPluginDescriptor kHungManagersPkg = {YUZU_PLUGIN_ABI_VERSION, "pkg_inventory", "1.0.0",
+                                               "test fake", kFakePkgActions, nullptr, nullptr,
+                                               hung_managers_execute, nullptr};
 } // namespace
 
 TEST_CASE("collector: a blocked plugin times out alone, stays single-flight, and clears when it returns",
@@ -5451,6 +5468,71 @@ TEST_CASE("collector: a blocked plugin times out alone, stays single-flight, and
     const auto third = c.collect();
     REQUIRE(third.has_value());
     CHECK(find_sec(sections_of(third->first), kFacetApps)->status == "full");
+}
+
+TEST_CASE("collector: single-flight is per plugin, so a hung action keeps its siblings out of the plugin",
+          "[sync][collector][v3][workers]") {
+    g_blocking_entered = 0;
+    g_blocking_release_p = std::promise<void>{};
+    g_blocking_release = g_blocking_release_p.get_future().share();
+    CollectorTuning tuning;
+    // Real-clock wait is the contract under test (a hung worker is abandoned at its limit);
+    // bounded at 50 ms.
+    tuning.time_limit = std::chrono::milliseconds{50};
+    Collector c({{"pkg_inventory", &kHungManagersPkg}}, tuning);
+    bool released = false;
+    const auto release_worker = [&released] {
+        if (!released) {
+            released = true;
+            g_blocking_release_p.set_value();
+        }
+    };
+    const yuzu::test::ScopeExit guard{release_worker};
+
+    const auto first = c.collect();
+    REQUIRE(first.has_value());
+    const auto s1 = sections_of(first->first);
+    const V3Sec* managers = find_sec(s1, "pkg_inventory.managers");
+    const V3Sec* packages = find_sec(s1, kFacetPkgs);
+    const V3Sec* store = find_sec(s1, "pkg_inventory.store_packages");
+    REQUIRE(managers != nullptr);
+    REQUIRE(packages != nullptr);
+    REQUIRE(store != nullptr);
+    // The hung action reports for itself, and each sibling reports for itself: busy, not a second
+    // worker in the same plugin.
+    CHECK(managers->status == "timeout");
+    CHECK(managers->token == "timeout");
+    CHECK(packages->status == "timeout");
+    CHECK(packages->token == "busy");
+    CHECK(store->status == "timeout");
+    CHECK(store->token == "busy");
+    CHECK(c.workers->outstanding() == 1); // one plugin with a worker, not three
+    CHECK(g_blocking_entered.load() <= 1);
+
+    // A later pass is still held out of the plugin entirely.
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    CHECK(c.workers->outstanding() == 1);
+    CHECK(g_blocking_entered.load() <= 1);
+
+    // Released: the worker returns, the plugin is free, and all three answer in full.
+    release_worker();
+    CHECK(yuzu::agent::drain_collector_workers(*c.workers, std::chrono::seconds{10}, {}));
+    CHECK(c.workers->outstanding() == 0);
+    CHECK(g_blocking_entered.load() == 1); // only `managers` was ever entered
+
+    const auto third = c.collect();
+    REQUIRE(third.has_value());
+    const auto s3 = sections_of(third->first);
+    for (const char* facet : {"pkg_inventory.managers", "pkg_inventory.packages",
+                              "pkg_inventory.store_packages"}) {
+        CAPTURE(facet);
+        const V3Sec* sec = find_sec(s3, facet);
+        REQUIRE(sec != nullptr);
+        CHECK(sec->status == "full");
+    }
+    CHECK(c.workers->outstanding() == 0);
+    CHECK(g_blocking_entered.load() == 4);
 }
 
 TEST_CASE("collector: a rejected bounded call is timeout:rejected and its flag is clear at once",
@@ -5583,13 +5665,13 @@ struct HookRig {
 
 } // namespace
 
-TEST_CASE("SyncScheduler: on_force_full runs before collect when nothing has been acknowledged yet, "
-          "and ack follows the send",
+TEST_CASE("SyncScheduler: first contact sends the blob without on_force_full (a facet with no "
+          "acknowledged set is full by the source's own rule), and ack follows the send",
           "[sync][scheduler][v3]") {
     HookRig r;
     r.first_send();
     CHECK(r.last_blob);
-    CHECK(r.hs.events == std::vector<std::string>{"force", "collect", "ack"});
+    CHECK(r.hs.events == std::vector<std::string>{"collect", "ack"}); // no "force"
 }
 
 TEST_CASE("SyncScheduler: an unchanged pass neither forces nor sends a blob; wants_blob forces the blob",
@@ -5671,6 +5753,33 @@ TEST_CASE("SyncScheduler: a whole-source nack forces every section full next; a 
     CHECK(r.last_blob);
 }
 
+TEST_CASE("SyncScheduler: a section nack consumes an owed force and leaves the hash unacknowledged",
+          "[sync][scheduler][v3]") {
+    HookRig r;
+    // A never-acknowledged hash: the first send is nacked for one section only.
+    r.need = {"installed_software:runtimes.python"};
+    std::int64_t t = r.first_send();
+    CHECK(r.hs.events == std::vector<std::string>{"collect", "ack:installed_software:runtimes.python"});
+
+    // The operator forces the source on top of it; this send is nacked for one section again.
+    r.hs.events.clear();
+    REQUIRE(r.sched.request_now("installed_software") == std::vector<std::string>{"installed_software"});
+    r.sched.tick(t + 10);
+    REQUIRE(r.sends == 2);
+    CHECK(r.hs.events ==
+          std::vector<std::string>{"force", "collect", "ack:installed_software:runtimes.python"});
+
+    // The forced blob was delivered and attributed per section, so the force is spent: the retry
+    // is the source's own (its persisted need_full), not another blanket force. The hash is still
+    // unacknowledged, so the blob goes.
+    r.need = {};
+    r.hs.events.clear();
+    t = live_advance(r.sched, t + 10, t + 1000, [&] { return r.sends == 3; });
+    REQUIRE(r.sends == 3);
+    CHECK(r.last_blob);
+    CHECK(r.hs.events == std::vector<std::string>{"collect", "ack"});
+}
+
 TEST_CASE("SyncScheduler: a token that merely starts with the source name, or names another source, "
           "is not this source's nack",
           "[sync][scheduler][v3]") {
@@ -5744,4 +5853,69 @@ TEST_CASE("SyncScheduler + installed_software: a forced send always carries a fu
     REQUIRE(blobs_sent.size() == 3);
     REQUIRE_FALSE(blobs_sent[2].empty());
     CHECK(full_sections(blobs_sent[2]) == 11);
+}
+
+TEST_CASE("SyncScheduler + installed_software: a per-facet nack before any clean acknowledgement "
+          "resends only the nacked facet and sends the deferred section next",
+          "[sync][scheduler][collector][v3]") {
+    fake_all_supported();
+    // 24,000 rows over two facets: 12,000 `+` per facet, 20,000 per call, so the second facet is
+    // deferred out of the first call. The other pkg_inventory facets are small.
+    g_fake[0].out["list_inventory"] = inv_lines(12000);
+    std::string formulae = supported_status("packages") + "\n";
+    for (int i = 0; i < 12000; ++i)
+        formulae += pkg::format_package_row("f" + std::to_string(i), "1.0", pkg::PackageKind::formula) + "\n";
+    g_fake[1].out["packages"] = formulae;
+    Collector c({{"installed_apps", &kFakeIa}, {"pkg_inventory", &kFakePkg}});
+    SyncSource src = c.src;
+    src.window.reset(); // plain phase-slot cadence: this case is about the nack, not the window
+
+    std::vector<std::string> blobs_sent;
+    std::vector<std::string> need;
+    SyncScheduler sched(
+        "agent-1",
+        [&](const std::string& k) {
+            const auto it = c.kv.find(k);
+            return it == c.kv.end() ? std::string{} : it->second;
+        },
+        [&](const std::string& k, const std::string& v) { c.kv[k] = v; },
+        [&](const std::vector<std::pair<std::string, std::string>>&,
+            const std::vector<std::pair<std::string, std::string>>& blobs)
+            -> std::optional<std::vector<std::string>> {
+            blobs_sent.push_back(blobs.empty() ? std::string{} : blobs.front().second);
+            return need;
+        });
+    sched.add_source(src);
+
+    // First contact: apps and the two small pkg_inventory facets go; packages is deferred. The
+    // server nacks only `pkg_inventory.managers`.
+    need = {"installed_software:pkg_inventory.managers"};
+    sched.tick(1000);
+    sched.tick(1700);
+    REQUIRE(blobs_sent.size() == 1);
+    const auto s1 = sections_of(blobs_sent[0]);
+    REQUIRE(find_sec(s1, kFacetApps) != nullptr);
+    CHECK(find_sec(s1, kFacetApps)->status == "full");
+    CHECK(find_sec(s1, kFacetPkgs) == nullptr); // deferred
+    CHECK(c.src.has_more());
+    // Not a complete acknowledgement: no report hash is recorded as acknowledged.
+    const std::string last_hash_key = SyncScheduler::kv_key("installed_software", "last_hash");
+    CHECK(c.kv[last_hash_key].empty());
+
+    // The retry (after the nack backoff) is the nacked facet in full and the deferred section in
+    // full. The acknowledged apps facet is NOT resent: without a blanket force it is unchanged.
+    need = {};
+    live_advance(sched, 1700, 1700 + 1000, [&] { return blobs_sent.size() == 2; });
+    REQUIRE(blobs_sent.size() == 2);
+    const auto s2 = sections_of(blobs_sent[1]);
+    CHECK(find_sec(s2, kFacetApps) == nullptr);
+    REQUIRE(find_sec(s2, "pkg_inventory.managers") != nullptr);
+    CHECK(find_sec(s2, "pkg_inventory.managers")->status == "full");
+    REQUIRE(find_sec(s2, kFacetPkgs) != nullptr);
+    CHECK(find_sec(s2, kFacetPkgs)->status == "full");
+    CHECK(find_sec(s2, kFacetPkgs)->adds.size() == 12000);
+    CHECK_FALSE(c.src.has_more());
+
+    // A clean acknowledgement ends the window: nothing more is owed.
+    CHECK_FALSE(c.kv[last_hash_key].empty());
 }

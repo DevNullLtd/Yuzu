@@ -287,6 +287,47 @@ TEST_CASE("is_per_user_path and the writer's install_location rule", "[v3][write
     CHECK(split(v3_record(e), '\x1f')[12] == "/Applications/Tool.app");
 }
 
+TEST_CASE("per-user install_location spellings are blanked on the wire", "[v3][writer][privacy]") {
+    // The Win32 extended-length and device prefixes, every UNC spelling, and the macOS Data-volume
+    // firmlink name the same per-user (or unclassifiable) paths as the plain forms.
+    const std::vector<std::string> blanked = {
+        "\\\\?\\C:\\Users\\Alice\\App",   "\\\\?\\c:\\users\\Alice\\App", "\\\\.\\D:\\Users\\Alice",
+        "//?/C:/Users/Alice/App",         "\\\\host\\share\\apps\\Tool",  "\\\\host\\home$\\alice",
+        "//host/share/Tool",              "\\\\?\\UNC\\host\\share\\Tool", "\\\\?\\unc\\host\\share",
+        "\\\\.\\UNC\\host\\share\\Tool",
+        "/System/Volumes/Data/Users/alice/App", "/System/Volumes/Data/home/alice",
+        "/System/Volumes/Data/root/bin"};
+    for (const auto& path : blanked) {
+        CAPTURE(path);
+        CHECK(is_per_user_path(path));
+        SwEntry e = alpha();
+        e.install_location = path;
+        // v3_record: slot 12 (install_location) is empty, and the row hashes as the blanked row.
+        CHECK(split(v3_record(e), '\x1f')[12].empty());
+        SwEntry blank = alpha();
+        blank.install_location.clear();
+        CHECK(v3_record(e) == v3_record(blank));
+        // plan_section: the full section carries the blanked row, so its hash is the blanked set's.
+        const SectionPlan plan = plan_section(kApps, {e}, std::nullopt, false);
+        REQUIRE(plan.status == V3Status::full);
+        REQUIRE(plan.adds.size() == 1);
+        CHECK(plan.adds[0].install_location.empty());
+        CHECK(plan.section_hash == plan_section(kApps, {blank}, std::nullopt, false).section_hash);
+    }
+    // Machine-scope spellings of the same shapes are kept.
+    const std::vector<std::string> kept = {
+        "\\\\?\\C:\\Program Files\\Tool", "\\\\.\\C:\\Windows", "/System/Volumes/Data/Applications/Tool.app",
+        "/System/Applications/Tool.app", "/System/Volumes/Data", "/System/Volumes/Data/opt/x",
+        "\\\\?\\", "\\x", "\\\\?\\Cx"};
+    for (const auto& path : kept) {
+        CAPTURE(path);
+        CHECK_FALSE(is_per_user_path(path));
+        SwEntry e = alpha();
+        e.install_location = path;
+        CHECK(split(v3_record(e), '\x1f')[12] == path);
+    }
+}
+
 TEST_CASE("canonical epoch and release spelling are stable across two collections",
           "[v3][writer][canonical]") {
     CHECK(canonical_epoch("0").empty());

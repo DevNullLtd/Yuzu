@@ -233,17 +233,20 @@ YUZU_EXPORT void vendor_or_origin(SwEntry& e);
 /// The in-flight state of the collector's detached workers: ONE object owned by the agent for
 /// its whole life (AgentImpl), never by the SyncSource. The source is rebuilt on every
 /// reconnect while a worker abandoned at its time limit may still be inside a plugin, so the
-/// single-flight flags and the outstanding count must outlive any one source. A flag is held
-/// from the moment a facet's bounded call is admitted until the worker physically returns
-/// (not until its caller stops waiting); outstanding() is the number of flags held.
+/// single-flight flags and the outstanding count must outlive any one source. There is ONE flag
+/// per PLUGIN (every action of `pkg_inventory` or `runtimes` shares one): a plugin is one object
+/// with shared state, so a worker of any of its actions that is still inside it keeps every
+/// other action of that plugin from starting a second thread there. A flag is held from the
+/// moment a plugin's bounded call is admitted until the worker physically returns (not until
+/// its caller stops waiting); outstanding() is the number of plugins with a worker in flight.
 class YUZU_EXPORT CollectorWorkers {
 public:
-    /// True and the facet marked busy iff no worker of it is in flight.
-    [[nodiscard]] bool try_begin(std::string_view facet);
-    /// Release a facet (the worker returning, or the caller when the bounded call was rejected
+    /// True and the plugin marked busy iff no worker of it is in flight.
+    [[nodiscard]] bool try_begin(std::string_view plugin);
+    /// Release a plugin (the worker returning, or the caller when the bounded call was rejected
     /// and no worker ever ran).
-    void end(std::string_view facet) noexcept;
-    /// Workers in flight now (callable from any thread).
+    void end(std::string_view plugin) noexcept;
+    /// Plugins with a worker in flight now (callable from any thread).
     [[nodiscard]] std::size_t outstanding() const;
 
 private:
@@ -291,8 +294,8 @@ struct CollectorTuning {
 ///   - anything else a status-only section naming why: `constrained` (`rc=<n>`, `truncated`, the
 ///     plugin's own status tokens, typed PARTIAL completeness, `unknown` for an answer that
 ///     declared no completeness at all, `no_rows` from installed_apps),
-///     `timeout` (`timeout`, `busy` while an earlier worker of that facet is still inside the
-///     plugin, `rejected` when no worker could be started), `oversize` (`rows=<n>` / `bytes=<n>`),
+///     `timeout` (`timeout`, `busy` while an earlier worker of ANY action of that plugin is still
+///     inside it, `rejected` when no worker could be started), `oversize` (`rows=<n>` / `bytes=<n>`),
 ///     `not_collected` (`not_loaded`, or the plugin's own `unsupported` answer).
 /// A status-only section is sent when its {status, token} differs from the one the server last
 /// acknowledged for that facet, and again after a forced send (Sync now), a nack, a reconnect or
@@ -301,7 +304,7 @@ struct CollectorTuning {
 /// status-only section.
 ///
 /// Each action runs on a bounded detached worker (agents/shared/bounded_wait.hpp), one at a
-/// time, under its table time limit. `workers` is the agent-owned single-flight state above;
+/// time per plugin, under its table time limit. `workers` is the agent-owned single-flight state above;
 /// `kv_get`/`kv_set` are the `__sync__` accessors the per-facet acknowledged sets persist
 /// through (`sync.installed_software.<facet>.acked` / `.need_full`). All three are required: a
 /// source built without the agent's workers would hold private single-flight state. The source

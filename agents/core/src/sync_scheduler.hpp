@@ -68,15 +68,17 @@ struct SyncSource {
     /// names the facets it holds in its report hash, and the server refuses a delta over a base
     /// that no longer matches (`installed_software:<facet>` nack -> that facet is resent in
     /// full), so a weekly blanket resend of every facet would only add load. A force, a
-    /// whole-source nack and a never-acknowledged hash still send full.
+    /// whole-source nack still send full, as does a never-acknowledged hash (decide_full).
     bool no_full_floor{false};
 
     /// A source that keeps its own per-section state (installed_software, blob v3) is told when
     /// the scheduler is about to send FULL regardless of what it collects: the operator forced
-    /// the source (request_now), the server nacked it (force_full), no hash has ever been
-    /// acknowledged, or the weekly floor is due (never for a no_full_floor source). Called on
-    /// the ticking thread immediately BEFORE collect(), in both tick passes, so a forced send
-    /// always carries a full payload.
+    /// the source (request_now), the server nacked the whole source (force_full), or the weekly
+    /// floor is due (never for a no_full_floor source). Called on the ticking thread immediately
+    /// BEFORE collect(), in both tick passes, so a forced send always carries a full payload.
+    /// A never-acknowledged hash does NOT call it: the blob still goes (decide_full), and a
+    /// section the source holds no acknowledged set for is full by the source's own rule, so a
+    /// per-section nack in that window cannot re-force the sections already acknowledged.
     /// Unset for every other source.
     std::function<void()> on_force_full;
 
@@ -250,10 +252,11 @@ private:
     /// offset in [0, kCatchUpWindow), and persist it. last_hash and force_full are
     /// left untouched.
     void catch_up_if_overdue(std::size_t idx, std::int64_t now_secs);
-    /// The part of the full decision that does not depend on the collected hash: an operator
-    /// force or a server nack, no acknowledged hash yet, or the weekly floor. Computed BEFORE
-    /// collect() so a source can be told (SyncSource::on_force_full) and is therefore
-    /// guaranteed to produce a full payload whenever decide_full will ask for one.
+    /// The blanket part of the full decision that does not depend on the collected hash: an
+    /// operator force or a whole-source nack, or the weekly floor. Computed BEFORE collect() so a
+    /// source can be told (SyncSource::on_force_full) and therefore produces a full payload for
+    /// every one of these. decide_full also sends the blob when no hash has ever been
+    /// acknowledged, which is not part of this blanket (see the definition).
     bool forced_full_due(std::size_t idx, const State& st, std::int64_t now_secs) const;
     /// Hash-skip decision for one source at `now_secs`, given its freshly
     /// collected `hash` — factored out of tick() so the forced-source (pass 1)
@@ -314,10 +317,9 @@ void emit_sync_skip_tags(TagMap& tags, const std::vector<std::string>& sources,
 }
 
 /// Publish the installed_software collector's count of answers that declared no completeness
-/// (sync_software_completeness_unknown_total) as the heartbeat tag
-/// `yuzu.sync.installed_software.completeness_unknown_total`, read from the `__sync__` KV the
-/// collector persists it in. Emitted only for a positive value of at most nine ASCII digits; no
-/// protobuf field is added (#1567), the same pattern as emit_sync_skip_tags.
+/// as the heartbeat tag `yuzu.sync.installed_software.completeness_unknown_total`, read from the
+/// `__sync__` KV the collector persists it in. Emitted only for a positive value of at most nine
+/// ASCII digits; no protobuf field is added (#1567), the same pattern as emit_sync_skip_tags.
 template <typename TagMap>
 void emit_sync_completeness_unknown_tag(
     TagMap& tags,

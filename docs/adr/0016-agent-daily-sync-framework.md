@@ -1474,7 +1474,9 @@ is unchanged; any other answer is a status-only section (`constrained`, `timeout
 differ from the ones the server last acknowledged for that source, and not again while they stay the same
 (memory only: a restart costs one resend, which the server's upsert makes harmless), so a host with
 sources its OS cannot collect still sends the report hash alone on a quiet day. The sources run one at a
-time, in the collector's table order, so a single detached worker is in flight at any moment.
+time, in the collector's table order, and at most one detached worker is ever inside a plugin: the
+single-flight slot is per plugin, so the three `pkg_inventory` sources (and the three `runtimes` ones) share
+one (see Bounded workers).
 
 **Rows.** A `+` record is the 16 wire slots of the stored form: every field through `clamp_field` (scrub to
 UTF-8, clamp to 1,024 bytes on a codepoint boundary, then strip 0x1F, 0x1E and NUL, the one preparation
@@ -1512,17 +1514,22 @@ those it sent `full` or `delta`.
 **Acknowledgement and forced sends.** The scheduler matches a nack token that equals the source name or
 starts with `<name>:`. The whole-source token marks every facet `need_full` and makes the next send
 full (`SyncSource::on_force_full`, called before `collect()` in both tick passes whenever the
-scheduler is about to send full: `request_now`, a whole-source nack or no acknowledged hash yet, so a
-forced blob always carries a full section per facet, and every status-only section again, and never a
-header-only blob, which the server's parser refuses). A per-section token (`installed_software:<facet>`) marks only that
-facet `need_full`; the scheduler does not force the other facets. `SyncSource::wants_blob` is OR-ed into
+scheduler is about to send full: `request_now`, a whole-source nack or the weekly floor (not for this
+source), so a forced blob always carries a full section per facet, and every status-only section again,
+and never a header-only blob, which the server's parser refuses). A never-acknowledged report hash sends
+the blob but does not call it: a facet with no acknowledged set is full by the collector's own rule, so first
+contact is full without it. A per-section token (`installed_software:<facet>`) marks only that
+facet `need_full`; the scheduler does not force the other facets, and it consumes a force that was owed
+(the forced blob was delivered and attributed per section) while leaving the report hash unacknowledged, so
+the retry is the collector's persisted `need_full` for the nacked facets alone: facets already acknowledged
+are not re-sent, and a section deferred by the call caps is sent on the next tick. `SyncSource::wants_blob` is OR-ed into
 the full decision after the hash comparison and is true whenever a collection wrote any section, so a
 status or token change reaches the server although the held-facet hash did not move; on a quiet pass it
 is false and the report is the hash alone.
 
 **No weekly full resend (`SyncSource::no_full_floor`).** The source is exempt from the scheduler's 7-day
 full floor (roadmap R3: no weekly forced full for v3); a force, a whole-source nack and a
-never-acknowledged hash still send full. Divergence heals without a floor: the server recomputes each
+never-acknowledged hash still send the blob, full for every facet the agent holds no acknowledged set for. Divergence heals without a floor: the server recomputes each
 section's hash after every apply and refuses a delta over a base that no longer matches, answering
 `installed_software:<facet>`, which the agent resends in full, and a facet with no acknowledged hash is
 always sent in full. The report hash covers only the facets the agent holds, so a facet the server lost is
@@ -1541,9 +1548,12 @@ the plugins again. A source whose rows exceed 20,000, or whose full section exce
 **Bounded workers.** Each source runs on a detached worker bounded by its time limit (`installed_apps`,
 `windows_optional_features` and `hardware.drivers_inventory` 120 s, the rest 60 s). The single-flight flag
 and the outstanding-worker count live in one object owned by the agent, not by the source (the source is
-rebuilt on every reconnect while a worker abandoned at its limit may still be inside a plugin); the flag is released by a
-guard inside the worker when it physically returns. A source whose worker is still running is `timeout`
-with token `busy`; a bounded call that could not start (the outstanding-call ceiling or thread creation)
+rebuilt on every reconnect while a worker abandoned at its limit may still be inside a plugin). The flag is
+per **plugin**, not per action: a plugin is one object with shared state, so a worker of any of its actions
+that is still inside it means a second thread must not enter it through a sibling action either, and the
+outstanding count is the number of plugins with a worker in flight. The flag is released by a
+guard inside the worker when it physically returns. Every source of a plugin whose worker is still running
+is `timeout` with token `busy` (each facet still reports for itself); a bounded call that could not start (the outstanding-call ceiling or thread creation)
 is `timeout` with token `rejected` and the caller clears the flag. **Teardown:** after the worker threads
 are joined and before any plugin `shutdown()` or unload, on both teardown paths of the agent, the agent
 waits `kOrphanDrainGrace` (3 s) for the count to reach zero and otherwise logs and exits with code 3
@@ -1578,8 +1588,13 @@ only on a 32-bit OS.
 **No per-user paths (ADR-0016 section 8).** The writer blanks an `install_location` under
 `<drive>:\Users\`, `<drive>:/Users/`, `/Users/`, `/home/` or `/root`, so the server's stored location
 and the change ledger's `identity_key` copy of it name machine-scope roots only; the blanking is part of the
-stored form, so it also keeps one app installed under two accounts one row. `tests/unit/test_installed_software_v3.cpp`
-covers the predicate and the blanked record.
+stored form, so it also keeps one app installed under two accounts one row. The same paths spelled with the
+Win32 `\\?\` or `\\.\` prefix, or on macOS under `/System/Volumes/Data`, are blanked too, and so is
+EVERY UNC path (`\\host\share\...`, `\\?\UNC\...`): the writer cannot tell a home share from an application
+share, so it fails closed and an application installed to a network share carries no location. A
+`\\?\Volume{...}` or other NT-namespace spelling that names neither a drive letter nor UNC is not recognised
+(a disclosed residual). `tests/unit/test_installed_software_v3.cpp` covers the predicate and the blanked record through both
+`v3_record` and `plan_section`.
 
 **Drivers are a daily-sync section.** This reverses the 2026-11-03 statement that
 `hardware.drivers_inventory` is not a daily-sync source. It is the eleventh and last row of the collector's

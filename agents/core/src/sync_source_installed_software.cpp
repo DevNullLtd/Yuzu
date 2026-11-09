@@ -209,7 +209,7 @@ struct InventoryAction {
     std::string_view action;
     AdaptedRows (*adapt)(const std::string& captured);
     // How long the sync thread waits for this one action before it reports `timeout` and goes on
-    // (the worker is abandoned, not killed: single-flight keeps it to one per facet). The agent's
+    // (the worker is abandoned, not killed: single-flight keeps it to one per plugin). The agent's
     // shutdown watchdog is 20 s, so a stop that lands inside a wait longer than that ends in the
     // watchdog's hard exit: the same outcome an unbounded in-process dispatch had before.
     std::chrono::seconds time_limit{60};
@@ -800,28 +800,33 @@ struct CollectorState {
             c.token = "not_loaded";
             return c;
         }
-        // Single-flight: a worker of this facet that outlived its time limit is still inside the
-        // plugin. A second dispatch would pile another thread into the same plugin.
-        if (!workers->try_begin(source)) {
-            spdlog::warn("sync: {} is still running from an earlier pass — reported timeout:busy",
-                         source);
+        // Single-flight per PLUGIN, not per action: a worker of ANY action of this plugin that
+        // outlived its time limit is still inside it, and a plugin is one shared object with
+        // shared state. A second dispatch, of the same action or a sibling, would pile another
+        // thread into the same wedged plugin. Every facet of a busy plugin reports `busy`.
+        const std::string plugin(row.plugin);
+        if (!workers->try_begin(plugin)) {
+            spdlog::warn("sync: plugin {} still has a worker running from an earlier pass — {} is "
+                         "reported timeout:busy",
+                         plugin, source);
             c.status = V3Status::timeout;
             c.token = "busy";
             return c;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        // The dispatcher is built INSIDE the worker and the single-flight flag is released by a
-        // guard inside it too: whichever of Completed and TimedOut the caller sees, the flag is
-        // cleared when the worker physically returns (or throws), never before. A Rejected call
-        // never invoked the lambda, so no guard exists and the caller clears the flag below.
+        // The dispatcher is built INSIDE the worker and the plugin's single-flight flag is
+        // released by a guard inside it too: whichever of Completed and TimedOut the caller sees,
+        // the flag is cleared when the worker physically returns (or throws), never before. A
+        // Rejected call never invoked the lambda, so no guard exists and the caller clears the
+        // flag below.
         using Result = LocalDispatcher::Result;
         std::function<Result()> fn = [workers = workers, desc = it->second,
-                                      action = std::string(row.action), source]() -> Result {
+                                      action = std::string(row.action), plugin]() -> Result {
             struct Release {
                 CollectorWorkers& w;
                 const std::string& k;
                 ~Release() { w.end(k); }
-            } release{*workers, source};
+            } release{*workers, plugin};
             try {
                 LocalDispatcher d;
                 return d.run(desc, action, {}, kInventoryCaptureCap);
@@ -840,7 +845,7 @@ struct CollectorState {
                             std::chrono::steady_clock::now() - t0)
                             .count();
         if (call.status == yuzu::shared::BoundedCallStatus::Rejected) {
-            workers->end(source);
+            workers->end(plugin);
             spdlog::warn("sync: {} could not start a worker (outstanding-call ceiling or thread "
                          "creation) — reported timeout:rejected",
                          source);

@@ -277,17 +277,20 @@ std::vector<std::size_t> SyncScheduler::drain_pending(std::int64_t now_secs) {
 
 bool SyncScheduler::forced_full_due(std::size_t idx, const State& st, std::int64_t now_secs) const {
     // A source that heals divergence per section (SyncSource::no_full_floor) is exempt from the
-    // weekly floor only; a force, a nack and a never-acknowledged hash still send full.
+    // weekly floor only; a force and a whole-source nack still send full. A never-acknowledged
+    // hash is deliberately NOT in this blanket: decide_full still sends the blob for it, but a
+    // sectioned source sends a facet with no acknowledged set in full by its own rule, and
+    // blanketing it would re-force the facets already acknowledged after a per-facet nack.
     const bool floor_due =
         !sources_[idx].no_full_floor &&
         (now_secs - st.last_full) >= static_cast<std::int64_t>(kFullFloor.count());
-    return st.force_full || st.last_hash.empty() || floor_due;
+    return st.force_full || floor_due;
 }
 
 bool SyncScheduler::decide_full(std::size_t idx, const State& st, const std::string& hash,
                                 std::int64_t now_secs) const {
     const SyncSource& src = sources_[idx];
-    return forced_full_due(idx, st, now_secs) || hash != st.last_hash ||
+    return forced_full_due(idx, st, now_secs) || st.last_hash.empty() || hash != st.last_hash ||
            (src.wants_blob && src.wants_blob());
 }
 
@@ -322,9 +325,12 @@ void SyncScheduler::apply_ack(std::size_t idx, const std::string& hash, bool sen
         // (the else branch). The jitter still de-stampedes a synchronized
         // fleet-wide nack (e.g. a server DB restore).
         // A per-section nack (`<name>:<detail>`) is the source's to resend, one section in full
-        // (on_ack above); only the whole-source nack forces every section full again.
-        if (whole_source)
-            st.force_full = true;
+        // (on_ack above); only the whole-source nack forces every section full again. A
+        // per-section nack also CONSUMES an owed force: the forced blob was delivered and every
+        // section of it attributed (the acknowledged ones are committed, the nacked one is
+        // flagged by the source), so keeping the force would re-send the acknowledged sections.
+        // last_hash stays as it was: this is not a complete acknowledgement.
+        st.force_full = whole_source;
         st.needfull_streak += 1;
         const std::int64_t jitter_cap = kNeedFullJitterWindow.count();
         const std::int64_t max_backoff = kMaxTickSeconds.count() - jitter_cap;

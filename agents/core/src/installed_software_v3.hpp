@@ -94,9 +94,12 @@ enum class V3Status { full, delta, constrained, timeout, oversize, not_collected
 [[nodiscard]] YUZU_EXPORT std::string canonical_release(std::string_view release);
 
 /// True for a path under an account's home: `<drive>:\Users\`, `<drive>:/Users/` (case-insensitive,
-/// as Windows paths are), `/Users/`, `/home/` or `/root` on a POSIX path. The writer blanks such an
-/// install_location (ADR-0016 section 8: machine-scope data only; the server stores slot 13 as sent
-/// and keeps a copy in the change ledger for 400 days).
+/// as Windows paths are), `/Users/`, `/home/` or `/root` on a POSIX path, also when spelled with a
+/// `\\?\` or `\\.\` prefix or, on macOS, under `/System/Volumes/Data`. EVERY UNC path
+/// (`\\host\share\...`, `\\?\UNC\...`) is true too: a home share cannot be told from an
+/// application share, so the writer fails closed. The writer blanks such an install_location
+/// (ADR-0016 section 8: machine-scope data only; the server stores slot 13 as sent and keeps a copy
+/// in the change ledger for 400 days).
 [[nodiscard]] YUZU_EXPORT bool is_per_user_path(std::string_view path);
 
 /// The stored form of one row, exactly what the server holds after its own field step: every

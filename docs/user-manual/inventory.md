@@ -38,8 +38,9 @@ cadences.
   degraded read never deletes anything. This holds for every source, including `runtimes` `python`,
   `dotnet` and `jvm`, `middleware` `ibm_mq` and `pkg_inventory` `managers`, whose constrained answers
   once kept some rows or removed all of them; a clean read that finds nothing (`supported` with zero
-  rows) is a `full` section with no rows and does retire the source's stored rows. A worker still
-  running from an earlier day is reported `timeout` with token `busy` and is not started twice; when a
+  rows) is a `full` section with no rows and does retire the source's stored rows. While a worker of
+  any action of a plugin is still running from an earlier day, every source of that plugin is reported
+  `timeout` with token `busy` and none is started again; when a
   worker cannot be started the token is `rejected`; a source whose rows exceed 20,000, or whose full
   section cannot fit in one report, is `oversize` (`rows=<n>`, `bytes=<n>`) and sends no rows. A
   status-only section is sent when its status or token changes, and again after Sync now or a server
@@ -375,7 +376,9 @@ cadences.
   sectioned report" below). This build's agent sends `install_location` (the Windows
   `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
   user's profile names an account, the agent blanks any location under `<drive>:\Users\`,
-  `/Users/`, `/home/` or `/root` before it hashes or sends it, so the stored value and the change
+  `/Users/`, `/home/` or `/root` (including the `\\?\` and macOS `/System/Volumes/Data` spellings of
+  them) before it hashes or sends it, and every UNC path too (a home share cannot be told from an
+  application share), so the stored value and the change
   history name machine-scope roots only (ADR-0016 §8, #5186). (The only `HKCU`
   read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
@@ -544,8 +547,8 @@ whole source name.
   rows that arrived) and an unchanged source sends nothing. A source that did not answer sends a
   status-only section naming why; the server keeps its previous rows. Sources run one at a time,
   each on its own bounded worker (120 s for `installed_apps`, `windows_optional_features` and
-  `hardware`, 60 s for the rest), so one plugin that hangs costs its own section only, and it is
-  not started again while the earlier run is still going (`busy`). A first report larger than one
+  `hardware`, 60 s for the rest), so one plugin that hangs costs its own sections only, and it is
+  not entered again, by any of its actions, while the earlier run is still going (`busy`). A first report larger than one
   call (20,000 rows or 3 MiB) is split across successive calls 30 seconds apart. A source whose
   rows alone cannot fit in one report is `oversize` and sends no rows. Sync now and a server request
   for the whole source resend every section in full; there is no weekly full resend of this report,
