@@ -86,8 +86,8 @@ bool exec_ok(PGconn* conn, const std::string& sql, std::string_view what, std::s
 // (nothing checks that mechanically, which is the defect #7164 had between a log
 // line and a renamed heading).
 constexpr const char* kDriftDocHeading =
-    "the server refuses to start when a recorded migration differs from this build "
-    "(every Postgres store)";
+    "a Postgres store refuses to open when its recorded migration differs from this build "
+    "(the server stops, except for three stores)";
 
 std::string short_hash(const std::string& h) {
     return h.substr(0, 12);

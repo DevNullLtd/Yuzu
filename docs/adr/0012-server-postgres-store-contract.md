@@ -383,8 +383,13 @@ adopted by every store, is not mass-adopted: it needs a hand-written probe per s
 only a missing column, not a changed type, constraint or index; it stays the second line of
 defence (playbook "Runner guards").
 
-A mismatch fails the store closed: `run()` returns false, the store does not open and the server
-does not start. This is deliberately not the #3894 posture. A database ahead of the binary is
+A mismatch fails the store closed: `run()` returns false and the store does not open. For
+nearly every store that stops the server from starting, but three do not make a failed `run()`
+fatal: `analytics_event_store` (degraded for the run), `crypto_dashboard_layout_store` (a recorded
+exception: layouts answer 503) and `leader_elector` (the server boots with its leader-only loops
+paused; the elector re-runs `run()` every election cycle and meets the same refusal, so it does not
+recover until the database is repaired). The operator signals are the `PgMigrationRunner: store
+'<store>' recorded migration` log line and the `yuzu_server_leader_*` metrics. This is deliberately not the #3894 posture. A database ahead of the binary is
 off-procedure and a refusal would be a second failure; a recorded version whose text differs is
 on-procedure (same build lineage), the build knows exactly what is wrong, and the alternative is
 the fail-open at the first query that the issue names. There is no override flag and there was
@@ -399,7 +404,7 @@ the same in every process and deployment. A migration must stay that way: no clo
 environment, address or unordered-container iteration may reach its text.
 
 The table is named `yuzu_schema_migrations` because `public` is shared with whatever else lives in
-the database. A foreign `schema_migrations` (golang-migrate, Rails, Flyway) would make the
+the database. A foreign `schema_migrations` (golang-migrate, Rails; Flyway's default table is `flyway_schema_history`, which does not collide) would make the
 `IF NOT EXISTS` skip silently and fail every store on a missing column.
 
 Trust on first use. A version applied before the table existed has no row. It is recorded as

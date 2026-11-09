@@ -400,7 +400,7 @@ from the registry changes what a FRESH database gets and nothing about a deploye
   open the store and names the table, so a registry ahead of its database fails at boot and not
   as `42P01`/`42703` on the first sections read).
 - **This is not the runner's drift detection** (#7158). The runner now refuses a store whose
-  recorded migration hash differs from this build's text (see "Runner guards"); the projection
+  recorded migration hash differs from this build's text (see "Recorded-hash drift guard (#7158)"); the projection
   check asks a different question (does the schema carry every column this build reads) and
   does not replace it: do not consolidate the two. The projection is column PRESENCE only (an
   extra column is tolerated, in line with the ahead-database stance of #3894); names, types,
@@ -678,7 +678,12 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   the hard-cutover deployment contract excludes). Steady state is one lock-free read. A migration's
   SQL must therefore be byte-identical across processes and deployments: never interpolate a
   config value, environment variable, timestamp or random value into it (a deterministic
-  generator over fixed text is fine). This detects accidental or procedural drift, not
+  generator over fixed text is fine). That includes a constant the runtime SQL also uses when a
+  migration is built from it: `kV4ShapeCheck` (`guaranteed_state_store.cpp`, concatenated into
+  v4's text and also executed by `ordering_schema_defect`) and `kDbNowEpochSql`
+  (`approval_manager.cpp`, concatenated into v2's text and also used by runtime queries) are part
+  of the hashed migration text, so tightening one for a runtime reason makes every database at
+  that version refuse to boot. This detects accidental or procedural drift, not
   tampering: whoever can write the table can rewrite `schema_meta`, and a deleted row is recorded
   again as `'tofu'`. Nor does it see drift in a version recorded by a build that predates the
   table. A test that hand-copies a migration vector under a SHIPPED store name and then
