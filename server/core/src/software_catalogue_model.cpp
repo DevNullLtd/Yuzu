@@ -388,10 +388,22 @@ std::string filter_fingerprint(const SoftwareCatalogQuery& q) {
 std::string devices_fingerprint(const SoftwareFleetQuery& q) {
     static const std::string kNoVersion;
     // A present-empty version (the exact empty-version bucket) is not an absent one.
-    return fnv1a_hex16(
+    std::string key =
         std::string(1, q.version ? '1' : '0') +
         length_prefixed({&q.agent_id, &q.name, q.version ? &*q.version : &kNoVersion, &q.q, &q.kind,
-                         &q.ecosystem, &q.source}));
+                         &q.ecosystem, &q.source});
+    // The SAM-17 filters join the key ONLY when set, so a default-filter request keeps the exact
+    // fingerprint it had before they existed (an in-flight cursor must not flip to a mismatch).
+    // The resolved `versions` set is deliberately NOT in it: it is derived from the request's
+    // version_min/version_max (bound by the list model) and moves with each rollup refresh.
+    if (q.match != NameMatch::kExact || !q.status.empty()) {
+        const std::string match = q.match == NameMatch::kExact    ? "exact"
+                                  : q.match == NameMatch::kPrefix ? "prefix"
+                                                                  : "contains";
+        key += '\x1e';
+        key += length_prefixed({&match, &q.status});
+    }
+    return fnv1a_hex16(key);
 }
 
 std::string encode_catalogue_cursor(const SoftwareCatalogRow& last, std::string_view fp,
@@ -808,103 +820,11 @@ read_versions(const VersionsReads& io, const SoftwareVersionsQuery& q) {
     return std::move(*rows);
 }
 
-std::string denied_detail(const DevicesPage& page) {
-    if (page.devices_omitted > 0)
-        return "scope: filtered " + std::to_string(page.devices_omitted) +
-               " out-of-scope device(s) (management-group and/or service-tag axis)";
-    return page.target_denied ? "scope: agent_id outside the caller's scope" : std::string{};
-}
-
 std::expected<DevicesPage, std::optional<CursorError>>
 read_devices_page(const DevicesReader& read, const DevicesRequest& rq,
                   const authz::VisibleSet& scope) {
-    auto q = rq.query;
-    // The cursor is bound to the filter set (never to the scope: the scope only narrows what the
-    // same keyset position yields).
-    const std::string fp = devices_fingerprint(q);
-    DevicesCursor incoming; // the head: nothing served yet
-    if (!rq.cursor.empty()) {
-        auto cur = decode_devices_cursor(rq.cursor, fp);
-        if (!cur)
-            return std::unexpected(cur.error());
-        incoming = std::move(*cur);
-    }
-    const auto key_of = [](const SoftwareFleetRow& r) {
-        return SoftwareCursor{r.entry.name, r.agent_id, r.install_id};
-    };
-    // The head anchor is "from the start", whatever install_id the store hands out.
-    const auto& a = incoming.after;
-    if (!(a.name.empty() && a.agent_id.empty() && a.install_id == 0))
-        q.after = a;
-    DevicesPage out;
-    out.target_denied = !q.agent_id.empty() && !authz::in_scope(scope, q.agent_id);
-    // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
-    // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
-    const bool filter = scope && scope->size() > kScopePushdownMaxIds;
-    if (scope && !filter)
-        q.agent_ids.emplace(scope->begin(), scope->end());
-    if (!filter) {
-        // Every returned row is in scope, so the last one is a safe cursor. A skip is only ever
-        // minted by the wide path below; it has no meaning here and is ignored.
-        auto rows = read(q);
-        if (!rows)
-            return std::unexpected(std::nullopt);
-        out.hit_cap = !rows->empty() && rows->size() == static_cast<std::size_t>(q.limit);
-        if (out.hit_cap)
-            out.next_cursor = encode_devices_cursor({key_of(rows->back()), 0}, fp);
-        out.rows = std::move(*rows);
-        return out;
-    }
-
-    // Wide scope: post-filter, refilling the page with at most kWideScopeMaxReads bounded reads.
-    // The cursor must never carry a dropped row's key, so it is the last IN-SCOPE row served
-    // (the incoming anchor if there is none) plus the number of rows scanned after it, which the
-    // next request passes over in SQL. Each refill read continues after the last row SCANNED,
-    // kept in-process only.
-    const auto limit = static_cast<std::size_t>(q.limit);
-    q.skip = incoming.skip;
-    std::int64_t since_anchor = incoming.skip;
-    std::unordered_set<std::string> dropped;
-    bool more = false;
-    out.rows.reserve(limit);
-    for (int reads = 1;; ++reads) {
-        auto rows = read(q);
-        if (!rows)
-            return std::unexpected(std::nullopt);
-        const bool full = !rows->empty() && rows->size() == limit;
-        SoftwareCursor last_scanned;
-        if (full && reads < kWideScopeMaxReads)
-            last_scanned = key_of(rows->back());
-        std::size_t i = 0;
-        for (; i < rows->size() && out.rows.size() < limit; ++i) {
-            auto& r = (*rows)[i];
-            if (authz::in_scope(scope, r.agent_id)) {
-                out.rows.push_back(std::move(r));
-                since_anchor = 0;
-            } else {
-                dropped.insert(r.agent_id); // each DISTINCT device counts once
-                ++since_anchor;
-            }
-        }
-        if (out.rows.size() >= limit) { // page filled: rows may remain here or beyond
-            more = i < rows->size() || full;
-            break;
-        }
-        if (!full) // a short read is the end of the data
-            break;
-        if (reads >= kWideScopeMaxReads) { // bound reached: say there may be more
-            more = true;
-            break;
-        }
-        q.after = std::move(last_scanned);
-        q.skip = 0;
-    }
-    out.devices_omitted = static_cast<std::int64_t>(dropped.size());
-    out.hit_cap = more;
-    if (more)
-        out.next_cursor = encode_devices_cursor(
-            {out.rows.empty() ? incoming.after : key_of(out.rows.back()), since_anchor}, fp);
-    return out;
+    return read_scoped_page<DevicesOps>(read, rq.query, rq.cursor, devices_fingerprint(rq.query),
+                                        scope);
 }
 
 } // namespace yuzu::server::software_catalogue

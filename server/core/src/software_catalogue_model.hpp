@@ -23,6 +23,7 @@
 #include <expected>
 #include <functional>
 #include <map>
+#include <unordered_set>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -147,6 +148,28 @@ struct DevicesCursor {
 /// Refusal order: malformed -> filter mismatch (never kStale).
 [[nodiscard]] std::expected<DevicesCursor, CursorError>
 decode_devices_cursor(std::string_view token, std::string_view fp);
+
+/// The cursor/key policy of the raw per-install list (cursor `d2:`); `read_scoped_page`'s Ops for
+/// SoftwareFleetRow. Shared with the SAM-17 list model, which binds a wider fingerprint.
+struct DevicesOps {
+    using Row = SoftwareFleetRow;
+    using Query = SoftwareFleetQuery;
+    using Anchor = SoftwareCursor;
+    static std::expected<std::pair<Anchor, std::int64_t>, CursorError>
+    decode(std::string_view token, std::string_view fp) {
+        auto cur = decode_devices_cursor(token, fp);
+        if (!cur)
+            return std::unexpected(cur.error());
+        return std::pair{std::move(cur->after), cur->skip};
+    }
+    static std::string encode(const Anchor& a, std::int64_t skip, std::string_view fp) {
+        return encode_devices_cursor({a, skip}, fp);
+    }
+    static Anchor key_of(const Row& r) { return {r.entry.name, r.agent_id, r.install_id}; }
+    static bool is_head(const Anchor& a) {
+        return a.name.empty() && a.agent_id.empty() && a.install_id == 0;
+    }
+};
 
 // ── KPIs ─────────────────────────────────────────────────────────────────────
 
@@ -298,8 +321,11 @@ using DevicesReader =
 /// The production binding of DevicesReader (same lifetime rule as catalogue_reads()).
 [[nodiscard]] DevicesReader devices_reader(SoftwareInventoryStore& store);
 
-struct DevicesPage {
-    std::vector<SoftwareFleetRow> rows;
+/// One keyset page of any scope-confined per-agent row list (the raw installs route, the
+/// components route). `Row` needs an `agent_id` member.
+template <class Row>
+struct ScopedPage {
+    std::vector<Row> rows;
     /// Non-empty iff more rows may exist: the read hit the limit (push-down/TOP) or, on the wide
     /// path, the last read was full, the page filled early, or the read bound was reached.
     std::string next_cursor;
@@ -310,9 +336,21 @@ struct DevicesPage {
     /// returns nothing and devices_omitted stays 0; the transports still audit it as a denial.
     bool target_denied{false};
 };
+using DevicesPage = ScopedPage<SoftwareFleetRow>;
 
-/// One raw per-install page: decode the cursor (bound to the filter set, never to the scope),
-/// push the caller's scope into the query, read, then post-filter. The scope: TOP -> unfiltered;
+/// The cursor/key policy `read_scoped_page` is instantiated with. A `Ops` names:
+///   Row, Query (agent_id, agent_ids, limit, after, skip members), Anchor (the type of
+///   Query::after's value, the keyset position);
+///   static decode(token, fp) -> expected<pair<Anchor, skip>, CursorError>;
+///   static encode(anchor, skip, fp) -> string;  static key_of(row) -> Anchor;
+///   static is_head(anchor) -> bool  (the "from the start" anchor a head cursor decodes to).
+/// `fp` is the filter fingerprint the cursor is bound to (computed by the caller: never the scope).
+template <class Ops>
+using ScopedReader = std::function<std::optional<std::vector<typename Ops::Row>>(
+    const typename Ops::Query&)>;
+
+/// One scoped keyset page: decode the cursor (bound to the filter set, never to the scope), push
+/// the caller's scope into the query, read, then post-filter. The scope: TOP -> unfiltered;
 /// engaged-empty -> agent_ids = {} (the store returns empty without SQL); engaged and
 /// <= kScopePushdownMaxIds -> agent_ids = the set (complete pages, nothing hidden; one read, the
 /// cursor is the last row); larger -> the rows are filtered here with authz::in_scope and
@@ -322,12 +360,104 @@ struct DevicesPage {
 /// since (the page can be empty with a non-empty cursor): no byte of a dropped row reaches the
 /// caller. Error: nullopt = degraded (a read returned nullopt); a CursorError = the cursor was
 /// refused.
+template <class Ops>
+[[nodiscard]] std::expected<ScopedPage<typename Ops::Row>, std::optional<CursorError>>
+read_scoped_page(const ScopedReader<Ops>& read, typename Ops::Query q, const std::string& cursor,
+                 const std::string& fp, const authz::VisibleSet& scope) {
+    using Anchor = typename Ops::Anchor;
+    Anchor incoming_after{}; // the head: nothing served yet
+    std::int64_t incoming_skip = 0;
+    if (!cursor.empty()) {
+        auto cur = Ops::decode(cursor, fp);
+        if (!cur)
+            return std::unexpected(cur.error());
+        incoming_after = std::move(cur->first);
+        incoming_skip = cur->second;
+    }
+    // The head anchor is "from the start", whatever key the store hands out.
+    if (!Ops::is_head(incoming_after))
+        q.after = incoming_after;
+    ScopedPage<typename Ops::Row> out;
+    out.target_denied = !q.agent_id.empty() && !authz::in_scope(scope, q.agent_id);
+    // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
+    // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
+    const bool filter = scope && scope->size() > kScopePushdownMaxIds;
+    if (scope && !filter)
+        q.agent_ids.emplace(scope->begin(), scope->end());
+    if (!filter) {
+        // Every returned row is in scope, so the last one is a safe cursor. A skip is only ever
+        // minted by the wide path below; it has no meaning here and is ignored.
+        auto rows = read(q);
+        if (!rows)
+            return std::unexpected(std::nullopt);
+        out.hit_cap = !rows->empty() && rows->size() == static_cast<std::size_t>(q.limit);
+        if (out.hit_cap)
+            out.next_cursor = Ops::encode(Ops::key_of(rows->back()), 0, fp);
+        out.rows = std::move(*rows);
+        return out;
+    }
+
+    // Wide scope: post-filter, refilling the page with at most kWideScopeMaxReads bounded reads.
+    const auto limit = static_cast<std::size_t>(q.limit);
+    q.skip = incoming_skip;
+    std::int64_t since_anchor = incoming_skip;
+    std::unordered_set<std::string> dropped;
+    bool more = false;
+    out.rows.reserve(limit);
+    for (int reads = 1;; ++reads) {
+        auto rows = read(q);
+        if (!rows)
+            return std::unexpected(std::nullopt);
+        const bool full = !rows->empty() && rows->size() == limit;
+        Anchor last_scanned{};
+        if (full && reads < kWideScopeMaxReads)
+            last_scanned = Ops::key_of(rows->back());
+        std::size_t i = 0;
+        for (; i < rows->size() && out.rows.size() < limit; ++i) {
+            auto& r = (*rows)[i];
+            if (authz::in_scope(scope, r.agent_id)) {
+                out.rows.push_back(std::move(r));
+                since_anchor = 0;
+            } else {
+                dropped.insert(r.agent_id); // each DISTINCT device counts once
+                ++since_anchor;
+            }
+        }
+        if (out.rows.size() >= limit) { // page filled: rows may remain here or beyond
+            more = i < rows->size() || full;
+            break;
+        }
+        if (!full) // a short read is the end of the data
+            break;
+        if (reads >= kWideScopeMaxReads) { // bound reached: say there may be more
+            more = true;
+            break;
+        }
+        q.after = std::move(last_scanned);
+        q.skip = 0;
+    }
+    out.devices_omitted = static_cast<std::int64_t>(dropped.size());
+    out.hit_cap = more;
+    if (more)
+        out.next_cursor = Ops::encode(
+            out.rows.empty() ? incoming_after : Ops::key_of(out.rows.back()), since_anchor, fp);
+    return out;
+}
+
+/// One raw per-install page (`read_scoped_page` over SoftwareFleetRow, cursor `d2:`). Error as
+/// read_scoped_page.
 [[nodiscard]] std::expected<DevicesPage, std::optional<CursorError>>
 read_devices_page(const DevicesReader& read, const DevicesRequest& rq, const authz::VisibleSet& scope);
 
 /// The audit `denied` detail for a page that dropped devices or refused the named `agent_id`,
-/// or empty when nothing was denied. One builder for both transports, so the two audit rows
-/// cannot drift; each appends its own correlation suffix.
-[[nodiscard]] std::string denied_detail(const DevicesPage& page);
+/// or empty when nothing was denied. One builder for every transport and both row lists, so the
+/// audit rows cannot drift; each appends its own correlation suffix.
+template <class Row>
+[[nodiscard]] std::string denied_detail(const ScopedPage<Row>& page) {
+    if (page.devices_omitted > 0)
+        return "scope: filtered " + std::to_string(page.devices_omitted) +
+               " out-of-scope device(s) (management-group and/or service-tag axis)";
+    return page.target_denied ? "scope: agent_id outside the caller's scope" : std::string{};
+}
 
 } // namespace yuzu::server::software_catalogue

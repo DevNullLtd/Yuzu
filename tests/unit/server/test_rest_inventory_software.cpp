@@ -36,6 +36,7 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
+#include "device_api.hpp"
 #include "device_ci_kinds.hpp"
 #include "hardware_list_model.hpp"
 #include "openapi_spec_access.hpp"
@@ -46,6 +47,7 @@
 #include "rbac_store.hpp"
 #include "software_catalogue_model.hpp"
 #include "software_inventory_store.hpp"
+#include "software_list_model.hpp"
 #include "tag_store.hpp"
 #include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
 #include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
@@ -66,6 +68,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <expected>
 #include <functional>
 #include <map>
 #include <memory>
@@ -105,6 +108,17 @@ yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
         throw std::runtime_error("swinv template: store failed to migrate");
 }};
 
+// The hostname source the lookup rows read (one roster read per page).
+class FakeDeviceApi : public DeviceApi {
+public:
+    std::vector<DeviceListRow> rows;
+    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
+    [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
+    lookup_device(const std::string&) const override {
+        return std::optional<DeviceDetail>{std::nullopt};
+    }
+};
+
 struct AuditRecord {
     std::string action;
     std::string result;
@@ -143,6 +157,7 @@ struct InvHarness {
     std::vector<AuditRecord> audit_log;
 
     yuzu::MetricsRegistry metrics;
+    std::shared_ptr<FakeDeviceApi> device_api = std::make_shared<FakeDeviceApi>();
     RestApiV1 api;
 
     explicit InvHarness(SoftwareInventoryStore* store, bool wire_fleet_read_fn = true) {
@@ -201,7 +216,9 @@ struct InvHarness {
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
-                            /*list_read_fn=*/{}, std::move(fleet_read_fn));
+                            /*list_read_fn=*/{}, std::move(fleet_read_fn),
+                            /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{},
+                            device_api, /*dex_api=*/{});
     }
 
     bool has_audit(const std::string& result) const {
@@ -1421,7 +1438,7 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     CHECK(csv->status == 200);
     CHECK(csv->get_header_value("Content-Type").find("text/csv") == 0);
     CHECK(csv->get_header_value("Content-Disposition").find("software-installs.csv") != std::string::npos);
-    CHECK(csv->body.starts_with(std::string(software_catalogue::kInstallsCsvHeader) + "\n"));
+    CHECK(csv->body.starts_with(std::string(software_list::kListCsvHeader) + "\n")); // 22 columns
     CHECK(csv->get_header_value("X-Result-Truncated-By-Cap").empty());
 
     // An uncapped export carries neither the continuation header nor the trailer.
@@ -1432,7 +1449,8 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     REQUIRE(cut);
     CHECK(cut->get_header_value("X-Result-Truncated-By-Cap") == "true");
     CHECK(std::ranges::count(cut->body, '\n') == 4); // header + 2 rows + the trailer record
-    CHECK(cut->body.ends_with("# result_truncated_by_cap cause=row_cap" + std::string(13, ',') +
+    CHECK(cut->body.ends_with("# result_truncated_by_cap cause=row_cap" +
+                              std::string(software_list::kListCsvColumns - 1, ',') +
                               "\r\n"));
     // The continuation is in X-Next-Cursor: feeding it back reads on, with no overlap.
     const auto next_cursor = cut->get_header_value("X-Next-Cursor");
@@ -1626,4 +1644,324 @@ TEST_CASE("REST inventory/software: success audit target equals audit_target(que
     q.agent_id = "dev-a";
     q.q = "A";
     CHECK(h.audit_log.back().target_id == software_catalogue::audit_target(q));
+}
+
+// ── SAM-17 lookup: status, hostname, match, version range, totals ────────────
+
+namespace {
+
+constexpr const char* kLookupFacet = "pkg_inventory.packages";
+
+SoftwareEntry lookup_entry(const std::string& name, const std::string& version,
+                           const std::string& arch = "") {
+    SoftwareEntry e;
+    e.name = name;
+    e.version = version;
+    e.arch = arch;
+    e.kind = "package";
+    e.ecosystem = "deb";
+    e.source = kLookupFacet;
+    return e;
+}
+
+// One agent's section through the v3 apply path (the only path that records facet state).
+void seed_v3(SoftwareInventoryStore& store, const std::string& agent, V3Status status,
+             std::vector<SoftwareEntry> rows = {}) {
+    V3Section s;
+    s.facet = kLookupFacet;
+    s.status = status;
+    s.rows = std::move(rows);
+    s.duration_ms = 1;
+    s.bytes_read = 1;
+    V3Report rep;
+    rep.sections.push_back(std::move(s));
+    const auto out = store.apply_installed_software_v3(agent, std::move(rep));
+    REQUIRE(out.size() == 1);
+    REQUIRE((out[0].outcome == V3SectionOutcome::kStored ||
+             out[0].outcome == V3SectionOutcome::kStatusOnly));
+}
+
+nlohmann::json get_lookup(InvHarness& h, const std::string& query, int expect = 200) {
+    auto res = h.sink.Get("/api/v1/inventory/software" + query);
+    REQUIRE(res);
+    CHECK(res->status == expect);
+    return nlohmann::json::parse(res->body, nullptr, false);
+}
+
+} // namespace
+
+TEST_CASE("REST inventory/software: the lookup row schema is typed in the OpenAPI spec and matches the serialiser",
+          "[rest][inventory_software]") {
+    InvHarness h{/*store=*/nullptr};
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    auto spec = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& schemas = spec["components"]["schemas"];
+    REQUIRE(schemas.contains("InstalledSoftwareLookupRow"));
+    const auto& extra = schemas["InstalledSoftwareLookupRow"]["allOf"][1];
+    std::set<std::string> properties;
+    for (const auto& [k, v] : extra["properties"].items())
+        properties.insert(k);
+    // The lookup keys are exactly those list_row_json adds to device_row_json.
+    std::set<std::string> added;
+    const auto base = software_catalogue::device_row_json(SoftwareFleetRow{});
+    for (const auto& [k, v] : software_list::list_row_json(SoftwareFleetRow{}, {}).items())
+        if (!base.contains(k))
+            added.insert(k);
+    CHECK(properties == added);
+    CHECK(added.size() == 8);
+    // The page carries the totals block and its omission reason.
+    const auto& data = schemas["InstalledSoftwarePage"]["properties"]["data"];
+    CHECK(data["properties"]["totals"]["nullable"] == true);
+    CHECK(data["properties"]["totals_omitted"]["enum"] ==
+          nlohmann::json::array({"scope", "filters", "building"}));
+    CHECK(schemas["InstalledSoftwarePage"]["properties"]["data"]["properties"]["software"]["items"]
+                 ["$ref"] == "#/components/schemas/InstalledSoftwareLookupRow");
+    // The new query parameters are discoverable.
+    std::set<std::string> params;
+    for (const auto& p : spec["paths"]["/inventory/software"]["get"]["parameters"])
+        params.insert(p["name"].get<std::string>());
+    for (const char* k : {"match", "version_min", "version_max", "status"})
+        CHECK(params.contains(k));
+}
+
+TEST_CASE("REST inventory/software: lookup rows carry hostname, last_seen, status and install fields",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_v3(store, "dev-a", V3Status::kFull, {lookup_entry("git", "2.1", "amd64")});
+    InvHarness h{&store};
+    h.device_api->rows.push_back(DeviceListRow{.agent_id = "dev-a", .hostname = "host-a"});
+
+    const auto body = get_lookup(h, "?name=git");
+    const auto& rows = body.at("data").at("software");
+    REQUIRE(rows.size() == 1);
+    const auto& r = rows[0];
+    CHECK(r["hostname"] == "host-a");
+    CHECK(r["last_seen"].is_number());
+    CHECK(r["status"] == "current");
+    CHECK(r["last_confirmed_at"].is_number());
+    CHECK(r["install_type"] == "package_manager");
+    CHECK(r["install_scope"] == "machine");
+    CHECK(r.contains("install_location"));
+    CHECK(r["instance_key"].get<std::string>().size() == 64);
+    // The original 14 fields are unchanged.
+    CHECK(r["name"] == "git");
+    CHECK(r["version"] == "2.1");
+    CHECK(r["source"] == kLookupFacet);
+}
+
+TEST_CASE("REST inventory/software: status is current/unconfirmed/disabled and status= filters; totals say filters",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_v3(store, "dev-ok", V3Status::kFull, {lookup_entry("git", "2.1")});
+    seed_v3(store, "dev-slow", V3Status::kFull, {lookup_entry("git", "2.1")});
+    seed_v3(store, "dev-off", V3Status::kFull, {lookup_entry("git", "2.1")});
+    seed_v3(store, "dev-slow", V3Status::kTimeout); // rows stay, the facet is no longer confirmed
+    seed_v3(store, "dev-off", V3Status::kDisabled);
+    seed(store, "dev-v2", {{"git", "2.1", "", ""}}); // a v2 row: no facet record at all
+
+    InvHarness h{&store};
+    const auto all = get_lookup(h, "?name=git");
+    std::map<std::string, std::string> status;
+    for (const auto& r : all.at("data").at("software"))
+        status[r["agent_id"].get<std::string>()] = r["status"].get<std::string>();
+    CHECK(status.size() == 4); // the default filter drops nothing
+    CHECK(status["dev-ok"] == "current");
+    CHECK(status["dev-slow"] == "unconfirmed");
+    CHECK(status["dev-off"] == "disabled");
+    CHECK(status["dev-v2"] == "unconfirmed"); // a missing facet record is unconfirmed
+
+    for (const auto& [filter, expect] :
+         std::vector<std::pair<std::string, std::string>>{{"current", "dev-ok"},
+                                                          {"disabled", "dev-off"}}) {
+        CAPTURE(filter);
+        const auto body = get_lookup(h, "?name=git&status=" + filter);
+        REQUIRE(body.at("data").at("software").size() == 1);
+        CHECK(body.at("data").at("software")[0]["agent_id"] == expect);
+        CHECK(body.at("data").at("totals_omitted") == "filters");
+    }
+    const auto unconfirmed = get_lookup(h, "?name=git&status=unconfirmed");
+    CHECK(unconfirmed.at("data").at("software").size() == 2);
+}
+
+TEST_CASE("REST inventory/software: match=prefix and contains filter; exact is unchanged; totals say filters",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"git", "1", "", ""}, {"gitk", "1", "", ""}, {"libgit2", "1", "", ""},
+                          {"g_t%", "1", "", ""}});
+    InvHarness h{&store};
+    auto names = [&](const std::string& query) {
+        std::set<std::string> out;
+        const auto body = get_lookup(h, query);
+        for (const auto& r : body.at("data").at("software"))
+            out.insert(r["name"].get<std::string>());
+        return out;
+    };
+    CHECK(names("?name=git") == std::set<std::string>{"git"});
+    CHECK(names("?name=git&match=exact") == std::set<std::string>{"git"});
+    CHECK(names("?name=git&match=prefix") == std::set<std::string>{"git", "gitk"});
+    CHECK(names("?name=GIT&match=contains") == std::set<std::string>{"git", "gitk", "libgit2"});
+    // LIKE metacharacters in the term are literal.
+    CHECK(names("?name=g_t&match=prefix") == std::set<std::string>{"g_t%"});
+    CHECK(names("?name=%25&match=contains") == std::set<std::string>{"g_t%"});
+    CHECK(get_lookup(h, "?name=git&match=prefix").at("data").at("totals_omitted") == "filters");
+    CHECK(get_lookup(h, "?name=git&match=regex", 400).contains("error"));
+}
+
+TEST_CASE("REST inventory/software: version_min/version_max resolve through the title's versions; building before the first refresh",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"git", "1.9", "", ""}});
+    seed(store, "dev-b", {{"git", "1.10", "", ""}});
+    seed(store, "dev-c", {{"git", "2.0-rc1", "", ""}});
+    seed(store, "dev-d", {{"git", "2.0", "", ""}});
+    InvHarness h{&store};
+
+    // No catalogue refresh yet: a range cannot be resolved, so it is a retryable 503.
+    auto early = h.sink.Get("/api/v1/inventory/software?name=git&version_min=1.9");
+    REQUIRE(early);
+    CHECK(early->status == 503);
+
+    REQUIRE(store.refresh_catalog_rollup());
+    auto agents = [&](const std::string& query) {
+        std::set<std::string> out;
+        const auto body = get_lookup(h, query);
+        for (const auto& r : body.at("data").at("software"))
+            out.insert(r["agent_id"].get<std::string>());
+        return out;
+    };
+    // 1.9 < 1.10 (numeric), 2.0-rc1 < 2.0; bounds are inclusive.
+    CHECK(agents("?name=git&version_min=1.9&version_max=2.0-rc1") ==
+          std::set<std::string>{"dev-a", "dev-b", "dev-c"});
+    CHECK(agents("?name=git&version_min=2.0") == std::set<std::string>{"dev-d"});
+    CHECK(agents("?name=git&version_max=1.9") == std::set<std::string>{"dev-a"});
+    CHECK(agents("?name=git&version_min=5") == std::set<std::string>{}); // an empty range is empty, not an error
+    CHECK(get_lookup(h, "?version_min=1.0", 400).contains("error"));
+    CHECK(get_lookup(h, "?name=git&match=prefix&version_max=1.0", 400).contains("error"));
+}
+
+TEST_CASE("REST inventory/software: totals - exact name, global admission; install rows vs distinct devices",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // dev-a holds the title twice on one version (two architectures) and again on another version.
+    seed_v3(store, "dev-a", V3Status::kFull,
+            {lookup_entry("git", "1.9", "amd64"), lookup_entry("git", "1.9", "arm64"),
+             lookup_entry("git", "1.10", "amd64")});
+    seed_v3(store, "dev-b", V3Status::kFull, {lookup_entry("git", "1.10", "amd64")});
+    seed_v3(store, "dev-c", V3Status::kFull, {lookup_entry("git", "3.0", "amd64")});
+    InvHarness h{&store};
+
+    // Before the first catalogue refresh a rollup-served total is not available: building.
+    const auto early = get_lookup(h, "?name=git");
+    CHECK(early.at("data").at("totals").is_null());
+    CHECK(early.at("data").at("totals_omitted") == "building");
+
+    REQUIRE(store.refresh_catalog_rollup());
+    const auto whole = get_lookup(h, "?name=git").at("data");
+    REQUIRE(whole.at("totals").is_object());
+    CHECK(whole.at("totals").at("installs") == 5);  // install ROWS
+    CHECK(whole.at("totals").at("devices") == 3);   // distinct devices
+    CHECK(whole.at("totals").at("as_of").is_number());
+    CHECK_FALSE(whole.contains("totals_omitted"));
+
+    // One exact version: live and exact (the same definitions).
+    const auto one = get_lookup(h, "?name=git&version=1.9").at("data");
+    CHECK(one.at("totals").at("installs") == 2);
+    CHECK(one.at("totals").at("devices") == 1);
+    CHECK(one.at("totals").at("as_of").is_null());
+
+    // A range over two versions: dev-a is on both and counts ONCE as a device.
+    const auto range = get_lookup(h, "?name=git&version_min=1.9&version_max=1.10").at("data");
+    CHECK(range.at("totals").at("installs") == 4);
+    CHECK(range.at("totals").at("devices") == 2);
+
+    // Any other filter: no totals, and the reason says so.
+    for (const char* q : {"?name=git&agent_id=dev-a", "?name=git&q=gi", "?name=git&ecosystem=deb"}) {
+        CAPTURE(q);
+        const auto body = get_lookup(h, q).at("data");
+        CHECK(body.at("totals").is_null());
+        CHECK(body.at("totals_omitted") == "filters");
+    }
+    // A request with no name at all is not a lookup.
+    CHECK(get_lookup(h, "").at("data").at("totals_omitted") == "filters");
+}
+
+TEST_CASE("REST inventory/software: a confined caller gets scoped rows and NO totals",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_v3(store, "dev-in", V3Status::kFull, {lookup_entry("git", "1.0")});
+    seed_v3(store, "dev-out", V3Status::kFull, {lookup_entry("git", "1.0")});
+    seed_v3(store, "dev-out2", V3Status::kFull, {lookup_entry("git", "1.0")});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    InvHarness h{&store};
+    h.fleet_scope = std::unordered_set<std::string>{"dev-in"};
+    for (const char* q : {"?name=git", "?name=git&version=1.0", "?name=git&version_min=0.1"}) {
+        CAPTURE(q);
+        const auto body = get_lookup(h, q).at("data");
+        REQUIRE(body.at("software").size() == 1);
+        CHECK(body.at("software")[0]["agent_id"] == "dev-in");
+        CHECK(body.at("totals").is_null());
+        CHECK(body.at("totals_omitted") == "scope");
+        // No fleet figure (3 installs / 3 devices) reaches a confined caller in any form.
+        CHECK(body.dump().find("dev-out") == std::string::npos);
+    }
+    h.fleet_scope.reset(); // the same request, unfiltered
+    const auto global = get_lookup(h, "?name=git").at("data");
+    CHECK(global.at("totals").at("devices") == 3);
+}
+
+TEST_CASE("REST inventory/software: a degraded totals read alone is a 503 with retry_after_ms",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"git", "1.0", "", ""}});
+    REQUIRE(store.refresh_catalog_rollup());
+    { // The page read does not touch catalog_rollup's row_count; the title-totals read does.
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.catalog_rollup RENAME COLUMN row_count TO rc_gone",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    InvHarness h{&store};
+    auto res = h.sink.Get("/api/v1/inventory/software?name=git");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body.contains("error"));
+    CHECK_FALSE(body.contains("data"));
+    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    CHECK(h.has_audit("failure"));
 }

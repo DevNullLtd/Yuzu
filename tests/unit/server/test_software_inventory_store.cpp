@@ -17,6 +17,7 @@
 #include "purl_compose.hpp"
 #include "software_catalog_rules.hpp"
 #include "software_inventory_store.hpp"
+#include "software_list_model.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -36,6 +37,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -116,7 +118,8 @@ void swinv_reset() {
         "software_inventory_store.version_rollup, software_inventory_store.catalog_rollup_meta, "
         "software_inventory_store.title_triples, software_inventory_store.software_facet_state, "
         "software_inventory_store.software_changes, software_inventory_store.software_components, "
-        "software_inventory_store.retention_meta "
+        "software_inventory_store.retention_meta, software_inventory_store.component_rollup, "
+        "software_inventory_store.component_rollup_meta "
         "RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
@@ -127,6 +130,12 @@ void swinv_reset() {
                         "ON CONFLICT (id) DO NOTHING",
                         std::vector<std::string>{});
     REQUIRE(seed.status() == PGRES_COMMAND_OK);
+    auto comp_seed = pg::exec_params(
+        lease.get(),
+        "INSERT INTO software_inventory_store.component_rollup_meta (id, refreshed_at) "
+        "VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
+        std::vector<std::string>{});
+    REQUIRE(comp_seed.status() == PGRES_COMMAND_OK);
 }
 
 // Preamble for a convertible test: same skip contract as YUZU_REQUIRE_PG_DB_TPL,
@@ -6849,4 +6858,391 @@ TEST_CASE("ingest_inventory_report: the v2 path is unchanged beside v3",
     CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.installed_software "
                          "WHERE agent_id = 'agent-v2' AND install_location <> ''")[0][0] == "0");
     CHECK(row_count(pool, "agent-v2") == "2");
+}
+
+// ── SAM-17: lookup read surface (migration v12, components rollup, totals, status) ──────────────
+
+namespace {
+
+using yuzu::server::kCatalogRowCap;
+using yuzu::server::kRowStatusCaseSql;
+using yuzu::server::NameMatch;
+using yuzu::server::SoftwareComponentCursor;
+using yuzu::server::SoftwareComponentQuery;
+using yuzu::server::SoftwareFleetQuery;
+
+// A component-inventory full section for one agent, through the v3 apply path.
+void apply_components(SoftwareInventoryStore& store, const std::string& agent,
+                      std::vector<V3Component> rows) {
+    const auto out = store.apply_installed_software_v3(agent, v3_report({comp_full(std::move(rows))}));
+    REQUIRE(out.size() == 1);
+    REQUIRE(out[0].outcome == V3SectionOutcome::kStored);
+}
+
+} // namespace
+
+TEST_CASE("v12: the lookup objects exist and the meta singleton is seeded building",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    CHECK(sql_rows(pool,
+                   "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                   "'software_inventory_store' AND table_name = 'catalog_rollup' AND column_name "
+                   "= 'row_count'")[0][0] == "1");
+    CHECK(sql_rows(pool, "SELECT count(*) FROM information_schema.tables WHERE table_schema = "
+                         "'software_inventory_store' AND table_name IN ('component_rollup', "
+                         "'component_rollup_meta')")[0][0] == "2");
+    CHECK(sql_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = "
+                         "'software_inventory_store' AND indexname = "
+                         "'software_components_name_idx'")[0][0] == "1");
+    const auto meta = store.component_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at == 0); // never computed: "building"
+    CHECK(meta->total_components == 0);
+}
+
+TEST_CASE("refresh_component_rollup: grain 0 and 1 counts are exact, devices_unconfirmed counts non-current facets",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    // dev-a: two rows of libfoo 1.0 (two paths) and one of libfoo 2.0; facet full (current).
+    apply_components(store, "dev-a",
+                     {comp("libfoo", "/a1", "1.0"), comp("libfoo", "/a2", "1.0"),
+                      comp("libfoo", "/a3", "2.0")});
+    // dev-b: one row; the facet then goes constrained (rows stay, no longer confirmed).
+    apply_components(store, "dev-b", {comp("libfoo", "/b", "1.0")});
+    REQUIRE(store.apply_installed_software_v3("dev-b", v3_report({v3_status(kV3Comp, V3Status::kConstrained)}))
+                .at(0).outcome == V3SectionOutcome::kStatusOnly);
+    // dev-c: a row with NO facet state record at all (a hand-made row): unconfirmed.
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.software_components (agent_id, kind, "
+                   "path_hash, path, name, version, row_hash, first_seen) VALUES ('dev-c', 'jar', "
+                   "'ph', '/c', 'libfoo', '1.0', 'rh', 1)"));
+
+    REQUIRE(store.refresh_component_rollup());
+    const auto meta = store.component_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at > 0);
+    CHECK(meta->total_components == 1); // (jar, libfoo)
+    CHECK(meta->total_devices == 3);
+
+    const auto grain1 = sql_rows(pool,
+                                 "SELECT instances, devices, devices_unconfirmed FROM "
+                                 "software_inventory_store.component_rollup WHERE grain = 1");
+    REQUIRE(grain1.size() == 1);
+    CHECK(grain1[0] == std::vector<std::string>{"5", "3", "2"});
+    const auto grain0 = sql_rows(pool,
+                                 "SELECT version, instances, devices, devices_unconfirmed FROM "
+                                 "software_inventory_store.component_rollup WHERE grain = 0 "
+                                 "ORDER BY version");
+    REQUIRE(grain0.size() == 2);
+    CHECK(grain0[0] == std::vector<std::string>{"1.0", "4", "3", "2"});
+    CHECK(grain0[1] == std::vector<std::string>{"2.0", "1", "1", "0"});
+
+    // component_totals without versions IS the grain-1 row; a version set is a live aggregate.
+    bool from_rollup = false;
+    const auto t = store.component_totals("jar", "libfoo", std::nullopt, &from_rollup);
+    REQUIRE(t.has_value());
+    CHECK(from_rollup);
+    CHECK(t->installs == 5);
+    CHECK(t->devices == 3);
+    CHECK(t->devices_unconfirmed == 2);
+    // dev-a holds BOTH versions: it counts once in the distinct-device figure.
+    const auto live = store.component_totals(
+        "jar", "libfoo", std::vector<std::string>{"1.0", "2.0"}, &from_rollup);
+    REQUIRE(live.has_value());
+    CHECK_FALSE(from_rollup);
+    CHECK(live->installs == 5);
+    CHECK(live->devices == 3);
+    const auto only_two = store.component_totals("jar", "libfoo", std::vector<std::string>{"2.0"},
+                                                 &from_rollup);
+    REQUIRE(only_two.has_value());
+    CHECK(only_two->installs == 1);
+    CHECK(only_two->devices == 1);
+    // No kind: live across kinds (distinct devices are not additive), still exact.
+    const auto any_kind = store.component_totals("", "libfoo", std::nullopt, &from_rollup);
+    REQUIRE(any_kind.has_value());
+    CHECK_FALSE(from_rollup);
+    CHECK(any_kind->devices == 3);
+    // An unknown component is a genuine zero, not a degrade.
+    const auto none = store.component_totals("jar", "nothing", std::nullopt, &from_rollup);
+    REQUIRE(none.has_value());
+    CHECK(none->installs == 0);
+}
+
+TEST_CASE("refresh_component_rollup: a cancelled refresh keeps the last-good rollup and stamp",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    apply_components(store, "dev-a", {comp("libfoo", "/a", "1.0")});
+    REQUIRE(store.refresh_component_rollup());
+    const auto good = store.component_rollup_meta();
+    REQUIRE(good.has_value());
+    REQUIRE(good->refreshed_at > 0);
+
+    apply_components(store, "dev-b", {comp("libbar", "/b", "1.0")}); // not in the rollup yet
+    CHECK_FALSE(store.refresh_component_rollup([] { return true; })); // cancelled before it starts
+    const auto after = store.component_rollup_meta();
+    REQUIRE(after.has_value());
+    CHECK(after->refreshed_at == good->refreshed_at);
+    CHECK(after->total_components == 1);
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup WHERE "
+                         "grain = 1")[0][0] == "1");
+    // An idempotent re-run picks the new data up.
+    REQUIRE(store.refresh_component_rollup());
+    CHECK(store.component_rollup_meta()->total_components == 2);
+}
+
+TEST_CASE("query_components: keyset order, scope push-down, prefix and contains escape LIKE metacharacters",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    apply_components(store, "dev-b", {comp("libfoo", "/b1", "1.0"), comp("libfoo", "/b2", "1.0")});
+    apply_components(store, "dev-a", {comp("libfoo", "/a", "1.0"), comp("lib_fo", "/x", "1.0"),
+                                      comp("libXfo", "/y", "1.0")});
+    apply_components(store, "dev-c", {comp("zlib", "/c", "1.0")});
+
+    SoftwareComponentQuery q;
+    q.limit = 100;
+    auto all = store.query_components(q);
+    REQUIRE(all.has_value());
+    REQUIRE(all->size() == 6);
+    // Ordered (name, agent_id, kind, path_hash).
+    for (std::size_t i = 1; i < all->size(); ++i) {
+        const auto& a = (*all)[i - 1];
+        const auto& b = (*all)[i];
+        CHECK(std::tie(a.name, a.agent_id, a.kind, a.path_hash) <
+              std::tie(b.name, b.agent_id, b.kind, b.path_hash));
+    }
+
+    // Keyset paging: pages of 3 cover every row exactly once.
+    std::vector<std::string> walked;
+    q.limit = 3;
+    for (int guard = 0; guard < 10; ++guard) {
+        auto page = store.query_components(q);
+        REQUIRE(page.has_value());
+        if (page->empty())
+            break;
+        for (const auto& r : *page)
+            walked.push_back(r.agent_id + r.path);
+        const auto& last = page->back();
+        q.after = SoftwareComponentCursor{last.name, last.agent_id, last.kind, last.path_hash};
+    }
+    CHECK(walked.size() == 6);
+    CHECK(std::set<std::string>(walked.begin(), walked.end()).size() == 6);
+    q.after.reset();
+    q.limit = 100;
+
+    // Scope push-down: only the listed agents; present-empty is deny-all with no SQL.
+    q.agent_ids = std::vector<std::string>{"dev-a", "dev-c"};
+    CHECK(store.query_components(q)->size() == 4);
+    q.agent_ids = std::vector<std::string>{};
+    REQUIRE(store.query_components(q).has_value());
+    CHECK(store.query_components(q)->empty());
+    q.agent_ids.reset();
+
+    // exact / prefix / contains; `_` and `%` are literal.
+    q.name = "libfoo";
+    CHECK(store.query_components(q)->size() == 3);
+    q.name = "lib_f";
+    q.match = NameMatch::kPrefix;
+    CHECK(store.query_components(q)->size() == 1); // only lib_fo, not libfoo / libXfo
+    q.name = "lib";
+    CHECK(store.query_components(q)->size() == 5); // libfoo x3, lib_fo, libXfo; not zlib
+    q.name = "LIBFO";
+    q.match = NameMatch::kContains;
+    CHECK(store.query_components(q)->size() == 3);
+    q.name = "%";
+    CHECK(store.query_components(q)->empty());
+    q.name.clear();
+    q.match = NameMatch::kExact;
+    // A present-empty version set selects nothing; a set selects its members.
+    q.versions = std::vector<std::string>{};
+    CHECK(store.query_components(q)->empty());
+    q.versions = std::vector<std::string>{"1.0"};
+    CHECK(store.query_components(q)->size() == 6);
+    q.versions = std::vector<std::string>{"9.9"};
+    CHECK(store.query_components(q)->empty());
+}
+
+TEST_CASE("query_components: the name-driven plan reaches software_components_name_idx",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    apply_components(store, "dev-a", {comp("libfoo", "/a", "1.0")});
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    const std::vector<std::string> none;
+    struct RollbackGuard {
+        PGconn* conn;
+        ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+    };
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+    const RollbackGuard rollback{lease.get()};
+    REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
+            PGRES_COMMAND_OK);
+    auto plan_of = [&](const std::string& sql, const std::vector<std::string>& params) {
+        pg::PgResult plan =
+            pg::exec_params(lease.get(), ("EXPLAIN (COSTS OFF) " + sql).c_str(), params);
+        REQUIRE(plan.status() == PGRES_TUPLES_OK);
+        std::string text;
+        for (int i = 0; i < PQntuples(plan.get()); ++i)
+            text += std::string(PQgetvalue(plan.get(), i, 0)) + "\n";
+        return text;
+    };
+    const std::string base =
+        "SELECT c.agent_id FROM software_inventory_store.software_components c WHERE c.name ";
+    const std::string order = " ORDER BY c.name, c.agent_id, c.kind, c.path_hash LIMIT 10";
+    CHECK(plan_of(base + "= $1" + order, {"libfoo"}).find("software_components_name_idx") !=
+          std::string::npos);
+    // A LIKE prefix can use a default-opclass btree only where the database collation is C; on any
+    // other collation it is a (limited) filtered scan, which is the documented ceiling.
+    const auto coll = sql_rows(pool, "SELECT datcollate FROM pg_database WHERE datname = "
+                                     "current_database()")[0][0];
+    if (coll == "C" || coll == "POSIX")
+        CHECK(plan_of(base + "LIKE $1 ESCAPE '\\'" + order, {"lib%"})
+                  .find("software_components_name_idx") != std::string::npos);
+}
+
+TEST_CASE("component_versions: distinct versions of one component, capped at kCatalogRowCap",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.component_rollup (kind, name, version, "
+                   "grain, instances, devices) SELECT 'jar', 'libfoo', 'v' || g, 0, 1, 1 FROM "
+                   "generate_series(1, 2100) g"));
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.component_rollup (kind, name, version, "
+                   "grain, instances, devices) VALUES ('jar', 'libfoo', '', 1, 2100, 1), "
+                   "('so', 'libfoo', 'v1', 0, 1, 1), ('jar', 'other', 'x', 0, 1, 1)"));
+    const auto capped = store.component_versions("jar", "libfoo");
+    REQUIRE(capped.has_value());
+    CHECK(capped->size() == static_cast<std::size_t>(kCatalogRowCap)); // never more
+    // Another kind and another component are separate; an empty kind spans kinds (distinct).
+    REQUIRE(store.component_versions("so", "libfoo").has_value());
+    CHECK(store.component_versions("so", "libfoo")->size() == 1);
+    CHECK(store.component_versions("jar", "other")->size() == 1);
+    CHECK(store.component_versions("jar", "").value().empty()); // no name: empty value
+}
+
+TEST_CASE("catalog_title_totals counts install ROWS and distinct devices; version-set totals count a device once",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    SoftwareEntry amd = v3_entry("git", kV3Pkgs, "1.9");
+    amd.arch = "amd64";
+    SoftwareEntry arm = v3_entry("git", kV3Pkgs, "1.9");
+    arm.arch = "arm64";
+    SoftwareEntry newer = v3_entry("git", kV3Pkgs, "1.10");
+    newer.arch = "amd64";
+    REQUIRE(store.apply_installed_software_v3("dev-a", v3_report({v3_full(kV3Pkgs, {amd, arm, newer})}))
+                .at(0).outcome == V3SectionOutcome::kStored);
+    REQUIRE(store.apply_installed_software_v3("dev-b", v3_report({v3_full(kV3Pkgs, {newer})}))
+                .at(0).outcome == V3SectionOutcome::kStored);
+    REQUIRE(store.refresh_catalog_rollup());
+
+    const auto title = store.catalog_title_totals("git");
+    REQUIRE(title.has_value());
+    CHECK(title->installs == 4); // rows: a device with two architectures counts twice
+    CHECK(title->devices == 2);  // distinct devices
+    const auto gone = store.catalog_title_totals("absent");
+    REQUIRE(gone.has_value());
+    CHECK(gone->installs == 0);
+    CHECK(gone->devices == 0);
+
+    // dev-a carries BOTH selected versions: never a sum of per-version distinct counts (2 + 2).
+    const auto both = store.installed_software_version_set_totals("git", {"1.9", "1.10"});
+    REQUIRE(both.has_value());
+    CHECK(both->installs == 4);
+    CHECK(both->devices == 2);
+    const auto one = store.installed_software_version_set_totals("git", {"1.9"});
+    REQUIRE(one.has_value());
+    CHECK(one->installs == 2);
+    CHECK(one->devices == 1);
+    const auto empty = store.installed_software_version_set_totals("git", {});
+    REQUIRE(empty.has_value());
+    CHECK(empty->installs == 0);
+}
+
+TEST_CASE("query_software: selects the install_* columns and facet state; the status predicate matches the shared CASE",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    // Every (status, enabled) pair plus a row with no state record at all.
+    const std::vector<std::string> statuses{"full", "delta", "constrained", "timeout", "oversize",
+                                            "not_collected", "disabled", ""};
+    int n = 0;
+    for (const bool enabled : {true, false})
+        for (const auto& st : statuses) {
+            const std::string agent = "t" + std::to_string(n++);
+            REQUIRE(sql_ok(pool,
+                           "INSERT INTO software_inventory_store.installed_software (agent_id, "
+                           "name, version, source, install_type, install_scope, install_location, "
+                           "instance_key) VALUES ($1, 'truth', '1', 'src.x', 'package_manager', "
+                           "'machine', '/opt', 'ik-' || $1)",
+                           {agent}));
+            REQUIRE(sql_ok(pool,
+                           "INSERT INTO software_inventory_store.software_facet_state (agent_id, "
+                           "facet, status, enabled, last_confirmed_at) VALUES ($1, 'src.x', $2, "
+                           "$3::boolean, 77)",
+                           {agent, st, enabled ? "true" : "false"}));
+        }
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.installed_software (agent_id, name, "
+                   "version, source) VALUES ('t-nostate', 'truth', '1', 'src.x')"));
+
+    // The SQL derivation, read straight from the shared fragment.
+    const std::string derive_sql =
+        "SELECT i.agent_id, " + std::string(kRowStatusCaseSql) +
+        " FROM software_inventory_store.installed_software i LEFT JOIN "
+        "software_inventory_store.software_facet_state fs ON fs.agent_id = i.agent_id AND "
+        "fs.facet = i.source WHERE i.name = 'truth'";
+    std::map<std::string, std::string> sql_status;
+    for (const auto& r : sql_rows(pool, derive_sql))
+        sql_status[r[0]] = r[1];
+    REQUIRE(sql_status.size() == 17);
+
+    SoftwareFleetQuery q;
+    q.name = "truth";
+    q.limit = 100;
+    const auto rows = store.query_software(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 17);
+    for (const auto& r : *rows) {
+        CAPTURE(r.agent_id, r.facet_status, r.facet_enabled);
+        // The C++ twin agrees with the SQL on every pair.
+        CHECK(std::string(yuzu::server::software_list::derive_status(r.facet_status, r.facet_enabled)) ==
+              sql_status.at(r.agent_id));
+        if (r.agent_id != "t-nostate") {
+            CHECK(r.entry.install_type == "package_manager");
+            CHECK(r.entry.install_scope == "machine");
+            CHECK(r.entry.install_location == "/opt");
+            CHECK(r.entry.instance_key == "ik-" + r.agent_id);
+            CHECK(r.last_confirmed_at == 77);
+        } else {
+            CHECK(r.facet_status.empty());
+            CHECK(r.facet_enabled);
+            CHECK(r.last_confirmed_at == 0);
+        }
+    }
+    // The status predicate returns exactly the agents the CASE derives.
+    for (const char* want : {"current", "unconfirmed", "disabled"}) {
+        CAPTURE(want);
+        q.status = want;
+        const auto got = store.query_software(q);
+        REQUIRE(got.has_value());
+        std::set<std::string> have;
+        for (const auto& r : *got)
+            have.insert(r.agent_id);
+        std::set<std::string> expect;
+        for (const auto& [agent, st] : sql_status)
+            if (st == want)
+                expect.insert(agent);
+        CHECK(have == expect);
+        CHECK_FALSE(expect.empty());
+    }
+    // A version SET narrows like the exact version; match=prefix/contains work over name.
+    q.status.clear();
+    q.versions = std::vector<std::string>{"nope"};
+    CHECK(store.query_software(q)->empty());
+    q.versions.reset();
+    q.name = "tru";
+    q.match = NameMatch::kPrefix;
+    CHECK(store.query_software(q)->size() == 17);
+    q.name = "RUT";
+    q.match = NameMatch::kContains;
+    CHECK(store.query_software(q)->size() == 17);
 }

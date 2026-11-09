@@ -80,6 +80,7 @@
 #include "response_templates_engine.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
+#include "software_list_model.hpp"      // SAM-17: lookup list/components model (totals, status, range)
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
@@ -1421,7 +1422,8 @@ const std::string& openapi_spec() {
       "EnrollmentPendingAgent": {"type": "object", "required": ["agent_id", "hostname", "os", "arch", "agent_version", "requested_at", "status"], "properties": {"agent_id": {"type": "string"}, "hostname": {"type": "string"}, "os": {"type": "string"}, "arch": {"type": "string"}, "agent_version": {"type": "string"}, "requested_at": {"type": "integer", "format": "int64", "description": "Epoch seconds."}, "status": {"type": "string", "enum": ["pending", "denied"], "description": "Approved agents are filtered out of this list."}}},
       "EnrollmentPendingAgentsResponse": {"type": "object", "required": ["data", "pagination", "meta"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/EnrollmentPendingAgent"}, "description": "The caller's confined slice of pending and denied requests."}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}},
       "InstalledSoftwareRow": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Endpoint that reported the row (added by the server)"}, "name": {"type": "string", "description": "Software name; a macOS pkg row carries the receipt's reverse-domain id"}, "version": {"type": "string", "description": "Upstream version with the release stripped; a Windows optional feature carries its DISM state"}, "publisher": {"type": "string", "description": "Unverified attribution: the declared vendor, else the origin label via:<ecosystem> (a source with no vendor); never empty"}, "install_date": {"type": "string", "description": "Format depends on the ecosystem; empty for deb, apk, pacman and Homebrew"}, "kind": {"type": "string", "description": "package | app | pkg | feat"}, "ecosystem": {"type": "string", "description": "Package ecosystem of the row; the accepted values are the ecosystem filter enum of GET /inventory/software"}, "epoch": {"type": "string", "description": "Package epoch; empty when none"}, "release": {"type": "string", "description": "Packaging release split out of the version"}, "arch": {"type": "string", "description": "Package architecture"}, "signature_status": {"type": "string", "description": "signed | unsigned (stored signing metadata, not a verified signature); empty when not read"}, "distro_id": {"type": "string", "description": "Linux only: /etc/os-release ID"}, "distro_version": {"type": "string", "description": "Linux only: /etc/os-release VERSION_ID"}, "source": {"type": "string", "description": "<plugin>.<action> that produced the row (open set); empty on rows ingested before the field existed"}}, "required": ["agent_id", "name", "version", "publisher", "install_date", "kind", "ecosystem", "epoch", "release", "arch", "signature_status", "distro_id", "distro_version", "source"], "description": "One installed-software row. Every key is always present; a field the source ecosystem does not store is the empty string."},
-      "InstalledSoftwarePage": {"type": "object", "properties": {"data": {"type": "object", "properties": {"software": {"type": "array", "items": {"$ref": "#/components/schemas/InstalledSoftwareRow"}}, "count": {"type": "integer", "description": "Rows in this page"}, "next_cursor": {"type": "string", "description": "Opaque; pass back as cursor. Null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor", "nullable": true}, "devices_omitted": {"type": "integer", "description": "Distinct devices hidden by the scope post-filter within the scanned window; 0 under SQL push-down"}, "result_truncated_by_cap": {"type": "boolean", "description": "Present (true) only when more rows may exist"}, "audit_persisted": {"type": "boolean", "description": "Present (false) only when the audit row for this read failed to persist"}}, "required": ["software", "count", "next_cursor", "devices_omitted"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"], "description": "GET /api/v1/inventory/software 200 body (format=json)"},
+      "InstalledSoftwareLookupRow": {"allOf": [{"$ref": "#/components/schemas/InstalledSoftwareRow"}, {"type": "object", "properties": {"hostname": {"type": "string", "nullable": true, "description": "Registry hostname; null when the device registry does not know the device"}, "last_seen": {"type": "integer", "nullable": true, "description": "Epoch seconds of the device's last accepted installed-software report; null if never"}, "status": {"type": "string", "enum": ["current", "unconfirmed", "disabled"], "description": "current: the row's facet last reported full or delta; disabled: the facet is switched off; unconfirmed: anything else (also no facet record). Unconfirmed is never proof of absence"}, "last_confirmed_at": {"type": "integer", "nullable": true, "description": "Epoch seconds the facet last confirmed a full or delta report; null if never"}, "install_type": {"type": "string"}, "install_scope": {"type": "string"}, "install_location": {"type": "string"}, "instance_key": {"type": "string"}}, "required": ["hostname", "last_seen", "status", "last_confirmed_at", "install_type", "install_scope", "install_location", "instance_key"]}], "description": "One lookup row: the installed-software row plus the lookup fields"},
+      "InstalledSoftwarePage": {"type": "object", "properties": {"data": {"type": "object", "properties": {"software": {"type": "array", "items": {"$ref": "#/components/schemas/InstalledSoftwareLookupRow"}}, "totals": {"type": "object", "nullable": true, "properties": {"installs": {"type": "integer", "description": "Install rows (a device with two architectures counts twice)"}, "devices": {"type": "integer", "description": "Distinct devices"}, "as_of": {"type": "integer", "nullable": true, "description": "Catalogue refresh epoch; null when computed live (any version filter)"}}, "description": "Exact fleet totals; null when totals_omitted is set (not shown, never zero)"}, "totals_omitted": {"type": "string", "enum": ["scope", "filters", "building"], "description": "Present when totals is null: scope (confined caller), filters (not an exact-name lookup), building (no catalogue refresh yet)"}, "count": {"type": "integer", "description": "Rows in this page"}, "next_cursor": {"type": "string", "description": "Opaque; pass back as cursor. Null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor", "nullable": true}, "devices_omitted": {"type": "integer", "description": "Distinct devices hidden by the scope post-filter within the scanned window; 0 under SQL push-down"}, "result_truncated_by_cap": {"type": "boolean", "description": "Present (true) only when more rows may exist"}, "audit_persisted": {"type": "boolean", "description": "Present (false) only when the audit row for this read failed to persist"}}, "required": ["software", "count", "next_cursor", "devices_omitted", "totals"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"], "description": "GET /api/v1/inventory/software 200 body (format=json)"},
       "HardwareListRow": {"type": "object", "properties": {"agent_id": {"type": "string"}, "hostname": {"type": "string", "description": "Falls back to agent_id when empty"}, "os": {"type": "string", "description": "OS token as the agent reports it"}, "os_label": {"type": "string", "description": "Windows | Linux | macOS, or the raw token"}, "online": {"type": "boolean", "description": "The device has a live stream to the server right now"}, "stale": {"type": "boolean", "description": "Last heartbeat older than 2 days; a stale device also counts as offline"}, "last_seen": {"type": "string", "description": "Readable age; empty when unknown"}, "last_seen_ms": {"type": "integer", "description": "Server receipt time in epoch milliseconds; -1 when unknown"}, "ci_present": {"type": "boolean", "description": "The device has synced a serial or a model"}, "serial": {"type": "string", "nullable": true}, "model": {"type": "string", "nullable": true}, "manufacturer": {"type": "string", "nullable": true}, "cpu_model": {"type": "string", "nullable": true}, "cpu_cores": {"type": "integer", "description": "Summed across sockets", "nullable": true}, "cpu_threads": {"type": "integer", "description": "Summed across sockets", "nullable": true}, "ram_bytes": {"type": "integer", "nullable": true}, "os_name": {"type": "string", "nullable": true}, "os_version": {"type": "string", "nullable": true}, "os_build": {"type": "string", "nullable": true}, "arch": {"type": "string", "description": "The agent's own report, else the CI sync value", "nullable": true}, "domain": {"type": "string", "nullable": true}, "primary_mac": {"type": "string", "nullable": true}, "agent_version": {"type": "string", "description": "Offline: the last value the agent reported", "nullable": true}, "ips": {"type": "array", "items": {"type": "string"}, "description": "Claimed IPs from the live fleet snapshot; null for an offline device", "nullable": true}, "tags": {"type": "array", "items": {"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}}, "dex_score": {"type": "integer", "description": "Scored only for rows on the returned page; null for no data and for a failed read alike", "minimum": 0, "maximum": 100, "nullable": true}}, "required": ["agent_id", "hostname", "os", "os_label", "online", "stale", "last_seen", "last_seen_ms", "ci_present", "serial", "model", "manufacturer", "cpu_model", "cpu_cores", "cpu_threads", "ram_bytes", "os_name", "os_version", "os_build", "arch", "domain", "primary_mac", "agent_version", "ips", "tags", "dex_score"], "description": "One device in the Hardware CI list. Every key is always present; CI fields are null when the device has not synced a value."},
 )json"
         R"json(
@@ -2167,7 +2169,7 @@ const std::string& openapi_spec() {
       "post": {"operationId": "postInventoryQuery", "summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "minimum": 0, "description": "Inclusive lower bound on collected_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value or a non-integer is rejected with 400."}, "until": {"type": "integer", "minimum": 1, "description": "Inclusive upper bound on collected_at, epoch seconds. Omit for no upper bound; 0, a negative value or a non-integer is rejected with 400 (0 is not a way to say unbounded)."}, "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000, "description": "Max results; an integer above 1000 is clamped to 1000, a value below 1 or a non-integer is rejected with 400."}}}}}}, "responses": {"200": {"description": "Matching inventory records", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "pagination", "meta", "result_truncated_by_cap"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/InventoryDataRecord"}}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}, "result_truncated_by_cap": {"type": "boolean", "description": "True when the underlying read hit its row or payload cap, so absent agents may simply not have been read."}}}}}}, "400": {"description": "Malformed JSON body, a limit below 1 or not an integer, a negative or non-integer since, or an until of 0 or below or non-integer (standard error envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/inventory/software": {
-      "get": {"operationId": "getInventorySoftware", "summary": "Fleet-wide installed-software inventory", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed software inventory (distinct from the generic /inventory/* routes, which read the generic inventory store). Rows carry name, version, publisher (unverified attribution: the declared vendor, else the origin label via:<ecosystem> for a source with no vendor; never empty), install_date plus the package fields: kind (package|app|pkg|feat), ecosystem (@@ECOSYSTEM_LIST@@), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version (rpm/deb/apk/pacman rows only) — fields an ecosystem does not store are empty, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak apps kind app and runtimes kind pkg (ecosystem flatpak). Machine-context Windows Installer products are kind pkg (ecosystem msi). Requires Inventory:Read, which is the only permission checked. Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 under push-down; for a scope wider than that bound the rows are filtered after the read and devices_omitted is the count of distinct out-of-scope devices within the scanned window(s), a bounded and audited signal that out-of-scope matches exist. A denied audit row is written when it is above zero or when the request names an agent_id outside the caller's scope. On a wide scope a page can be empty with a non-null next_cursor; the cursor re-anchors at the last row served and carries a count of the rows scanned since, never a row of another device, and an export reads at most four bounded windows. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when more rows may exist (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition, X-Result-Truncated-By-Cap and X-Next-Cursor, and a trailer record when more rows may exist) audited as inventory.software.export. Every served call is audited (inventory.software.query success, inventory.software.export for an export; continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["@@ECOSYSTEM_ENUM@@"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-installs.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when more rows may exist (the export reached the total cap, or a wide-scope read was cut short)"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation, present with X-Result-Truncated-By-Cap; pass it back as cursor"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when an audit row of the export did not persist (the export is still served)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InstalledSoftwarePage"}}, "text/csv": {"schema": {"type": "string", "description": "format=csv: header row then one row per record"}}}}, "400": {"description": "Non-integer limit, unknown format, text that is not valid UTF-8 or holds a NUL byte, an over-long value, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read check unwired"}}}
+      "get": {"operationId": "getInventorySoftware", "summary": "Fleet-wide installed-software inventory", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed software inventory (distinct from the generic /inventory/* routes, which read the generic inventory store). Rows carry name, version, publisher (unverified attribution: the declared vendor, else the origin label via:<ecosystem> for a source with no vendor; never empty), install_date plus the package fields: kind (package|app|pkg|feat), ecosystem (@@ECOSYSTEM_LIST@@), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version (rpm/deb/apk/pacman rows only) — fields an ecosystem does not store are empty, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak apps kind app and runtimes kind pkg (ecosystem flatpak). Machine-context Windows Installer products are kind pkg (ecosystem msi). Requires Inventory:Read, which is the only permission checked. Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 under push-down; for a scope wider than that bound the rows are filtered after the read and devices_omitted is the count of distinct out-of-scope devices within the scanned window(s), a bounded and audited signal that out-of-scope matches exist. A denied audit row is written when it is above zero or when the request names an agent_id outside the caller's scope. On a wide scope a page can be empty with a non-null next_cursor; the cursor re-anchors at the last row served and carries a count of the rows scanned since, never a row of another device, and an export reads at most four bounded windows. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when more rows may exist (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition, X-Result-Truncated-By-Cap and X-Next-Cursor, and a trailer record when more rows may exist) audited as inventory.software.export. Every served call is audited (inventory.software.query success, inventory.software.export for an export; continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. LOOKUP FIELDS: every row also carries hostname (null when the device registry does not know the device), last_seen (epoch seconds of the device's last accepted installed-software report; null if never), status (current when the row's collection facet last reported full or delta, disabled when that facet is switched off, unconfirmed otherwise, including a device with no facet record: an unconfirmed row may be stale or missing, never proof of absence), last_confirmed_at (null if never), install_type, install_scope, install_location and instance_key; format=csv has 22 columns. match=exact|prefix|contains selects how name matches (default exact). version_min and version_max are inclusive bounds under the catalogue comparator (1.10 above 1.9; 2.0 above 2.0-rc1), need name with match=exact, and are resolved against the title's fleet-wide distinct versions; a title with 2000 or more distinct versions is a 400, use version=. status filters rows. TOTALS: totals{installs,devices,as_of} is served only when the caller has unfiltered (global) access AND the request is name with match=exact plus at most one version filter. installs counts install ROWS (a device with two architectures counts twice) and devices distinct devices; as_of is the catalogue refresh epoch, or null when computed live (any version filter). Otherwise totals is null and totals_omitted says why: scope (a management-group-confined caller gets rows but no fleet total; null means not shown, never zero), filters, or building (before the first catalogue refresh). A degraded totals read is a 503 with retry_after_ms. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows; needs name with match=exact"}, {"name": "match", "in": "query", "schema": {"type": "string", "enum": ["exact", "prefix", "contains"], "default": "exact"}, "description": "How name matches; prefix and contains need name; contains is a literal case-insensitive substring"}, {"name": "version_min", "in": "query", "schema": {"type": "string"}, "description": "Inclusive lower version bound (catalogue comparator); needs name with match=exact; not with version"}, {"name": "version_max", "in": "query", "schema": {"type": "string"}, "description": "Inclusive upper version bound; same rules as version_min"}, {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["current", "unconfirmed", "disabled"]}, "description": "Row status filter; never applied by default"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["@@ECOSYSTEM_ENUM@@"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-installs.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when more rows may exist (the export reached the total cap, or a wide-scope read was cut short)"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation, present with X-Result-Truncated-By-Cap; pass it back as cursor"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when an audit row of the export did not persist (the export is still served)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InstalledSoftwarePage"}}, "text/csv": {"schema": {"type": "string", "description": "format=csv: header row then one row per record"}}}}, "400": {"description": "Non-integer limit, unknown format, text that is not valid UTF-8 or holds a NUL byte, an over-long value, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read check unwired"}}}
     },
 )json"
         R"json(
@@ -2186,6 +2188,9 @@ const std::string& openapi_spec() {
     "/compliance/{id}": {
       "get": {"operationId": "getComplianceById", "summary": "Per-policy compliance detail with per-agent status", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/compliance/{policy_id}, plus a policy_id sibling field. Requires Policy:Read; this is the only authorization check, and the agents array is a read of per-agent data: a caller whose access is limited to some devices or management groups (or a service-scoped token) sees only its own visible agents, and summary is tallied from exactly that filtered set, never the store's unfiltered fleet-wide aggregate. MCP twin get_policy_agent_statuses (same shape); get_compliance_summary covers the summary-only half. Audited as compliance.agent_statuses.view, fail-closed: 503 when the audit row cannot be persisted, and no data is served. check_result carries raw, unrestricted agent-instruction output (the check_instruction of the bound fragment is operator-authored and unconstrained), so this route is treated as behavioural data, unlike GET /api/v1/inventory/software, which carries machine-scope data only. A policy whose check instruction runs a Forensics-tier plugin (an action on the Forensics securable) is scored unknown for every agent with an empty check_result: the evaluator never reads Forensics-tier output, so unknown there is by design and says nothing about the device.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{policy_id,summary:{compliant,non_compliant,unknown,fixing,error,total},agents:[{agent_id,status,last_check_at,last_fix_at,check_result}]}}", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/CompliancePolicyAgents"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Policy:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Policy store not available/degraded, the fleet-read check unwired, or the audit write for this read failed (fail-closed)"}}}
     },)json"
+        // SAM-17 components lookup. Own segment (MSVC C2026 16,380-byte cap).
+        R"json(
+    "/inventory/software/components": {"get": {"operationId": "getInventorySoftwareComponents", "summary": "Component lookup: instances, devices, last poll and status", "tags": ["Inventory"], "description": "Components (bundled libraries and similar artefacts inside an application) reported by the component inventory, one row per (device, component path). No agent reports components yet, so an empty answer before the component producer ships is expected. Same access and confinement posture as GET /inventory/software: Inventory:Read through the fleet-read check, rows scoped to the caller's management groups and service tag on every page. Every row carries agent_id, hostname (null when the registry does not know the device), last_seen (epoch seconds of the device's last accepted installed-software report; null if never), kind, name, version, version_source, path, anchor_app, first_seen, status and last_confirmed_at (null if never). status is current when the component facet last reported full or delta, disabled when it is switched off, unconfirmed otherwise (including a device with no facet record); unconfirmed rows are included by default and are never proof of absence; status=current excludes them. Filters: name with match=exact|prefix|contains, kind, version, version_min/version_max (inclusive, catalogue comparator; they need name with match=exact and are resolved against the component's fleet-wide distinct versions; 2000 or more distinct versions is a 400, use version=), agent_id, q (substring over name, path and anchor_app), status. TOTALS: totals{instances,devices,devices_unconfirmed,as_of} is served only to a caller with unfiltered (global) access for name with match=exact plus optionally kind and one version filter. instances counts component rows, devices distinct devices, devices_unconfirmed the distinct devices whose status is not current; as_of is the components rollup refresh epoch (served for name+kind without a version filter), null when computed live. Otherwise totals is null with totals_omitted = scope (confined caller; null means not shown, never zero), filters, or building (before the first components rollup refresh). Keyset pagination as GET /inventory/software (cursor bound to the filter set; a malformed cursor or one for another filter set is a 400). format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv, 12 columns, adds X-Result-Truncated-By-Cap and X-Next-Cursor and a trailer record when more rows may exist). Every served call is audited (inventory.components.view; inventory.components.export for an export; continuation pages tagged page=continuation). A degraded rows, facts or totals read is a 503 with retry_after_ms, never an empty 200.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string", "maxLength": 1024}, "description": "Component name; see match"}, {"name": "match", "in": "query", "schema": {"type": "string", "enum": ["exact", "prefix", "contains"], "default": "exact"}}, {"name": "kind", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact component kind"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version; needs name with match=exact"}, {"name": "version_min", "in": "query", "schema": {"type": "string"}, "description": "Inclusive lower bound (catalogue comparator); needs name with match=exact; not with version"}, {"name": "version_max", "in": "query", "schema": {"type": "string"}, "description": "Inclusive upper bound; same rules as version_min"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Literal case-insensitive substring over name, path and anchor_app"}, {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["current", "unconfirmed", "disabled"]}, "description": "Never applied by default"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{components[{agent_id,hostname,last_seen,kind,name,version,version_source,path,anchor_app,first_seen,status,last_confirmed_at}],count,next_cursor,devices_omitted,totals|null,totals_omitted?,result_truncated_by_cap?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: more rows may exist"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation; pass it back as cursor"}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "required": ["components", "count", "next_cursor", "devices_omitted", "totals"], "properties": {"components": {"type": "array", "items": {"type": "object"}}, "count": {"type": "integer"}, "next_cursor": {"type": "string", "nullable": true}, "devices_omitted": {"type": "integer"}, "totals": {"type": "object", "nullable": true, "properties": {"instances": {"type": "integer"}, "devices": {"type": "integer"}, "devices_unconfirmed": {"type": "integer"}, "as_of": {"type": "integer", "nullable": true}}}, "totals_omitted": {"type": "string", "enum": ["scope", "filters", "building"]}}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}, "text/csv": {"schema": {"type": "string"}}}}, "400": {"description": "Malformed or repeated parameter, a version filter without name+match=exact, an unresolvable range, or a refused cursor (standard error envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "No Inventory:Read grant"}, "503": {"description": "Store, facts, totals or version read degraded, or the rollup is building (a range before the first refresh): retry_after_ms 5000"}}}},)json"
         // The software catalogue twins. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
     "/inventory/software/catalogue": {"get": {"operationId": "getInventorySoftwareCatalogue", "summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). MCP twin query_software_catalogue; both are shaped by one shared model. totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call that serves a page is audited (inventory.software.catalog success, continuation pages tagged page=continuation); an out-of-scope per-device read writes denied only (denied plus an empty-file inventory.software.export success on format=csv). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when the cap is reached; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200. Before the first catalogue refresh the JSON page answers 200 with kpis.building true, while the fleet format=csv export is a 503 with retry_after_ms (an empty file would read as no titles; the per-device export is unaffected).", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["@@ECOSYSTEM_ENUM@@"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000; with format=csv it is the TOTAL export cap (clamped into 1..10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=\"software-titles.csv\""}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the walk reached the total export cap (rows may have been left behind)"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist, or when only the paired denied row failed to persist (the export is still served)"}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/SoftwareCatalogueData"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}, "text/csv": {"schema": {"type": "string", "description": "format=csv: header row then one row per record"}}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (standard error envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (standard error envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Rows, totals or refresh-metadata read degraded, or (fleet format=csv) the catalogue is not built yet: retry_after_ms 5000. An absent store or an unwired fleet-read check is a 503 without retry_after_ms (standard error envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
@@ -11062,7 +11067,8 @@ void RestApiV1::register_routes(
                         "application/json");
     });
 
-    // ORDER MATTERS: `/api/v1/inventory/software/catalogue` also matches the generic
+    // ORDER MATTERS: `/api/v1/inventory/software/catalogue` (and the SAM-17 `.../components`
+    // route registered after the versions twin) also match the generic
     // `/api/v1/inventory/{agent_id}/{plugin}` regex route below, and the first registered match
     // wins — so the catalogue twins are registered BEFORE it (`.../catalogue/versions` has three
     // segments and is not shadowed, but lives with its sibling).
@@ -11322,6 +11328,219 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(swc::dump_safe(body)), "application/json");
         });
 
+
+    // ── SAM-17 lookup reads ────────────────────────────────────────────────────
+    // GET /api/v1/inventory/software            — installs of an application, with status
+    // GET /api/v1/inventory/software/components — components (SAM-14 store), same skeleton
+    // Both shape their answers through software_list_model.hpp. The components route is
+    // registered HERE, before the generic `/api/v1/inventory/{agent_id}/{plugin}` regex below
+    // (it has the same two trailing segments, and the first registered match wins).
+    //   * SOLE gate is fleet_read_fn (admit-then-filter; never stacked with perm_fn). Rows are
+    //     confined to the gate's composed scope on every page; a degraded read is a 503, never an
+    //     empty 200.
+    //   * `totals` is served ONLY to a globally-admitted caller (gate.scope == nullopt, the
+    //     ListReadDecision::AdmitAll case) for an exact name (ADR-0017: a fleet rollup cannot be
+    //     confined). Otherwise `totals: null` + `totals_omitted` (scope | filters | building).
+    //   * A degraded totals read is a 503 + retry_after_ms: a null a caller could read as zero
+    //     is never produced by a failure.
+    auto lookup_admit = [fleet_read_fn, software_inventory_store](
+                            const httplib::Request& req, httplib::Response& res,
+                            const std::string& cid,
+                            const char* verb) -> std::optional<authz::FleetReadGate> {
+        if (!fleet_read_fn) {
+            spdlog::error("{}: fleet_read_fn unwired — misconfigured call site; failing closed; "
+                          "cid={}",
+                          verb, cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return std::nullopt;
+        }
+        // The SOLE authorization gate: renders 401/403/503 itself and returns !admitted.
+        auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+        if (!gate.admitted)
+            return std::nullopt;
+        // Null-store ONLY (not !is_open()): a constructed-but-closed store falls through to the
+        // read, whose nullopt is the AUDITED degrade branch (CC7.2 trail).
+        if (!software_inventory_store) {
+            res.status = 503;
+            res.set_content(
+                detail::error_json_a4(503, "software inventory store not available", cid),
+                "application/json");
+            return std::nullopt;
+        }
+        return gate;
+    };
+    auto lookup_facts_reads = [software_inventory_store, device_api]() {
+        software_list::FactsReads io;
+        io.last_seen = [software_inventory_store](const std::vector<std::string>& ids) {
+            return software_inventory_store->source_last_seen_bulk("installed_software", ids);
+        };
+        io.device_api = device_api.get();
+        return io;
+    };
+    auto lookup_totals_reads = [software_inventory_store]() {
+        software_list::TotalsReads io;
+        io.catalog_meta = [software_inventory_store] {
+            return software_inventory_store->catalog_rollup_meta();
+        };
+        io.component_meta = [software_inventory_store] {
+            return software_inventory_store->component_rollup_meta();
+        };
+        io.title_totals = [software_inventory_store](std::string_view name) {
+            return software_inventory_store->catalog_title_totals(name);
+        };
+        io.version_set_totals = [software_inventory_store](std::string_view name,
+                                                           const std::vector<std::string>& vs) {
+            return software_inventory_store->installed_software_version_set_totals(name, vs);
+        };
+        io.component_totals = [software_inventory_store](
+                                  std::string_view kind, std::string_view name,
+                                  const std::optional<std::vector<std::string>>& vs,
+                                  bool* from_rollup) {
+            return software_inventory_store->component_totals(kind, name, vs, from_rollup);
+        };
+        return io;
+    };
+
+    sink.Get(
+        "/api/v1/inventory/software/components",
+        [audit_fn, software_inventory_store, sw_503, sw_building, lookup_admit, lookup_facts_reads,
+         lookup_totals_reads](const httplib::Request& req, httplib::Response& res) {
+            namespace swc = software_catalogue;
+            namespace swl = software_list;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
+
+            const auto gate_opt = lookup_admit(req, res, cid, "inventory.components.view");
+            if (!gate_opt)
+                return;
+            const auto& gate = *gate_opt;
+            auto parsed = swl::parse_components_params(model_detail::to_params(req.params));
+            if (!parsed) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+                return;
+            }
+            auto rq = std::move(*parsed);
+            const bool csv = rq.format == "csv";
+            const bool export_mode = !rq.format.empty();
+            const bool continuation = !rq.cursor.empty();
+            const char* const verb =
+                export_mode ? "inventory.components.export" : "inventory.components.view";
+            const std::string audit_key = swl::audit_target(rq);
+
+            // A version range resolves against the component's fleet-wide distinct versions for
+            // EVERY caller (the set is a SQL predicate only and never leaves this function).
+            if (rq.has_range()) {
+                const auto meta = software_inventory_store->component_rollup_meta();
+                if (!meta) {
+                    sw_503(req, res, cid, verb, audit_key, "version read degraded",
+                           "software inventory store degraded — version range read failed");
+                    return;
+                }
+                if (meta->refreshed_at == 0) {
+                    sw_building(req, res, cid, verb, audit_key);
+                    return;
+                }
+                const auto distinct =
+                    software_inventory_store->component_versions(rq.query.kind, rq.query.name);
+                if (!distinct) {
+                    sw_503(req, res, cid, verb, audit_key, "version read degraded",
+                           "software inventory store degraded — version range read failed");
+                    return;
+                }
+                auto set = swl::resolve_version_range(*distinct, rq.version_min, rq.version_max);
+                if (!set) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, set.error()), "application/json");
+                    return;
+                }
+                rq.query.versions = std::move(*set);
+            }
+
+            const auto read = swl::read_components_page(
+                [software_inventory_store](const SoftwareComponentQuery& q) {
+                    return software_inventory_store->query_components(q);
+                },
+                rq, gate.scope);
+            if (!read) {
+                if (read.error()) {
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         std::string(swc::cursor_error_message(*read.error()))),
+                        "application/json");
+                    return;
+                }
+                sw_503(req, res, cid, verb, audit_key, "store degraded",
+                       "software inventory store degraded — query failed");
+                return;
+            }
+            const auto& page = *read;
+            const auto facts =
+                swl::load_device_facts(lookup_facts_reads(), swl::page_agent_ids(page.rows));
+            if (!facts) {
+                sw_503(req, res, cid, verb, audit_key, "device facts degraded",
+                       "software inventory store degraded — last-poll read failed");
+                return;
+            }
+
+            // Totals (JSON only): the admission rule is the model's, the decision is the gate's.
+            const auto decision = swl::totals_decision(!gate.scope.has_value(), rq.query);
+            swl::TotalsOutcome totals;
+            if (!csv && decision.serve) {
+                totals = swl::read_component_totals(lookup_totals_reads(), rq.query);
+                if (totals.status == swl::TotalsStatus::kDegraded) {
+                    sw_503(req, res, cid, verb, audit_key, "totals degraded",
+                           "software inventory store degraded — totals read failed");
+                    return;
+                }
+            }
+
+            // Audit posture: SET-AND-PROCEED (machine-scope inventory, not behavioural PII), on
+            // every call; continuation pages tagged page=continuation.
+            bool denied_ok = true;
+            if (const auto denied = swc::denied_detail(page); !denied.empty())
+                denied_ok = detail::try_persist_audit(audit_fn, req, verb, "denied", "Inventory",
+                                                      audit_key, denied + "; cid=" + cid);
+            const std::string detail_text =
+                (export_mode ? "components format=" + rq.format +
+                                   " rows=" + std::to_string(page.rows.size()) +
+                                   " truncated=" + (page.hit_cap ? "true" : "false")
+                             : "rows=" + std::to_string(page.rows.size())) +
+                (continuation ? " page=continuation" : "") + " cid=" + cid;
+            const bool audit_ok = detail::try_persist_audit(audit_fn, req, verb, "success",
+                                                            "Inventory", audit_key, detail_text) &&
+                                  denied_ok;
+
+            if (csv) {
+                res.set_header("Content-Disposition",
+                               "attachment; filename=\"software-components.csv\"");
+                if (page.hit_cap)
+                    res.set_header("X-Result-Truncated-By-Cap", "true");
+                if (!page.next_cursor.empty())
+                    res.set_header("X-Next-Cursor", page.next_cursor);
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                auto body = swl::components_csv(page.rows, *facts);
+                if (page.hit_cap)
+                    body += export_csv_truncation_row(ExportCut{.row_cap = true},
+                                                      swl::kComponentsCsvColumns);
+                res.set_content(std::move(body), "text/csv; charset=utf-8");
+                return;
+            }
+            auto body = swl::components_response_json(page.rows, *facts, page.next_cursor,
+                                                      page.devices_omitted, page.hit_cap);
+            if (decision.serve && totals.status == swl::TotalsStatus::kServed)
+                swl::set_totals(body, totals, true);
+            else
+                swl::set_totals_omitted(body, decision.serve ? "building" : decision.omitted);
+            if (!audit_ok)
+                body["audit_persisted"] = false;
+            res.set_content(ok_json(swc::dump_safe(body)), "application/json");
+        });
+
     sink.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
              [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Inventory", "Read"))
@@ -11471,8 +11690,9 @@ void RestApiV1::register_routes(
     // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
     // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
-             [fleet_read_fn, audit_fn, software_inventory_store,
-              sw_503](const httplib::Request& req, httplib::Response& res) {
+             [fleet_read_fn, audit_fn, software_inventory_store, sw_503, sw_building,
+              lookup_facts_reads,
+              lookup_totals_reads](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
 
@@ -11488,17 +11708,14 @@ void RestApiV1::register_routes(
                  // require_fleet_read is the SOLE gate — see the comment above the
                  // route registration for why it must never be stacked with perm_fn.
                  // It renders 401/403/503 itself and returns !admitted on denial.
-                 auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+                 const auto gate = fleet_read_fn(req, res, "Inventory", "Read");
                  if (!gate.admitted)
                      return;
                  // Null-store ONLY (not `!is_open()`): a constructed-but-closed store
                  // deliberately falls through to query_software(), which returns nullopt →
                  // the AUDITED degrade branch below (CC7.2 trail + MCP parity — MCP guards
                  // only `!store` too). A live server never serves a closed store anyway
-                 // (server.cpp sets startup_failed_ and refuses to boot with one), so
-                 // dropping the `!is_open()` short-circuit is defensive: it keeps the
-                 // who/when/what trail intact against a future boot-gating refactor
-                 // (gov arch-NICE-1 / compliance-CC7.2 / unhappy UP-7).
+                 // (server.cpp sets startup_failed_ and refuses to boot with one).
                  if (!software_inventory_store) {
                      res.status = 503;
                      res.set_content(
@@ -11508,27 +11725,60 @@ void RestApiV1::register_routes(
                  }
 
                  namespace swc = software_catalogue;
-                 auto parsed = swc::parse_devices_params(model_detail::to_params(req.params));
+                 namespace swl = software_list;
+                 auto parsed = swl::parse_list_params(model_detail::to_params(req.params));
                  if (!parsed) {
                      res.status = 400;
                      res.set_content(detail::a4_error(res, parsed.error()), "application/json");
                      return;
                  }
-                 const auto& rq = *parsed;
-                 const bool csv = rq.format == "csv";
-                 const bool export_mode = !rq.format.empty();
-                 const bool continuation = !rq.cursor.empty();
+                 auto rq = std::move(*parsed);
+                 const bool csv = rq.base.format == "csv";
+                 const bool export_mode = !rq.base.format.empty();
+                 const bool continuation = !rq.base.cursor.empty();
                  const char* const verb =
                      export_mode ? "inventory.software.export" : "inventory.software.query";
-                 const std::string audit_key = swc::audit_target(rq.query);
+                 const std::string audit_key = swl::audit_target(rq);
+
+                 // A version range resolves against the title's fleet-wide distinct versions
+                 // (the catalogue comparator) for EVERY caller: the resolved set is a SQL
+                 // predicate only and never appears in a response.
+                 if (rq.has_range()) {
+                     SoftwareVersionsQuery vq;
+                     vq.name = rq.base.query.name;
+                     vq.limit = kCatalogRowCap;
+                     const auto drill = swc::read_versions(
+                         swc::versions_reads(*software_inventory_store), vq);
+                     if (!drill) {
+                         if (drill.error() == swc::VersionsError::kBuilding)
+                             sw_building(req, res, cid, verb, audit_key);
+                         else
+                             sw_503(req, res, cid, verb, audit_key, "version read degraded",
+                                    "software inventory store degraded — version range read "
+                                    "failed");
+                         return;
+                     }
+                     std::vector<std::string> distinct;
+                     distinct.reserve(drill->size());
+                     for (const auto& v : *drill)
+                         distinct.push_back(v.version);
+                     auto set = swl::resolve_version_range(distinct, rq.version_min, rq.version_max);
+                     if (!set) {
+                         res.status = 400;
+                         res.set_content(detail::a4_error(res, set.error()), "application/json");
+                         return;
+                     }
+                     rq.base.query.versions = std::move(*set);
+                 }
 
                  // The model decodes the cursor, pushes the scope into SQL up to
                  // kScopePushdownMaxIds (complete pages, nothing hidden) and post-filters only a
                  // wider scope — the gate's own composed meet(management-group, service-scope)
                  // VisibleSet (#3290). `devices_omitted` is DEFINED as the devices hidden by that
                  // filter (0 under push-down).
-                 const auto read = swc::read_devices_page(
-                     swc::devices_reader(*software_inventory_store), rq, gate.scope);
+                 const auto read =
+                     swl::read_list_page(swc::devices_reader(*software_inventory_store), rq,
+                                         gate.scope);
                  if (!read) {
                      if (read.error()) {
                          res.status = 400;
@@ -11541,15 +11791,34 @@ void RestApiV1::register_routes(
                      // Store degraded (pool/query failure) — surface it, NEVER an empty list.
                      // A silent empty reads as "installed nowhere" for a fleet vuln query
                      // (ADR-0016 §7 authoritative reads; agentic-first A4 failure-vs-empty).
-                     // Audit the degraded access (CC7.2): a CVE-triage caller under a sustained
-                     // outage must still leave a who/when/what trail. Routed through the #1647
-                     // throw-safe kernel (NOT raw audit_fn) so a throwing audit sink can't eat
-                     // the 503 — exact parity with the MCP sibling's mcp_audit (gov chaos CH-3).
+                     // Audit the degraded access (CC7.2) through the #1647 throw-safe kernel.
                      sw_503(req, res, cid, verb, audit_key, "store degraded",
                             "software inventory store degraded — query failed");
                      return;
                  }
                  const auto& page = *read;
+                 const auto facts =
+                     swl::load_device_facts(lookup_facts_reads(), swl::page_agent_ids(page.rows));
+                 if (!facts) {
+                     sw_503(req, res, cid, verb, audit_key, "device facts degraded",
+                            "software inventory store degraded — last-poll read failed");
+                     return;
+                 }
+
+                 // Totals (JSON only). The admission rule is the model's; the decision is the
+                 // gate's: scope == nullopt is the unfiltered (AdmitAll) case, anything engaged
+                 // gets rows and NO totals (a fleet rollup cannot be confined, ADR-0017).
+                 const auto decision =
+                     swl::totals_decision(!gate.scope.has_value(), rq.base.query);
+                 swl::TotalsOutcome totals;
+                 if (!csv && decision.serve) {
+                     totals = swl::read_application_totals(lookup_totals_reads(), rq.base.query);
+                     if (totals.status == swl::TotalsStatus::kDegraded) {
+                         sw_503(req, res, cid, verb, audit_key, "totals degraded",
+                                "software inventory store degraded — totals read failed");
+                         return;
+                     }
+                 }
 
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
                  // bool, surface audit_persisted:false, never withhold. Routed through the
@@ -11564,7 +11833,7 @@ void RestApiV1::register_routes(
                                                            "Inventory", audit_key,
                                                            denied + "; cid=" + cid);
                  const std::string detail_text =
-                     (export_mode ? "installs format=" + rq.format +
+                     (export_mode ? "installs format=" + rq.base.format +
                                         " rows=" + std::to_string(page.rows.size()) +
                                         " truncated=" + (page.hit_cap ? "true" : "false")
                                   : "rows=" + std::to_string(page.rows.size())) +
@@ -11586,15 +11855,19 @@ void RestApiV1::register_routes(
                          res.set_header("X-Next-Cursor", page.next_cursor);
                      if (!audit_ok)
                          res.set_header("Sec-Audit-Failed", "true");
-                     auto body = swc::installs_csv(page.rows);
+                     auto body = swl::list_csv(page.rows, *facts);
                      if (page.hit_cap)
                          body += export_csv_truncation_row(ExportCut{.row_cap = true},
-                                                           swc::kInstallsCsvColumns);
+                                                           swl::kListCsvColumns);
                      res.set_content(std::move(body), "text/csv; charset=utf-8");
                      return;
                  }
-                 auto body = swc::devices_response_json(page.rows, page.next_cursor,
-                                                        page.devices_omitted, page.hit_cap);
+                 auto body = swl::list_response_json(page.rows, *facts, page.next_cursor,
+                                                     page.devices_omitted, page.hit_cap);
+                 if (decision.serve && totals.status == swl::TotalsStatus::kServed)
+                     swl::set_totals(body, totals, false);
+                 else
+                     swl::set_totals_omitted(body, decision.serve ? "building" : decision.omitted);
                  if (!audit_ok)
                      body["audit_persisted"] = false;
                  res.set_content(ok_json(swc::dump_safe(body)), "application/json");

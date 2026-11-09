@@ -745,18 +745,39 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
   selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
-  `ecosystem`, `source` (exact), `limit` (max 1000; 10000 with `format`), `cursor` and `format` (`json` or
-  `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
-  and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
-  `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and
-  `cursor`).
-- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
-  "meta": {"api_version": "v1"}}`. Each row has 14 fields: `{agent_id, name, version,
-  publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
-  distro_id, distro_version, source}` — the v2 fields are `""` where the ecosystem does not
-  store them (see the availability matrix above), and `source` is the
-  `<plugin>.<action>` that produced the row. The MCP tool's rows carry the identical
-  field set.
+  `ecosystem`, `source` (exact), `match` (`exact`, `prefix` or `contains` for `name`),
+  `version_min` / `version_max` (inclusive version range), `status`, `limit` (max 1000; 10000
+  with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
+  `agent_id` for a fleet-wide scan. The full parameter and error tables are in
+  [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
+  `cursor` is REST-only (the MCP tool takes only those).
+- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 22 fields: the 14
+  package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
+  release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
+  ecosystem does not store them (see the availability matrix above); `source` is the
+  `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
+  (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
+  `last_confirmed_at`, `install_type`, `install_scope`, `install_location` and
+  `instance_key`. The MCP tool's rows keep the 14 package fields until its twin catches up.
+- **Lookup totals.** For an exact `name`, an unfiltered (global) caller also gets `totals`
+  `{installs, devices, as_of}`: `installs` counts install rows (a device with two
+  architectures counts twice), `devices` distinct devices. A management-group-confined
+  caller gets its rows and `totals: null` with `totals_omitted: "scope"`: **null means not
+  shown, never zero**. An `unconfirmed` row may be stale or missing and is never proof of
+  absence. `version_min` / `version_max` need an exact `name`; a title with 2000 or more
+  distinct versions must be queried with `version=`.
+- **Components.** `GET /api/v1/inventory/software/components` answers the same question for
+  components found inside applications (libraries and similar artefacts), with the same
+  gate, scope confinement, status and `totals` rule (`instances`, `devices`,
+  `devices_unconfirmed` in `totals`), and the audit verbs
+  `inventory.components.view` / `inventory.components.export`. Components are collected only
+  once the component producer ships, so an empty answer is expected before then. See
+  [rest-api.md](rest-api.md#get-apiv1inventorysoftwarecomponents). The components totals come
+  from an hourly rollup refreshed by the same background thread as the catalogue rollup
+  (`yuzu_inventory_component_rollup_total{outcome}`,
+  `yuzu_inventory_component_rollup_duration_seconds`,
+  `yuzu_inventory_component_rollup_last_success_timestamp`).
 - **Carries the same scope push-down as the MCP tool** — the SAME
   `require_fleet_read` gate, so REST and MCP cannot observe a different
   admit/filter decision for the same caller (see the MCP note above). A positive

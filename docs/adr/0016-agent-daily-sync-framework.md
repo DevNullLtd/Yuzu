@@ -1443,3 +1443,42 @@ build sends no settings to agents.
   a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
   the per-collector switch, and reject any setting it cannot honour, then report the effective version
   it applied. Until the push lands the settings have no effect on any agent.
+
+### 2026-11-09 — the lookup read surface: v3 columns, components, and totals (SAM-17, schema v12)
+
+**Decision.** The first read surface that returns the v3 columns. `GET /api/v1/inventory/software`
+rows gain `hostname`, `last_seen`, `status`, `last_confirmed_at`, `install_type`, `install_scope`,
+`install_location` and `instance_key`, and a new `GET /api/v1/inventory/software/components`
+reads the component store (`software_components`, schema v11) the same way. One call answers
+the lookup question for an application or a component: how many installs, on which devices,
+polled when, in what state.
+
+- **Row status.** `status` is derived from the row's own collection facet (`software_facet_state`
+  for the row's `source`; `component_inventory` for a component) by ONE rule: `disabled` when the
+  facet is switched off, `current` when it last reported a `full` or `delta` section, `unconfirmed`
+  otherwise, including a device with no facet record. The rule is one SQL fragment
+  (`kRowStatusCaseSql`) used by the reads, the status filter, the rollup and the live totals, and
+  its C++ twin is pinned equal to it by a test over every (status, enabled) pair. An unconfirmed
+  row may be stale or missing and is never proof of absence; it is returned by default.
+- **Totals.** `totals` is `{installs, devices, as_of}` (components: `{instances, devices,
+  devices_unconfirmed, as_of}`). `installs` and `instances` count install ROWS everywhere (a
+  device with two architectures counts twice), `devices` distinct devices, so a rollup-served and a
+  live figure agree on one definition. Application totals come from the hourly catalogue rollup
+  (the name-only grain, which gains a `row_count` column) unless a version filter is present, in
+  which case they are ONE live aggregate over the version set (never a sum of per-version distinct
+  counts). Component totals come from a new hourly `component_rollup` (grain 0 per version, grain 1
+  per kind and name, refreshed by the existing rollup thread with its own advisory lock and
+  keep-last-good), or are live for a version filter or no kind. Totals are served only to an
+  unfiltered caller for an exact name; ADR-0017 records why a confined caller gets rows and
+  `totals_omitted: "scope"`.
+- **Version range.** `version_min` / `version_max` resolve against the title's fleet-wide distinct
+  versions under the catalogue comparator into a version set, for every caller; a title at the
+  2000-version read cap is refused. The set is a predicate only.
+- **Schema v12.** `catalog_rollup.row_count` (constant default, metadata-only; the migration also
+  sets the catalogue stamp back to `building` so no reader sees a zero row count beside a non-zero
+  device count), the two component rollup tables, and `software_components_name_idx`. The index is
+  a plain `CREATE INDEX` in the ladder transaction: `software_components` is empty in every
+  deployment until an agent emits component rows (the server apply path is live, the producer ships
+  later), so the build holds its lock for no measurable time.
+- **Not changed.** The MCP `query_installed_software` rows keep their 14 fields; the twin is a
+  later change (recorded in `docs/api-parity-ledger.md`).

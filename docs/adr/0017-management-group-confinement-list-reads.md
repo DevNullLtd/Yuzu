@@ -318,6 +318,16 @@ gate.
     alternative and are out of scope). It **MUST NOT** be left on the flipped gate, or it becomes an
     INV-3 cross-group count leak. The UI scope caveat is *not* the safeguard (it shows only to
     operators who already hold global read); this ADR entry is.
+  - **Update (2026-11-09, SAM-17):** the list routes `GET /api/v1/inventory/software` and
+    `GET /api/v1/inventory/software/components` return a `totals` block (install rows or
+    instances, distinct devices) that reads the same shape of fleet-wide aggregate. It is served
+    **only** when the gate admitted the caller unfiltered (`ListReadDecision::AdmitAll`, an
+    unfiltered `FleetReadGate` scope) **and** the request is an exact-name lookup with at most one
+    version filter. A confined caller (`AdmitScoped`) gets its scoped rows and `totals: null` with
+    `totals_omitted: "scope"`; distinct counts are not additive across groups, so no confined
+    total can be derived from a fleet one. `null` documents "not shown", never zero. The
+    components figures come from a new fleet-wide rollup (`component_rollup`) that falls under
+    the same rule.
 - **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
   confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)

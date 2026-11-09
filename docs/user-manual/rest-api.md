@@ -8673,7 +8673,10 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 |---|---|---|---|
 | `name` | string | No | Exact software-name filter |
 | `agent_id` | string | No | Exact agent filter |
-| `version` | string | No | Exact version filter. A **present-empty** value (`?version=`) selects only the rows with an empty version; omit the parameter for any version |
+| `version` | string | No | Exact version filter. A **present-empty** value (`?version=`) selects only the rows with an empty version; omit the parameter for any version |; needs `name` with `match=exact` |
+| `match` | `exact` \| `prefix` \| `contains` | No | How `name` matches (default `exact`). `prefix` is a literal prefix, `contains` a literal case-insensitive substring (`%` and `_` are not wildcards). Both need `name` |
+| `version_min` / `version_max` | string | No | Inclusive version bounds under the catalogue comparator (`1.10` is above `1.9`; `2.0` is above `2.0-rc1`). Need `name` with `match=exact`; not combined with `version` |
+| `status` | `current` \| `unconfirmed` \| `disabled` | No | Row status filter. **Never applied by default**: unconfirmed rows are returned unless you ask otherwise |
 | `q` | string | No | Case-insensitive literal substring over name, publisher, ecosystem and source (`%`/`_` are not wildcards; clamped to 128 bytes) |
 | `kind` / `ecosystem` | string | No | Exact filters; an empty value means no filter |
 | `source` | string | No | Exact source filter. `source` is an **open set** (`<plugin>.<action>`), never an enum |
@@ -8681,7 +8684,7 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 | `cursor` | string | No | Opaque `next_cursor` from the previous page (see below) |
 | `format` | `json` \| `csv` | No | Selects **export mode**: a single response of up to 10000 rows |
 
-`q`, `kind`, `ecosystem` and `source` are **REST-only** on this route: its MCP twin `query_installed_software` takes `name`, `agent_id`, `version`, `limit` and `cursor` only (see [mcp.md](mcp.md)).
+`q`, `kind`, `ecosystem`, `source`, `match`, `version_min`, `version_max` and `status`, and every lookup field and the `totals` block below, are **REST-only** on this route until its MCP twin catches up: its MCP twin `query_installed_software` takes `name`, `agent_id`, `version`, `limit` and `cursor` only (see [mcp.md](mcp.md)).
 
 Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid UTF-8 or contains a NUL byte, an `agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, a `name`/`version` over 1024 bytes, a non-integer `limit`, an unknown `format` or a refused `cursor` is a `400` (never a retryable `503`). An unknown `kind` or `ecosystem` value is not refused: it matches nothing and returns an empty `200` (the OpenAPI enum is descriptive, not enforced).
 
@@ -8711,15 +8714,39 @@ Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid 
 
 Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`) alongside the original four. A field the source ecosystem does not store is `""` — **never synthesised** (a Windows/macOS app row is honestly empty on every NEVRA/signature/distro field, as in the second example above). These 8 keys are **always present in every row** (never absent) — integration code should test for an empty-string value, not key absence. See `docs/user-manual/inventory.md` for the full per-ecosystem availability matrix.
 
-Every row carries `source` — the `<plugin>.<action>` that produced it (an **open set**; `""` for rows ingested before the field existed). Rows therefore have **14 fields**.
+Every row carries `source` — the `<plugin>.<action>` that produced it (an **open set**; `""` for rows ingested before the field existed). The original row has **14 fields** (the lookup fields below make 22).
 
 `publisher` is an unverified attribution and is never empty: the declared vendor, else the origin label `via:<ecosystem>` (for example `via:snap`) when the source declares none.
+
+**Lookup fields.** Each row also carries eight fields that answer "which devices, polled when, in what state":
+
+| Field | Meaning |
+|---|---|
+| `hostname` | The device registry's hostname, or `null` when the registry does not know the device. One roster read per page |
+| `last_seen` | Epoch seconds of the device's last accepted installed-software report (the last poll), or `null` if it never synced |
+| `status` | `current` when the row's collection facet last reported a `full` or `delta` section; `disabled` when that facet is switched off; `unconfirmed` for anything else, including a device with no facet record (for example one still reporting the older blob format). **An `unconfirmed` row may be stale or missing: it is never proof of absence** |
+| `last_confirmed_at` | Epoch seconds the facet last confirmed a `full` or `delta` section, or `null` if never |
+| `install_type`, `install_scope`, `install_location`, `instance_key` | The server-derived install classification, the scope (`machine`), the install path and the row's stable identity hash |
+
+Rows therefore have **22 fields**; the original 14 are unchanged. `format=csv` carries the same 22 columns (`hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,instance_key` after the original header), so an external consumer that pinned 14 columns must read by header name.
+
+**Version ranges.** `version_min` and `version_max` are resolved against the title's fleet-wide distinct versions (the hourly catalogue's version list) under the catalogue's transitive comparator, for **every** caller; the resolved set is a query predicate only and never appears in a response. A title with 2000 or more distinct versions cannot be resolved and answers `400` (`version range not resolvable for this title; use version=`). Before the first catalogue refresh a range is a `503` with `retry_after_ms`.
+
+**Totals.** The response carries a `totals` block, `{installs, devices, as_of}`, **only** when the caller has unfiltered (global) access **and** the request is `name` with `match=exact`, optionally with one version filter (`version`, or `version_min`/`version_max`). `installs` counts install **rows** (a device with two architectures counts twice), `devices` counts **distinct devices**, and `as_of` is the catalogue refresh epoch the figure was read from, or `null` when it was computed live (any version filter). Both figures are exact: a device on two versions inside a range counts once in `devices`. In every other case `totals` is `null` and `totals_omitted` says why:
+
+| `totals_omitted` | Meaning |
+|---|---|
+| `scope` | The caller is confined to management groups or a service tag. A fleet total cannot be confined (ADR-0017), so a confined caller gets **rows but no total**. `null` here means *not shown*, **never zero** |
+| `filters` | The request is not a plain exact-name lookup (`agent_id`, `q`, `status`, `kind`, `ecosystem`, `source`, or a `prefix`/`contains` match) |
+| `building` | The catalogue has not been computed yet; retry after the first hourly refresh |
+
+A degraded totals read is a `503` with `retry_after_ms`, never a `null` a client could read as zero. CSV exports carry no totals.
 
 **Pagination (keyset).** `next_cursor` is non-null when more rows may exist (`result_truncated_by_cap: true` is set at the same moment — also in export mode); pass it back as `cursor` to continue. The cursor is **opaque** — never parse it. It is bound to the filter set: a malformed cursor, or one issued for a different filter set, is a `400` (`invalid cursor` / `cursor was issued for a different filter set`), never a silent restart. Under push-down the cursor is the last row of the page. When the page was post-filtered (below), a page can be short or empty while `next_cursor` is non-null — keep paging until `next_cursor` is `null`; that cursor never names a row you were not served (see the Scope paragraph).
 
 **Scope (`devices_omitted` — re-specified).** The gate's composed `meet(management-group, service-scope)` visibility set is **pushed into SQL** (`agent_id = ANY(...)`) for up to 10 000 visible devices, so a confined caller (management-group-confined operator or a correctly-confined service-scoped token) gets **complete pages of its own devices** and nothing is hidden. `devices_omitted` is the count of distinct devices hidden by the **in-process post-filter** used only for a scope wider than that bound. It is `0` under push-down, so there an empty page means no matching software in your scope. Above 10 000 visible devices it is a distinct-device count **within the scanned window(s)** and still signals that out-of-scope matches exist (bounded and audited). A `denied` audit row is written when it is greater than `0`, or when the request names an `agent_id` outside the caller's scope (the response is then empty with `devices_omitted` unchanged; the row says `agent_id outside the caller's scope`). On a wide scope the page is refilled with at most four bounded store reads, so a page can be empty with a non-null `next_cursor`; the cursor then re-anchors at the last row **you were served** (or at the start) and carries a count of the rows scanned since, which the next request passes over — no identifier, name or version of an out-of-scope row is ever in it. A row inserted inside that skipped span during a walk can be missed or repeated, the same class as the `install_id` churn already noted for concurrent resyncs; a wide-scope walk is best-effort under concurrent change, because the count is of positions: deleting an out-of-scope row inside the skipped span between pages, or widening the caller's scope between pages, can make the next page skip or repeat a row. A long run of out-of-scope rows costs proportionally more to resume, and a statement timeout there degrades the page to a 503 (tracked in #5698). An export on a wide scope reads at most four bounded windows, so it can hold fewer than `limit` rows with `X-Result-Truncated-By-Cap` set. `result_truncated_by_cap` is present only when more rows may exist (push-down: `count == limit`; wide scope: the page filled early or the read bound was reached). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
 
-**Export mode.** `format=csv` returns `text/csv; charset=utf-8` with `Content-Disposition: attachment; filename="software-installs.csv"` and the header row `agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,signature_status,distro_id,distro_version,source`; `format=json` returns the usual object. `limit` is the **total** row cap (default and maximum 10000); when more rows may exist the response carries `X-Result-Truncated-By-Cap: true` and `X-Next-Cursor: <cursor>` (CSV, whose body then ends with a `# result_truncated_by_cap cause=row_cap` trailer record of 14 fields) or `result_truncated_by_cap: true` and `next_cursor` (JSON); pass the cursor back as `cursor` with the same `format` to read on. Exports are audited as `inventory.software.export` and are REST-only (an agent pages the same data through the MCP cursor). Service-scoped tokens stay admitted — confined — on this route, **including export**, unlike the two catalogue routes below.
+**Export mode.** `format=csv` returns `text/csv; charset=utf-8` with `Content-Disposition: attachment; filename="software-installs.csv"` and the 22-column header row `agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,signature_status,distro_id,distro_version,source,hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,instance_key`; `format=json` returns the usual object. `limit` is the **total** row cap (default and maximum 10000); when more rows may exist the response carries `X-Result-Truncated-By-Cap: true` and `X-Next-Cursor: <cursor>` (CSV, whose body then ends with a `# result_truncated_by_cap cause=row_cap` trailer record of 22 fields) or `result_truncated_by_cap: true` and `next_cursor` (JSON); pass the cursor back as `cursor` with the same `format` to read on. Exports are audited as `inventory.software.export` and are REST-only (an agent pages the same data through the MCP cursor). Service-scoped tokens stay admitted — confined — on this route, **including export**, unlike the two catalogue routes below.
 
 **Audit.** Every call that is served writes a `success` row — `inventory.software.query`, or `inventory.software.export` in export mode (continuation pages carry `page=continuation` in the detail), with the target `fleet` / `agent=<id>` / `name=<n>` (`name=<n>;agent=<id>` when both are set) plus the active filters; a `400` writes nothing. Because the cursor is opaque but unauthenticated (a hand-made well-formed cursor is accepted), per-call audit is what keeps a forged cursor from walking the fleet unrecorded.
 
@@ -8729,12 +8756,28 @@ Every row carries `source` — the `<plugin>.<action>` that produced it (an **op
 
 | Status | Condition |
 |---|---|
-| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes) |
+| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes); an unknown `match` or `status`; a `version`, `version_min` or `version_max` without `name` and `match=exact`, or `version` together with a range; or a range that cannot be resolved |
 | 401 | Unauthenticated |
 | 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
 | 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded (including a failed read of the `ITServiceOwner` ceiling for a service-scoped token), the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
 On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+
+#### `GET /api/v1/inventory/software/components`
+
+Looks up **components**: libraries and similar artefacts found inside an application, one row per (device, component path), from the component inventory of the typed store. No agent reports components yet, so an empty answer is expected until the component producer ships.
+
+**Permission and scope:** exactly the raw installs route above: `Inventory:Read` through `require_fleet_read` as the sole gate, rows confined to the caller's management groups and service tag on every page, a denied named `agent_id` answered with an empty page and a `denied` audit row.
+
+**Query parameters:** `name` (with `match=exact|prefix|contains`, default `exact`), `kind`, `version`, `version_min` / `version_max` (inclusive, the catalogue comparator; they need `name` with `match=exact`, and resolve against the component's fleet-wide distinct versions with the same 2000-version limit as the installs route), `agent_id`, `q` (literal substring over name, path and anchor application), `status`, `limit` (default 100, max 1000), `cursor`, `format=json|csv`. Repeated parameters keep the first value.
+
+**Response (200):** `{"data": {"components": [...], "count", "next_cursor", "devices_omitted", "totals", "totals_omitted"?, "result_truncated_by_cap"?}}`. Each component row carries `agent_id`, `hostname` (`null` if unknown), `last_seen` (the device's last accepted installed-software report, `null` if never), `kind`, `name`, `version`, `version_source`, `path`, `anchor_app`, `first_seen`, `status` and `last_confirmed_at` (`null` if never). `status` is derived from the device's `component_inventory` facet exactly as on the installs route; unconfirmed rows are **included by default** and `status=current` excludes them.
+
+**Totals.** `totals` is `{instances, devices, devices_unconfirmed, as_of}` and follows the installs route's rule: served only to an unfiltered (global) caller for `name` with `match=exact`, optionally with `kind` and one version filter; otherwise `null` with `totals_omitted` of `scope`, `filters` or `building`. `instances` counts component rows, `devices` distinct devices, `devices_unconfirmed` the distinct devices whose status is not `current`. A `kind` with no version filter is served from the hourly components rollup (`as_of` is its refresh epoch; `building` until the first refresh); any version filter, or no `kind`, is a live exact count (`as_of` is `null`). A degraded totals read is a `503` with `retry_after_ms`.
+
+**Export and audit.** `format=csv` returns the 12-column `text/csv` `agent_id,hostname,last_seen,kind,name,version,version_source,path,anchor_app,first_seen,status,last_confirmed_at`; `limit` is the total cap (default and max 10000), and a capped export carries `X-Result-Truncated-By-Cap`, `X-Next-Cursor` and an in-band trailer record, as the installs export does. Every served call is audited as `inventory.components.view` (`inventory.components.export` for an export; continuation pages carry `page=continuation`); a `400` writes nothing.
+
+**Errors:** as the installs route: `400` for a malformed parameter, a version filter without `name` and `match=exact`, an unresolvable range or a refused cursor; `401`; `403`; `503` (store, last-poll, version or totals read degraded, or a range before the first components refresh) with `retry_after_ms`, **never an empty 200**.
 
 #### `GET /api/v1/inventory/software/catalogue`
 
