@@ -144,7 +144,9 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
 // section's outcome into the per-section nack (`installed_software:<facet>`; the whole-source
 // `installed_software` nack is kept for a blob that cannot be attributed to sections at all)
 // and the section counter. Returns the source-level `yuzu_inventory_ingest_total` outcome.
-// A refused section never stops the others: the store applies every section that parsed.
+// A refused section never stops the others: the store applies every section that parsed, and a
+// delta or component section that does not verify is rolled back alone (`mismatch`) and nacked
+// like a refused one, so the agent resends that facet in full.
 const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& agent_id,
                            const std::string& blob, pb::InventoryAck& ack,
                            ::yuzu::MetricsRegistry* metrics) {
@@ -223,7 +225,7 @@ void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics) {
     metrics.describe("yuzu_inventory_section_ingest_total",
                      "Blob-v3 installed-software section outcomes by facet and outcome "
                      "(facet = a collector source, component_inventory, or unknown; "
-                     "outcome = stored/status_only/need_full/delta_unsupported/rejected/"
+                     "outcome = stored/status_only/need_full/mismatch/rejected/"
                      "error; moves only once a v3 agent reports)",
                      "counter");
     const auto seed = [&](const std::string& facet) {
@@ -235,6 +237,15 @@ void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics) {
         seed(std::string(src.value));
     seed(std::string(kComponentInventoryFacet));
     seed("unknown");
+
+    metrics.describe("yuzu_software_changes_total",
+                     "Install-history ledger rows written by applied installed-software "
+                     "sections, by kind (install/remove/upgrade); a baseline section writes "
+                     "none",
+                     "counter");
+    for (const auto kind : kSoftwareChangeKinds)
+        metrics.counter("yuzu_software_changes_total",
+                        {{"kind", std::string(software_change_kind_name(kind))}});
 }
 
 bool validate_inventory_report_source_count(const std::string& agent_id,
