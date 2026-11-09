@@ -2,7 +2,7 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
-## ⚠️ Breaking: role removal and engine-role assignment refuse a role name containing a control byte
+## ⚠️ Breaking: role removal, engine-role assignment and management-group member and role routes refuse a control byte
 
 **What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (`DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (`POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F). REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name` (the value is never echoed). The check runs before the principal or role is looked up. Every other role name is accepted unchanged, including one granted out of band, spaces and UTF-8 included.
 
@@ -14,14 +14,31 @@ SELECT name FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]';
 
 An empty result means nothing is affected. (A Postgres text column cannot store a NUL byte, so only the other control bytes can appear in a stored name.)
 
-**What to do.** Delete or rename the role in SQL: `DELETE FROM rbac_store.roles WHERE name = '<name>';` removes its permissions and every grant of it (both tables reference `roles(name)` with `ON DELETE CASCADE`). Re-create the role under a clean name if it is still needed, then grant it again.
+**What to do.** Delete the role in SQL: `DELETE FROM rbac_store.roles WHERE name = '<name>';` removes its permissions and every grant of it (the three tables that reference `roles(name)`, `principal_roles`, `role_permissions` and `revoked_seed_defaults`, do so with `ON DELETE CASCADE`). A role cannot be renamed in place: those tables hold no `ON UPDATE CASCADE`, so a role that has grants cannot be renamed. Re-create the role under a clean name if it is still needed, then grant it again. A direct SQL delete does not bump the RBAC generation, so restart every serving replica afterwards; until then, or until another RBAC write, cached permissions can keep being served. This SQL is unsupported and is not recorded in the in-product audit log, so record it in the change ticket.
+
+**Management-group members and roles.** The same rule now applies to the management-group routes. Removing a member (`DELETE /api/v1/management-groups/{id}/members/{agent_id}`) and unassigning a role (`DELETE /api/v1/management-groups/{id}/roles`) refuse a control byte in `agent_id`, or in `role_name`, `principal_id` or `principal_type`, with `400` and an audit row `result=denied` (`invalid_agent_id`, `invalid_role_name`, `invalid_principal_id`, `invalid_principal_type`). Adding a member and assigning a role (`POST .../members`, `POST .../roles`, and the MCP tools `add_management_group_member` and `assign_management_group_role`) refuse it too, with `400` on REST and -32602 on MCP, and these two also refuse an `agent_id` or `principal_id` that is not valid UTF-8. A management group that does not exist now answers `404` on those add and assign routes (and the sibling tools' `group not found` invalid-params error on MCP) instead of a server error. A store fault answers `503` (MCP: a retryable internal error) with audit `result=failure`, `detail=store_error`.
+
+A member or grant whose stored id already carries a control byte (it can only have been written out of band) therefore cannot be removed through the API. To find them, run:
+
+```sql
+SELECT group_id, agent_id FROM management_group_store.management_group_members
+ WHERE agent_id ~ '[\x01-\x1f\x7f]';
+SELECT group_id, principal_type, principal_id, role_name FROM management_group_store.management_group_roles
+ WHERE principal_type ~ '[\x01-\x1f\x7f]' OR principal_id ~ '[\x01-\x1f\x7f]'
+    OR role_name ~ '[\x01-\x1f\x7f]';
+```
+
+An empty result means nothing is affected. Remove each row with a `DELETE` on that table that names its full key (`group_id` and `agent_id`, or `group_id`, `principal_type`, `principal_id` and `role_name`). This SQL is unsupported and is not recorded in the in-product audit log, so record it in the change ticket, and restart every serving replica afterwards, because a direct SQL change does not notify the other replicas.
 
 **Other behaviour changes in the same release.**
 
 - A text value containing a NUL byte is refused rather than shortened. Where an input check exists the answer is a client error (`400`, or -32602 on MCP). Elsewhere the refusal surfaces as a server error that retrying will not fix: treat it as permanent and do not retry. Database logs may show new SQLSTATE `22021` errors from a statement beginning `DO $yuzu_param$`; the value is never logged. The server's database role needs `USAGE` on the `plpgsql` language, which every database grants by default.
 - Directory sync: a record with a NUL byte in a key field (user id, UPN or email; group id; a member id) is skipped and counted; a NUL byte in a display field (display name, group description) is replaced with U+FFFD and the record is kept. A snapshot in which every user, or every group, would be skipped is refused and the stored roster is left unchanged. An already-synced record that gains a NUL byte in a key field is removed on the next sync, as any record absent upstream is.
 - A gateway that sends a NUL byte in a stream identifier receives `INVALID_ARGUMENT`.
-- Management-group member and role removal routes, OTA package upload and removal, and schedule enable, disable and delete now report a store failure (`503`, audit `result=failure`, `detail=store_error`) instead of a success answer and a success audit row; a NUL or control byte in the identifying fields is refused with `400`.
+- Management-group member and role routes, OTA package upload and removal, and schedule enable, disable and delete now report a store failure (`503`, audit `result=failure`, `detail=store_error`) instead of a success answer and a success audit row; a NUL or control byte in the identifying fields is refused with `400`.
+- OTA package upload: a failed registry write now restores the previously published binary and signature sidecar of the same filename (the new files are removed, and the answer stays `503` with audit `result=failure`, `detail=store_error`), so the package and its registry row are exactly as before the upload. An invalid UTF-8 byte sequence in the platform, architecture or filename is refused with `400` (`result=denied`, `detail=invalid_package_field`) before anything is written, and the same refusal applies to the key fields of an OTA package delete. A delete whose registry read fails answers `503` and leaves the files in place.
+- Schedules: `POST /api/schedules/{id}/enable` and `DELETE /api/schedules/{id}` tell a schedule that does not exist (`404` for enable and disable, `200` with `deleted: false` for delete, no audit row) from a store fault (`503`, `result=failure`, `detail=store_error`, with `retry_after_ms`) by reading that one id for the caller as owner, however many schedules exist. `POST /api/schedules` answers `400` for a NUL byte in a text field (audited `result=denied`, `detail=field_contains_nul`) and for a value the store refuses as invalid text or as a constraint violation (including a byte sequence that is not valid UTF-8, no audit row), and `503` for a store fault (audited `result=failure`, `detail=store_error`). An id containing a control byte is `400` on delete and enable. The strings `"true"` and `"false"` remain accepted for `enabled`.
+- Directory sync: the response of `POST /api/directory/sync` and the `directory.sync` success audit row (`Entra ID sync completed applied_users=<n> applied_groups=<n> skipped=<n>`) report the counts this sync applied, not a second read of the status row or a running total. The status row carries a note (`<n> record(s) skipped, <m> field(s) sanitized (embedded NUL)`) when records were skipped or fields sanitized.
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; this page does not describe it as supported, and it is not a procedure for a rolling or mixed-version upgrade.
 

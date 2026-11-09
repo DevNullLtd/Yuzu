@@ -501,6 +501,8 @@ curl -s -X POST http://localhost:8080/api/settings/updates/upload \
 | `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`). An empty value is the default; a malformed value (`0x5`, `5abc`, `1e1`) is `400` and nothing is stored, it never becomes `100`; an out-of-range integer is clamped to 0--100 |
 | `mandatory` | No | Whether agents must apply this update (`true`/`false`, default: `false`) |
 
+The `platform`, `arch` and file name must not contain a NUL or other control byte, and must be valid UTF-8; otherwise the upload is refused with `400` (audited `ota.package.uploaded`, `result=denied`, `detail=invalid_package_field`) before anything is written. If the registry write fails after the files were published, the answer is `503` and the package is left exactly as it was: the new files are removed and, when the upload replaced a package of the same file name, the earlier binary and signature sidecar are put back. A later successful upload of that file name leaves no backup files behind.
+
 ### View Available Updates
 
 ```bash
@@ -535,6 +537,8 @@ curl -s -X DELETE http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4 
   -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
+
+A platform, architecture or version containing a control byte or invalid UTF-8 is refused with `400` (`result=denied`, `detail=invalid_package_field`). If the registry cannot be read or the row cannot be deleted, the answer is `503` (`result=failure`, `detail=store_error`) and the binary and signature sidecar are left in place.
 
 ---
 

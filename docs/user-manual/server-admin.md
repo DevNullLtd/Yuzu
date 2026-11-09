@@ -364,7 +364,7 @@ separately.
 
 > **Fresh deployment only for 0.15.0.** Entries below that tell you to upgrade, roll back or restore an earlier build are historical and not a supported path (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Entries describing behaviour of the 0.15.0 build still apply.
 
-### vNEXT - role removal and engine-role assignment refuse a role name containing a control byte; a NUL byte in a database text value is refused (breaking for deployments with such a role)
+### vNEXT - role removal, engine-role assignment and management-group member and role routes refuse a control byte; a NUL byte in a database text value is refused (breaking for deployments with such a role or member)
 
 **What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (REST `DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (REST `POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F): REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name`. Every other role name is accepted, including one granted out of band. Separately, a text value containing a NUL byte is now refused rather than shortened before it reaches the database.
 
@@ -374,13 +374,26 @@ separately.
 SELECT name FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]';
 ```
 
-**What to do.** Delete or rename the role in SQL (`DELETE FROM rbac_store.roles WHERE name = '<name>';` also removes its permissions and every grant of it, through the foreign keys' `ON DELETE CASCADE`), then re-create it under a clean name if it is still needed and grant it again.
+**What to do.** Delete the role in SQL (`DELETE FROM rbac_store.roles WHERE name = '<name>';` also removes its permissions and every grant of it, through the foreign keys' `ON DELETE CASCADE` on `principal_roles`, `role_permissions` and `revoked_seed_defaults`; a role that has grants cannot be renamed, because those foreign keys have no `ON UPDATE CASCADE`), then re-create it under a clean name if it is still needed and grant it again. A direct SQL delete does not bump the RBAC generation, so restart every serving replica afterwards (cached permissions can keep being served until a restart or another RBAC write). This SQL is unsupported and not audited, so record it in the change ticket.
+
+**Management-group members and roles.** Removing a member or unassigning a role on a management group (REST) refuses a control byte in `agent_id`, `role_name`, `principal_id` or `principal_type` with `400`; adding a member and assigning a role (REST and the MCP tools `add_management_group_member` and `assign_management_group_role`) refuse it too, and an `agent_id` or `principal_id` that is not valid UTF-8. A missing group answers `404` on add and assign, and a store fault `503` (`result=failure`, `detail=store_error`). A member or grant whose stored id already carries a control byte can no longer be removed through the API. Find them with:
+
+```sql
+SELECT group_id, agent_id FROM management_group_store.management_group_members
+ WHERE agent_id ~ '[\x01-\x1f\x7f]';
+SELECT group_id, principal_type, principal_id, role_name FROM management_group_store.management_group_roles
+ WHERE principal_type ~ '[\x01-\x1f\x7f]' OR principal_id ~ '[\x01-\x1f\x7f]'
+    OR role_name ~ '[\x01-\x1f\x7f]';
+```
+
+Remove each row with a `DELETE` that names its full key. This SQL is unsupported and not audited, so record it in the change ticket, and restart every serving replica afterwards (a direct SQL change does not notify the other replicas).
 
 **Other effects.**
 
 - Where an input check exists, a NUL byte is answered as a client error (`400`, or -32602 on MCP). Elsewhere it may surface as a server error that retrying will not fix: treat it as permanent and do not retry. Database logs may show new SQLSTATE `22021` errors from a statement beginning `DO $yuzu_param$`; the value itself is never logged.
 - Directory sync skips and counts a record with a NUL byte in a key field, replaces a NUL byte in a display field with U+FFFD, and refuses a snapshot in which every user (or every group) would be skipped, leaving the stored roster unchanged. An already-synced record that gains a NUL byte in a key field is removed on the next sync, as any record absent upstream is.
 - A gateway that sends a NUL byte in a stream identifier receives `INVALID_ARGUMENT`.
+- OTA package upload restores the previously published binary and signature sidecar of the same filename when the registry write fails (the answer stays `503`), and refuses invalid UTF-8 in the platform, architecture or filename (and in the delete route's key fields) with `400`. Schedule enable, disable and delete answer `404`/`503` instead of `200` when the change did not apply, and schedule create answers `400` for a NUL or other refused text and `503` for a store fault. The Entra directory sync response and audit row report the counts that sync applied.
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)): every server replica and gateway runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; mixed-version operation is not supported. See also [Upgrading](upgrading.md).
 
@@ -4923,7 +4936,7 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
 
-**Database role privileges.** The server's database role needs `USAGE` on the `plpgsql` procedural language, which PostgreSQL grants to every role by default (a deployment that revoked it from `PUBLIC` must grant it back): `pg::exec_params` refuses a bound text value that contains a NUL byte with a server-side `DO` block, and without `USAGE` that refusal would surface as a permission error instead of the NUL-byte message.
+**Database role privileges.** The server's database role needs `USAGE` on the `plpgsql` procedural language, which PostgreSQL grants to every role by default (a deployment that revoked it from `PUBLIC` must grant it back, for example `GRANT USAGE ON LANGUAGE plpgsql TO <role>;` with `<role>` the server's database role): `pg::exec_params` refuses a bound text value that contains a NUL byte with a server-side `DO` block, and without `USAGE` that refusal would surface as a permission error instead of the NUL-byte message.
 
 **Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election, **plus one** for the `/readyz` reachability probe (HA WS-8). (The probe's connection runs one plain query per tick and holds no session state, so unlike the leader-election connection it works through a transaction-mode pooler; it reconnects after any failure.) Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 
