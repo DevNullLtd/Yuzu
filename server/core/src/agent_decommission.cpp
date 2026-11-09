@@ -12,6 +12,7 @@
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
 #include "certificate_inventory_store.hpp"
+#include "guaranteed_state_store.hpp"
 #include "offline_endpoint_store.hpp"
 
 namespace yuzu::server {
@@ -95,6 +96,16 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                                   return p->delete_agent(id);
                               })
                             : nullptr});
+    // The ninth store (#5675): the Guardian compliance census. `deleted` here means the device's
+    // guardian_agent_rule_status rows were erased and its pending census evidence retired in one
+    // transaction. The Guardian event log and the DEX observations are NOT erased (they expire by
+    // retention), so Deleted must not be read as "every Guardian row for the device is gone".
+    targets_.push_back(
+        {"guaranteed_state", stores.guaranteed_state
+                                 ? Fn([p = stores.guaranteed_state](std::string_view id) {
+                                       return p->delete_agent(id);
+                                   })
+                                 : nullptr});
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {

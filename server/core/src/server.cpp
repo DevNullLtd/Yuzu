@@ -10857,8 +10857,10 @@ public:
     /// PR7.2) — a device-level erasure grant covering the cascade's whole blast
     /// radius — plus audit-before-erase fail-closed (Decision 11). ADDING A STORE
     /// BELOW? Add it to `AgentDecommissionStores`, `agent_decommission.cpp`'s
-    /// registration list, and `kCascadeStoreCount` — the securable no longer
-    /// changes.
+    /// registration list, `kCascadeStoreCount` and this initializer (nothing but
+    /// tests/test_decommission_wiring_lexical.py notices a store registered but never
+    /// wired here: it would be Skipped for every operator decommission); the securable
+    /// no longer changes.
     /// Today's OTHER agent-removal paths (registry session teardown, enrollment
     /// deny/remove, cert revocation) are non-durable-data by design and deliberately
     /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
@@ -10873,6 +10875,7 @@ public:
             .app_usage = app_usage_store_.get(),
             .offline_endpoint = offline_endpoint_store_.get(),
             .certificate_inventory = certificate_inventory_store_.get(),
+            .guaranteed_state = guaranteed_state_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }

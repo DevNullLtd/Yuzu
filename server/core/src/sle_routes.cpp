@@ -205,7 +205,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // exists). Gate: ONE SCOPED securable, `Decommission:Delete` (ADR-0024 Decision
     // 9, amended Wave 7 PR7.2) — a device-level erasure grant that authorizes for
     // the cascade's WHOLE blast radius, not the individual securables that govern
-    // each store's READ. The radius is EIGHT stores: InventoryStore,
+    // each store's READ. The radius is NINE stores: InventoryStore,
     // SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by
     // `Inventory`), AppPerfDailyStore (read-gated by `GuaranteedState` — DEX
     // behavioural PII), SoftwareLicensingStore (read-gated by
@@ -213,7 +213,9 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // Wave 7 PR7.2), and OfflineEndpointStore (#5682: the endpoint_state
     // presence row, read on /hardware under `Inventory` and /viz/fleet under
     // `Response`), and CertificateInventoryStore (slice-2 PR 2a-2a: fleet certificate
-    // inventory; read securable arrives in PR 2a-2b).
+    // inventory; read securable arrives in PR 2a-2b), and GuaranteedStateStore (#5675: the
+    // Guardian compliance census, read-gated by `GuaranteedState`; the device's pending census
+    // evidence is retired, its Guardian event log and DEX observations are not erased).
     // Compat: the seeded
     // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
     // via seed_defaults() with no migration); an operator-authored custom role that
@@ -251,8 +253,9 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
             // ONE scoped gate for the cascade's whole blast radius (ADR-0024
             // Decision 9, amended Wave 7 PR7.2). Keep this in lockstep with
             // AgentDecommissionStores (the drift guard in test_agent_decommission.cpp
-            // pins the COUNT of registered targets via kCascadeStoreCount; it does
-            // not verify that every member is wired).
+            // pins the COUNT of registered targets via kCascadeStoreCount;
+            // tests/test_decommission_wiring_lexical.py verifies every member is wired in
+            // ServerImpl::decommission_agent).
             if (!scoped_perm_fn_(req, res, "Decommission", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
             if (!decommission_fn_) {

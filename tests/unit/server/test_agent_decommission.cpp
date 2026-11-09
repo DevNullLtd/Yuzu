@@ -11,7 +11,7 @@
 //     through the `add_store` seam with recording/throwing/failing fakes (no
 //     database needed);
 //   * a real-store fan-out ([pg][decommission][software_licensing]) — populate
-//     all eight stores (all born-on-PG), decommission one agent, and assert its
+//     all nine stores (all born-on-PG), decommission one agent, and assert its
 //     rows are gone from EVERY store while a bystander survives, including the
 //     software_licensing, app_usage and offline_endpoint (#5682) stores.
 
@@ -21,6 +21,7 @@
 
 #include "app_perf_daily_store.hpp"
 #include "device_ci_kinds.hpp"
+#include "guaranteed_state_store.hpp"
 #include "device_inventory_store.hpp"
 #include "inventory_ingest_outcome.hpp"
 #include "inventory_store.hpp"
@@ -250,12 +251,13 @@ TEST_CASE("AgentDecommission null-store constructor registers every store as Ski
     // The all-null construction (a deployment that configured no per-agent
     // stores) fans to nothing but still audits one line per store.
     AgentDecommission cascade{AgentDecommissionStores{}};
-    CHECK(cascade.target_count() == 8); // inventory + 5 typed projections + presence + certs
+    CHECK(cascade.target_count() == 9); // inventory + 5 typed projections + presence + certs +
+                                        // the Guardian census (guaranteed_state, #5675)
 
     const auto result = cascade.decommission("agent-x");
     CHECK(result.deleted == 0);
     CHECK(result.failed == 0);
-    CHECK(result.skipped == 8);
+    CHECK(result.skipped == 9);
     // The Decision-11 store is present in the audit even when unconfigured.
     const auto* sl = find_store(result, "software_licensing");
     REQUIRE(sl != nullptr);
@@ -282,9 +284,10 @@ yuzu::test::PgTestTemplate decommission_tpl{"decommission", [](const std::string
     yuzu::server::AppUsageStore app_usage{pool};
     yuzu::server::OfflineEndpointStore offline_endpoint{pool};
     yuzu::server::CertificateInventoryStore certificate_inventory{pool};
-    if (!certificate_inventory.is_open() || !inventory.is_open() || !software_inventory.is_open() || !app_perf_daily.is_open() ||
-        !device_inventory.is_open() || !software_licensing.is_open() || !app_usage.is_open() ||
-        !offline_endpoint.is_open())
+    yuzu::server::GuaranteedStateStore guaranteed_state{pool}; // #5675: the ninth store
+    if (!guaranteed_state.is_open() || !certificate_inventory.is_open() || !inventory.is_open() ||
+        !software_inventory.is_open() || !app_perf_daily.is_open() || !device_inventory.is_open() ||
+        !software_licensing.is_open() || !app_usage.is_open() || !offline_endpoint.is_open())
         throw std::runtime_error("decommission template: a store failed to migrate");
 }};
 } // namespace
@@ -351,8 +354,9 @@ long long child_rows(yuzu::server::pg::PgPool& pool, const std::string& table,
     return std::atoll(PQgetvalue(res.get(), 0, 0));
 }
 
-// Populate one agent across all eight stores. `tag` distinguishes the target
-// agent from the bystander so the assertions can prove agent-scoping.
+// Populate one agent across the eight seeded stores (the Guardian census is seeded separately).
+// `tag` distinguishes the target agent from the bystander so the assertions can prove
+// agent-scoping.
 void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
                 yuzu::server::SoftwareInventoryStore& soft,
                 yuzu::server::AppPerfDailyStore& perf,
@@ -451,6 +455,49 @@ bool presence_live(yuzu::server::OfflineEndpointStore& presence, const std::stri
     return false;
 }
 
+// #5675: one Guardian rule, and a census row for an agent through the real ingest path.
+yuzu::server::GuaranteedStateRuleRow gs_rule(const std::string& rule_id) {
+    yuzu::server::GuaranteedStateRuleRow r;
+    r.rule_id = rule_id;
+    r.name = "guard-" + rule_id;
+    r.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\n";
+    r.version = 1;
+    r.enabled = true;
+    r.enforcement_mode = "enforce";
+    r.severity = "high";
+    r.os_target = "windows";
+    r.scope_expr = "tag:workstations";
+    r.created_at = "2026-04-19T12:00:00Z";
+    r.updated_at = "2026-04-19T12:00:00Z";
+    r.created_by = "alice";
+    r.updated_by = "alice";
+    return r;
+}
+
+void seed_census(yuzu::server::GuaranteedStateStore& gs, const std::string& agent_id,
+                 const std::string& rule_id, const std::string& event_type) {
+    yuzu::server::GuaranteedStateEventRow e;
+    e.event_id = "evt-" + agent_id + "-" + rule_id;
+    e.rule_id = rule_id;
+    e.agent_id = agent_id;
+    e.event_type = event_type;
+    e.severity = "high";
+    e.guard_type = "registry";
+    e.guard_category = "event";
+    e.timestamp = "2026-04-19T12:00:00Z";
+    e.agent_ns = 1'700'000'000'000'000'000LL;
+    e.received_ns = 1'700'000'000'000'000'000LL;
+    REQUIRE(gs.insert_event_classified(e).outcome == yuzu::server::EventInsertOutcome::Inserted);
+}
+
+void exec_ddl(const std::string& dsn, const std::string& sql) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
 } // namespace
 
 TEST_CASE("AgentDecommission erases an agent from every real store; a bystander survives",
@@ -469,6 +516,8 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     yuzu::server::AppUsageStore app_usage{pool};
     yuzu::server::OfflineEndpointStore offline_endpoint{pool};
     yuzu::server::CertificateInventoryStore certificate_inventory{pool};
+    yuzu::server::GuaranteedStateStore guaranteed_state{pool};
+    REQUIRE(guaranteed_state.is_open());
     REQUIRE(certificate_inventory.is_open());
     REQUIRE(software_inventory.is_open());
     REQUIRE(app_perf_daily.is_open());
@@ -483,6 +532,15 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
                software_licensing, app_usage, offline_endpoint);
     REQUIRE(presence_row_exists(offline_endpoint, "agent-del"));
 
+    // #5675: the Guardian census. An errored row for the target and a compliant one for the
+    // bystander, on two rules, so the delete is proven agent-scoped and not rule-scoped.
+    REQUIRE(guaranteed_state.create_rule(gs_rule("r1")));
+    REQUIRE(guaranteed_state.create_rule(gs_rule("r2")));
+    seed_census(guaranteed_state, "agent-del", "r1", "guard.unhealthy");
+    seed_census(guaranteed_state, "agent-del", "r2", "guard.unhealthy");
+    seed_census(guaranteed_state, "agent-bystander", "r1", "guard.compliant");
+    REQUIRE(guaranteed_state.agent_rule_statuses_for_agent("agent-del").value().size() == 2);
+
     AgentDecommission cascade{AgentDecommissionStores{
         .inventory = &inventory,
         .software_inventory = &software_inventory,
@@ -492,12 +550,13 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
         .app_usage = &app_usage,
         .offline_endpoint = &offline_endpoint,
         .certificate_inventory = &certificate_inventory,
+        .guaranteed_state = &guaranteed_state,
     }};
 
     const auto result = cascade.decommission("agent-del");
 
-    // One decommission call fanned to all eight stores, all Deleted.
-    CHECK(result.deleted == 8);
+    // One decommission call fanned to all nine stores, all Deleted.
+    CHECK(result.deleted == 9);
     CHECK(result.skipped == 0);
     CHECK(result.failed == 0);
     CHECK(result.ok());
@@ -513,6 +572,17 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     const auto* ci = find_store(result, "certificate_inventory");
     REQUIRE(ci != nullptr);
     CHECK(ci->outcome == DecommissionOutcome::Deleted); // the certificate store IS included
+    const auto* gs = find_store(result, "guaranteed_state");
+    REQUIRE(gs != nullptr);
+    CHECK(gs->outcome == DecommissionOutcome::Deleted); // the Guardian census store IS included
+
+    // Re-read the table: a Deleted outcome alone would pass an empty-bodied delete_agent.
+    auto census_del = guaranteed_state.agent_rule_statuses_for_agent("agent-del");
+    REQUIRE(census_del.has_value());
+    CHECK(census_del->empty());
+    auto census_by = guaranteed_state.agent_rule_statuses_for_agent("agent-bystander");
+    REQUIRE(census_by.has_value());
+    CHECK(census_by->size() == 1);
 
     // agent-del is gone from EVERY store.
     auto inv_del = inventory.get_agent_inventory("agent-del");
@@ -619,13 +689,79 @@ TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still
 
     const auto result = cascade.decommission("agent-del");
     CHECK(result.deleted == 1);
-    CHECK(result.skipped == 7);
+    CHECK(result.skipped == 8);
     CHECK(result.failed == 0);
     CHECK(result.ok());
 
     auto post = software_licensing.agent_licenses("agent-del");
     REQUIRE(post.has_value());
     CHECK(post->empty());
+}
+
+// #5675: a census store whose DELETE fails is reported Failed (never Deleted) while every other
+// store still erases, so the Art.17 evidence stays truthful and the re-issue completes it.
+TEST_CASE("AgentDecommission reports a failing Guardian census delete as Failed, others Deleted",
+          "[pg][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    REQUIRE(pool.valid());
+
+    yuzu::server::InventoryStore inventory{pool};
+    yuzu::server::SoftwareInventoryStore software_inventory{pool};
+    yuzu::server::AppPerfDailyStore app_perf_daily{pool};
+    yuzu::server::DeviceInventoryStore device_inventory{pool};
+    yuzu::server::SoftwareLicensingStore software_licensing{pool};
+    yuzu::server::AppUsageStore app_usage{pool};
+    yuzu::server::OfflineEndpointStore offline_endpoint{pool};
+    yuzu::server::CertificateInventoryStore certificate_inventory{pool};
+    yuzu::server::GuaranteedStateStore guaranteed_state{pool};
+    REQUIRE(inventory.is_open());
+    REQUIRE(guaranteed_state.is_open());
+
+    seed_agent("agent-del", inventory, software_inventory, app_perf_daily, device_inventory,
+               software_licensing, app_usage, offline_endpoint);
+    REQUIRE(guaranteed_state.create_rule(gs_rule("r1")));
+    seed_census(guaranteed_state, "agent-del", "r1", "guard.unhealthy");
+
+    exec_ddl(db.dsn(), "CREATE FUNCTION guaranteed_state_store.yuzu_test_decom_fail() RETURNS "
+                       "trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced census "
+                       "delete failure' USING ERRCODE = 'XX000'; END $$");
+    exec_ddl(db.dsn(), "CREATE TRIGGER yuzu_test_decom_fail BEFORE DELETE ON "
+                       "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW EXECUTE "
+                       "FUNCTION guaranteed_state_store.yuzu_test_decom_fail()");
+
+    AgentDecommission cascade{AgentDecommissionStores{
+        .inventory = &inventory,
+        .software_inventory = &software_inventory,
+        .app_perf_daily = &app_perf_daily,
+        .device_inventory = &device_inventory,
+        .software_licensing = &software_licensing,
+        .app_usage = &app_usage,
+        .offline_endpoint = &offline_endpoint,
+        .certificate_inventory = &certificate_inventory,
+        .guaranteed_state = &guaranteed_state,
+    }};
+
+    const auto result = cascade.decommission("agent-del");
+    CHECK(result.failed == 1);
+    CHECK(result.deleted == 8);
+    CHECK_FALSE(result.ok());
+    for (const auto& st : result.stores) {
+        if (st.store == "guaranteed_state")
+            CHECK(st.outcome == DecommissionOutcome::Failed);
+        else
+            CHECK(st.outcome == DecommissionOutcome::Deleted);
+    }
+    // The failed erasure left the census row in place.
+    CHECK(guaranteed_state.agent_rule_statuses_for_agent("agent-del").value().size() == 1);
+
+    // Operator fixes the cause and re-issues: idempotent, completes the erasure.
+    exec_ddl(db.dsn(), "DROP TRIGGER yuzu_test_decom_fail ON "
+                       "guaranteed_state_store.guardian_agent_rule_status");
+    const auto retry = cascade.decommission("agent-del");
+    CHECK(retry.ok());
+    CHECK(retry.deleted == 9);
+    CHECK(guaranteed_state.agent_rule_statuses_for_agent("agent-del").value().empty());
 }
 
 // #5682: unlike the session-guarded remove_if_session, delete_agent removes the
@@ -796,10 +932,11 @@ TEST_CASE("decommission cascade: store list is pinned to the DELETE route's docu
     // is the cascade's registered-store count without needing a live store.
     AgentDecommission cascade{AgentDecommissionStores{}};
 
-    constexpr std::size_t kCascadeStoreCount = 8; // inventory, software_inventory,
+    constexpr std::size_t kCascadeStoreCount = 9; // inventory, software_inventory,
                                                   // app_perf_daily, device_inventory,
                                                   // software_licensing, app_usage,
-                                                  // offline_endpoint, certificate_inventory
+                                                  // offline_endpoint, certificate_inventory,
+                                                  // guaranteed_state
     CHECK(cascade.target_count() == kCascadeStoreCount);
 
     const auto result = cascade.decommission("agent-x");

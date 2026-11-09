@@ -19,11 +19,15 @@
 /// the securable destroys, so when you add a store to `AgentDecommissionStores`
 /// you MUST: (a) append the store here, (b) register it in
 /// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
-/// `test_agent_decommission.cpp`, (d) add the store to the blast-radius lists in
+/// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts and the
+/// real-store fan-out's counts: three pins), (d) add the store to the blast-radius lists in
 /// `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block, ADR-0024 Decisions
-/// 9/11, and `rest-api.md`. The drift guard in `test_agent_decommission.cpp` fails
-/// until (c) is done, so the store list and the documented radius cannot silently
-/// diverge.
+/// 9/11, and `rest-api.md`, and (e) hand the live pointer over in
+/// `ServerImpl::decommission_agent` (`server.cpp`). The drift guard in
+/// `test_agent_decommission.cpp` fails until (c) is done, so the store list and the documented
+/// radius cannot silently diverge; `tests/test_decommission_wiring_lexical.py` fails until (e) is
+/// done, because nothing else notices a registered store that is never wired (it would be
+/// `Skipped` for every operator decommission).
 ///
 /// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
 /// status: true iff the delete actually committed, false on a transient failure
@@ -62,6 +66,7 @@ class SoftwareLicensingStore;
 class AppUsageStore;
 class CertificateInventoryStore;
 class OfflineEndpointStore;
+class GuaranteedStateStore;
 
 /// Per-store outcome of one decommission fan-out.
 enum class DecommissionOutcome {
@@ -124,6 +129,8 @@ struct AgentDecommissionStores {
     AppUsageStore* app_usage{nullptr};                    ///< PG per-agent last-used app usage
     OfflineEndpointStore* offline_endpoint{nullptr}; ///< PG endpoint_state presence row (#5682)
     CertificateInventoryStore* certificate_inventory{nullptr}; ///< PG certificate_inventory_store (erase only)
+    /// PG guardian_agent_rule_status census rows + pending-evidence retire (#5675)
+    GuaranteedStateStore* guaranteed_state{nullptr};
 };
 
 /// A single decommission entry point that fans `delete_agent` across a fixed set
