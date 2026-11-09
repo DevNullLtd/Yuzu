@@ -268,6 +268,26 @@ int audit_count(const std::vector<std::string>& rows, const std::string& row) {
     return static_cast<int>(std::count(rows.begin(), rows.end(), row));
 }
 
+/// A handler-level argument refusal is the A4 envelope, never a bare -32602 (agentic-first
+/// principle A5 item 5): a fresh correlation id, a null retry hint (resending fails
+/// identically), the remediation text, and `audit_persisted` named only when the denial row was
+/// dropped.
+void check_a4_refusal(const json& r, std::string_view remediation_has, bool audit_persisted = true) {
+    REQUIRE(r.contains("error"));
+    CHECK(r["error"]["code"] == mcp::kInvalidParams);
+    const json& d = r["error"]["data"];
+    REQUIRE(d.contains("correlation_id"));
+    REQUIRE(d["correlation_id"].is_string());
+    CHECK_FALSE(d["correlation_id"].get<std::string>().empty());
+    CHECK(d["retry_after_ms"].is_null());
+    REQUIRE(d["remediation"].is_string());
+    CHECK(d["remediation"].get<std::string>().find(remediation_has) != std::string::npos);
+    if (audit_persisted)
+        CHECK_FALSE(d.contains("audit_persisted"));
+    else
+        CHECK(d["audit_persisted"] == false);
+}
+
 json set_args(double excellent, const std::string& if_match) {
     return {{"document", doc_json(excellent)}, {"if_match", if_match}};
 }
@@ -493,8 +513,16 @@ TEST_CASE("get_dex_score_policy: any argument is refused, every tier reads, a re
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == mcp::kInvalidParams);
         CHECK(r["error"]["message"].get<std::string>().find("takes no arguments") != std::string::npos);
+        check_a4_refusal(r, "correct the arguments and call again");
         CHECK(t.read_calls == 0);
         CHECK(audit_count(t.generic_rows, "mcp.get_dex_score_policy|denied") == 1);
+    }
+    SECTION("a dropped denial row is reported in the refusal's envelope") {
+        Twin t;
+        t.generic_audit_ok = false;
+        const json r = t.call("get_dex_score_policy", {{"if_match", "default"}});
+        check_a4_refusal(r, "correct the arguments and call again", /*audit_persisted=*/false);
+        CHECK(t.read_calls == 0);
     }
     SECTION("the readonly and operator tiers are admitted") {
         for (const char* tier : {"readonly", "operator"}) {
@@ -521,6 +549,17 @@ TEST_CASE("get_dex_score_policy: any argument is refused, every tier reads, a re
         CHECK(r["error"]["code"] == mcp::kInternalError);
         CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyRetryMs);
         CHECK(audit_count(t.generic_rows, "mcp.get_dex_score_policy|failure") == 1);
+        CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
+    }
+    SECTION("an unreadable store with a dropped failure row reports the drop") {
+        Twin t;
+        t.read_fails = true;
+        t.generic_audit_ok = false;
+        const json r = t.call("get_dex_score_policy");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyRetryMs);
+        CHECK(r["error"]["data"]["audit_persisted"] == false);
     }
     SECTION("an unwired read closure is a non-retryable internal error with a failure row") {
         Twin::Opts o;
@@ -618,8 +657,7 @@ TEST_CASE("set_dex_score_policy: caller refusals are non-retryable invalid-param
         json args = set_args(95.0, "default");
         args["dry_run"] = "true";
         const json r = t.call("set_dex_score_policy", args);
-        REQUIRE(r.contains("error"));
-        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        check_a4_refusal(r, "correct the arguments and call again");
         CHECK(t.domain_rows.empty());
         CHECK(audit_count(t.generic_rows, "mcp.set_dex_score_policy|denied") == 1);
     }
@@ -627,10 +665,19 @@ TEST_CASE("set_dex_score_policy: caller refusals are non-retryable invalid-param
         Twin t;
         json args = set_args(95.0, "default");
         args["bogus"] = 1;
-        CHECK(t.call("set_dex_score_policy", args)["error"]["code"] == mcp::kInvalidParams);
-        CHECK(t.call("set_dex_score_policy", {{"document", "x"}, {"if_match", "default"}})["error"]["code"] ==
-              mcp::kInvalidParams);
+        check_a4_refusal(t.call("set_dex_score_policy", args), "correct the arguments and call again");
+        check_a4_refusal(t.call("set_dex_score_policy", {{"document", "x"}, {"if_match", "default"}}),
+                         "correct the arguments and call again");
         CHECK(t.domain_rows.empty());
+        CHECK(t.cas_calls == 0);
+    }
+    SECTION("a dropped denial row is reported in the refusal's envelope") {
+        Twin t;
+        t.generic_audit_ok = false;
+        json args = set_args(95.0, "default");
+        args["bogus"] = 1;
+        check_a4_refusal(t.call("set_dex_score_policy", args), "correct the arguments and call again",
+                         /*audit_persisted=*/false);
         CHECK(t.cas_calls == 0);
     }
 }
@@ -966,8 +1013,10 @@ TEST_CASE("reset_dex_score_policy: dry_run and any other argument are refused; r
     t.tier = "";
     const json dry = t.call("reset_dex_score_policy", {{"if_match", "default"}, {"dry_run", true}});
     REQUIRE(dry.contains("error"));
-    CHECK(dry["error"]["code"] == mcp::kInvalidParams);
     CHECK(dry["error"]["message"].get<std::string>().find("unknown argument") != std::string::npos);
+    check_a4_refusal(dry, "correct the arguments and call again");
+    // The parse refusal is a post-consumption refusal like any other: it carries the recovery.
+    check_a4_refusal(dry, "fresh ticket");
     CHECK(t.domain_rows.empty());
 
     t.stored = doc_with_excellent(80.0);

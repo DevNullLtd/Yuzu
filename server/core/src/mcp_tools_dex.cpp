@@ -92,11 +92,16 @@ constexpr std::string_view kResetTicketSpentNote =
     "get_dex_score_policy, compare its revision with the one named here, then submit a new "
     "request without approval_id for a fresh ticket";
 
+/// Remediation for an argument-shape refusal (get, set and reset); reset appends the
+/// spent-ticket note to it.
+constexpr std::string_view kBadArgsRemediation = "correct the arguments and call again";
+
 /// A caller-input refusal judged before apply runs: the generic `mcp.<tool>|denied` row, then
-/// a bare non-retryable -32602 (the other registry files' helper of the same name).
-void refuse_params(const ToolCallContext& ctx, const std::string& message) {
-    (void)ctx.audit("denied", "invalid arguments: " + message);
-    answer(ctx, error_response(ctx.id, kInvalidParams, message)); // retry-hint-exempt: caller-input rejection
+/// the A4 envelope (-32602, non-retryable) with `remediation` and the row's persistence flag.
+void refuse_params(const ToolCallContext& ctx, const std::string& message,
+                   std::string_view remediation) {
+    const bool audited = ctx.audit("denied", "invalid arguments: " + message);
+    answer(ctx, ctx.a4_error(kInvalidParams, message, remediation, -1, {}, audited)); // retry-hint-exempt: caller-input rejection
 }
 
 /// The handler's own tier check (the generic C8 gate has already run; this is the defence in
@@ -162,7 +167,7 @@ void handle_get_dex_score_policy(const ToolCallContext& ctx) {
     // ctx.args is a JSON object here (the dispatch chain's central check refuses anything else
     // first), so "takes no arguments" is an emptiness test.
     if (!ctx.args.empty()) {
-        refuse_params(ctx, "get_dex_score_policy takes no arguments");
+        refuse_params(ctx, "get_dex_score_policy takes no arguments", kBadArgsRemediation);
         return;
     }
     if (!tier_admits(ctx, "GuaranteedState", "Read"))
@@ -177,10 +182,10 @@ void handle_get_dex_score_policy(const ToolCallContext& ctx) {
     }
     const auto stored = ctx.deps->dex_score_policy_read_fn();
     if (!stored) {
-        (void)ctx.audit("failure", "store read failed");
+        const bool audited = ctx.audit("failure", "store read failed");
         answer(ctx, ctx.a4_error(kInternalError, kDexScorePolicyStoreUnavailableMessage,
                                  "retry shortly", /*retry_after_ms=*/kDexScorePolicyRetryMs, {},
-                                 true));
+                                 audited));
         return;
     }
     (void)ctx.audit("success", "");
@@ -200,7 +205,7 @@ void handle_set_dex_score_policy(const ToolCallContext& ctx) {
         return; // loud: the answer carries application names
     auto rq = dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op::Put, ctx.args);
     if (!rq) {
-        refuse_params(ctx, rq.error());
+        refuse_params(ctx, rq.error(), kBadArgsRemediation);
         return;
     }
     const auto actor = writer_actor(ctx, "set_dex_score_policy", {});
@@ -244,7 +249,9 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
     // check accepts and ignores it.
     auto rq = dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op::Reset, ctx.args);
     if (!rq) {
-        refuse_params(ctx, rq.error());
+        // The ticket was spent before this handler ran: this refusal carries the recovery too.
+        refuse_params(ctx, rq.error(),
+                      std::string(kBadArgsRemediation) + "; " + std::string(kResetTicketSpentNote));
         return;
     }
     const auto actor = writer_actor(ctx, "reset_dex_score_policy", kResetTicketSpentNote);
