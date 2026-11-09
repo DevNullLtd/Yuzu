@@ -425,9 +425,9 @@ TEST_CASE("runtime daemon.json: wrong types read malformed, withhold their row a
     CHECK(hosts_sibling.malformed);
     REQUIRE(hosts_sibling.rows.size() == 1);
     CHECK(hosts_sibling.rows[0].key == "icc");
-    // the registry lists are counted, never read: a non-array is malformed, an array is not
-    for (const char* text : {R"({"insecure-registries":"a:5000"})", R"({"registry-mirrors":{"a":1}})",
-                             R"({"insecure-registries":null})"}) {
+    // the registry lists are counted, never read: a non-array is malformed, an array is not (a null
+    // list is a missing key, see "JSON null is a missing key")
+    for (const char* text : {R"({"insecure-registries":"a:5000"})", R"({"registry-mirrors":{"a":1}})"}) {
         const auto bad = parse_daemon_json(text);
         INFO(text);
         CHECK(bad.malformed);
@@ -469,7 +469,7 @@ TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is 
     CHECK(bare.api_version == "-");
 
     // every key read is wrong-typed: malformed, no dialect (Components is not an array), `-` fields
-    const auto odd = parse_version(json::parse(R"({"Version":27,"ApiVersion":null,"Components":"x"})"));
+    const auto odd = parse_version(json::parse(R"({"Version":27,"ApiVersion":true,"Components":"x"})"));
     CHECK(odd.malformed);
     CHECK(odd.dialect == Dialect::none);
     CHECK(odd.version == "-");
@@ -482,7 +482,7 @@ TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is 
     CHECK(wrong_version.dialect == Dialect::docker);
     CHECK(wrong_version.version == "-");
     CHECK(wrong_version.api_version == "1.47");
-    const auto wrong_api = parse_version(json::parse(R"({"Version":"1","ApiVersion":null})"));
+    const auto wrong_api = parse_version(json::parse(R"({"Version":"1","ApiVersion":5})"));
     CHECK(wrong_api.malformed);
     CHECK(wrong_api.version == "1");
     CHECK(wrong_api.api_version == "-");
@@ -493,7 +493,7 @@ TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is 
     CHECK(wrong_comp.malformed);
     CHECK(wrong_comp.dialect == Dialect::none);
     for (const char* body : {R"({"Components":[1]})", R"({"Components":[{"Name":5}]})",
-                             R"({"Components":null})", R"({"Components":{"Name":"Podman Engine"}})"}) {
+                             R"({"Components":{"Name":"Podman Engine"}})"}) {
         const auto bad = parse_version(json::parse(body));
         INFO(body);
         CHECK(bad.malformed);
@@ -683,7 +683,7 @@ TEST_CASE("runtime list: a wrong-typed key of a valid entry keeps the row and re
     CHECK(image.rows[0].image == "-");
     CHECK(image.rows[0].name == "web"); // the well-typed fields still report
     CHECK(image.rows[0].state == "running");
-    const auto state = one(R"(,"Image":"i","State":null)");
+    const auto state = one(R"(,"Image":"i","State":7)");
     CHECK(state.malformed);
     REQUIRE(state.rows.size() == 1);
     CHECK(state.rows[0].state == "invalid");
@@ -768,10 +768,10 @@ TEST_CASE("runtime inspect: privileged, network mode and the host-socket mount f
         INFO(src);
         CHECK(r.socket_mounted == Tri::no);
     }
-    // no mounts at all (null or empty) mounts no socket; an absent or wrong-typed Mounts is unknown
+    // an empty Mounts mounts no socket; an absent, null or wrong-typed Mounts is unknown
     ContainerRow none = make();
     REQUIRE(apply_inspect(none, json::parse(R"({"HostConfig":{},"Mounts":null})")));
-    CHECK(none.socket_mounted == Tri::no);
+    CHECK(none.socket_mounted == Tri::unknown); // null is a missing key, never `no`
     ContainerRow empty = make();
     REQUIRE(apply_inspect(empty, json::parse(R"({"HostConfig":{},"Mounts":[]})")));
     CHECK(empty.socket_mounted == Tri::no);
@@ -783,7 +783,6 @@ TEST_CASE("runtime inspect: privileged, network mode and the host-socket mount f
     for (const char* body : {
              R"({"HostConfig":{"Privileged":"yes","NetworkMode":5},"Mounts":"x"})",
              R"({"HostConfig":{"Privileged":1,"NetworkMode":"host"},"Mounts":[]})",
-             R"({"HostConfig":{"Privileged":null},"Mounts":[]})",
              R"({"HostConfig":{"Privileged":true,"NetworkMode":5},"Mounts":[]})",
              R"({"HostConfig":{"Privileged":true},"Mounts":"x"})",
              R"({"HostConfig":{"Privileged":true},"Mounts":{"Source":"/run"}})",
@@ -809,6 +808,91 @@ TEST_CASE("runtime inspect: privileged, network mode and the host-socket mount f
     CHECK_FALSE(apply_inspect(untouched, json::parse("[]")));
     CHECK(untouched.privileged == Tri::unknown);
     CHECK(untouched.socket_mounted == Tri::unknown);
+}
+
+TEST_CASE("runtime readers: a key whose value is JSON null is a missing key, never wrong-typed",
+          "[virtualization][runtime][null]") {
+    // Go runtimes emit null for an empty slice or pointer, so the honest common reply must stay
+    // clean: the row is omitted or the field stays unknown, with no token. A null ELEMENT of an
+    // array a reader walks is not a key and stays wrong-typed (covered beside each reader).
+
+    // /version
+    const auto version = parse_version(json::parse(R"({"Version":null,"ApiVersion":null,"Components":null})"));
+    CHECK_FALSE(version.malformed);
+    CHECK(version.dialect == Dialect::docker);
+    CHECK(version.version == "-");
+    CHECK(version.api_version == "-");
+    const auto name = parse_version(json::parse(R"({"Version":"1","Components":[{"Name":null}]})"));
+    CHECK_FALSE(name.malformed);
+    CHECK(name.dialect == Dialect::docker);
+    CHECK(name.version == "1");
+
+    // /info: a null SecurityOptions emits neither `rootless` nor the count (never `rootless no`)
+    const auto info = parse_info(json::parse(R"({"SecurityOptions":null,"CgroupDriver":null})"));
+    CHECK_FALSE(info.malformed);
+    CHECK(info.rows.empty());
+    const auto driver = parse_info(json::parse(R"({"SecurityOptions":null,"CgroupDriver":"systemd"})"));
+    CHECK_FALSE(driver.malformed);
+    REQUIRE(driver.rows.size() == 1);
+    CHECK(driver.rows[0].key == "cgroup_driver");
+
+    // the list reply: Names, Image and State
+    const auto list = containers_from_list(json::parse(
+        R"([{"Id":")" + id('a') + R"(","Names":null,"Image":null,"State":null},)" +
+        R"({"Id":")" + id('b') + R"(","Names":null,"Image":"i","State":"running"}])"));
+    CHECK_FALSE(list.malformed);
+    REQUIRE(list.rows.size() == 2);
+    CHECK(list.rows[0].name == "-");
+    CHECK(list.rows[0].image == "-");
+    CHECK(list.rows[0].state == "invalid");
+    CHECK(list.rows[1].name == "-");
+    CHECK(list.rows[1].image == "i"); // the well-typed keys still report
+    CHECK(list.rows[1].state == "running");
+
+    // inspect: every field stays unknown, and a well-typed key still reports beside a null one
+    const auto make = [] {
+        ContainerRow r;
+        r.id = id('a');
+        r.id12 = id('a', 12);
+        return r;
+    };
+    for (const char* body : {R"({"HostConfig":{"Privileged":null,"NetworkMode":null},"Mounts":null})",
+                             R"({"HostConfig":{"Privileged":null},"Mounts":null})"}) {
+        ContainerRow r = make();
+        INFO(body);
+        REQUIRE(apply_inspect(r, json::parse(body)));
+        CHECK(r.privileged == Tri::unknown);
+        CHECK(r.network_mode == "unknown");
+        CHECK(r.socket_mounted == Tri::unknown);
+    }
+    ContainerRow beside = make();
+    REQUIRE(apply_inspect(beside, json::parse(R"({"HostConfig":{"Privileged":true,"NetworkMode":null},"Mounts":null})")));
+    CHECK(beside.privileged == Tri::yes);
+    CHECK(beside.network_mode == "unknown");
+    CHECK(beside.socket_mounted == Tri::unknown);
+    // a mount whose Source is null mounts no host path, as for one without a Source (tmpfs)
+    ContainerRow no_source = make();
+    REQUIRE(apply_inspect(no_source, json::parse(R"({"HostConfig":{},"Mounts":[{"Source":null},{"Source":"/data"}]})")));
+    CHECK(no_source.socket_mounted == Tri::no);
+    // a null HostConfig is a missing one: the inspection counts as failed and the row is untouched
+    ContainerRow no_hc = make();
+    CHECK_FALSE(apply_inspect(no_hc, json::parse(R"({"HostConfig":null,"Mounts":[]})")));
+    CHECK(no_hc.privileged == Tri::unknown);
+    CHECK(no_hc.socket_mounted == Tri::unknown);
+
+    // daemon.json: every allow-listed key, `hosts` and the two registry lists included
+    for (const char* key : {"live-restore", "userns-remap", "no-new-privileges", "icc", "iptables", "tls",
+                            "tlsverify", "data-root", "log-driver", "storage-driver", "selinux-enabled",
+                            "userland-proxy", "hosts", "insecure-registries", "registry-mirrors"}) {
+        const auto out = parse_daemon_json(std::string{R"({")"} + key + R"(":null})");
+        INFO(key);
+        CHECK_FALSE(out.malformed);
+        CHECK(out.rows.empty());
+    }
+    const auto sibling = parse_daemon_json(R"({"icc":null,"live-restore":true,"hosts":null})");
+    CHECK_FALSE(sibling.malformed);
+    REQUIRE(sibling.rows.size() == 1);
+    CHECK(sibling.rows[0].key == "live-restore");
 }
 
 // ---------------------------------------------------------------------------------------------

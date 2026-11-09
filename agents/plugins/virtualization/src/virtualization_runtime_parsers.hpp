@@ -13,10 +13,10 @@
 //   * The JSON readers. Every body is parsed through parse_limited (non-throwing, comments
 //     ignored, nesting over kMaxJsonDepth discarded as it starts) and read only through accessors
 //     that tolerate a wrong type. ONE rule for every reader (typed_member): a key it reads that is
-//     absent omits its row or leaves the field unknown; a key present with another type, or a read
-//     element of another type, makes that reader `malformed` (the caller adds the token) and
-//     contributes nothing, while the well-typed keys still report. Each reader touches an
-//     allow-list of keys and nothing else:
+//     absent or JSON null omits its row or leaves the field unknown; a key present with another
+//     type, or a read element of another type (a null element included), makes that reader
+//     `malformed` (the caller adds the token) and contributes nothing, while the well-typed keys
+//     still report. Each reader touches an allow-list of keys and nothing else:
 //     /version (Version, ApiVersion, Components[].Name), /info (CgroupDriver, SecurityOptions),
 //     the list reply (Id, Names, Image, State), the inspect reply (HostConfig.Privileged,
 //     HostConfig.NetworkMode, Mounts[].Source), daemon.json (a fixed key list).
@@ -563,13 +563,18 @@ inline const nlohmann::json* member_of_type(const nlohmann::json& j, const char*
     return (m && m->type() == t) ? m : nullptr;
 }
 
-/// The typed read every JSON reader below uses for a key it reads. Absent: nullptr and nothing
-/// recorded (the row is omitted or stays unknown; a missing key is never wrong-typed). Present with
-/// another type, null included: nullptr and `malformed` set, so the reader reports a token beside
-/// whatever well-typed keys it still read. `malformed` is only ever set here, never cleared.
+/// The typed read every JSON reader below uses for a key it reads. Absent, or present as JSON
+/// `null` (Go runtimes emit null for an empty slice or pointer, so it is the honest common shape):
+/// nullptr and nothing recorded (the row is omitted or stays unknown; neither is ever wrong-typed).
+/// Present with another type: nullptr and `malformed` set, so the reader reports a token beside
+/// whatever well-typed keys it still read. A null ELEMENT of an array a reader walks is not a key
+/// and stays wrong-typed (the readers test elements themselves). `malformed` is only ever set here,
+/// never cleared.
 inline const nlohmann::json* typed_member(const nlohmann::json& j, const char* key,
                                           nlohmann::json::value_t t, bool& malformed) {
     const auto* m = member(j, key);
+    if (m && m->is_null())
+        return nullptr;
     if (m && m->type() != t) {
         malformed = true;
         return nullptr;
@@ -882,11 +887,11 @@ inline bool mount_exposes_runtime_socket(std::string_view source) {
 }
 
 /// Applies one inspect reply, all or nothing. Returns false (the row is left untouched, so its
-/// three inspect fields stay unknown) when the reply has no object HostConfig or any key read is
-/// wrong-typed: HostConfig.Privileged, HostConfig.NetworkMode, Mounts (neither null nor an array),
-/// a Mounts element that is not an object, or a Mounts[].Source that is present and not a string.
-/// A missing key leaves its field unknown, never `no`; a mount object without Source (tmpfs)
-/// mounts no host path.
+/// three inspect fields stay unknown) when the reply has no object HostConfig (a null one is a
+/// missing one) or any key read is wrong-typed: HostConfig.Privileged, HostConfig.NetworkMode,
+/// Mounts (neither null nor an array), a Mounts element that is not an object (a null element
+/// included), or a Mounts[].Source that is neither null nor a string. A missing or null key leaves
+/// its field unknown, never `no`; a mount object without Source (tmpfs) mounts no host path.
 inline bool apply_inspect(ContainerRow& row, const nlohmann::json& j) {
     const auto* hc = member_of_type(j, "HostConfig", nlohmann::json::value_t::object);
     if (!hc)
@@ -899,27 +904,20 @@ inline bool apply_inspect(ContainerRow& row, const nlohmann::json& j) {
         privileged = p->get<bool>() ? Tri::yes : Tri::no;
     if (const auto* nm = typed_member(*hc, "NetworkMode", nlohmann::json::value_t::string, bad))
         network_mode = checked_network_mode(nm->get_ref<const std::string&>());
-    if (const auto* mounts = member(j, "Mounts")) {
-        if (mounts->is_null()) {
-            socket_mounted = Tri::no;
-        } else if (mounts->is_array()) {
-            bool exposed = false;
-            for (const auto& m : *mounts) {
-                if (!m.is_object()) {
-                    bad = true;
-                    break;
-                }
-                if (const auto* src =
-                        typed_member(m, "Source", nlohmann::json::value_t::string, bad))
-                    exposed = exposed ||
-                              mount_exposes_runtime_socket(src->get_ref<const std::string&>());
+    if (const auto* mounts = typed_member(j, "Mounts", nlohmann::json::value_t::array, bad)) {
+        bool exposed = false;
+        for (const auto& m : *mounts) {
+            if (!m.is_object()) {
+                bad = true;
+                break;
             }
-            socket_mounted = exposed ? Tri::yes : Tri::no;
-        } else {
-            bad = true;
+            if (const auto* src = typed_member(m, "Source", nlohmann::json::value_t::string, bad))
+                exposed = exposed ||
+                          mount_exposes_runtime_socket(src->get_ref<const std::string&>());
         }
+        socket_mounted = exposed ? Tri::yes : Tri::no;
     }
-    // no Mounts key leaves socket_mounted unknown: never rendered as no
+    // no Mounts key, or a null one, leaves socket_mounted unknown: never rendered as no
     if (bad)
         return false;
     row.privileged = privileged;

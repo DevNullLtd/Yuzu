@@ -313,8 +313,10 @@ emitted only when it is numeric and in 100-599, otherwise the cause is `http_oth
 **Per-response recovery.** A non-200, malformed or wrong-typed `/version`, `/info` or list reply yields
 unknown fields for that verb plus one token `<verb>:http_<status>` or `<verb>:malformed`, where `<verb>` is
 `version`, `info` or `list`; earlier rows are kept and later verbs still run while budget remains.
-Wrong-typed means a key the parser reads is present with a value, or an element it reads, of another type;
-a missing key is never wrong-typed. The keys read are `/version` `Version`, `ApiVersion`, `Components`, each
+Wrong-typed means a key the parser reads is present with a non-null value, or an element it reads, of another
+type; a missing key, or a key whose value is null, is never wrong-typed and only omits its row or leaves its field
+unknown, with no token (Go runtimes emit null for an empty slice or pointer, so it is the honest common shape; a
+null element inside an array the parser walks is still wrong-typed). The keys read are `/version` `Version`, `ApiVersion`, `Components`, each
 `Components` element (an object) and its `Name`; `/info` as in section 6; and in a list entry `Names`, its
 first element, `Image` and `State`. A wrong-typed key withholds its own field and the reply reads
 `malformed` while the well-typed keys still report; a list entry keeps its row with `-` or `invalid` for the
@@ -375,8 +377,8 @@ wrong value.
 The check runs before truncation and before `wire_field`. `privileged` and `network_mode` come from the
 inspect reply. `host_runtime_socket_mounted` is `yes` when any mount source of the container equals one
 of the four default socket paths or is a parent directory of one (`/`, `/run`, `/var/run`, `/run/podman`,
-`/run/containerd`), `no` when none is, and `unknown` when the container was never inspected (cap) or
-inspection failed. `unknown` is never rendered as `no`.
+`/run/containerd`), `no` when none is, and `unknown` when the container was never inspected (cap), inspection
+failed, or the reply carried no `Mounts` (a missing or null key). `unknown` is never rendered as `no`.
 
 ## 9. Evidence the PR carries
 
